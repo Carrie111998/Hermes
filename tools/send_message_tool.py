@@ -503,6 +503,18 @@ def _handle_send(args):
         except Exception:
             pass  # best-effort durability — never blocks the real send below
 
+    if _outbox_entry_id:
+        # Mark attempting immediately before handing the message to the Bot
+        # API. A crash between here and the tombstone is *ambiguous* — the
+        # platform may already have it — and the drain must label that replay
+        # rather than silently duplicate it (review #74085; same contract as
+        # delivery_ledger.mark_attempting).
+        try:
+            from tools.telegram_outbox import outbox_mark_attempting
+            outbox_mark_attempting(_outbox_entry_id)
+        except Exception:
+            pass  # best-effort bookkeeping — never blocks the real send
+
     try:
         from model_tools import _run_async
         result = _run_async(

@@ -116,12 +116,62 @@ def outbox_append(chat_id: str, message: str, thread_id: str | None = None) -> s
     try:
         path = _outbox_path()
         with _outbox_lock(path):
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            _durable_append(path, entry)
         return entry_id
     except Exception as e:
         logger.warning("telegram_outbox: append failed (send proceeds anyway): %s", e)
         return None
+
+
+def _durable_append_fh(f, record: dict) -> None:
+    """Write one JSON line to an already-open handle and fsync it."""
+    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    f.flush()
+    os.fsync(f.fileno())
+
+
+def _durable_append(path: Path, record: dict) -> None:
+    """Append one JSON line and make it survive a power loss / reboot.
+
+    Review #74085: the original append relied on Python buffering + normal
+    process exit, so the title's "survives SIGKILL/reboot" only held for
+    SIGKILL. flush()+fsync() covers the reboot case; the parent-directory
+    fsync covers first-ever creation (otherwise the file itself can be
+    missing from the directory after a crash even though its data landed).
+    """
+    existed = path.exists()
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    if not existed:
+        try:
+            dfd = os.open(str(path.parent), os.O_RDONLY)
+            try:
+                os.fsync(dfd)
+            finally:
+                os.close(dfd)
+        except OSError:
+            pass      # best-effort: never block a send over directory fsync
+
+
+def outbox_mark_attempting(entry_id: str | None) -> None:
+    """Record that a send is about to be handed to the Bot API.
+
+    Mirrors ``delivery_ledger.mark_attempting()``. A crash after this point
+    but before the tombstone leaves an *ambiguous* entry: the platform may
+    already hold the message. The drain must not silently resend those —
+    see ``outbox_drain``.
+    """
+    if not entry_id:
+        return
+    try:
+        path = _outbox_path()
+        with _outbox_lock(path):
+            _durable_append(path, {"id": entry_id, "status": "attempting",
+                                   "attempting_at": time.time()})
+    except Exception as e:
+        logger.warning("telegram_outbox: mark_attempting failed: %s", e)
 
 
 def outbox_mark_sent(entry_id: str | None) -> None:
@@ -138,19 +188,25 @@ def outbox_mark_sent(entry_id: str | None) -> None:
         path = _outbox_path()
         with _outbox_lock(path):
             with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({"id": entry_id, "status": "sent", "sent_at": time.time()}, ensure_ascii=False) + "\n")
+                _durable_append_fh(f, {"id": entry_id, "status": "sent", "sent_at": time.time()})
     except Exception as e:
         logger.warning("telegram_outbox: mark_sent failed for %s (message was sent; only the outbox record is stale): %s", entry_id, e)
 
 
-def _load_resolved_ids(lines: list[str]) -> tuple[dict[str, dict], set[str]]:
-    """Parse outbox lines into (id -> pending entry, set of resolved ids).
+def _load_resolved_ids(lines: list[str]) -> tuple[dict[str, dict], set[str], set[str]]:
+    """Parse outbox lines into (id -> pending entry, resolved ids, ambiguous ids).
 
     Malformed lines are skipped (best-effort log parsing — a single corrupt
     line must never make the whole outbox unreadable).
+
+    ``ambiguous`` holds ids that reached ``attempting`` without a tombstone:
+    the Bot API may already have accepted them. Review #74085 required that
+    these be *labeled* on replay rather than silently duplicated, matching
+    ``delivery_ledger``'s contract (``RECOVERED_MARKER``).
     """
     pending: dict[str, dict] = {}
     resolved: set[str] = set()
+    ambiguous: set[str] = set()
     for line in lines:
         line = line.strip()
         if not line:
@@ -164,9 +220,13 @@ def _load_resolved_ids(lines: list[str]) -> tuple[dict[str, dict], set[str]]:
             continue
         if rec.get("status") == "sent":
             resolved.add(rid)
+        elif rec.get("status") == "attempting":
+            # 崩在 Bot API 已收下但 tombstone 未寫之間：平台可能已經有這則。
+            # 不移出 pending（還是要重送），但標記成模糊，重送時必須帶標記。
+            ambiguous.add(rid)
         elif rec.get("status") == "pending":
             pending[rid] = rec
-    return pending, resolved
+    return pending, resolved, ambiguous
 
 
 def outbox_pending_entries() -> list[dict]:
@@ -183,7 +243,7 @@ def outbox_pending_entries() -> list[dict]:
     except Exception as e:
         logger.warning("telegram_outbox: failed to read outbox for inspection: %s", e)
         return []
-    pending, resolved = _load_resolved_ids(lines)
+    pending, resolved, _amb = _load_resolved_ids(lines)
     return [e for rid, e in sorted(pending.items(), key=lambda kv: kv[1].get("created_at", 0)) if rid not in resolved]
 
 
@@ -220,7 +280,7 @@ def outbox_drain(
     that entry pending for the next drain call.
     """
     if send_fn is None:
-        def send_fn(chat_id, message, thread_id):
+        def send_fn(chat_id, message, thread_id, ambiguous=False):
             from tools.send_message_tool import send_message_tool
             # Telegram topic target format is "chat_id:thread_id" (see
             # _TELEGRAM_TOPIC_TARGET_RE in send_message_tool.py).
@@ -229,10 +289,23 @@ def outbox_drain(
             # without this flag _handle_send would outbox_append() again on
             # every retry, growing the file with duplicate pending entries
             # for what is logically the same message.
+            body = message
+            if ambiguous:
+                # Honest at-least-once: the platform may already hold this
+                # message, so label the replay instead of silently duplicating
+                # it — same contract as delivery_ledger (review #74085).
+                try:
+                    from gateway.delivery_ledger import RECOVERED_MARKER
+                except Exception:
+                    RECOVERED_MARKER = (
+                        "♻️ Recovered reply — the gateway restarted during "
+                        "delivery, so this may be a duplicate:\n\n"
+                    )
+                body = f"{RECOVERED_MARKER}{message}"
             result_str = send_message_tool({
                 "action": "send",
                 "target": target,
-                "message": message,
+                "message": body,
                 "_skip_outbox": True,
             })
             try:
@@ -241,9 +314,20 @@ def outbox_drain(
                 return False
             return bool(result.get("success"))
 
+    # Detect the send_fn signature ONCE, up front. Probing with TypeError at
+    # call time would re-invoke send_fn whenever send_fn itself raised
+    # TypeError internally — i.e. a double send. Older callers (tests, other
+    # integrations) that take only three positional args stay supported.
+    try:
+        import inspect
+        _send_fn_takes_ambiguous = "ambiguous" in inspect.signature(send_fn).parameters
+    except (TypeError, ValueError):
+        _send_fn_takes_ambiguous = False
+
     path = _outbox_path()
     if not path.exists():
-        return {"attempted": 0, "sent": 0, "dropped_stale": 0, "still_pending": 0}
+        return {"attempted": 0, "sent": 0, "dropped_stale": 0,
+                "still_pending": 0, "ambiguous_replayed": 0}
 
     try:
         with _outbox_lock(path):
@@ -251,9 +335,10 @@ def outbox_drain(
                 lines = f.readlines()
     except Exception as e:
         logger.warning("telegram_outbox: drain could not read outbox: %s", e)
-        return {"attempted": 0, "sent": 0, "dropped_stale": 0, "still_pending": 0}
+        return {"attempted": 0, "sent": 0, "dropped_stale": 0,
+                "still_pending": 0, "ambiguous_replayed": 0}
 
-    pending, resolved = _load_resolved_ids(lines)
+    pending, resolved, ambiguous = _load_resolved_ids(lines)
     now = time.time()
     started = time.monotonic()
     attempted = 0
@@ -278,8 +363,22 @@ def outbox_drain(
         if deadline_seconds is not None and time.monotonic() - started > deadline_seconds:
             break
         attempted += 1
+        is_ambiguous = rid in ambiguous
+        # Record the attempt *before* handing it to the Bot API, so a crash
+        # during this resend is itself recoverable-and-labeled next time
+        # (delivery_ledger.mark_attempting parity).
         try:
-            ok = bool(send_fn(entry.get("chat_id"), entry.get("message"), entry.get("thread_id")))
+            _durable_append(path, {"id": rid, "status": "attempting",
+                                   "attempting_at": time.time()})
+        except Exception:
+            pass          # best-effort: never block the resend over bookkeeping
+        try:
+            if _send_fn_takes_ambiguous:
+                ok = bool(send_fn(entry.get("chat_id"), entry.get("message"),
+                                  entry.get("thread_id"), ambiguous=is_ambiguous))
+            else:
+                ok = bool(send_fn(entry.get("chat_id"), entry.get("message"),
+                                  entry.get("thread_id")))
         except Exception as e:
             logger.warning("telegram_outbox: drain resend attempt raised for %s: %s", rid, e)
             ok = False
@@ -289,6 +388,7 @@ def outbox_drain(
 
     # Fallback summary count from the snapshot (used when compaction fails:
     # entries then remain on disk, so reporting 0 would be wrong).
+    ambiguous_replayed = len([rid for rid in sent_ids if rid in ambiguous])
     still_pending_count = len(
         [rid for rid in pending if rid not in resolved and rid not in sent_ids and rid not in stale_ids]
     )
@@ -302,14 +402,24 @@ def outbox_drain(
         with _outbox_lock(path):
             with open(path, "r", encoding="utf-8") as f:
                 fresh_lines = f.readlines()
-            fresh_pending, fresh_resolved = _load_resolved_ids(fresh_lines)
+            fresh_pending, fresh_resolved, fresh_ambiguous = _load_resolved_ids(fresh_lines)
             drop = fresh_resolved | sent_ids | stale_ids
             keep = {rid: e for rid, e in fresh_pending.items() if rid not in drop}
             still_pending_count = len(keep)
             tmp_path = path.with_suffix(path.suffix + ".tmp")
             with open(tmp_path, "w", encoding="utf-8") as f:
-                for entry in keep.values():
+                for rid, entry in keep.items():
                     f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    # Ambiguity must survive compaction: an entry that reached
+                    # 'attempting' but is still unresolved has to stay labeled,
+                    # otherwise the next drain would replay it as a clean
+                    # pending and silently duplicate (review #74085).
+                    if rid in fresh_ambiguous:
+                        f.write(json.dumps({"id": rid, "status": "attempting",
+                                            "attempting_at": time.time()},
+                                           ensure_ascii=False) + "\n")
+                f.flush()
+                os.fsync(f.fileno())
             os.replace(tmp_path, path)
     except Exception as e:
         logger.warning("telegram_outbox: drain compaction failed (outbox left as-is, will re-attempt next drain): %s", e)
@@ -319,4 +429,7 @@ def outbox_drain(
         "sent": sent,
         "dropped_stale": dropped_stale,
         "still_pending": still_pending_count,
+        # Ops visibility: how many of this pass's resends carried the
+        # recovered marker (i.e. were ambiguous rather than clean pending).
+        "ambiguous_replayed": ambiguous_replayed,
     }
