@@ -33,6 +33,7 @@ from gateway.canonical_writer_db import (
 from gateway.canonical_writer_schema_reconciliation import (
     BASE_ARTIFACT_NAME,
     SchemaContract,
+    SchemaReconciliationError,
     _load_sealed_artifacts,
     _target_policy,
     collect_schema_contract,
@@ -1349,6 +1350,19 @@ def _revalidate_stopped(context: _RuntimeContext, code: str) -> None:
         raise SchemaUpgradeRuntimeError(code) from exc
 
 
+def _schema_upgrade_apply_error_code(primary: BaseException) -> str:
+    """Preserve only a bounded, non-secret schema-upgrade invariant code."""
+
+    code = getattr(primary, "code", None)
+    if (
+        isinstance(primary, (SchemaUpgradeRuntimeError, SchemaReconciliationError))
+        and isinstance(code, str)
+        and _STABLE_ERROR.fullmatch(code) is not None
+    ):
+        return code
+    return "schema_upgrade_apply_failed"
+
+
 def _runtime_apply(
     context: _RuntimeContext,
     gate: Mapping[str, Any],
@@ -1420,7 +1434,9 @@ def _runtime_apply(
     if primary is not None:
         if isinstance(primary, SchemaUpgradeRuntimeError):
             raise primary
-        raise SchemaUpgradeRuntimeError("schema_upgrade_apply_failed") from primary
+        raise SchemaUpgradeRuntimeError(
+            _schema_upgrade_apply_error_code(primary)
+        ) from primary
     _revalidate_stopped(context, "schema_upgrade_stopped_boundary_drifted")
     unsigned = {
         "schema": INTERMEDIATE_SCHEMA,

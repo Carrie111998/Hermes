@@ -378,6 +378,102 @@ def test_execute_atomic_upgrade_rolls_back_unreviewed_contract(
     assert session.sql[-1] == "ROLLBACK"
 
 
+def test_post_apply_contract_mismatch_reports_only_structural_category(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _Session()
+    config = _config()
+    drifted = copy.deepcopy(_target().value)
+    drifted["attestation"]["routine_identities"][0][
+        "definition_sha256"
+    ] = "f" * 64
+    observed_target = SchemaContract.from_mapping(drifted)
+    contracts = iter((_source_contract(), observed_target))
+    truth = SimpleNamespace(sha256="b" * 64)
+    observations = iter(
+        (
+            SimpleNamespace(truth=truth, observation_sha256="c" * 64),
+            SimpleNamespace(truth=truth, observation_sha256="d" * 64),
+        )
+    )
+    monkeypatch.setattr(
+        upgrade,
+        "collect_schema_contract",
+        lambda *args, **kwargs: next(contracts),
+    )
+    monkeypatch.setattr(
+        upgrade,
+        "parse_control_observation",
+        lambda result: next(observations),
+    )
+
+    with pytest.raises(
+        SchemaReconciliationError,
+        match="schema_upgrade_post_apply_public_routines_invalid",
+    ):
+        execute_atomic_schema_upgrade(
+            _plan(),
+            target=_target(),
+            artifact=_load_source_artifacts_for_tests()["base_migration"],
+            session=session,
+            writer_config=config,
+            writer_managed_hba_receipt=_managed_hba(config, user=config.user),
+            admin_managed_hba_receipt=_managed_hba(
+                config,
+                user=session.username,
+            ),
+            authorization_sha256="a" * 64,
+            started_at_unix=100,
+        )
+    assert session.sql[-1] == "ROLLBACK"
+
+
+def test_post_apply_collection_failure_is_stage_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _Session()
+    config = _config()
+    calls = 0
+
+    def collect(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _source_contract()
+        raise SchemaReconciliationError("schema_reconciliation_contract_invalid")
+
+    truth = SimpleNamespace(sha256="b" * 64)
+    monkeypatch.setattr(upgrade, "collect_schema_contract", collect)
+    monkeypatch.setattr(
+        upgrade,
+        "parse_control_observation",
+        lambda result: SimpleNamespace(
+            truth=truth,
+            observation_sha256="c" * 64,
+        ),
+    )
+
+    with pytest.raises(
+        SchemaReconciliationError,
+        match="schema_upgrade_post_apply_contract_collection_failed",
+    ):
+        execute_atomic_schema_upgrade(
+            _plan(),
+            target=_target(),
+            artifact=_load_source_artifacts_for_tests()["base_migration"],
+            session=session,
+            writer_config=config,
+            writer_managed_hba_receipt=_managed_hba(config, user=config.user),
+            admin_managed_hba_receipt=_managed_hba(
+                config,
+                user=session.username,
+            ),
+            authorization_sha256="a" * 64,
+            started_at_unix=100,
+        )
+    assert session.sql[-1] == "ROLLBACK"
+
+
 def test_upgrade_admin_authority_requires_every_fixed_database_invariant() -> None:
     session = _Session()
     session.query = lambda sql, maximum_rows: QueryResult(

@@ -574,6 +574,50 @@ def _terminal_receipt(unsigned: Mapping[str, Any]) -> Mapping[str, Any]:
     return {**unsigned, "receipt_sha256": _sha256_json(unsigned)}
 
 
+def _post_apply_contract_mismatch_code(
+    actual: Mapping[str, Any],
+    expected: Mapping[str, Any],
+) -> str:
+    """Return one bounded structural category for an exact target mismatch.
+
+    The category is safe to return across the owner wire boundary: it contains
+    no catalog value, routine name, SQL text, or canonical data.  This is an
+    exact schema comparison, not semantic routing.
+    """
+
+    if not isinstance(actual, Mapping) or not isinstance(expected, Mapping):
+        return "schema_upgrade_post_apply_contract_invalid"
+    if actual.get("helper_catalog_identity") != expected.get(
+        "helper_catalog_identity"
+    ):
+        return "schema_upgrade_post_apply_helper_catalog_invalid"
+    actual_attestation = actual.get("attestation")
+    expected_attestation = expected.get("attestation")
+    if not isinstance(actual_attestation, Mapping) or not isinstance(
+        expected_attestation, Mapping
+    ):
+        return "schema_upgrade_post_apply_contract_invalid"
+    if actual_attestation.get("routine_identities") != expected_attestation.get(
+        "routine_identities"
+    ):
+        return "schema_upgrade_post_apply_public_routines_invalid"
+    if actual_attestation.get(
+        "helper_routine_identities"
+    ) != expected_attestation.get("helper_routine_identities"):
+        return "schema_upgrade_post_apply_helper_routines_invalid"
+    if any(
+        actual_attestation.get(name) != expected_attestation.get(name)
+        for name in (
+            "canonical_event_log_identity",
+            "canonical_private_schema_identity",
+        )
+    ):
+        return "schema_upgrade_post_apply_object_identity_invalid"
+    if actual_attestation != expected_attestation:
+        return "schema_upgrade_post_apply_privilege_contract_invalid"
+    return "schema_upgrade_post_apply_contract_invalid"
+
+
 def _apply_transactional_migration_chunks(
     session: SchemaUpgradeSession,
     artifact: SealedSQLArtifact,
@@ -703,14 +747,19 @@ def execute_atomic_schema_upgrade(
             session.query(OBSERVER_CALL_SQL, maximum_rows=1)
         )
         initial_truth = initial_observation.truth
-        initial_contract = collect_schema_contract(
-            session,
-            config=writer_config,
-            policy=_target_policy(target.attestation),
-            managed_hba_receipt=writer_managed_hba_receipt,
-            subject_user=writer_config.user,
-            allow_missing_helper=True,
-        )
+        try:
+            initial_contract = collect_schema_contract(
+                session,
+                config=writer_config,
+                policy=_target_policy(target.attestation),
+                managed_hba_receipt=writer_managed_hba_receipt,
+                subject_user=writer_config.user,
+                allow_missing_helper=True,
+            )
+        except Exception as exc:
+            raise SchemaReconciliationError(
+                "schema_upgrade_initial_contract_collection_failed"
+            ) from exc
         if initial_contract.sha256 != plan.value["source_contract_sha256"]:
             if initial_contract.sha256 == target.sha256:
                 _require_command(session, "ROLLBACK", "ROLLBACK")
@@ -750,21 +799,34 @@ def execute_atomic_schema_upgrade(
                 "schema_upgrade_unreviewed_database_drift"
             )
         _apply_transactional_migration_chunks(session, artifact)
-        final_contract = collect_schema_contract(
-            session,
-            config=writer_config,
-            policy=_target_policy(target.attestation),
-            managed_hba_receipt=writer_managed_hba_receipt,
-            subject_user=writer_config.user,
-            allow_missing_helper=False,
-        )
-        final_observation = parse_control_observation(
-            session.query(OBSERVER_CALL_SQL, maximum_rows=1)
-        )
+        try:
+            final_contract = collect_schema_contract(
+                session,
+                config=writer_config,
+                policy=_target_policy(target.attestation),
+                managed_hba_receipt=writer_managed_hba_receipt,
+                subject_user=writer_config.user,
+                allow_missing_helper=False,
+            )
+        except Exception as exc:
+            raise SchemaReconciliationError(
+                "schema_upgrade_post_apply_contract_collection_failed"
+            ) from exc
+        try:
+            final_observation = parse_control_observation(
+                session.query(OBSERVER_CALL_SQL, maximum_rows=1)
+            )
+        except Exception as exc:
+            raise SchemaReconciliationError(
+                "schema_upgrade_post_apply_truth_collection_failed"
+            ) from exc
         final_truth = final_observation.truth
         if final_contract.sha256 != target.sha256:
             raise SchemaReconciliationError(
-                "schema_upgrade_post_apply_contract_invalid"
+                _post_apply_contract_mismatch_code(
+                    final_contract.value,
+                    target.value,
+                )
             )
         if final_truth != initial_truth:
             raise SchemaReconciliationError("schema_upgrade_canonical_truth_changed")

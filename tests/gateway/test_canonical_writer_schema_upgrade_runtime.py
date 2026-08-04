@@ -10,6 +10,7 @@ from gateway import canonical_writer_schema_reconciliation_runtime as reconcilia
 from gateway import canonical_writer_schema_upgrade_runtime as runtime
 from gateway.canonical_writer_foundation import _load_source_artifacts_for_tests
 from gateway.canonical_writer_schema_reconciliation import SchemaContractAsset
+from gateway.canonical_writer_schema_reconciliation import SchemaReconciliationError
 from gateway.canonical_writer_schema_upgrade import SchemaUpgradePlan
 
 
@@ -30,6 +31,24 @@ def _plan() -> SchemaUpgradePlan:
         release_revision=REVISION,
         target=target,
         artifact=_load_source_artifacts_for_tests()["base_migration"],
+    )
+
+
+def test_apply_error_code_preserves_only_stable_upgrade_invariants() -> None:
+    exact = SchemaReconciliationError(
+        "schema_upgrade_post_apply_public_routines_invalid"
+    )
+    unrelated = SchemaReconciliationError(
+        "schema_reconciliation_contract_invalid"
+    )
+    assert runtime._schema_upgrade_apply_error_code(exact) == exact.code
+    assert (
+        runtime._schema_upgrade_apply_error_code(unrelated)
+        == "schema_upgrade_apply_failed"
+    )
+    assert (
+        runtime._schema_upgrade_apply_error_code(RuntimeError("secret text"))
+        == "schema_upgrade_apply_failed"
     )
 
 
