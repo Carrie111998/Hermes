@@ -355,6 +355,36 @@ def test_merge_pending_matches_same_raw_sender_when_alt_is_asymmetric():
     assert pending["shared"].media_urls == ["/tmp/a-1.jpg", "/tmp/a-2.jpg"]
 
 
+@pytest.mark.parametrize(
+    ("existing_token", "incoming_token"),
+    [("same-token", "same-token"), ("alice-alt", "bob-raw")],
+)
+def test_merge_pending_rejects_identity_bearing_disjoint_id_namespaces(
+    existing_token, incoming_token
+):
+    """Alt-only and raw-only identities cannot prove they name one sender."""
+    pending = {
+        "shared": _text_event(
+            "alice secret",
+            _group_source(user_id_alt=existing_token, user_name="Alice"),
+            message_id="a1",
+        )
+    }
+    bob = _text_event(
+        "bob words",
+        _group_source(user_id=incoming_token, user_name="Bob"),
+        message_id="b1",
+    )
+
+    absorbed = merge_pending_message_event(
+        pending, "shared", bob, merge_text=True
+    )
+
+    assert absorbed is False
+    assert pending["shared"].text == "alice secret"
+    assert pending["shared"].source.user_name == "Alice"
+
+
 def test_merge_pending_returns_false_only_on_sender_conflict():
     """The return value is the caller's ownership signal: True = absorbed."""
     same_sender_pending = {"k": _text_event("head", _alice_source(), message_id="a1")}
@@ -737,6 +767,37 @@ def test_cross_sender_refusal_at_busy_cap_remains_reachable():
     runner._queue_or_replace_pending_event(session_key, bob)
 
     assert any(turn is bob for turn in _queued_turns(runner, adapter, session_key))
+
+
+@pytest.mark.parametrize(
+    ("existing_token", "incoming_token"),
+    [("same-token", "same-token"), ("alice-alt", "bob-raw")],
+)
+def test_busy_queue_fifos_identity_bearing_disjoint_id_namespaces(
+    existing_token, incoming_token
+):
+    """Production queueing keeps alt-only and raw-only turns separately attributed."""
+    runner, adapter = _runner_with_adapter()
+    session_key = "telegram:group:disjoint-id-namespaces"
+    alice = _text_event(
+        "alice secret",
+        _group_source(user_id_alt=existing_token, user_name="Alice"),
+        message_id="a1",
+    )
+    bob = _text_event(
+        "bob words",
+        _group_source(user_id=incoming_token, user_name="Bob"),
+        message_id="b1",
+    )
+    adapter._pending_messages[session_key] = alice
+
+    runner._queue_or_replace_pending_event(
+        session_key, bob, adapter, merge_text=True
+    )
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert [turn.text for turn in turns] == ["alice secret", "bob words"]
+    assert [turn.source.user_name for turn in turns] == ["Alice", "Bob"]
 
 
 @pytest.mark.asyncio

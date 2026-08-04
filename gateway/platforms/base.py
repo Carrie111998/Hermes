@@ -2467,6 +2467,14 @@ def _sender_ids_match(
     return any(comparisons)
 
 
+def _source_has_sender_id(source: Any) -> bool:
+    """Return whether a source carries identity in either sender-ID namespace."""
+    return bool(
+        getattr(source, "user_id_alt", None)
+        or getattr(source, "user_id", None)
+    )
+
+
 def pending_merge_sender_conflict(
     existing: Optional[MessageEvent],
     event: Optional[MessageEvent],
@@ -2481,9 +2489,10 @@ def pending_merge_sender_conflict(
 
     The guard is deliberately conservative: directly comparable alternate and
     raw IDs are checked independently, and a match on either proves the same
-    sender. A conflict is reported only when at least one comparable pair
-    exists and all comparable pairs differ. Missing identity means "unknown",
-    so the merge proceeds exactly as it did before.
+    sender. Identity-bearing sources with no comparable namespace fail closed;
+    equal text in different ID fields is not proof of identity. When either
+    whole source has no identity, the compatibility fallback remains "unknown"
+    and the merge proceeds exactly as it did before.
 
     In per-user/DM sessions the guard is unreachable by construction:
     ``build_session_key`` appends ``user_id_alt or user_id`` when ``isolate_user``
@@ -2494,7 +2503,12 @@ def pending_merge_sender_conflict(
     if existing_source is None or incoming_source is None:
         return False
 
-    return _sender_ids_match(existing_source, incoming_source) is False
+    sender_match = _sender_ids_match(existing_source, incoming_source)
+    if sender_match is not None:
+        return not sender_match
+    return _source_has_sender_id(existing_source) and _source_has_sender_id(
+        incoming_source
+    )
 
 
 def merge_pending_message_event(
@@ -5295,14 +5309,8 @@ class BasePlatformAdapter(ABC):
         dm_types = {"dm", "private"}
         existing_chat_id = getattr(existing_source, "chat_id", None)
         incoming_chat_id = getattr(incoming_source, "chat_id", None)
-        existing_has_id = bool(
-            getattr(existing_source, "user_id_alt", None)
-            or getattr(existing_source, "user_id", None)
-        )
-        incoming_has_id = bool(
-            getattr(incoming_source, "user_id_alt", None)
-            or getattr(incoming_source, "user_id", None)
-        )
+        existing_has_id = _source_has_sender_id(existing_source)
+        incoming_has_id = _source_has_sender_id(incoming_source)
         return (
             not existing_has_id
             and not incoming_has_id
