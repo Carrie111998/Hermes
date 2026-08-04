@@ -66,7 +66,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Literal, Optional, Sequence
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -132,11 +132,14 @@ from gateway.platforms.base import (
     cache_image_from_bytes,
 )
 from gateway.status import acquire_scoped_lock, release_scoped_lock
-from hermes_constants import get_hermes_home
+from hermes_constants import get_default_hermes_root, get_hermes_home
 from utils import atomic_json_write, env_float, env_int
 
 from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
 from agent.secret_scope import get_secret as _scoped_get_secret
+
+if TYPE_CHECKING:  # pragma: no cover - annotation resolution only
+    from plugins.platforms.feishu.dedup_store import SharedMessageDedupStore
 
 
 def _get_scoped_secret(name, default=None):
@@ -1506,6 +1509,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
+        # Cross-profile dedup (issue #78514). Opened lazily on the first
+        # inbound message: the app_id that keys it is only meaningful once
+        # settings are applied, and an adapter that never receives anything
+        # (tests, a profile whose bot is idle) should not create the file.
+        self._shared_dedup: Optional["SharedMessageDedupStore"] = None
+        self._shared_dedup_ready = False
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
         self._webhook_rate_counts: Dict[str, tuple[int, float]] = {}  # rate_key → (count, window_start)
         self._webhook_anomaly_counts: Dict[str, tuple[int, str, float]] = {}  # ip → (count, last_status, first_seen)
@@ -1540,6 +1549,12 @@ class FeishuAdapter(BasePlatformAdapter):
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
         self._load_seen_message_ids()
+        # What this profile had persisted BEFORE the upgrade, handed to the
+        # shared store the first time it opens. Snapshotted here rather than
+        # read live: by the time the store opens lazily, the live cache has
+        # already recorded the message currently being checked, and importing
+        # that would make the very first sighting look like a duplicate.
+        self._legacy_dedup_seed: Dict[str, float] = dict(self._seen_message_ids)
 
     @staticmethod
     def _load_settings(extra: Dict[str, Any]) -> FeishuAdapterSettings:
@@ -4597,7 +4612,60 @@ class FeishuAdapter(BasePlatformAdapter):
         except OSError:
             logger.warning("[Feishu] Failed to persist dedup state to %s", self._dedup_state_path, exc_info=True)
 
+    def _shared_dedup_store(self) -> Optional["SharedMessageDedupStore"]:
+        """The cross-profile dedup store for this bot, or None if unavailable.
+
+        Opened once per adapter and memoized (including the failure case, so a
+        read-only or corrupt store is not retried on every inbound message).
+        Keyed by app_id: sibling profiles running the SAME bot share records,
+        while two genuinely different bots never shadow each other's ids.
+        """
+        if getattr(self, "_shared_dedup_ready", False):
+            return getattr(self, "_shared_dedup", None)
+        self._shared_dedup_ready = True
+        self._shared_dedup = None
+        try:
+            from plugins.platforms.feishu.dedup_store import SharedMessageDedupStore
+
+            store = SharedMessageDedupStore(
+                # The Hermes ROOT, not get_hermes_home() — that resolves to
+                # <root>/profiles/<name> under multiplexing, which is exactly
+                # the per-profile split this store exists to close (#78514).
+                get_default_hermes_root() / "feishu_seen_messages.db",
+                namespace=f"feishu:{self._app_id or 'unknown'}",
+                ttl_seconds=_FEISHU_DEDUP_TTL_SECONDS,
+                max_entries=self._dedup_cache_size,
+            )
+            # Carry the per-profile window over so an upgrade mid-window does
+            # not reopen the replay hole the old cache was still covering.
+            store.import_legacy(getattr(self, "_legacy_dedup_seed", None) or {})
+            self._shared_dedup = store
+        except Exception:
+            logger.warning(
+                "[Feishu] Could not open the shared dedup store; falling back "
+                "to per-adapter deduplication.",
+                exc_info=True,
+            )
+        return self._shared_dedup
+
     def _is_duplicate(self, message_id: str) -> bool:
+        """True when this message_id has already been processed.
+
+        Two gates. The in-process cache answers the common case without
+        touching disk and remains the sole gate when the shared store is
+        unavailable. The shared store then catches what the local cache
+        structurally cannot see: a redelivery that Feishu routed to a SIBLING
+        profile's adapter, whose cache lives in a different profile home
+        (#78514).
+        """
+        if self._is_duplicate_locally(message_id):
+            return True
+        store = self._shared_dedup_store()
+        if store is None:
+            return False
+        return store.seen(message_id)
+
+    def _is_duplicate_locally(self, message_id: str) -> bool:
         now = time.time()
         ttl = _FEISHU_DEDUP_TTL_SECONDS
         with self._dedup_lock:
