@@ -25,6 +25,7 @@ DEFAULT = {
     "python": True,
     "python_prod": True,
     "frontend": True,
+    "managed_desktop": True,
     "docker_meta": True,
     "site": True,
     "scan": True,
@@ -35,13 +36,31 @@ DEFAULT = {
 }
 
 
-def _lanes(python=False, frontend=False, site=False, scan=False, deps=False, npm_lock=False, mcp_catalog=False, docker_meta=False, ci_review=False, python_prod=None) -> dict[str, bool]:
+def _lanes(
+    python=False,
+    frontend=False,
+    site=False,
+    scan=False,
+    deps=False,
+    npm_lock=False,
+    mcp_catalog=False,
+    docker_meta=False,
+    ci_review=False,
+    python_prod=None,
+    managed_desktop=None,
+) -> dict[str, bool]:
     # python_prod tracks python except for tests-only diffs; default it to
     # python so the majority of cases don't need to spell it out.
+    resolved_python_prod = python if python_prod is None else python_prod
     return {
         "python": python,
-        "python_prod": python if python_prod is None else python_prod,
+        "python_prod": resolved_python_prod,
         "frontend": frontend,
+        "managed_desktop": (
+            (resolved_python_prod or frontend)
+            if managed_desktop is None
+            else managed_desktop
+        ),
         "docker_meta": docker_meta,
         "site": site,
         "scan": scan,
@@ -151,6 +170,21 @@ CASES = {
 @pytest.mark.parametrize("files,expected", CASES.values(), ids=CASES.keys())
 def test_classify(files, expected):
     assert classify(files) == expected
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "apps/desktop/electron/main.ts",
+        "apps/shared/src/websocket-url.ts",
+        "hermes_cli/web_server.py",
+        "tui_gateway/server.py",
+        "scripts/ci/classify_changes.py",
+        ".github/workflows/e2e-desktop-managed.yml",
+    ],
+)
+def test_managed_desktop_classifier_cannot_omit_supported_product_or_ci_paths(path):
+    assert classify([path])["managed_desktop"] is True
 
 
 def test_ci_review_files_returns_only_sensitive_paths_sorted_and_unique():

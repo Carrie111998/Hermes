@@ -15,8 +15,13 @@ jobs:
     name: Managed Playwright E2E (Linux)
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    env:
+      MANAGED_EXPECTED_HEAD: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
 
       - name: Install system dependencies for Electron
         run: |
@@ -39,6 +44,21 @@ jobs:
           # Electron's postinstall supplies the binary launched by Playwright.
           command: npm ci
 
+      - name: Run managed behavioral scenarios
+        working-directory: apps/desktop
+        env:
+          OPENROUTER_API_KEY: ''
+          OPENAI_API_KEY: ''
+          NOUS_API_KEY: ''
+        run: |
+          mkdir -p playwright-report
+          node --test \
+            --test-reporter=spec \
+            --test-reporter-destination=stdout \
+            --test-reporter=junit \
+            --test-reporter-destination=playwright-report/managed-scenarios.xml \
+            electron/eva-managed-scenarios.test.cjs
+
       - name: Build and run managed Playwright specs
         working-directory: apps/desktop
         env:
@@ -49,24 +69,11 @@ jobs:
         run: |
           npm run build
           xvfb-run -a --server-args="-screen 0 1280x1024x24" \
-            npx playwright test e2e/managed-boot.spec.ts --trace=off
+            npx playwright test e2e/managed-boot.spec.ts --trace=off --fail-on-flaky-tests
 
-      - name: Require every managed scenario to execute
+      - name: Verify exact head and fail-closed managed reports
         working-directory: apps/desktop
-        run: |
-          node -e '
-          const fs = require("node:fs");
-          const report = JSON.parse(fs.readFileSync("playwright-report/results.json", "utf8"));
-          const stats = report.stats || {};
-          const expected = Number(stats.expected || 0);
-          const skipped = Number(stats.skipped || 0);
-          const unexpected = Number(stats.unexpected || 0);
-          if (expected === 0 || skipped !== 0 || unexpected !== 0) {
-            console.error("::error::Managed E2E must execute every scenario (passed=" + expected + ", skipped=" + skipped + ", failed=" + unexpected + ").");
-            process.exit(1);
-          }
-          console.log("Managed E2E executed " + expected + " scenarios with no skips.");
-          '
+        run: node e2e/verify-managed-reports.mjs
 
       - name: Upload managed Playwright report
         if: always()
