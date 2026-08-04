@@ -74,6 +74,7 @@ import {
   resolveProfileBackendRoute,
   resolveTestWsUrl,
   savedProfileSsh,
+  sshReconnectScope,
   tokenPreview
 } from './connection-config'
 import { describeCrashReason, installCrashForensics } from './crash-forensics'
@@ -7295,8 +7296,7 @@ async function sshProbeReuseProof(baseUrl, token, spawnNonce) {
   }
 }
 
-async function teardownSshConnection(profile) {
-  const scope = sshScopeKey(profile)
+async function teardownSshConnectionScope(scope) {
   const state = sshConnections.get(scope)
 
   if (!state) {
@@ -7324,6 +7324,10 @@ async function teardownSshConnection(profile) {
   } catch {
     // best effort
   }
+}
+
+async function teardownSshConnection(profile) {
+  return teardownSshConnectionScope(sshScopeKey(profile))
 }
 
 // CRITICAL: this must mirror resolveRemoteBackend's precedence, not just return
@@ -7510,7 +7514,7 @@ async function bootstrapSshConnectionInner(profile, sshConfig, reuseToken, sourc
     result.ownershipId
   )
 
-  return { ...connection, remoteHermesVersion: result.hermesVersion || '' }
+  return { ...connection, remoteHermesVersion: result.hermesVersion || '', sshScope: scope }
 }
 
 function persistSshConnectionToken(profile, source, token) {
@@ -8418,6 +8422,7 @@ async function startHermes() {
         remoteHost: remote.remoteHost,
         remoteKind: remote.remoteKind,
         remoteHermesVersion: remote.remoteHermesVersion,
+        sshScope: remote.sshScope,
         token: remote.token,
         wsUrl: remote.wsUrl,
         logs: hermesLog.slice(-80),
@@ -9504,11 +9509,10 @@ ipcMain.handle('hermes:connection:revalidate', async () => {
     // fresh bootstrap can't reattach to a dying transport.
     if (result.rebuilt) {
       const conn = await connectionPromise.catch(() => null)
+      const scope = sshReconnectScope(conn)
 
-      if (conn?.remoteKind === 'ssh') {
-        const profile = primaryProfileKey()
-        await sshBootstrapCoordinator.cancelAndWait(sshScopeKey(profile))
-        await teardownSshConnection(profile)
+      if (scope !== null) {
+        await sshBootstrapCoordinator.cancelAndWait(scope, () => teardownSshConnectionScope(scope))
       }
     }
 
