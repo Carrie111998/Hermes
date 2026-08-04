@@ -33,7 +33,7 @@ class _FakeOpenAI:
         pass
 
 
-def _make_agent(monkeypatch, base_url, api_mode="chat_completions"):
+def _make_agent(monkeypatch, base_url, api_mode="chat_completions", provider=None):
     """Create an AIAgent pointing at the given base_url."""
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: _tool_defs("web_search"))
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
@@ -41,7 +41,7 @@ def _make_agent(monkeypatch, base_url, api_mode="chat_completions"):
     return AIAgent(
         api_key="test-key",
         base_url=base_url,
-        provider="copilot" if "githubcopilot" in base_url else "openrouter",
+        provider=provider or ("copilot" if "githubcopilot" in base_url else "openrouter"),
         api_mode=api_mode,
         max_iterations=4,
         quiet_mode=True,
@@ -79,6 +79,13 @@ class TestIsCopilotUrl:
     def test_case_insensitive(self, monkeypatch):
         agent = _make_agent(monkeypatch, "https://API.GITHUBCOPILOT.COM")
         assert agent._is_copilot_url() is True
+
+    def test_configured_enterprise_endpoint(self, monkeypatch):
+        base_url = "https://copilot-api.ghe.example.com"
+        monkeypatch.setenv("COPILOT_API_BASE_URL", base_url)
+        agent = _make_agent(monkeypatch, base_url, provider="copilot")
+        assert agent._is_copilot_url() is True
+        assert agent._is_github_copilot_url() is True
 
 
 class TestUserInitiatedTurnFlag:

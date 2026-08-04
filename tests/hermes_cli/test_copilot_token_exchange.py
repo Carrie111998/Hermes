@@ -51,6 +51,20 @@ class TestExchangeCopilotToken:
         assert req.get_header("Authorization") == "token gho_test123"
         assert "GitHubCopilotChat" in req.get_header("User-agent")
 
+    @patch("urllib.request.urlopen")
+    def test_uses_enterprise_host_for_token_exchange(self, mock_urlopen, monkeypatch):
+        from hermes_cli.copilot_auth import exchange_copilot_token
+
+        monkeypatch.setenv("COPILOT_GH_HOST", "https://ghe.example.com/")
+        mock_urlopen.return_value = self._mock_urlopen()
+
+        exchange_copilot_token("ghu_enterprise")
+
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url == (
+            "https://ghe.example.com/api/v3/copilot_internal/v2/token"
+        )
+
 
 
     @patch("urllib.request.urlopen")
@@ -79,6 +93,18 @@ class TestGetCopilotApiToken:
         api_token, base_url = get_copilot_api_token("gho_raw")
         assert api_token == "exchanged_jwt"
         assert base_url is None
+
+
+class TestEnterpriseDeviceLogin:
+    @patch("urllib.request.urlopen", side_effect=OSError("stop after first request"))
+    def test_uses_configured_github_host(self, mock_urlopen, monkeypatch):
+        from hermes_cli.copilot_auth import copilot_device_code_login
+
+        monkeypatch.setenv("COPILOT_GH_HOST", "https://ghe.example.com/")
+
+        assert copilot_device_code_login() is None
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url == "https://ghe.example.com/login/device/code"
 
 
 class TestTokenFingerprint:

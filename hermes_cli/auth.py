@@ -7137,7 +7137,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
             if raw_token:
                 _, resolved = get_copilot_api_token(raw_token)
                 resolved = (resolved or "").strip()
-                if resolved:
+                if resolved and not env_url:
                     base_url = resolved
         except Exception as exc:
             logger.debug("Copilot base URL resolution fell back to default: %s", exc)

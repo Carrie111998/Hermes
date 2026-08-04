@@ -1352,15 +1352,13 @@ class AIAgent:
 
     def _is_github_copilot_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets GitHub Copilot's OpenAI-compatible API."""
-        if base_url is not None:
-            hostname = base_url_hostname(base_url)
-        else:
-            hostname = getattr(self, "_base_url_hostname", "") or base_url_hostname(
-                getattr(self, "_base_url_lower", "")
-            )
-        if not hostname:
-            return False
-        return hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com")
+        from hermes_cli.copilot_auth import is_copilot_api_url
+
+        url = base_url if base_url is not None else getattr(self, "_base_url_lower", "")
+        return is_copilot_api_url(
+            url,
+            provider=getattr(self, "provider", "") or "",
+        )
 
     def _resolved_api_call_timeout(self) -> float:
         """Resolve the effective per-call request timeout in seconds.
@@ -1502,9 +1500,8 @@ class AIAgent:
 
     def _is_copilot_url(self) -> bool:
         """Return True when the base URL targets GitHub Copilot or GitHub Models."""
-        return (
-            "api.githubcopilot.com" in self._base_url_lower
-            or "models.github.ai" in self._base_url_lower
+        return self._is_github_copilot_url() or base_url_host_matches(
+            self._base_url_lower, "models.github.ai"
         )
 
     def _is_copilot_provider(self) -> bool:
@@ -4987,7 +4984,7 @@ class AIAgent:
         # unaffected (they don't go through here).
         request_kwargs["max_retries"] = 0
         if (
-            base_url_host_matches(str(request_kwargs.get("base_url", "")), "githubcopilot.com")
+            self._is_github_copilot_url(str(request_kwargs.get("base_url", "")))
             and self._api_kwargs_have_image_parts(api_kwargs or {})
         ):
             request_kwargs["default_headers"] = self._copilot_headers_for_request(is_vision=True)
@@ -5473,7 +5470,9 @@ class AIAgent:
             api_token, enterprise_base_url = get_copilot_api_token(new_token)
             if isinstance(api_token, str) and api_token.strip():
                 new_token = api_token.strip()
-                if enterprise_base_url:
+                if enterprise_base_url and not os.getenv(
+                    "COPILOT_API_BASE_URL", ""
+                ).strip():
                     self.base_url = enterprise_base_url.rstrip("/")
         except Exception as exc:
             logger.debug("Copilot 401 re-exchange failed, using resolved token: %s", exc)
@@ -5543,7 +5542,9 @@ class AIAgent:
             return False
 
         self.api_key = api_token.strip()
-        if enterprise_base_url:
+        if enterprise_base_url and not os.getenv(
+            "COPILOT_API_BASE_URL", ""
+        ).strip():
             self.base_url = enterprise_base_url.rstrip("/")
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
@@ -5626,7 +5627,7 @@ class AIAgent:
             self._client_kwargs["default_headers"] = build_nvidia_nim_headers(base_url)
         elif base_url_host_matches(base_url, "api.routermint.com"):
             self._client_kwargs["default_headers"] = _routermint_headers()
-        elif base_url_host_matches(base_url, "githubcopilot.com"):
+        elif self._is_github_copilot_url(base_url):
             from hermes_cli.models import copilot_default_headers
 
             self._client_kwargs["default_headers"] = copilot_default_headers()
@@ -6826,7 +6827,7 @@ class AIAgent:
             return True
         if (
             base_url_host_matches(self._base_url_lower, "models.github.ai")
-            or base_url_host_matches(self._base_url_lower, "githubcopilot.com")
+            or self._is_github_copilot_url()
         ):
             try:
                 from hermes_cli.models import github_model_reasoning_efforts

@@ -150,7 +150,7 @@ def _try_gh_cli_token() -> Optional[str]:
     subprocess environment so ``gh`` reads from its own credential store
     (hosts.yml) instead of just echoing the env var back.
     """
-    hostname = os.getenv("COPILOT_GH_HOST", "").strip()
+    hostname = _normalize_copilot_host(os.getenv("COPILOT_GH_HOST", ""))
 
     # Build a clean env so gh doesn't short-circuit on GITHUB_TOKEN / GH_TOKEN
     clean_env = {k: v for k, v in os.environ.items()
@@ -180,9 +180,40 @@ def _try_gh_cli_token() -> Optional[str]:
 
 # ─── OAuth Device Code Flow ────────────────────────────────────────────────
 
+def _normalize_copilot_host(value: str) -> str:
+    """Return a bare host[:port] from a hostname or URL."""
+    from urllib.parse import urlsplit
+
+    candidate = str(value or "").strip().rstrip("/")
+    if not candidate:
+        return ""
+    parsed = urlsplit(candidate if "://" in candidate else f"//{candidate}")
+    return parsed.netloc or parsed.path.split("/", 1)[0]
+
+
+def resolve_copilot_github_host() -> str:
+    """Resolve the GitHub host used for OAuth, CLI auth, and token exchange."""
+    return _normalize_copilot_host(os.getenv("COPILOT_GH_HOST", "")) or "github.com"
+
+
+def is_copilot_api_url(base_url: str, *, provider: str = "") -> bool:
+    """Return whether a URL is a public or configured Copilot inference API."""
+    from utils import base_url_hostname
+
+    if provider.strip().lower() in {"copilot", "github-copilot", "github"}:
+        return True
+    hostname = base_url_hostname(base_url)
+    if not hostname:
+        return False
+    if hostname == "api.githubcopilot.com" or hostname.endswith(".githubcopilot.com"):
+        return True
+    configured = os.getenv("COPILOT_API_BASE_URL", "").strip()
+    return bool(configured and hostname == base_url_hostname(configured))
+
+
 def copilot_device_code_login(
     *,
-    host: str = "github.com",
+    host: Optional[str] = None,
     timeout_seconds: float = 300,
 ) -> Optional[str]:
     """Run the GitHub OAuth device code flow for Copilot.
@@ -195,7 +226,7 @@ def copilot_device_code_login(
     import urllib.request
     import urllib.parse
 
-    domain = host.rstrip("/")
+    domain = _normalize_copilot_host(host or resolve_copilot_github_host())
     device_code_url = f"https://{domain}/login/device/code"
     access_token_url = f"https://{domain}/login/oauth/access_token"
 
@@ -314,6 +345,15 @@ _JWT_REFRESH_MARGIN_SECONDS = 120  # refresh 2 min before expiry
 _TOKEN_EXCHANGE_URL = "https://api.github.com/copilot_internal/v2/token"
 _EDITOR_VERSION = "vscode/1.104.1"
 _EXCHANGE_USER_AGENT = "GitHubCopilotChat/0.26.7"
+
+
+def resolve_copilot_token_exchange_url() -> str:
+    """Return the public or GHE token-exchange endpoint."""
+    host = resolve_copilot_github_host()
+    if host not in {"github.com", "api.github.com"}:
+        return f"https://{host}/api/v3/copilot_internal/v2/token"
+    return _TOKEN_EXCHANGE_URL
+
 
 # Transient-failure hardening for the token exchange. Gateway startup often
 # races network readiness (launchd relaunch, DHCP/VPN settling); a single-shot
@@ -528,7 +568,7 @@ def exchange_copilot_token(raw_token: str, *, timeout: float = 10.0) -> tuple[st
         )
 
     req = urllib.request.Request(
-        _TOKEN_EXCHANGE_URL,
+        resolve_copilot_token_exchange_url(),
         method="GET",
         headers={
             "Authorization": f"token {raw_token}",

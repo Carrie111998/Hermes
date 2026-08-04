@@ -31,7 +31,6 @@ logger = logging.getLogger(__name__)
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
-COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
 COPILOT_EDITOR_VERSION = "vscode/1.104.1"
 COPILOT_REASONING_EFFORTS_GPT5 = ["minimal", "low", "medium", "high"]
 COPILOT_REASONING_EFFORTS_O_SERIES = ["low", "medium", "high"]
@@ -3476,9 +3475,27 @@ def _copilot_catalog_item_is_text_model(item: dict[str, Any]) -> bool:
 # clock so wall-clock adjustments can't extend the TTL. Lock-free like the
 # other module caches here — a racing thread at worst duplicates one fetch.
 _github_model_catalog_cache: Optional[list[dict[str, Any]]] = None
-_github_model_catalog_cache_key: Optional[str] = None
+_github_model_catalog_cache_key: Optional[tuple[Optional[str], str]] = None
 _github_model_catalog_cache_time: float = 0.0
 _GITHUB_MODEL_CATALOG_CACHE_TTL = 300  # 5 minutes
+
+
+def _resolve_copilot_catalog_base_url() -> str:
+    configured = os.getenv("COPILOT_API_BASE_URL", "").strip().rstrip("/")
+    if configured:
+        return configured
+
+    try:
+        from hermes_cli.auth import resolve_api_key_provider_credentials
+
+        credentials = resolve_api_key_provider_credentials("copilot")
+        resolved = str(credentials.get("base_url", "")).strip().rstrip("/")
+        if resolved:
+            return resolved
+    except Exception as exc:
+        logger.debug("Copilot catalog endpoint resolution fell back to default: %s", exc)
+
+    return COPILOT_BASE_URL
 
 
 def fetch_github_model_catalog(
@@ -3488,9 +3505,13 @@ def fetch_github_model_catalog(
     global _github_model_catalog_cache, _github_model_catalog_cache_key
     global _github_model_catalog_cache_time
 
+    base_url = _resolve_copilot_catalog_base_url()
+    models_url = f"{base_url}/models"
+    cache_key = (api_key, models_url)
+
     if (
         _github_model_catalog_cache is not None
-        and _github_model_catalog_cache_key == api_key
+        and _github_model_catalog_cache_key == cache_key
         and (time.monotonic() - _github_model_catalog_cache_time) < _GITHUB_MODEL_CATALOG_CACHE_TTL
     ):
         # Deep copy: catalog items are dicts, and a shallow copy would let
@@ -3506,7 +3527,7 @@ def fetch_github_model_catalog(
     attempts.append(copilot_default_headers())
 
     for headers in attempts:
-        req = urllib.request.Request(COPILOT_MODELS_URL, headers=headers)
+        req = urllib.request.Request(models_url, headers=headers)
         try:
             with _urlopen_model_catalog_request(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode())
@@ -3523,7 +3544,7 @@ def fetch_github_model_catalog(
                     models.append(item)
                 if models:
                     _github_model_catalog_cache = copy.deepcopy(models)
-                    _github_model_catalog_cache_key = api_key
+                    _github_model_catalog_cache_key = cache_key
                     _github_model_catalog_cache_time = time.monotonic()
                     return models
         except Exception:

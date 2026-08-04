@@ -177,6 +177,20 @@ The Copilot API does **not** support classic Personal Access Tokens (`ghp_*`). S
 If your `gh auth token` returns a `ghp_*` token, use `hermes model` to authenticate via OAuth instead.
 :::
 
+#### GitHub Enterprise Server
+
+For a GitHub Enterprise Server instance, configure its GitHub host and
+Copilot inference endpoint:
+
+```bash
+COPILOT_GH_HOST=ghe.example.com
+COPILOT_API_BASE_URL=https://copilot-api.ghe.example.com
+```
+
+`COPILOT_GH_HOST` controls OAuth, `gh auth token --hostname`, and Copilot
+token exchange. `COPILOT_API_BASE_URL` controls inference and model-catalog
+routing. Public GitHub remains the default when these variables are unset.
+
 :::info Copilot auth behavior in Hermes
 Hermes sends a supported GitHub token (`gho_*`, `github_pat_*`, or `ghu_*`) directly to `api.githubcopilot.com` and includes Copilot-specific headers (`Editor-Version`, `Copilot-Integration-Id`, `Openai-Intent`, `x-initiator`).
 
@@ -208,6 +222,8 @@ model:
 | Environment variable | Description |
 |---------------------|-------------|
 | `COPILOT_GITHUB_TOKEN` | GitHub token for Copilot API (first priority) |
+| `COPILOT_GH_HOST` | GitHub host for Enterprise OAuth, CLI auth, and token exchange |
+| `COPILOT_API_BASE_URL` | Copilot inference and model-catalog base URL |
 | `HERMES_COPILOT_ACP_COMMAND` | Override the Copilot CLI binary path (default: `copilot`) |
 | `HERMES_COPILOT_ACP_ARGS` | Override ACP args (default: `--acp --stdio`) |
 

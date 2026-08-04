@@ -28,6 +28,7 @@ from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 from hermes_cli.timeouts import get_provider_request_timeout, get_provider_stale_timeout
+from hermes_cli.copilot_auth import is_copilot_api_url
 from hermes_constants import PARTIAL_STREAM_STUB_ID, FINISH_REASON_LENGTH
 from agent.error_classifier import FailoverReason
 from agent.errors import EmptyStreamError
@@ -1172,7 +1173,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         _ct = agent._get_transport()
         is_github_responses = (
             base_url_host_matches(agent.base_url, "models.github.ai")
-            or base_url_host_matches(agent.base_url, "githubcopilot.com")
+            or is_copilot_api_url(agent.base_url, provider=agent.provider)
         )
         is_codex_backend = (
             agent.provider == "openai-codex"
@@ -1243,7 +1244,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
     _is_or = agent._is_openrouter_url()
     _is_gh = (
         base_url_host_matches(agent._base_url_lower, "models.github.ai")
-        or base_url_host_matches(agent._base_url_lower, "githubcopilot.com")
+        or is_copilot_api_url(agent._base_url_lower, provider=agent.provider)
     )
     _is_nous = "nousresearch" in agent._base_url_lower
     _is_nvidia = "integrate.api.nvidia.com" in agent._base_url_lower

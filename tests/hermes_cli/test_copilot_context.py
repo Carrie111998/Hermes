@@ -126,6 +126,72 @@ class TestGetCopilotModelContext:
         assert mock_urlopen.call_count == 1
 
     @patch("hermes_cli.models._urlopen_model_catalog_request")
+    def test_fetch_github_model_catalog_uses_enterprise_base_url(
+        self, mock_urlopen, monkeypatch
+    ):
+        import json as _json
+        import hermes_cli.models as mod
+
+        monkeypatch.setenv(
+            "COPILOT_API_BASE_URL",
+            "https://copilot-api.ghe.example.com/",
+        )
+        mod._github_model_catalog_cache = None
+        mod._github_model_catalog_cache_key = None
+        mock_urlopen.return_value.__enter__.return_value.read.return_value = (
+            _json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "model_picker_enabled": True,
+                            "supported_endpoints": ["/responses"],
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
+        assert mod.fetch_github_model_catalog(api_key="token")
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url == "https://copilot-api.ghe.example.com/models"
+
+    @patch("hermes_cli.models._urlopen_model_catalog_request")
+    def test_fetch_github_model_catalog_uses_exchange_base_url(
+        self, mock_urlopen, monkeypatch
+    ):
+        import json as _json
+        import hermes_cli.models as mod
+
+        monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
+        monkeypatch.setattr(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            lambda _provider: {
+                "api_key": "token",
+                "base_url": "https://copilot-api.ghe.example.com",
+            },
+        )
+        mod._github_model_catalog_cache = None
+        mod._github_model_catalog_cache_key = None
+        mock_urlopen.return_value.__enter__.return_value.read.return_value = (
+            _json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": "gpt-5.4",
+                            "model_picker_enabled": True,
+                            "supported_endpoints": ["/responses"],
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
+        assert mod.fetch_github_model_catalog(api_key="token")
+        req = mock_urlopen.call_args[0][0]
+        assert req.full_url == "https://copilot-api.ghe.example.com/models"
+
+    @patch("hermes_cli.models._urlopen_model_catalog_request")
     def test_fetch_github_model_catalog_cache_expires_after_ttl(self, mock_urlopen):
         import json as _json
         import time as _time
@@ -214,5 +280,3 @@ class TestModelMetadataCopilotIntegration:
 
         ctx = get_model_context_length("claude-opus-4.6-1m", provider="copilot")
         assert ctx == 1_000_000
-
-

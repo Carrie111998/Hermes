@@ -33,6 +33,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
+from hermes_cli.copilot_auth import is_copilot_api_url
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -2329,7 +2330,7 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
     # missing Copilot headers here closes the whole class. We only ADD missing
     # keys — never override headers a caller deliberately set.
     try:
-        if base_url_host_matches(str(client_kwargs.get("base_url", "")), "githubcopilot.com"):
+        if is_copilot_api_url(str(client_kwargs.get("base_url", ""))):
             from hermes_cli.models import copilot_default_headers
             existing = dict(client_kwargs.get("default_headers") or {})
             existing_lower = {k.lower() for k in existing}

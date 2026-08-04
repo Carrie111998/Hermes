@@ -421,6 +421,31 @@ class TestResolveVisionMainFirst:
         assert captured == {"is_agent_turn": True, "is_vision": False}
         assert "default_headers" not in mock_openai.call_args.kwargs
 
+    def test_copilot_exchange_endpoint_receives_copilot_headers(self, monkeypatch):
+        monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "ghu_test-token")
+
+        with patch(
+            "agent.auxiliary_client.OpenAI",
+        ) as mock_openai, patch(
+            "hermes_cli.auth.resolve_api_key_provider_credentials",
+            return_value={
+                "provider": "copilot",
+                "api_key": "copilot-api-token",
+                "base_url": "https://copilot-api.ghe.example.com",
+            },
+        ), patch(
+            "hermes_cli.copilot_auth.copilot_request_headers",
+            return_value={"Copilot-Integration-Id": "vscode-chat"},
+        ):
+            from agent.auxiliary_client import resolve_provider_client
+
+            resolve_provider_client("copilot", "gpt-5-mini")
+
+        assert mock_openai.call_args.kwargs["default_headers"] == {
+            "Copilot-Integration-Id": "vscode-chat"
+        }
+
 
 
 

@@ -2566,10 +2566,12 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                     )
                 active_sources.add(source_name)
                 pconfig = PROVIDER_REGISTRY.get(provider)
-                # Use enterprise base URL from token exchange if available,
-                # otherwise fall back to the provider's default.
-                effective_base_url = enterprise_base_url or (
-                    pconfig.inference_base_url if pconfig else ""
+                # An explicit endpoint is authoritative; otherwise use exchange
+                # metadata before falling back to the public provider default.
+                effective_base_url = (
+                    os.getenv("COPILOT_API_BASE_URL", "").strip().rstrip("/")
+                    or enterprise_base_url
+                    or (pconfig.inference_base_url if pconfig else "")
                 )
                 changed |= _upsert_entry(
                     entries,
