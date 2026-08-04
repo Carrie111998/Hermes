@@ -8,15 +8,19 @@ The gateway's next ``read()`` returns ``EAGAIN``, which CPython's buffered
 This module provides:
 - :func:`diagnose_stdin_state` — forensic diagnostic (``O_NONBLOCK`` / ``SO_RCVTIMEO``)
 - :func:`handle_spurious_eof` — check whether an empty ``readline()`` is a genuine
-  peer-close or a spurious EOF, and recover if spurious.
+  peer-close or a spurious EOF, and recover if spurious (POSIX ``fcntl`` path)
+- :func:`handle_stdin_oserror` — Windows-aware recovery when ``readline()`` *raises*
+  ``OSError`` (EINVAL/EBADF/EPIPE) instead of returning empty (#78820)
 
-The recovery is **POSIX-only** (``fcntl``).  On Windows, ``O_NONBLOCK`` on a
-shared file description is not a concern, so the guard simply reports a
-genuine EOF and lets the caller exit.
+``handle_spurious_eof`` is **POSIX-only** (``fcntl``).  On Windows, ``O_NONBLOCK``
+on a shared file description is not the usual failure mode, so that path reports
+a genuine EOF.  Windows pipe corruption from inherited stdin handles is covered
+by :func:`handle_stdin_oserror` instead.
 """
 
 from __future__ import annotations
 
+import errno
 import os
 import time
 
@@ -165,18 +169,11 @@ def handle_spurious_eof(
 # (ECONNRESET, ENOTCONN, permission errors, …) must propagate unchanged.
 
 _RECOVERABLE_STDIN_ERRNOS: frozenset[int] = frozenset({
-    getattr(os, "errno", None) and getattr(os.errno, "EINVAL", 22) or 22,   # corrupted pipe state (primary Windows symptom)
-    getattr(os, "errno", None) and getattr(os.errno, "EBADF", 9) or 9,    # child closed the inherited handle
-    getattr(os, "errno", None) and getattr(os.errno, "EPIPE", 32) or 32,    # broken pipe on the read path
+    errno.EINVAL,  # corrupted pipe state (primary Windows symptom)
+    errno.EBADF,   # child closed the inherited handle
+    errno.EPIPE,   # broken pipe on the read path
 })
 
-import errno
-
-_RECOVERABLE_STDIN_ERRNOS = frozenset({
-    errno.EINVAL,
-    errno.EBADF,
-    errno.EPIPE,
-})
 
 def handle_stdin_oserror(
     exc: OSError,
@@ -194,10 +191,18 @@ def handle_stdin_oserror(
       with fresh state.
     * ``None``  — the error is **not** recoverable; the caller should
       re-raise so unexpected failures surface normally.
+
+    ``recovery_times`` is the same list used by :func:`handle_spurious_eof`
+    so both recovery paths share a single rate-limit budget per process.
+
+    ``log_fn`` is called with a diagnostic string — ``_log_exit`` in
+    ``entry.py``, a stderr ``print`` in ``slash_worker.py``.
     """
     if exc.errno not in _RECOVERABLE_STDIN_ERRNOS:
         return None
 
+    # Mirror handle_spurious_eof's rate-limiting so the two recovery
+    # paths cannot gang up to create a busy-loop.
     now = time.time()
     recovery_times.append(now)
     recovery_times[:] = [t for t in recovery_times if t > now - 60]
@@ -213,5 +218,6 @@ def handle_stdin_oserror(
         f"{os.strerror(exc.errno)}), retrying"
     )
 
+    # Brief backoff so a persistently corrupted pipe doesn't burn CPU.
     time.sleep(0.1)
     return True
