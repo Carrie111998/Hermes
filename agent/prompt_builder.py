@@ -14,7 +14,7 @@ from collections import OrderedDict
 from pathlib import Path
 
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.skill_utils import (
@@ -247,8 +247,8 @@ KANBAN_GUIDANCE = (
     "before counting as merged/done (most coding tasks), drop the "
     "structured metadata (changed_files / tests_run / diff_path) into a "
     "`kanban_comment` first, then end with "
-    "`kanban_block(reason=\"review-required: <one-line summary>\")` so a "
-    "reviewer can approve+unblock or request changes. Reviewing-then-"
+    "`kanban_block(reason=\"Please review <one-line summary>.\")` so a "
+    "reviewer can approve and unblock or request changes. Reviewing-then-"
     "completing is more honest than auto-completing work that still needs "
     "eyes on it.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
@@ -305,6 +305,245 @@ KANBAN_GUIDANCE = (
     "for short reasoning subtasks inside your own run; board tasks are for "
     "cross-agent handoffs that outlive one API loop."
 )
+
+
+def _default_kanban_hitl_policy() -> dict[str, Any]:
+    """Return a copy of the built-in Kanban HITL policy defaults."""
+    try:
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        policy = (
+            DEFAULT_CONFIG.get("kanban", {})
+            .get("hitl_policy", {})
+        )
+        if isinstance(policy, dict):
+            return json.loads(json.dumps(policy))
+    except Exception:
+        logger.debug("failed to load built-in kanban HITL defaults", exc_info=True)
+    return {
+        "enabled": True,
+        "all_blocked_tasks_are_human_facing": True,
+        "max_notification_chars": 240,
+        "reject_machine_shaped_reasons": True,
+        "require_action_first": True,
+        "default_audience": {
+            "name": "the human reviewer",
+            "role": "human decision-maker",
+            "style": "plain English, action-first, no dev-speak, under 240 chars",
+        },
+        "text": (
+            "When blocking for human input, write like a short business chat message.\n"
+            "Use everyday words. Prefer 'what we can say', 'what we should not say', "
+            "'what you need to choose', 'what approval lets us do next', and "
+            "'what to change if you disagree'.\n"
+            "Use this shape by default:\n"
+            "1. Ask: say exactly what the human must decide or provide.\n"
+            "2. Proposal: say the recommended path in plain words.\n"
+            "3. Limit: say what should not happen, if relevant.\n"
+            "4. Next step: say what approval or the chosen option allows.\n"
+            "5. Change path: say what to ask for if the human disagrees.\n"
+            "Keep the first sentence useful on its own and normally under 240 characters.\n"
+            "If there are choices, label them OPTION A, OPTION B, etc., and recommend one.\n"
+            "Do not use abstract labels such as 'risk posture', 'risk boundary', "
+            "'validation state', 'commercial logic', or 'review status' unless you "
+            "immediately translate them into everyday words.\n"
+            "Do not use JSON, metadata dumps, stack traces, raw file lists, or internal shorthand."
+        ),
+        "profile_overrides": {},
+    }
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    if value is None:
+        return default
+    return default
+
+
+def _as_positive_int(value: Any, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def _merged_hitl_audience(
+    base: Mapping[str, Any],
+    override: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    audience = {
+        "name": str(base.get("name") or "the human reviewer").strip(),
+        "role": str(base.get("role") or "human decision-maker").strip(),
+        "style": str(base.get("style") or "plain English, action-first").strip(),
+    }
+    if not isinstance(override, Mapping):
+        return audience
+    raw_override = override.get("audience")
+    if isinstance(raw_override, Mapping):
+        for key in ("name", "role", "style"):
+            value = raw_override.get(key)
+            if value:
+                audience[key] = str(value).strip()
+    elif raw_override:
+        audience["name"] = str(raw_override).strip()
+    if override.get("style"):
+        audience["style"] = str(override["style"]).strip()
+    return audience
+
+
+def resolve_kanban_hitl_policy(
+    config: Optional[Mapping[str, Any]] = None,
+    profile: Optional[str] = None,
+) -> dict[str, Any]:
+    """Resolve the Kanban human-in-the-loop language policy.
+
+    Invalid or missing config fails open to the built-in safe policy. An
+    explicit ``enabled: false`` is honored and returns a disabled policy.
+    """
+    defaults = _default_kanban_hitl_policy()
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+
+            config = load_config()
+        except Exception:
+            logger.debug("failed to load config for kanban HITL policy", exc_info=True)
+            config = {}
+
+    raw_policy: Any = None
+    if isinstance(config, Mapping):
+        kanban = config.get("kanban")
+        if isinstance(kanban, Mapping):
+            raw_policy = kanban.get("hitl_policy")
+    if raw_policy is None:
+        raw_policy = defaults
+
+    if not isinstance(raw_policy, Mapping):
+        raw_policy = defaults
+
+    enabled = _as_bool(raw_policy.get("enabled"), _as_bool(defaults.get("enabled"), True))
+    if not enabled:
+        return {
+            "enabled": False,
+            "profile": profile or os.environ.get("HERMES_PROFILE") or "",
+            "max_notification_chars": _as_positive_int(
+                raw_policy.get("max_notification_chars"),
+                _as_positive_int(defaults.get("max_notification_chars"), 240),
+            ),
+        }
+
+    merged = dict(defaults)
+    merged.update(dict(raw_policy))
+    default_audience = defaults.get("default_audience", {})
+    if not isinstance(default_audience, Mapping):
+        default_audience = {}
+    raw_audience = raw_policy.get("default_audience")
+    if not isinstance(raw_audience, Mapping):
+        raw_audience = default_audience
+    else:
+        audience_base = dict(default_audience)
+        audience_base.update(dict(raw_audience))
+        raw_audience = audience_base
+
+    active_profile = (
+        str(profile or os.environ.get("HERMES_PROFILE") or "").strip()
+    )
+    overrides = merged.get("profile_overrides")
+    profile_override: Mapping[str, Any] | None = None
+    if isinstance(overrides, Mapping) and active_profile:
+        candidate = overrides.get(active_profile)
+        if isinstance(candidate, Mapping):
+            profile_override = candidate
+
+    audience = _merged_hitl_audience(raw_audience, profile_override)
+    max_chars = _as_positive_int(
+        merged.get("max_notification_chars"),
+        _as_positive_int(defaults.get("max_notification_chars"), 240),
+    )
+
+    return {
+        "enabled": True,
+        "profile": active_profile,
+        "audience": audience,
+        "all_blocked_tasks_are_human_facing": _as_bool(
+            merged.get("all_blocked_tasks_are_human_facing"),
+            True,
+        ),
+        "max_notification_chars": max_chars,
+        "reject_machine_shaped_reasons": _as_bool(
+            merged.get("reject_machine_shaped_reasons"),
+            True,
+        ),
+        "require_action_first": _as_bool(
+            merged.get("require_action_first"),
+            True,
+        ),
+        "strict": _as_bool(merged.get("strict"), False),
+        "text": str(merged.get("text") or defaults.get("text") or "").strip(),
+        "profile_override": dict(profile_override or {}),
+    }
+
+
+def build_kanban_hitl_policy_prompt(
+    config: Optional[Mapping[str, Any]] = None,
+    profile: Optional[str] = None,
+) -> str:
+    """Build the compact Kanban HITL guidance block for worker prompts."""
+    policy = resolve_kanban_hitl_policy(config=config, profile=profile)
+    if not policy.get("enabled"):
+        return ""
+
+    audience = policy.get("audience") or {}
+    name = str(audience.get("name") or "the human reviewer").strip()
+    role = str(audience.get("role") or "human decision-maker").strip()
+    style = str(audience.get("style") or "plain English, action-first").strip().rstrip(".")
+    max_chars = policy.get("max_notification_chars") or 240
+    text = str(policy.get("text") or "").strip()
+
+    parts = [
+        "# Kanban HITL language policy",
+        (
+            f"When `kanban_block` needs human input, write for {name} "
+            f"({role}). Style: {style}."
+        ),
+        (
+            "All true blocked tasks are human-facing by default. "
+            '`kind="dependency"` is not human-facing; use it only when waiting '
+            "on another board task so it can resume automatically."
+        ),
+        (
+            "Lead with the action the human must take. Keep the first visible "
+            f"notification sentence concise, normally under {max_chars} characters. "
+            "Put machine detail in metadata, artifacts, or internal comments."
+        ),
+        (
+            "If the human must choose, label choices `OPTION A`, `OPTION B`, "
+            "etc., and include a recommendation."
+        ),
+    ]
+    if text:
+        parts.append(text)
+    override = policy.get("profile_override")
+    if isinstance(override, Mapping) and override:
+        override_style = str(override.get("style") or "").strip()
+        human_surface = override.get("human_surface")
+        suffix = []
+        if human_surface:
+            suffix.append(f"human_surface={human_surface}")
+        if override_style:
+            suffix.append(override_style)
+        if suffix:
+            profile_name = policy.get("profile") or "active profile"
+            parts.append(f"Profile override for {profile_name}: {'; '.join(suffix)}")
+    return "\n".join(parts)
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
     "# Tool-use enforcement\n"

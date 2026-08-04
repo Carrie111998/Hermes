@@ -352,6 +352,75 @@ Three reasons:
 
 The auto-injected kanban guidance teaches the model which tool to call when and in what order.
 
+### Human-facing blockers
+
+Every true Kanban blocker is treated as human-facing by default. When a worker
+calls `kanban_block(reason=...)` for `needs_input`, `capability`, `transient`,
+or an omitted kind, the reason is visible on the board and can be sent through
+gateway notifications. Workers therefore get extra prompt guidance naming the
+configured human audience and telling them to lead with the action that person
+must take.
+
+`kind="dependency"` is different: it means the worker is waiting on another
+board task. Dependency waits route through `todo` and resume automatically when
+their parents finish; they are not forced through the human-facing wording
+validator.
+
+The `kanban_block` tool has a lightweight guardrail for obvious machine-shaped
+reasons. It rejects JSON/dict dumps, stack traces, internal-label starts like
+`review-required:` without a plain-English action, unlabeled choices, and
+strict-mode overlong reasons before the DB write happens. It is not a writing
+judge: short actionable text passes even if it is not stylistically perfect.
+
+Configure the audience and profile-specific wording under `kanban.hitl_policy`:
+
+```yaml
+kanban:
+  hitl_policy:
+    enabled: true
+    all_blocked_tasks_are_human_facing: true
+    max_notification_chars: 240
+    reject_machine_shaped_reasons: true
+    require_action_first: true
+
+    default_audience:
+      name: the human reviewer
+      role: human decision-maker
+      style: plain English, action-first, no dev-speak, under 240 chars
+
+    text: |
+      When blocking for human input, write like a short business chat message.
+      Use everyday words. Prefer "what we can say", "what we should not say",
+      "what you need to choose", "what approval lets us do next", and
+      "what to change if you disagree".
+      Use this shape by default:
+      1. Ask: say exactly what the human must decide or provide.
+      2. Proposal: say the recommended path in plain words.
+      3. Limit: say what should not happen, if relevant.
+      4. Next step: say what approval or the chosen option allows.
+      5. Change path: say what to ask for if the human disagrees.
+      Keep the first sentence useful on its own and normally under 240 characters.
+      If there are choices, label them OPTION A, OPTION B, etc., and recommend one.
+      Do not use abstract labels such as "risk posture", "risk boundary",
+      "validation state", "commercial logic", or "review status" unless you
+      immediately translate them into everyday words.
+      Do not use JSON, metadata dumps, stack traces, raw file lists, or internal shorthand.
+
+    profile_overrides:
+      platform-ops:
+        human_surface: blockers_only
+        audience: the operations reviewer
+        style: Translate platform terms. Say whether anything live will change.
+      red-team:
+        human_surface: blockers_only
+        audience: the security reviewer
+        style: Use everyday words for risk. Say what is okay, what is not okay, and what the reviewer should approve or change.
+```
+
+Gateway notifications do not rewrite blocker meaning. They deliver the worker's
+first plain-English action sentence and cap it to `max_notification_chars`; the
+full reason remains on the task for follow-up context.
+
 ### Recommended handoff evidence
 
 `kanban_complete(summary=..., metadata={...})` is intentionally flexible:
@@ -580,6 +649,10 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `hitl_policy.enabled` | `true` | Inject human-facing blocker guidance into Kanban worker prompts and validate obvious machine-shaped blocker reasons. |
+| `hitl_policy.default_audience` | human reviewer / human decision-maker | The explicit human audience workers should write blocker reasons for. Set `name`, `role`, and `style` for your install. |
+| `hitl_policy.profile_overrides` | `{}` | Optional per-profile audience/style overrides. These customize wording; they do not make true blockers non-human-facing. |
+| `hitl_policy.max_notification_chars` | `240` | Cap for the first blocker sentence delivered by gateway notifications. |
 
 And the two auxiliary LLM slots:
 

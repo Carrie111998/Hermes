@@ -217,13 +217,94 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
 def test_block_happy_path(worker_env):
     from tools import kanban_tools as kt
-    out = kt._handle_block({"reason": "need clarification"})
+    out = kt._handle_block({"reason": "Please clarify the acceptance criteria."})
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_block_rejects_json_reason_before_db_write(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": '{"status": "review-required", "tests": ["ready"]}',
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "Rewrite this blocker" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejects_stack_trace_reason_before_db_write(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": (
+            "Traceback (most recent call last):\n"
+            '  File "worker.py", line 12, in <module>\n'
+            "RuntimeError: no token"
+        ),
+        "kind": "capability",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "Rewrite this blocker" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_block_rejects_technical_phrase_without_action(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": "metadata-shape regression tests are ready",
+        "kind": "needs_input",
+    })
+    d = json.loads(out)
+    assert "error" in d
+    assert "Rewrite this blocker" in d["error"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "running"
+    finally:
+        conn.close()
+
+
+def test_dependency_block_is_exempt_from_human_facing_validator(worker_env):
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    out = kt._handle_block({
+        "reason": '{"waiting_on": "parent task output"}',
+        "kind": "dependency",
+    })
+    d = json.loads(out)
+    assert d["ok"] is True
+    assert d["status"] == "todo"
+    assert d["block_kind"] == "dependency"
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, worker_env).status == "todo"
     finally:
         conn.close()
 

@@ -240,7 +240,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         tool_guidance.append(_kanban_guidance)
     elif _kanban_guidance is None and "kanban_show" in agent.valid_tool_names:
         # Fallback for code paths that bypass agent_init (rare).
-        tool_guidance.append(KANBAN_GUIDANCE)
+        from agent.prompt_builder import build_kanban_hitl_policy_prompt
+
+        tool_guidance.append(
+            (KANBAN_GUIDANCE + "\n\n" + build_kanban_hitl_policy_prompt()).rstrip()
+        )
     if tool_guidance:
         stable_parts.append(" ".join(tool_guidance))
 

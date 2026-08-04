@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import sqlite3
 import time
 from pathlib import Path
@@ -23,6 +24,33 @@ from agent.i18n import t
 # Match the logger run.py uses (logging.getLogger(__name__) where __name__ ==
 # "gateway.run") so extracted log records keep their original logger name.
 logger = logging.getLogger("gateway.run")
+
+
+def _kanban_hitl_notification_cap() -> int:
+    try:
+        from agent.prompt_builder import resolve_kanban_hitl_policy
+
+        policy = resolve_kanban_hitl_policy()
+        return int(policy.get("max_notification_chars") or 240)
+    except Exception:
+        logger.debug("kanban HITL notification cap resolution failed", exc_info=True)
+        return 240
+
+
+def _kanban_first_action_sentence(reason: Any, *, cap: Optional[int] = None) -> str:
+    """Return the first concise blocker sentence without rewriting meaning."""
+    text = str(reason or "").strip()
+    if not text:
+        return ""
+    limit = cap if isinstance(cap, int) and cap > 0 else _kanban_hitl_notification_cap()
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), text)
+    match = re.search(r"(?<=[.!?])\s+", first_line)
+    sentence = first_line[: match.start()].strip() if match else first_line
+    if len(sentence) <= limit:
+        return sentence
+    if limit <= 1:
+        return sentence[:limit]
+    return sentence[: limit - 1].rstrip() + "…"
 
 
 def _resolve_auto_decompose_settings(
@@ -435,7 +463,11 @@ class GatewayKanbanWatchersMixin:
                         elif kind == "blocked":
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
-                                reason = f": {str(ev.payload['reason'])[:160]}"
+                                excerpt = _kanban_first_action_sentence(
+                                    ev.payload["reason"]
+                                )
+                                if excerpt:
+                                    reason = f": {excerpt}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
@@ -475,7 +507,11 @@ class GatewayKanbanWatchersMixin:
                             recurrences = None
                             if ev.payload:
                                 if ev.payload.get("reason"):
-                                    reason = f": {str(ev.payload['reason'])[:160]}"
+                                    excerpt = _kanban_first_action_sentence(
+                                        ev.payload["reason"]
+                                    )
+                                    if excerpt:
+                                        reason = f": {excerpt}"
                                 recurrences = ev.payload.get("recurrences")
                             rc = f" (blocked {recurrences}x for the same cause)" if recurrences else ""
                             msg = (

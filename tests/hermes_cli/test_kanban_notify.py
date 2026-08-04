@@ -35,6 +35,31 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def test_blocked_notification_prefers_first_action_sentence():
+    from gateway.kanban_watchers import _kanban_first_action_sentence
+
+    reason = (
+        "Please approve the test-only change. Nothing live will change. "
+        "Ask for changes if the test purpose is unclear."
+    )
+
+    assert (
+        _kanban_first_action_sentence(reason, cap=180)
+        == "Please approve the test-only change."
+    )
+
+
+def test_blocked_notification_respects_configured_cap():
+    from gateway.kanban_watchers import _kanban_first_action_sentence
+
+    reason = "Please approve the generated customer migration briefing for Monday."
+
+    excerpt = _kanban_first_action_sentence(reason, cap=32)
+    assert excerpt.startswith("Please approve")
+    assert excerpt.endswith("…")
+    assert len(excerpt) <= 32
+
+
 
 
 

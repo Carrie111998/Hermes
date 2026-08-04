@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -213,6 +214,21 @@ def _connect(board: Optional[str] = None):
 
 
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_HITL_ACTION_START_RE = re.compile(
+    r"^\s*(please|choose|approve|reject|decide|tell|provide|grant|confirm|"
+    r"review|pick|select|share|upload|open|reconnect|authorize|sign in|"
+    r"connect|set|move|create|reply|answer|allow|deny)\b",
+    re.IGNORECASE,
+)
+_HITL_INTERNAL_LABEL_RE = re.compile(r"^\s*[a-z][a-z0-9_.-]{2,}\s*:\s+", re.IGNORECASE)
+_HITL_OPTION_RE = re.compile(r"\boption\s+[a-z]\b", re.IGNORECASE)
+_HITL_UNLABELED_CHOICE_RE = re.compile(r"(^|\s)([ab])[\).]\s+\S", re.IGNORECASE)
+_HITL_TECH_OBJECT_RE = re.compile(
+    r"\b(metadata|regression|stack trace|traceback|exception|token|msal|"
+    r"api|json|yaml|sqlite|db|schema|diff|patch|worktree|cron|gateway|"
+    r"artifact|stdout|stderr|pytest|importerror|attributeerror)\b",
+    re.IGNORECASE,
+)
 
 
 def _goal_judge_available() -> bool:
@@ -234,6 +250,92 @@ def _goal_judge_available() -> bool:
     except Exception:
         return False
     return client is not None and bool(model)
+
+
+def _kanban_hitl_rewrite_error(policy: dict[str, Any]) -> str:
+    audience = policy.get("audience") or {}
+    name = str(audience.get("name") or "the human").strip()
+    style = str(audience.get("style") or "plain English").strip()
+    return tool_error(
+        f"Rewrite this blocker for {name} as a short business message. "
+        f"Use {style}. Use this shape: 'Please [decide/provide/approve] ____. "
+        f"Approval means ____. Ask for changes if ____.' If there are choices, "
+        f"write: 'Please choose ____. OPTION A: ____. OPTION B: ____. "
+        f"Recommendation: ____.' Do not use JSON, metadata, stack traces, or "
+        f"agent shorthand."
+    )
+
+
+def _validate_human_facing_block_reason(
+    reason: str,
+    *,
+    kind: Optional[str],
+) -> Optional[str]:
+    """Return a rewrite error for obvious machine-shaped human blockers.
+
+    This is intentionally a coarse pre-write guardrail, not a prose judge.
+    Dependency waits are internal board coordination and bypass HITL wording.
+    """
+    if kind == "dependency":
+        return None
+    try:
+        from agent.prompt_builder import resolve_kanban_hitl_policy
+
+        policy = resolve_kanban_hitl_policy()
+    except Exception:
+        logger.debug("kanban HITL policy resolution failed", exc_info=True)
+        policy = {
+            "enabled": True,
+            "reject_machine_shaped_reasons": True,
+            "require_action_first": True,
+            "max_notification_chars": 240,
+            "strict": False,
+            "audience": {
+                "name": "the human reviewer",
+                "style": "plain English, action-first, no dev-speak, under 240 chars",
+            },
+        }
+    if not policy.get("enabled"):
+        return None
+
+    text = reason.strip()
+    if not text:
+        return _kanban_hitl_rewrite_error(policy)
+
+    reject_machine = bool(policy.get("reject_machine_shaped_reasons", True))
+    if reject_machine:
+        if text.startswith(("{", "[", "```json", "```python")):
+            return _kanban_hitl_rewrite_error(policy)
+        if re.search(
+            r"Traceback \(most recent call last\)|^\s*File \".+\", line \d+",
+            text,
+            re.MULTILINE,
+        ):
+            return _kanban_hitl_rewrite_error(policy)
+        if _HITL_INTERNAL_LABEL_RE.match(text) and not _HITL_ACTION_START_RE.match(text):
+            return _kanban_hitl_rewrite_error(policy)
+        if _HITL_UNLABELED_CHOICE_RE.search(text) and not _HITL_OPTION_RE.search(text):
+            return _kanban_hitl_rewrite_error(policy)
+
+    if policy.get("require_action_first", True):
+        first_line = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        if (
+            first_line
+            and not _HITL_ACTION_START_RE.match(first_line)
+            and _HITL_TECH_OBJECT_RE.search(first_line)
+        ):
+            return _kanban_hitl_rewrite_error(policy)
+
+    if policy.get("strict"):
+        max_chars = policy.get("max_notification_chars") or 240
+        try:
+            limit = int(max_chars)
+        except (TypeError, ValueError):
+            limit = 240
+        if limit > 0 and len(text) > limit:
+            return _kanban_hitl_rewrite_error(policy)
+
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -844,6 +946,10 @@ def _handle_block(args: dict, **kw) -> str:
                 f"another reason, call kanban_complete instead — the "
                 f"completion judge will evaluate it."
             )
+        hitl_err = _validate_human_facing_block_reason(reason, kind=kind)
+        if hitl_err:
+            conn.close()
+            return hitl_err
         try:
             ok = kb.block_task(
                 conn, tid,
@@ -1715,7 +1821,9 @@ KANBAN_BLOCK_SCHEMA = {
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
         "no agent can do), or 'transient' (a flaky failure that may clear). "
-        "``reason`` is shown to the human on the board. If a task keeps "
+        "``reason`` is shown to the human on the board for every non-dependency "
+        "blocker, so lead with the action they need to take in plain English. "
+        "If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
         "block on things you can resolve yourself."
@@ -1730,9 +1838,12 @@ KANBAN_BLOCK_SCHEMA = {
             "reason": {
                 "type": "string",
                 "description": (
-                    "What you need answered or what stopped you, in one or "
-                    "two sentences. Don't paste the whole conversation; the "
-                    "human has the board and can ask follow-ups via comments."
+                    "What the human needs to do, in one or two plain-English "
+                    "sentences. Lead with the action. If there are choices, "
+                    "label them OPTION A, OPTION B, etc., and recommend one. "
+                    "Don't paste JSON, stack traces, metadata dumps, or the "
+                    "whole conversation; use comments/artifacts for technical "
+                    "detail."
                 ),
             },
             "kind": {

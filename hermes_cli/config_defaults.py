@@ -2262,6 +2262,41 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Human-in-the-loop language policy. True blockers interrupt a human,
+        # so workers must phrase kanban_block(reason=...) for the configured
+        # audience rather than as agent-to-agent metadata. Dependency waits are
+        # not human-facing and route through todo until their parents finish.
+        "hitl_policy": {
+            "enabled": True,
+            "all_blocked_tasks_are_human_facing": True,
+            "max_notification_chars": 240,
+            "reject_machine_shaped_reasons": True,
+            "require_action_first": True,
+            "default_audience": {
+                "name": "the human reviewer",
+                "role": "human decision-maker",
+                "style": "plain English, action-first, no dev-speak, under 240 chars",
+            },
+            "text": (
+                "When blocking for human input, write like a short business chat message.\n"
+                "Use everyday words. Prefer 'what we can say', 'what we should not say', "
+                "'what you need to choose', 'what approval lets us do next', and "
+                "'what to change if you disagree'.\n"
+                "Use this shape by default:\n"
+                "1. Ask: say exactly what the human must decide or provide.\n"
+                "2. Proposal: say the recommended path in plain words.\n"
+                "3. Limit: say what should not happen, if relevant.\n"
+                "4. Next step: say what approval or the chosen option allows.\n"
+                "5. Change path: say what to ask for if the human disagrees.\n"
+                "Keep the first sentence useful on its own and normally under 240 characters.\n"
+                "If there are choices, label them OPTION A, OPTION B, etc., and recommend one.\n"
+                "Do not use abstract labels such as 'risk posture', 'risk boundary', "
+                "'validation state', 'commercial logic', or 'review status' unless you "
+                "immediately translate them into everyday words.\n"
+                "Do not use JSON, metadata dumps, stack traces, raw file lists, or internal shorthand."
+            ),
+            "profile_overrides": {},
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
