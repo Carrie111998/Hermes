@@ -172,3 +172,23 @@ def test_local_oauth_keeps_cli_in_control_and_uses_user_local_npm_install():
         contents = markdown_file.read_text(encoding="utf-8")
         assert "npm install -g @box/cli" not in contents
         assert ".local/share/hermes-box-cli" not in contents
+
+
+def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assumptions():
+    skill = SKILL_MD.read_text(encoding="utf-8")
+    oauth = (SKILL_DIR / "references" / "oauth-setup.md").read_text(
+        encoding="utf-8"
+    )
+    ccg = (SKILL_DIR / "references" / "ccg-setup.md").read_text(encoding="utf-8")
+    rest = (SKILL_DIR / "references" / "rest-api.md").read_text(encoding="utf-8")
+
+    assert "CLI process and the browser" in skill
+    assert "Do not infer runtime topology from the operating system alone" in skill
+    assert "Same-host interactive path" in oauth
+    assert "Separate-host or headless path" in oauth
+    assert "Node.js and npm in the runtime where Hermes executes commands" in (
+        SKILL_DIR / "references" / "cli-guide.md"
+    ).read_text(encoding="utf-8")
+    assert "active Hermes home's `.env` file" in ccg
+    assert "~/.hermes/.env" not in ccg
+    assert "uses POSIX shell syntax" in rest

@@ -6,6 +6,8 @@ Run Box commands through Hermes' `terminal` tool. Prefer the documented command 
 
 If `box` is on `PATH`, run the examples in this guide as written. If it is missing, install the CLI once under the current Hermes home at `tools/box-cli`. `HERMES_HOME` is optional: Hermes uses its platform default when it is unset (`~/.hermes` on macOS/Linux and `%LOCALAPPDATA%\hermes` on Windows). Choose the command for the current shell.
 
+Require Node.js and npm in the runtime where Hermes executes commands. If they are unavailable or the filesystem is not writable, ask for the runtime-appropriate installation or writable Hermes home; do not assume a system package manager, a desktop, or elevated privileges.
+
 On macOS/Linux:
 
 ```bash

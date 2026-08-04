@@ -30,6 +30,8 @@ box files:get <RETURNED_FILE_ID> --json --fields id,name,type,parent
 
 Keep secrets out of shell history and command output. Prefer the CLI or SDK for token refresh; this is a fallback pattern only.
 
+The following `curl` example uses POSIX shell syntax. On Windows PowerShell, prefer the Box CLI or SDK instead of translating this secret-bearing request manually.
+
 ```bash
 curl -sS -X POST https://api.box.com/oauth2/token \
   -H "Content-Type: application/x-www-form-urlencoded" \

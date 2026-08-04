@@ -6,7 +6,7 @@ Use CCG when Hermes needs its own service-account identity: a background agent, 
 
 Open the [Box Developer Console](https://app.box.com/developers/console) with browser tools when available, then create a **Platform App** using **Client Credentials Grant**. Choose only the scopes and access level required for the work; the authorization method is fixed at creation.
 
-Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Never ask for a Client Secret in chat. Ask the human to store the Client ID, Client Secret, and Enterprise ID directly in `~/.hermes/.env`, then resume after they confirm it is ready:
+Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Never ask for a Client Secret in chat. Ask the human to store the Client ID, Client Secret, and Enterprise ID directly in the active Hermes home's `.env` file, then resume after they confirm it is ready:
 
 ```text
 BOX_CLIENT_ID=your_client_id
