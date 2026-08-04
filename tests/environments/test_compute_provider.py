@@ -277,6 +277,58 @@ def test_modal_transport_backend_forwards_app_lifecycle_actions() -> None:
     )
     assert transport.call_tool.call_args_list[2].args == ("kill_app", {"pid": 42})
 
+
+def test_modal_transport_backend_captures_through_native_cua_window_state() -> None:
+    png_b64 = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42m"
+        "NkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
+    )
+    transport = Mock()
+    transport.call_tool.side_effect = [
+        {"structuredContent": {"windows": [{
+            "app_name": "Chromium", "pid": 42, "window_id": 7,
+            "is_on_screen": True, "title": "Example Domain", "z_index": 1,
+        }]}},
+        {"structuredContent": {
+            "elements": [{
+                "element_index": 3, "role": "button", "label": "More information",
+                "frame": {"x": 10, "y": 20, "w": 30, "h": 40},
+            }],
+            "screenshot_png_b64": png_b64,
+            "screenshot_mime_type": "image/png",
+        }},
+    ]
+    backend = _TransportComputerBackend(transport)
+
+    capture = backend.capture()
+
+    assert [call.args[0] for call in transport.call_tool.call_args_list] == [
+        "list_windows", "get_window_state",
+    ]
+    assert transport.call_tool.call_args_list[1].args == (
+        "get_window_state", {"pid": 42, "window_id": 7},
+    )
+    assert capture.width == 1
+    assert capture.height == 1
+    assert capture.png_b64 == png_b64
+    assert capture.app == "Chromium"
+    assert capture.window_title == "Example Domain"
+    assert [(element.index, element.bounds) for element in capture.elements] == [
+        (3, (10, 20, 30, 40)),
+    ]
+
+
+def test_modal_transport_backend_surfaces_cua_tool_errors() -> None:
+    transport = Mock()
+    transport.call_tool.return_value = {
+        "isError": True,
+        "content": [{"type": "text", "text": "Permission denied: unavailable desktop"}],
+    }
+    backend = _TransportComputerBackend(transport)
+
+    with pytest.raises(RuntimeError, match="Permission denied: unavailable desktop"):
+        backend.capture()
+
 def test_modal_desktop_config_defaults() -> None:
     config = ModalDesktopConfig()
 

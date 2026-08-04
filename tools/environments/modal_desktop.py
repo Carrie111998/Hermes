@@ -45,18 +45,48 @@ class _TransportComputerBackend(ComputerUseBackend):
 
     def capture(self, mode: str = "som", app: Optional[str] = None, pid: Optional[int] = None,
                 window_id: Optional[int] = None) -> CaptureResult:
-        result = self.transport.call_tool("capture", {
-            "mode": mode, "app": app, "pid": pid, "window_id": window_id,
-        })
+        """Capture through CUA's current window-state MCP contract.
+
+        The image-configured Modal driver does not expose Hermes' legacy
+        ``capture`` tool.  Resolve a target through ``list_windows`` and ask
+        the same lease-bound MCP service for ``get_window_state`` instead.
+        """
+        if (pid is None) != (window_id is None):
+            raise ValueError("capture targeting requires both pid and window_id")
+
+        windows = self.list_windows()
+        target = _capture_target(windows, app=app, pid=pid, window_id=window_id)
+        if target is None:
+            return CaptureResult(mode=mode, width=0, height=0, app=app or "")
+
+        target_pid = _positive_int(target.get("pid"))
+        target_window_id = _positive_int(target.get("window_id"))
+        if target_pid is None or target_window_id is None:
+            raise RuntimeError("CUA list_windows returned a target without pid/window_id")
+
+        result = self.transport.call_tool(
+            "get_window_state", {"pid": target_pid, "window_id": target_window_id},
+        )
         data = _result_data(result)
-        elements = [_element_from(item) for item in data.get("elements", []) if isinstance(item, Mapping)]
-        png_b64 = data.get("png_b64") or data.get("image")
-        if isinstance(png_b64, str) and png_b64.startswith("data:"):
-            png_b64 = png_b64.split(",", 1)[-1]
+        raw_elements = data.get("elements", [])
+        elements = [
+            _element_from(item, app=str(target.get("app_name", target.get("app", ""))),
+                          pid=target_pid, window_id=target_window_id)
+            for item in raw_elements if isinstance(item, Mapping)
+        ]
+        if mode == "vision":
+            elements = []
+        png_b64, image_mime_type = _image_from_result(result, data)
+        width = _positive_int(data.get("width")) or 0
+        height = _positive_int(data.get("height")) or 0
+        if png_b64 and (not width or not height):
+            width, height = _png_dimensions(png_b64)
         return CaptureResult(
-            mode=mode, width=int(data.get("width", 0)), height=int(data.get("height", 0)),
-            png_b64=png_b64 if isinstance(png_b64, str) else None, elements=elements,
-            app=str(data.get("app", app or "")), window_title=str(data.get("window_title", "")),
+            mode=mode, width=width, height=height, png_b64=png_b64,
+            elements=elements,
+            app=str(target.get("app_name", target.get("app", app or ""))),
+            window_title=str(data.get("title", data.get("window_title", target.get("title", "")))),
+            png_bytes_len=_base64_size(png_b64), image_mime_type=image_mime_type,
         )
 
     def click(self, **kwargs: Any) -> ActionResult:
@@ -132,21 +162,120 @@ class _TransportComputerBackend(ComputerUseBackend):
 
 
 def _result_data(result: Mapping[str, Any]) -> Mapping[str, Any]:
+    if result.get("isError") is True:
+        raise RuntimeError(_mcp_error_message(result))
     structured = result.get("structuredContent")
     if isinstance(structured, Mapping):
         return structured
     return result
 
 
-def _element_from(value: Mapping[str, Any]) -> UIElement:
-    bounds = value.get("bounds", (0, 0, 0, 0))
+def _mcp_error_message(result: Mapping[str, Any]) -> str:
+    error = result.get("error")
+    if isinstance(error, Mapping):
+        message = error.get("message")
+        if isinstance(message, str) and message:
+            return message
+    data = result.get("data")
+    if isinstance(data, str) and data:
+        return data
+    content = result.get("content")
+    if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+        messages = [
+            item.get("text") for item in content
+            if isinstance(item, Mapping) and isinstance(item.get("text"), str)
+        ]
+        if messages:
+            return "\n".join(messages)
+    return "CUA MCP tool call failed"
+
+
+def _capture_target(
+    windows: Sequence[Mapping[str, Any]], *, app: Optional[str], pid: Optional[int], window_id: Optional[int],
+) -> Optional[Mapping[str, Any]]:
+    candidates = [window for window in windows if window.get("is_on_screen", not window.get("off_screen", False))]
+    if pid is not None and window_id is not None:
+        return next(
+            (window for window in candidates if window.get("pid") == pid and window.get("window_id") == window_id),
+            None,
+        )
+    if app:
+        needle = app.casefold()
+        candidates = [
+            window for window in candidates
+            if needle in str(window.get("app_name", window.get("app", ""))).casefold()
+        ]
+    return candidates[0] if candidates else None
+
+
+def _image_from_result(
+    result: Mapping[str, Any], data: Mapping[str, Any],
+) -> tuple[Optional[str], Optional[str]]:
+    png_b64 = data.get("screenshot_png_b64") or data.get("png_b64") or data.get("image")
+    image_mime_type = data.get("screenshot_mime_type")
+    if not isinstance(png_b64, str):
+        images = result.get("images")
+        if isinstance(images, Sequence) and not isinstance(images, (str, bytes)) and images:
+            png_b64 = images[0]
+            mimes = result.get("image_mime_types")
+            if isinstance(mimes, Sequence) and not isinstance(mimes, (str, bytes)) and mimes:
+                image_mime_type = mimes[0]
+    if not isinstance(png_b64, str):
+        content = result.get("content")
+        if isinstance(content, Sequence) and not isinstance(content, (str, bytes)):
+            for item in content:
+                if isinstance(item, Mapping) and item.get("type") == "image" and isinstance(item.get("data"), str):
+                    png_b64 = item["data"]
+                    image_mime_type = item.get("mimeType")
+                    break
+    if isinstance(png_b64, str) and png_b64.startswith("data:"):
+        png_b64 = png_b64.split(",", 1)[-1]
+    return (
+        png_b64 if isinstance(png_b64, str) else None,
+        image_mime_type if isinstance(image_mime_type, str) else None,
+    )
+
+
+def _png_dimensions(png_b64: str) -> tuple[int, int]:
+    try:
+        raw = base64.b64decode(png_b64, validate=False)
+    except Exception:
+        return 0, 0
+    if raw.startswith(b"\x89PNG\r\n\x1a\n") and len(raw) >= 24:
+        return int.from_bytes(raw[16:20], "big"), int.from_bytes(raw[20:24], "big")
+    return 0, 0
+
+
+def _base64_size(png_b64: Optional[str]) -> int:
+    if not png_b64:
+        return 0
+    try:
+        return len(base64.b64decode(png_b64, validate=False))
+    except Exception:
+        return len(png_b64) * 3 // 4
+
+
+def _positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
+def _element_from(value: Mapping[str, Any], *, app: str = "", pid: int = 0, window_id: int = 0) -> UIElement:
+    bounds = value.get("bounds")
     if not isinstance(bounds, (list, tuple)) or len(bounds) != 4:
-        bounds = (0, 0, 0, 0)
+        frame = value.get("frame")
+        bounds = (
+            frame.get("x", 0), frame.get("y", 0), frame.get("w", 0), frame.get("h", 0)
+        ) if isinstance(frame, Mapping) else (0, 0, 0, 0)
     return UIElement(
-        index=int(value.get("index", 0)), role=str(value.get("role", "")),
+        index=int(value.get("element_index", value.get("index", 0))), role=str(value.get("role", "")),
         label=str(value.get("label", "")), bounds=tuple(int(part) for part in bounds),
-        app=str(value.get("app", "")), pid=int(value.get("pid", 0)),
-        window_id=int(value.get("window_id", 0)),
+        app=str(value.get("app", app)), pid=int(value.get("pid", pid)),
+        window_id=int(value.get("window_id", window_id)),
+        element_token=value.get("element_token") if isinstance(value.get("element_token"), str) else None,
     )
 
 
