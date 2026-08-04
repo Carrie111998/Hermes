@@ -1309,13 +1309,25 @@ async def _standalone_send(
         }
 
     try:
-        reply, context_id, _state = await asyncio.to_thread(
+        reply, context_id, state = await asyncio.to_thread(
             _send_task, peer_name, peer, message, ""
         )
     except Exception as exc:  # urllib errors, timeouts, protocol errors
         return {"success": False, "error": f"A2A send to {peer_name} failed: {exc}"}
 
     note = f"A2A task delivered to {peer_name}"
+    if state == protocol.STATE_INPUT_REQUIRED:
+        # The peer needs the operator to answer before it can proceed —
+        # surface that explicitly instead of looking like a completed task.
+        return {
+            "success": True,
+            "message_id": context_id,
+            "needs_input": True,
+            "note": (
+                f"A2A peer {peer_name} needs input: {reply[:300]} — "
+                f"answer by sending again with context '{context_id}'."
+            ),
+        }
     if reply:
         note += f" — peer reply: {reply[:300]}"
     return {"success": True, "message_id": context_id, "note": note}

@@ -1665,6 +1665,26 @@ def test_standalone_send_strips_a2a_prefix(monkeypatch):
     assert seen["name"] == "macmini"
 
 
+def test_standalone_send_surfaces_input_required_state(monkeypatch):
+    from plugins.platforms.a2a.adapter import _standalone_send
+
+    monkeypatch.setattr(
+        "plugins.platforms.a2a.tools._resolve_peer",
+        lambda name: {"url": "http://peer:9900", "auth": {}, "timeout": 30, "capabilities": []},
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.a2a.tools._send_task",
+        lambda *a, **k: ("是否允许删除该文件？", "ctx-9", "TASK_STATE_INPUT_REQUIRED"),
+    )
+
+    result = asyncio.run(_standalone_send(None, "macmini", "delete the file"))
+
+    assert result["success"] is True
+    assert result["needs_input"] is True
+    assert result["message_id"] == "ctx-9"
+    assert "是否允许删除该文件" in result["note"]
+
+
 def test_standalone_send_unknown_peer_errors(monkeypatch):
     from plugins.platforms.a2a.adapter import _standalone_send
 
