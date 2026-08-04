@@ -1,10 +1,18 @@
 /** New ids first, then ids still present in the persisted order. */
 export function reconcileFreshFirst(currentIds: string[], orderIds: string[]): string[] {
   const current = new Set(currentIds)
-  const retained = orderIds.filter(id => current.has(id))
+  const retained = [...new Set(orderIds.filter(id => current.has(id)))]
   const retainedSet = new Set(retained)
+  const seenCurrent = new Set<string>()
 
-  return [...currentIds.filter(id => !retainedSet.has(id)), ...retained]
+  return [
+    ...currentIds.filter(id => {
+      if (retainedSet.has(id) || seenCurrent.has(id)) return false
+      seenCurrent.add(id)
+      return true
+    }),
+    ...retained,
+  ]
 }
 
 export function resolveManualSessionOrderIds(currentIds: string[], orderIds: string[], manual: boolean): string[] {
@@ -35,7 +43,7 @@ export function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: 
   for (const id of orderIds) {
     const item = byId.get(id)
 
-    if (item) {
+    if (item && !seen.has(id)) {
       ordered.push(item)
       seen.add(id)
     }
@@ -58,7 +66,7 @@ export function reconcileOrderIds(currentIds: string[], orderIds: string[]): str
   }
 
   if (!orderIds.length) {
-    return currentIds
+    return [...new Set(currentIds)]
   }
 
   return reconcileFreshFirst(currentIds, orderIds)
