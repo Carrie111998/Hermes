@@ -268,14 +268,14 @@ class TestEnvConfigLoading:
         monkeypatch.setenv("GOOGLE_CHAT_PROJECT_ID", "p")
         # No subscription.
         cfg = load_gateway_config()
-        assert Platform.GOOGLE_CHAT not in cfg.platforms
+        assert Platform("google_chat") not in cfg.platforms
 
     def test_missing_project_does_not_enable(self, monkeypatch):
         self._clean_env(monkeypatch)
         monkeypatch.setenv("GOOGLE_CHAT_SUBSCRIPTION_NAME",
                            "projects/p/subscriptions/s")
         cfg = load_gateway_config()
-        assert Platform.GOOGLE_CHAT not in cfg.platforms
+        assert Platform("google_chat") not in cfg.platforms
 
 
 
@@ -2585,7 +2585,7 @@ class TestAuthorizationEmailMatch:
         runner.pairing_store.is_approved = MagicMock(return_value=False)
 
         source = SessionSource(
-            platform=Platform.GOOGLE_CHAT,
+            platform=Platform("google_chat"),
             chat_id="spaces/S",
             chat_type="dm",
             user_id="alice@example.com",       # post-swap: email is canonical
@@ -2606,7 +2606,7 @@ class TestAuthorizationEmailMatch:
         runner.pairing_store.is_approved = MagicMock(return_value=False)
 
         source = SessionSource(
-            platform=Platform.GOOGLE_CHAT,
+            platform=Platform("google_chat"),
             chat_id="spaces/S",
             chat_type="dm",
             user_id="bob@example.com",
@@ -2632,7 +2632,7 @@ class TestAuthorizationEmailMatch:
         runner.pairing_store.is_approved = MagicMock(return_value=False)
 
         source = SessionSource(
-            platform=Platform.GOOGLE_CHAT,
+            platform=Platform("google_chat"),
             chat_id="spaces/S",
             chat_type="dm",
             user_id="users/77777",  # no email available — resource name wins
