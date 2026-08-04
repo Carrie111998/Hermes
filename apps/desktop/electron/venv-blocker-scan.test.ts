@@ -17,6 +17,7 @@ import { describe, it } from 'vitest'
 import {
   formatBlockerMessage,
   formatProbeFailedMessage,
+  isHermesGatewayCommandLine,
   parseVenvBlockerScanOutput,
   resolveVenvPython,
   scanVenvBlockers
@@ -65,6 +66,45 @@ describe('formatBlockerMessage', () => {
     assert.ok(msg.includes('remote backend'))
     assert.ok(msg.includes('retry'))
     assert.ok(!msg.includes('force-venv'))
+  })
+
+  it('gives gateway-specific recovery guidance for a reported gateway blocker', () => {
+    const msg = formatBlockerMessage({
+      blocked: true,
+      processes: [
+        {
+          pid: 20132,
+          name: 'python.exe',
+          cmdline:
+            'C:\\Users\\athif\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe -m hermes_cli.main gateway run'
+        }
+      ]
+    })
+
+    assert.ok(msg.includes('Hermes messaging gateway'))
+    assert.ok(msg.includes('hermes gateway stop'))
+    assert.ok(msg.includes('disconnect remote clients'))
+  })
+})
+
+describe('isHermesGatewayCommandLine', () => {
+  it('recognizes the Windows gateway command shown by the updater', () => {
+    assert.equal(
+      isHermesGatewayCommandLine(
+        'C:\\Users\\athif\\AppData\\Local\\hermes\\hermes-agent\\venv\\Scripts\\python.exe -m hermes_cli.main gateway run'
+      ),
+      true
+    )
+  })
+
+  it('handles a profile named gateway without mistaking the profile value for the command', () => {
+    assert.equal(isHermesGatewayCommandLine('python.exe -m hermes_cli.main --profile gateway gateway run'), true)
+  })
+
+  it('does not classify other Hermes subcommands or non-Hermes processes as gateways', () => {
+    assert.equal(isHermesGatewayCommandLine('python.exe -m hermes_cli.main gateway stop'), false)
+    assert.equal(isHermesGatewayCommandLine('python.exe -m hermes_cli.main serve --host 127.0.0.1'), false)
+    assert.equal(isHermesGatewayCommandLine('python.exe -m http.server 8077'), false)
   })
 })
 

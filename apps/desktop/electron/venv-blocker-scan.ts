@@ -34,6 +34,38 @@ export type ScanOutcome =
   | { kind: 'blocked'; result: VenvBlockerScanResult }
   | { kind: 'probe-failure'; error: string }
 
+/**
+ * Conservative compatibility check for the recovery copy below.
+ *
+ * Current runtimes classify pausable gateways in the Python scan and let the
+ * CLI updater pause them. Older/stale installations can still surface a
+ * `gateway run` process as a blocker, though. Recognizing that exact Hermes
+ * invocation here lets the error explain the manual recovery without changing
+ * the blocker decision or duplicating the updater's canonical matcher.
+ */
+export function isHermesGatewayCommandLine(cmdline: string): boolean {
+  const tokens = cmdline.match(/"[^"]*"|'[^']*'|\S+/g)?.map(token => token.replace(/^["']|["']$/g, '')) ?? []
+  const moduleIndex = tokens.findIndex(token => token.toLowerCase() === 'hermes_cli.main')
+
+  if (moduleIndex === -1) {
+    return false
+  }
+
+  for (let index = moduleIndex + 1; index < tokens.length; index += 1) {
+    if (tokens[index]?.toLowerCase() !== 'gateway') {
+      continue
+    }
+
+    const next = tokens[index + 1]?.toLowerCase()
+
+    if (next === undefined || next === 'run' || next.startsWith('--')) {
+      return true
+    }
+  }
+
+  return false
+}
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -196,7 +228,21 @@ export function formatBlockerMessage(result: VenvBlockerScanResult): string {
     'Close the terminal, app, or service owning that process.  If it is a ' +
       'remote backend, stopping it will disconnect remote clients.'
   )
-  lines.push('Then retry the update.')
+
+  const gatewayBlockers = result.processes.filter(proc => isHermesGatewayCommandLine(proc.cmdline))
+
+  if (gatewayBlockers.length > 0) {
+    lines.push('')
+    lines.push(
+      gatewayBlockers.length === result.processes.length
+        ? 'A Hermes messaging gateway is holding the installation.'
+        : 'One of the listed processes is a Hermes messaging gateway.'
+    )
+    lines.push('Run `hermes gateway stop`, then retry the update.')
+    lines.push('Stopping the gateway may disconnect remote clients.')
+  } else {
+    lines.push('Then retry the update.')
+  }
 
   return lines.join('\n')
 }
