@@ -1,0 +1,832 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Memory Graph - Rlay's Second Brain</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    
+    :root {
+      --bg-primary: #0a0a0f;
+      --bg-secondary: #11111a;
+      --fg-primary: #f0f0f5;
+      --fg-muted: #888899;
+      --accent-cyan: #00ffea;
+      --accent-magenta: #ff00ea;
+      --accent-gold: #ffd700;
+      --glass-bg: rgba(17, 17, 26, 0.7);
+      --glass-border: rgba(255, 255, 255, 0.08);
+      --link-color: rgba(0, 255, 234, 0.3);
+      --node-size: 12;
+    }
+
+    body {
+      min-height: 100vh;
+      background: var(--bg-primary);
+      color: var(--fg-primary);
+      font-family: 'JetBrains Mono', 'Fira Code', monospace;
+      position: relative;
+      /* Removed overflow: hidden to allow scrolling */
+    }
+
+    /* Video Background */
+    .video-bg {
+      position: fixed;
+      top: 0; left: 0; right: 0; bottom: 0;
+      z-index: -2;
+      overflow: hidden;
+    }
+
+    .video-bg video {
+      width: 100%; height: 100%;
+      object-fit: cover;
+      opacity: 0.35;
+      filter: saturate(1.2) contrast(1.1);
+    }
+
+    .video-bg::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background: 
+        radial-gradient(ellipse at 20% 20%, rgba(0, 255, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 80% 80%, rgba(255, 0, 234, 0.08) 0%, transparent 50%),
+        radial-gradient(ellipse at 50% 50%, rgba(0, 0, 0, 0.4) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    /* Animated Grid Overlay */
+    .grid-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: -1;
+      pointer-events: none;
+      background-image: 
+        linear-gradient(rgba(0, 255, 234, 0.03) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0, 255, 234, 0.03) 1px, transparent 1px);
+      background-size: 60px 60px;
+      animation: gridMove 20s linear infinite;
+    }
+
+    @keyframes gridMove {
+      0% { transform: translate(0, 0); }
+      100% { transform: translate(60px, 60px); }
+    }
+
+    /* Floating Orbs */
+    .orb {
+      position: fixed;
+      border-radius: 50%;
+      filter: blur(60px);
+      opacity: 0.4;
+      animation: orbFloat 15s ease-in-out infinite;
+      pointer-events: none;
+    }
+
+    .orb-1 { width: 400px; height: 400px; background: var(--accent-cyan); top: -100px; left: -100px; animation-delay: 0s; }
+    .orb-2 { width: 300px; height: 300px; background: var(--accent-magenta); bottom: -50px; right: -50px; animation-delay: -5s; }
+    .orb-3 { width: 200px; height: 200px; background: var(--accent-gold); top: 50%; left: 50%; transform: translate(-50%, -50%); animation-delay: -10s; }
+
+    @keyframes orbFloat {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      25% { transform: translate(30px, -20px) scale(1.1); }
+      50% { transform: translate(-20px, 30px) scale(0.95); }
+      75% { transform: translate(10px, -30px) scale(1.05); }
+    }
+
+    /* Main Content */
+    .container {
+      position: relative;
+      z-index: 10;
+      min-height: 100vh;
+      padding: 2rem;
+      /* Allow scrolling */
+    }
+
+    /* Header */
+    .header {
+      text-align: center;
+      margin-bottom: 3rem;
+    }
+
+    .title {
+      font-size: clamp(2.5rem, 8vw, 5rem);
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      position: relative;
+      display: inline-block;
+      margin-bottom: 1rem;
+      background: linear-gradient(135deg, var(--fg-primary) 0%, var(--accent-cyan) 50%, var(--fg-primary) 100%);
+      background-size: 200% 200%;
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      animation: gradientShift 4s ease-in-out infinite;
+    }
+
+    .title::before {
+      content: attr(data-text);
+      position: absolute;
+      inset: 0;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      filter: blur(8px);
+      opacity: 0.6;
+      animation: glowPulse 3s ease-in-out infinite alternate;
+    }
+
+    .subtitle {
+      font-size: clamp(1rem, 3vw, 1.5rem);
+      color: var(--fg-muted);
+      max-width: 800px;
+      margin: 0 auto;
+      line-height: 1.6;
+    }
+
+    @keyframes gradientShift {
+      0%, 100% { background-position: 0% 50%; }
+      50% { background-position: 100% 50%; }
+    }
+
+    @keyframes glowPulse {
+      0% { filter: blur(8px); opacity: 0.4; }
+      100% { filter: blur(16px); opacity: 0.8; }
+    }
+
+    /* Graph Container */
+    #graph-container {
+      position: relative;
+      width: 100%;
+      height: 1200px; /* Increased height for scrolling */
+      margin: 0 auto;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      backdrop-filter: blur(20px);
+      overflow: visible;
+    }
+
+    /* Links/Edges */
+    .link {
+      stroke: var(--link-color);
+      stroke-width: 1.5;
+      transition: stroke-width 0.3s, opacity 0.3s;
+    }
+
+    .link:hover {
+      stroke-width: 2.5;
+      opacity: 0.8;
+    }
+
+    /* Nodes */
+    .node {
+      cursor: pointer;
+      transition: transform 0.2s, r 0.2s;
+    }
+
+    .node:hover {
+      transform: scale(1.2);
+    }
+
+    .node circle {
+      fill: var(--fg-primary);
+      stroke: var(--accent-cyan);
+      stroke-width: 2px;
+      filter: drop-shadow(0 0 5px rgba(0, 255, 234, 0.3));
+    }
+
+    .node text {
+      pointer-events: none;
+      font-size: 10px;
+      fill: var(--fg-primary);
+      text-anchor: middle;
+      dy:-20px;
+      text-shadow: 0 0 3px rgba(0,0,0,0.5);
+      font-weight: 600;
+    }
+
+    /* Node Types - Different colors for different categories */
+    .node-project circle { fill: var(--accent-cyan); }
+    .node-template circle { fill: var(--accent-magenta); }
+    .node-resource circle { fill: var(--accent-gold); }
+    .node-note circle { fill: var(--fg-primary); }
+
+    /* Legend */
+    .legend {
+      position: fixed;
+      bottom: 20px;
+      left: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1rem;
+      backdrop-filter: blur(10px);
+      font-size: 0.9rem;
+      z-index: 100;
+    }
+
+    .legend-item {
+      display: flex;
+      align-items: center;
+      margin-bottom: 0.5rem;
+    }
+
+    .legend-color {
+      width: 12px;
+      height: 12px;
+      border-radius: 50%;
+      margin-right: 0.5rem;
+    }
+
+    .legend-color.project { background: var(--accent-cyan); }
+    .legend-color.template { background: var(--accent-magenta); }
+    .legend-color.resource { background: var(--accent-gold); }
+    .legend-color.note { background: var(--fg-primary); }
+
+    /* Controls */
+    .controls {
+      position: fixed;
+      top: 20px;
+      right: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1rem;
+      backdrop-filter: blur(10px);
+      z-index: 100;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+      align-items: flex-end;
+    }
+
+    .controls-row {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+    }
+
+    .search-box {
+      padding: 0.5rem 1rem;
+      background: var(--bg-secondary);
+      border: 2px solid var(--glass-border);
+      border-radius: 8px;
+      color: var(--fg-primary);
+      font-family: inherit;
+      font-size: 0.9rem;
+      width: 200px;
+      transition: border-color 0.3s;
+    }
+
+    .search-box:focus {
+      outline: none;
+      border-color: var(--accent-cyan);
+    }
+
+    .btn {
+      padding: 0.5rem 1rem;
+      background: transparent;
+      border: 2px solid var(--accent-cyan);
+      border-radius: 8px;
+      color: var(--accent-cyan);
+      font-family: inherit;
+      font-size: 0.9rem;
+      cursor: pointer;
+      transition: all 0.3s;
+    }
+
+    .btn:hover {
+      background: var(--accent-cyan);
+      color: var(--bg-primary);
+    }
+
+    .btn:active {
+      transform: scale(0.95);
+    }
+
+    .btn.secondary {
+      border-color: var(--fg-muted);
+      color: var(--fg-muted);
+    }
+
+    .btn.secondary:hover {
+      background: var(--fg-muted);
+      color: var(--bg-primary);
+    }
+
+    /* Info Panel */
+    #info-panel {
+      position: fixed;
+      bottom: 20px;
+      right: 20px;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 12px;
+      padding: 1.5rem;
+      max-width: 300px;
+      max-height: 200px;
+      overflow-y: auto;
+      backdrop-filter: blur(10px);
+      z-index: 100;
+      font-size: 0.9rem;
+      line-height: 1.5;
+      display: none;
+    }
+
+    #info-panel h3 {
+      margin-top: 0;
+      color: var(--accent-cyan);
+      border-bottom: 1px solid var(--glass-border);
+      padding-bottom: 0.5rem;
+    }
+
+    /* Tooltip */
+    .tooltip {
+      position: absolute;
+      background: var(--glass-bg);
+      border: 1px solid var(--glass-border);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      pointer-events: none;
+      backdrop-filter: blur(10px);
+      z-index: 200;
+      font-size: 0.85rem;
+      max-width: 250px;
+      opacity: 0;
+      transition: opacity 0.2s;
+      pointer-events: none;
+    }
+
+    .tooltip.visible {
+      opacity: 1;
+    }
+    @media (max-width: 768px) {
+      .container {
+        padding: 1rem;
+      }
+      
+      .title {
+        font-size: 2rem;
+      }
+      
+      #graph-container {
+        height: 1000px;
+      }
+      
+      .controls, .legend, #info-panel {
+        position: static;
+        margin: 1rem 0;
+        max-width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <!-- Video Background (placeholder) -->
+  <div class="video-bg">
+    <video autoplay loop muted playsinline poster="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1920 1080'%3E%3Crect fill='%230a0a0f' width='1920' height='1080'/%3E%3C/svg%3E">
+      <!-- Replace source with your video file -->
+      <!-- <source src="your-background.mp4" type="video/mp4"> -->
+    </video>
+  </div>
+
+  <!-- Grid Overlay -->
+  <div class="grid-overlay" aria-hidden="true"></div>
+
+  <!-- Floating Orbs -->
+  <div class="orb orb-1" aria-hidden="true"></div>
+  <div class="orb orb-2" aria-hidden="true"></div>
+  <div class="orb orb-3" aria-hidden="true"></div>
+
+  <main class="container">
+    <header class="header">
+      <h1 class="title" data-text="MEMORY GRAPH">MEMORY GRAPHERMES</h1>
+      <p class="subtitle">Visualizing your Obsidian vault connections - Rlay's Second Brain</p>
+    </header>
+
+    <!-- Controls -->
+    <div class="controls">
+      <div class="controls-row">
+        <input type="text" class="search-box" id="search-box" placeholder="Search nodes...">
+      </div>
+      <div class="controls-row">
+        <button class="btn" id="reset-btn">Reset View</button>
+        <button class="btn" id="info-toggle">Info</button>
+      </div>
+      <div class="controls-row">
+        <button class="btn secondary" id="export-btn">Export PNG</button>
+        <button class="btn secondary" id="fit-btn">Fit All</button>
+      </div>
+    </div>
+
+    <!-- Graph Container -->
+    <div id="graph-container">
+      <!-- Graph will be rendered here by D3.js -->
+    </div>
+
+    <!-- Info Panel -->
+    <div id="info-panel">
+      <h3>Node Info</h3>
+      <div id="info-content">Click on a node to see details</div>
+    </div>
+
+    <!-- Tooltip -->
+    <div class="tooltip" id="tooltip"></div>
+
+    <!-- Legend -->
+    <div class="legend">
+      <div>Node Types:</div>
+      <div class="legend-item"><div class="legend-color project"></div><span>Projects</span></div>
+      <div class="legend-item"><div class="legend-color template"></div><span>Templates</span></div>
+      <div class="legend-item"><div class="legend-color resource"></div><span>Resources</span></div>
+      <div class="legend-item"><div class="legend-color note"></div><span>Notes</span></div>
+    </div>
+  </main>
+
+  <script src="https://d3js.org/d3.v7.min.js"></script>
+  <script>
+    // Sample data based on the user's Obsidian vault structure
+    const nodes = [
+      // Main categories
+      {id: "home", name: "Home", group: "note", category: "Home"},
+      {id: "templates", name: "Templates", group: "folder", category: "Templates"},
+      {id: "resources", name: "Resources", group: "folder", category: "Resources"},
+      {id: "copilot", name: "Copilot Prompts", group: "folder", category: "Copilot"},
+      
+      // Templates
+      {id: "weekly-orbit-review", name: "Weekly Orbit Review", group: "template", category: "Templates"},
+      {id: "resource-template", name: "Resource Template", group: "template", category: "Templates"},
+      {id: "project-template", name: "Project Template", group: "template", category: "Templates"},
+      {id: "project-plan", name: "Project Plan", group: "template", category: "Templates"},
+      {id: "daily-note", name: "Daily Note", group: "template", category: "Templates"},
+      
+      // Projects/Notes from vault
+      {id: "origin-dashbook", name: "Origin Dashbook", group: "project", category: "Projects"},
+      {id: "google-web-designer", name: "Google Web Designer", group: "resource", category: "Resources"},
+      
+      // Copilot prompts
+      {id: "translate-chinese", name: "Translate to Chinese", group: "note", category: "Copilot"},
+      {id: "summarize", name: "Summarize", group: "note", category: "Copilot"},
+      {id: "simplify", name: "Simplify", group: "note", category: "Copilot"},
+      {id: "rewrite-tweet", name: "Rewrite as Tweet", group: "note", category: "Copilot"},
+      {id: "rewrite-tweet-thread", name: "Rewrite as Tweet Thread", group: "note", category: "Copilot"},
+      {id: "remove-urls", name: "Remove URLs", group: "note", category: "Copilot"},
+      {id: "make-shorter", name: "Make Shorter", group: "note", category: "Copilot"},
+      {id: "make-longer", name: "Make Longer", group: "note", category: "Copilot"},
+      {id: "generate-toc", name: "Generate Table of Contents", group: "note", category: "Copilot"},
+      {id: "generate-glossary", name: "Generate Glossary", group: "note", category: "Copilot"},
+      {id: "fix-grammar", name: "Fix Grammar and Spelling", group: "note", category: "Copilot"},
+      {id: "explain-like-i-am-5", name: "Explain Like I Am 5", group: "note", category: "Copilot"},
+      {id: "emojify", name: "Emojify", group: "note", category: "Copilot"},
+      {id: "clip-youtube-transcript", name: "Clip YouTube Transcript", group: "note", category: "Copilot"},
+      {id: "clip-web-page", name: "Clip Web Page", group: "note", category: "Copilot"},
+      
+      // Sample notes
+            {id: "untitled-1", name: "Untitled 1", group: "note", category: "Notes"},
+            {id: "untitled-2", name: "Untitled 2", group: "note", category: "Notes"},
+            {id: "untitled-3", name: "Untitled 3", group: "note", category: "Notes"},
+            {id: "untitled-4", name: "Untitled 4", group: "note", category: "Notes"},
+            {id: "untitled-5", name: "Untitled 5", group: "note", category: "Notes"},
+            {id: "untitled-6", name: "Untitled 6", group: "note", category: "Notes"},
+            {id: "untitled-7", name: "Untitled 7", group: "note", category: "Notes"},
+            {id: "untitled-8", name: "Untitled 8", group: "note", category: "Notes"},
+            {id: "untitled-9", name: "Untitled 9", group: "note", category: "Notes"},
+            {id: "untitled-10", name: "Untitled 10", group: "note", category: "Notes"},
+            {id: "untitled-11", name: "Untitled 11", group: "note", category: "Notes"},
+            {id: "untitled-12", name: "Untitled 12", group: "note", category: "Notes"},
+            {id: "untitled-13", name: "Untitled 13", group: "note", category: "Notes"},
+
+            // Test note from vault
+            {id: "test-note", name: "Test Note", group: "note", category: "Notes"}
+    ];
+
+    // Links representing connections between notes
+    const links = [
+      // Folder structures
+      {source: "home", target: "templates", type: "contains"},
+      {source: "home", target: "resources", type: "contains"},
+      {source: "home", target: "copilot", type: "contains"},
+      
+      // Template relationships
+      {source: "templates", target: "weekly-orbit-review", type: "contains"},
+      {source: "templates", target: "resource-template", type: "contains"},
+      {source: "templates", target: "project-template", type: "contains"},
+      {source: "templates", target: "project-plan", type: "contains"},
+      {source: "templates", target: "daily-note", type: "contains"},
+      
+      // Project connections
+      {source: "origin-dashbook", target: "home", type: "related"},
+      {source: "origin-dashbook", target: "weekly-orbit-review", type: "uses"},
+      {source: "origin-dashbook", target: "project-plan", type: "uses"},
+      
+      // Resource connections
+      {source: "google-web-designer", target: "resources", type: "contains"},
+      {source: "google-web-designer", target: "project-template", type: "related"},
+      
+      // Copilot prompt connections
+      {source: "copilot", target: "translate-chinese", type: "contains"},
+      {source: "copilot", target: "summarize", type: "contains"},
+      {source: "copilot", target: "simplify", type: "contains"},
+      {source: "copilot", target: "rewrite-tweet", type: "contains"},
+      {source: "copilot", target: "rewrite-tweet-thread", type: "contains"},
+      {source: "copilot", target: "remove-urls", type: "contains"},
+      {source: "copilot", target: "make-shorter", type: "contains"},
+      {source: "copilot", target: "make-longer", type: "contains"},
+      {source: "copilot", target: "generate-toc", type: "contains"},
+      {source: "copilot", target: "generate-glossary", type: "contains"},
+      {source: "copilot", target: "fix-grammar", type: "contains"},
+      {source: "copilot", target: "explain-like-i-am-5", type: "contains"},
+      {source: "copilot", target: "emojify", type: "contains"},
+      {source: "copilot", target: "clip-youtube-transcript", type: "contains"},
+      {source: "copilot", target: "clip-web-page", type: "contains"},
+      
+      // Note connections (sample)
+      {source: "untitled-1", target: "daily-note", type: "based-on"},
+      {source: "untitled-2", target: "project-template", type: "based-on"},
+      {source: "untitled-3", target: "resource-template", type: "based-on"},
+      {source: "untitled-4", target: "weekly-orbit-review", type: "based-on"},
+      {source: "untitled-5", target: "summarize", type: "inspired-by"},
+      {source: "untitled-6", target: "translate-chinese", type: "inspired-by"},
+      {source: "untitled-7", target: "fix-grammar", type: "uses"},
+      {source: "untitled-8", target: "emojify", type: "uses"},
+      {source: "untitled-9", target: "clip-youtube-transcript", type: "uses"},
+      {source: "untitled-10", target: "make-shorter", type: "uses"},
+      {source: "untitled-11", target: "generate-toc", type: "uses"},
+      {source: "untitled-12", target: "resource-template", type: "references"},
+      {source: "untitled-13", target: "project-plan", type: "references"},
+      
+      // Test note connections
+      {source: "test-note", target: "daily-note", type: "based-on"},
+      {source: "test-note", target: "fix-grammar", type: "uses"}
+    ];
+
+    // Set up the SVG container
+    const width = 1200;
+    const height = 1200;
+    
+    const svg = d3.select("#graph-container")
+      .append("svg")
+      .attr("width", width)
+      .attr("height", height)
+      .style("position", "absolute")
+      .style("top", 0)
+      .style("left", 0);
+
+    // Add zoom and pan capabilities
+    const zoom = d3.zoom()
+      .scaleExtent([0.3, 3])
+      .on("zoom", (event) => {
+        g.attr("transform", event.transform);
+      });
+
+    svg.call(zoom);
+
+    const g = svg.append("g");
+
+    // Create links
+    const link = g.append("g")
+      .attr("class", "links")
+      .selectAll("line")
+      .data(links)
+      .enter()
+      .append("line")
+      .attr("class", "link")
+      .style("stroke", (d) => {
+        // Color links by type
+        switch(d.type) {
+          case "contains": return "#00ffea";      // cyan
+          case "uses": return "#ff00ea";          // magenta
+          case "related": return "#ffd700";       // gold
+          case "based-on": return "#88c0d0";      // light blue
+          case "inspired-by": return "#b48ead";   // purple
+          case "references": return "#a3be8c";    // green
+          default: return "rgba(0, 255, 234, 0.3)";
+        }
+      });
+
+    // Create nodes
+    const node = g.append("g")
+      .attr("class", "nodes")
+      .selectAll("g")
+      .data(nodes)
+      .enter()
+      .append("g")
+      .attr("class", "node")
+      .call(d3.drag()
+        .on("start", dragstarted)
+        .on("drag", dragged)
+        .on("end", dragended));
+
+    node.append("circle")
+      .attr("r", (d) => {
+        // Size based on category importance
+        switch(d.category) {
+          case "Projects": return 18;
+          case "Templates": return 16;
+          case "Resources": return 15;
+          case "Copilot": return 14;
+          default: return 12;
+        }
+      })
+      .attr("class", (d) => `node-${d.category.toLowerCase()}`)
+      .on("mouseover", function(event, d) {
+        d3.select(this).transition()
+          .duration(200)
+          .attr("r", d.category === "Projects" ? 22 : 
+                 d.category === "Templates" ? 20 :
+                 d.category === "Resources" ? 18 : 16);
+        
+        // Show info panel
+        showInfo(d);
+      })
+      .on("mouseout", function() {
+        d3.select(this).transition()
+          .duration(200)
+          .attr("r", (d) => {
+            switch(d.category) {
+              case "Projects": return 18;
+              case "Templates": return 16;
+              case "Resources": return 15;
+              case "Copilot": return 14;
+              default: return 12;
+            }
+          });
+      })
+      .on("click", function(event, d) {
+        showInfo(d);
+      });
+
+    node.append("text")
+          .attr("dy", ".35em")
+          .text((d) => d.name)
+          .style("font-size", "10px")
+          .style("text-anchor", "middle");
+
+        // Tooltip element
+        const tooltip = d3.select("#tooltip");
+
+        // Show tooltip on hover
+        node.on("mousemove", function(event, d) {
+          tooltip.style("left", (event.pageX + 15) + "px")
+                 .style("top", (event.pageY - 10) + "px")
+                 .html(`<strong>${d.name}</strong><br><em>${d.category}</em><br>${getDescription(d.id)}`)
+                 .classed("visible", true);
+        })
+        .on("mouseout", function() {
+          tooltip.classed("visible", false);
+        });
+
+        // Simulation
+    const simulation = d3.forceSimulation(nodes)
+      .force("link", d3.forceLink(links).id(d => d.id).distance(150))
+      .force("charge", d3.forceManyBody().strength(-400))
+      .force("center", d3.forceCenter(width / 2, height / 2))
+      .force("collision", d3.forceCollide(20));
+
+    simulation.on("tick", () => {
+      link
+        .attr("x1", d => d.source.x)
+        .attr("y1", d => d.source.y)
+        .attr("x2", d => d.target.x)
+        .attr("y2", d => d.target.y);
+
+      node
+        .attr("transform", d => `translate(${d.x},${d.y})`);
+    });
+
+    // Drag functions
+    function dragstarted(event, d) {
+      if (!event.active) simulation.alphaTarget(0.3).restart();
+      d.fx = d.x;
+      d.fy = d.y;
+    }
+
+    function dragged(event, d) {
+      d.fx = event.x;
+      d.fy = event.y;
+    }
+
+    function dragended(event, d) {
+      if (!event.active) simulation.alphaTarget(0);
+      d.fx = null;
+      d.fy = null;
+    }
+
+    // Info panel functions
+    function showInfo(nodeData) {
+      const infoContent = document.getElementById('info-content');
+      infoContent.innerHTML = `
+        <p><strong>${nodeData.name}</strong></p>
+        <p><em>${nodeData.category}</em></p>
+        <p>${getDescription(nodeData.id)}</p>
+      `;
+      document.getElementById('info-panel').style.display = 'block';
+    }
+
+    function getDescription(nodeId) {
+      const descriptions = {
+        "home": "Main index page of your Obsidian vault",
+        "templates": "Folder containing all your note templates",
+        "resources": "Collection of reference materials and resources",
+        "copilot": "GitHub Copilot custom prompts collection",
+        "weekly-orbit-review": "Weekly review template for your knowledge garden",
+        "resource-template": "Template for creating resource notes",
+        "project-template": "Template for project planning and tracking",
+        "project-plan": "Template for detailed project planning",
+        "daily-note": "Daily journaling template",
+        "origin-dashbook": "Your main dashboard or homepage",
+        "google-web-designer": "Resource about Google Web Designer tool",
+        "test-note": "Test note created during setup"
+      };
+      
+      return descriptions[nodeId] || "A note in your knowledge base";
+    }
+
+    // Event listeners
+    document.getElementById('reset-btn').addEventListener('click', () => {
+      svg.transition()
+        .duration(750)
+        .call(zoom.transform, d3.zoomIdentity);
+    });
+
+    document.getElementById('info-toggle').addEventListener('click', () => {
+      const panel = document.getElementById('info-panel');
+      panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    });
+
+    // Fit all nodes in view
+    document.getElementById('fit-btn').addEventListener('click', () => {
+      const bounds = g.node().getBBox();
+      const fullWidth = width;
+      const fullHeight = height;
+      const scale = Math.min(fullWidth / bounds.width, fullHeight / bounds.height) * 0.9;
+      const translate = [
+        (fullWidth - bounds.width * scale) / 2 - bounds.x * scale,
+        (fullHeight - bounds.height * scale) / 2 - bounds.y * scale
+      ];
+      svg.transition()
+        .duration(750)
+        .call(zoom.transform, d3.zoomIdentity.translate(translate[0], translate[1]).scale(scale));
+    });
+
+    // Export as PNG
+    document.getElementById('export-btn').addEventListener('click', () => {
+      const svgElement = document.querySelector('#graph-container svg');
+      const serializer = new XMLSerializer();
+      const svgString = serializer.serializeToString(svgElement);
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      const img = new Image();
+      const svgBlob = new Blob([svgString], {type: 'image/svg+xml;charset=utf-8'});
+      const url = URL.createObjectURL(svgBlob);
+      
+      img.onload = () => {
+        canvas.width = width * 2;
+        canvas.height = height * 2;
+        ctx.scale(2, 2);
+        ctx.drawImage(img, 0, 0);
+        URL.revokeObjectURL(url);
+        
+        const link = document.createElement('a');
+        link.download = 'memory-graph.png';
+        link.href = canvas.toDataURL('image/png');
+        link.click();
+      };
+      
+      img.src = url;
+    });
+
+    // Search/filter nodes
+    document.getElementById('search-box').addEventListener('input', (event) => {
+      const query = event.target.value.toLowerCase().trim();
+      
+      node.style('display', (d) => {
+        if (!query) return null;
+        const matches = d.name.toLowerCase().includes(query) || 
+                       d.category.toLowerCase().includes(query);
+        return matches ? null : 'none';
+      });
+      
+      link.style('display', (d) => {
+        if (!query) return null;
+        const sourceMatch = d.source.name.toLowerCase().includes(query) || 
+                           d.source.category.toLowerCase().includes(query);
+        const targetMatch = d.target.name.toLowerCase().includes(query) || 
+                           d.target.category.toLowerCase().includes(query);
+        return (sourceMatch && targetMatch) ? null : 'none';
+      });
+    });
+
+    // Close info panel when clicking outside
+    document.addEventListener('click', (event) => {
+      const panel = document.getElementById('info-panel');
+      if (panel && !panel.contains(event.target) && 
+          !event.target.closest('.node')) {
+        panel.style.display = 'none';
+      }
+    });
+  </script>
+</body>
+</html>
