@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -258,6 +259,43 @@ def _serialise_value(value: Any) -> Optional[dict]:
     return {"text": str(value)}
 
 
+def _recovery_file_sort_key(path: Path) -> tuple[float, int, str]:
+    """Order legacy and ordered files using persisted chronology when available.
+
+    Legacy ``pending-<uuid>.json`` names carry no sequence.  Payload timestamps
+    establish cross-version order; ordered filenames provide their durable
+    same-timestamp sequence while legacy files fall back to mtime.  The name is
+    only the conservative final fallback when order is otherwise unknowable.
+    """
+    try:
+        mtime_ns = path.stat().st_mtime_ns
+    except OSError:
+        mtime_ns = 0
+    timestamp = mtime_ns / 1_000_000_000
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        raw_timestamp = payload.get("ts") if isinstance(payload, dict) else None
+        if isinstance(raw_timestamp, (int, float)):
+            try:
+                candidate = float(raw_timestamp)
+            except OverflowError:
+                candidate = math.nan
+            if math.isfinite(candidate):
+                timestamp = candidate
+    except (OSError, ValueError, TypeError):
+        pass
+
+    ordered_sequence = None
+    name_parts = path.stem.split("-")
+    if len(name_parts) == 3 and name_parts[0] == "pending":
+        try:
+            ordered_sequence = int(name_parts[1])
+        except ValueError:
+            pass
+    tie_breaker = ordered_sequence if ordered_sequence is not None else mtime_ns
+    return timestamp, tie_breaker, path.name
+
+
 def recover_pending_to_db(
     session_db=None,
 ) -> int:
@@ -280,7 +318,7 @@ def recover_pending_to_db(
         Number of messages recovered.
     """
     flush_dir = _get_flush_dir()
-    flush_files = sorted(flush_dir.glob("*.json"))
+    flush_files = sorted(flush_dir.glob("*.json"), key=_recovery_file_sort_key)
     if not flush_files:
         return 0
 
@@ -292,7 +330,9 @@ def recover_pending_to_db(
         own_db = True
 
     recovered = 0
+    blocked_session_keys: set[str] = set()
     for path in flush_files:
+        session_key = ""
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots use a different schema (reason +
@@ -301,6 +341,8 @@ def recover_pending_to_db(
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
             session_key = payload.get("session_key", "")
+            if session_key in blocked_session_keys:
+                continue
             data = payload.get("data", {})
             text = data.get("text", "")
             if not text or not session_key:
@@ -309,6 +351,8 @@ def recover_pending_to_db(
                     "the flush file has been preserved",
                     path,
                 )
+                if session_key:
+                    blocked_session_keys.add(session_key)
                 continue
 
             # The session_key is a gateway routing key (e.g.
@@ -331,6 +375,7 @@ def recover_pending_to_db(
                     "preserved in %s",
                     session_key, path,
                 )
+                blocked_session_keys.add(session_key)
                 continue
 
             session_db.append_message(
@@ -347,6 +392,8 @@ def recover_pending_to_db(
                 path, exc,
             )
             # Leave the file for next startup retry.
+            if session_key:
+                blocked_session_keys.add(session_key)
 
     if own_db:
         try:

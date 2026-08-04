@@ -6749,7 +6749,22 @@ class BasePlatformAdapter(ABC):
         # Flush pending messages to disk before clearing (#72680).
         try:
             from gateway.shutdown_flush import flush_pending_to_file
-            flush_pending_to_file(self._pending_messages, reason="adapter_shutdown")
+
+            session_ids = {}
+            session_store = getattr(self, "_session_store", None)
+            if session_store is not None:
+                for session_key in self._pending_messages:
+                    try:
+                        session_id = session_store.peek_session_id(session_key)
+                    except Exception:
+                        session_id = None
+                    if session_id:
+                        session_ids[session_key] = session_id
+            flush_pending_to_file(
+                self._pending_messages,
+                reason="adapter_shutdown",
+                session_ids=session_ids,
+            )
         except Exception:
             pass
         self._pending_messages.clear()
