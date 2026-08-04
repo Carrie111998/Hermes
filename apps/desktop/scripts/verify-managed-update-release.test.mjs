@@ -15,7 +15,7 @@ import {
 
 const manifest = {
   productName: 'evaOS Agent',
-  version: '2026.7.20-es.10',
+  version: '2026.7.20-es.11',
   build: {
     appId: 'com.electricsheephq.evaos.agent',
     artifactName: 'evaOS-Agent-${version}-${arch}.${ext}',
@@ -141,7 +141,7 @@ test('parses electron-builder mac update metadata without reading release notes 
 test('derives release filenames from package metadata', () => {
   assert.equal(
     renderArtifactName(manifest, { arch: 'arm64', ext: 'dmg', version: manifest.version }),
-    'evaOS-Agent-2026.7.20-es.10-arm64.dmg'
+    'evaOS-Agent-2026.7.20-es.11-arm64.dmg'
   )
 })
 

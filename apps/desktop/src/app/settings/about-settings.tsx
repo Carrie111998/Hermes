@@ -95,6 +95,13 @@ function ManagedAboutSettings() {
         <ListRow description={a.managed.attributionDescription} title={a.managed.attributionTitle} />
         <ListRow description={a.managed.distributionDescription} title={a.managed.distributionTitle} />
       </div>
+
+      <div className="mx-auto mt-4 flex w-full max-w-2xl justify-center">
+        <Button onClick={() => openUpdatesWindow()} size="sm" variant="textStrong">
+          <RefreshCw className="size-3" />
+          {a.checkNow}
+        </Button>
+      </div>
     </SettingsContent>
   )
 }

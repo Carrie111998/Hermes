@@ -261,7 +261,7 @@ export function startActiveUpdate(): void {
  * check answer, and only apply when there's something to install.
  */
 export function requestActiveUpdate(): void {
-  const target: UpdateTarget = isRemoteMode() ? 'backend' : 'client'
+  const target: UpdateTarget = isManagedEva() ? 'client' : isRemoteMode() ? 'backend' : 'client'
   const status = target === 'backend' ? $backendUpdateStatus.get() : $updateStatus.get()
 
   if ((status?.behind ?? 0) > 0 || status?.updateAvailable) {
