@@ -52,6 +52,8 @@ BRANCH="main"
 USE_VENV=true
 RUN_SETUP=true
 SKIP_RUST=false
+WITH_SEMANTIC_MEMORY=false
+WITH_AGENT_GRAPH=false
 
 # ── Logging ─────────────────────────────────────────────────────────
 log()   { echo -e "${GREEN}[RI]${NC} $1"; }
@@ -82,11 +84,15 @@ show_help() {
     echo "  curl -fsSL https://recursiveintell.com/hermes/install.sh | bash"
     echo
     echo "Options:"
-    echo "  --skip-rust     Skip PyO3 wheel installation"
-    echo "  --no-venv       Use system Python instead of uv venv"
-    echo "  --skip-setup    Skip post-install setup wizard"
-    echo "  --branch NAME   Install from a specific branch (default: main)"
-    echo "  --help          Show this message"
+    echo "  --skip-rust              Skip PyO3 wheel installation"
+    echo "  --no-venv                Use system Python instead of uv venv"
+    echo "  --skip-setup             Skip post-install setup wizard"
+    echo "  --branch NAME            Install from a specific branch (default: main)"
+    echo
+    echo "  --with-semantic-memory   Install semantic-memory MCP server (knowledge base)"
+    echo "  --with-agent-graph       Install agent-graph MCP server (multi-agent graphs)"
+    echo "  --with-all-mcp           Install both MCP servers above"
+    echo "  --help                   Show this message"
     echo
     echo "Disable Rust acceleration after install:"
     echo "  HERMES_RI_PIPELINE=0 hermes"
@@ -100,6 +106,9 @@ while [ $# -gt 0 ]; do
         --no-venv)      USE_VENV=false; shift ;;
         --skip-setup)   RUN_SETUP=false; shift ;;
         --branch)       BRANCH="$2"; shift 2 ;;
+        --with-semantic-memory)  WITH_SEMANTIC_MEMORY=true; shift ;;
+        --with-agent-graph)      WITH_AGENT_GRAPH=true; shift ;;
+        --with-all-mcp) WITH_SEMANTIC_MEMORY=true; WITH_AGENT_GRAPH=true; shift ;;
         --help)         show_help ;;
         *)              warn "Unknown option: $1"; show_help ;;
     esac
@@ -224,6 +233,79 @@ install_rust_wheels() {
     fi
 }
 
+# ── Install MCP servers (prebuilt binaries) ──────────────────────────
+install_mcp_servers() {
+    local installed_any=false
+
+    # ── semantic-memory ──────────────────────────────────────────
+    if [ "$WITH_SEMANTIC_MEMORY" = true ]; then
+        echo
+        step "Installing semantic-memory MCP server..."
+        info "  Knowledge base + memory store. Lets Hermes remember across sessions,"
+        info "  search past conversations, and build a personal knowledge graph."
+
+        local asset="semantic-memory-mcp-linux-x64"
+        local url="https://github.com/RecursiveIntell/semantic-memory-mcp/releases/latest/download/${asset}"
+        local dest="$HOME/.local/bin/semantic-memory-mcp"
+
+        if [ "$OS" != "linux" ]; then
+            warn "  Prebuilt binary only available for Linux. Build from source:"
+            warn "    cargo install semantic-memory-mcp"
+        elif curl -fsSL "$url" -o "$dest" 2>/dev/null; then
+            chmod +x "$dest"
+            ok "semantic-memory-mcp → $dest"
+            installed_any=true
+        else
+            fail "semantic-memory-mcp download failed. Build from source:"
+            fail "  cargo install semantic-memory-mcp"
+        fi
+    fi
+
+    # ── agent-graph ──────────────────────────────────────────────
+    if [ "$WITH_AGENT_GRAPH" = true ]; then
+        echo
+        step "Installing agent-graph MCP server..."
+        info "  Multi-agent graph orchestration. Run 9+ LLM nodes in parallel fan-out,"
+        info "  council deliberation, plan→critique→refine pipelines, HITL approvals."
+
+        local asset="agent-graph-mcp-linux-x64"
+        local url="https://github.com/RecursiveIntell/agent-graph-mcp/releases/latest/download/${asset}"
+        local proxy_dest="$HOME/.local/bin/agent-graph-mcp"
+        local daemon_dest="$HOME/.local/bin/agent-graph-mcpd"
+
+        if [ "$OS" != "linux" ]; then
+            warn "  Prebuilt binary only available for Linux. Build from source:"
+            warn "    cargo install agent-graph-mcp"
+        elif curl -fsSL "$url" -o "$proxy_dest" 2>/dev/null; then
+            chmod +x "$proxy_dest"
+            ok "agent-graph-mcp → $proxy_dest"
+            # The release asset is a combined binary; symlink for daemon
+            ln -sf "$proxy_dest" "$daemon_dest"
+            ok "agent-graph-mcpd → $daemon_dest (symlink)"
+            installed_any=true
+        else
+            fail "agent-graph-mcp download failed. Build from source:"
+            fail "  cargo install agent-graph-mcp"
+        fi
+    fi
+
+    # ── Coming soon ──────────────────────────────────────────────
+    if [ "$WITH_SEMANTIC_MEMORY" = true ] || [ "$WITH_AGENT_GRAPH" = true ]; then
+        echo
+        info "Coming soon (source-only for now):"
+        info "  claim-ledger-mcp    — evidence/claim verification ledger"
+        info "  forge-memory-bridge — Forge → semantic-memory import bridge"
+        info "  Build with: cargo install <crate-name>"
+    fi
+
+    if [ "$installed_any" = true ]; then
+        echo
+        ok "MCP servers installed. Register them in Hermes config or run:"
+        info "  hermes mcp add semantic-memory -- ..."
+        info "  hermes mcp add agent-graph -- ..."
+    fi
+}
+
 # ── Configure RecursiveIntell defaults ───────────────────────────────
 configure_ri_defaults() {
     step "Configuring RecursiveIntell defaults..."
@@ -274,6 +356,18 @@ print_next_steps() {
     echo    "    context-governor → deterministic prompt compaction"
     echo    "    poly-kv       → vector scoring"
     echo
+
+    if [ "$WITH_SEMANTIC_MEMORY" = true ] || [ "$WITH_AGENT_GRAPH" = true ]; then
+        echo -e "  ${BOLD}MCP servers installed:${NC}"
+        [ "$WITH_SEMANTIC_MEMORY" = true ] && echo "    semantic-memory → knowledge base + memory search"
+        [ "$WITH_AGENT_GRAPH" = true ] && echo "    agent-graph     → multi-agent graph orchestration (daemon: agent-graph-mcpd)"
+        echo
+        echo -e "  ${BOLD}Register in Hermes:${NC}"
+        echo    "    hermes mcp add semantic-memory -- ~/.local/bin/semantic-memory-mcp"
+        echo    "    hermes mcp add agent-graph -- ~/.local/bin/agent-graph-mcp --socket /tmp/agent-graph/mcp.sock"
+        echo
+    fi
+
     echo -e "  ${BOLD}Disable a path:${NC}"
     echo    "    HERMES_RI_PIPELINE=0 hermes"
     echo
@@ -302,6 +396,7 @@ main() {
     clone_repo
     setup_python
     install_rust_wheels
+    install_mcp_servers
     configure_ri_defaults
     run_setup
     print_next_steps
