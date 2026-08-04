@@ -83,6 +83,7 @@ def _native_plan_mapping(
     writer_unit_sha256: str,
     gateway_unit_sha256: str,
     collector_sha256: str = COLLECTOR_SHA256,
+    external_iam_policy_sha256: str = "e" * 64,
 ) -> dict[str, Any]:
     root = f"/opt/muncho-canary-releases/{SOURCE_REVISION}"
     interpreter = f"{root}/venv/bin/python"
@@ -179,7 +180,7 @@ def _native_plan_mapping(
             "/opt/adventico-ai-platform/canonical-brain/bin/"
             "cloud_sql_synthetic_write_gate.py"
         ),
-        "external_iam_policy_sha256": "e" * 64,
+        "external_iam_policy_sha256": external_iam_policy_sha256,
     }
 
 
@@ -273,6 +274,10 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         staging_root / "muncho-canonical-writer-phase-b-readiness.service"
     )
     gateway_unit_path = staging_root / "hermes-cloud-gateway.service"
+    owner_approval_path = staging_root / "owner-approval.json"
+    external_iam_path = staging_root / "external-iam-receipt.json"
+    quarantine_path = tmp_path / "writer-failure" / "quarantine.json"
+    native_failure_root = tmp_path / "native-failures"
     writer_raw = b'{"writer":"stopped"}'
     gateway_raw = b"gateway: stopped\n"
     writer_path.write_bytes(writer_raw)
@@ -337,6 +342,22 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "DEFAULT_STAGED_GATEWAY_UNIT_PATH",
         gateway_unit_path,
     )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_OWNER_APPROVAL_PATH",
+        owner_approval_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_STAGED_EXTERNAL_IAM_PATH",
+        external_iam_path,
+    )
+    monkeypatch.setattr(recovery, "DEFAULT_QUARANTINE_PATH", quarantine_path)
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_NATIVE_FAILURE_ROOT",
+        native_failure_root,
+    )
     monkeypatch.setattr(recovery, "CONFIG_COLLECTOR_EVIDENCE_ROOT", evidence_root)
     monkeypatch.setattr(
         recovery,
@@ -345,6 +366,8 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             writer_path,
             gateway_path,
             native_plan_path,
+            owner_approval_path,
+            external_iam_path,
             installed_native_plan_path,
             foreign_path,
             writer_unit_path,
@@ -367,7 +390,15 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             "muncho-canonical-writer-phase-b-readiness.service",
             "hermes-cloud-gateway.service",
         })
-        if not path.is_dir() or frozenset(os.listdir(path)) not in {pair, bundle}:
+        failed = bundle | frozenset({
+            "owner-approval.json",
+            "external-iam-receipt.json",
+        })
+        if not path.is_dir() or frozenset(os.listdir(path)) not in {
+            pair,
+            bundle,
+            failed,
+        }:
             raise RuntimeError("test staging directory is not exact")
         return frozenset(os.listdir(path))
 
@@ -408,6 +439,10 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "writer_unit_path": writer_unit_path,
         "phase_b_unit_path": phase_b_unit_path,
         "gateway_unit_path": gateway_unit_path,
+        "owner_approval_path": owner_approval_path,
+        "external_iam_path": external_iam_path,
+        "quarantine_path": quarantine_path,
+        "native_failure_root": native_failure_root,
         "recovery_root": recovery_root,
         "foreign_path": foreign_path,
         "service_states": service_states,
@@ -617,6 +652,124 @@ def _write_complete_bundle_with_installed_native(
     return extras, native_raw
 
 
+def _external_iam_mapping(*, source_approval_sha256: str) -> dict[str, Any]:
+    return {
+        "schema": "muncho-writer-external-iam-evidence.v1",
+        "project": "adventico-ai-platform",
+        "zone": "europe-west3-a",
+        "instance": "muncho-canary-v2-01",
+        "service_account": (
+            "muncho-canary-v2-runtime@adventico-ai-platform.iam.gserviceaccount.com"
+        ),
+        "scopes": ["https://www.googleapis.com/auth/cloud-platform"],
+        "roles": [
+            "roles/logging.logWriter",
+            "roles/monitoring.metricWriter",
+            ("projects/adventico-ai-platform/roles/munchoCanaryCloudSqlReadinessV1"),
+        ],
+        "permissions": [
+            "cloudsql.instances.get",
+            "logging.logEntries.create",
+            "logging.logEntries.route",
+            "monitoring.metricDescriptors.create",
+            "monitoring.metricDescriptors.get",
+            "monitoring.metricDescriptors.list",
+            "monitoring.monitoredResourceDescriptors.get",
+            "monitoring.monitoredResourceDescriptors.list",
+            "monitoring.timeSeries.create",
+        ],
+        "foundation_plan_sha256": "1" * 64,
+        "host_plan_sha256": "2" * 64,
+        "foundation_report_sha256": "3" * 64,
+        "host_report_sha256": "4" * 64,
+        "source_approval_sha256": source_approval_sha256,
+        "collected_at_unix": 100,
+        "expires_at_unix": 1300,
+    }
+
+
+def _write_failed_native_bundle(
+    recovery_tree: dict[str, Any],
+) -> tuple[dict[Path, bytes], bytes, bytes]:
+    writer_unit = b"[Service]\nExecStart=/writer\n"
+    gateway_unit = b"[Service]\nExecStart=/gateway\n"
+    policy_receipt = recovery.ExternalIAMReceipt.from_mapping(
+        _external_iam_mapping(source_approval_sha256="0" * 64)
+    )
+    native_mapping = _native_plan_mapping(
+        writer_sha256=_sha256(recovery_tree["writer_raw"]),
+        gateway_sha256=_sha256(recovery_tree["gateway_raw"]),
+        writer_unit_sha256=_sha256(writer_unit),
+        gateway_unit_sha256=_sha256(gateway_unit),
+        external_iam_policy_sha256=policy_receipt.policy_sha256,
+    )
+    native = recovery.NativeObservationPlan.from_mapping(native_mapping)
+    native_raw = recovery._canonical_bytes(native.to_mapping())
+    owner = recovery.OwnerApprovalReceipt.from_mapping({
+        "schema": "muncho-writer-owner-approval.v1",
+        "scope": "native_observation",
+        "plan_sha256": native.sha256,
+        "authority_kind": "trusted_root_bootstrap_out_of_band_owner",
+        "cryptographic_owner_proof": False,
+        "owner_subject_sha256": "5" * 64,
+        "approval_source_sha256": "6" * 64,
+        "nonce_sha256": "7" * 64,
+        "approved_at_unix": 100,
+        "expires_at_unix": 400,
+    })
+    iam = recovery.ExternalIAMReceipt.from_mapping(
+        _external_iam_mapping(source_approval_sha256=owner.sha256)
+    )
+    owner_raw = recovery._canonical_bytes(owner.to_mapping())
+    iam_raw = recovery._canonical_bytes(iam.to_mapping())
+    phase_b_unit = recovery.render_phase_b_readiness_service(
+        revision=SOURCE_REVISION,
+        artifact_root=f"/opt/muncho-canary-releases/{SOURCE_REVISION}",
+        artifact_sha256="d" * 64,
+    ).encode()
+    extras = {
+        recovery_tree["native_plan_path"]: native_raw,
+        recovery_tree["writer_unit_path"]: writer_unit,
+        recovery_tree["phase_b_unit_path"]: phase_b_unit,
+        recovery_tree["gateway_unit_path"]: gateway_unit,
+        recovery_tree["owner_approval_path"]: owner_raw,
+        recovery_tree["external_iam_path"]: iam_raw,
+    }
+    for path, raw in extras.items():
+        path.write_bytes(raw)
+    recovery_tree["installed_native_plan_path"].write_bytes(native_raw)
+    failure_path = (
+        recovery_tree["native_failure_root"]
+        / SOURCE_REVISION
+        / native.sha256
+        / "failures"
+        / "failure-123-456.json"
+    )
+    failure_path.parent.mkdir(parents=True)
+    failure = {
+        "schema": "muncho-writer-only-activation-failure.v1",
+        "revision": SOURCE_REVISION,
+        "native_observation_plan_sha256": native.sha256,
+        "owner_approval_receipt_sha256": owner.sha256,
+        "owner_approval_receipt": owner.to_mapping(),
+        "external_iam_evidence": {},
+        "stage": "read_only_preflight",
+        "error_type": "ValueError",
+        "error_sha256": "8" * 64,
+        "failed_at_unix": 200,
+        "quarantined": True,
+        "failure_receipt_path": str(failure_path),
+        "host_preparation_sha256": recovery._sha256_json({}),
+        "host_preparation_evidence": {},
+        "stage_preserved": False,
+    }
+    failure_raw = recovery._canonical_bytes(failure)
+    failure_path.write_bytes(failure_raw)
+    recovery_tree["quarantine_path"].parent.mkdir(parents=True)
+    recovery_tree["quarantine_path"].write_bytes(failure_raw)
+    return extras, native_raw, failure_raw
+
+
 def test_apply_archives_identical_installed_native_plan_crash_safely(
     recovery_tree: dict[str, Any],
 ) -> None:
@@ -664,6 +817,123 @@ def test_apply_archives_identical_installed_native_plan_crash_safely(
         lifecycle_lock=contextlib.nullcontext,
     )
     assert repeated == receipt
+
+
+def test_apply_archives_exact_read_only_preflight_failure_chain_last(
+    recovery_tree: dict[str, Any],
+) -> None:
+    extras, native_raw, failure_raw = _write_failed_native_bundle(recovery_tree)
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+    assert plan["schema"] == recovery.FAILED_NATIVE_PLAN_SCHEMA
+    assert set(plan["staged_artifacts"]) == {
+        "writer.json",
+        "gateway.yaml",
+        "native-observation-plan.json",
+        "muncho-canonical-writer.service",
+        "muncho-canonical-writer-phase-b-readiness.service",
+        "hermes-cloud-gateway.service",
+        "owner-approval.json",
+        "external-iam-receipt.json",
+    }
+    failed = plan["failed_native_observation"]
+    assert failed["source_path"] == str(recovery_tree["quarantine_path"])
+    assert failed["sha256"] == _sha256(failure_raw)
+    assert failed["failure_receipt_sha256"] == _sha256(failure_raw)
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 891,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    archive = Path(plan["archive_path"])
+    installed_archive = Path(plan["installed_native_observation_plan"]["archive_path"])
+    failure_archive = Path(failed["archive_path"])
+    assert not recovery_tree["staging_root"].exists()
+    assert not recovery_tree["installed_native_plan_path"].exists()
+    assert not recovery_tree["quarantine_path"].exists()
+    assert installed_archive.read_bytes() == native_raw
+    assert failure_archive.read_bytes() == failure_raw
+    assert Path(failed["failure_receipt_path"]).read_bytes() == failure_raw
+    for path, raw in extras.items():
+        assert (archive / path.name).read_bytes() == raw
+    assert receipt["schema"] == recovery.FAILED_NATIVE_RECEIPT_SCHEMA
+    assert receipt["failure_quarantine_archived"] is True
+    assert receipt["failure_quarantine_deleted"] is False
+    assert receipt["failure_receipt_preserved"] is True
+
+    repeated = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 999,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+    assert repeated == receipt
+
+
+def test_failed_native_recovery_rejects_unbound_quarantine(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(recovery_tree)
+    value = json.loads(recovery_tree["quarantine_path"].read_text())
+    value["native_observation_plan_sha256"] = "f" * 64
+    recovery_tree["quarantine_path"].write_bytes(recovery._canonical_bytes(value))
+
+    with pytest.raises(ValueError, match="quarantine binding is invalid"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_failed_native_recovery_resumes_with_quarantine_still_blocking(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(recovery_tree)
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    recovery_tree["recovery_root"].mkdir()
+    recovery._write_intent(plan)
+    installed = plan["installed_native_observation_plan"]
+    os.rename(
+        recovery_tree["installed_native_plan_path"],
+        Path(installed["archive_path"]),
+    )
+    os.rename(recovery_tree["staging_root"], Path(plan["archive_path"]))
+
+    assert recovery_tree["quarantine_path"].is_file()
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 892,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert receipt["created_at_unix"] == 892
+    assert not recovery_tree["quarantine_path"].exists()
+    assert Path(plan["failed_native_observation"]["archive_path"]).is_file()
+
+
+def test_failed_native_recovery_rejects_quarantine_moved_before_residue(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(recovery_tree)
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    recovery_tree["recovery_root"].mkdir()
+    recovery._write_intent(plan)
+    os.rename(
+        recovery_tree["quarantine_path"],
+        Path(plan["failed_native_observation"]["archive_path"]),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="quarantine moved before residue",
+    ):
+        recovery.apply_stopped_writer_residue_recovery(
+            TARGET_REVISION,
+            plan["plan_sha256"],
+            lifecycle_lock=contextlib.nullcontext,
+        )
 
 
 def test_apply_resumes_after_installed_native_plan_rename(
