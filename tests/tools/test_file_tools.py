@@ -6,10 +6,13 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+
+import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.file_tools import (
     PATCH_SCHEMA,
+    _check_sensitive_path,
 )
 
 
@@ -994,3 +997,59 @@ class TestNotFoundCache:
         assert _check_not_found_cache("read", "/tmp/never-exists-notify", tid) is None, (
             "notify_other_tool_call must clear cached misses"
         )
+
+
+class TestSensitivePathGuardIsSeparatorAgnostic:
+    r"""The sensitive-path guard must hold on Windows, not just POSIX.
+
+    ``_SENSITIVE_PATH_PREFIXES`` / ``_SENSITIVE_EXACT_PATHS`` are written in
+    POSIX form, but ``_check_sensitive_path`` builds its comparison strings
+    with ``os.path.normpath`` and ``_resolve_path_for_task``. On Windows both
+    route through ``ntpath``, which rewrites ``/etc/resolv.conf`` to
+    ``\etc\resolv.conf`` — so every ``startswith`` missed and the guard
+    returned None for every sensitive path.
+
+    That is not cosmetic: a task running on a Windows host whose file_ops
+    backend is a Linux container (see ``_file_ops_uses_host_paths``) targets a
+    real ``/etc``, so the write guard was fully bypassed there.
+    """
+
+    @pytest.mark.parametrize(
+        "sensitive",
+        [
+            "/etc/resolv.conf",
+            "/boot/grub/grub.cfg",
+            "/usr/lib/systemd/system/evil.service",
+            "/private/var/db/something",
+            "/var/run/docker.sock",
+        ],
+    )
+    def test_sensitive_paths_are_blocked(self, sensitive):
+        assert _check_sensitive_path(sensitive) is not None, (
+            f"{sensitive} must be refused on every platform"
+        )
+
+    @pytest.mark.parametrize(
+        "ordinary",
+        [
+            "/home/me/project/main.py",
+            "./relative/file.txt",
+            "docs/readme.md",
+        ],
+    )
+    def test_ordinary_paths_are_not_blocked(self, ordinary):
+        assert _check_sensitive_path(ordinary) is None, (
+            f"{ordinary} is an ordinary path and must stay writable"
+        )
+
+    def test_posix_does_not_rewrite_backslashes(self):
+        r"""On POSIX a backslash is a legal filename character.
+
+        The separator normalisation must be Windows-only, otherwise a file
+        genuinely named ``foo\bar.txt`` would be reinterpreted as a path.
+        """
+        import os
+
+        if os.sep != "/":
+            pytest.skip("POSIX-only: asserts backslashes are left untouched")
+        assert _check_sensitive_path("/home/me/weird\name.txt") is None

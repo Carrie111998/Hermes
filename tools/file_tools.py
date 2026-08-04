@@ -8,7 +8,7 @@ import os
 import posixpath
 import sys
 import threading
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath
 
 from agent.file_safety import get_read_block_error
 from tools.binary_extensions import has_binary_extension
@@ -672,6 +672,24 @@ def _get_hermes_config_resolved() -> str | None:
     return _hermes_config_resolved
 
 
+def _posix_form(path: str) -> str:
+    """Return *path* with native separators flipped to ``/``.
+
+    ``_SENSITIVE_PATH_PREFIXES`` / ``_SENSITIVE_EXACT_PATHS`` are written in
+    POSIX form, but on Windows both ``os.path.normpath`` and
+    ``_resolve_path_for_task`` (which goes through ``ntpath``) rewrite
+    ``/etc/resolv.conf`` to ``\\etc\\resolv.conf`` — so every ``startswith``
+    below silently missed and the guard no-opped on a Windows host, including
+    for tasks whose file_ops backend is a Linux container where ``/etc/...``
+    really is the system path. Comparing in POSIX form makes the guard
+    separator-agnostic. Never rewrite on POSIX, where ``\\`` is a legal
+    character in a filename.
+    """
+    if os.sep == "/":
+        return path
+    return PurePath(path).as_posix()
+
+
 def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None:
     """Return an error message if the path targets a sensitive system location."""
     try:
@@ -679,14 +697,16 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     except (OSError, ValueError):
         resolved = filepath
     normalized = os.path.normpath(_expand_tilde(filepath))
+    resolved_posix = _posix_form(resolved)
+    normalized_posix = _posix_form(normalized)
     _err = (
         f"Refusing to write to sensitive system path: {filepath}\n"
         "Use the terminal tool with sudo if you need to modify system files."
     )
     for prefix in _SENSITIVE_PATH_PREFIXES:
-        if resolved.startswith(prefix) or normalized.startswith(prefix):
+        if resolved_posix.startswith(prefix) or normalized_posix.startswith(prefix):
             return _err
-    if resolved in _SENSITIVE_EXACT_PATHS or normalized in _SENSITIVE_EXACT_PATHS:
+    if resolved_posix in _SENSITIVE_EXACT_PATHS or normalized_posix in _SENSITIVE_EXACT_PATHS:
         return _err
     # Prevent agents from modifying the Hermes config file directly.
     # approvals.mode and other security settings live here; a malicious or
