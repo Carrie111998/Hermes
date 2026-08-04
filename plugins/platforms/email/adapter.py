@@ -571,6 +571,10 @@ def _extract_attachments(
 class EmailAdapter(BasePlatformAdapter):
     """Email gateway adapter using IMAP (receive) and SMTP (send)."""
 
+    # Email sends one atomic MIME message and handles long payloads itself.
+    # This prevents DeliveryRouter from truncating complete HTML documents.
+    splits_long_messages = True
+
     def __init__(self, config: PlatformConfig):
         super().__init__(config, Platform.EMAIL)
 

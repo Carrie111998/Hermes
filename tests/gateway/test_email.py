@@ -13,8 +13,11 @@ Covers:
 """
 
 import email as email_lib
+import hashlib
 import os
+import tempfile
 import unittest
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase
@@ -1154,6 +1157,80 @@ class TestSenderAuthentication(unittest.TestCase):
             authserv_id="mx.ourserver.com",
         )
         self.assertFalse(ok, reason)
+
+
+class TestLongEmailDeliveryBoundary(unittest.IsolatedAsyncioTestCase):
+    """Regression for the production arXiv digest truncated on 2026-08-04."""
+
+    def test_email_declares_atomic_long_payload_handling(self):
+        from plugins.platforms.email.adapter import EmailAdapter
+
+        self.assertIs(EmailAdapter.splits_long_messages, True)
+
+    @patch.dict(os.environ, {
+        "EMAIL_ADDRESS": "hermes@test.com",
+        "EMAIL_PASSWORD": "secret",
+        "EMAIL_IMAP_HOST": "imap.test.com",
+        "EMAIL_SMTP_HOST": "smtp.test.com",
+    }, clear=False)
+    async def test_router_preserves_exact_production_digest(self):
+        from gateway.config import GatewayConfig, Platform, PlatformConfig
+        from gateway.delivery import DeliveryRouter, DeliveryTarget
+        from plugins.platforms.email.adapter import EmailAdapter, _decode_header_value
+
+        fixture = Path(__file__).parents[1] / "fixtures" / "email" / "arxiv-cron-21757.txt"
+        payload = fixture.read_text(encoding="utf-8")
+        self.assertEqual(len(payload), 21_757)
+        self.assertEqual(
+            hashlib.sha256(payload.encode()).hexdigest(),
+            "83a89f79358e89e6fc51fc78ba7bcc3ee4c530f56ff6e66e2f50f5a7f31998c9",
+        )
+
+        config = GatewayConfig(
+            platforms={Platform.EMAIL: PlatformConfig(enabled=True)}
+        )
+        adapter = EmailAdapter(config.platforms[Platform.EMAIL])
+        smtp = MagicMock()
+
+        with tempfile.TemporaryDirectory() as home, \
+             patch("gateway.delivery.get_hermes_home", return_value=Path(home)), \
+             patch.object(adapter, "_connect_smtp", return_value=smtp):
+            router = DeliveryRouter(config, adapters={Platform.EMAIL: adapter})
+            result = await router._deliver_to_platform(
+                DeliveryTarget(platform=Platform.EMAIL, chat_id="user@test.com"),
+                payload,
+                metadata={"job_id": "43d8e7ef1f8f"},
+            )
+            audit_files = list((Path(home) / "cron" / "output").glob("*.txt"))
+            self.assertEqual(len(audit_files), 1)
+            audit_content = audit_files[0].read_text(encoding="utf-8")
+
+        self.assertTrue(getattr(result, "success", False))
+        self.assertEqual(audit_content, payload)
+        smtp.send_message.assert_called_once()
+
+        reparsed = email_lib.message_from_bytes(
+            smtp.send_message.call_args.args[0].as_bytes()
+        )
+        self.assertEqual(
+            " ".join(_decode_header_value(reparsed["Subject"]).split()),
+            "[retrieval incomplete] Exact Hamiltonian Inversion for OTOCs (+23 more)",
+        )
+        self.assertEqual(reparsed.get_content_type(), "multipart/alternative")
+        leaves = [part for part in reparsed.walk() if not part.is_multipart()]
+        self.assertEqual(
+            [part.get_content_type() for part in leaves],
+            ["text/plain", "text/html"],
+        )
+        html_payload = leaves[1].get_payload(decode=True)
+        self.assertIsInstance(html_payload, bytes)
+        html = bytes(html_payload).decode("utf-8")
+        self.assertEqual(
+            hashlib.sha256(html.encode()).hexdigest(),
+            "e23871101a91da29d94d9115e76b8c82d8b36d788f59b1ba0352e9f3f9951a45",
+        )
+        self.assertIn("QUEUE: 2607.29382", html)
+        self.assertTrue(html.rstrip().endswith("</html>"))
 
 
 if __name__ == "__main__":
