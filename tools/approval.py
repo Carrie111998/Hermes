@@ -485,31 +485,25 @@ HARDLINE_PATTERNS_COMPILED = [
 # =========================================================================
 # Sudo stdin guard — block password guessing via "sudo -S"
 # =========================================================================
-# When SUDO_PASSWORD is not configured, any explicit "sudo -S" in the
-# command is the LLM piping a guessed password via stdin.  This is a
-# brute-force attack vector: the model iterates through candidate
-# passwords, inspects sudo's "Sorry, try again" output, and refines.
-# Treat this as an unconditional block — there is never a legitimate
-# reason for the agent to pipe passwords to sudo -S when no password
-# has been configured.
+# Any explicit "sudo -S" in the submitted command is an attempt to pipe a
+# password through stdin. Hermes may inject ``-S`` internally only after an
+# interactive local prompt; that transformed command never re-enters this
+# submitted-command guard. Treat all explicit uses as an unconditional block.
 _SUDO_STDIN_RE = re.compile(
     r'(?:^|[;&|`\n]|&&|\|\||\$\()\s*sudo\s+-S\b',
     re.IGNORECASE)
 
 
 def _check_sudo_stdin_guard(command: str) -> tuple:
-    """Detect ``sudo -S`` (stdin password) without configured SUDO_PASSWORD.
+    """Detect an agent-authored ``sudo -S`` password pipe.
 
-    When SUDO_PASSWORD is set, ``_transform_sudo_command`` injects ``-S``
-    internally — that path is legitimate and handled elsewhere.  This guard
-    only fires when SUDO_PASSWORD is *not* set, meaning the LLM explicitly
-    wrote ``sudo -S`` to pipe a guessed password.
+    Hermes only adds ``-S`` after an interactive local password prompt. An
+    ``-S`` already present in the submitted command is always untrusted,
+    including when a legacy ``SUDO_PASSWORD`` environment variable exists.
 
     Returns:
         (is_blocked: bool, description: str | None)
     """
-    if "SUDO_PASSWORD" in os.environ:
-        return (False, None)
     normalized = _normalize_command_for_detection(command).lower()
     if _SUDO_STDIN_RE.search(normalized):
         return (True, "sudo password guessing via stdin (sudo -S)")
@@ -678,9 +672,8 @@ def _sudo_stdin_block_result(description: str) -> dict:
         "message": (
             f"BLOCKED: {description}. "
             "Do not pipe passwords to 'sudo -S' — this is a brute-force "
-            "attack vector. Set SUDO_PASSWORD in your .env file if the "
-            "agent needs passwordless sudo, or run the sudo command "
-            "manually in your own terminal."
+            "attack vector. Run the sudo command manually from a visible "
+            "terminal and enter the password locally."
         ),
     }
 
@@ -929,8 +922,8 @@ DANGEROUS_PATTERNS = [
     # or via an askpass helper (-A/--askpass). The shell-launch (-s) and
     # list-privileges (-a) flags are also gated since they are
     # privilege-relevant invocations the agent can chain after acquiring
-    # the password (e.g. read SUDO_PASSWORD from .env -> sudo -S -s ->
-    # root shell). Plain `sudo cmd` (no flag) is TTY-bound and excluded.
+    # a password into sudo -S -s to obtain a root shell). Plain `sudo cmd` (no
+    # flag) is TTY-bound and excluded.
     # `_normalize_command_for_detection` lowercases input before pattern
     # matching, so case variants of S/s and A/a collapse — both forms
     # are gated below. Lazy `[^;|&\n]*?` allows flag arguments (e.g.
@@ -3559,9 +3552,9 @@ def check_all_command_guards(command: str, env_type: str,
 
     # == Sudo stdin guard ==
     # Like the hardline floor above, this is unconditional: there is never a
-    # legitimate reason for the agent to pipe passwords to sudo -S when no
-    # SUDO_PASSWORD has been configured.  This must fire BEFORE the yolo
-    # check so even yolo/smart approval/mode=off cannot bypass it.
+    # legitimate reason for an agent-submitted command to pipe passwords to
+    # sudo -S. This must fire BEFORE the yolo check so even yolo/smart
+    # approval/mode=off cannot bypass it.
     is_sudo_guess, sudo_guess_desc = _check_sudo_stdin_guard(command)
     if is_sudo_guess:
         logger.warning("Sudo stdin guard block: %s (command: %s)",
