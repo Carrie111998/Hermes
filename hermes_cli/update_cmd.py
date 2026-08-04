@@ -3887,6 +3887,17 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 None,
             )
 
+            # A current checkout does NOT imply healthy dependencies. A previous
+            # Python or Node sync may have failed partway while HEAD still moved
+            # to the new commit. The Python probe below handles a damaged venv;
+            # the npm manifest/toolchain probe routes a damaged Node tree through
+            # the same managed-npm EBADENGINE recovery used after a real pull.
+            from hermes_constants import get_default_hermes_root
+
+            hermes_root = get_default_hermes_root()
+            node_repair_needed = _npm_lockfile_changed(hermes_root)
+            node_failures: list[str] = []
+
             # A current checkout does NOT imply a healthy install: a previous
             # dependency sync may have failed partway (classic on Windows,
             # where a running gateway/desktop backend keeps .pyd files locked
@@ -3895,7 +3906,8 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
             healthy, detail = _venv_core_imports_healthy()
-            if not healthy:
+            venv_repair_needed = not healthy
+            if venv_repair_needed:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
                 print(f"  {detail}")
                 print("→ Repairing Python dependencies...")
@@ -3930,13 +3942,35 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 _m()._clear_update_incomplete_marker()
                 healthy_after, detail_after = _venv_core_imports_healthy()
                 if healthy_after:
+                    healthy = True
                     print("✓ Dependencies repaired!")
-                    _print_update_completion("✓ Update complete!")
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
-                _print_update_completion("✓ Already up to date!")
+            if node_repair_needed:
+                node_failures = _update_node_dependencies()
+                if not node_failures and _npm_lockfile_changed(hermes_root):
+                    node_failures = ["dependency health check"]
+                if not node_failures:
+                    _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+                    print("✓ Node.js dependencies repaired!")
+                _finish_dashboard_update_cleanup(node_failures)
+
+            if healthy:
+                if node_failures:
+                    print()
+                    print(
+                        "⚠ Code is already up to date, but Node.js dependencies "
+                        "remain incomplete."
+                    )
+                    print(
+                        "  Ensure npm is available and resolve any dependency "
+                        "error above, then re-run `hermes update`."
+                    )
+                elif venv_repair_needed or node_repair_needed:
+                    _print_update_completion("✓ Update complete!")
+                else:
+                    _print_update_completion("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
                 print(
