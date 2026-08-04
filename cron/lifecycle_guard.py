@@ -258,7 +258,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: ``open: embedded null character in path``. A path
+        # candidate carrying a NUL byte can only come from tokenizing
+        # non-script bytes, so there is nothing to scan — and a guarded
+        # path must never crash the guard (#76762). ``_resolve_script_path``
+        # below already treats ValueError this way; os.open did not.
         return None, False
     try:
         metadata = os.fstat(descriptor)

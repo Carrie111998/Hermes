@@ -373,6 +373,32 @@ def _check_all_guards(command: str, env_type: str,
                                   has_host_access=has_host_access)
 
 
+def _script_text_if_not_binary(data: "bytes | str | None") -> Optional[str]:
+    """Return scannable script text, or ``None`` when *data* is a binary.
+
+    The lifecycle guard feeds whatever a script reader returns straight back
+    into its recursive scanner, so replacement-decoded ELF/Mach-O/PE bytes make
+    it tokenize machine code into path candidates — junk that carries NUL bytes
+    and then blows up path handling (``ValueError: open: embedded null
+    character in path``, #76762).  ``cron.lifecycle_guard._read_referenced_script``
+    already refuses binaries this way for its own local reads; every other
+    reader handed to the guard has to agree, or a command as ordinary as
+    ``/bin/ls -la`` fails.
+
+    NUL is valid UTF-8 and survives an ``errors="replace"`` decode, so the same
+    check is correct for raw bytes and for already-decoded text.
+    """
+    if data is None:
+        return None
+    if isinstance(data, bytes):
+        if b"\x00" in data:
+            return None
+        return data.decode("utf-8", errors="replace")
+    if "\x00" in data:
+        return None
+    return data
+
+
 # Allowlist: characters that can legitimately appear in directory paths.
 # Covers Unicode letters/digits, path separators, Windows drive/UNC separators,
 # tilde, dot, hyphen, underscore, space, plus, at, equals, and comma.  Shell
@@ -2533,6 +2559,12 @@ def terminal_tool(
                 For local backends the script path is on the host filesystem. For
                 SSH/Modal/Daytona the same path is remote; the local read misses, so we
                 fall back to ``env.execute('cat ...')``.
+
+                Binaries are rejected rather than returned as replacement-decoded
+                text — see ``_script_text_if_not_binary`` for why that matters
+                (#76762). Both branches must agree on it: the `cat` fallback below is
+                what actually fed decoded ELF bytes back into the scanner, because a
+                multi-megabyte interpreter fails the local size check and falls through.
                 """
                 if env is None:
                     return None
@@ -2545,14 +2577,14 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
-                                return data.decode("utf-8", errors="replace")
+                                return _script_text_if_not_binary(data)
                 except Exception:
                     pass
                 # Remote / sandboxed backend: read via the environment's shell.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        return _script_text_if_not_binary(result.get("output", ""))
                 except Exception:
                     pass
                 return None

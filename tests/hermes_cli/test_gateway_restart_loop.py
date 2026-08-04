@@ -9,6 +9,7 @@ Covers:
 import json
 import os
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -694,6 +695,72 @@ class TestLifecycleGuardModule:
             '/usr/bin/python3 -c "print(1)"'
         )
         assert result is False
+
+    def test_nul_path_from_remote_reader_does_not_crash_guard(self, tmp_path):
+        """#76762 follow-up: the same crash came back through the OTHER reader.
+
+        The test above passes because it omits ``read_remote_script`` — but
+        tools/terminal_tool.py ALWAYS passes one (``_read_script_in_env``), and
+        that fallback returned replacement-decoded binaries. The scanner then
+        tokenized machine code into path candidates carrying NUL bytes and
+        ``os.open`` raised ``ValueError: open: embedded null character in path``,
+        which the ``except OSError`` in ``_read_referenced_script`` did not catch.
+
+        Effect on a real deployment: every terminal command whose executable
+        contains a "/" failed — ``.venv/bin/python -m pytest``, ``/bin/ls -la`` —
+        after burning ~28s in the scan first.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        binary = tmp_path / "fake-interpreter"
+        # Shaped like decoded machine code: NUL bytes glued to path-ish tokens.
+        binary.write_bytes(b"\x7fELF\x00\x00./setup.sh\x00/tmp/x.sh\x00\x01\x02")
+
+        def _decode_anything(script_path):
+            """Exactly what _read_script_in_env used to do.
+
+            ``except Exception`` matches the real callback — and is load-bearing:
+            the scanner feeds junk tokens back in, and ``Path.read_bytes`` on one
+            raises ``ValueError: embedded null byte``, not OSError.
+            """
+            try:
+                return Path(script_path).read_bytes().decode("utf-8", errors="replace")
+            except Exception:
+                return None
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"{binary} --version",
+            cwd=str(tmp_path),
+            read_remote_script=_decode_anything,
+        )
+        assert result is False
+
+    def test_remote_reader_binary_rejected_before_scanning(self):
+        """The root-cause fix: a binary payload is never handed to the scanner.
+
+        Covers ``tools.terminal_tool._script_text_if_not_binary``, which both
+        branches of ``_read_script_in_env`` now route through. Catching the
+        ValueError alone is not enough — it stops the crash but leaves the
+        scanner grinding through decoded machine code (measured at >80s per
+        command on a real interpreter, worse than failing fast).
+        """
+        from tools.terminal_tool import _script_text_if_not_binary
+
+        # Binaries: rejected, as bytes and as already-decoded text (NUL is valid
+        # UTF-8, so it survives an errors="replace" decode).
+        assert _script_text_if_not_binary(b"\x7fELF\x00\x02\x01") is None
+        assert _script_text_if_not_binary("\x7fELF\x00\x02\x01") is None
+        assert _script_text_if_not_binary(None) is None
+
+        # Real shell scripts: passed through unchanged, so the guard can still
+        # walk them (see test_shell_script_reference_walk_still_works).
+        assert _script_text_if_not_binary(
+            b"#!/bin/sh\nhermes gateway restart\n"
+        ) == "#!/bin/sh\nhermes gateway restart\n"
+        assert _script_text_if_not_binary("#!/bin/sh\ntrue\n") == "#!/bin/sh\ntrue\n"
+        # Invalid UTF-8 without NULs is still text-shaped; decode, do not drop.
+        assert _script_text_if_not_binary(b"#!/bin/sh\n\xff\xfe\n") is not None
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
