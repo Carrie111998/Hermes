@@ -5,7 +5,7 @@ import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch as mock_patch
+from unittest.mock import MagicMock, patch as mock_patch
 
 import pytest
 
@@ -1503,3 +1503,163 @@ class TestCliApprovalTimeoutClassifiedSeparately:
         assert result.get("user_consent") is False
         assert "timed out without user response" in result["message"]
         assert "Silence is not consent" in result["message"]
+
+
+class TestGatewayApprovalCancellationCleanup:
+    """A cancelled owner must not leave a stale queue entry behind."""
+
+    SESSION_KEY = "test-cancelled-approval"
+
+    def setup_method(self):
+        from tools import approval as mod
+
+        mod._gateway_queues.clear()
+
+    def teardown_method(self):
+        from tools import approval as mod
+
+        mod._gateway_queues.clear()
+
+    def test_cancel_event_removes_the_pending_entry(self):
+        from tools import approval as mod
+
+        cancel_event = threading.Event()
+        notified = threading.Event()
+        result_holder = {}
+
+        def wait_for_decision():
+            result_holder["result"] = mod._await_gateway_decision(
+                self.SESSION_KEY,
+                lambda _data: notified.set(),
+                {
+                    "command": "Submit external operation?",
+                    "description": "MCP elicitation",
+                    "pattern_key": "mcp_elicitation",
+                    "pattern_keys": ["mcp_elicitation"],
+                },
+                cancellation_event=cancel_event,
+                surface="mcp-elicitation/test",
+            )
+
+        worker = threading.Thread(target=wait_for_decision)
+        worker.start()
+        assert notified.wait(timeout=1)
+        assert mod.has_blocking_approval(self.SESSION_KEY)
+
+        cancel_event.set()
+        worker.join(timeout=2)
+
+        assert not worker.is_alive()
+        assert result_holder["result"]["resolved"] is False
+        assert not mod.has_blocking_approval(self.SESSION_KEY)
+
+    def test_pre_cancelled_wait_never_enqueues_or_notifies(self):
+        from tools import approval as mod
+
+        cancel_event = threading.Event()
+        cancel_event.set()
+        notify = MagicMock()
+
+        result = mod._await_gateway_decision(
+            self.SESSION_KEY,
+            notify,
+            {"command": "x", "description": "y"},
+            cancellation_event=cancel_event,
+        )
+
+        assert result == {"resolved": False, "choice": None}
+        notify.assert_not_called()
+        assert not mod.has_blocking_approval(self.SESSION_KEY)
+
+    def test_cancel_token_revokes_queue_while_notify_is_blocked(self):
+        from tools import approval as mod
+
+        cancellation = mod.ApprovalCancellation()
+        notified = threading.Event()
+        release_notify = threading.Event()
+        result_holder = {}
+
+        def blocking_notify(_data):
+            notified.set()
+            release_notify.wait(timeout=2)
+
+        def wait_for_decision():
+            result_holder["result"] = mod._await_gateway_decision(
+                self.SESSION_KEY,
+                blocking_notify,
+                {"command": "x", "description": "y"},
+                cancellation_event=cancellation,
+            )
+
+        worker = threading.Thread(target=wait_for_decision)
+        worker.start()
+        assert notified.wait(timeout=1)
+        assert mod.has_blocking_approval(self.SESSION_KEY)
+
+        cancellation.cancel()
+        assert not mod.has_blocking_approval(self.SESSION_KEY)
+
+        release_notify.set()
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert result_holder["result"]["resolved"] is False
+
+    def test_cancellation_racing_response_wakeup_wins_fail_closed(self, monkeypatch):
+        from tools import approval as mod
+
+        cancellation = mod.ApprovalCancellation()
+
+        class RaceEvent:
+            def wait(self, timeout=None):
+                cancellation.cancel()
+                return True
+
+            def set(self):
+                pass
+
+        class RaceEntry:
+            def __init__(self, data):
+                self.data = data
+                self.event = RaceEvent()
+                self.result = "once"
+                self.reason = None
+
+        monkeypatch.setattr(mod, "_ApprovalEntry", RaceEntry)
+
+        result = mod._await_gateway_decision(
+            self.SESSION_KEY,
+            lambda _data: None,
+            {"command": "x", "description": "y"},
+            cancellation_event=cancellation,
+        )
+
+        assert result["resolved"] is False
+        assert not mod.has_blocking_approval(self.SESSION_KEY)
+
+    def test_exceptional_wait_exit_also_removes_the_entry(self, monkeypatch):
+        from tools import approval as mod
+
+        class RaisingEvent:
+            def wait(self, timeout=None):
+                raise RuntimeError("wait failed")
+
+            def set(self):
+                pass
+
+        class RaisingEntry:
+            def __init__(self, data):
+                self.data = data
+                self.event = RaisingEvent()
+                self.result = None
+                self.reason = None
+
+        monkeypatch.setattr(mod, "_ApprovalEntry", RaisingEntry)
+
+        with pytest.raises(RuntimeError, match="wait failed"):
+            mod._await_gateway_decision(
+                self.SESSION_KEY,
+                lambda _data: None,
+                {"command": "x", "description": "y"},
+            )
+
+        assert not mod.has_blocking_approval(self.SESSION_KEY)

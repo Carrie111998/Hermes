@@ -154,6 +154,155 @@ class TestElicitationHandlerFailureModes:
         assert result.action == "cancel"
         assert handler.metrics["errors"] == 1
 
+    def test_cancellation_signals_worker_and_waits_for_cleanup(self):
+        """Cancelling the async callback must not strand its blocking worker.
+
+        ``asyncio.to_thread`` cannot cancel a running thread. The handler must
+        therefore signal the synchronous consent flow and wait until it has
+        released its approval state before propagating cancellation.
+        """
+        import threading
+
+        handler = ElicitationHandler("pay", {"timeout": 5})
+        params = _form_params()
+        started = threading.Event()
+        cleaned = threading.Event()
+
+        def wait_for_cancel(*_args, cancellation_event=None, **_kwargs):
+            assert cancellation_event is not None
+            started.set()
+            assert cancellation_event.wait(timeout=2)
+            cleaned.set()
+            return "cancel"
+
+        async def exercise():
+            with patch(
+                "tools.approval.request_elicitation_consent",
+                side_effect=wait_for_cancel,
+            ):
+                task = asyncio.create_task(handler(context=None, params=params))
+                assert await asyncio.to_thread(started.wait, 1)
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+
+        asyncio.run(exercise())
+        assert cleaned.is_set()
+
+    def test_timeout_signals_worker_and_waits_for_cleanup(self, monkeypatch):
+        """The handler's own timeout must revoke the synchronous wait too."""
+        import threading
+
+        handler = ElicitationHandler("pay", {"timeout": 5})
+        handler.timeout = 0.01
+        monkeypatch.setattr(ElicitationHandler, "_OUTER_TIMEOUT_GRACE_SECONDS", 0.01)
+        params = _form_params()
+        cleaned = threading.Event()
+
+        def wait_for_cancel(*_args, cancellation_event=None, **_kwargs):
+            assert cancellation_event is not None
+            assert cancellation_event.wait(timeout=1)
+            cleaned.set()
+            return "cancel"
+
+        with patch(
+            "tools.approval.request_elicitation_consent",
+            side_effect=wait_for_cancel,
+        ):
+            result = asyncio.run(handler(context=None, params=params))
+
+        assert result.action == "cancel"
+        assert cleaned.is_set()
+        assert handler.metrics["errors"] == 1
+
+    def test_cancelled_handler_cleans_real_gateway_entry(self):
+        """Exercise the production handler → router → queue cancellation path."""
+        import contextvars
+        import threading
+        from types import SimpleNamespace
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools import approval
+
+        session_key = "test-mcp-cancelled-gateway"
+        notified = threading.Event()
+        approval.register_gateway_notify(session_key, lambda _data: notified.set())
+        tokens = set_session_vars(
+            platform="desktop",
+            session_key=session_key,
+            cron_session="",
+        )
+        try:
+            captured = contextvars.copy_context()
+        finally:
+            clear_session_vars(tokens)
+
+        owner = SimpleNamespace(_pending_call_context=captured)
+        handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)  # type: ignore[arg-type]
+        params = _form_params()
+
+        async def exercise():
+            task = asyncio.create_task(handler(context=None, params=params))
+            assert await asyncio.to_thread(notified.wait, 1)
+            assert approval.has_blocking_approval(session_key)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        try:
+            asyncio.run(exercise())
+            assert not approval.has_blocking_approval(session_key)
+        finally:
+            approval.unregister_gateway_notify(session_key)
+
+    def test_cancelled_handler_revokes_queue_while_notify_is_blocked(self):
+        """Cleanup cannot depend on the synchronous notify callback returning."""
+        import contextvars
+        import threading
+        from types import SimpleNamespace
+
+        from gateway.session_context import clear_session_vars, set_session_vars
+        from tools import approval
+
+        session_key = "test-mcp-cancelled-blocked-notify"
+        notified = threading.Event()
+        release_notify = threading.Event()
+
+        def blocking_notify(_data):
+            notified.set()
+            release_notify.wait(timeout=3)
+
+        approval.register_gateway_notify(session_key, blocking_notify)
+        tokens = set_session_vars(
+            platform="desktop",
+            session_key=session_key,
+            cron_session="",
+        )
+        try:
+            captured = contextvars.copy_context()
+        finally:
+            clear_session_vars(tokens)
+
+        owner = SimpleNamespace(_pending_call_context=captured)
+        handler = ElicitationHandler("pay", {"timeout": 5}, owner=owner)  # type: ignore[arg-type]
+        params = _form_params()
+
+        async def exercise():
+            task = asyncio.create_task(handler(context=None, params=params))
+            assert await asyncio.to_thread(notified.wait, 1)
+            assert approval.has_blocking_approval(session_key)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+            assert not approval.has_blocking_approval(session_key)
+            release_notify.set()
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            release_notify.set()
+            approval.unregister_gateway_notify(session_key)
+
 
 class TestElicitationHandlerWiring:
     def test_session_kwargs_returns_callback(self):

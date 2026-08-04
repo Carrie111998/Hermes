@@ -1742,7 +1742,7 @@ class ElicitationHandler:
         # bootstrap; matching the lazy pattern used by _fire_approval_hook
         # avoids any chance of import-order coupling.
         try:
-            from tools.approval import request_elicitation_consent
+            from tools.approval import ApprovalCancellation, request_elicitation_consent
         except Exception as exc:  # pragma: no cover -- defensive
             logger.error(
                 "MCP server '%s' elicitation: approval system unavailable: %s",
@@ -1765,6 +1765,7 @@ class ElicitationHandler:
         # contextvars.Context.run so the gateway-platform detection in
         # request_elicitation_consent picks up the right session.
         captured = getattr(self.owner, "_pending_call_context", None) if self.owner else None
+        cancellation_event = ApprovalCancellation()
 
         def _invoke_consent() -> str:
             if captured is None:
@@ -1773,6 +1774,7 @@ class ElicitationHandler:
                     description,
                     timeout_seconds=int(self.timeout),
                     surface=f"mcp-elicitation/{self.server_name}",
+                    cancellation_event=cancellation_event,
                 )
             # Context.run can only execute a context once — copy to allow
             # multiple elicitations within a single tool call.
@@ -1782,14 +1784,49 @@ class ElicitationHandler:
                 description,
                 timeout_seconds=int(self.timeout),
                 surface=f"mcp-elicitation/{self.server_name}",
+                cancellation_event=cancellation_event,
             )
+
+        consent_task = asyncio.create_task(asyncio.to_thread(_invoke_consent))
+
+        async def _cancel_and_drain_worker() -> None:
+            cancellation_event.cancel()
+            try:
+                # Gateway waits observe the event within 100 ms. Keep this
+                # bounded for custom/CLI approval callbacks that cannot be
+                # interrupted while blocked in synchronous input.
+                await asyncio.wait_for(
+                    asyncio.shield(consent_task),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                # Cancelling the asyncio wrapper cannot stop the underlying
+                # thread, but it prevents an eventual late exception/result
+                # from becoming an unobserved task warning. Gateway queue state
+                # has already been revoked through ``cancellation_event``.
+                consent_task.cancel()
+                logger.warning(
+                    "MCP server '%s' elicitation worker did not stop after cancellation",
+                    self.server_name,
+                )
+            except Exception:
+                # The original cancellation/timeout remains authoritative.
+                logger.debug(
+                    "MCP server '%s' elicitation worker failed during cleanup",
+                    self.server_name,
+                    exc_info=True,
+                )
 
         try:
             answer = await asyncio.wait_for(
-                asyncio.to_thread(_invoke_consent),
+                asyncio.shield(consent_task),
                 timeout=self.timeout + self._OUTER_TIMEOUT_GRACE_SECONDS,
             )
+        except asyncio.CancelledError:
+            await _cancel_and_drain_worker()
+            raise
         except asyncio.TimeoutError:
+            await _cancel_and_drain_worker()
             logger.warning(
                 "MCP server '%s' elicitation timed out after %ds",
                 self.server_name, int(self.timeout),

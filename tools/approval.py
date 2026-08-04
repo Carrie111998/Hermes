@@ -2292,6 +2292,51 @@ def _denial_breaker_addendum(session_key: str) -> str:
 # resolves every pending approval in the session.
 
 
+class ApprovalCancellation:
+    """Thread-safe cancellation signal with synchronous cleanup callbacks.
+
+    ``threading.Event`` alone only wakes code that is actively polling it. An
+    approval worker can instead be blocked in a host notify callback or another
+    synchronous extension point. Registering cleanup here lets the async owner
+    revoke queue state immediately, without waiting for that worker to resume.
+    """
+
+    def __init__(self):
+        self._event = threading.Event()
+        self._lock = threading.Lock()
+        self._callbacks: set = set()
+
+    def is_set(self) -> bool:
+        return self._event.is_set()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        return self._event.wait(timeout)
+
+    def register(self, callback) -> None:
+        with self._lock:
+            fire_now = self._event.is_set()
+            if not fire_now:
+                self._callbacks.add(callback)
+        if fire_now:
+            callback()
+
+    def unregister(self, callback) -> None:
+        with self._lock:
+            self._callbacks.discard(callback)
+
+    def cancel(self) -> None:
+        with self._lock:
+            if self._event.is_set():
+                return
+            self._event.set()
+            callbacks = tuple(self._callbacks)
+        for callback in callbacks:
+            callback()
+
+    # Event-compatible spelling for test helpers and simple callers.
+    set = cancel
+
+
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
     __slots__ = ("event", "data", "result", "reason")
@@ -3414,8 +3459,14 @@ def _format_tirith_description(tirith_result: dict) -> str:
     return "Security scan — " + "; ".join(parts)
 
 
-def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+def _await_gateway_decision(
+    session_key: str,
+    notify_cb,
+    approval_data: dict,
+    *,
+    surface: str = "gateway",
+    cancellation_event: Optional[threading.Event | ApprovalCancellation] = None,
+) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -3423,6 +3474,10 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     Shared by the terminal command guard (``check_all_command_guards``) and
     the execute_code guard (``check_execute_code_guard``) so the fiddly
     heartbeat-polling wait loop lives in one place.
+
+    When *cancellation_event* is supplied, the owning async operation can
+    revoke this blocking wait. The queue entry is removed before this function
+    returns or raises, so a later user response cannot resolve an orphan.
 
     Returns ``{"resolved": bool, "choice": str|None}`` on completion, or
     ``{"resolved": False, "choice": None, "notify_failed": True}`` if the
@@ -3433,6 +3488,9 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     description = approval_data.get("description", "")
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
+
+    if cancellation_event is not None and cancellation_event.is_set():
+        return {"resolved": False, "choice": None}
 
     entry = _ApprovalEntry(approval_data)
     with _lock:
@@ -3445,6 +3503,20 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
                 queue.remove(entry)
             if not queue:
                 _gateway_queues.pop(session_key, None)
+
+    def _cancel_entry() -> None:
+        _drop_entry()
+        entry.event.set()
+
+    cancellation = (
+        cancellation_event
+        if isinstance(cancellation_event, ApprovalCancellation)
+        else None
+    )
+    if cancellation is not None:
+        # register() invokes immediately if cancellation won the race between
+        # the pre-enqueue check and this registration.
+        cancellation.register(_cancel_entry)
 
     # Notify plugins that an approval is being requested. Fires before the
     # gateway notify callback so observers get the event in real time.
@@ -3463,6 +3535,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         notify_cb(approval_data)
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
+        if cancellation is not None:
+            cancellation.unregister(_cancel_entry)
         _drop_entry()
         return {"resolved": False, "choice": None, "notify_failed": True}
 
@@ -3482,34 +3556,46 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     _deadline = _now + max(timeout, 0)
     _activity_state = {"last_touch": _now, "start": _now}
     resolved = False
-    while True:
-        # Respect interrupt signals (e.g. /stop, /new, or an inactivity
-        # timeout from the gateway) so a pending approval doesn't keep the
-        # session wedged on threading.Event.wait() until the 5-minute approval
-        # timeout. The wait runs on the agent's execution thread, which is the
-        # exact thread AIAgent.interrupt() flags — so is_interrupted() here
-        # sees the signal. Resolve as "deny" so the agent loop receives a
-        # normal denial and unwinds cleanly (#8697).
-        if is_interrupted():
-            logger.info(
-                "Approval wait interrupted by user signal — "
-                "returning deny for session %s",
-                session_key,
-            )
-            entry.result = "deny"
-            entry.event.set()
-            resolved = True
-            break
-        _remaining = _deadline - time.monotonic()
-        if _remaining <= 0:
-            break
-        if entry.event.wait(timeout=min(1.0, _remaining)):
-            resolved = True
-            break
-        if touch_activity_if_due is not None:
-            touch_activity_if_due(_activity_state, "waiting for user approval")
-
-    _drop_entry()
+    try:
+        while True:
+            if cancellation_event is not None and cancellation_event.is_set():
+                break
+            # Respect interrupt signals (e.g. /stop, /new, or an inactivity
+            # timeout from the gateway) so a pending approval doesn't keep the
+            # session wedged on threading.Event.wait() until the 5-minute approval
+            # timeout. The wait runs on the agent's execution thread, which is the
+            # exact thread AIAgent.interrupt() flags — so is_interrupted() here
+            # sees the signal. Resolve as "deny" so the agent loop receives a
+            # normal denial and unwinds cleanly (#8697).
+            if is_interrupted():
+                logger.info(
+                    "Approval wait interrupted by user signal — "
+                    "returning deny for session %s",
+                    session_key,
+                )
+                entry.result = "deny"
+                entry.event.set()
+                resolved = True
+                break
+            _remaining = _deadline - time.monotonic()
+            if _remaining <= 0:
+                break
+            poll_interval = 0.1 if cancellation_event is not None else 1.0
+            if entry.event.wait(timeout=min(poll_interval, _remaining)):
+                # Cancellation racing a user response must remain fail-closed.
+                if cancellation_event is not None and cancellation_event.is_set():
+                    break
+                resolved = True
+                break
+            if touch_activity_if_due is not None:
+                touch_activity_if_due(_activity_state, "waiting for user approval")
+    finally:
+        # A wait implementation, heartbeat callback, or owning task can fail
+        # independently of the approval. Never leave its queue entry available
+        # for a later response to resolve accidentally.
+        if cancellation is not None:
+            cancellation.unregister(_cancel_entry)
+        _drop_entry()
 
     choice = entry.result
     # Normalize outcome for the post hook. Unresolved (timeout) and None both
@@ -4266,6 +4352,7 @@ def request_elicitation_consent(
     *,
     timeout_seconds: int | None = None,
     surface: str = "mcp-elicitation",
+    cancellation_event: Optional[threading.Event | ApprovalCancellation] = None,
 ) -> str:
     """Route an MCP elicitation request to whichever approval surface owns
     the active session and return a normalized result.
@@ -4278,6 +4365,9 @@ def request_elicitation_consent(
     Always fails closed: missing notify_cb in a gateway session, timeouts,
     and exceptions all map to ``"decline"`` so a server treats them as
     "user did not approve" rather than retrying or hanging.
+
+    *cancellation_event* is used by the async MCP callback to stop this
+    synchronous gateway wait when its owning tool call is cancelled.
 
     Returns one of ``"accept" | "decline" | "cancel"``.
     """
@@ -4306,7 +4396,11 @@ def request_elicitation_consent(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                cancellation_event=cancellation_event,
             )
         except Exception as exc:
             logger.error(
