@@ -4,7 +4,9 @@ Drop a `<name>/plugin.{ts,tsx}` here that default-exports a `HermesPlugin` and
 it registers automatically at boot (vite glob in `../contrib/plugins.ts`), with
 the same inventory + live enable/disable contract as runtime plugins.
 
-None ship in-tree today — reference/demo plugins (the counter example, the
+Real opt-in plugins ship in-tree: `kanban/` and `hermes-achievements/` — both
+`defaultEnabled: false`, so they inventory in Settings ▸ Plugins off until the
+user flips the switch. Reference/demo plugins (the counter example, the
 gateway-pill 1:1 rebuild, the runtime-loader hello world) live in the companion
 [`hermes-example-plugins`](https://github.com/NousResearch/hermes-example-plugins)
 repo so the shipped app stays uncluttered.
