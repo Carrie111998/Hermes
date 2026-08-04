@@ -185,9 +185,76 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
     )
 
 
+@pytest.mark.asyncio
+async def test_shared_channel_context_is_model_only_and_fallback_keeps_origin_once(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner.config.group_sessions_per_user = False
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-42",
+        chat_name="general",
+        chat_type="channel",
+        user_id="person-7",
+        user_name="Alice",
+        scope_id="guild-1",
+    )
+    event = MessageEvent(
+        text="hello world",
+        source=source,
+        message_id="message-99",
+        channel_context="[Recent channel messages]\n[Bob] earlier",
+    )
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:discord:channel:channel-42",
+        session_id="sess-origin",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.DISCORD,
+        chat_type="channel",
+    )
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "final_response": None,
+            "error": "429 Too Many Requests",
+            "messages": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+
+    await runner._handle_message_with_agent(
+        event, source, "agent:main:discord:channel:channel-42", 1
+    )
+
+    run_kwargs = runner._run_agent.await_args.kwargs
+    assert run_kwargs["message"] == (
+        "[Recent channel messages]\n[Bob] earlier\n\n"
+        "[New message]\n[Alice] hello world"
+    )
+    assert run_kwargs["persist_user_message"] == "hello world"
+    assert run_kwargs["persist_user_platform_message_id"] == "message-99"
+    assert run_kwargs["persist_user_display_metadata"]["origin"] == {
+        **source.to_dict(),
+        "message_id": "message-99",
+    }
+
+    user_entries = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2 and call.args[1].get("role") == "user"
+    ]
+    assert len(user_entries) == 1
+    assert user_entries[0]["content"] == "hello world"
+    assert user_entries[0]["platform_message_id"] == "message-99"
+    assert user_entries[0]["display_metadata"] == (
+        run_kwargs["persist_user_display_metadata"]
+    )
+
+
 # ── Post-stream MEDIA delivery keeps prior-turn deduplication ──────────
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
-
-

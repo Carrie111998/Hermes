@@ -339,6 +339,7 @@ def build_turn_context(
     *,
     persist_user_display_kind: Optional[str] = None,
     persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    persist_user_platform_message_id: Optional[str] = None,
     restore_or_build_system_prompt,
     install_safe_stdio,
     sanitize_surrogates,
@@ -551,12 +552,14 @@ def build_turn_context(
     # message so the crash persist below writes the row already typed. Typing
     # it after the turn instead leaves the row untyped for the whole run — and
     # forever if the turn crashes — so the raw system note paints as a user
-    # bubble. The model still receives role/content unchanged; the api_messages
-    # build strips both fields from every outgoing copy.
+    # bubble. The model still receives role/content unchanged; the provider
+    # payload sanitizer strips these transcript-only fields from every copy.
     if persist_user_display_kind:
         user_msg["display_kind"] = persist_user_display_kind
-        if persist_user_display_metadata:
-            user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_display_metadata:
+        user_msg["display_metadata"] = persist_user_display_metadata
+    if persist_user_platform_message_id:
+        user_msg["platform_message_id"] = str(persist_user_platform_message_id)
 
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1

@@ -5313,6 +5313,14 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_display_metadata:
+                _conversation_kwargs["persist_user_display_metadata"] = (
+                    ctx.persist_user_display_metadata
+                )
+            if ctx.persist_user_platform_message_id:
+                _conversation_kwargs["persist_user_platform_message_id"] = (
+                    ctx.persist_user_platform_message_id
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -16295,6 +16303,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
+        _origin = source.to_dict()
+        if getattr(source, "is_bot", False):
+            _origin["is_bot"] = True
+        _platform_message_id = getattr(event, "message_id", None) or _origin.get(
+            "message_id"
+        )
+        if _platform_message_id:
+            _platform_message_id = str(_platform_message_id)
+            _origin["message_id"] = _platform_message_id
+        persist_user_display_metadata = {"origin": _origin}
+
+        def _decorate_inbound_user_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+            """Attach the current platform event identity to one user row."""
+            if entry.get("role") != "user":
+                return entry
+            if _platform_message_id and not (
+                entry.get("platform_message_id") or entry.get("message_id")
+            ):
+                entry["platform_message_id"] = _platform_message_id
+            metadata = entry.get("display_metadata")
+            if not isinstance(metadata, dict):
+                metadata = {}
+            if "origin" not in metadata:
+                metadata = {**metadata, "origin": _origin}
+            entry["display_metadata"] = metadata
+            return entry
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -17311,6 +17345,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if message_text is None:
             return
 
+        # The model-facing text above may include sender attribution, channel
+        # backfill, reply pointers, and attachment guidance. Those are useful
+        # live context, but they are not what the person authored. Persist the
+        # triggering text separately so transcript miners can rely on clean
+        # content plus the structured origin metadata attached below.
+        _trigger_text = getattr(event, "_gateway_pending_stt_text", None)
+        if _trigger_text is None:
+            _trigger_text = getattr(event, "text", "")
+        if _trigger_text is None:
+            _trigger_text = ""
+
         # Capture the platform event time as message metadata and keep the
         # persisted transcript clean (strip any leading timestamp prefix).
         # This runs regardless of the toggle so storage stays clean and the
@@ -17326,13 +17371,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _evt_tz = _get_evt_tz()
             _evt_ts = getattr(event, "timestamp", None)
-            if message_text and isinstance(message_text, str):
+            if isinstance(message_text, str):
                 _clean_message_text, _embedded_ts = _strip_msg_ts(
                     message_text, tz=_evt_tz)
-                persist_user_message = _clean_message_text
+                _clean_trigger_text, _trigger_embedded_ts = _strip_msg_ts(
+                    str(_trigger_text), tz=_evt_tz
+                )
+                persist_user_message = _clean_trigger_text
                 _event_epoch = _coerce_msg_ts(_evt_ts, tz=_evt_tz)
                 persist_user_timestamp = (
-                    _event_epoch if _event_epoch is not None else _embedded_ts
+                    _event_epoch
+                    if _event_epoch is not None
+                    else (
+                        _trigger_embedded_ts
+                        if _trigger_embedded_ts is not None
+                        else _embedded_ts
+                    )
                 )
                 if _message_timestamps_enabled(_load_gateway_config()):
                     message_text = _render_msg_ts(
@@ -17395,6 +17449,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_message_id=_platform_message_id,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -17839,8 +17895,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else ts
                     ),
                 }
-                if event.message_id:
-                    _user_entry["message_id"] = str(event.message_id)
+                _decorate_inbound_user_entry(_user_entry)
                 # Dedupe: skip if this platform message_id is already in the
                 # transcript (prevents duplicate user turns on Telegram retries
                 # after transient failures). #47237
@@ -17881,8 +17936,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else ts
                         ),
                     }
-                    if event.message_id:
-                        _user_entry["message_id"] = str(event.message_id)
+                    _decorate_inbound_user_entry(_user_entry)
                     await self.async_session_store.append_to_transcript(
                         session_entry.session_id,
                         _user_entry,
@@ -17909,10 +17963,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         if (
                             not _user_msg_id_attached
                             and msg.get("role") == "user"
-                            and event.message_id
-                            and "message_id" not in entry
                         ):
-                            entry["message_id"] = str(event.message_id)
+                            _decorate_inbound_user_entry(entry)
                             _user_msg_id_attached = True
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id, entry,
@@ -18069,8 +18121,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 else time.time()
                             ),
                         }
-                        if getattr(event, "message_id", None):
-                            _user_entry["message_id"] = str(event.message_id)
+                        _decorate_inbound_user_entry(_user_entry)
                         await self.async_session_store.append_to_transcript(
                             session_entry.session_id,
                             _user_entry,
@@ -23868,6 +23919,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -23887,6 +23940,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_message_id=persist_user_platform_message_id,
                 message_type=message_type,
             )
 
@@ -23899,6 +23954,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_metadata=persist_user_display_metadata,
+                persist_user_platform_message_id=persist_user_platform_message_id,
                 message_type=message_type,
             )
 
@@ -24021,6 +24078,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -24306,6 +24365,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_metadata=persist_user_display_metadata,
+            persist_user_platform_message_id=persist_user_platform_message_id,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to

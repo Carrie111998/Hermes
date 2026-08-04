@@ -41,7 +41,15 @@ class _NoopAgent:
 
     def run_conversation(self, user_message, conversation_history=None,
                          task_id=None, persist_user_message=None,
-                         persist_user_timestamp=None):
+                         persist_user_timestamp=None,
+                         persist_user_display_metadata=None,
+                         persist_user_platform_message_id=None):
+        type(self).last_run = {
+            "user_message": user_message,
+            "persist_user_message": persist_user_message,
+            "persist_user_display_metadata": persist_user_display_metadata,
+            "persist_user_platform_message_id": persist_user_platform_message_id,
+        }
         return {
             "final_response": "Hello from the agent.",
             "messages": [],
@@ -154,4 +162,42 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
 
+
+def test_local_run_propagates_clean_text_origin_and_platform_message_id(monkeypatch, tmp_path):
+    _setup_monkeypatches(monkeypatch, tmp_path)
+    runner = _make_runner()
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-42",
+        chat_name="general",
+        chat_type="channel",
+        user_id="person-7",
+        user_name="Alice",
+        scope_id="guild-1",
+    )
+    origin = {"origin": source.to_dict()}
+
+    async def _run():
+        return await runner._run_agent(
+            message="[Recent channel messages]\n[Bob] earlier\n\n[New message]\n[Alice] hello",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:discord:channel:channel-42",
+            event_message_id="message-99",
+            persist_user_message="hello",
+            persist_user_display_metadata=origin,
+            persist_user_platform_message_id="message-99",
+        )
+
+    result = asyncio.new_event_loop().run_until_complete(_run())
+
+    assert result["final_response"] == "Hello from the agent."
+    assert _NoopAgent.last_run == {
+        "user_message": "[Recent channel messages]\n[Bob] earlier\n\n[New message]\n[Alice] hello",
+        "persist_user_message": "hello",
+        "persist_user_display_metadata": origin,
+        "persist_user_platform_message_id": "message-99",
+    }
 

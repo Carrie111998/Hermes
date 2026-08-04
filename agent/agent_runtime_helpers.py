@@ -3235,6 +3235,21 @@ def repair_empty_non_final_messages(
     return messages
 
 
+_TRANSCRIPT_ONLY_API_MESSAGE_FIELDS = frozenset({
+    "api_content",
+    "display_kind",
+    "display_metadata",
+    "platform_message_id",
+    "message_id",
+    "timestamp",
+    "observed",
+    "active",
+    "compacted",
+    "_row_id",
+    "_db_persisted",
+})
+
+
 def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """Fix orphaned tool_call / tool_result pairs before every LLM call.
 
@@ -3252,7 +3267,18 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                 role,
             )
             continue
-        filtered.append(msg)
+        # Session and presentation fields are valuable in state.db but are not
+        # part of any provider message schema. Strip them at the final shared
+        # API boundary so every transport, including callers that bypass the
+        # main conversation-loop copy step, receives a clean payload.
+        if msg.keys() & _TRANSCRIPT_ONLY_API_MESSAGE_FIELDS:
+            filtered.append({
+                key: value
+                for key, value in msg.items()
+                if key not in _TRANSCRIPT_ONLY_API_MESSAGE_FIELDS
+            })
+        else:
+            filtered.append(msg)
     messages = filtered
 
     # --- Heal empty-content non-final messages (self-recovery) ---
