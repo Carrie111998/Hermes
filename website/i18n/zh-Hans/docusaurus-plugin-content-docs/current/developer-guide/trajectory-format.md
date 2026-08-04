@@ -7,12 +7,42 @@ Hermes Agent 以 ShareGPT 兼容的 JSONL 格式保存对话轨迹，用于训�
 
 ## 文件命名规范
 
-轨迹写入当前工作目录下的文件：
+轨迹写入当前工作目录下的文件，**除非**该目录位于 git 检出目录内——见下方提示：
 
 | 文件 | 时机 |
 |------|------|
 | `trajectory_samples.jsonl` | 成功完成的对话（`completed=True`） |
 | `failed_trajectories.jsonl` | 失败或被中断的对话（`completed=False`） |
+
+:::warning 在 git 检出目录内，写入位置会改变
+
+轨迹是**完整逐字的对话记录**——消息正文、工具返回结果以及工具调用参数。
+当前工作目录位于 git 工作树内时，把它写在源码旁边会留下一个未跟踪文件，
+距离被 `git add -A` 提交只有一步之遥。因此 Hermes 会改为写入
+`<HERMES_HOME>/trajectories/<work-tree>/`（默认即 `~/.hermes/trajectories/…`），
+并打印一次性提示告知实际位置。
+
+- 不会丢弃或截断任何内容——只改变写入位置。
+- `<work-tree>` 按仓库区分（`<目录名>-<哈希>`），因此两个检出目录各自保留一份
+  数据集，而不会合并进同一个文件。
+- **绝对路径**的 `filename` 始终按原样使用；在 `config.yaml` 中设置
+  `agent.trajectory_allow_git_cwd: true` 可全局恢复写入工作目录。
+- 若无法安全准备目标位置（路径不可读、`HERMES_HOME` 不可写），本次保存会被
+  **跳过**并给出提示，而不会写进你的检出目录。
+
+**升级既有流水线：**检出目录中已存在的 `./trajectory_samples.jsonl` 会被原样保留，
+并且不再接收新条目。首次保存时 Hermes 会在终端和 `errors.log` 中说明这一点。
+请将流水线指向新路径、把两个文件拼接起来，或设置
+`agent.trajectory_allow_git_cwd: true`。
+
+查看当前实际位置：列出 Hermes 主目录（默认 `~/.hermes`，`hermes profile`
+会打印当前生效的目录）下的 `trajectories/`：
+
+```bash
+ls -R ~/.hermes/trajectories
+```
+
+:::
 
 批量运行器（`batch_runner.py`）按批次写入自定义输出文件
 （例如 `batch_001_output.jsonl`），并附带额外的元数据字段。
@@ -184,6 +214,8 @@ def load_trajectories(path: str):
     return entries
 
 # Filter to successful completions only
+# 在 git 检出目录内，该文件位于
+# <HERMES_HOME>/trajectories/<work-tree>/ —— 参见“文件命名规范”。
 successful = [e for e in load_trajectories("trajectory_samples.jsonl")
               if e.get("completed")]
 
@@ -196,6 +228,9 @@ training_data = [e["conversations"] for e in successful]
 ```python
 from datasets import load_dataset
 
+# 请把 data_files 指向 Hermes 在保存时提示的路径；在 git 检出目录内，
+# 该路径是 <HERMES_HOME>/trajectories/<work-tree>/trajectory_samples.jsonl，
+# 而不是工作目录。
 ds = load_dataset("json", data_files="trajectory_samples.jsonl")
 ```
 

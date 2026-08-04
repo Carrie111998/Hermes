@@ -8,12 +8,47 @@ Source files: `agent/trajectory.py`, `run_agent.py` (search for `_save_trajector
 
 ## File Naming Convention
 
-Trajectories are written to files in the current working directory:
+Trajectories are written to the current working directory, **unless** that
+directory is inside a git checkout — see the warning below:
 
 | File | When |
 |------|------|
 | `trajectory_samples.jsonl` | Conversations that completed successfully (`completed=True`) |
 | `failed_trajectories.jsonl` | Conversations that failed or were interrupted (`completed=False`) |
+
+:::warning Inside a git checkout, the destination changes
+
+A trajectory is a **full verbatim transcript** — message text, tool results and
+tool-call arguments. When the current working directory is inside a git work
+tree, writing that next to your source leaves an untracked file one
+`git add -A` away from being published, so Hermes writes it under
+`<HERMES_HOME>/trajectories/<work-tree>/` instead (`~/.hermes/trajectories/…`
+by default) and prints a one-time notice naming the destination.
+
+- Nothing is dropped or truncated — only the destination changes.
+- `<work-tree>` is per-repository (`<basename>-<hash>`), so two checkouts keep
+  two datasets rather than merging into one file.
+- An **absolute** `filename` is always honoured as given, and
+  `agent.trajectory_allow_git_cwd: true` in `config.yaml` restores writing to
+  the working directory globally.
+- If the destination cannot be prepared safely (unreadable path, unwritable
+  `HERMES_HOME`), the save is **skipped** and reported rather than written into
+  your checkout.
+
+**Upgrading an existing pipeline:** a `./trajectory_samples.jsonl` already in
+your checkout is left exactly as it is and stops receiving new entries. Hermes
+says so on the terminal and in `errors.log` on the first save. Repoint the
+pipeline at the new path, concatenate the two files, or set
+`agent.trajectory_allow_git_cwd: true`.
+
+To find the active destination, list `trajectories/` under your Hermes home
+(`~/.hermes` by default; `hermes profile` prints the active one):
+
+```bash
+ls -R ~/.hermes/trajectories
+```
+
+:::
 
 The batch runner (`batch_runner.py`) writes to a custom output file per batch
 (e.g., `batch_001_output.jsonl`) with additional metadata fields.
@@ -194,6 +229,8 @@ def load_trajectories(path: str):
     return entries
 
 # Filter to successful completions only
+# Inside a git checkout the file lives under
+# <HERMES_HOME>/trajectories/<work-tree>/ — see "File Naming Convention".
 successful = [e for e in load_trajectories("trajectory_samples.jsonl")
               if e.get("completed")]
 
@@ -206,6 +243,9 @@ training_data = [e["conversations"] for e in successful]
 ```python
 from datasets import load_dataset
 
+# Point data_files at the path Hermes reported when saving; inside a git
+# checkout that is <HERMES_HOME>/trajectories/<work-tree>/trajectory_samples.jsonl
+# rather than the working directory.
 ds = load_dataset("json", data_files="trajectory_samples.jsonl")
 ```
 

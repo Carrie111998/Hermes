@@ -829,8 +829,15 @@ agent:
   # file. Launched from a source checkout, that leaves an untracked
   # trajectory_samples.jsonl next to your code, one `git add -A` away from
   # being committed. By default such a write is redirected under
-  # <HERMES_HOME>/trajectories/ (nothing is dropped, only relocated) and a
-  # warning names the destination.
+  # <HERMES_HOME>/trajectories/<work-tree>/ (nothing is dropped, only
+  # relocated) and a one-time notice names the destination on the terminal.
+  # The <work-tree> component is per-repository, so two checkouts keep two
+  # datasets instead of merging into one file.
+  #
+  # Upgrading with a pipeline that already reads ./trajectory_samples.jsonl:
+  # that file is left exactly as it is and stops receiving new entries. Hermes
+  # says so on the terminal and in errors.log — repoint the pipeline at the
+  # new path, concatenate the two, or set this to true.
   #
   # Set true to restore writing to the working directory. Passing an absolute
   # filename to save_trajectory() also bypasses the redirect.

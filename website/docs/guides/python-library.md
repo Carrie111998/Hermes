@@ -151,7 +151,11 @@ agent = AIAgent(
 )
 
 agent.chat("Write a Python function to sort a list")
-# Saves to trajectory_samples.jsonl in ShareGPT format
+# Saves to trajectory_samples.jsonl in ShareGPT format.
+# Inside a git checkout, that write is redirected under
+# <HERMES_HOME>/trajectories/<work-tree>/ instead, so a full verbatim
+# transcript is not left next to your source. The destination is printed on
+# startup; see the Trajectory Format guide for the details and the opt-out.
 ```
 
 Each conversation is appended as a single JSONL line, making it easy to collect datasets from automated runs.

@@ -7901,8 +7901,9 @@ def main(
         print("💾 Trajectory saving: ENABLED")
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
-        print("   - Inside a git work tree these are written under "
-              "<HERMES_HOME>/trajectories/ instead (agent.trajectory_allow_git_cwd: true to override)")
+        print("   - Inside a git checkout these are written under "
+              "<HERMES_HOME>/trajectories/<work-tree>/ instead "
+              "(agent.trajectory_allow_git_cwd: true to override)")
     
     # Initialize agent with provided parameters
     try:
@@ -7955,29 +7956,34 @@ def main(
         # under a relative name, so it lands in the CWD — a source checkout as
         # often as not. Route it through the same guard.
         sample_filename = resolve_trajectory_path(f"sample_{sample_id}.json")
-        
-        # Convert messages to trajectory format (same as batch_runner)
-        trajectory = agent._convert_to_trajectory_format(
-            result['messages'], 
-            user_query, 
-            result['completed']
-        )
-        
-        entry = {
-            "conversations": trajectory,
-            "timestamp": datetime.now().isoformat(),
-            "model": model,
-            "completed": result['completed'],
-            "query": user_query
-        }
-        
-        try:
-            with open(sample_filename, "w", encoding="utf-8") as f:
-                # Pretty-print JSON with indent for readability
-                f.write(json.dumps(entry, ensure_ascii=False, indent=2))
-            print(f"\n💾 Sample trajectory saved to: {sample_filename}")
-        except Exception as e:
-            print(f"\n⚠️ Failed to save sample: {e}")
+
+        # None means the guard could not place the file safely and refused to
+        # drop it in the checkout; it has already reported the reason.
+        if sample_filename is None:
+            print("\n⚠️ Sample trajectory not saved: could not place it outside a git checkout")
+        else:
+            # Convert messages to trajectory format (same as batch_runner)
+            trajectory = agent._convert_to_trajectory_format(
+                result['messages'], 
+                user_query, 
+                result['completed']
+            )
+
+            entry = {
+                "conversations": trajectory,
+                "timestamp": datetime.now().isoformat(),
+                "model": model,
+                "completed": result['completed'],
+                "query": user_query
+            }
+
+            try:
+                with open(sample_filename, "w", encoding="utf-8") as f:
+                    # Pretty-print JSON with indent for readability
+                    f.write(json.dumps(entry, ensure_ascii=False, indent=2))
+                print(f"\n💾 Sample trajectory saved to: {sample_filename}")
+            except Exception as e:
+                print(f"\n⚠️ Failed to save sample: {e}")
     
     print("\n👋 Agent execution completed!")
 

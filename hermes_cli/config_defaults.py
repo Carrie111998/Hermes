@@ -37,10 +37,11 @@ DEFAULT_CONFIG = {
         # a CWD-relative filename, so an agent run launched from a source
         # checkout dropped one next to the user's code, one `git add -A` from
         # being published (#77472). Default False redirects such a write under
-        # ``<HERMES_HOME>/trajectories/`` and warns with the destination;
-        # nothing is dropped or truncated, only relocated. Set True to restore
-        # writing to the working directory (passing an absolute filename also
-        # bypasses the redirect).
+        # ``<HERMES_HOME>/trajectories/<work-tree>/`` and warns with the
+        # destination; nothing is dropped or truncated, only relocated, and the
+        # per-work-tree directory keeps one dataset per repo the way the
+        # CWD-relative path did. Set True to restore writing to the working
+        # directory (passing an absolute filename also bypasses the redirect).
         "trajectory_allow_git_cwd": False,
         # Inactivity timeout for gateway agent execution (seconds).
         # The agent can run indefinitely as long as it's actively calling

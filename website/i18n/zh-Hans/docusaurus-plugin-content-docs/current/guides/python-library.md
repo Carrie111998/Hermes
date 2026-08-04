@@ -151,7 +151,10 @@ agent = AIAgent(
 )
 
 agent.chat("Write a Python function to sort a list")
-# 以 ShareGPT 格式保存到 trajectory_samples.jsonl
+# 以 ShareGPT 格式保存到 trajectory_samples.jsonl。
+# 在 git 检出目录内，该写入会被重定向到
+# <HERMES_HOME>/trajectories/<work-tree>/，以免把完整逐字的对话记录
+# 留在源码旁边。启动时会打印实际位置；详情与关闭方式见《轨迹格式》文档。
 ```
 
 每次对话以单行 JSONL 的形式追加写入，便于从自动化运行中收集数据集。

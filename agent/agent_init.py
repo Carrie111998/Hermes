@@ -1468,7 +1468,20 @@ def init_agent(
     
     # Show trajectory saving status
     if agent.save_trajectories and not agent.quiet_mode:
-        print("📝 Trajectory saving enabled")
+        # Name the destination. This is the path datagen actually uses
+        # (AIAgent(save_trajectories=True)), and the file may be redirected out
+        # of a git checkout — "enabled" with no path left the user hunting for
+        # their training data. resolve_trajectory_path also reports a
+        # pre-existing in-checkout dataset here, before the run starts.
+        try:
+            from agent.trajectory import describe_trajectory_destination
+            _traj_dest = describe_trajectory_destination()
+        except Exception:  # pragma: no cover - a status line must not break init
+            _traj_dest = None
+        if _traj_dest:
+            print(f"📝 Trajectory saving enabled → {_traj_dest}")
+        else:
+            print("📝 Trajectory saving enabled")
     
     # Show ephemeral system prompt status
     if agent.ephemeral_system_prompt and not agent.quiet_mode:
