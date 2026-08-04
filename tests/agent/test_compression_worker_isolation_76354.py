@@ -287,3 +287,65 @@ def test_f5_session_contextvar_rebound_after_rotation(
         )
     finally:
         clear_session_vars(tokens)
+
+
+def test_f3_class_worker_stays_blocked_until_explicit_release(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """CLASS regression: a detached compression worker must remain blocked
+    until the host explicitly releases it — never exit on its own timing.
+
+    The original flake (#76354 F3, observed on CI slice 8/8 under 8-worker
+    load) failed because the worker's release wait was a short wall-clock
+    budget that scheduler starvation could exhaust, letting the worker exit
+    and the isolation assertions run vacuously. The class invariant is:
+    worker blocked -> host times out -> host asserts byte-identity WHILE the
+    worker is provably still alive -> only then release. This test asserts
+    the worker is still alive after the host's full assertion pass and does
+    not exit until release_engine is set, independent of any timer.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "F3_CLASS_BLOCKED"
+    db.create_session(session_id, source="cli")
+    agent = _build_agent_with_db(db, session_id)
+    agent._cached_system_prompt = "sys"
+
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda cfg=None: (0.6, 1.2),
+    )
+
+    engine_started = threading.Event()
+    release_engine = threading.Event()
+    worker_alive = threading.Event()
+
+    def _mutating_engine(msgs, **_kwargs):
+        engine_started.set()
+        msgs[:] = [{"role": "assistant", "content": "ENGINE GARBAGE"}]
+        # Must block on the EVENT, not a timer: premature timer expiry is the
+        # bug class. Event.wait without a timeout blocks indefinitely; the
+        # host is the only releaser.
+        release_engine.wait()
+        worker_alive.set()
+
+    agent.context_compressor.compress.side_effect = _mutating_engine
+
+    live = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    baseline = copy.deepcopy(live)
+
+    try:
+        returned, _sp = agent._compress_context(live, "sys", approx_tokens=120_000)
+        assert engine_started.wait(timeout=60)
+        assert not release_engine.is_set()
+        assert returned is live
+        assert live == baseline, "live transcript mutated by detached worker"
+        # The worker is STILL blocked after the host's full assertion pass.
+        assert not worker_alive.is_set(), (
+            "worker exited before the host released it — timing-budget "
+            "flake class: isolation assertions ran against a dead worker"
+        )
+    finally:
+        release_engine.set()
+    # After release the worker completes; transcript still untouched.
+    assert worker_alive.wait(timeout=60)
+    assert live == baseline
