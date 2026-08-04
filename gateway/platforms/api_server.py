@@ -42,6 +42,8 @@ import re
 import sqlite3
 import time
 import uuid
+from contextvars import ContextVar
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
@@ -543,15 +545,16 @@ class RunEventStore:
                 db_path = str(get_hermes_home() / "run_event_store.db")
             except Exception:
                 db_path = ":memory:"
+        self._db_path: Optional[str] = db_path if db_path != ":memory:" else None
         try:
             self._conn = sqlite3.connect(db_path, check_same_thread=False)
         except Exception:
             self._conn = sqlite3.connect(":memory:", check_same_thread=False)
+            self._db_path = None
         self._conn.row_factory = sqlite3.Row
-        try:
-            self._conn.execute("PRAGMA journal_mode=WAL")
-        except Exception:
-            pass
+        from hermes_state import apply_wal_with_fallback
+
+        apply_wal_with_fallback(self._conn, db_label="run_event_store.db")
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS run_events (
                 run_id TEXT NOT NULL,
@@ -574,6 +577,25 @@ class RunEventStore:
             )"""
         )
         self._conn.commit()
+        self._tighten_file_permissions()
+
+    def _tighten_file_permissions(self) -> None:
+        if not self._db_path:
+            return
+        for candidate in (
+            Path(self._db_path),
+            Path(f"{self._db_path}-wal"),
+            Path(f"{self._db_path}-shm"),
+        ):
+            try:
+                if candidate.exists():
+                    candidate.chmod(0o600)
+            except OSError:
+                logger.debug(
+                    "Failed to restrict run event store permissions for %s",
+                    candidate,
+                    exc_info=True,
+                )
 
     @staticmethod
     def is_terminal_status(status: str) -> bool:
@@ -870,6 +892,28 @@ def _openai_error(message: str, err_type: str = "invalid_request_error", param: 
     }
 
 
+_api_agent_request_reservation: ContextVar[Optional[Dict[str, bool]]] = ContextVar(
+    "api_agent_request_reservation", default=None
+)
+
+
+def _admit_api_agent_request(handler):
+    @wraps(handler)
+    async def _wrapped(self, request, *args, **kwargs):
+        reservation = {"active": True}
+        token = _api_agent_request_reservation.set(reservation)
+        self._pending_agent_requests += 1
+        try:
+            return await handler(self, request, *args, **kwargs)
+        finally:
+            if reservation["active"]:
+                reservation["active"] = False
+                self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+            _api_agent_request_reservation.reset(token)
+
+    return _wrapped
+
+
 if AIOHTTP_AVAILABLE:
     @web.middleware
     async def body_limit_middleware(request, handler):
@@ -1058,6 +1102,11 @@ class APIServerAdapter(BasePlatformAdapter):
         # Active run agent/task references for stop support
         self._active_run_agents: Dict[str, Any] = {}
         self._active_run_tasks: Dict[str, "asyncio.Task"] = {}
+        self._max_concurrent_runs = self._resolve_max_concurrent_runs(
+            extra.get("max_concurrent_runs")
+        )
+        self._inflight_agent_runs = 0
+        self._pending_agent_requests = 0
         # Hot cache only. RunEventStore is the source of truth.
         self._run_statuses: Dict[str, Dict[str, Any]] = {}
         # Active approval session key for each run_id.  The approval core
@@ -1065,6 +1114,61 @@ class APIServerAdapter(BasePlatformAdapter):
         # in-flight run by run_id.
         self._run_approval_sessions: Dict[str, str] = {}
         self._session_db: Optional[Any] = None  # Lazy-init SessionDB for session continuity
+
+    @staticmethod
+    def _resolve_max_concurrent_runs(explicit: Any = None) -> int:
+        default = 10
+        raw = explicit
+        if raw is None:
+            try:
+                from hermes_cli.config import cfg_get, load_config
+
+                raw = cfg_get(
+                    load_config(),
+                    "gateway",
+                    "api_server",
+                    "max_concurrent_runs",
+                    default=default,
+                )
+            except Exception:
+                raw = default
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            return default
+
+    def active_agent_work_count(self) -> int:
+        return (
+            self._pending_agent_requests
+            + self._inflight_agent_runs
+            + sum(not task.done() for task in self._active_run_tasks.values())
+        )
+
+    def _activate_admitted_request(self) -> None:
+        reservation = _api_agent_request_reservation.get()
+        if reservation and reservation["active"]:
+            reservation["active"] = False
+            self._pending_agent_requests = max(0, self._pending_agent_requests - 1)
+
+    def _concurrency_limited_response(self) -> Optional["web.Response"]:
+        limit = self._max_concurrent_runs
+        if limit <= 0:
+            return None
+        inflight = self.active_agent_work_count()
+        reservation = _api_agent_request_reservation.get()
+        if reservation and reservation["active"]:
+            inflight -= 1
+        if inflight < limit:
+            return None
+        return web.json_response(
+            _openai_error(
+                f"Too many concurrent runs (max {limit})",
+                err_type="rate_limit_error",
+                code="rate_limit_exceeded",
+            ),
+            status=429,
+            headers={"Retry-After": "1"},
+        )
 
     @staticmethod
     def _parse_cors_origins(value: Any) -> tuple[str, ...]:
@@ -2020,11 +2124,16 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.debug("[api_server] session SSE stream error: %s", exc)
         return response
 
+    @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         # Parse request body
         try:
@@ -3089,11 +3198,16 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return response
 
+    @_admit_api_agent_request
     async def _handle_responses(self, request: "web.Request") -> "web.Response":
         """POST /v1/responses — OpenAI Responses API format."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
+
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         # Long-term memory scope header (see chat_completions for details).
         gateway_session_key, key_err = self._parse_session_key_header(request)
@@ -3851,13 +3965,17 @@ class APIServerAdapter(BasePlatformAdapter):
             finally:
                 clear_session_vars(tokens)
 
-        return await loop.run_in_executor(None, _run)
+        self._activate_admitted_request()
+        self._inflight_agent_runs += 1
+        try:
+            return await loop.run_in_executor(None, _run)
+        finally:
+            self._inflight_agent_runs -= 1
 
     # ------------------------------------------------------------------
     # /v1/runs — structured event streaming
     # ------------------------------------------------------------------
 
-    _MAX_CONCURRENT_RUNS = 10  # Prevent unbounded resource allocation
     _RUN_STATUS_TTL = 3600  # seconds to retain terminal run status for polling
 
     def _get_run_lock(self, run_id: str) -> "asyncio.Lock":
@@ -4011,6 +4129,7 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return _callback
 
+    @_admit_api_agent_request
     async def _handle_runs(self, request: "web.Request") -> "web.Response":
         """POST /v1/runs — start an agent run, return run_id immediately."""
         auth_err = self._check_auth(request)
@@ -4022,15 +4141,9 @@ class APIServerAdapter(BasePlatformAdapter):
         if key_err is not None:
             return key_err
 
-        # Enforce active run concurrency limit.
-        if self._run_event_store.count_nonterminal_runs() >= self._MAX_CONCURRENT_RUNS:
-            return web.json_response(
-                _openai_error(
-                    f"Too many concurrent runs (max {self._MAX_CONCURRENT_RUNS})",
-                    code="rate_limit_exceeded",
-                ),
-                status=429,
-            )
+        limited = self._concurrency_limited_response()
+        if limited is not None:
+            return limited
 
         try:
             body = await request.json()
@@ -4151,6 +4264,9 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
                     event = dict(approval_data or {})
+                    from gateway.run import _redact_approval_command
+
+                    event["command"] = _redact_approval_command(event.get("command"))
                     event.update({
                         "event": "approval.request",
                         "run_id": run_id,
@@ -4294,6 +4410,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
 
+        self._activate_admitted_request()
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task
         try:

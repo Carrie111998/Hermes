@@ -10,6 +10,7 @@ Covers:
 
 import asyncio
 import json
+import os
 import threading
 import time as _time
 from unittest.mock import MagicMock, patch
@@ -21,6 +22,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.api_server import (
     APIServerAdapter,
+    RunEventStore,
     cors_middleware,
     security_headers_middleware,
 )
@@ -144,6 +146,48 @@ def auth_adapter():
 
 
 class TestStartRun:
+    @pytest.mark.asyncio
+    async def test_start_uses_configured_shared_concurrency_limit(self):
+        adapter = _make_adapter(max_concurrent_runs=1)
+        adapter._inflight_agent_runs = 1
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post("/v1/runs", json={"input": "hello"})
+            assert resp.status == 429
+            assert resp.headers["Retry-After"] == "1"
+            data = await resp.json()
+        assert data["error"]["code"] == "rate_limit_exceeded"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("path", "payload"),
+        [
+            ("/v1/chat/completions", {"messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/responses", {"input": "hi"}),
+        ],
+    )
+    async def test_shared_limit_applies_to_other_agent_endpoints(self, path, payload):
+        adapter = _make_adapter(max_concurrent_runs=1)
+        adapter._active_run_tasks["run_existing"] = asyncio.create_task(asyncio.sleep(10))
+        app = web.Application()
+        app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
+        app.router.add_post("/v1/responses", adapter._handle_responses)
+
+        try:
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(path, json=payload)
+                assert resp.status == 429
+                assert resp.headers["Retry-After"] == "1"
+                data = await resp.json()
+            assert data["error"]["code"] == "rate_limit_exceeded"
+        finally:
+            adapter._active_run_tasks["run_existing"].cancel()
+            await asyncio.gather(
+                adapter._active_run_tasks["run_existing"],
+                return_exceptions=True,
+            )
+
     @pytest.mark.asyncio
     async def test_start_returns_202(self, adapter):
         app = _create_runs_app(adapter)
@@ -377,6 +421,38 @@ class TestRunEvents:
                     "approval_not_active",
                     "approval_not_pending",
                 }
+
+    @pytest.mark.asyncio
+    async def test_approval_event_is_redacted_before_persistence(self, adapter):
+        app = _create_runs_app(adapter)
+        original_command = "echo sk-secret-token"
+
+        def _register_notify(_session_key, notify):
+            notify({
+                "command": original_command,
+                "description": "run command",
+            })
+
+        mock_agent = MagicMock()
+        mock_agent.run_conversation.return_value = {"final_response": "done"}
+        mock_agent.session_prompt_tokens = 0
+        mock_agent.session_completion_tokens = 0
+        mock_agent.session_total_tokens = 0
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_create_agent", return_value=mock_agent),
+                patch("tools.approval.register_gateway_notify", side_effect=_register_notify),
+            ):
+                resp = await cli.post("/v1/runs", json={"input": "hello"})
+                run_id = (await resp.json())["run_id"]
+                await adapter._active_run_tasks[run_id]
+                await asyncio.sleep(0)
+
+        events = adapter._run_event_store.list_events_after(run_id, 0)
+        approval_event = next(event for event in events if event["event"] == "approval.request")
+        assert approval_event["command"] != original_command
+        assert "sk-secret-token" not in json.dumps(approval_event)
 
     @pytest.mark.asyncio
     async def test_approval_string_false_does_not_resolve_all(self, adapter):
@@ -637,6 +713,25 @@ class TestRunEvents:
         assert status["status"] == "failed"
         assert "abandoned" in status["error"]
         assert events[-1]["event"] == "run.failed"
+
+
+class TestRunEventStoreSecurity:
+    def test_disk_store_uses_wal_fallback_and_owner_only_permissions(self, tmp_path):
+        db_path = tmp_path / "run_events.db"
+
+        with patch("hermes_state.apply_wal_with_fallback") as apply_wal:
+            store = RunEventStore(str(db_path))
+
+        try:
+            apply_wal.assert_called_once_with(store._conn, db_label="run_event_store.db")
+            if os.name != "nt":
+                assert db_path.stat().st_mode & 0o777 == 0o600
+                for suffix in ("-wal", "-shm"):
+                    sidecar = tmp_path / f"run_events.db{suffix}"
+                    if sidecar.exists():
+                        assert sidecar.stat().st_mode & 0o777 == 0o600
+        finally:
+            store.close()
 
 
 # ---------------------------------------------------------------------------
