@@ -439,6 +439,10 @@ _PROVIDER_MODELS: dict[str, list[str]] = {
         "anthropic/claude-sonnet-4.6",
         "openai/gpt-5.4",
     ],
+    "sambanova": [
+        "Meta-Llama-3.3-70B-Instruct",
+        "Qwen2.5-72B-Instruct",
+    ],
     "opencode-zen": [
         "kimi-k2.5",
         "kimi-k2.6",
@@ -1358,6 +1362,8 @@ _PROVIDER_ALIASES = {
     "nvidia-nim": "nvidia",
     "build-nvidia": "nvidia",
     "nemotron": "nvidia",
+    "sambanova-ai": "sambanova",
+    "sambanovaai": "sambanova",
     "lmstudio": "lmstudio",
     "lm-studio": "lmstudio",
     "lm_studio": "lmstudio",

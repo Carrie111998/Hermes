@@ -16,6 +16,7 @@ SAMBA_NOVA_MODELS_URL = "https://api.sambanova.ai/v1/models"
 
 sambanova = ProviderProfile(
     name="sambanova",
+    aliases=("sambanova-ai", "sambanovaai"),
     env_vars=("SAMBANOVA_API_KEY",),
     display_name="SambaNova",
     description="SambaNova — AI acceleration platform with OpenAI-compatible API",
