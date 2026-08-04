@@ -209,13 +209,19 @@ class TestCompress:
     def test_compress_strips_db_persisted_from_assembled_messages(self, compressor):
         """Regression for #57491: shallow copies must not carry flush markers."""
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i}",
+                "_db_persisted": True,
+                "_db_content_update_pending": True,
+            }
             for i in range(10)
         ]
         with patch("agent.context_compressor.call_llm", side_effect=RuntimeError("no provider")):
             result = compressor.compress(msgs)
         assert len(result) < len(msgs)
         assert all("_db_persisted" not in msg for msg in result)
+        assert all("_db_content_update_pending" not in msg for msg in result)
 
     def test_compress_terminal_sweep_strips_markers_even_if_a_copy_site_leaks(self, compressor):
         """Regression for #57491, structural: even if a copy site fails to strip
@@ -226,7 +232,12 @@ class TestCompress:
         import agent.context_compressor as _cc
 
         msgs = [
-            {"role": "user" if i % 2 == 0 else "assistant", "content": f"m{i}", "_db_persisted": True}
+            {
+                "role": "user" if i % 2 == 0 else "assistant",
+                "content": f"m{i}",
+                "_db_persisted": True,
+                "_db_content_update_pending": True,
+            }
             for i in range(10)
         ]
         # Make the per-site helper leak the marker (dict.copy keeps it).
@@ -237,6 +248,7 @@ class TestCompress:
         assert all("_db_persisted" not in msg for msg in result), (
             "terminal sweep must strip _db_persisted even when a copy site leaks"
         )
+        assert all("_db_content_update_pending" not in msg for msg in result)
 
     def test_protect_first_n_decays_after_first_compression(self):
         """Regression for #11996: protect_first_n must protect early turns on

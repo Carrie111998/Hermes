@@ -148,7 +148,11 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # micro markers: a batch marker's content is NOT contained in the micro
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
-_DB_PERSISTED_MARKER = "_db_persisted"
+
+from agent.persistence_markers import (  # noqa: E402
+    _DB_PERSISTED_MARKER,
+    _DB_CONTENT_UPDATE_PENDING,
+)
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -178,6 +182,7 @@ def _fresh_compaction_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     fresh = msg.copy()
     fresh.pop(_DB_PERSISTED_MARKER, None)
+    fresh.pop(_DB_CONTENT_UPDATE_PENDING, None)
     return fresh
 
 
@@ -227,6 +232,7 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
     for msg in messages:
         if isinstance(msg, dict):
             msg.pop(_DB_PERSISTED_MARKER, None)
+            msg.pop(_DB_CONTENT_UPDATE_PENDING, None)
 
 
 # Appended to every standalone summary message (and to the merged-into-tail

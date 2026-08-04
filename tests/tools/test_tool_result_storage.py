@@ -3,6 +3,7 @@
 import pytest
 from unittest.mock import MagicMock, patch
 
+from agent.persistence_markers import _DB_CONTENT_UPDATE_PENDING
 from tools.budget_config import (
     DEFAULT_RESULT_SIZE_CHARS,
     DEFAULT_PREVIEW_SIZE_CHARS,
@@ -282,6 +283,25 @@ class TestEnforceTurnBudget:
             1 for m in msgs if PERSISTED_OUTPUT_TAG in m["content"]
         )
         assert persisted_count >= 2  # Need to shed at least ~52K
+
+
+    def test_replaced_content_flagged_for_durable_update(self):
+        """Budget rewrites run after the per-tool incremental flush, so a
+        replaced message must be flagged for an in-place durable update."""
+        msgs = [
+            {"role": "tool", "tool_call_id": "t1", "content": "small"},
+            {"role": "tool", "tool_call_id": "t2", "content": "x" * 250_000},
+        ]
+        enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        assert msgs[1]["content"] != "x" * 250_000
+        assert msgs[1][_DB_CONTENT_UPDATE_PENDING] is True
+        assert _DB_CONTENT_UPDATE_PENDING not in msgs[0]
+
+
+    def test_under_budget_sets_no_update_flag(self):
+        msgs = [{"role": "tool", "tool_call_id": "t1", "content": "small"}]
+        enforce_turn_budget(msgs, env=None, config=BudgetConfig(turn_budget=200_000))
+        assert _DB_CONTENT_UPDATE_PENDING not in msgs[0]
 
 
     def test_empty_messages(self):

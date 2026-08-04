@@ -6293,7 +6293,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         messages: List[Dict[str, Any]],
         compression_lock_holder: Optional[str] = None,
         chunk_rows: Optional[int] = None,
-    ) -> int:
+        return_row_ids: bool = False,
+    ) -> int | List[int]:
         """Append multiple messages atomically in ONE write transaction.
 
         ``messages`` is a list of dicts in the same shape
@@ -6319,12 +6320,28 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         the batch commits in chunks of at most that many rows — same
         recovery semantics as the old per-row loops (a mid-copy failure
         leaves a partial seed), just with bounded lock holds. A turn flush
-        never needs it. Returns the inserted row count.
+        never needs it.
+
+        Returns the inserted row count by default. ``return_row_ids=True``
+        returns the inserted ids in input order for live consumers that must
+        retain exact durable message identity.
         """
         if not messages:
-            return 0
+            return [] if return_row_ids else 0
 
         if chunk_rows is not None and len(messages) > chunk_rows:
+            if return_row_ids:
+                inserted_ids: List[int] = []
+                for start in range(0, len(messages), chunk_rows):
+                    inserted_ids.extend(
+                        self.append_messages_batch(
+                            session_id,
+                            messages[start:start + chunk_rows],
+                            compression_lock_holder=compression_lock_holder,
+                            return_row_ids=True,
+                        )
+                    )
+                return inserted_ids
             inserted_total = 0
             for start in range(0, len(messages), chunk_rows):
                 inserted_total += self.append_messages_batch(
@@ -6338,9 +6355,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._check_transcript_write_guards(
                 conn, session_id, compression_lock_holder
             )
-            inserted, tool_calls_total = self._insert_message_rows(
-                conn, session_id, messages
-            )
+            inserted_ids = [] if return_row_ids else None
+            if return_row_ids:
+                inserted, tool_calls_total = self._insert_message_rows(
+                    conn,
+                    session_id,
+                    messages,
+                    inserted_row_ids=inserted_ids,
+                )
+            else:
+                inserted, tool_calls_total = self._insert_message_rows(
+                    conn, session_id, messages
+                )
             # One aggregated counter update for the whole batch.
             if tool_calls_total > 0:
                 conn.execute(
@@ -6353,7 +6379,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     "UPDATE sessions SET message_count = message_count + ? WHERE id = ?",
                     (inserted, session_id),
                 )
-            return inserted
+            return inserted_ids if return_row_ids else inserted
 
         # Same criticality as append_message: this IS the turn's transcript.
         return self._execute_write(
@@ -6602,7 +6628,80 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return row[0] if row else None
 
-    def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> tuple[int, int]:
+    def update_tool_message_content(
+        self,
+        message_row_id: Optional[int],
+        content: Any,
+        session_id: str,
+        *,
+        tool_call_id: Optional[str] = None,
+        compression_lock_holder: Optional[str] = None,
+    ) -> Optional[int]:
+        """Update an intentionally mutated active tool row and return its id.
+
+        ``message_row_id`` is exact for rows inserted by the live agent or
+        loaded for live replay. ``tool_call_id`` is a fallback for an atomic
+        transcript rewrite that replaced the SQLite row id, and is accepted
+        only when it resolves uniquely. FTS update triggers keep search indexes
+        in sync.
+        """
+        stored_content = self._encode_content(content)
+
+        def _do(conn):
+            self._check_transcript_write_guards(
+                conn, session_id, compression_lock_holder
+            )
+
+            row = None
+            if message_row_id is not None:
+                row = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE id = ? AND session_id = ? "
+                    "AND role = 'tool' AND active = 1",
+                    (message_row_id, session_id),
+                ).fetchone()
+            if row is None and tool_call_id:
+                matches = conn.execute(
+                    "SELECT id FROM messages "
+                    "WHERE session_id = ? AND role = 'tool' "
+                    "AND tool_call_id = ? AND active = 1 "
+                    "ORDER BY id LIMIT 2",
+                    (session_id, tool_call_id),
+                ).fetchall()
+                # Durable transcripts may contain retry/crash duplicates that
+                # live replay repairs by keeping only the first. Never guess
+                # which duplicate a metadata-free message represents.
+                if len(matches) == 1:
+                    row = matches[0]
+            if row is None:
+                return None
+            resolved_row_id = int(row["id"])
+            conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (stored_content, resolved_row_id),
+            )
+            return resolved_row_id
+
+        updated_row_id = self._execute_write(
+            _do, patience_s=self._TRANSCRIPT_WRITE_PATIENCE_S
+        )
+        if updated_row_id is None:
+            logger.warning(
+                "update_tool_message_content matched no active row "
+                "(id=%s session_id=%s tool_call_id=%s)",
+                message_row_id,
+                session_id,
+                tool_call_id,
+            )
+        return updated_row_id
+
+    def _insert_message_rows(
+        self,
+        conn,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        inserted_row_ids: Optional[List[int]] = None,
+    ) -> tuple[int, int]:
         """Insert *messages* as fresh active rows for *session_id*.
 
         Shared by :meth:`replace_messages` (delete-then-insert) and
@@ -6661,7 +6760,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
             api_content = msg.get("api_content")
 
-            conn.execute(
+            cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
@@ -6691,6 +6790,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
+            if inserted_row_ids is not None:
+                inserted_row_ids.append(int(cursor.lastrowid))
             inserted += 1
             if tool_calls is not None:
                 tool_calls_total += (
@@ -7099,8 +7200,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         otherwise re-triggers the pre-request defensive repair on every
         single request for the rest of the session's life — the repair
         mutates only the per-request list, never the stored transcript.
-        Inspection/export consumers keep the default and see the transcript
-        verbatim.
+        ``include_row_ids=True`` adds the private SQLite row id needed by
+        consumers that address or intentionally mutate a durable message.
+        Inspection/export consumers keep the default transcript shape.
         """
         session_ids = [session_id]
         if include_ancestors:
@@ -7165,9 +7267,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 content = sanitize_context(content).strip()
             msg = {"role": row["role"], "content": content}
             # Durable per-message identity for surfaces that need to address a
-            # specific row later (desktop reactions). OPT-IN: only the gateway
-            # asks for it — every other consumer (ACP restore, export,
-            # inspection) gets the transcript in its historical shape.
+            # specific row later (desktop reactions and live post-flush
+            # mutations). OPT-IN: other consumers (ACP restore, export,
+            # inspection) keep the transcript's historical shape.
             # Underscore-prefixed so every transport's convert_messages()
             # strips it before the wire.
             if include_row_ids and row["id"] is not None:

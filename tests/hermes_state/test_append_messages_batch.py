@@ -113,6 +113,14 @@ class TestAppendMessagesBatch:
     def test_returns_inserted_count(self, db):
         assert db.append_messages_batch("sess-batch", _turn_messages()) == 4
 
+    def test_optionally_returns_inserted_row_ids_in_input_order(self, db):
+        row_ids = db.append_messages_batch(
+            "sess-batch", _turn_messages(), return_row_ids=True
+        )
+
+        stored_ids = [row["id"] for row in db.get_messages("sess-batch")]
+        assert row_ids == stored_ids
+
     def test_empty_batch_is_noop(self, db):
         assert db.append_messages_batch("sess-batch", []) == 0
         row = db._conn.execute(

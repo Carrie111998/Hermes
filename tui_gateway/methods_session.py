@@ -420,7 +420,11 @@ def _(rid, params: dict) -> dict:
             # history becomes the resumed session record's working conversation),
             # so heal a durable ``user;user`` violation once here instead of
             # re-firing the pre-request repair on every subsequent turn.
-            history = db.get_messages_as_conversation(target, repair_alternation=True)
+            history = db.get_messages_as_conversation(
+                target,
+                repair_alternation=True,
+                include_row_ids=True,
+            )
         except Exception as e:
             if lease is not None:
                 lease.release()
@@ -2652,12 +2656,17 @@ def _(rid, params: dict) -> dict:
             # Copy the whole parent history in bounded-chunk transactions —
             # a branch seed can be hundreds of rows, and per-row transactions
             # were the write-amplification pattern removed in #23254.
-            db.append_messages_batch(
+            child_row_ids = db.append_messages_batch(
                 new_key,
                 [
                     {
                         "role": msg.get("role", "user"),
                         "content": msg.get("content"),
+                        # Preserve assistant/tool pairing and retain the
+                        # protocol-level fallback for later durable updates.
+                        "tool_name": msg.get("tool_name") or msg.get("name"),
+                        "tool_calls": msg.get("tool_calls"),
+                        "tool_call_id": msg.get("tool_call_id"),
                         # Preserve the parent's original message timestamps —
                         # branch copies are history, not new activity (9d73006ad).
                         "timestamp": msg.get("timestamp"),
@@ -2665,7 +2674,14 @@ def _(rid, params: dict) -> dict:
                     for msg in history
                 ],
                 chunk_rows=500,
+                return_row_ids=True,
             )
+            if len(child_row_ids) != len(history):
+                raise RuntimeError("branch copy returned an unexpected row-id count")
+            # The shallow copies still point at parent rows. Re-stamp them with
+            # child ids for later mutations and desktop reactions.
+            for msg, row_id in zip(history, child_row_ids):
+                msg["_row_id"] = row_id
             db.set_session_title(new_key, title)
         except Exception as e:
             if lease is not None:
