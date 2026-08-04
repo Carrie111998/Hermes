@@ -2677,7 +2677,14 @@ def run_conversation(
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
                         agent._emit_status(f"❌ Max retries ({max_retries}) exceeded for invalid responses. Giving up.")
-                        logger.error("%sInvalid API response after %d retries.", agent.log_prefix, max_retries)
+                        logger.error(
+                            "%sInvalid API response after %d retries.",
+                            agent.log_prefix, max_retries,
+                            extra={
+                                "error_category": "api",
+                                "error_detail": f"invalid_response retries={max_retries}",
+                            },
+                        )
                         agent._persist_session(messages, conversation_history)
                         _final_response = f"Invalid API response after {max_retries} retries: {_failure_hint}"
                         return {
@@ -5405,6 +5412,13 @@ def run_conversation(
                         "%sAPI call failed after %s retries. %s | provider=%s model=%s msgs=%s tokens=~%s",
                         agent.log_prefix, max_retries, _final_summary,
                         _provider, _model, len(api_messages), f"{approx_tokens:,}",
+                        extra={
+                            "error_category": "api",
+                            "error_detail": (
+                                f"provider={_provider} model={_model} "
+                                f"retries={max_retries}"
+                            ),
+                        },
                     )
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(

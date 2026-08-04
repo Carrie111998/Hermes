@@ -3750,7 +3750,13 @@ def run_job(
         
     except Exception as e:
         error_msg = f"{type(e).__name__}: {str(e)}"
-        logger.exception("Job '%s' failed: %s", job_name, error_msg)
+        logger.exception(
+            "Job '%s' failed: %s", job_name, error_msg,
+            extra={
+                "error_category": "cron",
+                "error_detail": f"job_id={job_id} name={job_name}",
+            },
+        )
         
         output = f"""# Cron Job: {job_name} (FAILED)
 
