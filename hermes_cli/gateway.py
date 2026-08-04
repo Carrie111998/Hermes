@@ -4057,9 +4057,9 @@ def generate_launchd_plist() -> str:
     # to launchd's WorkingDirectory as to systemd's).
     working_dir = _stable_service_working_dir()
     hermes_home = str(get_hermes_home().resolve())
-    log_dir = get_hermes_home() / "logs"
-    log_dir.mkdir(parents=True, exist_ok=True)
     label = get_launchd_label()
+    log_dir = Path.home() / "Library" / "Logs" / label
+    log_dir.mkdir(parents=True, exist_ok=True)
     profile_arg = _profile_arg(hermes_home)
     # Build a sane PATH for the launchd plist.  launchd provides only a
     # minimal default (/usr/bin:/bin:/usr/sbin:/sbin) which misses Homebrew,
@@ -4144,10 +4144,10 @@ def generate_launchd_plist() -> str:
     <integer>25</integer>
 
     <key>StandardOutPath</key>
-    <string>{log_dir}/gateway.log</string>
+    <string>{log_dir}/gateway.stdout.log</string>
     
     <key>StandardErrorPath</key>
-    <string>{log_dir}/gateway.error.log</string>
+    <string>{log_dir}/gateway.stderr.log</string>
 </dict>
 </plist>
 """

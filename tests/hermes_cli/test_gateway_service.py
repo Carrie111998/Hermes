@@ -232,6 +232,26 @@ class TestGeneratedSystemdUnits:
         assert str(local_bin) in plist
         assert str(profile_node_bin) not in plist
 
+    def test_launchd_stdio_uses_user_library_logs_not_hermes_home(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        user_home = tmp_path / "user"
+        hermes_home = tmp_path / "external-volume" / "hermes"
+        user_home.mkdir()
+        hermes_home.mkdir(parents=True)
+        monkeypatch.setenv("HOME", str(user_home))
+        monkeypatch.setattr(gateway_cli, "get_hermes_home", lambda: hermes_home)
+
+        plist = gateway_cli.generate_launchd_plist()
+
+        log_dir = user_home / "Library" / "Logs" / gateway_cli.get_launchd_label()
+        assert f"<string>{log_dir}/gateway.stdout.log</string>" in plist
+        assert f"<string>{log_dir}/gateway.stderr.log</string>" in plist
+        assert str(hermes_home / "logs") not in plist
+        assert log_dir.is_dir()
+
 
 
 class TestGatewayStopCleanup:
@@ -1759,4 +1779,3 @@ class TestRetryLaunchctlBootstrapUntilRegistered:
         )
         assert ok is True
         assert attempts["bootstrap"] >= 2  # the timeout was retried, not raised
-
