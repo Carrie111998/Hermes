@@ -1261,6 +1261,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    timestamps: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1305,6 +1306,12 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        timestamps: Optional per-job override for timestamp injection. When
+                ``True``, always prepend a timestamp to the prompt (regardless
+                of global config). When ``False``, never inject. When ``None``
+                (default), follow the global ``gateway.message_timestamps.enabled``
+                setting. Mirrors the per-job override pattern used by
+                ``attach_to_session``.
 
     Returns:
         The created job dict
@@ -1337,6 +1344,7 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_timestamps = timestamps if isinstance(timestamps, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1432,6 +1440,11 @@ def create_job(
     # global cron.mirror_delivery config, default off).
     if normalized_attach is not None:
         job["attach_to_session"] = normalized_attach
+    # Only persist timestamps when explicitly set, so existing jobs and
+    # the common case stay byte-identical (absent key => fall back to the
+    # global gateway.message_timestamps.enabled config, default off).
+    if normalized_timestamps is not None:
+        job["timestamps"] = normalized_timestamps
 
     with _jobs_lock():
         jobs = load_jobs()
@@ -1530,8 +1543,16 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            if "timestamps" in updates and not (
+                updates["timestamps"] is None
+                or isinstance(updates["timestamps"], bool)
+            ):
+                raise ValueError("Cron job timestamps must be true, false, or null (inherit)")
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if "timestamps" in updates and updates["timestamps"] is None:
+                updated.pop("timestamps", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)

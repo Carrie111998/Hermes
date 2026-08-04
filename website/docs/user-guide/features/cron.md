@@ -67,6 +67,53 @@ Every morning at 9am, check Hacker News for AI news and send me a summary on Tel
 
 Hermes will use the unified `cronjob` tool internally.
 
+## Prompt timestamps
+
+LLM-driven cron jobs can prepend the current fire time to the job prompt, using
+Hermes' configured timezone. Timestamp behaviour is a per-job tri-state:
+
+| State | Standalone CLI | REST API / `cronjob` tool | Behaviour |
+|-------|----------------|---------------------------|-----------|
+| Inherit (default) | `--timestamps inherit` | `"timestamps": null` (or omit when creating) | Follow `gateway.message_timestamps.enabled`. |
+| Enabled | `--timestamps on` | `"timestamps": true` | Always timestamp this job's prompt, even when the gateway setting is off. |
+| Disabled | `--timestamps off` | `"timestamps": false` | Never timestamp this job's prompt, even when the gateway setting is on. |
+
+Set the inherited default in `~/.hermes/config.yaml`:
+
+```yaml
+gateway:
+  message_timestamps:
+    enabled: true
+```
+
+For example, create an explicitly timestamped job from the CLI:
+
+```bash
+hermes cron create "0 9 * * *" "Prepare the morning brief" --timestamps on
+```
+
+The equivalent `cronjob` tool call is:
+
+```python
+cronjob(
+    action="create",
+    schedule="0 9 * * *",
+    prompt="Prepare the morning brief",
+    timestamps=True,
+)
+```
+
+The REST API uses the same JSON tri-state. Pass `timestamps` to
+`POST /api/jobs` when creating a job or `PATCH /api/jobs/<job_id>` when editing
+one. To return an existing override to inheritance, use `--timestamps inherit`,
+`timestamps=None` in the tool, or `{"timestamps": null}` in the API.
+
+:::note
+`no_agent` script-only jobs do not build a model prompt, so prompt timestamp
+settings have no effect on them. If a script's output needs a timestamp, the
+script must add it itself.
+:::
+
 ## Letting unpinned jobs track global defaults
 
 The model/provider drift guard is enabled by default. If your unpinned cron

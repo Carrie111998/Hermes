@@ -2984,8 +2984,37 @@ def run_job(
             )
             return True, silent_doc, SILENT_MARKER, None
 
+    # Resolve timestamp policy before assembling the cron wrapper. A recurring
+    # job may have a timestamp stored at the front of its raw prompt; clean that
+    # raw value first so a fresh run timestamp does not leave the stale one
+    # embedded below the wrapper.
+    _timestamp_job = job
+    _should_inject_timestamp = False
+    _cron_timestamp_tz = None
     try:
-        prompt = _build_job_prompt(job, prerun_script=prerun_script)
+        from gateway.message_timestamps import (
+            message_timestamps_enabled as _cron_ts_enabled,
+            strip_leading_message_timestamps as _cron_strip_ts,
+        )
+        from hermes_time import get_timezone as _get_cron_timestamp_tz
+
+        per_job_timestamps = job.get("timestamps")
+        if isinstance(per_job_timestamps, bool):
+            _should_inject_timestamp = per_job_timestamps
+        else:
+            _should_inject_timestamp = _cron_ts_enabled()
+        _cron_timestamp_tz = _get_cron_timestamp_tz()
+        if _should_inject_timestamp and isinstance(job.get("prompt"), str):
+            _clean_job_prompt, _ = _cron_strip_ts(
+                job["prompt"], tz=_cron_timestamp_tz
+            )
+            if _clean_job_prompt != job["prompt"]:
+                _timestamp_job = {**job, "prompt": _clean_job_prompt}
+    except Exception:
+        logger.debug("Job '%s': timestamp policy resolution skipped", job_name, exc_info=True)
+
+    try:
+        prompt = _build_job_prompt(_timestamp_job, prerun_script=prerun_script)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface
@@ -3012,6 +3041,25 @@ def run_job(
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+
+    # Timestamp the assembled prompt at every fire. Do not let the generic
+    # renderer preserve a previously stored prefix: recurring jobs need the
+    # current fire time, rendered in Hermes' configured timezone.
+    try:
+        if _should_inject_timestamp:
+            from gateway.message_timestamps import (
+                render_user_content_with_timestamp as _cron_render_ts,
+                strip_leading_message_timestamps as _cron_strip_ts,
+            )
+
+            _clean_prompt, _ = _cron_strip_ts(prompt, tz=_cron_timestamp_tz)
+            prompt = _cron_render_ts(
+                _clean_prompt,
+                ts_value=time.time(),
+                tz=_cron_timestamp_tz,
+            )
+    except Exception:
+        logger.debug("Job '%s': timestamp injection skipped", job_name, exc_info=True)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
     logger.info("Running job '%s' (ID: %s)", job_name, job_id)

@@ -129,6 +129,33 @@ def render_user_content_with_timestamp(content: str, ts_value: Any = None, tz=No
     return prefix
 
 
+def message_timestamps_enabled(config: Optional[dict] = None) -> bool:
+    """True when ``gateway.message_timestamps.enabled`` is opted in.
+
+    Cron uses the gateway's established opt-in setting unless a job has an
+    explicit override. Accepts a pre-loaded config dict; when omitted, loads
+    from ``hermes_cli.config.load_config`` (fail-safe → False).
+
+    Accepts both the explicit dict form (``message_timestamps: {enabled: true}``)
+    and the gateway's existing bare-value shorthand semantics.
+    """
+    if config is None:
+        try:
+            from hermes_cli.config import load_config
+            config = load_config()
+        except Exception:
+            return False
+    if not isinstance(config, dict):
+        return False
+    gw = config.get("gateway")
+    if not isinstance(gw, dict):
+        return False
+    mt = gw.get("message_timestamps")
+    if isinstance(mt, dict):
+        return bool(mt.get("enabled", False))
+    return bool(mt)
+
+
 def _parse_timestamp_prefix(text: str, tz=None) -> Optional[float]:
     match = _HUMAN_TIMESTAMP_RE.match(text) or _ISO_TIMESTAMP_RE.match(text)
     if not match:

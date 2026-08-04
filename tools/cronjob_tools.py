@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Union
 from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
+_UNSET = object()
 
 # Cadence for the heartbeat that keeps the calling agent's inactivity watchdog
 # at bay while a manual `cronjob(action="run")` executes the job synchronously
@@ -577,6 +578,7 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         "state": job.get("state", "scheduled" if job.get("enabled", True) else "paused"),
         "paused_at": job.get("paused_at"),
         "paused_reason": job.get("paused_reason"),
+        "timestamps": job.get("timestamps"),
     }
     if job.get("script"):
         result["script"] = job["script"]
@@ -728,6 +730,7 @@ def cronjob(
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
+    timestamps: Any = _UNSET,
     task_id: str = None,
 ) -> str:
     """Unified cron job management tool."""
@@ -739,6 +742,13 @@ def cronjob(
         if normalized == "create":
             if not schedule:
                 return tool_error("schedule is required for create", success=False)
+            if timestamps is not _UNSET and not (
+                timestamps is None or isinstance(timestamps, bool)
+            ):
+                return tool_error(
+                    "timestamps must be true, false, or null (inherit)",
+                    success=False,
+                )
             canonical_skills = _canonical_skills(skill, skills)
             _no_agent = bool(no_agent)
             # Job-shape validation differs by mode:
@@ -801,6 +811,7 @@ def cronjob(
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
                 attach_to_session=attach_to_session,
+                timestamps=None if timestamps is _UNSET else timestamps,
             )
             _notify_provider_jobs_changed_safe()
             _create_message = f"Cron job '{job['name']}' created."
@@ -980,6 +991,13 @@ def cronjob(
                 updates["enabled_toolsets"] = enabled_toolsets or None
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
+            if timestamps is not _UNSET:
+                if not (timestamps is None or isinstance(timestamps, bool)):
+                    return tool_error(
+                        "timestamps must be true, false, or null (inherit)",
+                        success=False,
+                    )
+                updates["timestamps"] = timestamps
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
@@ -1127,6 +1145,10 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 "type": "boolean",
                 "description": "When True, this job becomes CONTINUABLE: the user can reply to its delivery and the agent has the brief in context instead of asking 'what is that?'. On thread-capable platforms (Telegram topics, Discord/Slack threads) a dedicated thread is opened for the job and its replies; on DM-only platforms (WhatsApp/Signal) the brief is mirrored into the origin DM session. Use this for conversational recurring jobs the user will reply to — daily briefings, reminders that kick off follow-up work. Leave unset for fire-and-forget alerts/watchdogs. Overrides the global cron.mirror_delivery config for this one job. Only the origin chat is touched (never fan-out targets); no effect when deliver='local'."
             },
+            "timestamps": {
+                "type": ["boolean", "null"],
+                "description": "Per-job prompt timestamp override. True always adds the current fire time, False disables it, and null clears the override so the job inherits gateway.message_timestamps.enabled. Omit on create/update to leave the current/default behavior unchanged."
+            },
         },
         "required": ["action"]
     }
@@ -1184,6 +1206,7 @@ registry.register(
         enabled_toolsets=args.get("enabled_toolsets"),
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
+        timestamps=args.get("timestamps", _UNSET),
         task_id=kw.get("task_id"),
     ),
     check_fn=check_cronjob_requirements,
