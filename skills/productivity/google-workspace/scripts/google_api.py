@@ -31,7 +31,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 from email.mime.text import MIMEText
 from pathlib import Path
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+# zoneinfo is imported lazily where needed (Python 3.9+).
 
 # Ensure sibling modules (_hermes_home) are importable when run standalone.
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
@@ -486,6 +486,7 @@ def _normalize_event_time(dt_obj: dict, user_tz: str | None) -> str:
         raw_clean = re.sub(r"Z$", "+00:00", raw)
         dt = datetime.fromisoformat(raw_clean)
         try:
+            from zoneinfo import ZoneInfo
             dt_local = dt.astimezone(ZoneInfo(user_tz))
             return dt_local.strftime("%Y-%m-%d %H:%M %Z")
         except Exception as exc:
@@ -508,9 +509,14 @@ def calendar_list(args):
     # clear error message rather than a confusing remote-side rejection.
     if user_tz:
         try:
-            ZoneInfo(user_tz)
-        except (ValueError, ZoneInfoNotFoundError) as exc:
-            print(json.dumps({"error": f"Invalid timezone '{user_tz}': {exc}"}))
+            from zoneinfo import ZoneInfo
+            try:
+                ZoneInfo(user_tz)
+            except (ValueError, KeyError) as exc:
+                print(json.dumps({"error": f"Invalid timezone '{user_tz}': {exc}"}))
+                sys.exit(1)
+        except ImportError:
+            print(json.dumps({"error": "Timezone support unavailable (requires Python 3.9+)."}))
             sys.exit(1)
 
     if _gws_binary():
