@@ -1,13 +1,14 @@
 """
 Regression tests for the shared-container task_id mapping.
 
-The top-level agent and all delegate_task subagents share a single
-terminal sandbox keyed by ``"default"``.  ``_resolve_container_task_id``
-is the sole gatekeeper for which tool-call task_ids go to the shared
-container vs. get their own isolated sandbox.  RL / benchmark
-environments opt in to isolation by calling
+The top-level agent and all delegate_task subagents normally share a
+terminal sandbox keyed by ``"default"``. Kanban workers instead share a
+board-and-card-scoped sandbox with only their own delegates.
+``_resolve_container_task_id`` is the sole gatekeeper for which tool-call
+task_ids go to a shared container vs. get their own isolated sandbox.
+RL / benchmark environments opt in to isolation by calling
 ``register_task_env_overrides(task_id, {...})`` before the agent loop;
-every other task_id collapses back to ``"default"``.
+other task_ids collapse back to the applicable shared key.
 
 If you change the collapse logic, update both the helper and these
 tests -- see `hermes-agent-dev` skill, "Why do subagents get their own
@@ -36,6 +37,19 @@ def test_none_task_id_maps_to_default():
 
 def test_empty_task_id_maps_to_default():
     assert terminal_tool._resolve_container_task_id("") == "default"
+
+
+def test_kanban_worker_uses_board_and_card_scoped_container(monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_a082045e")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+
+    top_level_key = terminal_tool._resolve_container_task_id(None)
+
+    assert top_level_key.startswith("kanban-")
+    assert terminal_tool._resolve_container_task_id("delegate-1") == top_level_key
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "other-board")
+    assert terminal_tool._resolve_container_task_id(None) != top_level_key
 
 
 def test_cwd_only_override_collapses_to_default():

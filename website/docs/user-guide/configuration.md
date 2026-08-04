@@ -259,13 +259,14 @@ terminal:
 
 #### Container lifecycle
 
-Every Hermes-managed container is tagged with three labels so subsequent processes (and the orphan reaper) can identify it:
+Every Hermes-managed container is tagged with labels so subsequent processes (and the orphan reaper) can identify it:
 
 - `hermes-agent=1` — marks it as Hermes-managed
 - `hermes-task-id=<sanitized task_id>` — keys the per-task reuse probe
 - `hermes-profile=<sanitized profile name>` — scopes reuse and reaping to the active Hermes profile
+- `hermes-container-spec=<fingerprint>` — identifies the immutable image, working directory, mounts, and other `docker run` arguments
 
-On startup, Hermes runs `docker ps --filter label=hermes-task-id=<id> --filter label=hermes-profile=<profile>` and **attaches to the existing container** when it finds one. If the container is `exited` (e.g. after a Docker daemon restart), it's `docker start`'d and reused — filesystem state and any installed packages survive, but in-container background processes do not.
+On startup, Hermes probes for matching task, profile, and container-spec labels and **attaches to the existing container** when it finds one. A changed image, workspace bind, network mode, forwarded environment, or other immutable create argument starts a fresh container instead of reusing one with stale access. Dispatcher-spawned Kanban workers use a board-and-card-scoped task key, so a worker and its delegates share one sandbox without sharing another card's workspace. If a matching container is `exited` (e.g. after a Docker daemon restart), it's `docker start`'d and reused — filesystem state and any installed packages survive, but in-container background processes do not.
 
 When a Hermes process exits — `/quit`, closing a TUI session, gateway shutdown, even SIGKILL — the cleanup path is a **no-op for the container in default mode**. The container keeps running. The next Hermes process attaches to it in milliseconds via the label probe. This is the behavior the "one long-lived container shared across sessions" contract requires: it's the only way background processes (npm watchers, dev servers, long-running pytest) survive across sessions.
 

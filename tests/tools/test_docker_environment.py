@@ -596,16 +596,26 @@ def test_labels_attribute_populated_after_init(monkeypatch):
     the sanitizer or re-importing the profile module."""
     monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "default")
-    _mock_subprocess_run(monkeypatch)
+    calls = _mock_subprocess_run(monkeypatch)
 
     env = _make_dummy_env(task_id="abc")
 
-    assert env._labels == {
-        "hermes-agent": "1",
-        "hermes-task-id": "abc",
-        "hermes-profile": "default",
-        "hermes-egress": "off",
+    assert set(env._labels) == {
+        "hermes-agent",
+        "hermes-task-id",
+        "hermes-profile",
+        "hermes-egress",
+        "hermes-container-spec",
     }
+    assert env._labels["hermes-agent"] == "1"
+    assert env._labels["hermes-task-id"] == "abc"
+    assert env._labels["hermes-profile"] == "default"
+    assert env._labels["hermes-egress"] == "off"
+    spec_label = env._labels["hermes-container-spec"]
+    assert len(spec_label) == 24
+    assert all(character in "0123456789abcdef" for character in spec_label)
+    labels = _labels_in_run_args(_run_args_from_calls(calls))
+    assert f"hermes-container-spec={spec_label}" in labels
 
 
 # ── Cross-process container reuse (issue #20561) ──────────────────
@@ -656,6 +666,50 @@ def _mock_subprocess_run_with_reuse(monkeypatch, ps_state: str | None,
 
     monkeypatch.setattr(docker_env.subprocess, "run", _run)
     return calls
+
+
+def test_reuse_rejects_legacy_container_without_current_mount_spec(
+    monkeypatch, tmp_path,
+):
+    monkeypatch.setattr(docker_env, "find_docker", lambda: "/usr/bin/docker")
+    monkeypatch.setattr(docker_env, "_get_active_profile_name", lambda: "platform")
+    docker_env._cgroup_limits_ok = True
+    calls = []
+
+    def _run(cmd, **kwargs):
+        calls.append((list(cmd) if isinstance(cmd, list) else cmd, kwargs))
+        if isinstance(cmd, list) and len(cmd) >= 2:
+            if cmd[1] == "version":
+                return subprocess.CompletedProcess(cmd, 0, stdout="Docker version", stderr="")
+            if cmd[1] == "ps":
+                has_current_spec = any(
+                    str(part).startswith("label=hermes-container-spec=")
+                    for part in cmd
+                )
+                stdout = "" if has_current_spec else "legacy-cid\trunning\t<no value>\n"
+                return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+            if cmd[1] == "run":
+                return subprocess.CompletedProcess(cmd, 0, stdout="fresh-cid\n", stderr="")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(docker_env.subprocess, "run", _run)
+    worktree = tmp_path / "card-worktree"
+    worktree.mkdir()
+
+    env = _make_dummy_env(
+        cwd="/workspace",
+        task_id="kanban-card",
+        host_cwd=str(worktree),
+        auto_mount_cwd=True,
+    )
+
+    assert env._container_id == "fresh-cid"
+    run_calls = [
+        call for call in calls
+        if isinstance(call[0], list) and len(call[0]) >= 2 and call[0][1] == "run"
+    ]
+    assert run_calls
+    assert f"{worktree}:/workspace" in run_calls[0][0]
 
 
 def test_reuse_attaches_to_running_container_without_docker_run(monkeypatch):

@@ -33,6 +33,7 @@ Usage:
     result = terminal_tool("python server.py", background=True)
 """
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -1276,12 +1277,14 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
     Map a tool-call ``task_id`` to the container/sandbox key used by
     ``_active_environments``.
 
-    The top-level agent passes ``task_id=None`` and lands on ``"default"``.
+    The top-level agent passes ``task_id=None`` and normally lands on
+    ``"default"``. A dispatcher-spawned Kanban worker instead uses a stable
+    board-and-card-scoped key so separate workspaces cannot share a sandbox.
     ``delegate_task`` children pass their own subagent ID so that
     file-state tracking, the active-subagents registry, and TUI events stay
-    distinct per child -- but we deliberately collapse that ID back to
-    ``"default"`` here so subagents share the parent's long-lived container
-    (one bash, one /workspace, one set of installed packages).
+    distinct per child -- but we deliberately collapse that ID back to the
+    parent's shared key here so subagents share its long-lived container (one
+    bash, one /workspace, one set of installed packages).
 
     Exception: RL / benchmark environments (TerminalBench2, HermesSweEnv, ...)
     call ``register_task_env_overrides(task_id, {...})`` to request a
@@ -1303,6 +1306,14 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         overrides = _task_env_overrides[task_id]
         if set(overrides.keys()) & _ISOLATION_KEYS:
             return task_id
+
+    kanban_task = os.getenv("HERMES_KANBAN_TASK", "").strip()
+    if kanban_task:
+        kanban_board = os.getenv("HERMES_KANBAN_BOARD", "").strip() or "default"
+        scope = hashlib.sha256(
+            f"{kanban_board}\0{kanban_task}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"kanban-{scope}"
     return "default"
 
 

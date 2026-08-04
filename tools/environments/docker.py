@@ -39,6 +39,7 @@ _DOCKER_SEARCH_PATHS = [
 _docker_executable: Optional[str] = None  # resolved once, cached
 _ENV_VAR_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _EGRESS_LABEL_KEY = "hermes-egress"
+_CONTAINER_SPEC_LABEL_KEY = "hermes-container-spec"
 
 
 def _normalize_forward_env_names(forward_env: list[str] | None) -> list[str]:
@@ -1338,11 +1339,23 @@ class DockerEnvironment(BaseEnvironment):
         )
         logger.info("Docker run_args: %s", all_run_args)
 
+        spec_payload = json.dumps(
+            {
+                "cwd": cwd,
+                "image": image,
+                "image_uses_s6_init": image_uses_s6_init,
+                "run_args": all_run_args,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        spec_label = hashlib.sha256(spec_payload.encode("utf-8")).hexdigest()[:24]
+
         # Start the container directly via `docker run -d`.
         container_name = f"hermes-{uuid.uuid4().hex[:8]}"
         # Labels make hermes-created containers identifiable to:
         #   * the orphan reaper (`hermes-agent=1` for the global sweep filter)
-        #   * future cross-process reuse (`hermes-task-id`, `hermes-profile`)
+        #   * cross-process reuse (task, profile, and immutable create spec)
         #   * operators running `docker ps --filter label=hermes-agent=1`
         # Values are limited to the safe character set defined by
         # _sanitize_label_value(); the active Hermes profile is captured at
@@ -1354,6 +1367,7 @@ class DockerEnvironment(BaseEnvironment):
             "--label", f"hermes-task-id={task_label}",
             "--label", f"hermes-profile={profile_name}",
             "--label", f"{_EGRESS_LABEL_KEY}={egress_label}",
+            "--label", f"{_CONTAINER_SPEC_LABEL_KEY}={spec_label}",
         ]
         # Save args for container recreation on "No such container" recovery.
         self._image = image
@@ -1366,11 +1380,12 @@ class DockerEnvironment(BaseEnvironment):
             "hermes-task-id": task_label,
             "hermes-profile": profile_name,
             _EGRESS_LABEL_KEY: egress_label,
+            _CONTAINER_SPEC_LABEL_KEY: spec_label,
         }
 
         # Cross-process container reuse (issue #20561 — docs claim "ONE long-lived
         # container shared across sessions").  If a prior Hermes process
-        # already started a container for this (task_id, profile) and it
+        # already started a container for this (task_id, profile, create spec) and it
         # still exists, attach to it instead of starting a fresh one.  This
         # restores the documented contract; opt out via
         # ``terminal.docker_persist_across_processes: false``.
@@ -1382,7 +1397,7 @@ class DockerEnvironment(BaseEnvironment):
         reused = False
         if persist_across_processes:
             existing = self._find_reusable_container(
-                task_label, profile_name, egress_label,
+                task_label, profile_name, egress_label, spec_label,
             )
             if existing is not None:
                 container_id, state = existing
@@ -1642,7 +1657,10 @@ class DockerEnvironment(BaseEnvironment):
         task_label = self._labels.get("hermes-task-id", "")
         profile_label = self._labels.get("hermes-profile", "")
         existing = self._find_reusable_container(
-            task_label, profile_label, self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            task_label,
+            profile_label,
+            self._labels.get(_EGRESS_LABEL_KEY, "off"),
+            self._labels.get(_CONTAINER_SPEC_LABEL_KEY, ""),
         )
         if existing is not None:
             cid, state = existing
@@ -1807,8 +1825,9 @@ class DockerEnvironment(BaseEnvironment):
         task_label: str,
         profile_label: str,
         egress_label: str,
+        spec_label: str,
     ) -> Optional[tuple[str, str]]:
-        """Look for an existing container labeled for this (task, profile).
+        """Look for a container with the same task and immutable run spec.
 
         Returns ``(container_id, state)`` on hit, ``None`` on miss / on any
         failure (including ``docker ps`` itself failing). State is one of the
@@ -1825,6 +1844,7 @@ class DockerEnvironment(BaseEnvironment):
                 "--filter", "label=hermes-agent=1",
                 "--filter", f"label=hermes-task-id={task_label}",
                 "--filter", f"label=hermes-profile={profile_label}",
+                "--filter", f"label={_CONTAINER_SPEC_LABEL_KEY}={spec_label}",
             ]
             if egress_label != "off":
                 filters.extend(["--filter", f"label={_EGRESS_LABEL_KEY}={egress_label}"])
