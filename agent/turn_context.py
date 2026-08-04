@@ -234,6 +234,12 @@ def _maybe_title_session_at_turn_start(agent: Any, messages: List[Any]) -> None:
                 getattr(agent, "model", None) == _model
                 and getattr(agent, "provider", None) == _provider
             ),
+            # Temporary chat: a title is a durable summary of content the
+            # user was told is not saved. The in-function guard is the
+            # chokepoint; passing the flag here keeps this call site honest
+            # even though the persist-gated row-ensure above already bails
+            # for ephemeral agents.
+            ephemeral=bool(getattr(agent, "ephemeral", False)),
         )
     except Exception:
         logger.debug("Turn-start auto-title dispatch failed", exc_info=True)
@@ -575,9 +581,16 @@ def build_turn_context(
     agent.iteration_budget = IterationBudget(agent.max_iterations)
 
     # Log conversation turn start for debugging/observability.
-    _preview_text = summarize_user_message_for_log(user_message)
-    _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
-    _msg_preview = _msg_preview.replace("\n", " ")
+    # Temporary ("ephemeral") chats promise "no history, no memory, no resume",
+    # so the message body must not land in agent.log either -- that file
+    # outlives the chat and is exactly the durable record the user opted out
+    # of. Log the shape of the turn, never its content.
+    if getattr(agent, "ephemeral", False):
+        _msg_preview = f"<redacted: temporary chat, {len(user_message or '')} chars>"
+    else:
+        _preview_text = summarize_user_message_for_log(user_message)
+        _msg_preview = (_preview_text[:80] + "...") if len(_preview_text) > 80 else _preview_text
+        _msg_preview = _msg_preview.replace("\n", " ")
     logger.info(
         "conversation turn: session=%s model=%s provider=%s platform=%s history=%d msg=%r",
         agent.session_id or "none", agent.model, agent.provider or "unknown",
