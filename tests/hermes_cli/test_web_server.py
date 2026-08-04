@@ -295,13 +295,20 @@ class TestTokenMismatchHint:
             "fresh session token" in m for m in self._warning_messages(caplog)
         )
 
-    def test_no_hint_when_injected(self, monkeypatch, caplog):
+    def test_hint_emitted_for_injected_source_loopback(self, monkeypatch, caplog):
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "_SESSION_TOKEN_SOURCE", "injected")
         with caplog.at_level(logging.WARNING, logger="hermes_cli.web_server"):
             ws._log_token_mismatch_hint("loopback")
-        assert self._warning_messages(caplog) == []
+        # A mismatch under the desktop marker IS the lockout signature: the
+        # stale-.env clobber leaves HERMES_DESKTOP=1 intact while replacing
+        # the token, so source reads "injected" even though the desktop's
+        # credential was clobbered. The hint must NOT be suppressed here.
+        assert any(
+            "stale HERMES_DASHBOARD_SESSION_TOKEN" in m and ".env" in m
+            for m in self._warning_messages(caplog)
+        )
 
     def test_no_hint_outside_loopback_mode(self, monkeypatch, caplog):
         import hermes_cli.web_server as ws
@@ -333,7 +340,11 @@ class TestTokenMismatchHint:
             for m in self._warning_messages(caplog)
         )
 
-    def test_ws_auth_reason_silent_when_injected(self, monkeypatch, caplog):
+    def test_ws_auth_reason_emits_hint_when_injected(self, monkeypatch, caplog):
+        # End-to-end: a bad token in loopback mode with an injected-sourced
+        # server token STILL warns — the marker survives the stale-.env
+        # clobber, so "injected" does not exonerate the mismatch. The
+        # rejection itself is preserved.
         import hermes_cli.web_server as ws
 
         fake_ws = SimpleNamespace(
@@ -347,7 +358,10 @@ class TestTokenMismatchHint:
             reason, cred = ws._ws_auth_reason(fake_ws)
         assert reason == "token_mismatch"
         assert cred == "token"
-        assert self._warning_messages(caplog) == []
+        assert any(
+            "stale HERMES_DASHBOARD_SESSION_TOKEN" in m
+            for m in self._warning_messages(caplog)
+        )
 
 
 # ---------------------------------------------------------------------------
