@@ -294,6 +294,30 @@ class TestShellFileOpsHelpers:
             "C:/Users/alice/notes.txt"
         ) == "'/c/Users/alice/notes.txt'"
 
+    def test_escape_native_tool_arg_uses_windows_form_for_rg(self, monkeypatch, file_ops):
+        """ripgrep is a native Windows binary and cannot resolve the MSYS
+        /c/... form produced by _escape_shell_arg; the rg-targeted escaper must
+        emit the native drive form instead."""
+        import os as os_mod
+        import tools.environments.local as local_mod
+
+        monkeypatch.setattr(os_mod, "name", "nt")
+        monkeypatch.setattr(
+            local_mod,
+            "_msys_to_windows_path",
+            lambda p: r"D:\workexe\notes.txt",
+        )
+        assert (
+            file_ops._escape_native_tool_arg("/d/workexe/notes.txt")
+            == r"'D:\workexe\notes.txt'"
+        )
+
+    def test_escape_native_tool_arg_noop_off_windows(self, monkeypatch, file_ops):
+        import os as os_mod
+
+        monkeypatch.setattr(os_mod, "name", "posix")
+        assert file_ops._escape_native_tool_arg("/tmp/x") == "'/tmp/x'"
+
     def test_read_file_uses_bash_safe_windows_paths(self, mock_env, monkeypatch):
         import tools.environments.local as local_mod
 
