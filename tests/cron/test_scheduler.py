@@ -1304,7 +1304,7 @@ class TestParallelTick:
         barrier = threading.Barrier(2, timeout=5)
         call_order = []
 
-        def mock_run_job(job, *, defer_agent_teardown=None):
+        def mock_run_job(job, *, defer_agent_teardown=None, **kw):
             call_order.append(("start", job["id"]))
             barrier.wait()
             call_order.append(("end", job["id"]))
@@ -1328,7 +1328,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
