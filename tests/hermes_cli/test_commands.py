@@ -703,6 +703,52 @@ class TestTelegramMenuCommands:
             "prefix-match sibling directories must not be admitted"
         )
 
+    def test_symlinked_skills_dir_included_in_telegram_menu(self, tmp_path, monkeypatch):
+        """Skills under a symlinked $HERMES_HOME must appear in gateway menus.
+
+        Regression test for symlinked HERMES_HOME: with ~/.hermes a symlink to
+        the real HERMES_HOME (e.g. an external drive), get_skill_commands()
+        returns paths built from the un-resolved SKILLS_DIR while the menu
+        filter compares against SKILLS_DIR.resolve(), so every skill failed the
+        prefix check and gateway menus showed zero skills. Hub skills must also
+        stay excluded under symlink.
+        """
+        import sys
+        from unittest.mock import patch
+
+        if sys.platform == "win32":
+            pytest.skip("symlinks need elevated privileges on Windows")
+
+        real_dir = tmp_path / "real-skills"
+        real_dir.mkdir()
+        link_dir = tmp_path / "skills-link"
+        link_dir.symlink_to(real_dir, target_is_directory=True)
+
+        fake_cmds = {
+            "/apple-notes": {
+                "name": "apple-notes",
+                "description": "Notes",
+                "skill_md_path": f"{link_dir}/apple-notes/SKILL.md",
+                "skill_dir": f"{link_dir}/apple-notes",
+            },
+            "/hub-skill": {
+                "name": "hub-skill",
+                "description": "Hub installed",
+                "skill_md_path": f"{link_dir}/.hub/hub-skill/SKILL.md",
+                "skill_dir": f"{link_dir}/.hub/hub-skill",
+            },
+        }
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", link_dir),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+        ):
+            menu, _ = telegram_menu_commands(max_commands=100)
+
+        menu_names = {n for n, _ in menu}
+        assert "apple_notes" in menu_names
+        assert "hub_skill" not in menu_names  # hub stays excluded under symlink
+
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
         from unittest.mock import patch
