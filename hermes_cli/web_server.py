@@ -76,6 +76,7 @@ from hermes_cli.config import (
     check_config_version,
     detect_install_method,
     format_docker_update_message,
+    recommended_update_command,
     recommended_update_command_for_method,
     redact_key,
     write_platform_config_field,
@@ -4086,7 +4087,7 @@ async def update_hermes():
             "name": "hermes-update",
             "error": "dashboard_update_managed_externally",
             "message": message,
-            "update_command": "managed outside dashboard",
+            "update_command": recommended_update_command(),
         }
 
     install_method = detect_install_method(PROJECT_ROOT)
