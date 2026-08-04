@@ -540,6 +540,44 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_local_binary_is_not_re_read_through_environment(
+        self, monkeypatch, tmp_path
+    ):
+        """A local binary is not a missing remote script.
+
+        Re-reading a skipped Mach-O/ELF executable through ``env.execute(cat)``
+        feeds decoded machine code back into the shell-script tokenizer.  A
+        path-shaped token containing NUL then crashes pathlib before the real
+        command can start.
+        """
+        import tools.terminal_tool as tt
+
+        calls = []
+        binary = tmp_path / "python"
+        binary.write_bytes(b"\x7fELF\x00/bad\x00reference.sh")
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                if command.startswith("cat "):
+                    return {
+                        "output": binary.read_bytes().decode("utf-8", errors="replace"),
+                        "returncode": 0,
+                    }
+                return {"output": "started", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        result = json.loads(tt.terminal_tool(command=str(binary)))
+
+        assert result["exit_code"] == 0
+        assert calls == [str(binary)]
+
     def test_safe_systemctl_commands_pass_through(self, monkeypatch):
         """Non-hermes systemctl commands must not be blocked by this guard."""
         import tools.terminal_tool as tt

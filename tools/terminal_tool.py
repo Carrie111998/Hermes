@@ -2542,8 +2542,12 @@ def terminal_tool(
                         local_path = Path(guard_cwd) / local_path
                     if local_path.is_file():
                         metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
+                        if stat.S_ISREG(metadata.st_mode):
+                            if metadata.st_size > 1024 * 1024:
+                                return None
                             data = local_path.read_bytes()
+                            if b"\x00" in data:
+                                return None
                             if len(data) <= 1024 * 1024:
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
