@@ -24,6 +24,8 @@ gateway ``/learn``, the dashboard "Learn a skill" panel) calls
 
 from __future__ import annotations
 
+import re
+
 # The house-style rules, distilled from AGENTS.md "Skill authoring standards
 # (HARDLINE)" and the hermes-agent-dev new-skill salvage reference. Embedded in
 # the prompt so the agent authors skills the way a maintainer would by hand.
@@ -96,6 +98,47 @@ Quality bar:
   templates in `templates/`."""
 
 
+# Guidance appended when the /learn request points at a `hermes record`
+# recording (a .json under HERMES_HOME/recordings/, or the word "recording").
+# The recording JSON schema is documented in hermes_cli/record.py:
+# {version, started_at, url, steps: [{t, type, selector, text?, value?, url?}]}.
+_RECORDING_GUIDANCE = """\
+RECORDING SOURCE — the request references a `hermes record` browser workflow
+recording. Handle it like this:
+
+- Read the recording JSON with `read_file`. Its shape is
+  {version, started_at, url, steps: [{t, type, selector, text?, value?, url?}]}
+  where step types are: click (selector + text), input (selector + final
+  value), enter (selector), navigate (url), and manual (free-text narration).
+- Reconstruct the workflow in HUMAN terms first: what the user was doing and
+  why, not a selector-by-selector transcript. Collapse noise (stray clicks,
+  focus changes) into the meaningful steps.
+- SECRET PLACEHOLDERS: any step value like `{SECRET:name}` is a masked
+  password or credential — the real value was never recorded. Ask the user
+  which env var or secret reference should supply each placeholder (e.g.
+  `$MYAPP_PASSWORD` from .env or `hermes secrets`). NEVER ask them to paste
+  the secret inline, and NEVER write a literal secret into the skill.
+- Author the skill so its Procedure section REPLAYS the flow with the
+  existing browser tools: `browser_navigate` to the recorded URLs,
+  `browser_snapshot` to find elements, `browser_click` / `browser_type` for
+  the recorded clicks and inputs (using the recorded selectors and text as
+  hints for locating the right elements, since ref IDs change per session),
+  and `browser_press` for Enter submissions. Secret placeholders become
+  env/secret lookups at replay time.
+- Keep the recorded selectors in the skill as location hints, but tell the
+  agent to prefer the live `browser_snapshot` refs when replaying."""
+
+
+def _references_recording(req: str) -> bool:
+    """True when a /learn request points at a `hermes record` recording."""
+    low = (req or "").lower()
+    if "recording" in low:
+        return True
+    # A .json path under a recordings/ directory also counts, even without
+    # the keyword (e.g. "/learn ~/.hermes/recordings/checkout-....json").
+    return bool(re.search(r"recordings[/\\][^\s]+\.json", low))
+
+
 def build_learn_prompt(user_request: str) -> str:
     """Build the agent prompt for an open-ended ``/learn`` request.
 
@@ -115,6 +158,10 @@ def build_learn_prompt(user_request: str) -> str:
             "the steps taken and distill them into a reusable skill"
         )
 
+    recording_block = ""
+    if _references_recording(req):
+        recording_block = f"{_RECORDING_GUIDANCE}\n\n"
+
     return (
         "[/learn] The user wants you to learn a reusable skill from the "
         "request below, and save it.\n\n"
@@ -130,6 +177,7 @@ def build_learn_prompt(user_request: str) -> str:
         "endpoints` means: gather the URL AND honor \"focus on auth, skip "
         "deprecated\" as authoring requirements. Never fetch the first source "
         "and ignore the rest.\n\n"
+        f"{recording_block}"
         "Do this:\n"
         "1. Gather every source the user named, using the tools you already "
         "have — `read_file`/`search_files` for local files or directories, "

@@ -10580,6 +10580,7 @@ _BUILTIN_SUBCOMMANDS = frozenset(
         "model", "monitoring", "pairing", "pets", "plugins", "portal", "profile",
         "project", "proxy",
         "prompt-size",
+        "record",
         "send", "sessions", "setup",
         "skin", "skills", "slack", "status", "sync", "tools", "uninstall", "update",
         "version", "webhook", "whatsapp", "whatsapp-cloud", "chat", "secrets", "security",
@@ -11705,6 +11706,28 @@ def main():
         _register_journey_cli(journey_parser)
     except Exception as _exc:
         logging.getLogger(__name__).debug("journey CLI wiring failed: %s", _exc)
+
+    # =========================================================================
+    # record command — demonstrate a browser workflow, save it as a recording
+    # =========================================================================
+    record_parser = subparsers.add_parser(
+        "record",
+        help="Record a browser workflow over CDP; /learn turns it into a skill",
+        description=(
+            "Attach to your live browser (same CDP endpoint as /browser "
+            "connect), capture clicks, typed values (passwords masked as "
+            "{SECRET:name} placeholders at capture time), Enter presses, and "
+            "navigations until Ctrl-C, then save a recording JSON under "
+            "HERMES_HOME/recordings/. Turn it into a replayable skill with: "
+            'hermes chat "/learn recording <path>".'
+        ),
+    )
+    try:
+        from hermes_cli.record import register_cli as _register_record_cli
+
+        _register_record_cli(record_parser)
+    except Exception as _exc:
+        logging.getLogger(__name__).debug("record CLI wiring failed: %s", _exc)
 
     # =========================================================================
     # memory command  (parser built in hermes_cli/subcommands/memory.py)
