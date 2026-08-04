@@ -158,6 +158,20 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronAllSkillsFailed(Exception):
+    """Raised by _build_job_prompt when EVERY declared skill fails to load.
+
+    Without this, the scheduler fell through to a contextless LLM call —
+    the agent received the user's raw prompt minus all skill methodology,
+    had no idea how to perform the task, and frequently returned
+    ``[SILENT]`` (suppressing delivery). The result was a silent multi-week
+    failure indistinguishable from "nothing happened" (#77362).
+
+    Raising instead of falling through lets the caller deliver a clear
+    error to the operator so the broken skill is visible immediately.
+    """
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -2632,6 +2646,16 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         )
 
     if skipped:
+        # When EVERY declared skill failed to load, the prompt has zero
+        # skill context. Running the LLM anyway produces a contextless
+        # call that frequently returns [SILENT], suppressing delivery —
+        # a silent multi-week failure (#77362). Abort and deliver an
+        # error instead so the operator sees the broken skill immediately.
+        if not parts and skill_names and len(skipped) == len(skill_names):
+            raise CronAllSkillsFailed(
+                f"All skill(s) failed to load for cron job "
+                f"'{job.get('name', job.get('id', '?'))}': {', '.join(skipped)}"
+            )
         notice = (
             f"[IMPORTANT: The following skill(s) were listed for this job but could not be found "
             f"and were skipped: {', '.join(skipped)}. "
@@ -3009,6 +3033,34 @@ def run_job(
             "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
         )
         return False, blocked_doc, "", str(block_exc)
+    except CronAllSkillsFailed as skill_exc:
+        # Every declared skill failed to load. Do NOT fall through to a
+        # contextless LLM call — the agent would have no methodology,
+        # would likely return [SILENT], and delivery would be suppressed,
+        # producing a silent multi-week failure (#77362). Deliver a clear
+        # error so the operator sees the broken skill immediately.
+        logger.warning(
+            "Job '%s' (ID: %s): all skills failed to load — %s",
+            job_name, job_id, skill_exc,
+        )
+        skill_error_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** SKILL LOAD FAILURE\n\n"
+            "Every skill declared on this cron job failed to load, so the "
+            "agent was NOT run. The job's prompt requires skill context to "
+            "be useful; running without it would produce a contextless "
+            "response or silent suppression.\n\n"
+            f"**Error:** {skill_exc}\n\n"
+            "Check that the skill(s) exist and are valid:\n"
+            "- Run `hermes skills list` to see available skills\n"
+            "- Run `skill_view('<skill-name>')` to test loading\n"
+            "- A common cause: a flat-file skill (.md) colliding with a "
+            "directory stub (skill-name/SKILL.md) from an aborted migration\n"
+            "- Remove the stale stub or consolidate to one format"
+        )
+        return False, skill_error_doc, "", str(skill_exc)
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None

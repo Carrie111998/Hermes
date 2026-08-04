@@ -1105,12 +1105,47 @@ class TestBuildJobPromptMissingSkill:
         return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
 
-    def test_missing_skill_injects_user_notice_into_prompt(self):
-        """A system notice about the missing skill is injected into the prompt."""
+    def test_all_skills_missing_raises_hard_abort(self):
+        """When every declared skill fails to load, the prompt builder
+        raises CronAllSkillsFailed instead of returning a contextless
+        prompt (#77362). This prevents a silent multi-week failure where
+        the agent runs without skill methodology, returns [SILENT], and
+        delivery is suppressed.
+        """
+        from cron.scheduler import CronAllSkillsFailed
+
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
+            with pytest.raises(CronAllSkillsFailed, match="ghost-skill"):
+                _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
+
+    def test_all_skills_missing_with_multiple_skills_raises_hard_abort(self):
+        """Same hard-abort when multiple skills ALL fail to load."""
+        from cron.scheduler import CronAllSkillsFailed
+
+        with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
+            with pytest.raises(CronAllSkillsFailed, match="alpha.*beta"):
+                _build_job_prompt({"skills": ["alpha", "beta"], "prompt": "go"})
+
+    def test_partial_skill_failure_still_injects_notice(self):
+        """When some skills load but others fail, the prompt is still
+        assembled with the loaded skills + a notice about the missing
+        ones. This is NOT the all-failed case, so no hard abort.
+        """
+
+        def _mixed_skill_view(name: str) -> str:
+            if name == "good-skill":
+                return json.dumps({"success": True, "content": "# Good\nDo good things."})
+            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+        with patch("tools.skills_tool.skill_view", side_effect=_mixed_skill_view), \
+             patch("tools.skill_usage.bump_use"):
+            result = _build_job_prompt(
+                {"skills": ["good-skill", "ghost-skill"], "prompt": "do something"}
+            )
+        assert "good-skill" in result
+        assert "Do good things." in result
         assert "ghost-skill" in result
-        assert "not found" in result.lower() or "skipped" in result.lower()
+        assert "skipped" in result.lower()
 
 
 class TestBuildJobPromptAbsoluteSkillPath:

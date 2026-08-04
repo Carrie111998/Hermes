@@ -236,10 +236,11 @@ class TestBuildJobPromptScansSkillContent:
             "prompt": "run task",
             "skills": ["does-not-exist"],
         }
-        # Should not raise — missing skills are skipped with a notice.
-        prompt = scheduler._build_job_prompt(job)
-        assert prompt is not None
-        assert "could not be found" in prompt
+        # All skills failed to load → CronAllSkillsFailed is raised so the
+        # caller can deliver a clear error instead of running a contextless
+        # LLM call that silently suppresses delivery (#77362).
+        with pytest.raises(scheduler.CronAllSkillsFailed, match="does-not-exist"):
+            scheduler._build_job_prompt(job)
 
 
     def test_bundle_name_shadows_skill_name_for_cron_jobs(self, cron_env):
