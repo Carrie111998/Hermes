@@ -6288,8 +6288,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         self._tokens_display_global = False
         try:
-            data = json.loads(self._TOKENS_DISPLAY_PATH.read_text())
-        except (FileNotFoundError, json.JSONDecodeError, OSError):
+            data = json.loads(self._TOKENS_DISPLAY_PATH.read_text(encoding="utf-8"))
+        except (FileNotFoundError, json.JSONDecodeError, OSError, UnicodeDecodeError):
+            # UnicodeDecodeError covers a file written by a build that omitted
+            # encoding= and so used the Windows locale codepage: fail soft to
+            # defaults; the next /tokens write re-creates it as UTF-8.
             return {}
         if not isinstance(data, dict):
             return {}
@@ -6314,7 +6317,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "chats": self._tokens_display,
                     },
                     indent=2,
-                )
+                ),
+                encoding="utf-8",
             )
         except OSError as e:
             logger.warning("Failed to save tokens display state: %s", e)

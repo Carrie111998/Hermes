@@ -1260,7 +1260,16 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - tokens: the per-message token-footer display toggle — a set-once
+#     preference that persists per chat, not a recurring surface, so reaching
+#     it as /hermes tokens costs one interaction in total. Listed here because
+#     the registry was already AT the 50-cap when /tokens was added: without
+#     this entry the new command clamps /platform off the native list and
+#     breaks Telegram parity. The new arrival yields rather than evicting an
+#     established native slash.
+_SLACK_VIA_HERMES_ONLY = frozenset(
+    {"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "tokens"}
+)
 
 
 def _sanitize_slack_name(raw: str) -> str:

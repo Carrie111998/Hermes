@@ -369,15 +369,24 @@ export const fmtK = (n: number) => COMPACT_NUMBER.format(n).replace(/[KMBT]$/, s
  */
 export function formatTokenCount(n: number): string {
   const v = Math.max(0, Math.trunc(Number.isFinite(n) ? n : 0))
-  if (v < 1000) return String(v)
+
+  if (v < 1000) {
+    return String(v)
+  }
+
   for (const [threshold, suffix] of [[1_000_000, 'M'], [1_000, 'K']] as const) {
     if (v >= threshold) {
       const scaled = v / threshold
       let text = scaled < 10 ? scaled.toFixed(2) : scaled < 100 ? scaled.toFixed(1) : scaled.toFixed(0)
-      if (text.includes('.')) text = text.replace(/0+$/, '').replace(/\.$/, '')
+
+      if (text.includes('.')) {
+        text = text.replace(/0+$/, '').replace(/\.$/, '')
+      }
+
       return `${text}${suffix}`
     }
   }
+
   return String(v)
 }
 

@@ -7299,6 +7299,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_inactive: bool = False,
         repair_alternation: bool = False,
         include_row_ids: bool = False,
+        include_token_view: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         Load messages in the OpenAI conversation format (role + content dicts).
@@ -7346,6 +7347,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             include_ancestors=include_ancestors,
             repair_alternation=repair_alternation,
             include_row_ids=include_row_ids,
+            include_token_view=include_token_view,
         )
 
     # Columns every conversation projection decodes. Shared by
@@ -7366,6 +7368,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         include_ancestors: bool,
         repair_alternation: bool,
         include_row_ids: bool = False,
+        include_token_view: bool = False,
     ) -> List[Dict[str, Any]]:
         """Decode fetched message rows into the OpenAI conversation format.
 
@@ -7453,11 +7456,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                     except (json.JSONDecodeError, TypeError):
                         logger.warning("Failed to deserialize codex_message_items, falling back to None")
                         msg["codex_message_items"] = None
-            # Surface a flattened, readable token view for display consumers
-            # (TUI / ACP / API history). Pass the raw column explicitly so no
-            # scalar token_count is added to the replay dict — it stays clean,
-            # and the `tokens` key is stripped before any provider call.
-            _attach_token_view(msg, raw_token_count=row["token_count"])
+            # Flattened, readable token view for display surfaces that want it.
+            # OPT-IN, exactly like include_row_ids above: this is accounting
+            # metadata, not transcript content, and every default consumer
+            # (ACP restore, model replay, export, inspection) compares or
+            # re-persists the historical shape. The raw column is passed
+            # explicitly so no scalar token_count enters the replay dict.
+            if include_token_view:
+                _attach_token_view(msg, raw_token_count=row["token_count"])
             if include_ancestors and self._is_duplicate_replayed_user_message(messages, msg):
                 continue
             messages.append(msg)

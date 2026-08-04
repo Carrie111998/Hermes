@@ -72,7 +72,9 @@ def test_dashboard_trends_match_sessiondb(db, monkeypatch):
     )
 
     monkeypatch.setattr(db, "close", lambda: None)
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda profile: db)
+    monkeypatch.setattr(
+        web_server, "_open_session_db_for_profile", lambda profile, *, read_only: db
+    )
     monkeypatch.setattr(web_server.time, "time", lambda: T0 + 120)
 
     payload = asyncio.run(web_server.get_token_trends(window="1h", bucket=60))
@@ -101,7 +103,9 @@ def test_dashboard_usage_rates_sees_reasoning(db, monkeypatch):
     )
 
     monkeypatch.setattr(db, "close", lambda: None)
-    monkeypatch.setattr(web_server, "_open_session_db_for_profile", lambda profile: db)
+    monkeypatch.setattr(
+        web_server, "_open_session_db_for_profile", lambda profile, *, read_only: db
+    )
     monkeypatch.setattr(web_server.time, "time", lambda: T0 + 120)
 
     payload = asyncio.run(web_server.get_usage_rates(window="1h"))

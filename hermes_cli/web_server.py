@@ -14185,16 +14185,27 @@ async def get_provider_quotas(provider: Optional[str] = None):
     return {"object": "list", "data": data}
 
 
-@app.get("/api/analytics/usage-rates")
-async def get_usage_rates(window: str = "24h", profile: Optional[str] = None):
+def _analytics_window_seconds(window: str) -> int:
+    """Resolve a window preset, raising the endpoint's 400 for anything else."""
     from fastapi import HTTPException
-    from agent.analytics import compute_usage_rates
-    from agent.provider_quotas import get_provider_quota
 
     seconds = _ANALYTICS_WINDOWS.get(window)
     if seconds is None:
         raise HTTPException(status_code=400, detail="window must be 1h|24h|7d|30d")
-    db = _open_session_db_for_profile(profile)
+    return seconds
+
+
+# Each endpoint is a sync worker + an async wrapper that hands it to a thread:
+# SessionDB is blocking SQLite, and running it inline would stall the event
+# loop for the whole dashboard. Same shape as _get_usage_analytics below.
+
+
+def _get_usage_rates(window: str, profile: Optional[str] = None):
+    from agent.analytics import compute_usage_rates
+    from agent.provider_quotas import get_provider_quota
+
+    seconds = _analytics_window_seconds(window)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         now = time.time()
         minute_buckets = db.get_message_token_timeseries(now - seconds, now, 60)
@@ -14207,16 +14218,17 @@ async def get_usage_rates(window: str = "24h", profile: Optional[str] = None):
         db.close()
 
 
-@app.get("/api/analytics/token-trends")
-async def get_token_trends(window: str = "24h", bucket: Optional[int] = None, profile: Optional[str] = None):
-    from fastapi import HTTPException
+@app.get("/api/analytics/usage-rates")
+async def get_usage_rates(window: str = "24h", profile: Optional[str] = None):
+    return await asyncio.to_thread(_get_usage_rates, window, profile)
+
+
+def _get_token_trends(window: str, bucket: Optional[int] = None, profile: Optional[str] = None):
     from agent.analytics import compute_token_trends
 
-    seconds = _ANALYTICS_WINDOWS.get(window)
-    if seconds is None:
-        raise HTTPException(status_code=400, detail="window must be 1h|24h|7d|30d")
+    seconds = _analytics_window_seconds(window)
     bucket_seconds = bucket if bucket and bucket >= 60 else _ANALYTICS_TREND_BUCKETS[window]
-    db = _open_session_db_for_profile(profile)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         now = time.time()
         buckets = db.get_message_token_timeseries(now - seconds, now, bucket_seconds)
@@ -14226,16 +14238,17 @@ async def get_token_trends(window: str = "24h", bucket: Optional[int] = None, pr
         db.close()
 
 
-@app.get("/api/analytics/cost-estimate")
-async def get_cost_estimate(window: str = "24h", profile: Optional[str] = None):
-    from fastapi import HTTPException
+@app.get("/api/analytics/token-trends")
+async def get_token_trends(window: str = "24h", bucket: Optional[int] = None, profile: Optional[str] = None):
+    return await asyncio.to_thread(_get_token_trends, window, bucket, profile)
+
+
+def _get_cost_estimate(window: str, profile: Optional[str] = None):
     from agent.analytics import compute_cost_estimate
     from agent.usage_pricing import get_pricing_entry
 
-    seconds = _ANALYTICS_WINDOWS.get(window)
-    if seconds is None:
-        raise HTTPException(status_code=400, detail="window must be 1h|24h|7d|30d")
-    db = _open_session_db_for_profile(profile)
+    seconds = _analytics_window_seconds(window)
+    db = _open_session_db_for_profile(profile, read_only=True)
     try:
         now = time.time()
         groups = db.get_session_cost_aggregates(now - seconds)
@@ -14249,6 +14262,11 @@ async def get_cost_estimate(window: str = "24h", profile: Optional[str] = None):
         return {"window": window, "generated_at": now, **estimate}
     finally:
         db.close()
+
+
+@app.get("/api/analytics/cost-estimate")
+async def get_cost_estimate(window: str = "24h", profile: Optional[str] = None):
+    return await asyncio.to_thread(_get_cost_estimate, window, profile)
 
 
 @app.get("/api/analytics/usage")

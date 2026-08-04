@@ -57,12 +57,24 @@ def test_get_messages_raw_when_opted_out(db):
     assert "tokens" not in raw[1]
 
 
-def test_conversation_format_attaches_tokens_without_scalar(db):
+def test_conversation_format_is_clean_by_default(db):
+    """The replay shape stays the historical one — no accounting metadata.
+
+    ACP restore and the model-fed replay path compare and re-persist these
+    dicts, so the token view must not appear unless a caller asks for it.
+    """
     _seed(db)
     convo = db.get_messages_as_conversation("s1")
+    assert all("token_count" not in m for m in convo)
+    assert all("tokens" not in m for m in convo)
+
+
+def test_conversation_format_attaches_tokens_without_scalar(db):
+    _seed(db)
+    convo = db.get_messages_as_conversation("s1", include_token_view=True)
     # Replay format never carries a scalar token_count key...
     assert all("token_count" not in m for m in convo)
-    # ...but exposes the flattened view for display consumers.
+    # ...but exposes the flattened view for display consumers that opt in.
     assert convo[0]["tokens"]["input"] == 8000
     assert convo[0]["tokens"]["cache_read"] == 6000
     assert convo[1]["tokens"]["output"] == 900
