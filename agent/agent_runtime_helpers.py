@@ -3421,7 +3421,15 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
                     seen_assistant_call_ids.add(cid)
                 kept_tcs.append(tc)
             if len(kept_tcs) != len(msg.get("tool_calls") or []):
-                msg = {**msg, "tool_calls": kept_tcs}
+                if kept_tcs:
+                    msg = {**msg, "tool_calls": kept_tcs}
+                else:
+                    # Every call in this message was a duplicate — write an
+                    # empty array back and strict providers (DeepSeek v4,
+                    # OpenClaw Console) 400 it ("expected minimum length 1").
+                    # Drop the key entirely: a tool_calls-less assistant
+                    # message is semantically identical.
+                    msg = {k: v for k, v in msg.items() if k != "tool_calls"}
             deduped.append(msg)
         elif role == "tool":
             cid = (msg.get("tool_call_id") or "").strip()

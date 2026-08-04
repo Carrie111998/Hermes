@@ -2602,6 +2602,65 @@ class TestHandleMaxIterations:
         tool_ids = [m.get("tool_call_id") for m in sanitized if m.get("role") == "tool"]
         assert tool_ids == ["call_good", "call_bad"]
 
+    def test_api_sanitizer_drops_key_when_all_tool_calls_deduped(self, agent):
+        """When every tool_call in an assistant message is a duplicate of an
+        earlier call (retries / crash-resume / a compression window re-emitting
+        a tool result, #58327), the dedup pass must drop the ``tool_calls`` key
+        entirely rather than write an empty array back. Strict providers
+        (DeepSeek v4, OpenClaw Console) reject ``tool_calls: []`` with HTTP 400
+        \"Invalid 'messages[N].tool_calls': empty array\" — an assistant message
+        without the key is semantically identical and always accepted."""
+        messages = [
+            {
+                "role": "assistant",
+                "content": "first call",
+                "tool_calls": [
+                    {
+                        "id": "call_dup",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_dup", "content": "result"},
+            {
+                "role": "assistant",
+                "content": "re-emitted duplicate",
+                "tool_calls": [
+                    {
+                        "id": "call_dup",
+                        "type": "function",
+                        "function": {"name": "web_search", "arguments": "{}"},
+                    }
+                ],
+            },
+        ]
+
+        sanitized = agent._sanitize_api_messages(messages)
+
+        # The re-emitted message keeps its content but loses the tool_calls
+        # key — never an empty array.
+        dup_msg = next(
+            m
+            for m in sanitized
+            if m.get("role") == "assistant" and m.get("content") == "re-emitted duplicate"
+        )
+        assert "tool_calls" not in dup_msg
+        # No message anywhere carries an empty tool_calls array.
+        assert not any(
+            m.get("role") == "assistant" and "tool_calls" in m and not m["tool_calls"]
+            for m in sanitized
+        )
+        # The first call and its result are untouched.
+        first = next(
+            m for m in sanitized if m.get("role") == "assistant" and m.get("content") == "first call"
+        )
+        assert first["tool_calls"][0]["id"] == "call_dup"
+        assert [m.get("tool_call_id") for m in sanitized if m.get("role") == "tool"] == [
+            "call_dup"
+        ]
+
+
 
 class TestRunConversation:
     """Tests for the main run_conversation method.
