@@ -2,6 +2,7 @@
 
 import os
 import struct
+import sys
 import time
 import wave
 from pathlib import Path
@@ -120,6 +121,10 @@ def fake_clock(monkeypatch):
 # detect_audio_environment — WSL / SSH / Docker detection
 # ============================================================================
 
+@pytest.mark.skipif(
+    sys.platform == "win32",
+    reason="AF_UNIX/PulseAudio socket reachability is POSIX-only",
+)
 class TestPulseSocketReachable:
     def test_stale_socket_file_not_reachable(self, monkeypatch, tmp_path):
         """A socket file with no listener should not count as reachable."""
@@ -207,6 +212,11 @@ class TestDetectAudioEnvironment:
         monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
+        # On a Windows host powershell.exe exists, which makes the WSL2
+        # PowerShell TTS fallback "available" and downgrades the block to a
+        # notice. The scenario under test is WSL *without* that fallback, so
+        # pin it off regardless of the host platform.
+        monkeypatch.setattr("tools.voice_mode._wsl_powershell_tts_available", lambda: False)
 
         proc_version = tmp_path / "proc_version"
         proc_version.write_text("Linux 5.15.0-microsoft-standard-WSL2")
@@ -1409,6 +1419,7 @@ class TestWSL2PowerShellFallback:
 
         with patch("tools.voice_mode._is_wsl2_env", return_value=True), \
              patch("tools.voice_mode._import_audio", side_effect=ImportError), \
+             patch("tools.voice_mode.platform.system", return_value="Linux"), \
              patch("tools.voice_mode.shutil.which",
                    side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay", "sh") else (x if x.startswith("/") else None)), \
              patch("tools.voice_mode.subprocess.check_output",
@@ -1460,6 +1471,8 @@ class TestWSL2PowerShellFallback:
             return open(path, *args, **kwargs)
 
         with patch("builtins.open", side_effect=_fake_open), \
+             patch("platform.system", return_value="Linux"), \
+             patch("tools.voice_mode._import_audio", side_effect=ImportError), \
              patch("shutil.which", side_effect=lambda x: f"/bin/{x}" if x in ("powershell.exe", "ffmpeg", "ffplay") else None), \
              patch("subprocess.check_output", side_effect=_capture_check_output), \
              patch("subprocess.Popen", return_value=MagicMock(returncode=0, wait=lambda **k: 0)), \
