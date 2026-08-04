@@ -1607,8 +1607,6 @@ def _gather_skills_by_category(
     visible_entries: list[dict] = []
     skill_entries: list[dict] = []
 
-=======
->>>>>>> 4f3c2f54e (fix(skills): delegate semantic retrieval out-of-band and maintain prefix-cache invariant)
     if snapshot is not None:
         # Fast path: use pre-parsed metadata from disk
         for entry in snapshot.get("skills", []):
