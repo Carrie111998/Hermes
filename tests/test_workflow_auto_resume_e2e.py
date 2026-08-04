@@ -201,3 +201,59 @@ class TestAutoResumeE2E:
         with patch("plugins.workflow._spawn_supervisor_for_resume") as mock_spawn:
             _on_kanban_task_claimed(task_id="t_random", assignee="newton")
             mock_spawn.assert_not_called()
+
+    def test_completed_worker_side_latch_reopens(
+        self, isolated_env, resume_workflow_yaml, tmp_path, monkeypatch,
+    ):
+        """Completion hook re-opens the run when the card was re-run standalone.
+
+        The dispatcher is a machine singleton that any gateway may hold —
+        including gateways WITHOUT the workflow plugin (the claimed event
+        fires there, but no handler runs). The worker-side completed hook
+        DOES run in the worker's gateway (plugin loaded), so a standalone
+        re-run of a completed card's node must latch there.
+        """
+        from plugins.workflow import _on_kanban_task_completed
+        import sqlite3
+
+        run_id = "resume-test-20260804-120000-123456"
+        state, state_path = _make_completed_state(isolated_env["wf_dir"], run_id)
+
+        # Record the card→run mapping in executions.db (the durable hook)
+        exec_db = isolated_env["home"] / "workflows" / "executions.db"
+        exec_db.parent.mkdir(parents=True)
+        with sqlite3.connect(str(exec_db)) as conn:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS workflow_node_cards ("
+                "card_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, node_id TEXT NOT NULL, "
+                "status TEXT NOT NULL DEFAULT 'pending')"
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO workflow_node_cards VALUES (?, ?, 'implement', 'done')",
+                ("t_implement", run_id),
+            )
+
+        with patch("plugins.workflow._spawn_supervisor_for_resume") as mock_spawn:
+            _on_kanban_task_completed(task_id="t_implement", assignee="newton")
+            mock_spawn.assert_called_once()
+
+        # State file rewritten: final_status dropped, node reset, layer rewound
+        rewritten = json.loads(state_path.read_text())
+        assert "final_status" not in rewritten
+        assert rewritten["states"]["implement"]["status"] == "ready"
+        assert rewritten["current_layer"] == 0
+
+    def test_completed_active_run_does_not_reopen(
+        self, isolated_env, resume_workflow_yaml, tmp_path, monkeypatch,
+    ):
+        """Active run completion does not re-open (no final_status)."""
+        from plugins.workflow import _on_kanban_task_completed
+
+        run_id = "resume-test-20260804-120000-123456"
+        state, state_path = _make_completed_state(isolated_env["wf_dir"], run_id)
+        state.pop("final_status")
+        state_path.write_text(json.dumps(state, indent=2))
+
+        with patch("plugins.workflow._spawn_supervisor_for_resume") as mock_spawn:
+            _on_kanban_task_completed(task_id="t_implement", assignee="newton")
+            mock_spawn.assert_not_called()

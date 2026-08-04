@@ -174,7 +174,18 @@ def _on_kanban_task_claimed(*, task_id: str, **kwargs):
 
 
 def _on_kanban_task_completed(*, task_id: str, **kwargs):
-    """Update the job log DB when a workflow node card completes."""
+    """Update the job log DB when a workflow node card completes.
+
+    Auto-resume (worker-side latch): the kanban dispatcher is a machine
+    singleton that any gateway may hold — including gateways WITHOUT the
+    workflow plugin (e.g. penny) — so ``kanban_task_claimed`` is not a
+    reliable re-open trigger. The completion/block hooks DO fire in the
+    worker's process (assignee profile loads the plugin). If this card
+    belongs to an already-completed run and was re-run standalone,
+    re-open the run here; the fresh supervisor owns the rest.
+    """
+    if _reopen_completed_run(task_id):
+        return  # Run re-opened — supervisor takes over
     _update_node_card_db(task_id, "done")
     _handle_workflow_node_event(task_id, "done")
     # Check if this completed card is a final-layer card and notify
@@ -183,6 +194,8 @@ def _on_kanban_task_completed(*, task_id: str, **kwargs):
 
 def _on_kanban_task_blocked(*, task_id: str, reason: str = None, **kwargs):
     """Update the job log DB when a workflow node card is blocked."""
+    if _reopen_completed_run(task_id):
+        return  # Run re-opened — supervisor takes over
     _update_node_card_db(task_id, "blocked")
     _handle_workflow_node_event(task_id, "blocked", reason=reason)
 
@@ -315,10 +328,24 @@ def _spawn_supervisor_for_resume(state: dict):
         "--run-id", run_id,
     ]
     env = os.environ.copy()
-    env["HERMES_WORKFLOW_FILES"] = os.environ.get(
-        "HERMES_WORKFLOW_FILES",
-        str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines"),
-    )
+    # The supervisor must resolve the SAME workflows dir the state came
+    # from. The gateway env rarely sets HERMES_WORKFLOW_FILES, and the
+    # repo-default fallback (hermes-agent/docs/fleet-pipelines) does NOT
+    # hold the fleet YAMLs — they live under the shared workspace.
+    # Prefer, in order: env override, dir beside the state file,
+    # kanban_home()/workspace/docs/fleet-pipelines, repo default.
+    wf_files = os.environ.get("HERMES_WORKFLOW_FILES", "")
+    if not wf_files:
+        try:
+            from hermes_cli.kanban_db import kanban_home
+            shared = kanban_home() / "workspace" / "docs" / "fleet-pipelines"
+            if (shared / f"{workflow_name}.yaml").exists():
+                wf_files = str(shared)
+        except Exception:
+            pass
+    if not wf_files:
+        wf_files = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
+    env["HERMES_WORKFLOW_FILES"] = wf_files
     try:
         subprocess.Popen(
             cmd,
@@ -362,6 +389,26 @@ def _reopen_completed_run(task_id: str) -> bool:
         board = state.get("kanban_board", "")
         if not workflow_name or not run_id or not board:
             return False
+
+        # Loop guard: if the execution row is already 'running', a
+        # supervisor is actively driving this round — the completion/
+        # blocked hook firing is the SUPERVISED echo, not a standalone
+        # re-run. Re-opening here would spawn a duplicate supervisor.
+        try:
+            from hermes_cli.kanban_db import kanban_home
+            db_path = kanban_home() / "workflows" / "executions.db"
+            if db_path.exists():
+                import sqlite3
+                with sqlite3.connect(str(db_path)) as conn:
+                    exec_row = conn.execute(
+                        "SELECT status FROM workflow_executions WHERE run_id = ?",
+                        (run_id,),
+                    ).fetchone()
+                if exec_row and exec_row[0] == "running":
+                    print(f"   ℹ  Run {run_id} already running — supervised echo, skipping re-open")
+                    return False
+        except Exception:
+            pass  # DB read failure — fall through and re-open
 
         # Find which node this card belongs to
         node_id = None
