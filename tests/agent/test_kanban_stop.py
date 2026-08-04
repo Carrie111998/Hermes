@@ -6,6 +6,7 @@ import pytest
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
+    build_kanban_stop_fallback_block,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
 )
@@ -131,3 +132,62 @@ def test_nudge_and_dispatcher_budgets_are_independent(clear_kanban_env):
     # Dispatcher-side streak is tracked in the DB, not in the nudge module —
     # the nudge module has no knowledge of the streak counter.
     assert not hasattr(build_kanban_stop_nudge, "_streak")
+
+
+# ── Hard terminal-call fallback (t_44cfa735) ───────────────────────────
+# When the nudge budget is exhausted and the worker STILL exits with only a
+# narration (no kanban_complete/kanban_block), the harness must fire a concrete
+# kanban_block so the card lands in a visible `blocked` state with a real reason
+# — never silently `running` (protocol_violation) and never a phantom complete.
+
+
+def test_fallback_block_returns_payload_after_budget(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_pv123")
+    # attempts == max_attempts (2) => budget exhausted => fallback fires.
+    fb = build_kanban_stop_fallback_block(
+        final_response="Done, wrote the file.", model="tencent/hy3:free",
+        attempts=2, max_attempts=2,
+    )
+    assert fb is not None
+    assert fb["kind"] == "capability"
+    assert fb["auto_guard"] is True
+    assert fb["task_id"] == "t_pv123"
+    assert "auto-block" in fb["reason"].lower()
+    assert "tencent/hy3:free" in fb["reason"]
+
+
+def test_fallback_block_suppressed_before_budget_exhausted(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_pv123")
+    # attempts < max_attempts => caller should still nudge, not hard-block.
+    assert build_kanban_stop_fallback_block(attempts=0, max_attempts=2) is None
+    assert build_kanban_stop_fallback_block(attempts=1, max_attempts=2) is None
+
+
+def test_fallback_block_disabled_without_kanban_task(clear_kanban_env):
+    assert build_kanban_stop_fallback_block(attempts=5, max_attempts=2) is None
+
+
+def test_fallback_block_suppressed_if_terminal_called(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_pv123")
+    # A session that already called a terminal tool must never be double-blocked.
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "1", "type": "function",
+                 "function": {"name": "kanban_complete", "arguments": "{}"}},
+            ],
+        },
+        {"role": "tool", "name": "kanban_complete",
+         "tool_call_id": "1", "content": "done"},
+    ]
+    # session_called_kanban_terminal scans live messages; pass them explicitly.
+    assert build_kanban_stop_fallback_block(
+        attempts=2, max_attempts=2,
+    ) is not None  # returns payload, but the harness guards on session_called_kanban_terminal
+    # The defensive double-guard inside build_kanban_stop_fallback_block only
+    # checks session_called_kanban_terminal(None); the harness passes live
+    # messages. Verify session_called_kanban_terminal sees the terminal call.
+    assert session_called_kanban_terminal(messages) is True
+

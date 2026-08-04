@@ -605,6 +605,23 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
+    # Surface a typed failure_reason when the turn failed due to a provider
+    # error. The kanban dispatcher reads this in cli.py to exit with the
+    # EX_TEMPFAIL sentinel (rc=75) for rate_limit / billing deaths, which the
+    # dispatcher's reap classifier maps to a quota wall and requeues WITHOUT
+    # tripping the circuit breaker. Without this stamp, a worker that dies on
+    # a provider 429 exits rc=1 → "crashed" → counts against the breaker and
+    # the provider cause stays invisible (the gap that hid the dominant
+    # failure class in t_44cfa735). Only stamp for provider-side reasons; a
+    # genuinely broken task (auth_permanent, format_error, context_overflow…)
+    # must keep failing normally so the breaker still trips.
+    _last_cls = getattr(agent, "_last_api_error_classification", None)
+    if failed and _last_cls is not None:
+        _reason = _last_cls.reason.value if hasattr(_last_cls, "reason") else None
+        if _reason in ("rate_limit", "billing", "upstream_rate_limit"):
+            result["failure_reason"] = _reason
+            if _last_cls.status_code:
+                result["failure_status_code"] = _last_cls.status_code
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Surface any post-loop cleanup failures so the caller can distinguish a

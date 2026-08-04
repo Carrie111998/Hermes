@@ -1080,11 +1080,26 @@ def _set_status_direct(
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {new_status} (dashboard/direct)",
             )
+        event_payload = {"status": new_status}
+        blocked_to_ready_direct = prev["status"] == "blocked" and new_status == "ready"
+        if blocked_to_ready_direct:
+            event_payload = {
+                "status": new_status,
+                "reason": "dashboard_direct",
+                "prev_status": prev["status"],
+            }
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (task_id, run_id, json.dumps(event_payload), int(time.time())),
         )
+        if blocked_to_ready_direct:
+            kanban_db._append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"reason": "dashboard_direct", "prev_status": prev["status"]},
+            )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that
             # was sitting in ready solely because that parent used to satisfy

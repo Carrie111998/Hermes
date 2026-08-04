@@ -356,6 +356,72 @@ def test_recompute_ready_promotes_blocked_with_done_parents(kanban_home):
         assert task.last_failure_error is None
 
 
+def test_promote_blocked_task_emits_unblocked_and_clears_sticky_gate(kanban_home):
+    """promote_task must emit an 'unblocked' event when transitioning
+    a blocked task to ready, so _has_sticky_block() stops refusing it."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="blocked", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="need input") is True
+        assert kb.get_task(conn, t).status == "blocked"
+        assert kb._has_sticky_block(conn, t) is True
+
+        ok, err = kb.promote_task(conn, t, actor="ops", reason="forced clear")
+        assert ok is True
+        assert err is None
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb._has_sticky_block(conn, t) is False
+
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert kinds.index("unblocked") < kinds.index("promoted_manual")
+        assert kinds.count("unblocked") == 1
+
+
+def test_reclaim_blocked_task_emits_unblocked_and_clears_sticky_gate(kanban_home, monkeypatch):
+    """reclaim_task must emit an 'unblocked' event when transitioning
+    a blocked task to ready, so the dispatcher no longer sees it as
+    sticky-gated."""
+    import signal
+    import time
+    import secrets
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="blocked", assignee="a")
+        kb.claim_task(conn, t)
+        assert kb.block_task(conn, t, reason="need input") is True
+        assert kb.get_task(conn, t).status == "blocked"
+        assert kb._has_sticky_block(conn, t) is True
+
+        lock = f"{kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
+        future = int(time.time()) + 3600
+        state = {"alive": True}
+
+        def _signal(_pid, sig):
+            if sig == signal.SIGTERM:
+                state["alive"] = False
+
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: state["alive"])
+        conn.execute(
+            "UPDATE tasks SET claim_lock=?, claim_expires=?, worker_pid=? "
+            "WHERE id=?",
+            (lock, future, 12345, t),
+        )
+        conn.execute(
+            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
+            "worker_pid, started_at) VALUES (?, 'blocked', ?, ?, ?, ?)",
+            (t, lock, future, 12345, int(time.time())),
+        )
+        conn.commit()
+
+        assert kb.reclaim_task(conn, t, reason="operator reset", signal_fn=_signal) is True
+        assert kb.get_task(conn, t).status == "ready"
+        assert kb._has_sticky_block(conn, t) is False
+
+        kinds = [e.kind for e in kb.list_events(conn, t)]
+        assert "unblocked" in kinds
+        assert kinds.index("unblocked") < kinds.index("reclaimed")
+
+
 def test_recompute_ready_fan_in_waits_for_all_parents(kanban_home):
     with kb.connect() as conn:
         a = kb.create_task(conn, title="a")
@@ -732,7 +798,13 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
 def test_detect_crashed_workers_systemic_failure_fast_block(
     kanban_home, monkeypatch,
 ):
-    """When many tasks crash with the same error, trip the breaker faster."""
+    """When many tasks crash with the same error, trip the breaker faster.
+
+    Seeded with REAL nonzero exits (reap-registry entries) so the systemic
+    fast-block path is exercised for genuine crashes — an unknown-cause
+    death (no registry entry, no durable verdict) is a DETECTOR GAP and is
+    deliberately NOT blocked (t_6a5a8d9e).
+    """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -748,6 +820,7 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
                 (90000 + i, f"{host}:w{i}", tid),
             )
             task_ids.append(tid)
+            _kb._record_worker_exit(90000 + i, _exited_status(1))
         conn.commit()
 
         crashed = kb.detect_crashed_workers(conn)
@@ -763,7 +836,11 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
 def test_detect_crashed_workers_isolated_failure_normal_retry(
     kanban_home, monkeypatch,
 ):
-    """Below the systemic threshold, tasks retain normal retry budget."""
+    """Below the systemic threshold, tasks retain normal retry budget.
+
+    Seeded with REAL nonzero exits so the crash path is exercised — an
+    unknown-cause death would be a DETECTOR GAP, not a crash (t_6a5a8d9e).
+    """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -779,6 +856,7 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
                 (80000 + i, f"{host}:w{i}", tid),
             )
             task_ids.append(tid)
+            _kb._record_worker_exit(80000 + i, _exited_status(1))
         conn.commit()
 
         crashed = kb.detect_crashed_workers(conn)
@@ -794,7 +872,12 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
 def test_detect_crashed_workers_skips_freshly_claimed_tasks(
     kanban_home, monkeypatch,
 ):
-    """Grace period prevents reclaim of freshly-started tasks."""
+    """Grace period prevents reclaim of freshly-started tasks.
+
+    Seeded with a REAL nonzero exit so the post-grace reclaim is a genuine
+    crash — an unknown-cause death would be a DETECTOR GAP, not a crash
+    (t_6a5a8d9e).
+    """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -812,6 +895,7 @@ def test_detect_crashed_workers_skips_freshly_claimed_tasks(
             (99999, f"{host}:w", int(now), tid),
         )
         conn.commit()
+        _kb._record_worker_exit(99999, _exited_status(1))
 
         # With time = now (just claimed), grace period should suppress reclaim.
         crashed = kb.detect_crashed_workers(conn)
@@ -826,7 +910,12 @@ def test_detect_crashed_workers_skips_freshly_claimed_tasks(
 def test_detect_crashed_workers_grace_period_env_override(
     kanban_home, monkeypatch,
 ):
-    """HERMES_KANBAN_CRASH_GRACE_SECONDS env var adjusts the window."""
+    """HERMES_KANBAN_CRASH_GRACE_SECONDS env var adjusts the window.
+
+    Seeded with a REAL nonzero exit so the post-grace reclaim is a genuine
+    crash — an unknown-cause death would be a DETECTOR GAP, not a crash
+    (t_6a5a8d9e).
+    """
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
@@ -843,6 +932,7 @@ def test_detect_crashed_workers_grace_period_env_override(
             (99999, f"{host}:w", int(now), tid),
         )
         conn.commit()
+        _kb._record_worker_exit(99999, _exited_status(1))
 
         # 3s after claim: within 5s grace → no reclaim.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 3)
@@ -851,6 +941,351 @@ def test_detect_crashed_workers_grace_period_env_override(
         # 6s after claim: past 5s grace → reclaim.
         monkeypatch.setattr(_kb.time, "time", lambda: now + 6)
         assert tid in kb.detect_crashed_workers(conn)
+
+
+def test_detect_crashed_workers_durable_verdict_survives_reap_window_miss(
+    kanban_home, monkeypatch,
+):
+    """A worker reaped OUTSIDE the dispatcher reap-tick window still yields
+    a SPECIFIC ``dispatch_death_reason`` via the durable ``task_runs``
+    verdict — NOT the generic ``pid N not alive`` (t_6a5a8d9e acceptance #1).
+
+    The in-memory reap registry (``_recent_worker_exits``) is volatile: a
+    dispatcher restart between spawn and death, or init reaping the worker
+    before the next reap tick, empties it. The durable columns the reap loop
+    persisted at exit time must carry the classification across that window.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="durable", assignee="a")
+        pid = 71111
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None, "task was not claimable"
+        _kb._set_worker_pid(conn, tid, pid)
+        conn.commit()
+
+        # The reap loop OBSERVED the exit and persisted a durable verdict
+        # (this is what `reap_worker_zombies(conn)` does on a real tick).
+        _kb._record_worker_exit(pid, _exited_status(1), conn=conn)
+        # Simulate the reap-registry loss: a different dispatch window /
+        # process restart wiped the volatile dict.
+        _kb._recent_worker_exits.clear()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed, "task should be reclaimed as a crash"
+
+        run = conn.execute(
+            "SELECT outcome, error, dispatch_death_reason, dispatch_exit_code "
+            "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["dispatch_death_reason"] == "nonzero_exit"
+        assert run["dispatch_exit_code"] == 1
+        assert "not alive" not in (run["error"] or ""), (
+            f"generic pid-not-alive must NOT be emitted, got {run['error']!r}"
+        )
+        assert "exited with code 1" in (run["error"] or ""), (
+            f"specific reason missing from {run['error']!r}"
+        )
+
+
+def test_detect_crashed_workers_unknown_death_flags_detector_gap(
+    kanban_home, monkeypatch,
+):
+    """An UNCLASSIFIABLE death (no reap-registry entry AND no durable
+    ``dispatch_death_reason``) is a DETECTOR GAP, not a real crash: requeued
+    to ``ready`` WITHOUT counting a failure, surfaced via the
+    ``_last_detector_gap`` side-channel, and NOT auto-blocked
+    (t_6a5a8d9e acceptance #1 gap-flag).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="gap", assignee="a")
+        pid = 72222
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None, "task was not claimable"
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+        conn.commit()
+        # No _record_worker_exit call: no reap-registry entry AND no
+        # durable verdict → the detector cannot classify the death.
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid not in crashed, "a detector gap is NOT a real crash"
+        assert tid in getattr(
+            _kb.detect_crashed_workers, "_last_detector_gap", []
+        ), "gap task must surface via _last_detector_gap"
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready", (
+            f"gap task should requeue to ready, got {task.status}"
+        )
+        assert task.consecutive_failures == 0, (
+            "a detector gap must NOT count a failure, got "
+            f"consecutive_failures={task.consecutive_failures}"
+        )
+
+        run = conn.execute(
+            "SELECT outcome, error FROM task_runs "
+            "WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["outcome"] == "detector_gap"
+        assert "DETECTOR GAP" in (run["error"] or "")
+
+
+def test_detect_crashed_workers_detector_gap_coalesces_alert(
+    kanban_home, monkeypatch,
+):
+    """Multiple unclassifiable deaths with the SAME fingerprint raise ONE
+    coalesced ``kanban_failure_alert`` per (host, fingerprint, window), not
+    N per-task alerts (t_6a5a8d9e acceptance #3).
+    """
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+    fired: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        _kb,
+        "_fire_failure_alert",
+        lambda task_id, **kw: fired.append((task_id, kw)),
+    )
+    # Fresh coalesce window so earlier detector-gap tests can't suppress
+    # this alert (module-global cache, same fingerprint).
+    _kb._deadpid_alert_coalesce.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tids = []
+        for i in range(3):
+            tid = kb.create_task(conn, title=f"gap-{i}", assignee="a")
+            pid = 73000 + i
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None, f"task {tid} was not claimable"
+            conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, tid))
+            tids.append(tid)
+        conn.commit()
+
+        crashed = kb.detect_crashed_workers(conn)
+        assert crashed == [], "detector gaps are not crashes"
+        assert len(fired) == 1, (
+            f"expected ONE coalesced alert for 3 same-fingerprint gaps, "
+            f"got {len(fired)}: {fired}"
+        )
+        _task_id, kw = fired[0]
+        assert kw.get("coalesced") is True
+        assert kw.get("window_count") == 3
+
+        # Second pass within the window: tasks are already ready (no new
+        # gaps) so nothing re-fires.
+        fired.clear()
+        kb.detect_crashed_workers(conn)
+        assert len(fired) == 0
+
+
+def test_abandoned_popen_handle_is_stolen_by_subprocess_reaper():
+    """Documents the ROOT CAUSE of the 100%-NULL ``dispatch_death_reason``.
+
+    ``_default_spawn`` used to abandon its ``Popen`` handle and rely on
+    ``os.waitpid(-1, WNOHANG)`` to harvest the exit status. Python's
+    ``subprocess`` module reaps abandoned children itself (via
+    ``Popen.__del__`` / ``_cleanup()``), so ``waitpid(-1)`` sees NOTHING and
+    the durable verdict is never written — every death degrades to a generic
+    ``pid N not alive`` DETECTOR GAP (t_6a5a8d9e).
+
+    This test pins the OS/interpreter behaviour that makes the fix necessary.
+    If a future Python stops stealing the child, this test fails loudly and
+    the handle registry can be revisited.
+    """
+    import gc
+    import subprocess
+
+    def _spawn_and_abandon():
+        p = subprocess.Popen(
+            ["/bin/sh", "-c", "exit 7"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        pid = p.pid
+        del p  # the old fire-and-forget pattern
+        return pid
+
+    pid = _spawn_and_abandon()
+    time.sleep(0.5)
+    gc.collect()
+    # Any later Popen() triggers subprocess._cleanup(), reaping stragglers.
+    subprocess.Popen(["/bin/true"]).wait()
+
+    reaped = []
+    try:
+        while True:
+            rp, _status = os.waitpid(-1, os.WNOHANG)
+            if rp == 0:
+                break
+            reaped.append(rp)
+    except ChildProcessError:
+        pass
+
+    assert pid not in reaped, (
+        "waitpid(-1) unexpectedly harvested an abandoned child; the "
+        "fire-and-forget reap assumption may be valid again"
+    )
+
+
+def test_reap_worker_zombies_harvests_abandoned_handle_verdict(
+    kanban_home, monkeypatch,
+):
+    """END-TO-END: a REAL spawned worker yields a SPECIFIC durable verdict.
+
+    This is the acceptance test for t_6a5a8d9e #1 that the original
+    hardening lacked: the earlier tests called ``_record_worker_exit``
+    directly, so they passed while production wrote NULL to every
+    ``dispatch_death_reason`` row (6896/6896 NULL on the jarvis-os board).
+
+    Here we drive the ACTUAL path — retain handle at spawn, let the child
+    die, run the dispatcher's reap tick — and assert the durable columns
+    are populated with a specific reason rather than a generic gap.
+    """
+    import subprocess
+
+    import hermes_cli.kanban_db as _kb
+
+    _kb._recent_worker_exits.clear()
+    _kb._worker_handles.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="real-spawn", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None, "task was not claimable"
+
+        # Spawn a real short-lived child exactly like _default_spawn does,
+        # and retain the handle through the production helper.
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "exit 3"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        _kb._register_worker_handle(proc.pid, proc)
+        _kb._set_worker_pid(conn, tid, proc.pid)
+        conn.commit()
+
+        # Let the child exit, then run the dispatcher's reap tick.
+        for _ in range(50):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        reaped = _kb.reap_worker_zombies(conn)
+        assert proc.pid in reaped, (
+            f"reap tick did not harvest the worker pid {proc.pid}; got {reaped}"
+        )
+
+        run = conn.execute(
+            "SELECT dispatch_death_reason, dispatch_exit_code "
+            "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["dispatch_death_reason"] == "nonzero_exit", (
+            "durable verdict was not persisted from a REAL spawn; got "
+            f"{run['dispatch_death_reason']!r} (this is the production bug: "
+            "every row NULL -> generic pid-not-alive DETECTOR GAP)"
+        )
+        assert run["dispatch_exit_code"] == 3
+
+        # And the crash detector must now report the SPECIFIC cause.
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+        _kb._recent_worker_exits.clear()  # force the durable-verdict path
+        crashed = kb.detect_crashed_workers(conn)
+        assert tid in crashed
+        err = conn.execute(
+            "SELECT error FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()["error"] or ""
+        assert "not alive" not in err, f"generic gap leaked: {err!r}"
+        assert "exited with code 3" in err, f"specific reason missing: {err!r}"
+
+
+def test_harvest_worker_handles_classifies_signal_death(kanban_home):
+    """A signal-killed worker (OOM/SIGKILL) records ``signaled``, not unknown."""
+    import subprocess
+
+    import hermes_cli.kanban_db as _kb
+
+    _kb._recent_worker_exits.clear()
+    _kb._worker_handles.clear()
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="sigkill", assignee="a")
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None
+
+        proc = subprocess.Popen(
+            ["/bin/sh", "-c", "kill -9 $$"],
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.STDOUT,
+        )
+        _kb._register_worker_handle(proc.pid, proc)
+        _kb._set_worker_pid(conn, tid, proc.pid)
+        conn.commit()
+
+        for _ in range(50):
+            if proc.poll() is not None:
+                break
+            time.sleep(0.05)
+
+        _kb.reap_worker_zombies(conn)
+
+        run = conn.execute(
+            "SELECT dispatch_death_reason, dispatch_exit_code "
+            "FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,),
+        ).fetchone()
+        assert run["dispatch_death_reason"] == "signaled"
+        assert run["dispatch_exit_code"] == 9
+
+
+def test_harvest_worker_handles_leaves_running_workers_registered(kanban_home):
+    """A still-running worker must NOT be harvested or misclassified."""
+    import subprocess
+
+    import hermes_cli.kanban_db as _kb
+
+    _kb._worker_handles.clear()
+    proc = subprocess.Popen(
+        ["/bin/sh", "-c", "sleep 30"],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.STDOUT,
+    )
+    try:
+        _kb._register_worker_handle(proc.pid, proc)
+        harvested = _kb._harvest_worker_handles(None)
+        assert harvested == [], "a live worker must not be harvested"
+        assert proc.pid in _kb._worker_handles, "live handle must stay registered"
+    finally:
+        proc.kill()
+        proc.wait()
+        _kb._worker_handles.pop(proc.pid, None)
 
 
 def test_resolve_crash_grace_seconds_handles_bad_env(monkeypatch):
@@ -1923,14 +2358,88 @@ def test_respawn_guard_stale_success_not_guarded(kanban_home):
 
 
 def test_respawn_guard_active_pr_in_comment(kanban_home):
-    """A GitHub PR URL in a recent comment triggers active_pr."""
+    """A GitHub PR URL in a recent comment triggers active_pr when the PR is OPEN."""
     with kb.connect() as conn:
         t = kb.create_task(conn, title="has-pr", assignee="alice")
         kb.add_comment(
             conn, t, "worker",
             "PR created: https://github.com/totemx-AI/subsidysmart/pull/42",
         )
-        reason = kb.check_respawn_guard(conn, t)
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_active_pr_unknown_state_fails_closed(kanban_home):
+    """When gh cannot resolve PR state (None), the guard stays (fail closed)."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="unknown-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR created: https://github.com/totemx-AI/subsidysmart/pull/43",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value=None):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_merged_pr_not_guarded(kanban_home):
+    """A MERGED GitHub PR in a recent comment must NOT block re-spawn (t_9799c507).
+
+    Replay of the sycode-trading/t_30c13209 stall: PR #856 is MERGED, so the
+    active_pr guard must not fire even though the PR URL is in recent comments.
+    """
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR merged: https://github.com/sycamoregroupltd/sycode-trading/pull/856",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="MERGED"):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_closed_pr_not_guarded(kanban_home):
+    """A CLOSED GitHub PR in a recent comment must NOT block re-spawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="closed-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "PR closed: https://github.com/totemx-AI/subsidysmart/pull/44",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="CLOSED"):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason is None
+
+
+def test_respawn_guard_mixed_pr_states_guards_on_open(kanban_home):
+    """One OPEN PR among MERGED/CLOSED PRs still blocks re-spawn."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="mixed-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "https://github.com/a/b/pull/1 https://github.com/c/d/pull/2",
+        )
+
+        def fake_state(repo, number):
+            return "MERGED" if number == "1" else "OPEN"
+
+        with unittest.mock.patch.object(kb, "_github_pr_state", side_effect=fake_state):
+            reason = kb.check_respawn_guard(conn, t)
+    assert reason == "active_pr"
+
+
+def test_respawn_guard_pr_state_check_disabled_keeps_legacy(kanban_home):
+    """HERMES_KANBAN_PR_STATE_CHECK=0 keeps the legacy URL-only guard."""
+    with unittest.mock.patch.dict(os.environ, {"HERMES_KANBAN_PR_STATE_CHECK": "0"}):
+        with kb.connect() as conn:
+            t = kb.create_task(conn, title="legacy-pr", assignee="alice")
+            kb.add_comment(
+                conn, t, "worker",
+                "PR created: https://github.com/totemx-AI/subsidysmart/pull/45",
+            )
+            reason = kb.check_respawn_guard(conn, t)
     assert reason == "active_pr"
 
 
@@ -2035,13 +2544,38 @@ def test_dispatch_respawn_guard_skips_active_pr(
             conn, t, "worker",
             "Opened https://github.com/totemx-AI/subsidysmart/pull/99",
         )
-        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="OPEN"):
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
 
     assert (t, "active_pr") in res.respawn_guarded
     assert t not in spawned_ids
     assert t not in res.auto_blocked
     with kb.connect() as conn:
         assert kb.get_task(conn, t).status == "ready"
+
+
+def test_dispatch_respawn_guard_spawns_when_pr_merged(
+    kanban_home, all_assignees_spawnable
+):
+    """dispatch_once SPAWNS a ready task whose recent PR comment is MERGED
+    (t_9799c507 regression: the PR-state-blind guard used to block it)."""
+    spawned_ids = []
+
+    def fake_spawn(task, workspace):
+        spawned_ids.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="merged-pr", assignee="alice")
+        kb.add_comment(
+            conn, t, "worker",
+            "Opened https://github.com/sycamoregroupltd/sycode-trading/pull/856",
+        )
+        with unittest.mock.patch.object(kb, "_github_pr_state", return_value="MERGED"):
+            res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+
+    assert (t, "active_pr") not in res.respawn_guarded
+    assert t in spawned_ids
+    assert t not in res.auto_blocked
 
 
 def test_dispatch_respawn_guard_dry_run_no_auto_block(
@@ -4850,7 +5384,7 @@ def test_reap_worker_zombies_records_exit_status():
     with patch("hermes_cli.kanban_db.os.waitpid", side_effect=fake_waitpid):
         with patch(
             "hermes_cli.kanban_db._record_worker_exit",
-            side_effect=lambda p, s: calls.append((p, s)),
+            side_effect=lambda p, s, conn=None: calls.append((p, s)),
         ):
             kb.reap_worker_zombies()
 
@@ -5721,3 +6255,239 @@ class TestTriageLifecycleRegression:
         err = capsys.readouterr().err
         assert rc == 1
         assert "current status is 'triage'" in err
+
+
+# ---------------------------------------------------------------------------
+# DISPATCHER_MAX_CONSECUTIVE_FAILURES kill-switch regression tests
+# (t_c5d27be0 / t_458ab8d6)
+#
+# Spec: DISPATCHER_MAX_CONSECUTIVE_FAILURES = 10 is an ABSOLUTE catch-all
+# hard limit on consecutive failures that NO override — per-task
+# max_retries, config kanban.failure_limit, caller-supplied failure_limit,
+# or force_trip=False — can bypass. It must fire in:
+#   1. _record_task_failure (counter reaches the absolute max)
+#   2. detect_crashed_workers below-budget protocol-violation path
+#      (DB consecutive_failures >= absolute max, even when the violation
+#      streak is below its own budget)
+#   3. recompute_ready (a blocked task at the absolute max is never
+#      auto-promoted)
+#   4. `hermes kanban show <id>` (the gave_up event carries
+#      limit_source=absolute_max / effective_limit=10)
+# ---------------------------------------------------------------------------
+
+
+def _kill_switch_abs_max() -> int:
+    """Return DISPATCHER_MAX_CONSECUTIVE_FAILURES, failing with a precise
+    message when the kill-switch implementation is absent.
+
+    The constant is the spec anchor. When it is missing (the t_458ab8d6
+    kill-switch was not re-landed into the canonical tree, per the guardian
+    REJECT), these regression tests fail loudly and identify exactly what is
+    missing instead of crashing with a bare AttributeError.
+    """
+    value = getattr(kb, "DISPATCHER_MAX_CONSECUTIVE_FAILURES", None)
+    if value is None:
+        pytest.fail(
+            "DISPATCHER_MAX_CONSECUTIVE_FAILURES is not defined — the "
+            "absolute kill-switch implementation from t_458ab8d6 is absent "
+            "from hermes_cli/kanban_db.py; this regression test encodes the "
+            "acceptance criteria and will pass once the kill-switch is "
+            "re-landed."
+        )
+    return int(value)
+
+
+def test_record_task_failure_absolute_max_trips_despite_max_retries_99(kanban_home):
+    """Acceptance #1a: _record_task_failure trips at the absolute max even
+    when the per-task max_retries override is 99."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax task", assignee="worker", max_retries=99,
+        )
+        # Seed the counter one below the absolute max so this failure reaches it.
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absolute max",
+            outcome="crashed", failure_limit=99,
+        )
+        task = kb.get_task(conn, tid)
+        assert tripped is True, "absolute max must trip the breaker"
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_record_task_failure_absolute_max_trips_despite_failure_limit_99(kanban_home):
+    """Acceptance #1b: _record_task_failure trips at the absolute max even
+    when the caller/config failure_limit is 99 (no per-task override)."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="absmax task2", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absolute max 2",
+            outcome="crashed", failure_limit=99,
+        )
+        task = kb.get_task(conn, tid)
+        assert tripped is True, "absolute max must trip the breaker"
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_detect_crashed_workers_absolute_max_force_trips_below_budget_violation(
+    kanban_home, monkeypatch,
+):
+    """Acceptance #2: the below-budget protocol-violation path force-trips
+    instead of ``continue`` when the DB consecutive_failures is at the
+    absolute max.
+
+    Setup: max_retries=99 raises the violation budget to 99, so the first
+    clean-exit violation is FAR below its own streak budget. The ONLY thing
+    that can legitimately block this card is the absolute kill-switch seeing
+    the unified counter at 10.
+    """
+    abs_max = _kill_switch_abs_max()
+    import hermes_cli.kanban_db as _kb
+
+    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax proto", assignee="worker", max_retries=99,
+        )
+        host = _kb._claimer_id().split(":", 1)[0]
+        pid = 770001
+        conn.execute(
+            "UPDATE tasks SET status='running', worker_pid=?, claim_lock=?, "
+            "started_at=0, consecutive_failures=? WHERE id=?",
+            (pid, f"{host}:w", abs_max, tid),
+        )
+        conn.commit()
+        # Clean exit (raw status 0) → protocol-violation classification.
+        _kb._record_worker_exit(pid, _exited_status(0))
+        crashed = kb.detect_crashed_workers(conn)
+        task = kb.get_task(conn, tid)
+        assert tid in crashed
+        assert task.status == "blocked", (
+            f"high unified counter must force-trip, got {task.status}"
+        )
+        gave_up = [e for e in kb.list_events(conn, tid) if e.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload.get("limit_source") == "absolute_max", payload
+        assert payload.get("effective_limit") == abs_max, payload
+
+
+def test_recompute_ready_does_not_promote_absolute_max_blocked(kanban_home):
+    """Acceptance #3: recompute_ready must not promote a blocked task whose
+    consecutive_failures is at the absolute max, even with max_retries=99 /
+    failure_limit=99."""
+    abs_max = _kill_switch_abs_max()
+    with kb.connect() as conn:
+        parent = kb.create_task(conn, title="parent", assignee="a")
+        child = kb.create_task(
+            conn, title="child", assignee="a",
+            parents=[parent], max_retries=99,
+        )
+        kb.claim_task(conn, parent)
+        kb.complete_task(conn, parent, summary="done")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=? "
+            "WHERE id=?",
+            (abs_max, child),
+        )
+        conn.commit()
+        promoted = kb.recompute_ready(conn, failure_limit=99)
+        assert promoted == 0
+        task = kb.get_task(conn, child)
+        assert task.status == "blocked", f"got {task.status}"
+        assert task.consecutive_failures == abs_max
+
+
+def test_kanban_show_displays_gave_up_absolute_max(kanban_home, capsys):
+    """Acceptance #4: `hermes kanban show <id>` renders the gave_up event
+    with limit_source=absolute_max after a kill-switch trip."""
+    abs_max = _kill_switch_abs_max()
+    from hermes_cli import kanban as kc
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn, title="absmax show", assignee="worker", max_retries=99,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+            (abs_max - 1, tid),
+        )
+        conn.commit()
+        tripped = kb._record_task_failure(
+            conn, tid, error="synthetic absmax show",
+            outcome="crashed", failure_limit=99,
+        )
+        assert tripped is True, "absolute max must trip the breaker"
+
+    ns = argparse.Namespace(task_id=tid, state_type=None, state_name=None, json=False)
+    rc = kc._cmd_show(ns)
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "gave_up" in out, out
+    assert "absolute_max" in out, out
+
+
+def test_absolute_max_trip_fires_delivered_failure_alert(kanban_home, monkeypatch):
+    """Acceptance #5 (binding jarvis seat decision, t_458ab8d6): an
+    absolute-max kill-switch trip MUST emit a LOUD, DELIVERED
+    ``kanban_failure_alert`` through the failure-alert path — not a silent
+    status change. Captures the strict hook the same way
+    test_deadpid_fleet_alert does, and asserts the trip fires it exactly
+    once with the kill-switch provenance.
+    """
+    abs_max = _kill_switch_abs_max()
+    from hermes_cli.plugins import get_plugin_manager
+
+    mgr = get_plugin_manager()
+    events: list[dict] = []
+    saved = {k: list(v) for k, v in mgr._hooks.items()}
+    mgr._hooks["kanban_failure_alert"] = [lambda **kw: events.append(kw)]
+    try:
+        with kb.connect() as conn:
+            tid = kb.create_task(
+                conn, title="absmax alert", assignee="worker", max_retries=99,
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', consecutive_failures=? WHERE id=?",
+                (abs_max - 1, tid),
+            )
+            conn.commit()
+            tripped = kb._record_task_failure(
+                conn, tid, error="synthetic absmax alert",
+                outcome="crashed", failure_limit=99,
+            )
+            assert tripped is True, "absolute max must trip the breaker"
+    finally:
+        mgr._hooks = saved
+
+    assert len(events) == 1, events
+    ev = events[0]
+    assert ev["task_id"] == tid
+    assert ev["limit_source"] == "absolute_max"
+    assert ev["consecutive_failures"] == abs_max
+    assert ev["kill_switch"] is True
+    assert ev["fingerprint"] == f"kill-switch:absolute-max:{tid}"
+
