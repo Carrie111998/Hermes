@@ -496,16 +496,17 @@ def _mask_token(token: str) -> str:
 
 # A quote that closes a *containing* document, plus any structural characters
 # that follow it, rather than part of the secret value. Anchored at the end of
-# the captured value; ``[}\],]*`` covers compact (un-indented) JSON, where the
-# value class also swallows the object/array/element punctuation after the
-# closing quote (``"MY_TOKEN=ab"}`` captures ``ab"}``).
-_TRAILING_DELIMITER_RE = re.compile(r"[\"'][}\],]*$")
+# the captured value; ``[}\],]*`` covers a container tail deeper than one level
+# (``"MY_TOKEN=ab"}]`` captures ``ab"}]``).
+_TRAILING_DELIMITER_RE = re.compile(r"([\"'])[}\],]*$")
 # Quote characters a capture may have wrapped whole — see
 # ``_mask_preserving_delimiter``.
 _QUOTE_CHARS = "\"'"
 
 
-def _split_trailing_delimiter(value: str, *, quote: str = "") -> tuple[str, str]:
+def _split_trailing_delimiter(
+    value: str, *, quote: str = "", text: str = "", pos: int = 0
+) -> tuple[str, str]:
     """Split a trailing container delimiter off an unquoted captured value.
 
     Several patterns here bound the secret with a "not whitespace" value class
@@ -515,41 +516,54 @@ def _split_trailing_delimiter(value: str, *, quote: str = "") -> tuple[str, str]
     to the masker, and because a value under the 18-char floor masks to a bare
     ``***`` the closing quote is deleted outright. The document no longer
     parses, so a caller that reparses the redacted text loses the whole payload.
+    The same applies to a shell string: ``sh -c 'export MY_TOKEN=xyz'`` would
+    lose its closing quote and no longer parse.
 
-    Returns ``(value, suffix)``; ``suffix`` is re-emitted verbatim after the
-    mask. Splitting is skipped when an opening ``quote`` was captured — such a
-    value already ends at its own backreference — and when nothing but the
-    delimiter was captured, which is left for the masker to handle as before.
+    Returns ``(secret, suffix)``; ``suffix`` is re-emitted after the mask.
+
+    A delimiter only closes something that was *opened*, so the split requires
+    the same quote character to appear in ``text`` before ``pos`` (the start of
+    this match). Without that requirement the run would be re-emitted verbatim
+    whenever it merely *looked* structural, which discloses secret bytes the
+    masker would otherwise have covered: ``MY_TOKEN=a'}}}}`` has no opening
+    quote, so its trailing run belongs to the secret and is masked. Skipped
+    entirely when the pattern captured its own opening ``quote`` — such a value
+    already ends at its own backreference.
 
     Known limit: a value with no whitespace before the next JSON token (truly
-    compact ``{"a":"MY_TOKEN=x","b":1}`` captures ``x","b":1}``) has no
-    delimiter-only suffix and is not split. Fully general handling would mean
-    not running a text redactor across JSON boundaries at all, which is the
-    caller's choice, not this helper's.
+    compact ``{"a":"MY_TOKEN=x","b":1}`` captures ``x","b":1}``) ends in ``}``
+    preceded by non-structural bytes, so it has no delimiter-only suffix to
+    split. Fully general handling would mean not running a text redactor across
+    JSON boundaries at all, which is the caller's choice, not this helper's.
     """
     if quote:
         return value, ""
     match = _TRAILING_DELIMITER_RE.search(value)
-    if match is None or match.start() == 0:
+    if match is None:
+        return value, ""
+    # The delimiter must close a quote opened earlier in the document.
+    if match.group(1) not in text[:pos]:
         return value, ""
     return value[: match.start()], match.group(0)
 
 
-def _mask_preserving_delimiter(value: str) -> str:
+def _mask_preserving_delimiter(value: str, *, text: str = "", pos: int = 0) -> str:
     """``_mask_token`` for a bare ``(\\S+)`` capture, keeping any delimiter.
 
     For the patterns whose value class is bare ``(\\S+)`` and which have no
-    quote group of their own to defer to (``_SECRET_HEADER_RE``). Handles the
-    two ways such a capture can pick up quotes it does not own:
+    quote group of their own to defer to (``_SECRET_HEADER_RE``,
+    ``_YAML_ASSIGN_RE``). Handles the two ways such a capture can pick up
+    quotes it does not own:
 
     * wrapped in a matching pair (``x-api-key: "abc"``) — mask the inside and
       re-emit both quotes, keeping the pair balanced;
     * a single trailing quote closing an enclosing document or shell string —
-      delegate to ``_split_trailing_delimiter``.
+      delegate to ``_split_trailing_delimiter``, which requires that quote to
+      have been opened earlier in ``text``.
     """
     if len(value) >= 2 and value[0] in _QUOTE_CHARS and value[-1] == value[0]:
         return f"{value[0]}{_mask_token(value[1:-1])}{value[0]}"
-    secret, delimiter = _split_trailing_delimiter(value)
+    secret, delimiter = _split_trailing_delimiter(value, text=text, pos=pos)
     return f"{_mask_token(secret)}{delimiter}"
 
 
@@ -801,7 +815,9 @@ def redact_sensitive_text(
                 # Hand the masker only the secret and re-emit the delimiter, or
                 # a short value's bare ``***`` would swallow it and leave the
                 # document unparseable.
-                value, delimiter = _split_trailing_delimiter(value, quote=quote)
+                value, delimiter = _split_trailing_delimiter(
+                    value, quote=quote, text=m.string, pos=m.start()
+                )
                 return f"{name}={quote}{_mask_token(value)}{quote}{delimiter}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
@@ -848,7 +864,15 @@ def redact_sensitive_text(
                 # document text, not credentials (nearai/ironclaw#6129).
                 if not _key_has_secret_keyword(key):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                # Same unquoted-capture hazard as the KEY=VALUE and header
+                # passes: ``[^\s&]++`` absorbs a quote that closes an enclosing
+                # shell string, so ``sh -c '\npassword: xyz'`` masked to an
+                # unterminated quote. The lookahead only rejects a *leading*
+                # quote, so a trailing one still reaches the masker.
+                return (
+                    f"{key}{sep}"
+                    f"{_mask_preserving_delimiter(value, text=m.string, pos=m.start())}"
+                )
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -868,7 +892,8 @@ def redact_sensitive_text(
             # ``(\S+)`` value class absorbs the quote closing an enclosing
             # JSON document, and a short header value masks to a bare ``***``
             # that would delete it.
-            lambda m: m.group(1) + _mask_preserving_delimiter(m.group(2)),
+            lambda m: m.group(1)
+            + _mask_preserving_delimiter(m.group(2), text=m.string, pos=m.start()),
             text,
         )
 

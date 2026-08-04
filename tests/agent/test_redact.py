@@ -982,10 +982,11 @@ class TestSerializedJsonStaysParseable:
         unbalanced, and the same shape #43083 asserts for Authorization
         (``result.count('"') == 2``).
         """
-        for text in ['x-api-key: "quoted"', "x-api-key: 'quoted'"]:
+        for quote in ('"', "'"):
+            text = f"x-api-key: {quote}quoted{quote}"
             result = redact_sensitive_text(text, force=True)
             assert "quoted" not in result
-            assert result.count(text[11]) == 2, result
+            assert result.count(quote) == 2, result
 
     def test_shell_command_quote_survives(self):
         """The non-JSON half of the same defect: a quoted curl header.
@@ -1028,6 +1029,112 @@ class TestSerializedJsonStaysParseable:
         assert secret not in result, result
         assert result.count(quote) % 2 == 0, result
         assert result.endswith(quote), result
+
+
+class TestDelimiterSplitNeverDisclosesSecretBytes:
+    """The delimiter split must not become a channel for secret bytes.
+
+    ``_split_trailing_delimiter`` re-emits the run it split off. If that run is
+    taken purely on shape (``["'][}\\],]*$``), a secret whose own tail happens
+    to look structural gets republished verbatim: ``MY_TOKEN=a'}}}}…`` printed
+    32 of 33 characters that the bare ``***`` had covered. A redactor that
+    emits *more* plaintext than before is a regression, not a fix.
+
+    The invariant: a delimiter only closes something that was **opened**, so the
+    split requires the same quote earlier in the text. These tests pin that
+    requirement rather than the current output, so widening the run class again
+    fails here.
+    """
+
+    # (secret, the substring that must not be republished). Each ends in a run
+    # that _TRAILING_DELIMITER_RE matches on shape alone.
+    STRUCTURAL_TAIL_SECRETS = [
+        ("Tr0ub4dor&3'}", "'}"),
+        ("a" + "'" + "}" * 31, "'" + "}" * 31),
+        ("s3cret'}],", "'}],"),
+        ("pw'}]},", "'}]},"),
+        ('hunter2"]', '"]'),
+        ("pw',", "',"),
+    ]
+
+    @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
+    def test_no_opening_quote_means_tail_belongs_to_the_secret(
+        self, secret, structural_tail
+    ):
+        """With nothing opened earlier, the whole value is the secret."""
+        result = redact_sensitive_text(f"MY_TOKEN={secret}", force=True)
+
+        assert structural_tail not in result, result
+        assert secret not in result, result
+
+    @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
+    def test_disclosure_never_exceeds_the_baseline(self, secret, structural_tail):
+        """No suffix of the secret survives the mask.
+
+        Stronger than the test above and the property that actually matters:
+        for every suffix of the secret, that suffix must not appear in the
+        output. Catches a partial re-emission as well as a whole-run one.
+        """
+        result = redact_sensitive_text(f"MY_TOKEN={secret}", force=True)
+
+        for start in range(len(secret)):
+            assert secret[start:] not in result, (secret[start:], result)
+
+    def test_delimiter_is_still_split_when_a_quote_was_opened(self):
+        """The repair must survive the anti-disclosure requirement.
+
+        Same structural tail, but now a quote is genuinely open before the key,
+        so the trailing quote is a delimiter and must be re-emitted.
+        """
+        result = redact_sensitive_text("sh -c 'export MY_TOKEN=xyz'", force=True)
+
+        assert result == "sh -c 'export MY_TOKEN=***'"
+
+    def test_empty_value_keeps_its_container_delimiter(self):
+        """A key with no value at all must not eat the closing quote.
+
+        ``MY_TOKEN=`` captures only the delimiter, which an earlier guard
+        skipped — leaving the same unterminated-quote corruption the fix exists
+        to remove.
+        """
+        result = redact_sensitive_text("sh -c 'export MY_TOKEN='", force=True)
+        assert result.count("'") == 2, result
+
+        payload = json.dumps({"c": "MY_TOKEN=", "b": 1}, ensure_ascii=False, indent=2)
+        reparsed = json.loads(redact_sensitive_text(payload, force=True))
+        assert sorted(reparsed) == ["b", "c"]
+
+
+class TestYamlAssignDelimiter:
+    """``_YAML_ASSIGN_RE`` is the fourth pattern in this bug class.
+
+    Its value class ``[^\\s&]++`` absorbs a trailing quote exactly like the
+    KEY=VALUE and header patterns; the negative lookahead only rejects a
+    *leading* quote, so a quoted value defers to ``_JSON_FIELD_RE`` while a
+    trailing delimiter still reaches the masker.
+
+    Reachable through ``gateway.run._redact_approval_command``, which runs the
+    raw command string with ``code_file=False`` — so a multi-line command
+    echoed into a chat approval prompt hits this pass.
+    """
+
+    @pytest.mark.parametrize("key", ["password", "api_key", "client_secret"])
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_multiline_shell_string_stays_balanced(self, key, quote):
+        text = f"sh -c {quote}\n{key}: xyz{quote}"
+
+        result = redact_sensitive_text(text, force=True)
+
+        assert "xyz" not in result, result
+        assert result.count(quote) == 2, result
+        assert result.endswith(quote), result
+
+    def test_structural_tail_without_opening_quote_is_masked(self):
+        """Same anti-disclosure requirement as the other patterns."""
+        result = redact_sensitive_text("password: pw'}]", force=True)
+
+        assert "'}]" not in result, result
+        assert "pw" not in result, result
 
 
 class TestRedactThenReparseConsumers:
