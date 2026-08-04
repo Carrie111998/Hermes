@@ -7599,6 +7599,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             pending_slot[session_key] = queued_event
 
+    def _requeue_fifo_head(
+        self,
+        session_key: str,
+        queued_event: "MessageEvent",
+        adapter: Any,
+    ) -> None:
+        """Put an earlier drained event back ahead of any promoted overflow."""
+        if adapter is None:
+            return
+        pending_slot = getattr(adapter, "_pending_messages", None)
+        if pending_slot is None:
+            return
+        displaced = pending_slot.get(session_key)
+        pending_slot[session_key] = queued_event
+        if displaced is not None:
+            self._session_state(session_key).conversation.queued_events.insert(
+                0, displaced
+            )
+
     def _promote_queued_event(
         self,
         session_key: str,
@@ -8565,6 +8584,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_key: str,
         event: MessageEvent,
         adapter: Any = None,
+        *,
+        merge_text: bool = False,
     ) -> None:
         adapter = adapter or self._adapter_for_source(event.source)
         if not adapter:
@@ -8588,13 +8609,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 or event.message_type == MessageType.PHOTO
                 or bool(getattr(tail, "media_urls", None))
                 or bool(getattr(event, "media_urls", None))
+                or (
+                    merge_text
+                    and getattr(tail, "message_type", None) == MessageType.TEXT
+                    and event.message_type == MessageType.TEXT
+                )
             ):
                 tail_slot = {session_key: tail}
                 if merge_pending_message_event(
                     tail_slot,
                     session_key,
                     event,
-                    merge_text=event.message_type == MessageType.TEXT,
+                    merge_text=merge_text,
                 ):
                     if tail_slot.get(session_key) is tail:
                         return
@@ -8622,6 +8648,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             or event.message_type == MessageType.PHOTO
             or bool(getattr(existing, "media_urls", None))
             or bool(getattr(event, "media_urls", None))
+            or (
+                merge_text
+                and getattr(existing, "message_type", None) == MessageType.TEXT
+                and event.message_type == MessageType.TEXT
+            )
         ):
             # Preserve photo-burst / media-merge semantics for the head slot.
             # A False return means the head slot belongs to a different sender:
@@ -8631,7 +8662,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter._pending_messages,
                 session_key,
                 event,
-                merge_text=event.message_type == MessageType.TEXT,
+                merge_text=merge_text,
             ):
                 if adapter._pending_messages.get(session_key) is existing:
                     return
@@ -14780,10 +14811,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("PRIORITY photo follow-up for session %s — queueing without interrupt", _quick_key)
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if not merge_pending_message_event(adapter._pending_messages, _quick_key, event):
-                        # Cross-sender: never splice into another sender's album.
-                        # Transfer ownership to the canonical runner FIFO.
-                        self._enqueue_fifo(_quick_key, event, adapter)
+                    self._queue_or_replace_pending_event(_quick_key, event, adapter)
                 return None
 
             _telegram_followup_grace = float(
@@ -14808,13 +14836,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if self._busy_input_mode == "queue":
                         self._enqueue_fifo(_quick_key, event, adapter)
                     else:
-                        if not merge_pending_message_event(
-                            adapter._pending_messages,
-                            _quick_key,
-                            event,
-                            merge_text=True,
-                        ):
-                            self._enqueue_fifo(_quick_key, event, adapter)
+                        self._queue_or_replace_pending_event(
+                            _quick_key, event, adapter, merge_text=True
+                        )
                 return None
 
             _ra_state = self._peek_session_state(_quick_key)
@@ -14830,13 +14854,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # agent starts.
                 adapter = self._adapter_for_source(source)
                 if adapter:
-                    if not merge_pending_message_event(
-                        adapter._pending_messages,
-                        _quick_key,
-                        event,
-                        merge_text=True,
-                    ):
-                        self._enqueue_fifo(_quick_key, event, adapter)
+                    self._queue_or_replace_pending_event(
+                        _quick_key, event, adapter, merge_text=True
+                    )
                 return None
             if self._draining:
                 if self._queue_during_drain_enabled():
@@ -25463,8 +25483,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     adapter = self._adapter_for_source(source)
                     if adapter and pending_event:
-                        if not merge_pending_message_event(adapter._pending_messages, session_key, pending_event):
-                            self._enqueue_fifo(session_key, pending_event, adapter)
+                        self._requeue_fifo_head(session_key, pending_event, adapter)
                     elif adapter and hasattr(adapter, 'queue_message'):
                         adapter.queue_message(session_key, pending)
                     return result_holder[0] or {"final_response": response, "messages": history}
