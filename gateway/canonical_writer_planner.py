@@ -1394,6 +1394,7 @@ def _write_atomic_root_staged_file(path: Path, payload: bytes) -> None:
     _require_root_linux()
     allowed = frozenset({
         DEFAULT_STAGED_WRITER_UNIT_PATH,
+        DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH,
         DEFAULT_STAGED_GATEWAY_UNIT_PATH,
         DEFAULT_STAGED_NATIVE_PLAN_PATH,
         DEFAULT_STAGED_PLAN_PATH,
