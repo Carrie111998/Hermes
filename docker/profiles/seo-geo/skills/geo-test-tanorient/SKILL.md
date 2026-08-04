@@ -45,6 +45,12 @@ Demande dans chaque cas les **sources/citations** (OpenRouter renvoie les
 annotations de recherche web ; si un moteur répond sans citations, note-le :
 mode dégradé, résultat moins fiable).
 
+⚠️ **Les appels avec recherche web sont LENTS** (90 s+ observés, timeout curl
+exit 28). Obligatoire : `--max-time 240`, lancer les 4 `curl` **en parallèle
+en arrière-plan** (`curl ... -o /tmp/geo_<moteur>.json & ... wait`), puis
+parser les 4 fichiers. Un moteur qui timeout = « non testé ce mois-ci » dans
+la grille, on ne retente qu'une fois.
+
 Claude via l'API Anthropic (`$GEO_TEST_ANTHROPIC_KEY`) avec l'outil serveur
 `web_search` :
 

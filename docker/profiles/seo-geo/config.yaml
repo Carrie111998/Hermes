@@ -6,9 +6,10 @@
 
 model:
   # DeepSeek v4 Flash via OpenRouter (choix Gilles 2026-08-04) — routines de
-  # suivi à fort volume, coût faible. Fallback Opus 5 direct Anthropic.
-  # (id vérifié sur /api/v1/models : pas de variante "-latest")
-  default: "deepseek/deepseek-v4-flash"
+  # suivi à fort volume, coût faible. Snapshot épinglé 0731 (demande Gilles ;
+  # l'alias ~deepseek/deepseek-v4-flash-latest existe aussi sur OpenRouter).
+  # Fallback Opus 5 direct Anthropic.
+  default: "deepseek/deepseek-v4-flash-0731"
   provider: "openrouter"
 
 fallback_providers:
