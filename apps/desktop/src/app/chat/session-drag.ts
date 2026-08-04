@@ -215,14 +215,17 @@ export function startSessionDrag(
     },
 
     onCommit() {
-      if (reorder) {
+      // Capture for TS control-flow narrowing: callbacks (filter) would
+      // otherwise see `reorder` as still possibly null (TS18047).
+      const activeReorder = reorder
+      if (activeReorder) {
         const tree = $layoutTree.get()
-        const panes = tree ? (findGroup(tree, reorder.groupId)?.panes ?? []) : []
-        const others = panes.filter(id => id !== reorder.paneId)
-        const toIndex = reorder.before ? others.indexOf(reorder.before) : others.length
+        const panes = tree ? (findGroup(tree, activeReorder.groupId)?.panes ?? []) : []
+        const others = panes.filter(id => id !== activeReorder.paneId)
+        const toIndex = activeReorder.before ? others.indexOf(activeReorder.before) : others.length
 
         if (toIndex >= 0) {
-          reorderTreePane(reorder.groupId, reorder.paneId, toIndex)
+          reorderTreePane(activeReorder.groupId, activeReorder.paneId, toIndex)
         }
 
         return
