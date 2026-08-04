@@ -325,7 +325,11 @@ class RelayRuntime:
                         allow_closing=True,
                     )
                 except Exception as exc:
-                    failures.append(f"session scope close failed: {exc}")
+                    # When a session is forcefully closed mid-turn (e.g. from a gateway transport crash),
+                    # inner scopes might still be active, causing the pop to fail.
+                    # This is safe to ignore since the session is tearing down anyway.
+                    if "scope handle is not at the top of the stack" not in str(exc):
+                        failures.append(f"session scope close failed: {exc}")
         try:
             self.relay.subscribers.flush()
         except Exception as exc:

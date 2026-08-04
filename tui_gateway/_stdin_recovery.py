@@ -149,3 +149,69 @@ def handle_spurious_eof(
     # but does NOT stick EOF; after restoring blocking, the next call will
     # block until data arrives or the peer truly closes.
     return True
+
+
+# ---------------------------------------------------------------------------
+# Windows OSError recovery (#78820)
+# ---------------------------------------------------------------------------
+# On Windows, a child process inheriting the stdio pipe can corrupt its
+# state, surfacing as a *raised* ``OSError`` (EINVAL / EBADF / EPIPE) on
+# the next ``sys.stdin.readline()`` instead of the empty-read that POSIX
+# produces.  Without a guard the exception propagates out of the read loop
+# and kills the gateway child mid-session, losing the in-flight turn.
+#
+# The recoverable errno set is deliberately narrow: only transient
+# pipe-corruption errors that a retry can clear.  Anything else
+# (ECONNRESET, ENOTCONN, permission errors, …) must propagate unchanged.
+
+_RECOVERABLE_STDIN_ERRNOS: frozenset[int] = frozenset({
+    getattr(os, "errno", None) and getattr(os.errno, "EINVAL", 22) or 22,   # corrupted pipe state (primary Windows symptom)
+    getattr(os, "errno", None) and getattr(os.errno, "EBADF", 9) or 9,    # child closed the inherited handle
+    getattr(os, "errno", None) and getattr(os.errno, "EPIPE", 32) or 32,    # broken pipe on the read path
+})
+
+import errno
+
+_RECOVERABLE_STDIN_ERRNOS = frozenset({
+    errno.EINVAL,
+    errno.EBADF,
+    errno.EPIPE,
+})
+
+def handle_stdin_oserror(
+    exc: OSError,
+    recovery_times: list[float],
+    log_fn: object,
+) -> bool | None:
+    """Handle a raised ``OSError`` from ``sys.stdin.readline()``.
+
+    Returns a tri-state action code:
+
+    * ``True``  — the error is recoverable and under the rate limit; the
+      caller should retry the read (``continue`` the loop).
+    * ``False`` — the error is recoverable but the rate limit was exceeded;
+      the caller should exit gracefully (``break``) so the parent respawns
+      with fresh state.
+    * ``None``  — the error is **not** recoverable; the caller should
+      re-raise so unexpected failures surface normally.
+    """
+    if exc.errno not in _RECOVERABLE_STDIN_ERRNOS:
+        return None
+
+    now = time.time()
+    recovery_times.append(now)
+    recovery_times[:] = [t for t in recovery_times if t > now - 60]
+    if len(recovery_times) > MAX_RECOVERIES_PER_MINUTE:
+        log_fn(  # type: ignore[operator]
+            f"stdin OSError recovery rate exceeded "
+            f"({len(recovery_times)}/min, cap {MAX_RECOVERIES_PER_MINUTE})"
+        )
+        return False
+
+    log_fn(  # type: ignore[operator]
+        f"stdin OSError recovered (errno={exc.errno}, "
+        f"{os.strerror(exc.errno)}), retrying"
+    )
+
+    time.sleep(0.1)
+    return True
