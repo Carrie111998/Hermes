@@ -13,17 +13,18 @@ import contextlib
 import importlib
 from importlib.machinery import PathFinder
 import os
+from pathlib import Path
 import socket
 import sys
 import time
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch, call
 
 import pytest
 
 import agent.secret_scope as secret_scope
 from gateway.config import Platform, PlatformConfig
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, _home_channel_prompt_enabled
 from gateway.platforms.base import (
     MessageEvent,
     MessageType,
@@ -250,6 +251,86 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+
+
+@pytest.mark.asyncio
+async def test_mention_only_message_gets_usage_hint_without_starting_agent(adapter):
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="hint-1"))
+
+    await adapter._handle_slack_message(
+        {
+            "text": "<@U_BOT>",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T123",
+            "ts": "1785806964.795449",
+            "thread_ts": "1785801603.247069",
+            "client_msg_id": "client-1",
+        }
+    )
+
+    adapter.handle_message.assert_not_awaited()
+    adapter.send.assert_awaited_once()
+    send_call = adapter.send.await_args
+    assert send_call is not None
+    assert "멘션과 함께 입력" in send_call.args[1]
+    assert send_call.kwargs["reply_to"] == "1785801603.247069"
+
+
+def test_final_response_mentions_requester_with_native_slack_token():
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"mention_requester": True},
+    )
+    adapter = SlackAdapter(config)
+    source = SimpleNamespace(user_id="U0B3QMXHFBJ", chat_type="group")
+
+    content = "**To:** 요청자  \n**CC:** —\n\n광고 ROAS 답변"
+    rendered = adapter.prepare_final_response(content, source)
+
+    assert rendered.startswith("**To:** <@U0B3QMXHFBJ>")
+    assert "To:** 요청자" not in rendered
+
+
+def test_final_response_prefixes_requester_when_to_header_is_absent():
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"mention_requester": True},
+    )
+    adapter = SlackAdapter(config)
+    source = SimpleNamespace(user_id="U0B3QMXHFBJ", chat_type="group")
+
+    rendered = adapter.prepare_final_response("광고 ROAS 답변", source)
+
+    assert rendered == "<@U0B3QMXHFBJ>\n\n광고 ROAS 답변"
+
+
+def test_final_response_does_not_mention_requester_in_dm():
+    config = PlatformConfig(
+        enabled=True,
+        token="***",
+        extra={"mention_requester": True},
+    )
+    adapter = SlackAdapter(config)
+    source = SimpleNamespace(user_id="U0B3QMXHFBJ", chat_type="dm")
+
+    assert adapter.prepare_final_response("광고 ROAS 답변", source) == "광고 ROAS 답변"
+
+
+def test_slack_home_channel_prompt_can_be_disabled(monkeypatch):
+    monkeypatch.setenv("SLACK_HOME_CHANNEL_PROMPT", "false")
+
+    assert _home_channel_prompt_enabled("slack") is False
+
+
+def test_home_channel_prompt_defaults_to_enabled(monkeypatch):
+    monkeypatch.delenv("SLACK_HOME_CHANNEL_PROMPT", raising=False)
+    monkeypatch.delenv("HERMES_HOME_CHANNEL_PROMPT", raising=False)
+
+    assert _home_channel_prompt_enabled("slack") is True
 
 
 class TestBotEventDiagnostics:
@@ -1755,6 +1836,16 @@ class TestStandaloneSendUserDmResolution:
 
 
 class TestSendDocument:
+    def test_plain_csv_media_line_is_extracted(self, adapter, tmp_path):
+        csv_path = tmp_path / "sales.csv"
+        csv_path.write_text("name,value\nA,1\n", encoding="utf-8")
+
+        media, cleaned = adapter.extract_media(f"완료했습니다.\nMEDIA:{csv_path}")
+
+        assert media == [(str(csv_path), False)]
+        assert "MEDIA:" not in cleaned
+        assert "완료했습니다." in cleaned
+
     @pytest.mark.asyncio
     async def test_send_document_success(self, adapter, tmp_path):
         test_file = tmp_path / "report.pdf"
@@ -1811,6 +1902,25 @@ class TestSendDocument:
         assert result.success
         call_kwargs = adapter._app.client.files_upload_v2.call_args[1]
         assert call_kwargs["filename"] == "quarterly-report.csv"
+
+    @pytest.mark.asyncio
+    async def test_send_document_uploads_large_cp949_csv_opaquely(
+        self, adapter, tmp_path
+    ):
+        content = ("상품명,수량\n" + "스크럽대디,10\n" * 10_000).encode("cp949")
+        assert len(content) > 100 * 1024
+        csv_path = tmp_path / "대용량_판매량.csv"
+        csv_path.write_bytes(content)
+        adapter._app.client.files_upload_v2 = AsyncMock(return_value={"ok": True})
+
+        result = await adapter.send_document("C123", str(csv_path))
+
+        assert result.success
+        kwargs = adapter._app.client.files_upload_v2.call_args[1]
+        assert kwargs["channel"] == "C123"
+        assert kwargs["file"] == str(csv_path)
+        assert kwargs["filename"] == "대용량_판매량.csv"
+        assert csv_path.read_bytes() == content
 
     @pytest.mark.asyncio
     async def test_send_document_missing_file(self, adapter):
@@ -2536,6 +2646,67 @@ class TestIncomingDocumentHandling:
         assert "Hello from a text file" in msg_event.text
         assert "[Content of notes.txt]" in msg_event.text
         assert "summarize this" in msg_event.text
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("encoding", ["euc-kr", "cp949"])
+    async def test_cp949_csv_is_normalized_and_injected(self, adapter, encoding):
+        """Korean Excel CSV uploads should be readable as normalized UTF-8."""
+        content = "상품명,수량\n스크럽대디,10\n".encode(encoding)
+
+        with patch.object(
+            adapter, "_download_slack_file_bytes", new_callable=AsyncMock
+        ) as dl:
+            dl.return_value = content
+            event = self._make_event(
+                text="이 파일을 요약해줘",
+                files=[
+                    {
+                        "mimetype": "text/csv",
+                        "name": "판매량.csv",
+                        "url_private_download": "https://files.slack.com/sales.csv",
+                        "size": len(content),
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "상품명,수량" in msg_event.text
+        assert "스크럽대디,10" in msg_event.text
+        assert Path(msg_event.media_urls[0]).read_text(encoding="utf-8") == (
+            "상품명,수량\n스크럽대디,10\n"
+        )
+
+    @pytest.mark.asyncio
+    async def test_large_cp949_csv_is_cached_as_utf8_without_injection(self, adapter):
+        """Large Korean CSVs stay path-backed but remain readable by read_file."""
+        text = "상품명,수량\n" + "스크럽대디,10\n" * 10_000
+        content = text.encode("cp949")
+        assert len(content) > 100 * 1024
+
+        with patch.object(
+            adapter, "_download_slack_file_bytes", new_callable=AsyncMock
+        ) as dl:
+            dl.return_value = content
+            event = self._make_event(
+                text="이 파일을 분석해줘",
+                files=[
+                    {
+                        "mimetype": "text/csv",
+                        "name": "대용량_판매량.csv",
+                        "url_private_download": "https://files.slack.com/large.csv",
+                        "size": len(content),
+                    }
+                ],
+            )
+            await adapter._handle_slack_message(event)
+
+        msg_event = adapter.handle_message.call_args[0][0]
+        assert "[Content of" not in msg_event.text
+        cached = Path(msg_event.media_urls[0])
+        assert cached.read_bytes() == text.encode("utf-8")
+        normalized = cached.read_text(encoding="utf-8")
+        assert normalized.startswith("상품명,수량\n스크럽대디,10")
 
     @pytest.mark.asyncio
     async def test_md_document_injects_content(self, adapter):

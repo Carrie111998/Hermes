@@ -5,7 +5,7 @@ A user who attaches a PDF / DOCX in chat used to see the agent treat it as
 they'd like you to do with it" — steering it away from extracting the text it
 is perfectly capable of reading. These tests pin the contract:
 
-- text documents: note confirms the (adapter-)inlined content + records path.
+- text documents: note handles either adapter-inlined content or a cached path.
 - binary documents (PDF/DOCX/…): note tells the agent to extract the text
   itself and never tells it to punt back to the user.
 """
@@ -20,12 +20,14 @@ _build_document_context_note = gateway_run._build_document_context_note
 
 class TestTextDocumentNote:
     @pytest.mark.parametrize("mtype", ["text/plain", "text/markdown", "text/csv"])
-    def test_text_note_mentions_included_content_and_path(self, mtype):
+    def test_text_note_handles_inlined_or_path_backed_content(self, mtype):
         note = _build_document_context_note("notes.txt", "/cache/doc_notes.txt", mtype)
         assert "text document" in note
         assert "notes.txt" in note
         assert "/cache/doc_notes.txt" in note
-        assert "included below" in note
+        assert "may be included below" in note
+        assert "read_file" in note
+        assert "has been included" not in note
 
 
 class TestBinaryDocumentNote:

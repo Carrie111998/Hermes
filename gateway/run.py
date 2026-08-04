@@ -1553,6 +1553,16 @@ def _home_target_env_var(platform_name: str) -> str:
     return f"{platform_name.upper()}_HOME_CHANNEL"
 
 
+def _home_channel_prompt_enabled(platform_name: str) -> bool:
+    """Return whether first-turn home-channel onboarding should be shown."""
+    raw = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL_PROMPT")
+    if raw is None:
+        raw = os.getenv("HERMES_HOME_CHANNEL_PROMPT")
+    if raw is None:
+        return True
+    return raw.strip().lower() not in {"false", "0", "no", "off"}
+
+
 def _home_thread_env_var(platform_name: str) -> str:
     """Return the optional thread/topic env var for a platform home target."""
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
@@ -2481,8 +2491,9 @@ def _build_media_placeholder(event) -> str:
 def _build_document_context_note(display_name: str, agent_path: str, mtype: str) -> str:
     """Context note prepended to a user turn when they attach a document.
 
-    Text documents (``text/*``) have their content inlined upstream by the
-    platform adapter, so the note just confirms that and records the path.
+    Small text documents may have their content inlined upstream. Large files
+    and undecodable text remain path-backed, so never claim unconditional
+    inclusion; tell the agent to open the cached file when needed.
 
     Binary documents (PDF, DOCX, XLSX, …) cannot be inlined as text. The note
     must tell the agent to *extract* the text itself before answering — earlier
@@ -2493,8 +2504,9 @@ def _build_document_context_note(display_name: str, agent_path: str, mtype: str)
     if mtype.startswith("text/"):
         return (
             f"[The user sent a text document: '{display_name}'. "
-            f"Its content has been included below. "
-            f"The file is also saved at: {agent_path}]"
+            f"Its content may be included below. The file is saved at: {agent_path}. "
+            f"If its content is not included below, read the saved file yourself "
+            f"with read_file before answering.]"
         )
     return (
         f"[The user sent a document: '{display_name}'. It is saved at: {agent_path}. "
@@ -3089,7 +3101,10 @@ def _normalize_empty_agent_response(
         return response
     if api_calls > 0:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
-            return ""
+            return (
+                "⚠️ 답변을 생성하지 못했습니다. 대화 상태를 초기화했으니 "
+                "같은 질문을 다시 보내 주세요."
+            )
         if agent_result.get("partial"):
             err = agent_result.get("error", "processing incomplete")
             return f"⚠️ Processing stopped: {str(err)[:200]}. Try again."
@@ -13827,7 +13842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             home_env = "set"
                 except Exception:
                     pass
-            if not home_env:
+            if not home_env and _home_channel_prompt_enabled(platform_name):
                 # Slack dispatches all Hermes commands through a single
                 # parent slash command `/hermes`; bare `/sethome` is not
                 # registered and would fail with "app did not respond".
@@ -14285,11 +14300,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
             elif hidden_reasoning_incomplete:
                 logger.warning(
-                    "Suppressing hidden-reasoning-only incomplete gateway turn "
-                    "for session %s: %s",
+                    "Resetting hidden-reasoning-only incomplete gateway turn "
+                    "for session %s after notifying the user: %s",
                     session_entry.session_id,
                     agent_result.get("error", "processing incomplete"),
                 )
+
+            hidden_incomplete_reset = False
+            if hidden_reasoning_incomplete and session_entry and session_key:
+                new_entry = await self.async_session_store.reset_session(session_key)
+                self._evict_cached_agent(session_key)
+                self._clear_conversation_scope(
+                    session_key, reason="hidden_incomplete_reset"
+                )
+                if new_entry is not None:
+                    session_entry = new_entry
+                hidden_incomplete_reset = True
 
             # When compression is exhausted, the session is permanently too
             # large to process.  Auto-reset it so the next message starts
@@ -14350,8 +14376,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # If this is a fresh session (no history), write the full tool
             # definitions as the first entry so the transcript is self-describing
             # -- the same list of dicts sent as tools=[...] in the API request.
-            if is_context_overflow_failure:
-                pass  # Skip all transcript writes — don't grow a broken session
+            if is_context_overflow_failure or hidden_incomplete_reset:
+                pass  # Skip transcript writes for broken/reset sessions.
             elif not history:
                 tool_defs = agent_result.get("tools", [])
                 await self.async_session_store.append_to_transcript(

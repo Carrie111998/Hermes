@@ -97,6 +97,9 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     # (#47237). A bare MagicMock returns a truthy mock, which would wrongly
     # mark the user turn as a duplicate and skip persisting it.
     runner.session_store.has_platform_message_id = MagicMock(return_value=False)
+    runner.session_store.reset_session = MagicMock(
+        return_value=runner.session_store.get_or_create_session.return_value
+    )
     runner._running_agents = {}
     runner._pending_messages = {}
     runner._pending_approvals = {}
@@ -104,6 +107,8 @@ def _make_runner(adapter: CaptureSlackAdapter) -> gateway_run.GatewayRunner:
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._run_agent = AsyncMock(return_value=_make_incomplete_result())
+    runner._evict_cached_agent = MagicMock()
+    runner._clear_conversation_scope = MagicMock()
     return runner
 
 
@@ -121,7 +126,7 @@ def _make_event() -> MessageEvent:
     )
 
 
-def test_incomplete_codex_warning_is_not_surfaced_as_chat_text():
+def test_incomplete_codex_turn_returns_retry_notice():
     agent_result = _make_incomplete_result()
 
     # Mirror the gateway pipeline: the hidden-turn detector blanks the
@@ -136,7 +141,8 @@ def test_incomplete_codex_warning_is_not_surfaced_as_chat_text():
         history_len=4,
     )
 
-    assert response == ""
+    assert "답변을 생성하지 못했습니다" in response
+    assert "다시 보내" in response
 
 
 def test_real_answer_alongside_incomplete_error_is_never_suppressed():
@@ -157,7 +163,7 @@ def test_interrupted_or_failed_turns_are_not_classified_hidden():
 
 
 @pytest.mark.asyncio
-async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, tmp_path):
+async def test_incomplete_codex_turn_notifies_and_resets_session(monkeypatch, tmp_path):
     adapter = CaptureSlackAdapter()
     runner = _make_runner(adapter)
 
@@ -175,15 +181,19 @@ async def test_incomplete_codex_turn_stays_out_of_slack_transcript(monkeypatch, 
     event = _make_event()
     await adapter._process_message_background(event, build_session_key(event.source))
 
-    assert adapter.sent == []
+    assert len(adapter.sent) == 1
+    assert "답변을 생성하지 못했습니다" in adapter.sent[0]["content"]
+    assert getattr(runner.session_store.reset_session, "call_count") == 1
+    runner._evict_cached_agent.assert_called_once()
+    runner._clear_conversation_scope.assert_called_once()
     assert runner.session_store.update_session.called
 
     transcript_roles = [
         call.args[1]["role"]
         for call in runner.session_store.append_to_transcript.call_args_list
     ]
-    assert transcript_roles == ["session_meta", "user"]
-    assert runner.session_store.append_to_transcript.call_args_list[1].args[1]["content"] == "hello"
+    assert transcript_roles == ["user"]
+    assert "assistant" not in transcript_roles
     assert adapter.processing_hooks == [
         ("start", "m-1"),
         ("complete", "m-1", ProcessingOutcome.SUCCESS),

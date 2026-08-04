@@ -3608,6 +3608,14 @@ class BasePlatformAdapter(ABC):
         """
         return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
 
+    def prepare_final_response(self, content: str, source: SessionSource) -> str:
+        """Apply platform-specific formatting to a final user-visible reply.
+
+        The hook runs before the delivery obligation is recorded, so durable
+        retries preserve the exact content originally prepared for delivery.
+        """
+        return content
+
     async def play_tts(
         self,
         chat_id: str,
@@ -5222,6 +5230,12 @@ class BasePlatformAdapter(ABC):
                             self.name, len(_response_pre_extract), event.source.chat_id,
                         )
                         text_content = _recovered
+
+                if text_content:
+                    text_content = self.prepare_final_response(
+                        text_content,
+                        event.source,
+                    )
 
                 # Final user-visible content (text, TTS, media, files) gets
                 # the existing notify=True marker. Clone once so typing/status

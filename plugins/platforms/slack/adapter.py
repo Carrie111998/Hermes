@@ -808,6 +808,25 @@ _SLACK_EXT_TO_AUDIO_MIME = {
 }
 
 
+def _decode_slack_text_attachment(
+    raw_bytes: bytes, ext: str, mimetype: str
+) -> tuple[Optional[str], Optional[str]]:
+    """Decode a Slack text attachment, including Korean Excel CSV encodings."""
+    is_csv_like = ext in {".csv", ".tsv"} or mimetype in {
+        "text/csv",
+        "text/tab-separated-values",
+    }
+    encodings = ["utf-8-sig", "utf-8"]
+    if is_csv_like:
+        encodings.extend(["cp949", "euc-kr"])
+    for encoding in encodings:
+        try:
+            return raw_bytes.decode(encoding), encoding
+        except UnicodeDecodeError:
+            continue
+    return None, None
+
+
 def _resolve_slack_audio_ext(file_obj: Dict[str, Any], mimetype: str) -> str:
     """Pick the cache extension that matches an inbound Slack audio file's bytes.
 
@@ -2435,6 +2454,28 @@ class SlackAdapter(BasePlatformAdapter):
         parent_channel_id = str(channel_id).split(":", 1)[0]
         ignored = self._slack_ignored_channels()
         return "*" in ignored or parent_channel_id in ignored
+
+    def prepare_final_response(self, content: str, source: Any) -> str:
+        """Mention the triggering Slack user in configured channel replies."""
+        if not self._slack_mention_requester():
+            return content
+        if getattr(source, "chat_type", None) == "dm":
+            return content
+
+        user_id = str(getattr(source, "user_id", "") or "").strip()
+        if not re.fullmatch(r"[UW][A-Z0-9]+", user_id):
+            return content
+
+        mention = f"<@{user_id}>"
+        to_header = re.compile(
+            r"^(\s*(?:\*\*)?To:(?:\*\*)?\s*)[^\r\n]*",
+            re.IGNORECASE | re.MULTILINE,
+        )
+        if to_header.search(content):
+            return to_header.sub(rf"\g<1>{mention}  ", content, count=1)
+        if mention in content:
+            return content
+        return f"{mention}\n\n{content}"
 
     async def send(
         self,
@@ -5736,6 +5777,38 @@ class SlackAdapter(BasePlatformAdapter):
                 # hidden behind the leading mention on the first probe.
                 command_probe_text = command_text
                 is_command_text = True
+
+            # A bare @mention carries no actionable user intent once Slack's
+            # bot token is stripped.  Do not create an agent session for it:
+            # besides wasting a model turn, an empty first turn can poison the
+            # live thread cache and make the next real question inherit an
+            # incomplete assistant response.  Attachments or meaningful Block
+            # Kit text are still valid intent, so only intercept a truly empty
+            # mention-only event.
+            meaningful_block_text = (
+                _extract_text_from_slack_blocks(blocks).replace(f"<@{bot_uid}>", "").strip()
+                if blocks
+                else ""
+            )
+            if (
+                not mention_stripped
+                and not meaningful_block_text
+                and not event.get("files")
+                and not slack_attachments
+            ):
+                await self.send(
+                    channel_id,
+                    "궁금한 내용을 봇 멘션과 함께 입력해 주세요.",
+                    reply_to=event_thread_ts or ts,
+                    metadata={"team_id": team_id} if team_id else None,
+                )
+                logger.info(
+                    "[Slack] Replied to mention-only message without starting an agent session: "
+                    "channel=%s user=%s",
+                    channel_id,
+                    user_id,
+                )
+                return
             # Register this thread so all future messages auto-trigger the bot.
             # Skipped in strict/thread-gated mode: strict_mention=true and
             # thread_require_mention=true bots must be re-mentioned for
@@ -6102,12 +6175,31 @@ class SlackAdapter(BasePlatformAdapter):
                         )
                         continue
 
-                    # Download and cache
+                    # Download and cache. Korean CSV files exported by Windows
+                    # Excel commonly arrive as CP949/EUC-KR; normalize those to
+                    # UTF-8 so read_file can consume both small and path-backed
+                    # large uploads without mojibake.
                     raw_bytes = await self._download_slack_file_bytes(
                         url, team_id=team_id
                     )
+                    _is_text = ext in _TEXT_INJECT_EXTENSIONS or (
+                        mimetype or ""
+                    ).startswith("text/")
+                    text_content: Optional[str] = None
+                    detected_encoding: Optional[str] = None
+                    cache_bytes = raw_bytes
+                    if _is_text:
+                        text_content, detected_encoding = _decode_slack_text_attachment(
+                            raw_bytes, ext, mimetype or ""
+                        )
+                        if text_content is not None and (
+                            ext in {".csv", ".tsv"}
+                            or mimetype
+                            in {"text/csv", "text/tab-separated-values"}
+                        ):
+                            cache_bytes = text_content.encode("utf-8")
                     cached_path = cache_document_from_bytes(
-                        raw_bytes, original_filename or f"document{ext or '.bin'}"
+                        cache_bytes, original_filename or f"document{ext or '.bin'}"
                     )
                     if in_allowlist:
                         doc_mime = SUPPORTED_DOCUMENT_TYPES[ext]
@@ -6124,19 +6216,20 @@ class SlackAdapter(BasePlatformAdapter):
                     # decodable ASCII headers. Binary files are surfaced as a
                     # cached path only (run.py emits a path-pointing note).
                     MAX_TEXT_INJECT_BYTES = 100 * 1024
-                    _is_text = ext in _TEXT_INJECT_EXTENSIONS or (mimetype or "").startswith("text/")
-                    if _is_text and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
-                        try:
-                            text_content = raw_bytes.decode("utf-8")
-                            display_name = original_filename or f"document{ext or '.txt'}"
-                            display_name = re.sub(r"[^\w.\- ]", "_", display_name)
-                            injection = f"[Content of {display_name}]:\n{text_content}"
-                            if text:
-                                text = f"{injection}\n\n{text}"
-                            else:
-                                text = injection
-                        except UnicodeDecodeError:
-                            pass  # Binary content, skip injection
+                    if text_content is not None and len(raw_bytes) <= MAX_TEXT_INJECT_BYTES:
+                        display_name = original_filename or f"document{ext or '.txt'}"
+                        display_name = re.sub(r"[^\w.\- ]", "_", display_name)
+                        injection = f"[Content of {display_name}]:\n{text_content}"
+                        if text:
+                            text = f"{injection}\n\n{text}"
+                        else:
+                            text = injection
+                    if detected_encoding:
+                        logger.debug(
+                            "[Slack] Decoded text attachment %s as %s",
+                            original_filename or f"document{ext or '.txt'}",
+                            detected_encoding,
+                        )
 
                 except Exception as e:  # pragma: no cover - defensive logging
                     detail = self._describe_slack_download_failure(e, file_obj=f)
@@ -8366,6 +8459,15 @@ class SlackAdapter(BasePlatformAdapter):
         raw = self.config.extra.get("disable_dms")
         if raw is None:
             raw = os.getenv("SLACK_DISABLE_DMS", "false")
+        if isinstance(raw, str):
+            return raw.strip().lower() in {"true", "1", "yes", "on"}
+        return bool(raw)
+
+    def _slack_mention_requester(self) -> bool:
+        """Return whether final channel replies should mention their requester."""
+        raw = self.config.extra.get("mention_requester")
+        if raw is None:
+            raw = os.getenv("SLACK_MENTION_REQUESTER", "false")
         if isinstance(raw, str):
             return raw.strip().lower() in {"true", "1", "yes", "on"}
         return bool(raw)
