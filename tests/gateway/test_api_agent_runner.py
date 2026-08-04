@@ -44,6 +44,40 @@ class _FakeAdapter:
         return self._db
 
 
+def test_run_agent_sync_forwards_non_empty_runtime_message_id_only():
+    class RuntimeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+        session_id = "runtime-session"
+
+        def run_conversation(
+            self,
+            user_message,
+            conversation_history,
+            task_id,
+            runtime_message_id,
+        ):
+            return {
+                "final_response": "ok",
+                "runtime_message_id": runtime_message_id,
+            }
+
+    class RuntimeAdapter:
+        def _create_agent(self, **_kwargs):
+            return RuntimeAgent()
+
+    result, _usage = run_agent_sync(
+        RuntimeAdapter(),
+        user_message="runtime turn",
+        conversation_history=[],
+        session_id="runtime-session",
+        runtime_message_id="wire-user-1",
+    )
+
+    assert result["runtime_message_id"] == "wire-user-1"
+
+
 def test_run_agent_sync_binds_principal_scope_and_sandbox_lease(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     adapter = _FakeAdapter(db)

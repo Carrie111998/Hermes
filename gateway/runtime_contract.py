@@ -8,7 +8,6 @@ RUNTIME_PROTOCOL_VERSION = "1"
 RUNTIME_DRIVER_FRAME_TYPES = (
     "run_started",
     "heartbeat",
-    "checkpoint",
     "text_delta",
     "tool_request",
     "activity_started",

@@ -142,7 +142,9 @@ def finalize_turn(
     # empty stdout with no traceback — #8049).  Each step is now guarded
     # independently so one failure can't skip the others, and any errors
     # are surfaced on the result dict via ``cleanup_errors`` rather than
-    # killing the turn.
+    # killing the turn. Runtime is the narrow exception: when it declares
+    # SessionDB persistence mandatory, a final persistence failure must make
+    # the turn fail closed even though the diagnostic response is preserved.
     _cleanup_errors = []
 
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
@@ -181,7 +183,7 @@ def finalize_turn(
         # here instead. On an interrupt ``final_response`` is typically
         # empty, so fall back to an explicit placeholder rather than
         # persisting an empty-content assistant turn.
-        if interrupted:
+        if interrupted and not getattr(agent, "_runtime_deferred_tool_call_id", None):
             from agent.message_sanitization import close_interrupted_tool_sequence
             close_interrupted_tool_sequence(messages, final_response)
 
@@ -189,6 +191,10 @@ def finalize_turn(
     except Exception as _persist_err:
         _cleanup_errors.append(f"persist_session: {_persist_err}")
         logger.error("finalize_turn: _persist_session failed: %s", _persist_err, exc_info=True)
+        if getattr(agent, "_require_incremental_session_persistence", False):
+            completed = False
+            failed = True
+            _turn_exit_reason = "required_session_persistence_failed"
 
     # ── Turn-exit diagnostic log ─────────────────────────────────────
     # Always logged at INFO so agent.log captures WHY every turn ended.

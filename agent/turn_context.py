@@ -125,6 +125,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[str],
     persist_user_timestamp: Optional[float] = None,
+    runtime_message_id: Optional[str] = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -204,6 +205,7 @@ def build_turn_context(
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
+    agent._runtime_message_id = runtime_message_id
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
@@ -219,6 +221,7 @@ def build_turn_context(
     agent._codex_incomplete_retries = 0
     agent._thinking_prefill_retries = 0
     agent._post_tool_empty_retried = False
+    agent._runtime_deferred_tool_call_id = None
     agent._last_content_with_tools = None
     agent._last_content_tools_all_housekeeping = False
     agent._mute_post_response = False
@@ -310,6 +313,9 @@ def build_turn_context(
         current_turn_user_idx = -1
     else:
         user_msg = {"role": "user", "content": user_message}
+        if runtime_message_id:
+            user_msg["platform_message_id"] = runtime_message_id
+            user_msg["message_id"] = runtime_message_id
         messages.append(user_msg)
         current_turn_user_idx = len(messages) - 1
         agent._persist_user_message_idx = current_turn_user_idx
@@ -336,6 +342,8 @@ def build_turn_context(
     try:
         agent._persist_session(messages, conversation_history)
     except Exception:
+        if getattr(agent, "_require_incremental_session_persistence", False):
+            raise
         logger.warning(
             "Early turn-start session persistence failed for session=%s",
             agent.session_id or "none",

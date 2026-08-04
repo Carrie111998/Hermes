@@ -37,6 +37,7 @@ def run_agent_sync(
     principal_scope: dict[str, Any] | None = None,
     agent_configurator: Any = None,
     agent_creation_overrides: dict[str, Any] | None = None,
+    runtime_message_id: str | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     from gateway.session_context import clear_session_vars, set_session_vars
 
@@ -144,11 +145,14 @@ def run_agent_sync(
         if agent_ref is not None:
             agent_ref[0] = agent
         effective_task_id = session_id or str(uuid.uuid4())
-        result = agent.run_conversation(
-            user_message=user_message,
-            conversation_history=conversation_history,
-            task_id=effective_task_id,
-        )
+        conversation_kwargs = {
+            "user_message": user_message,
+            "conversation_history": conversation_history,
+            "task_id": effective_task_id,
+        }
+        if isinstance(runtime_message_id, str) and runtime_message_id.strip():
+            conversation_kwargs["runtime_message_id"] = runtime_message_id
+        result = agent.run_conversation(**conversation_kwargs)
         usage = {
             "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
             "output_tokens": getattr(agent, "session_completion_tokens", 0) or 0,

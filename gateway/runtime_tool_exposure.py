@@ -118,7 +118,7 @@ class RuntimeToolExposure:
             self.activated_names.update(names & self.deferred_names)
 
     def snapshot_activated_names(self) -> list[str]:
-        """Return a stable checkpoint projection of loaded deferred Tools."""
+        """Return a stable list of loaded deferred Tools."""
         with self._lock:
             return sorted(self.activated_names & self.deferred_names)
 

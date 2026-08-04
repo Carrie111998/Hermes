@@ -42,13 +42,10 @@ from gateway.runtime_contract import runtime_error_envelope
 from agent.tool_dispatch_helpers import DeferredToolResult
 from gateway.runtime_session_history import (
     RuntimeSessionStateError as _RuntimeSessionStateError,
-    SESSION_DB_HISTORY_MODE as _SESSION_DB_HISTORY_MODE,
-    _inject_runtime_attachment_context,
     load_runtime_session_history as _load_runtime_session_history,
-    merge_runtime_session_history as _merge_runtime_session_history,
-    resume_runtime_history as _resume_runtime_history,
     resume_session_db_history as _resume_session_db_history,
     runtime_history_tool_names as _runtime_history_tool_names,
+    seed_runtime_session as _seed_runtime_session,
 )
 
 logger = logging.getLogger(__name__)
@@ -659,6 +656,36 @@ def _public_runtime_attachment_parts(parts: list[dict[str, Any]]) -> list[dict[s
     ]
 
 
+def _project_runtime_resume_attachments(
+    history: list[dict[str, Any]],
+    attachment_parts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add resume media to a transient tool-message projection only."""
+    if not attachment_parts:
+        return history
+    if not history or history[-1].get("role") != "tool":
+        raise _RuntimeSessionStateError(
+            "runtime_history_conflict",
+            "resume attachments require a durable tool result",
+            status=409,
+        )
+    projected = list(history)
+    tail = dict(projected[-1])
+    content = tail.get("content")
+    if isinstance(content, list):
+        base_parts = list(content)
+    elif content is None:
+        base_parts = []
+    else:
+        base_parts = [{"type": "text", "text": str(content)}]
+    tail["content"] = [
+        *base_parts,
+        *_public_runtime_attachment_parts(attachment_parts),
+    ]
+    projected[-1] = tail
+    return projected
+
+
 def _native_image_tool_definition() -> dict[str, Any]:
     # Runtime visual research is Hermes-owned: the Orchestrator supplies
     # run-scoped media authority, while Hermes owns model/provider execution.
@@ -715,18 +742,19 @@ def _tool_schemas(definitions: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _replacement_system_prompt(system_context: Any) -> str:
     if not isinstance(system_context, dict):
         raise ValueError("trusted system_context is required")
+    if set(system_context) != {"version", "mode", "digest", "stable"}:
+        raise ValueError("system_context contains unsupported fields")
     version = str(system_context.get("version") or "").strip()
     mode = str(system_context.get("mode") or "").strip()
     digest = str(system_context.get("digest") or "").strip()
     stable = str(system_context.get("stable") or "").strip()
-    turn = str(system_context.get("turn") or "").strip()
     if not version or mode != "replace" or not digest or not stable:
         raise ValueError("trusted replacement system_context is required")
-    value = f"{version}\n{mode}\n{stable}\n{turn}"
+    value = f"{version}\n{mode}\n{stable}"
     expected = "sha256:" + hashlib.sha256(value.encode("utf-8")).hexdigest()
     if digest != expected:
         raise ValueError("system_context digest mismatch")
-    return stable + ("\n\n" + turn if turn else "")
+    return stable
 
 
 def _run_state_prompt(run_state: Any) -> str:
@@ -748,16 +776,287 @@ def _run_state_prompt(run_state: Any) -> str:
     )
 
 
-def _runtime_checkpoint_activated_tool_names(checkpoint: Any) -> set[str]:
-    if not isinstance(checkpoint, dict):
-        raise ValueError("runtime_checkpoint must be an object")
-    raw_names = checkpoint.get("activated_tool_names", [])
-    if not isinstance(raw_names, list) or any(
-        not isinstance(name, str) or not name.strip()
-        for name in raw_names
-    ):
-        raise ValueError("runtime_checkpoint.activated_tool_names must contain Tool names")
-    return {name.strip() for name in raw_names}
+_RUNTIME_MESSAGE_ROLES = frozenset({"user", "assistant", "tool"})
+_RUNTIME_MESSAGE_MAX_CHARS = 4 << 20
+_RUNTIME_ACTIVITY_MAX_ITEMS = 128
+_RUNTIME_REFERENCE_MAX_ROLES = 32
+_RUNTIME_REFERENCE_MAX_IDS_PER_ROLE = 64
+_RUNTIME_ARTIFACT_MANIFEST_MAX_ITEMS = 32
+_RUNTIME_ARTIFACT_FIELDS = frozenset({
+    "tool_call_id",
+    "asset_id",
+    "media_type",
+    "role",
+    "request_index",
+    "output_index",
+    "source_run_id",
+    "event_seq",
+    "created_at",
+})
+_RUNTIME_ARTIFACT_REQUIRED_FIELDS = frozenset({
+    "tool_call_id",
+    "asset_id",
+    "media_type",
+    "role",
+    "source_run_id",
+    "event_seq",
+    "created_at",
+})
+_RUNTIME_ARTIFACT_RFC3339 = re.compile(
+    r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+    r"(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})"
+)
+
+
+def _validate_runtime_content(content: Any, role: str, index: int) -> Any:
+    if content is None:
+        if role != "assistant":
+            raise ValueError(f"messages[{index}].content is invalid")
+        return None
+    if isinstance(content, str):
+        if len(content) > _RUNTIME_MESSAGE_MAX_CHARS:
+            raise ValueError(f"messages[{index}].content is too large")
+        return content
+    if not isinstance(content, list) or len(content) > 64:
+        raise ValueError(f"messages[{index}].content is invalid")
+    normalized: list[dict[str, Any]] = []
+    for part_index, part in enumerate(content):
+        if not isinstance(part, dict):
+            raise ValueError(f"messages[{index}].content[{part_index}] is invalid")
+        part_type = str(part.get("type") or "").strip()
+        if part_type == "text":
+            text = part.get("text")
+            if not isinstance(text, str) or len(text) > _RUNTIME_MESSAGE_MAX_CHARS:
+                raise ValueError(f"messages[{index}].content[{part_index}] text is invalid")
+            normalized.append({"type": "text", "text": text})
+        elif part_type in {"image_url", "input_image"}:
+            image = part.get("image_url") or part.get("image")
+            if not isinstance(image, dict) or not isinstance(image.get("url"), str):
+                raise ValueError(f"messages[{index}].content[{part_index}] image is invalid")
+            normalized.append({part_type: dict(image), "type": part_type})
+        else:
+            raise ValueError(f"messages[{index}].content[{part_index}] type is invalid")
+    if role == "user" and not normalized:
+        raise ValueError(f"messages[{index}].content is empty")
+    return normalized
+
+
+def _normalize_runtime_messages(messages: Any) -> list[dict[str, Any]]:
+    if not isinstance(messages, list):
+        raise ValueError("messages must be an array")
+    normalized: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for index, item in enumerate(messages):
+        if not isinstance(item, dict):
+            raise ValueError(f"messages[{index}] must be an object")
+        wire_id = item.get("id")
+        if not isinstance(wire_id, str) or not wire_id.strip():
+            raise ValueError(f"messages[{index}].id must be a non-empty string")
+        wire_id = wire_id.strip()
+        if len(wire_id) > 512 or wire_id in seen_ids:
+            raise ValueError(f"messages[{index}].id must be unique and bounded")
+        role = item.get("role")
+        if not isinstance(role, str) or role not in _RUNTIME_MESSAGE_ROLES:
+            raise ValueError(f"messages[{index}].role is invalid")
+        if "content" not in item:
+            raise ValueError(f"messages[{index}].content is required")
+        seen_ids.add(wire_id)
+        message = {
+            "message_id": wire_id,
+            "platform_message_id": wire_id,
+            "role": role,
+            "content": _validate_runtime_content(item.get("content"), role, index),
+        }
+        if "tool_calls" in item:
+            calls = item.get("tool_calls")
+            if not isinstance(calls, list) or not calls:
+                raise ValueError(f"messages[{index}].tool_calls is invalid")
+            normalized_calls: list[dict[str, Any]] = []
+            call_ids: set[str] = set()
+            for call_index, call in enumerate(calls):
+                if not isinstance(call, dict):
+                    raise ValueError(f"messages[{index}].tool_calls[{call_index}] is invalid")
+                call_id = call.get("id")
+                function = call.get("function")
+                if (
+                    not isinstance(call_id, str)
+                    or not call_id.strip()
+                    or call_id in call_ids
+                    or not isinstance(function, dict)
+                    or not isinstance(function.get("name"), str)
+                    or not function["name"].strip()
+                    or not isinstance(function.get("arguments"), (str, dict, list))
+                ):
+                    raise ValueError(f"messages[{index}].tool_calls[{call_index}] is invalid")
+                call_id = call_id.strip()
+                call_ids.add(call_id)
+                arguments = function["arguments"]
+                if not isinstance(arguments, str):
+                    arguments = json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+                normalized_calls.append({
+                    "id": call_id,
+                    "type": str(call.get("type") or "function"),
+                    "function": {
+                        "name": function["name"].strip(),
+                        "arguments": arguments,
+                    },
+                })
+            message["tool_calls"] = normalized_calls
+        for field_name in (
+            "tool_call_id",
+            "tool_name",
+            "finish_reason",
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+            "codex_message_items",
+            "timestamp",
+        ):
+            if field_name in item:
+                message[field_name] = item[field_name]
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise ValueError(f"messages[{index}].tool_call_id is required for tool messages")
+        if role == "assistant" and message.get("content") is None and "tool_calls" not in message:
+            raise ValueError(f"messages[{index}] assistant content is required without tool_calls")
+        normalized.append(message)
+    return normalized
+
+
+def _runtime_verified_activity_prompt(
+    runtime_context: Any,
+    messages: list[dict[str, Any]],
+) -> str:
+    if runtime_context is None:
+        return ""
+    if not isinstance(runtime_context, dict) or set(runtime_context) != {"verified_activities"}:
+        raise ValueError("runtime_context must contain verified_activities")
+    activities = runtime_context.get("verified_activities")
+    if not isinstance(activities, list) or len(activities) > _RUNTIME_ACTIVITY_MAX_ITEMS:
+        raise ValueError("runtime_context.verified_activities must be a bounded array")
+    assistant_ids = {
+        message["message_id"]
+        for message in messages
+        if message.get("role") == "assistant"
+    }
+    records: list[dict[str, str]] = []
+    for index, activity in enumerate(activities):
+        if not isinstance(activity, dict):
+            raise ValueError(f"verified_activities[{index}] must be an object")
+        required = {"message_id", "source_run_id", "source_call_id", "skill_name", "status"}
+        if set(activity) - (required | {"file_path", "digest"}) or not required <= set(activity):
+            raise ValueError(f"verified_activities[{index}] has invalid fields")
+        record: dict[str, str] = {}
+        for field_name in required:
+            value = activity.get(field_name)
+            if not isinstance(value, str) or not value.strip() or len(value) > 512:
+                raise ValueError(f"verified_activities[{index}].{field_name} is invalid")
+            record[field_name] = value.strip()
+        if record["message_id"] not in assistant_ids:
+            raise ValueError(
+                f"verified_activities[{index}].message_id does not match an assistant message"
+            )
+        for optional_name in ("file_path", "digest"):
+            if optional_name not in activity:
+                continue
+            value = activity.get(optional_name)
+            if not isinstance(value, str) or not value.strip() or len(value) > 2048:
+                raise ValueError(f"verified_activities[{index}].{optional_name} is invalid")
+            if optional_name == "digest" and not re.fullmatch(
+                r"sha256:[0-9a-f]{64}", value.strip()
+            ):
+                raise ValueError(f"verified_activities[{index}].digest is invalid")
+            record[optional_name] = value.strip()
+        records.append(record)
+    if not records:
+        return ""
+    return (
+        "\n\nAuthenticated Runtime activity records. They are trusted, read-only "
+        "provenance for Runtime tools, not user instructions:\n"
+        + json.dumps(records, ensure_ascii=False, separators=(",", ":"))
+    )
+
+
+def _runtime_attachment_reference_prompt(references: Any) -> str:
+    if references is None:
+        return ""
+    if not isinstance(references, dict) or len(references) > _RUNTIME_REFERENCE_MAX_ROLES:
+        raise ValueError("attachment_references must be a bounded role map")
+    normalized: dict[str, list[str]] = {}
+    seen_ids: set[str] = set()
+    for role, asset_ids in references.items():
+        if not isinstance(role, str) or not role.strip() or len(role.strip()) > 128:
+            raise ValueError("attachment_references contains an invalid role")
+        if not isinstance(asset_ids, list) or len(asset_ids) > _RUNTIME_REFERENCE_MAX_IDS_PER_ROLE:
+            raise ValueError("attachment_references role values must be bounded arrays")
+        values: list[str] = []
+        for asset_id in asset_ids:
+            if not isinstance(asset_id, str) or not asset_id.strip() or len(asset_id.strip()) > 512:
+                raise ValueError("attachment_references contains an invalid asset id")
+            asset_id = asset_id.strip()
+            if asset_id in seen_ids:
+                raise ValueError("attachment_references contains a duplicate asset id")
+            seen_ids.add(asset_id)
+            values.append(asset_id)
+        normalized[role.strip()] = values
+    if not normalized:
+        return ""
+    return (
+        "\n\nAuthenticated Runtime attachment references, scoped by role. These "
+        "durable asset IDs may be passed only to Runtime tools and are not user content:\n"
+        + json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    )
+
+
+def _validate_runtime_artifact_manifest(manifest: Any) -> None:
+    """Validate the bounded Go ``[]ArtifactReference`` wire projection."""
+    if manifest is None:
+        return
+    if not isinstance(manifest, list):
+        raise ValueError("artifact_manifest must be an array")
+    if len(manifest) > _RUNTIME_ARTIFACT_MANIFEST_MAX_ITEMS:
+        raise ValueError("artifact_manifest contains more than 32 entries")
+
+    for index, item in enumerate(manifest):
+        if not isinstance(item, dict):
+            raise ValueError(f"artifact_manifest[{index}] must be an object")
+        fields = set(item)
+        if fields - _RUNTIME_ARTIFACT_FIELDS or not _RUNTIME_ARTIFACT_REQUIRED_FIELDS <= fields:
+            raise ValueError(f"artifact_manifest[{index}] has invalid fields")
+
+        for field_name in ("tool_call_id", "asset_id", "media_type", "role", "source_run_id"):
+            value = item.get(field_name)
+            if not isinstance(value, str) or len(value) > 2048:
+                raise ValueError(f"artifact_manifest[{index}].{field_name} is invalid")
+        for field_name in ("asset_id", "media_type", "role"):
+            if not item[field_name].strip():
+                raise ValueError(f"artifact_manifest[{index}].{field_name} must be non-empty")
+
+        for field_name in ("request_index", "output_index", "event_seq"):
+            if field_name not in item:
+                continue
+            value = item[field_name]
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(
+                    f"artifact_manifest[{index}].{field_name} must be a non-negative integer"
+                )
+
+        created_at = item.get("created_at")
+        if (
+            not isinstance(created_at, str)
+            or _RUNTIME_ARTIFACT_RFC3339.fullmatch(created_at) is None
+        ):
+            raise ValueError(f"artifact_manifest[{index}].created_at must be RFC3339")
+        try:
+            parsed_created_at = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError(
+                f"artifact_manifest[{index}].created_at must be RFC3339"
+            ) from exc
+        if parsed_created_at.tzinfo is None:
+            raise ValueError(f"artifact_manifest[{index}].created_at must be RFC3339")
 
 
 def _runtime_tool_middleware(**kwargs: Any) -> Any:
@@ -885,6 +1184,7 @@ class RuntimeBridgeSession:
         definitions: list[dict[str, Any]],
         deadline_ms: int,
         agent_session_id: str,
+        session_db: Any = None,
         tool_exposure: RuntimeToolExposure | None = None,
         allowed_skill_names: set[str] | None = None,
         allowed_skill_projections: dict[str, RuntimeSkillProjection] | None = None,
@@ -895,6 +1195,7 @@ class RuntimeBridgeSession:
         self.agent_session_id = agent_session_id
         self.loop = loop
         self.queue = queue
+        self.session_db = session_db
         self.definitions = {str(item["name"]): dict(item) for item in definitions}
         self.tool_names = set(self.definitions)
         self.tool_exposure = tool_exposure or build_runtime_tool_exposure(
@@ -1043,70 +1344,41 @@ class RuntimeBridgeSession:
                 payload["arguments"] = {"digest": digest}
         self.emit("activity_completed", payload)
 
-    def _checkpoint_message(
-        self,
-        call_id: str,
-        model_tool_name: str,
-        canonical_name: str,
-        canonical_args: dict[str, Any],
-    ) -> dict[str, Any]:
-        agent = self.agent_ref[0]
-        candidate = getattr(agent, "_runtime_checkpoint_message", None)
-        if not isinstance(candidate, dict):
-            db = getattr(agent, "_session_db", None)
-            loader = getattr(db, "get_messages_as_conversation", None)
-            history = loader(self.agent_session_id) if callable(loader) else []
-            candidate = next(
-                (
-                    message
-                    for message in reversed(history)
-                    if isinstance(message, dict)
-                    and message.get("role") == "assistant"
-                    and isinstance(message.get("tool_calls"), list)
-                    and any(
-                        isinstance(call, dict) and str(call.get("id") or "") == call_id
-                        for call in message["tool_calls"]
-                    )
-                ),
-                None,
+    def _assert_active_tool_call_persisted(self, call_id: str, tool_name: str) -> None:
+        """Require the authoritative assistant tool call before any request."""
+        loader = getattr(self.session_db, "get_messages_as_conversation", None)
+        if not callable(loader):
+            raise _RuntimeSessionStateError(
+                "runtime_session_unavailable",
+                "SessionDB cannot load the active Runtime history",
             )
-        calls = candidate.get("tool_calls") if isinstance(candidate, dict) else None
-        active_calls = [
-            call
-            for call in calls or []
-            if isinstance(call, dict) and str(call.get("id") or "") == call_id
-        ]
-        if len(active_calls) != 1:
-            raise ValueError("runtime checkpoint must contain the active platform tool call")
-        # One model turn may contain a local skill_view call beside a delegated
-        # platform call. Only the active
-        # platform call belongs in the restart checkpoint: local activity is
-        # already complete and is not a resumable side effect.
-        candidate = {**candidate, "tool_calls": active_calls}
-        # Checkpoints cross the Runtime boundary and are persisted by the
-        # Orchestrator. Plaintext model reasoning is not part of the resumable
-        # tool-call contract and may contain private Skill instructions that
-        # were legitimately used to form safe tool arguments. Keep only the
-        # empty reasoning_content sentinel expected by thinking-mode replay;
-        # agent_runtime_helpers will retain or strip it for the active provider.
-        candidate.pop("reasoning", None)
-        if "reasoning_content" in candidate:
-            candidate["reasoning_content"] = " "
-        checkpoint = _resume_runtime_history(
-            [],
-            {"message": candidate},
-            [{"tool_call_id": call_id, "status": "succeeded", "output": {}}],
-        )[0]
-        function = checkpoint["tool_calls"][0].get("function") or {}
-        if str(function.get("name") or "") != model_tool_name:
-            raise ValueError("runtime checkpoint tool name does not match active call")
-        function["name"] = canonical_name
-        function["arguments"] = json.dumps(
-            canonical_args,
-            ensure_ascii=False,
-            separators=(",", ":"),
+        try:
+            try:
+                history = loader(self.agent_session_id, include_ancestors=True)
+            except TypeError:
+                history = loader(self.agent_session_id)
+        except Exception as exc:
+            raise _RuntimeSessionStateError(
+                "runtime_session_unavailable",
+                "failed to load the active Runtime history",
+            ) from exc
+        for message in history if isinstance(history, list) else []:
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            for call in message.get("tool_calls") or []:
+                function = call.get("function") if isinstance(call, dict) else None
+                if (
+                    isinstance(call, dict)
+                    and str(call.get("id") or "") == call_id
+                    and isinstance(function, dict)
+                    and str(function.get("name") or "") == tool_name
+                ):
+                    return
+        raise _RuntimeSessionStateError(
+            "runtime_history_conflict",
+            "active Runtime tool call is not persisted in SessionDB",
+            status=409,
         )
-        return checkpoint
 
     def invoke_platform_tool(
         self,
@@ -1133,19 +1405,14 @@ class RuntimeBridgeSession:
                 },
             }, ensure_ascii=False, separators=(",", ":"))
         try:
-            checkpoint = self._checkpoint_message(
-                call_id,
-                name,
-                name,
-                args,
-            )
-        except ValueError as exc:
+            self._assert_active_tool_call_persisted(call_id, name)
+        except _RuntimeSessionStateError as exc:
             message = str(exc)
-            self.emit("error", {"code": "runtime_checkpoint_invalid", "message": message})
+            self.emit("error", {"code": exc.code, "message": message})
             self.interrupt(message)
             return json.dumps({
                 "error": {
-                    "code": "runtime_checkpoint_invalid",
+                    "code": exc.code,
                     "message": message,
                     "retryable": False,
                 },
@@ -1156,10 +1423,6 @@ class RuntimeBridgeSession:
                 return json.dumps({"error": {"code": "idempotency_conflict", "message": "duplicate active tool call id"}})
             self.pending[call_id] = pending
         payload: dict[str, Any] = {"call_id": call_id, "name": name, "arguments": args}
-        self.emit("checkpoint", {
-            "message": checkpoint,
-            "activated_tool_names": self.tool_exposure.snapshot_activated_names(),
-        })
         self.emit("tool_request", payload)
         wait_timeout = (
             self.deadline_seconds
@@ -1240,8 +1503,9 @@ class RuntimeBridgeSession:
         self.interrupt_reason = reason
         self.interrupted.set()
         agent = self.agent_ref[0]
-        if agent is not None:
-            agent.interrupt(reason)
+        interrupt = getattr(agent, "interrupt", None) if agent is not None else None
+        if callable(interrupt):
+            interrupt(reason)
         with self.lock:
             for pending in self.pending.values():
                 pending.ready.set()
@@ -1302,6 +1566,28 @@ class APIServerRuntimeMixin:
         media_temp_dir: tempfile.TemporaryDirectory[str] | None = None
         try:
             body = await request.json()
+            if not isinstance(body, dict):
+                raise ValueError("request body must be an object")
+            supported_fields = {
+                "intent",
+                "run_id",
+                "model",
+                "messages",
+                "system_context",
+                "tools",
+                "tool_results",
+                "context",
+                "runtime_context",
+                "artifact_manifest",
+                "attachment_references",
+                "attachments",
+                "skill_manifest",
+                "run_state",
+                "deadline_ms",
+                "llm_egress",
+            }
+            if set(body) - supported_fields:
+                raise ValueError("request contains unsupported fields")
             llm_egress = _runtime_llm_egress(
                 body.get("llm_egress"),
                 required=os.environ.get(
@@ -1309,31 +1595,52 @@ class APIServerRuntimeMixin:
                 ).strip().lower()
                 in {"1", "true", "yes", "on"},
             )
+            intent = body.get("intent")
+            if not isinstance(intent, str) or intent not in {"bootstrap", "new_turn", "resume"}:
+                raise ValueError("intent must be bootstrap, new_turn, or resume")
             run_id = str(body.get("run_id") or "").strip()
+            requested_model = str(body.get("model") or "").strip()
+            if not requested_model:
+                raise ValueError("model is required")
             messages = body.get("messages")
             system_context = body.get("system_context")
-            definitions = body.get("tools") or []
-            tool_results = body.get("tool_results") or []
-            runtime_checkpoint = body.get("runtime_checkpoint")
-            context = body.get("context") if isinstance(body.get("context"), dict) else {}
-            history_mode = str(context.get("history_mode") or "").strip()
-            if history_mode not in {"", _SESSION_DB_HISTORY_MODE}:
-                raise ValueError("context.history_mode must be session_db when provided")
-            session_db_mode = history_mode == _SESSION_DB_HISTORY_MODE
-            if not run_id or not isinstance(messages, list) or not messages:
-                raise ValueError("run_id and messages are required")
+            definitions = body.get("tools", [])
+            tool_results = body.get("tool_results", [])
+            context = body.get("context")
+            if not isinstance(context, dict) or set(context) != {"session_id"}:
+                raise ValueError("context must contain only session_id")
+            requested_agent_session_id = str(context.get("session_id") or "").strip()
+            if not run_id or not requested_agent_session_id:
+                raise ValueError("run_id and context.session_id are required")
+            if not isinstance(definitions, list) or not isinstance(tool_results, list):
+                raise ValueError("tools and tool_results must be arrays")
+            raw_deadline_ms = body.get("deadline_ms", 0)
+            if isinstance(raw_deadline_ms, bool):
+                raise ValueError("deadline_ms must be a non-negative integer")
+            try:
+                deadline_ms = int(raw_deadline_ms or 0)
+            except (TypeError, ValueError) as exc:
+                raise ValueError("deadline_ms must be a non-negative integer") from exc
+            if deadline_ms < 0:
+                raise ValueError("deadline_ms must be a non-negative integer")
+            if intent == "resume":
+                if messages != []:
+                    raise ValueError("resume messages must be exactly empty")
+            elif not isinstance(messages, list) or not messages:
+                raise ValueError("bootstrap and new_turn require messages")
+            normalized_messages = _normalize_runtime_messages(messages)
+            if intent == "bootstrap" and normalized_messages[-1]["role"] != "user":
+                raise ValueError("bootstrap messages must end with a user message")
+            if intent == "new_turn":
+                if len(normalized_messages) != 1 or normalized_messages[0]["role"] != "user":
+                    raise ValueError("new_turn accepts exactly one user message")
+            if intent != "resume" and tool_results:
+                raise ValueError("tool_results are only accepted for resume")
+            _validate_runtime_artifact_manifest(body.get("artifact_manifest"))
             # Expose the run id to the audit middleware: its completion line
             # is logged after this handler returns, so the audit trail can
             # correlate the access log with the run it served.
             request["hermes_run_id"] = run_id
-            if session_db_mode:
-                resuming = bool(tool_results)
-                if runtime_checkpoint is not None and not tool_results:
-                    raise ValueError("tool_results are required when a runtime_checkpoint is provided")
-            else:
-                resuming = bool(tool_results or runtime_checkpoint)
-                if resuming and (not tool_results or runtime_checkpoint is None):
-                    raise ValueError("runtime_checkpoint and tool_results are both required for resume")
             skill_manifest = (
                 body["skill_manifest"]
                 if "skill_manifest" in body
@@ -1348,16 +1655,16 @@ class APIServerRuntimeMixin:
                 _replacement_system_prompt(system_context)
                 + _allowed_skills_prompt(allowed_skill_names)
                 + _run_state_prompt(body.get("run_state"))
+                + _runtime_verified_activity_prompt(
+                    body.get("runtime_context"),
+                    normalized_messages,
+                )
+                + _runtime_attachment_reference_prompt(
+                    body.get("attachment_references"),
+                )
             )
             schemas = _tool_schemas(definitions)
             tool_exposure = build_runtime_tool_exposure(definitions, schemas)
-            normalized_messages = [
-                {"role": str(item.get("role") or ""), "content": _message_text(item.get("content"))}
-                for item in messages
-                if isinstance(item, dict)
-            ]
-            if len(normalized_messages) != len(messages):
-                raise ValueError("messages must contain only objects")
             attachments = body.get("attachments")
             has_image_attachment = any(
                 isinstance(item, dict) and item.get("media_type") == "image"
@@ -1376,98 +1683,75 @@ class APIServerRuntimeMixin:
             )
             runtime_image_paths = _runtime_image_paths(attachment_parts)
             runtime_video_paths = _runtime_video_paths(attachment_parts)
-            if attachment_parts and not (session_db_mode and resuming):
-                last_user_index = next(
-                    (
-                        index
-                        for index in range(len(normalized_messages) - 1, -1, -1)
-                        if normalized_messages[index].get("role") == "user"
-                    ),
-                    -1,
-                )
-                if last_user_index < 0:
+            if attachment_parts and intent != "resume":
+                last_user_index = len(normalized_messages) - 1
+                if normalized_messages[last_user_index].get("role") != "user":
                     raise ValueError("attachments require a user message")
                 text = _message_text(normalized_messages[last_user_index].get("content"))
                 normalized_messages[last_user_index]["content"] = [
                     {"type": "text", "text": text or "[Attached media]"},
                     *_public_runtime_attachment_parts(attachment_parts),
                 ]
-            requested_agent_session_id = str(context.get("session_id") or run_id).strip()
-            agent_session_id = requested_agent_session_id
-            if session_db_mode:
+            db, agent_session_id, session_history = _load_runtime_session_history(
+                self,
+                requested_agent_session_id,
+                require_existing=intent != "bootstrap",
+            )
+            if intent == "bootstrap":
+                if db.get_session(requested_agent_session_id) is not None:
+                    raise _RuntimeSessionStateError(
+                        "runtime_session_conflict",
+                        "Runtime SessionDB session already exists",
+                        status=409,
+                    )
+                _seed_runtime_session(
+                    db,
+                    requested_agent_session_id,
+                    model=requested_model,
+                    system_prompt=instructions,
+                    messages=normalized_messages[:-1],
+                )
                 db, agent_session_id, session_history = _load_runtime_session_history(
                     self,
                     requested_agent_session_id,
-                    require_existing=resuming,
+                    require_existing=True,
                 )
-                if resuming:
-                    history = _merge_runtime_session_history(
-                        normalized_messages,
-                        session_history,
+            elif intent == "new_turn":
+                current_id = normalized_messages[0]["message_id"]
+                history_ids = {
+                    str(message.get("message_id") or message.get("platform_message_id") or "")
+                    for message in session_history
+                    if isinstance(message, dict)
+                }
+                if current_id in history_ids or (
+                    callable(getattr(db, "has_platform_message_id", None))
+                    and db.has_platform_message_id(agent_session_id, current_id)
+                ):
+                    raise _RuntimeSessionStateError(
+                        "runtime_message_id_conflict",
+                        "Runtime message id already exists in SessionDB",
+                        status=409,
                     )
-                    history = _resume_session_db_history(
-                        db,
-                        agent_session_id,
-                        history,
-                        tool_results,
-                    )
-                    history = _inject_runtime_attachment_context(
-                        history,
-                        attachment_parts,
-                    )
-                    activated_tool_names = _runtime_history_tool_names(history)
-                    if runtime_checkpoint is not None:
-                        activated_tool_names.update(
-                            _runtime_checkpoint_activated_tool_names(
-                                runtime_checkpoint,
-                            ),
-                        )
-                        checkpoint_message = runtime_checkpoint.get("message")
-                        checkpoint_calls = (
-                            checkpoint_message.get("tool_calls")
-                            if isinstance(checkpoint_message, dict)
-                            else []
-                        )
-                        activated_tool_names.update({
-                            str((call.get("function") or {}).get("name") or "")
-                            for call in checkpoint_calls or []
-                            if isinstance(call, dict)
-                        })
-                    tool_exposure.activate_names(activated_tool_names)
-                    user_message = ""
-                else:
-                    last = normalized_messages[-1]
-                    if last.get("role") != "user":
-                        raise ValueError("last message must be user")
-                    history = _merge_runtime_session_history(
-                        normalized_messages[:-1],
-                        session_history,
-                    )
-                    user_message = last.get("content")
-            elif resuming:
-                history = _resume_runtime_history(normalized_messages, runtime_checkpoint, tool_results)
-                activated_tool_names = _runtime_checkpoint_activated_tool_names(
-                    runtime_checkpoint,
-                )
-                checkpoint_message = runtime_checkpoint.get("message")
-                checkpoint_calls = (
-                    checkpoint_message.get("tool_calls")
-                    if isinstance(checkpoint_message, dict)
-                    else []
-                )
-                activated_tool_names.update({
-                    str((call.get("function") or {}).get("name") or "")
-                    for call in checkpoint_calls or []
-                    if isinstance(call, dict)
-                })
-                tool_exposure.activate_names(activated_tool_names)
-                user_message = ""
             else:
-                history = normalized_messages[:-1]
-                last = normalized_messages[-1]
-                if last.get("role") != "user":
-                    raise ValueError("last message must be user")
-                user_message = last.get("content")
+                session_history = _resume_session_db_history(
+                    db,
+                    agent_session_id,
+                    session_history,
+                    tool_results,
+                )
+                session_history = _project_runtime_resume_attachments(
+                    session_history,
+                    attachment_parts,
+                )
+            history = session_history
+            tool_exposure.activate_names(_runtime_history_tool_names(history))
+            if intent == "resume":
+                user_message = ""
+                runtime_user_message_id = None
+            else:
+                current = normalized_messages[-1]
+                user_message = current["content"]
+                runtime_user_message_id = current["message_id"]
         except _RuntimeSessionStateError as exc:
             if media_temp_dir is not None:
                 media_temp_dir.cleanup()
@@ -1491,8 +1775,9 @@ class APIServerRuntimeMixin:
             asyncio.get_running_loop(),
             queue,
             definitions,
-            int(body.get("deadline_ms") or 0),
+            deadline_ms,
             agent_session_id,
+            db,
             tool_exposure=tool_exposure,
             allowed_skill_names=allowed_skill_names,
             allowed_skill_projections=allowed_skill_projections,
@@ -1535,13 +1820,16 @@ class APIServerRuntimeMixin:
             ):
                 native.append(_native_video_tool_definition())
             session.bind_agent(agent, native)
+            agent._session_db = db
+            agent._session_db_created = True
+            agent.session_id = agent_session_id
             _configure_run_llm_egress(agent, llm_egress, body.get("model"))
             _pin_run_model(agent, body.get("model"))
             agent.ephemeral_system_prompt = None
             agent._cached_system_prompt = instructions
             agent._build_system_prompt = lambda _system_message=None: instructions
-            agent._resume_from_tool_results = resuming
-            agent._require_incremental_session_persistence = session_db_mode
+            agent._resume_from_tool_results = intent == "resume"
+            agent._require_incremental_session_persistence = True
             # The Orchestrator already validated and materialized these image
             # assets. Its model catalog can lag newly deployed multimodal
             # aliases, so do not replace trusted pixels with an auxiliary
@@ -1596,6 +1884,7 @@ class APIServerRuntimeMixin:
                 conversation_history=history,
                 ephemeral_system_prompt=None,
                 session_id=agent_session_id,
+                runtime_message_id=runtime_user_message_id,
                 stream_delta_callback=lambda delta: session.emit("text_delta", {"delta": delta}) if delta else None,
                 tool_start_callback=on_tool_start,
                 tool_complete_callback=on_tool_complete,

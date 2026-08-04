@@ -31,6 +31,12 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from agent.tool_dispatch_helpers import DeferredToolResult, make_tool_result_message
+from agent.turn_finalizer import finalize_turn
+from gateway.runtime_session_history import (
+    RuntimeSessionStateError,
+    resume_session_db_history,
+)
+from hermes_state import SessionDB
 from run_agent import AIAgent
 
 
@@ -187,6 +193,42 @@ def test_required_session_db_append_error_is_not_swallowed():
     assert agent._runtime_persistence_failed is True
 
 
+def test_runtime_wire_message_id_round_trips_through_real_agent_flush(tmp_path):
+    agent = _make_agent()
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "thread_wire_id"
+    db.create_session(session_id, "api_server", model="test/model")
+    agent.session_id = session_id
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._require_incremental_session_persistence = True
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="done",
+        finish_reason="stop",
+    )
+
+    try:
+        with (
+            patch.object(agent, "_save_session_log"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "current Runtime turn",
+                runtime_message_id="wire-user-001",
+            )
+
+        assert result["final_response"] == "done"
+        persisted = db.get_messages_as_conversation(session_id)
+        user_messages = [message for message in persisted if message["role"] == "user"]
+        assert len(user_messages) == 1
+        assert user_messages[0]["content"] == "current Runtime turn"
+        assert user_messages[0]["message_id"] == "wire-user-001"
+        assert db.has_platform_message_id(session_id, "wire-user-001") is True
+    finally:
+        db.close()
+
+
 # ---------------------------------------------------------------------------
 # Contract 2: the SEQUENTIAL path flushes each tool result immediately, BEFORE
 # the next tool dispatches.  Dispatch goes through run_agent.handle_function_call
@@ -293,6 +335,149 @@ def test_deferred_runtime_call_closes_unexecuted_sibling_tool_calls():
     assert messages[0]["tool_call_id"] == "call_skipped"
     assert "runtime_tool_call_deferred" in messages[0]["content"]
     agent._flush_messages_to_session_db.assert_called_once()
+
+
+def test_runtime_park_tail_reopens_and_resumes_real_result_exactly_once(tmp_path):
+    agent = _make_agent()
+    db_path = tmp_path / "state.db"
+    session_id = "thread_runtime_park"
+    db = SessionDB(db_path=db_path)
+    db.create_session(session_id, "api_server", model="test/model")
+    agent.session_id = session_id
+    agent._session_db = db
+    agent._session_db_created = True
+    agent._require_incremental_session_persistence = True
+
+    tool_calls = [
+        _mock_tool_call(name="media.generate_image", call_id="call_park"),
+        _mock_tool_call(name="media.generate_video", call_id="call_sibling"),
+    ]
+    assistant_message = SimpleNamespace(content="", tool_calls=tool_calls)
+    messages = [
+        {
+            "role": "user",
+            "content": "make both",
+            "message_id": "wire-user-park",
+        },
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": call.id,
+                    "type": "function",
+                    "function": {
+                        "name": call.function.name,
+                        "arguments": call.function.arguments,
+                    },
+                }
+                for call in tool_calls
+            ],
+        },
+    ]
+    agent._flush_messages_to_session_db(messages)
+
+    with patch(
+        "run_agent.handle_function_call",
+        return_value=DeferredToolResult("call_park"),
+    ) as dispatch:
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            session_id,
+        )
+
+    dispatch.assert_called_once()
+    assert agent._runtime_deferred_tool_call_id == "call_park"
+    assert [
+        message["tool_call_id"]
+        for message in messages
+        if message.get("role") == "tool"
+    ] == ["call_sibling"]
+    assert "runtime_tool_call_deferred" in messages[-1]["content"]
+
+    with (
+        patch.object(agent, "_save_session_log"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        finalize_turn(
+            agent,
+            final_response=None,
+            api_call_count=1,
+            interrupted=True,
+            failed=False,
+            messages=messages,
+            conversation_history=None,
+            effective_task_id=session_id,
+            turn_id="turn-park",
+            user_message="make both",
+            original_user_message="make both",
+            _should_review_memory=False,
+            _turn_exit_reason="runtime_tool_call_deferred",
+        )
+
+    assert all(
+        message.get("content") != "Operation interrupted."
+        for message in messages
+    )
+    db.close()
+
+    reopened = SessionDB(db_path=db_path)
+    history = reopened.get_messages_as_conversation(session_id)
+    assistant_calls = {
+        call["id"]
+        for message in history
+        if message["role"] == "assistant"
+        for call in message.get("tool_calls") or []
+    }
+    durable_results = [
+        message
+        for message in history
+        if message["role"] == "tool"
+    ]
+    assert assistant_calls == {"call_park", "call_sibling"}
+    assert [message["tool_call_id"] for message in durable_results] == ["call_sibling"]
+
+    real_result = {
+        "tool_call_id": "call_park",
+        "status": "succeeded",
+        "output": {"asset_id": "asset-real"},
+    }
+    resumed = resume_session_db_history(
+        reopened,
+        session_id,
+        history,
+        [real_result],
+    )
+    assert [message["tool_call_id"] for message in resumed if message["role"] == "tool"] == [
+        "call_sibling",
+        "call_park",
+    ]
+    persisted_once = reopened.get_messages_as_conversation(session_id)
+    redelivered = resume_session_db_history(
+        reopened,
+        session_id,
+        persisted_once,
+        [real_result],
+    )
+    assert redelivered == persisted_once
+    assert len(reopened.get_messages_as_conversation(session_id)) == len(persisted_once)
+
+    conflicting_result = {
+        **real_result,
+        "output": {"asset_id": "asset-conflict"},
+    }
+    with pytest.raises(RuntimeSessionStateError) as conflict:
+        resume_session_db_history(
+            reopened,
+            session_id,
+            persisted_once,
+            [conflicting_result],
+        )
+    assert conflict.value.code == "runtime_history_conflict"
+    assert len(reopened.get_messages_as_conversation(session_id)) == len(persisted_once)
+    reopened.close()
 
 
 # ---------------------------------------------------------------------------

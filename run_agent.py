@@ -1668,7 +1668,14 @@ class AIAgent:
                     # List of OpenAI-style content parts: strip images, keep text.
                     _txt = []
                     for p in content:
-                        if isinstance(p, dict) and p.get("type") == "text":
+                        if (
+                            isinstance(p, dict)
+                            and p.get("type") == "text"
+                            and not (
+                                p.get("_runtime_image_path")
+                                or p.get("_runtime_video_path")
+                            )
+                        ):
                             _txt.append(str(p.get("text", "")))
                         elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
                             _txt.append("[screenshot]")
@@ -1694,6 +1701,9 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    platform_message_id=(
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    ),
                     timestamp=msg.get("timestamp"),
                 )
                 flushed_ids.add(msg_id)
@@ -5400,6 +5410,7 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        runtime_message_id: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.conversation_loop import run_conversation
@@ -5413,6 +5424,7 @@ class AIAgent:
             persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
             moa_config=moa_config,
+            runtime_message_id=runtime_message_id,
         )
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:

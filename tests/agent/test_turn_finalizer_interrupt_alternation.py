@@ -174,6 +174,49 @@ def test_interrupt_after_tool_keeps_delivered_text_when_present():
     assert messages[-1]["content"] == "Partial answer so far"
 
 
+def test_runtime_deferred_park_does_not_append_generic_interrupt_tail():
+    agent = _StubAgent()
+    agent._runtime_deferred_tool_call_id = "call_park"
+    messages = [
+        {"role": "user", "content": "make an image and a video"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_park",
+                    "function": {
+                        "name": "media.generate_image",
+                        "arguments": "{}",
+                    },
+                },
+                {
+                    "id": "call_sibling",
+                    "function": {
+                        "name": "media.generate_video",
+                        "arguments": "{}",
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call_sibling",
+            "content": '{"error":{"code":"runtime_tool_call_deferred"}}',
+        },
+    ]
+
+    _finalize(agent, messages, interrupted=True, final_response=None)
+
+    assert messages[-1]["role"] == "tool"
+    assert messages[-1]["tool_call_id"] == "call_sibling"
+    assert all(
+        message.get("content") != "Operation interrupted."
+        for message in messages
+    )
+    assert agent.persisted_messages == messages
+
+
 def test_non_interrupted_tool_tail_is_left_untouched():
     # A turn that ends on a tool tail WITHOUT an interrupt (mid-progress
     # tool loop) must not get a synthetic close — that is normal dialog

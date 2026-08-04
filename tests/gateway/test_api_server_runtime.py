@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import logging
@@ -24,11 +25,12 @@ from gateway.api_server_runtime import (
     APIServerRuntimeMixin,
     RuntimeBridgeSession,
     _failed_tool_result_projection,
-    _merge_runtime_session_history,
+    _normalize_runtime_messages,
     _pin_run_model,
-    _resume_runtime_history,
+    _project_runtime_resume_attachments,
     _resume_session_db_history,
     _runtime_attachment_parts,
+    _runtime_attachment_reference_prompt,
     _runtime_failure_code,
     _runtime_allowed_skill_digests,
     _runtime_image_paths,
@@ -36,9 +38,13 @@ from gateway.api_server_runtime import (
     _runtime_skill_projections,
     _runtime_video_paths,
     _runtime_tool_middleware,
+    _runtime_verified_activity_prompt,
+    _validate_runtime_artifact_manifest,
 )
 from agent.tool_dispatch_helpers import DeferredToolResult
 from hermes_state import SessionDB
+from gateway.runtime_contract import RUNTIME_DRIVER_FRAME_TYPES
+from gateway.runtime_session_history import RuntimeSessionStateError, seed_runtime_session
 
 aiohttp = pytest.importorskip("aiohttp")
 from aiohttp import web
@@ -117,7 +123,75 @@ async def test_runtime_stream_emits_private_heartbeat_while_agent_is_quiet(monke
     assert await runtime_module._next_runtime_stream_event(queue) is event
 
 
-class _RuntimeAdapter(APIServerRuntimeMixin):
+class _MemorySessionDB:
+    """Small SessionDB-shaped store for runtime handler tests."""
+
+    def __init__(self):
+        self.sessions = {}
+        self.messages = {}
+
+    def create_session(self, session_id, source, **kwargs):
+        self.sessions.setdefault(session_id, {"id": session_id, "source": source, **kwargs})
+        self.messages.setdefault(session_id, [])
+        return session_id
+
+    def delete_session(self, session_id):
+        self.sessions.pop(session_id, None)
+        self.messages.pop(session_id, None)
+        return True
+
+    def get_session(self, session_id):
+        return self.sessions.get(session_id)
+
+    def resolve_resume_session_id(self, session_id):
+        return session_id
+
+    def get_messages_as_conversation(self, session_id, include_ancestors=False):
+        return copy.deepcopy(self.messages.get(session_id, []))
+
+    def has_platform_message_id(self, session_id, platform_message_id):
+        return any(
+            message.get("message_id") == platform_message_id
+            for message in self.messages.get(session_id, [])
+        )
+
+    def append_message(self, session_id, role, content=None, **fields):
+        message = {"role": role, "content": copy.deepcopy(content)}
+        message.update({key: copy.deepcopy(value) for key, value in fields.items() if value is not None})
+        if fields.get("platform_message_id"):
+            message["message_id"] = fields["platform_message_id"]
+        self.messages.setdefault(session_id, []).append(message)
+        return len(self.messages[session_id])
+
+
+class _TestRuntimeAdapter(APIServerRuntimeMixin):
+    def __init__(self):
+        self.db = _MemorySessionDB()
+
+    def _ensure_session_db(self):
+        return self.db
+
+
+def _runtime_call_db(session_id: str, *calls: tuple[str, str]) -> _MemorySessionDB:
+    db = _MemorySessionDB()
+    db.create_session(session_id, "api_server")
+    db.append_message(
+        session_id,
+        role="assistant",
+        content=None,
+        tool_calls=[
+            {
+                "id": call_id,
+                "type": "function",
+                "function": {"name": name, "arguments": "{}"},
+            }
+            for call_id, name in calls
+        ],
+    )
+    return db
+
+
+class _RuntimeAdapter(_TestRuntimeAdapter):
     def _check_auth(self, _request):
         return None
 
@@ -258,10 +332,11 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
         assert "tool_describe" not in agent.valid_tool_names
 
         delegated_args = {"operation": "image.generate", "prompt": "test"}
-        agent._runtime_checkpoint_message = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
+        self.db.append_message(
+            kwargs["session_id"],
+            role="assistant",
+            content=None,
+            tool_calls=[{
                 "id": "call_01",
                 "type": "function",
                 "function": {
@@ -269,7 +344,7 @@ class _RuntimeAdapter(APIServerRuntimeMixin):
                     "arguments": json.dumps(delegated_args),
                 },
             }],
-        }
+        )
         kwargs["tool_start_callback"]("call_01", "ultra_media_job_create", delegated_args)
         tool_result = await asyncio.to_thread(
             _runtime_tool_middleware,
@@ -544,7 +619,7 @@ def test_runtime_image_tool_allows_remote_and_scopes_local_sources(tmp_path):
 async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_content():
     captured = {}
 
-    class AttachmentAdapter(APIServerRuntimeMixin):
+    class AttachmentAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -592,20 +667,20 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
     try:
         stable = "platform rules"
         version = "attachments/v1"
-        turn = '{"attachment_asset_ids":{"user_upload":["asset_image"]}}'
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\nreplace\n{stable}\n{turn}".encode(),
+            f"{version}\nreplace\n{stable}".encode(),
         ).hexdigest()
         encoded = base64.b64encode(b"png-bytes").decode()
         response = await client.post("/v1/runtime/runs", json={
+            "intent": "bootstrap",
             "run_id": "run_attachment",
             "model": "chat-test",
-            "messages": [{"role": "user", "content": "describe it"}],
+            "context": {"session_id": "session-run-attachment"},
+            "messages": [{"id": "message-attachment", "role": "user", "content": "describe it"}],
             "system_context": {
                 "version": version,
                 "mode": "replace",
                 "stable": stable,
-                "turn": turn,
                 "digest": digest,
             },
             "attachments": [{
@@ -634,7 +709,7 @@ async def test_runtime_bridge_delivers_image_attachment_as_multimodal_user_conte
 async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_file():
     captured = {}
 
-    class VideoAttachmentAdapter(APIServerRuntimeMixin):
+    class VideoAttachmentAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -682,19 +757,19 @@ async def test_runtime_bridge_exposes_scoped_video_analysis_and_cleans_source_fi
     try:
         stable = "platform rules"
         version = "video-attachments/v1"
-        turn = '{"attachment_asset_ids":{"user_upload":["asset_video"]}}'
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\nreplace\n{stable}\n{turn}".encode(),
+            f"{version}\nreplace\n{stable}".encode(),
         ).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
+            "intent": "bootstrap",
             "run_id": "run_video_attachment",
             "model": "chat-test",
-            "messages": [{"role": "user", "content": "analyze the complete video"}],
+            "context": {"session_id": "session-run-video-attachment"},
+            "messages": [{"id": "message-video-attachment", "role": "user", "content": "analyze the complete video"}],
             "system_context": {
                 "version": version,
                 "mode": "replace",
                 "stable": stable,
-                "turn": turn,
                 "digest": digest,
             },
             "attachments": [{
@@ -743,25 +818,23 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
     try:
         version = "ultrastudio-supercomputer/v1"
         mode = "replace"
-        stable = "platform rules"
-        turn = "trusted turn context"
+        stable = "platform rules\n\ntrusted turn context"
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\n{mode}\n{stable}\n{turn}".encode("utf-8"),
+            f"{version}\n{mode}\n{stable}".encode("utf-8"),
         ).hexdigest()
         package_digest = "sha256:" + hashlib.sha256(b"complete skill bundle").hexdigest()
         root_skill_digest = "sha256:" + hashlib.sha256(b"workflow instructions").hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_test",
-            "runtime": "hermes",
+            "intent": "bootstrap",
             "model": "chat-test",
             "context": {"session_id": "panel_session_test"},
-            "messages": [{"role": "user", "content": "make an image"}],
+            "messages": [{"id": "message-run-test", "role": "user", "content": "make an image"}],
             "system_context": {
                 "version": version,
                 "mode": mode,
                 "digest": digest,
                 "stable": stable,
-                "turn": turn,
             },
             "skill_manifest": {
                 "resolution_id": "resolution-test",
@@ -876,13 +949,6 @@ async def test_runtime_driver_streams_tool_request_and_waits_for_result(monkeypa
                 "status": "completed",
             },
         }
-        checkpoint = json.loads(await response.content.readline())
-        assert checkpoint["type"] == "checkpoint"
-        assert checkpoint["payload"]["message"]["tool_calls"][0]["id"] == "call_01"
-        assert (
-            checkpoint["payload"]["message"]["tool_calls"][0]["function"]["name"]
-            == "ultra_media_job_create"
-        )
         tool_request = json.loads(await response.content.readline())
         assert tool_request["type"] == "tool_request"
         assert tool_request["payload"] == {
@@ -1032,58 +1098,87 @@ def test_bound_skill_view_rejects_traversal_and_binary_files(monkeypatch):
         session_loop.close()
 
 
-def test_resume_history_continues_from_tool_result_without_synthetic_user():
-    history = _resume_runtime_history(
-        [{"role": "user", "content": "make an image"}],
-        {
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_media",
-                    "type": "function",
-                    "function": {
-                        "name": "media.generate_image",
-                        "arguments": '{"requests":[{"model":"image-model","prompt":"cat"}]}',
-                    },
-                }],
-            },
-        },
-        [{
-            "tool_call_id": "call_media",
-            "status": "succeeded",
-            "output": {"batch_status": "succeeded", "jobs": [{"job_id": "job_1"}]},
-        }],
+def test_runtime_resume_projects_and_persists_result_without_synthetic_user():
+    db = _MemorySessionDB()
+    db.create_session("thread_resume", "api_server")
+    db.append_message(
+        "thread_resume",
+        role="user",
+        content="make an image",
+        platform_message_id="user-1",
     )
-    assert [message["role"] for message in history] == ["user", "assistant", "tool"]
-    assert history[-1]["tool_call_id"] == "call_media"
-    assert json.loads(history[-1]["content"])["batch_status"] == "succeeded"
-    assert sum(message["role"] == "user" for message in history) == 1
-
-
-def test_resume_history_rejects_checkpoint_with_multiple_platform_calls():
-    checkpoint = {
-        "message": {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {"id": "call_1", "function": {"name": "one", "arguments": "{}"}},
-                {"id": "call_2", "function": {"name": "two", "arguments": "{}"}},
-            ],
-        },
+    db.append_message(
+        "thread_resume",
+        role="assistant",
+        content=None,
+        tool_calls=[{
+            "id": "call_media",
+            "type": "function",
+            "function": {
+                "name": "media.generate_image",
+                "arguments": '{"requests":[{"model":"image-model","prompt":"cat"}]}',
+            },
+        }],
+        platform_message_id="assistant-1",
+    )
+    history = db.get_messages_as_conversation("thread_resume")
+    result = {
+        "tool_call_id": "call_media",
+        "status": "succeeded",
+        "output": {"batch_status": "succeeded", "jobs": [{"job_id": "job_1"}]},
     }
-    with pytest.raises(ValueError, match="exactly one platform tool call"):
-        _resume_runtime_history(
-            [{"role": "user", "content": "go"}],
-            checkpoint,
+    resumed = _resume_session_db_history(db, "thread_resume", history, [result])
+    assert [message["role"] for message in resumed] == ["user", "assistant", "tool"]
+    assert resumed[-1]["tool_call_id"] == "call_media"
+    assert json.loads(resumed[-1]["content"])["batch_status"] == "succeeded"
+    assert sum(message["role"] == "user" for message in resumed) == 1
+
+
+def test_runtime_resume_rejects_more_than_one_unfinished_tool_call():
+    db = _MemorySessionDB()
+    db.create_session("thread_resume_conflict", "api_server")
+    db.append_message(
+        "thread_resume_conflict",
+        role="assistant",
+        content=None,
+        tool_calls=[
+            {"id": "call_1", "function": {"name": "one", "arguments": "{}"}},
+            {"id": "call_2", "function": {"name": "two", "arguments": "{}"}},
+        ],
+    )
+    with pytest.raises(RuntimeSessionStateError, match="more than one unfinished"):
+        _resume_session_db_history(
+            db,
+            "thread_resume_conflict",
+            db.get_messages_as_conversation("thread_resume_conflict"),
             [{"tool_call_id": "call_1", "status": "succeeded", "output": {}}],
         )
 
 
 @pytest.mark.asyncio
 async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
-    class ResumeAdapter(APIServerRuntimeMixin):
+    class ResumeAdapter(_TestRuntimeAdapter):
         _api_key = ""
+
+        def __init__(self):
+            super().__init__()
+            self.db.create_session("thread_session", "api_server")
+            self.db.append_message(
+                "thread_session",
+                role="user",
+                content="make an image",
+                platform_message_id="user-resume",
+            )
+            self.db.append_message(
+                "thread_session",
+                role="assistant",
+                content=None,
+                tool_calls=[{
+                    "id": "call_media",
+                    "function": {"name": "media.generate_image", "arguments": "{}"},
+                }],
+                platform_message_id="assistant-resume",
+            )
 
         def _check_auth(self, _request):
             return None
@@ -1093,7 +1188,10 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
             kwargs["agent_configurator"](agent)
             assert agent._resume_from_tool_results is True
             assert "media.generate_image" in agent.valid_tool_names
-            assert "platform.prompt_enhance" in agent.valid_tool_names
+            # Resume activation comes only from authoritative SessionDB tool
+            # calls. This deferred tool remains discoverable via tool_search,
+            # but no persisted call proves it was previously loaded or used.
+            assert "platform.prompt_enhance" not in agent.valid_tool_names
             assert "platform.internal_reconcile" not in agent.valid_tool_names
             assert "tool_search" in agent.valid_tool_names
             assert kwargs["user_message"] == ""
@@ -1111,33 +1209,19 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
         stable = "platform rules"
         version = "resume/v1"
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\nreplace\n{stable}\n".encode(),
+            f"{version}\nreplace\n{stable}".encode(),
         ).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
+            "intent": "resume",
             "run_id": "run_resume",
             "model": "chat-test",
-            "messages": [{"role": "user", "content": "make an image"}],
+            "context": {"session_id": "thread_session"},
+            "messages": [],
             "system_context": {
                 "version": version,
                 "mode": "replace",
                 "stable": stable,
-                "turn": "",
                 "digest": digest,
-            },
-            "runtime_checkpoint": {
-                "activated_tool_names": [
-                    "media.generate_image",
-                    "platform.prompt_enhance",
-                    "platform.internal_reconcile",
-                ],
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": "call_media",
-                        "function": {"name": "media.generate_image", "arguments": "{}"},
-                    }],
-                },
             },
             "tool_results": [{
                 "tool_call_id": "call_media",
@@ -1167,61 +1251,6 @@ async def test_runtime_resume_wiring_reaches_agent_without_new_user_message():
         assert events[-1]["payload"]["text"] == "image complete"
     finally:
         await client.close()
-
-
-@pytest.mark.asyncio
-async def test_runtime_checkpoint_preserves_all_activated_deferred_tools():
-    queue = asyncio.Queue()
-    definitions = [{
-        "name": name,
-        "description": name,
-        "input_schema": {"type": "object", "properties": {}},
-        "exposure": "deferred",
-    } for name in ("media.generate_image", "platform.prompt_enhance")]
-    session = RuntimeBridgeSession(
-        "run_checkpoint_tools",
-        asyncio.get_running_loop(),
-        queue,
-        definitions,
-        10_000,
-        "agent_checkpoint_tools",
-    )
-    for query in ("media.generate_image", "platform.prompt_enhance"):
-        result = json.loads(session.search_and_activate_tools({"query": query}))
-        assert result["loaded_tools"] == [query]
-    session.agent_ref[0] = SimpleNamespace(
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_image",
-                "function": {
-                    "name": "media.generate_image",
-                    "arguments": "{}",
-                },
-            }],
-        },
-    )
-
-    call = asyncio.create_task(asyncio.to_thread(
-        session.invoke_platform_tool,
-        "media.generate_image",
-        {},
-        "call_image",
-    ))
-    checkpoint = await queue.get()
-    assert checkpoint["type"] == "checkpoint"
-    assert checkpoint["payload"]["activated_tool_names"] == [
-        "media.generate_image",
-        "platform.prompt_enhance",
-    ]
-    assert (await queue.get())["type"] == "tool_request"
-    assert session.submit_result({
-        "call_id": "call_image",
-        "ok": True,
-        "result": {"batch_status": "succeeded"},
-    })
-    assert json.loads(await call) == {"batch_status": "succeeded"}
 
 
 @pytest.mark.asyncio
@@ -1255,22 +1284,20 @@ async def test_runtime_driver_reports_skill_failure_without_result_content():
         version = "ultrastudio-supercomputer/v1"
         mode = "replace"
         stable = "platform rules"
-        turn = ""
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\n{mode}\n{stable}\n{turn}".encode("utf-8"),
+            f"{version}\n{mode}\n{stable}".encode("utf-8"),
         ).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
             "run_id": "run_failed_skill",
-            "runtime": "hermes",
+            "intent": "bootstrap",
             "model": "chat-test",
             "context": {"session_id": "panel_session_failed_skill"},
-            "messages": [{"role": "user", "content": "load a missing skill"}],
+            "messages": [{"id": "message-failed-skill", "role": "user", "content": "load a missing skill"}],
             "system_context": {
                 "version": version,
                 "mode": mode,
                 "digest": digest,
                 "stable": stable,
-                "turn": turn,
             },
         })
         events = [json.loads(line) async for line in response.content]
@@ -1302,18 +1329,11 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
         [{"name": "ultra_prompt_compile", "input_schema": {"type": "object"}}],
         10_000,
         "agent_guard",
+        _runtime_call_db("agent_guard", ("call_first", "ultra_prompt_compile")),
     )
     decisions = []
     session.agent_ref[0] = SimpleNamespace(
         _set_tool_guardrail_halt=decisions.append,
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_first",
-                "function": {"name": "ultra_prompt_compile", "arguments": "{}"},
-            }],
-        },
     )
     args = {"capability": "media.video.generate", "spec": {"intent": "ad"}}
     first = asyncio.create_task(asyncio.to_thread(
@@ -1322,8 +1342,6 @@ async def test_runtime_bridge_blocks_unchanged_non_retryable_tool_retry():
         args,
         "call_first",
     ))
-    checkpoint = await queue.get()
-    assert checkpoint["type"] == "checkpoint"
     request = await queue.get()
     assert request["type"] == "tool_request"
     assert session.submit_result({
@@ -1364,30 +1382,23 @@ async def test_runtime_bridge_allows_one_corrected_argument_attempt_then_halts()
         [{"name": "ask_user_question", "input_schema": {"type": "object"}}],
         10_000,
         "agent_correction",
+        _runtime_call_db(
+            "agent_correction",
+            ("call_invalid", "ask_user_question"),
+            ("call_still_invalid", "ask_user_question"),
+        ),
     )
     decisions = []
     agent = SimpleNamespace(_set_tool_guardrail_halt=decisions.append)
     session.agent_ref[0] = agent
 
     async def invoke(call_id, args, result):
-        agent._runtime_checkpoint_message = {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": call_id,
-                "function": {
-                    "name": "ask_user_question",
-                    "arguments": json.dumps(args),
-                },
-            }],
-        }
         pending = asyncio.create_task(asyncio.to_thread(
             session.invoke_platform_tool,
             "ask_user_question",
             args,
             call_id,
         ))
-        assert (await queue.get())["type"] == "checkpoint"
         assert (await queue.get())["type"] == "tool_request"
         assert session.submit_result({"call_id": call_id, **result})
         return json.loads(await pending)
@@ -1425,108 +1436,33 @@ async def test_runtime_bridge_allows_one_corrected_argument_attempt_then_halts()
 
 
 @pytest.mark.asyncio
-async def test_runtime_checkpoint_filters_local_activity_sibling_call():
+async def test_runtime_bridge_requires_persisted_tool_call_before_emitting_request():
     queue = asyncio.Queue()
+    db = _MemorySessionDB()
+    db.create_session("agent_unpersisted", "api_server")
+    interrupted = []
     session = RuntimeBridgeSession(
-        "run_checkpoint_filter",
+        "run_unpersisted",
         asyncio.get_running_loop(),
         queue,
         [{"name": "platform.prompt_compile", "input_schema": {"type": "object"}}],
         10_000,
-        "agent_checkpoint_filter",
+        "agent_unpersisted",
+        db,
     )
-    session.agent_ref[0] = SimpleNamespace(
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [
-                {
-                    "id": "call_skill",
-                    "function": {"name": "skill_view", "arguments": '{"name":"media-qa"}'},
-                },
-                {
-                    "id": "call_compile",
-                    "function": {"name": "platform.prompt_compile", "arguments": "{}"},
-                },
-            ],
-        },
-    )
-    call = asyncio.create_task(asyncio.to_thread(
+    session.agent_ref[0] = SimpleNamespace(interrupt=interrupted.append)
+    result = json.loads(await asyncio.to_thread(
         session.invoke_platform_tool,
         "platform.prompt_compile",
         {},
-        "call_compile",
+        "call_not_persisted",
     ))
-    checkpoint = await queue.get()
-    assert checkpoint["type"] == "checkpoint"
-    assert [item["id"] for item in checkpoint["payload"]["message"]["tool_calls"]] == ["call_compile"]
-    assert (await queue.get())["type"] == "tool_request"
-    assert session.submit_result({"call_id": "call_compile", "ok": True, "result": {"compiled": {}}})
-    assert json.loads(await call) == {"compiled": {}}
-
-
-@pytest.mark.asyncio
-async def test_runtime_checkpoint_redacts_private_skill_reasoning_without_blocking_safe_tool():
-    queue = asyncio.Queue()
-    session = RuntimeBridgeSession(
-        "run_private_reasoning_checkpoint",
-        asyncio.get_running_loop(),
-        queue,
-        [{
-            "name": "media.model_catalog",
-            "input_schema": {"type": "object"},
-            "allowed_skills": ["product-photoshoot"],
-        }],
-        10_000,
-        "agent_private_reasoning_checkpoint",
-    )
-    private_body = (
-        "Inspect every supplied reference before composing the shot. Preserve "
-        "exact packaging geometry, material finish, label hierarchy, and brand "
-        "colors. Verify every output against the private acceptance checklist."
-    )
-    safe_args = {
-        "action": "recommend",
-        "query": "lifestyle product photography from a reference image",
-        "media_type": "image",
-    }
-    session.agent_ref[0] = SimpleNamespace(
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "reasoning": f"Apply the loaded workflow: {private_body}",
-            "reasoning_content": f"Apply the loaded workflow: {private_body}",
-            "tool_calls": [{
-                "id": "call_catalog",
-                "function": {
-                    "name": "media.model_catalog",
-                    "arguments": json.dumps(safe_args),
-                },
-            }],
-        },
-    )
-
-    call = asyncio.create_task(asyncio.to_thread(
-        session.invoke_platform_tool,
-        "media.model_catalog",
-        safe_args,
-        "call_catalog",
-    ))
-    checkpoint = await queue.get()
-    assert checkpoint["type"] == "checkpoint"
-    checkpoint_message = checkpoint["payload"]["message"]
-    assert "reasoning" not in checkpoint_message
-    assert checkpoint_message["reasoning_content"] == " "
-    assert private_body not in json.dumps(checkpoint, ensure_ascii=False)
-    request = await queue.get()
-    assert request["type"] == "tool_request"
-    assert request["payload"]["arguments"] == safe_args
-    assert session.submit_result({
-        "call_id": "call_catalog",
-        "ok": True,
-        "result": {"models": []},
-    })
-    assert json.loads(await call) == {"models": []}
+    event = await queue.get()
+    assert event["type"] == "error"
+    assert event["payload"]["code"] == "runtime_history_conflict"
+    assert result["error"]["code"] == "runtime_history_conflict"
+    assert session.pending == {}
+    assert interrupted
 
 
 @pytest.mark.asyncio
@@ -1539,24 +1475,15 @@ async def test_runtime_bridge_preserves_safe_failed_result_with_typed_error():
         [{"name": "platform.prompt_compile", "input_schema": {"type": "object"}}],
         10_000,
         "agent_failed_projection",
+        _runtime_call_db("agent_failed_projection", ("call_failed_projection", "platform.prompt_compile")),
     )
-    session.agent_ref[0] = SimpleNamespace(
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_failed_projection",
-                "function": {"name": "platform.prompt_compile", "arguments": "{}"},
-            }],
-        },
-    )
+    session.agent_ref[0] = SimpleNamespace()
     call = asyncio.create_task(asyncio.to_thread(
         session.invoke_platform_tool,
         "platform.prompt_compile",
         {},
         "call_failed_projection",
     ))
-    assert (await queue.get())["type"] == "checkpoint"
     assert (await queue.get())["type"] == "tool_request"
     assert session.submit_result({
         "call_id": "call_failed_projection",
@@ -1653,26 +1580,16 @@ async def test_runtime_bridge_preserves_terminal_platform_error_code():
         [{"name": "ultra_quota_snapshot", "input_schema": {"type": "object"}}],
         10_000,
         "agent_terminal",
+        _runtime_call_db("agent_terminal", ("call_terminal", "ultra_quota_snapshot")),
     )
     decisions = []
-    session.agent_ref[0] = SimpleNamespace(
-        _set_tool_guardrail_halt=decisions.append,
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_terminal",
-                "function": {"name": "ultra_quota_snapshot", "arguments": "{}"},
-            }],
-        },
-    )
+    session.agent_ref[0] = SimpleNamespace(_set_tool_guardrail_halt=decisions.append)
     call = asyncio.create_task(asyncio.to_thread(
         session.invoke_platform_tool,
         "ultra_quota_snapshot",
         {},
         "call_terminal",
     ))
-    assert (await queue.get())["type"] == "checkpoint"
     assert (await queue.get())["type"] == "tool_request"
     assert session.submit_result({
         "call_id": "call_terminal",
@@ -1710,10 +1627,10 @@ async def test_runtime_driver_rejects_non_replacement_or_tampered_prompt():
     try:
         body = {
             "run_id": "run_bad_prompt",
-            "runtime": "hermes",
+            "intent": "bootstrap",
             "model": "chat-test",
             "context": {"session_id": "panel_session_bad"},
-            "messages": [{"role": "user", "content": "hello"}],
+            "messages": [{"id": "message-bad-prompt", "role": "user", "content": "hello"}],
             "system_context": {
                 "version": "ultrastudio-supercomputer/v1",
                 "mode": "append",
@@ -1739,22 +1656,393 @@ def _run_body(run_id: str, **extra):
     stable = "platform rules"
     version = "bridge-test/v1"
     digest = "sha256:" + hashlib.sha256(
-        f"{version}\nreplace\n{stable}\n".encode("utf-8"),
+        f"{version}\nreplace\n{stable}".encode("utf-8"),
     ).hexdigest()
     body = {
+        "intent": "bootstrap",
         "run_id": run_id,
         "model": "chat-test",
-        "messages": [{"role": "user", "content": "go"}],
+        "context": {"session_id": f"session-{run_id}"},
+        "messages": [{"id": f"message-{run_id}", "role": "user", "content": "go"}],
         "system_context": {
             "version": version,
             "mode": "replace",
             "stable": stable,
-            "turn": "",
             "digest": digest,
         },
     }
     body.update(extra)
+    if isinstance(body.get("messages"), list):
+        body["messages"] = [
+            {
+                **message,
+                "id": message.get("id") or f"message-{run_id}-{index}",
+            }
+            for index, message in enumerate(body["messages"])
+        ]
+    if body.get("intent") == "resume":
+        body["messages"] = []
     return body
+
+
+def _complete_test_run(adapter, body):
+    async def _run():
+        app = web.Application()
+        app.router.add_post("/v1/runtime/runs", adapter._handle_runtime_run)
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            response = await client.post("/v1/runtime/runs", json=body)
+            status = response.status
+            if response.content_type == "application/x-ndjson":
+                payload = [json.loads(line) async for line in response.content]
+            else:
+                payload = await response.json()
+            return status, payload
+        finally:
+            await client.close()
+
+    return _run
+
+
+def test_runtime_message_validation_requires_stable_unique_ids_and_valid_roles():
+    with pytest.raises(ValueError, match="id must be a non-empty"):
+        _normalize_runtime_messages([{"id": "", "role": "user", "content": "go"}])
+    with pytest.raises(ValueError, match="unique"):
+        _normalize_runtime_messages([
+            {"id": "same", "role": "user", "content": "one"},
+            {"id": "same", "role": "assistant", "content": "two"},
+        ])
+    with pytest.raises(ValueError, match="role is invalid"):
+        _normalize_runtime_messages([{"id": "m1", "role": "system", "content": "no"}])
+    with pytest.raises(ValueError, match="tool_call_id is required"):
+        _normalize_runtime_messages([{"id": "m1", "role": "tool", "content": "result"}])
+
+
+def test_runtime_typed_context_is_authenticated_and_never_message_content():
+    messages = [{"message_id": "assistant-1", "role": "assistant", "content": "done"}]
+    activity_prompt = _runtime_verified_activity_prompt({
+        "verified_activities": [{
+            "message_id": "assistant-1",
+            "source_run_id": "source-run",
+            "source_call_id": "source-call",
+            "skill_name": "media-qa",
+            "status": "completed",
+            "file_path": "/orchestrator/reference.md",
+            "digest": "sha256:" + "a" * 64,
+        }],
+    }, messages)
+    reference_prompt = _runtime_attachment_reference_prompt({
+        "generated_output": ["asset-output-1"],
+        "user_upload": ["asset-upload-1"],
+    })
+    assert "assistant-1" in activity_prompt
+    assert "asset-output-1" in reference_prompt
+    assert all("source-run" not in message.get("content", "") for message in messages)
+    with pytest.raises(ValueError, match="does not match an assistant"):
+        _runtime_verified_activity_prompt({
+            "verified_activities": [{
+                "message_id": "forged",
+                "source_run_id": "source-run",
+                "source_call_id": "source-call",
+                "skill_name": "media-qa",
+                "status": "completed",
+            }],
+        }, messages)
+
+
+def test_runtime_contract_removes_legacy_runtime_checkpoint_surface():
+    assert "checkpoint" not in RUNTIME_DRIVER_FRAME_TYPES
+    production = "\n".join(
+        Path(path).read_text()
+        for path in (
+            runtime_module.__file__,
+            str(Path(runtime_module.__file__).with_name("runtime_session_history.py")),
+        )
+    )
+    for forbidden in (
+        "runtime_checkpoint",
+        "resume_runtime_history",
+        "merge_runtime_session_history",
+        "_anchor_content",
+        "runtime_generated_media_context",
+    ):
+        assert forbidden not in production
+
+
+@pytest.mark.asyncio
+async def test_runtime_bootstrap_seeds_stable_ids_and_rejects_existing_session():
+    class CaptureAdapter(_TestRuntimeAdapter):
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            self.captured = kwargs
+            agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
+            kwargs["agent_configurator"](agent)
+            return {"final_response": "done"}, {}
+
+    adapter = CaptureAdapter()
+    status, events = await _complete_test_run(adapter, _run_body(
+        "run_bootstrap_ids",
+        context={"session_id": "thread_bootstrap_ids"},
+        messages=[
+            {"id": "public-1", "role": "user", "content": "old"},
+            {"id": "current-1", "role": "user", "content": "new"},
+        ],
+    ))()
+    assert status == 200
+    assert events[-1]["type"] == "completed"
+    assert [message["message_id"] for message in adapter.db.messages["thread_bootstrap_ids"]] == [
+        "public-1",
+    ]
+    assert adapter.captured["conversation_history"][0]["message_id"] == "public-1"
+    assert adapter.captured["runtime_message_id"] == "current-1"
+
+    adapter.db.create_session("thread_bootstrap_conflict", "api_server")
+    status, payload = await _complete_test_run(
+        adapter,
+        _run_body(
+            "run_bootstrap_conflict",
+            context={"session_id": "thread_bootstrap_conflict"},
+        ),
+    )()
+    assert status == 409
+    assert payload["error"]["code"] == "runtime_session_conflict"
+
+
+@pytest.mark.asyncio
+async def test_runtime_new_turn_uses_only_current_id_and_rejects_missing_or_duplicate():
+    class CaptureAdapter(_TestRuntimeAdapter):
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            self.captured = kwargs
+            agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
+            kwargs["agent_configurator"](agent)
+            return {"final_response": "done"}, {}
+
+    adapter = CaptureAdapter()
+    adapter.db.create_session("thread_new_turn", "api_server")
+    adapter.db.append_message(
+        "thread_new_turn",
+        role="user",
+        content="old",
+        platform_message_id="old-id",
+    )
+    status, events = await _complete_test_run(adapter, _run_body(
+        "run_new_turn",
+        intent="new_turn",
+        context={"session_id": "thread_new_turn"},
+        messages=[{"id": "new-id", "role": "user", "content": "new"}],
+    ))()
+    assert status == 200
+    assert events[-1]["type"] == "completed"
+    assert [message["message_id"] for message in adapter.captured["conversation_history"]] == ["old-id"]
+    assert adapter.captured["runtime_message_id"] == "new-id"
+
+    status, payload = await _complete_test_run(
+        adapter,
+        _run_body(
+            "run_new_turn_missing",
+            intent="new_turn",
+            context={"session_id": "missing-thread"},
+            messages=[{"id": "new-id", "role": "user", "content": "new"}],
+        ),
+    )()
+    assert status == 409
+    assert payload["error"]["code"] == "runtime_session_not_found"
+
+    status, payload = await _complete_test_run(
+        adapter,
+        _run_body(
+            "run_new_turn_duplicate",
+            intent="new_turn",
+            context={"session_id": "thread_new_turn"},
+            messages=[{"id": "old-id", "role": "user", "content": "changed content"}],
+        ),
+    )()
+    assert status == 409
+    assert payload["error"]["code"] == "runtime_message_id_conflict"
+
+
+@pytest.mark.asyncio
+async def test_runtime_handler_accepts_bounded_artifact_manifest_without_message_projection():
+    class ManifestAdapter(_TestRuntimeAdapter):
+        def _check_auth(self, _request):
+            return None
+
+        async def _run_agent_bridge(self, **kwargs):
+            agent = SimpleNamespace(tools=[], valid_tool_names=set(), model="configured-model")
+            kwargs["agent_configurator"](agent)
+            projected = json.dumps({
+                "user_message": kwargs["user_message"],
+                "history": kwargs["conversation_history"],
+                "system": agent._cached_system_prompt,
+            })
+            assert "artifact-private-1" not in projected
+            return {"final_response": "done"}, {}
+
+    adapter = ManifestAdapter()
+    status, events = await _complete_test_run(adapter, _run_body(
+        "run_artifact_manifest",
+        artifact_manifest=[{
+            "tool_call_id": "call-private-1",
+            "asset_id": "artifact-private-1",
+            "media_type": "image",
+            "role": "output",
+            "request_index": 1,
+            "output_index": 2,
+            "source_run_id": "source-run-1",
+            "event_seq": 17,
+            "created_at": "2026-08-04T09:10:11.123456789Z",
+        }],
+    ))()
+    assert status == 200
+    assert events[-1]["type"] == "completed"
+
+    status, payload = await _complete_test_run(
+        adapter,
+        _run_body(
+            "run_artifact_manifest_invalid",
+            context={"session_id": "thread-artifact-invalid"},
+            artifact_manifest=[{
+                "tool_call_id": "call-invalid",
+                "asset_id": "asset-invalid",
+                "media_type": "image",
+                "role": "output",
+                "source_run_id": "source-run",
+                "event_seq": 1,
+                "created_at": "2026-08-04T09:10:11Z",
+                "unexpected": True,
+            }],
+        ),
+    )()
+    assert status == 422
+    assert payload["error"]["code"] == "invalid_param"
+
+    status, payload = await _complete_test_run(
+        adapter,
+        _run_body(
+            "run_artifact_manifest_unbounded",
+            context={"session_id": "thread-artifact-unbounded"},
+            artifact_manifest=[{
+                "tool_call_id": f"call-{index}",
+                "asset_id": f"asset-{index}",
+                "media_type": "image",
+                "role": "output",
+                "source_run_id": "source-run",
+                "event_seq": index,
+                "created_at": "2026-08-04T09:10:11Z",
+            } for index in range(33)],
+        ),
+    )()
+    assert status == 422
+    assert "more than 32 entries" in payload["error"]["message"]
+
+
+def test_artifact_manifest_validator_is_bounded_and_typed():
+    go_serialized = [{
+        "tool_call_id": "call-1",
+        "asset_id": "asset-1",
+        "media_type": "image",
+        "role": "output",
+        "request_index": 3,
+        "output_index": 1,
+        "source_run_id": "run-source-1",
+        "event_seq": 42,
+        "created_at": "2026-08-04T09:10:11.123456789Z",
+    }]
+    _validate_runtime_artifact_manifest(go_serialized)
+    without_omitempty_indexes = dict(go_serialized[0])
+    without_omitempty_indexes.pop("request_index")
+    without_omitempty_indexes.pop("output_index")
+    _validate_runtime_artifact_manifest([without_omitempty_indexes])
+    _validate_runtime_artifact_manifest([])
+    _validate_runtime_artifact_manifest(None)
+
+    with pytest.raises(ValueError, match="must be an array"):
+        _validate_runtime_artifact_manifest({})
+    with pytest.raises(ValueError, match="invalid fields"):
+        _validate_runtime_artifact_manifest([{**go_serialized[0], "url": "private"}])
+    with pytest.raises(ValueError, match="asset_id must be non-empty"):
+        _validate_runtime_artifact_manifest([{**go_serialized[0], "asset_id": ""}])
+    with pytest.raises(ValueError, match="media_type is invalid"):
+        _validate_runtime_artifact_manifest([{**go_serialized[0], "media_type": 7}])
+    with pytest.raises(ValueError, match="event_seq must be a non-negative integer"):
+        _validate_runtime_artifact_manifest([{**go_serialized[0], "event_seq": True}])
+    with pytest.raises(ValueError, match="output_index must be a non-negative integer"):
+        _validate_runtime_artifact_manifest([{**go_serialized[0], "output_index": -1}])
+    with pytest.raises(ValueError, match="created_at must be RFC3339"):
+        _validate_runtime_artifact_manifest([{
+            **go_serialized[0],
+            "created_at": "2026-08-04 09:10:11",
+        }])
+    with pytest.raises(ValueError, match="more than 32 entries"):
+        _validate_runtime_artifact_manifest(go_serialized * 33)
+
+
+def test_resume_attachment_projection_strips_private_runtime_metadata():
+    durable_history = [{
+        "role": "tool",
+        "tool_call_id": "call-media",
+        "content": '{"asset_id":"asset-1"}',
+    }]
+    private_parts = [
+        {
+            "type": "text",
+            "text": "[Attached image: output.png; image_url=/tmp/output.png. Keep it scoped.]",
+            "_runtime_image_path": "/tmp/output.png",
+        },
+        {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,cGl4ZWxz"},
+        },
+    ]
+
+    projected = _project_runtime_resume_attachments(durable_history, private_parts)
+
+    assert projected is not durable_history
+    assert durable_history[-1]["content"] == '{"asset_id":"asset-1"}'
+    assert isinstance(projected[-1]["content"], list)
+    assert all(
+        not any(str(key).startswith("_runtime_") for key in part)
+        for part in projected[-1]["content"]
+        if isinstance(part, dict)
+    )
+
+
+def test_seed_runtime_session_reports_seed_and_cleanup_failures():
+    class FailingSeedDB:
+        def create_session(self, **_kwargs):
+            return None
+
+        def append_message(self, **_kwargs):
+            raise OSError("seed write failed")
+
+        def delete_session(self, _session_id):
+            raise OSError("cleanup delete failed")
+
+    with pytest.raises(RuntimeSessionStateError) as failure:
+        seed_runtime_session(
+            FailingSeedDB(),
+            "thread-seed-failure",
+            model="test-model",
+            system_prompt="system",
+            messages=[{
+                "message_id": "wire-1",
+                "role": "user",
+                "content": "hello",
+            }],
+        )
+
+    cause = failure.value.__cause__
+    assert isinstance(cause, ExceptionGroup)
+    assert [str(error) for error in cause.exceptions] == [
+        "seed write failed",
+        "cleanup delete failed",
+    ]
 
 
 @pytest.mark.asyncio
@@ -1762,7 +2050,7 @@ async def test_runtime_run_over_limit_returns_retryable_429(monkeypatch):
     monkeypatch.setenv("HERMES_RUNTIME_MAX_CONCURRENT", "1")
     release = asyncio.Event()
 
-    class BlockingAdapter(APIServerRuntimeMixin):
+    class BlockingAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -1812,7 +2100,7 @@ async def test_runtime_interrupt_waits_without_thread_pool(monkeypatch):
 
     monkeypatch.setattr(asyncio, "to_thread", _forbidden)
 
-    class InterruptAdapter(APIServerRuntimeMixin):
+    class InterruptAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -1854,7 +2142,7 @@ async def test_runtime_interrupt_waits_without_thread_pool(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_client_disconnect_interrupts_run_and_clears_session():
-    class DisconnectAdapter(APIServerRuntimeMixin):
+    class DisconnectAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -1904,53 +2192,37 @@ async def test_client_disconnect_interrupts_run_and_clears_session():
 
 
 def test_resume_history_projects_externalized_output_ref():
-    history = _resume_runtime_history(
-        [{"role": "user", "content": "make an image"}],
-        {
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_ext",
-                    "type": "function",
-                    "function": {"name": "media.generate_image", "arguments": "{}"},
-                }],
-            },
-        },
+    db = _runtime_call_db("thread_ext", ("call_ext", "media.generate_image"))
+    history = _resume_session_db_history(
+        db,
+        "thread_ext",
+        db.get_messages_as_conversation("thread_ext"),
         [{
             "tool_call_id": "call_ext",
             "status": "succeeded",
-            "output_ref": {"asset_id": "asset_01", "kind": "media_batch"},
+            "output_ref": "asset://image/01",
         }],
     )
     assert json.loads(history[-1]["content"]) == {
         "status": "externalized",
-        "output_ref": {"asset_id": "asset_01", "kind": "media_batch"},
+        "output_ref": "asset://image/01",
     }
 
 
-def test_resume_history_prefers_inline_output_over_output_ref():
-    history = _resume_runtime_history(
-        [{"role": "user", "content": "make an image"}],
-        {
-            "message": {
-                "role": "assistant",
-                "content": None,
-                "tool_calls": [{
-                    "id": "call_inline",
-                    "type": "function",
-                    "function": {"name": "media.generate_image", "arguments": "{}"},
-                }],
-            },
-        },
-        [{
-            "tool_call_id": "call_inline",
-            "status": "succeeded",
-            "output": {"url": "asset://image/1"},
-            "output_ref": {"asset_id": "asset_01"},
-        }],
-    )
-    assert json.loads(history[-1]["content"]) == {"url": "asset://image/1"}
+def test_resume_history_rejects_ambiguous_output_fields():
+    db = _runtime_call_db("thread_inline", ("call_inline", "media.generate_image"))
+    with pytest.raises(ValueError, match="exactly one output field"):
+        _resume_session_db_history(
+            db,
+            "thread_inline",
+            db.get_messages_as_conversation("thread_inline"),
+            [{
+                "tool_call_id": "call_inline",
+                "status": "succeeded",
+                "output": {"url": "asset://image/1"},
+                "output_ref": "asset://image/01",
+            }],
+        )
 
 
 @pytest.mark.asyncio
@@ -1965,18 +2237,9 @@ async def test_unbounded_deadline_tool_wait_is_capped(monkeypatch):
         [{"name": "ultra_media_job_create", "input_schema": {"type": "object"}}],
         0,
         "agent_cap",
+        _runtime_call_db("agent_cap", ("call_cap", "ultra_media_job_create")),
     )
-    session.agent_ref[0] = SimpleNamespace(
-        interrupt=lambda reason: None,
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_cap",
-                "function": {"name": "ultra_media_job_create", "arguments": "{}"},
-            }],
-        },
-    )
+    session.agent_ref[0] = SimpleNamespace(interrupt=lambda reason: None)
     assert session.deadline_seconds is None
     result = json.loads(await asyncio.to_thread(
         session.invoke_platform_tool,
@@ -1998,25 +2261,15 @@ async def test_interrupt_wakeup_reports_run_interrupted_not_deadline():
         [{"name": "ultra_media_job_create", "input_schema": {"type": "object"}}],
         10_000,
         "agent_intr_attr",
+        _runtime_call_db("agent_intr_attr", ("call_intr", "ultra_media_job_create")),
     )
-    session.agent_ref[0] = SimpleNamespace(
-        interrupt=lambda reason: None,
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_intr",
-                "function": {"name": "ultra_media_job_create", "arguments": "{}"},
-            }],
-        },
-    )
+    session.agent_ref[0] = SimpleNamespace(interrupt=lambda reason: None)
     call = asyncio.create_task(asyncio.to_thread(
         session.invoke_platform_tool,
         "ultra_media_job_create",
         {},
         "call_intr",
     ))
-    assert (await queue.get())["type"] == "checkpoint"
     assert (await queue.get())["type"] == "tool_request"
     session.interrupt("orchestrator stream disconnected")
     result = json.loads(await call)
@@ -2034,25 +2287,15 @@ async def test_park_interrupt_defers_tool_result_without_synthetic_error():
         [{"name": "media.generate_image", "input_schema": {"type": "object"}}],
         10_000,
         "thread_park",
+        _runtime_call_db("thread_park", ("call_park", "media.generate_image")),
     )
-    session.agent_ref[0] = SimpleNamespace(
-        interrupt=lambda reason: None,
-        _runtime_checkpoint_message={
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_park",
-                "function": {"name": "media.generate_image", "arguments": "{}"},
-            }],
-        },
-    )
+    session.agent_ref[0] = SimpleNamespace(interrupt=lambda reason: None)
     call = asyncio.create_task(asyncio.to_thread(
         session.invoke_platform_tool,
         "media.generate_image",
         {},
         "call_park",
     ))
-    assert (await queue.get())["type"] == "checkpoint"
     assert (await queue.get())["type"] == "tool_request"
     session.interrupt("parked:tool_operation")
 
@@ -2100,73 +2343,6 @@ def test_session_db_resume_appends_real_result_once_and_accepts_redelivery():
     assert len(db.appended) == 1
 
 
-def test_session_db_merge_retains_public_turns_after_private_history_tail():
-    caller = [
-        {"role": "user", "content": "Hermes turn"},
-        {"role": "assistant", "content": "Hermes answer"},
-        {"role": "user", "content": "Other runtime turn"},
-        {"role": "assistant", "content": "Other runtime answer"},
-    ]
-    session = [
-        {"role": "user", "content": "Hermes turn"},
-        {
-            "role": "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id": "call_1",
-                "function": {"name": "web_search", "arguments": "{}"},
-            }],
-        },
-        {
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": "result",
-        },
-        {"role": "assistant", "content": "Hermes answer"},
-    ]
-
-    merged = _merge_runtime_session_history(caller, session)
-
-    assert merged == [*session, *caller[2:]]
-
-
-def test_session_db_merge_ignores_private_runtime_attachment_descriptors():
-    caller = [{"role": "user", "content": "describe the uploaded image"}]
-    session = [{
-        "role": "user",
-        "content": [
-            {"type": "text", "text": "describe the uploaded image"},
-            {
-                "type": "text",
-                "text": (
-                    "[Attached image: reference.png; role=user_upload; "
-                    "asset_id=asset_1. When pixel analysis is required, call "
-                    "image_analyze with image_url=/tmp/runtime/reference.png.]"
-                ),
-            },
-            {"type": "image_url", "image_url": {"url": "data:image/png;base64,eA=="}},
-        ],
-    }]
-
-    assert _merge_runtime_session_history(caller, session) == session
-
-
-def test_session_db_merge_ignores_flattened_runtime_attachment_descriptors():
-    prompt = "describe the uploaded image"
-    caller = [{"role": "user", "content": prompt}]
-    session = [{
-        "role": "user",
-        "content": (
-            prompt
-            + "\n[Attached image: reference.png; role=user_upload; "
-            "asset_id=asset_1. When pixel analysis is required, call "
-            "image_analyze with image_url=/tmp/runtime/reference.png.]"
-        ),
-    }]
-
-    assert _merge_runtime_session_history(caller, session) == session
-
-
 def test_session_db_resume_survives_database_reopen(tmp_path):
     db_path = tmp_path / "state.db"
     session_id = "thread_restart"
@@ -2208,14 +2384,20 @@ def test_session_db_resume_survives_database_reopen(tmp_path):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("restore_checkpoint_tools", [False, True])
-async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_tools(
-    restore_checkpoint_tools,
-):
+async def test_runtime_session_db_resume_rebuilds_tool_exposure_from_authoritative_history():
     class RecordingDB:
         def __init__(self):
             self.messages = [
                 {"role": "user", "content": "make an image"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": "call_previous",
+                        "function": {"name": "media.generate_video", "arguments": "{}"},
+                    }],
+                },
+                {"role": "tool", "tool_call_id": "call_previous", "content": "{}"},
                 {
                     "role": "assistant",
                     "content": None,
@@ -2240,7 +2422,7 @@ async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_to
         def append_message(self, session_id, **message):
             self.messages.append({"role": message["role"], **message})
 
-    class SessionDBAdapter(APIServerRuntimeMixin):
+    class SessionDBAdapter(_TestRuntimeAdapter):
         _api_key = ""
 
         def __init__(self):
@@ -2269,11 +2451,12 @@ async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_to
             kwargs["agent_configurator"](agent)
             assert agent._resume_from_tool_results is True
             assert agent._require_incremental_session_persistence is True
-            assert ("media.generate_video" in agent.valid_tool_names) is restore_checkpoint_tools
+            assert "media.generate_video" in agent.valid_tool_names
+            assert "media.generate_image" in agent.valid_tool_names
             assert kwargs["session_id"] == "thread_session"
             assert kwargs["user_message"] == ""
             assert [message["role"] for message in kwargs["conversation_history"]] == [
-                "user", "assistant", "user", "assistant", "tool",
+                "user", "assistant", "tool", "assistant", "tool",
             ]
             assert kwargs["conversation_history"][-1]["tool_call_id"] == "call_media"
             return {"final_response": "done"}, {"total_tokens": 1}
@@ -2284,33 +2467,11 @@ async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_to
     client = TestClient(TestServer(app))
     await client.start_server()
     try:
-        resume_fields = {}
-        if restore_checkpoint_tools:
-            resume_fields["runtime_checkpoint"] = {
-                "activated_tool_names": [
-                    "media.generate_image",
-                    "media.generate_video",
-                ],
-                "message": {
-                    "role": "assistant",
-                    "content": None,
-                    "tool_calls": [{
-                        "id": "call_media",
-                        "function": {
-                            "name": "media.generate_image",
-                            "arguments": "{}",
-                        },
-                    }],
-                },
-            }
         response = await client.post("/v1/runtime/runs", json=_run_body(
             "run_session_resume",
-            context={"session_id": "thread_session", "history_mode": "session_db"},
-            messages=[
-                {"role": "user", "content": "older question"},
-                {"role": "assistant", "content": "older answer"},
-                {"role": "user", "content": "make an image"},
-            ],
+            intent="resume",
+            context={"session_id": "thread_session"},
+            messages=[],
             tool_results=[{
                 "tool_call_id": "call_media",
                 "status": "succeeded",
@@ -2327,7 +2488,6 @@ async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_to
                 "input_schema": {"type": "object"},
                 "exposure": "deferred",
             }],
-            **resume_fields,
         ))
         assert response.status == 200
         events = [json.loads(line) async for line in response.content]
@@ -2338,7 +2498,7 @@ async def test_runtime_session_db_resume_loads_private_history_and_checkpoint_to
 
 
 @pytest.mark.asyncio
-async def test_runtime_session_db_resume_injects_generated_output_after_history_merge():
+async def test_runtime_session_db_resume_projects_generated_output_after_durable_result():
     captured = {}
 
     class RecordingDB:
@@ -2369,7 +2529,7 @@ async def test_runtime_session_db_resume_injects_generated_output_after_history_
         def append_message(self, session_id, **message):
             self.messages.append({"role": message["role"], **message})
 
-    class GeneratedOutputAdapter(APIServerRuntimeMixin):
+    class GeneratedOutputAdapter(_TestRuntimeAdapter):
         _api_key = ""
 
         def __init__(self):
@@ -2403,13 +2563,35 @@ async def test_runtime_session_db_resume_injects_generated_output_after_history_
             ]
             assert history[0]["content"] == "make an image"
             persisted_result = self.db.messages[-1]["content"]
+            assert json.loads(persisted_result) == {
+                "asset_id": "asset_1",
+                "output_id": "output_1",
+            }
             assert "runtime_generated_media_context" not in persisted_result
-            assert history[-1]["content"].startswith(persisted_result)
-            assert "runtime_generated_media_context" in history[-1]["content"]
-            marker = history[-1]["content"].split("image_url=", 1)[1]
-            image_path = marker.split(". Keep", 1)[0]
+            assert isinstance(history[-1]["content"], list)
+            assert history[-1]["content"][0] == {
+                "type": "text",
+                "text": persisted_result,
+            }
+            marker = next(
+                part["text"]
+                for part in history[-1]["content"]
+                if part.get("type") == "text" and "image_url=" in part.get("text", "")
+            )
+            assert "runtime_generated_media_context" not in json.dumps(history[-1])
+            assert all(
+                not any(str(key).startswith("_runtime_") for key in part)
+                for part in history[-1]["content"]
+                if isinstance(part, dict)
+            )
+            image_path = marker.split("image_url=", 1)[1].split(". Keep", 1)[0]
             captured["image_path"] = image_path
             assert Path(image_path).read_bytes() == b"generated-pixels"
+            persisted = json.dumps(self.db.messages)
+            assert image_path not in persisted
+            assert "data:image" not in persisted
+            assert base64.b64encode(b"generated-pixels").decode() not in persisted
+            assert "runtime_generated_media_context" not in persisted
             analyzed = _runtime_tool_middleware(
                 tool_name="image_analyze",
                 args={"image_url": image_path, "question": "Inspect the output"},
@@ -2428,11 +2610,9 @@ async def test_runtime_session_db_resume_injects_generated_output_after_history_
     try:
         response = await client.post("/v1/runtime/runs", json=_run_body(
             "run_generated_output_resume",
-            context={
-                "session_id": "thread_generated_output",
-                "history_mode": "session_db",
-            },
-            messages=[{"role": "user", "content": "make an image"}],
+            intent="resume",
+            context={"session_id": "thread_generated_output"},
+            messages=[],
             tool_results=[{
                 "tool_call_id": "call_media",
                 "status": "succeeded",
@@ -2491,7 +2671,7 @@ def test_sweeper_evicts_only_stale_finished_sessions():
 
 @pytest.mark.asyncio
 async def test_runtime_run_pins_one_hour_prompt_cache_ttl():
-    class TTLAdapter(APIServerRuntimeMixin):
+    class TTLAdapter(_TestRuntimeAdapter):
         _api_key = ""
 
         def _check_auth(self, _request):
@@ -2516,17 +2696,18 @@ async def test_runtime_run_pins_one_hour_prompt_cache_ttl():
         stable = "platform rules"
         version = "ttl/v1"
         digest = "sha256:" + hashlib.sha256(
-            f"{version}\nreplace\n{stable}\n".encode(),
+            f"{version}\nreplace\n{stable}".encode(),
         ).hexdigest()
         response = await client.post("/v1/runtime/runs", json={
+            "intent": "bootstrap",
             "run_id": "run_ttl",
             "model": "chat-test",
-            "messages": [{"role": "user", "content": "make an image"}],
+            "context": {"session_id": "session-run-ttl"},
+            "messages": [{"id": "message-ttl", "role": "user", "content": "make an image"}],
             "system_context": {
                 "version": version,
                 "mode": "replace",
                 "stable": stable,
-                "turn": "",
                 "digest": digest,
             },
         })
@@ -2551,9 +2732,27 @@ def test_runtime_failure_code_projects_only_stable_safe_codes(result, expected):
     assert _runtime_failure_code(result) == expected
 
 
+def test_runtime_persistence_failure_projects_safe_error_without_db_detail():
+    result = {
+        "final_response": "retained for diagnostics",
+        "completed": False,
+        "failed": True,
+        "turn_exit_reason": "required_session_persistence_failed",
+        "cleanup_errors": ["persist_session: sqlite database is locked"],
+    }
+
+    code = _runtime_failure_code(result)
+    envelope = runtime_module.runtime_error_envelope(code, support_id="run-persist")
+
+    assert code == "runtime_unavailable"
+    assert envelope["code"] == "runtime_unavailable"
+    assert "sqlite" not in json.dumps(envelope).lower()
+    assert "database is locked" not in json.dumps(envelope).lower()
+
+
 @pytest.mark.asyncio
 async def test_runtime_failed_agent_result_emits_error_without_completed():
-    class FailedAdapter(APIServerRuntimeMixin):
+    class FailedAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 
@@ -2600,7 +2799,7 @@ def _audit_messages(caplog) -> list[str]:
     ]
 
 
-class _AuditRunAdapter(APIServerRuntimeMixin):
+class _AuditRunAdapter(_TestRuntimeAdapter):
     def _check_auth(self, _request):
         return None
 
@@ -2675,7 +2874,7 @@ async def test_runtime_tool_result_audit_line_carries_run_id(caplog):
 async def test_runtime_interrupt_audit_line_carries_run_id(caplog):
     caplog.set_level(logging.INFO, logger="gateway.api_server.audit")
 
-    class InterruptAdapter(APIServerRuntimeMixin):
+    class InterruptAdapter(_TestRuntimeAdapter):
         def _check_auth(self, _request):
             return None
 

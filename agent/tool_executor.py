@@ -1390,6 +1390,11 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
 
         if isinstance(function_result, DeferredToolResult):
             agent._runtime_deferred_tool_call_id = function_result.tool_call_id
+            # The parked call itself remains unfinished in SessionDB.  Only
+            # later sibling calls receive synthetic results; adding a
+            # synthetic result for the parked call would make the durable
+            # tool sequence look complete and prevent the real result from
+            # resuming exactly once.
             remaining_calls = assistant_message.tool_calls[i:]
             for skipped_call in remaining_calls:
                 skipped_name = skipped_call.function.name

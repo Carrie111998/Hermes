@@ -146,6 +146,25 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.active_system_prompt == "SYSTEM"
 
 
+def test_runtime_wire_id_is_attached_to_current_user_message_only():
+    agent = _FakeAgent()
+    history = [{"role": "assistant", "content": "earlier"}]
+    ctx = _build(
+        agent,
+        conversation_history=history,
+        runtime_message_id="wire-user-001",
+    )
+
+    assert ctx.messages[0] == history[0]
+    assert "message_id" not in ctx.messages[0]
+    assert ctx.messages[-1] == {
+        "role": "user",
+        "content": "hello",
+        "platform_message_id": "wire-user-001",
+        "message_id": "wire-user-001",
+    }
+
+
 def test_tool_result_resume_does_not_append_synthetic_user_turn():
     agent = _FakeAgent()
     agent._resume_from_tool_results = True

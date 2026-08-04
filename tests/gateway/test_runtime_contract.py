@@ -9,10 +9,12 @@ def test_runtime_health_contract_is_explicit_and_versioned():
     contract = runtime_health_contract()
     assert contract["runtime_protocol_version"] == "1"
     assert contract["runtime_frame_types"] == list(RUNTIME_DRIVER_FRAME_TYPES)
+    assert "checkpoint" not in contract["runtime_frame_types"]
     assert {
         "delegated_tools",
         "interrupt",
         "system_context.replace",
+        "llm_egress",
     } <= set(contract["runtime_capabilities"])
 
 

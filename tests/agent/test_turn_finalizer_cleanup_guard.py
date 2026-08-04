@@ -26,8 +26,9 @@ class _StubCompressor:
 class _StubAgent:
     """Minimal agent surface that ``finalize_turn`` reads from."""
 
-    def __init__(self, *, raise_in):
+    def __init__(self, *, raise_in, require_persistence=False):
         self._raise_in = set(raise_in)
+        self._require_incremental_session_persistence = require_persistence
         self.max_iterations = 3
         self.iteration_budget = _StubBudget()
         self.context_compressor = _StubCompressor()
@@ -182,3 +183,60 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_generic_persistence_cleanup_failure_preserves_success_status():
+    agent = _StubAgent(raise_in=("persist_session",))
+    result = _run(
+        agent,
+        final_response="final report",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "final report"
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert result["cleanup_errors"] == [
+        "persist_session: sqlite database is locked",
+    ]
+
+
+def test_required_runtime_persistence_cleanup_failure_fails_closed():
+    agent = _StubAgent(
+        raise_in=("persist_session",),
+        require_persistence=True,
+    )
+    result = _run(
+        agent,
+        final_response="final report retained for diagnostics",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "final report retained for diagnostics"
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "required_session_persistence_failed"
+    assert result["cleanup_errors"] == [
+        "persist_session: sqlite database is locked",
+    ]
+
+
+@pytest.mark.parametrize("step", ["save_trajectory", "cleanup_task_resources"])
+def test_required_runtime_non_persistence_cleanup_failure_keeps_success(step):
+    agent = _StubAgent(raise_in=(step,), require_persistence=True)
+    result = _run(
+        agent,
+        final_response="final report",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == "final report"
+    assert result["completed"] is True
+    assert result["failed"] is False
+    assert result["turn_exit_reason"] == "text_response(finish_reason=stop)"
+    assert len(result["cleanup_errors"]) == 1
+    assert result["cleanup_errors"][0].startswith(f"{step}:")
