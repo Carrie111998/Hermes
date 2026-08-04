@@ -44,7 +44,6 @@ class AgentSandboxBackend(BaseEnvironment):
     """K8s-agent-sandbox cloud sandbox execution backend.
 
     Spawn-per-call via _ThreadedProcessHandle wrapping blocking SDK calls.
-    cancel_fn wired to sandbox.stop() for interrupt support.
     Shell timeout wrapper preserved (SDK timeout unreliable).
     """
     def __init__(
@@ -55,17 +54,21 @@ class AgentSandboxBackend(BaseEnvironment):
         timeout: int = 60,
         task_id: str = "default",
         namespace: str = "default",
-        persistent_filesystem: bool = False
+        persistent_filesystem: bool = False,
+        _stdin_mode: str = "heredoc",
     ):
         super().__init__(cwd=cwd, timeout=timeout)
 
         try:
             from tools.lazy_deps import ensure as _lazy_ensure
-            _lazy_ensure("terminal.agent_sandbox", prompt=False)
         except ImportError:
-            pass
+            _lazy_ensure = None
         except Exception as e:
             raise ImportError(str(e))
+
+        if _lazy_ensure:
+            _lazy_ensure("terminal.agent_sandbox", prompt=False)
+
         from k8s_agent_sandbox import (
             SandboxClient,
         )
@@ -97,14 +100,13 @@ class AgentSandboxBackend(BaseEnvironment):
             )
         elif config_name == "SandboxInClusterConnectionConfig":
             connection_config = SandboxInClusterConnectionConfig(
-                server_port=connection_config_args.get("port_forward_ready_timeout", 8888),
+                server_port=connection_config_args.get("server_port", 8888),
                 use_pod_ip=connection_config_args.get("use_pod_ip", False),
             )
         else:
             raise ValueError(f"Not allowed connection config name: \"{config_name}\"")
 
         self._timeout = timeout
-        self._remote_home = ""
         self._task_id = task_id
         self._lock = threading.Lock()
         self._persistent = persistent_filesystem
@@ -128,7 +130,7 @@ class AgentSandboxBackend(BaseEnvironment):
                 labels={"hermes_task_id": task_id},
             )
         self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+            get_files_fn=lambda: iter_sync_files(f"/.hermes"),
             upload_fn=self._agent_sandbox_upload,
             delete_fn=self._agent_sandbox_delete,
             bulk_upload_fn=self._agent_sandbox_bulk_upload,
@@ -152,26 +154,23 @@ class AgentSandboxBackend(BaseEnvironment):
         tar_buffer = io.BytesIO()
         with tarfile.open(fileobj=tar_buffer, mode="w:gz") as tar:
             for host_path, remote_path in files:
-                # Strip leading slash so paths are relative to root ('/app')
                 arcname = remote_path.lstrip("/")
                 tar.add(name=host_path, arcname=arcname)
 
         # 2. Upload the single tarball to a temporary path via SDK's HTTP write
         tmp_tar_path = f"tmp/bundle_{uuid.uuid4().hex}.tar.gz"
-        print("tmp_tar_path:", tmp_tar_path)
         self._sandbox.files.write(path=tmp_tar_path, content=tar_buffer.getvalue())
 
-        # 3. Extract the archive from root ('/app') and clean up
-        extract_cmd = f"tar -xzf {tmp_tar_path} -C /app"
+        extract_cmd = f"tar -xzf {tmp_tar_path} -C {self.cwd}"
         self._sandbox.commands.run(command=extract_cmd, timeout=self._timeout)
         self._agent_sandbox_delete([tmp_tar_path])
 
     def _agent_sandbox_bulk_download(self, dest: Path):
         """Download remote .hermes/ dir as a tar archive."""
-        rel_base = f"{self._remote_home}/.hermes".lstrip("/")
+        rel_base = ".hermes"
         rel_remote_tar = f"{rel_base}_sync.{os.getpid()}.tar"
         self._sandbox.commands.run(
-            command=f"tar cf {shlex.quote(rel_remote_tar)} -C /app {shlex.quote(rel_base)}",
+            command=f"tar cf {shlex.quote(rel_remote_tar)} -C {self.cwd} {shlex.quote(rel_base)}",
             timeout=self._timeout
         )
         content = self._sandbox.files.read(rel_remote_tar)
@@ -211,7 +210,7 @@ class AgentSandboxBackend(BaseEnvironment):
 
         def exec_fn() -> tuple[str, int]:
             response = sandbox.commands.run(command=shell_cmd, timeout=timeout)
-            return (response.stdout or response.stderr, response.exit_code)
+            return (response.stdout or "") + (response.stderr or ""), response.exit_code
         return _ThreadedProcessHandle(exec_fn=exec_fn)
 
     def cleanup(self):
