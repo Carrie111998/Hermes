@@ -5269,6 +5269,13 @@ def _resolve_fallback_entry(entry: Dict[str, Any]) -> Tuple[Optional[Any], Optio
     return client, resolved_model
 
 
+class _TerminalMainFallbackLabel(str):
+    """Empty-string-compatible marker for a terminal top-level hold boundary."""
+
+
+_TERMINAL_MAIN_FALLBACK_LABEL = _TerminalMainFallbackLabel("")
+
+
 def _try_main_fallback_chain(
     task: Optional[str],
     failed_provider: str = "",
@@ -5320,10 +5327,15 @@ def _try_main_fallback_chain(
         if not fallback_entry_allows_continuation(entry):
             # ``triage_and_notify`` is not an auxiliary task provider.  The
             # bounded local notifier is owned solely by the cron conversation
-            # lane; auxiliary work must fail closed rather than continue on it.
-            label = f"fallback_providers[{i}]({entry.get('provider') or 'unknown'})"
-            tried.append(f"{label} (triage-only)")
-            continue
+            # lane. The empty-string-compatible marker preserves legacy
+            # three-value callers while telling routing callers not to resume
+            # built-in discovery after this terminal hold boundary.
+            logger.info(
+                "Auxiliary %s: stopping at triage-only fallback_providers[%d]",
+                task or "call",
+                i,
+            )
+            return None, None, _TERMINAL_MAIN_FALLBACK_LABEL
         fb_provider = str(entry.get("provider") or "").strip()
         fb_model = str(entry.get("model") or "").strip()
         if not fb_provider or not fb_model:
@@ -5547,6 +5559,8 @@ def _resolve_auto(
             return fb_client, fb_model
     fb_client, fb_model, _fb_label = _try_main_fallback_chain(
         task, main_provider or "auto", reason="main provider unavailable")
+    if _fb_label is _TERMINAL_MAIN_FALLBACK_LABEL:
+        return None, None
     if fb_client is not None:
         return fb_client, fb_model
 
@@ -9248,7 +9262,10 @@ def _call_llm_impl(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
+                if (
+                    fb_client is None
+                    and fb_label is not _TERMINAL_MAIN_FALLBACK_LABEL
+                ):
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:
@@ -9885,7 +9902,10 @@ async def _async_call_llm_impl(
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
-                if fb_client is None:
+                if (
+                    fb_client is None
+                    and fb_label is not _TERMINAL_MAIN_FALLBACK_LABEL
+                ):
                     fb_client, fb_model, fb_label = _try_payment_fallback(
                         resolved_provider, task, reason=reason)
             else:

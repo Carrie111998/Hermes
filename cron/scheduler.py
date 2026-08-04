@@ -341,7 +341,12 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
 }
 
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.executions import (
+    create_execution,
+    finish_execution,
+    mark_execution_running,
+    recover_held_execution,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -3420,15 +3425,16 @@ def run_job(
                         raise InvalidFallbackPolicyError()
                     if not fallback_entry_allows_continuation(entry):
                         # Runtime resolution occurs before an AIAgent/session
-                        # exists. Do not silently run the complete cron prompt
-                        # on a triage-only local fallback.
+                        # exists. A valid triage-only entry terminates this
+                        # chain and falls through to the deterministic primary
+                        # auth failure below; no later full runtime may resolve.
                         logger.info(
-                            "Job '%s': skipping triage-only fallback before agent construction (%s/%s)",
+                            "Job '%s': stopping at triage-only fallback before agent construction (%s/%s)",
                             job_id,
                             fb_provider,
                             fb_model,
                         )
-                        continue
+                        break
 
                     fb_kwargs = {
                         "requested": fb_provider,
@@ -4035,6 +4041,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
     execution_id = job.get("execution_id")
     if not execution_id:
         execution_id = create_execution(job["id"], source="direct")["id"]
+    held_job_persisted = False
+    held_job_detail = None
     try:
         # Pre-run dispatch claim (issue #38758): atomically commit a finite
         # one-shot's dispatch BEFORE its side effect runs, so a tick that dies
@@ -4202,6 +4210,8 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     hold_detail=hold_detail,
                     notification_succeeded=watcher_succeeded,
                 )
+                held_job_persisted = True
+                held_job_detail = hold_detail or error
             else:
                 mark_job_run(
                     job["id"],
@@ -4236,6 +4246,41 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below
+        if held_job_persisted:
+            # The jobs store is authoritative for replay/recovery semantics.
+            # Never erase that durable hold merely because the secondary audit
+            # ledger failed to finalize. Attempt only a held terminal repair;
+            # no ordinary failed/completed persistence is valid from here.
+            ledger_error_type = type(e).__name__
+            logger.error(
+                "Held work for job %s remains durable; execution ledger "
+                "finalization failed (%s); attempting held-only recovery",
+                job["id"],
+                ledger_error_type,
+            )
+            try:
+                recovered = recover_held_execution(
+                    execution_id,
+                    hold_error=held_job_detail,
+                    ledger_error_type=ledger_error_type,
+                )
+                if recovered is None:
+                    logger.error(
+                        "Held execution ledger recovery remains required for job %s; "
+                        "jobs-store hold remains authoritative and will not replay",
+                        job["id"],
+                    )
+            except Exception as recovery_error:
+                logger.error(
+                    "Held execution ledger recovery remains required for job %s "
+                    "after %s; jobs-store hold remains authoritative and will not replay",
+                    job["id"],
+                    type(recovery_error).__name__,
+                )
+            if not isinstance(e, Exception):
+                raise
+            return True
+
         # BaseException, not Exception (#73973): the inner run_job handler
         # re-raises CancelledError / KeyboardInterrupt / SystemExit after agent
         # teardown, and none of those are Exception subclasses. If they escape

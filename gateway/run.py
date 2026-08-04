@@ -2527,14 +2527,14 @@ def _try_resolve_fallback_provider() -> dict | None:
                     raise InvalidFallbackPolicyError()
                 if not fallback_entry_allows_continuation(entry):
                     # No AIAgent/session exists at this credential-resolution
-                    # boundary. Fail closed rather than turning a triage-only
-                    # local endpoint into a full gateway runtime.
+                    # boundary. A valid triage-only entry terminates the chain;
+                    # it must not expose gateway work to a later full runtime.
                     logger.info(
-                        "Skipping triage-only fallback during gateway runtime resolution: provider=%s model=%s",
+                        "Stopping gateway runtime resolution at triage-only fallback: provider=%s model=%s",
                         entry.get("provider"),
                         entry.get("model"),
                     )
-                    continue
+                    return None
 
                 runtime = resolve_runtime_provider(
                     requested=entry.get("provider"),

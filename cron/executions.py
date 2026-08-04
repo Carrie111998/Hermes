@@ -233,6 +233,44 @@ def finish_execution(
     return record
 
 
+def recover_held_execution(
+    execution_id: str,
+    *,
+    hold_error: Optional[str] = None,
+    ledger_error_type: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    """Recover terminal ``held`` after its first ledger finalization failed.
+
+    The caller may use this only after the jobs store has durably persisted the
+    work as held. This is a held-only terminal repair, never a retry/replay path,
+    and it cannot rewrite an already-terminal non-held execution.
+    """
+    now = _hermes_now().isoformat()
+    failure_type = str(ledger_error_type or "unknown error").strip() or "unknown error"
+    held_detail = str(
+        hold_error or "Original scheduled work held; no automatic replay."
+    ).strip()
+    recovery_detail = (
+        f"{held_detail} execution ledger recovery recorded after {failure_type}; "
+        "jobs-store hold remains authoritative; no automatic replay."
+    )
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET status='held', finished_at=?, error=?
+               WHERE id=? AND status IN ('claimed','running')""",
+            (now, recovery_detail, execution_id),
+        )
+        if cur.rowcount:
+            _prune_unlocked(conn)
+        record = _record(conn.execute(
+            "SELECT * FROM executions WHERE id=?", (execution_id,)
+        ).fetchone())
+    if record is None or record.get("status") != "held":
+        return None
+    _emit_execution_state(record)
+    return record
+
+
 def recover_interrupted_executions() -> int:
     """Mark provably abandoned attempts unknown without scheduling retries."""
     now = _hermes_now().isoformat()
