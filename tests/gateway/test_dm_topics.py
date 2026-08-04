@@ -40,6 +40,8 @@ _ensure_telegram_mock()
 sys.modules.pop("plugins.platforms.telegram.adapter", None)
 
 from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.telegram_dm_topics import TelegramDmTopicMixin  # noqa: E402
+from gateway.platforms.base import BasePlatformAdapter  # noqa: E402
 
 
 def _make_adapter(dm_topics_config=None, group_topics_config=None):
@@ -476,5 +478,79 @@ def test_group_topic_skill_binding_second_topic():
 
 
 # ── _build_message_event: from_user=None fallback in DMs ──
+
+
+# ── TelegramDmTopicMixin seam identity (adapter god-file slice A1) ──
+
+
+# Every DM-topic method extracted into TelegramDmTopicMixin. If a future
+# slice moves these names again, update the list alongside the extraction.
+_DM_TOPIC_MIXIN_METHODS = [
+    "_metadata_thread_id",
+    "_metadata_direct_messages_topic_id",
+    "_metadata_reply_to_message_id",
+    "_is_private_dm_topic_send",
+    "_dm_topic_missing_anchor_error",
+    "_reply_to_message_id_for_send",
+    "_thread_kwargs_for_send",
+    "_message_thread_id_for_send",
+    "_message_thread_id_for_typing",
+    "_is_thread_not_found_error",
+    "_prune_stale_dm_topic_binding",
+    "_is_bad_request_error",
+    "_should_retry_without_dm_topic_reply_anchor",
+    "_send_with_dm_topic_reply_anchor_retry",
+    "_create_dm_topic",
+    "create_handoff_thread",
+    "ensure_dm_topic",
+    "rename_dm_topic",
+    "_persist_dm_topic_thread_id",
+    "_setup_dm_topics",
+    "_reload_dm_topics_from_config",
+    "_get_dm_topic_info",
+    "_cache_dm_topic_from_message",
+]
+
+
+def _underlying(cls, name):
+    """Resolve the underlying function object for a class attribute.
+
+    ``getattr(Class, name)`` on a classmethod yields a fresh bound-method
+    wrapper per class, so identity must be compared on ``__func__``.
+    """
+    attr = getattr(cls, name)
+    return getattr(attr, "__func__", attr)
+
+
+def test_dm_topic_mixin_seam_identity():
+    """The DM-topic slice must not change any function object.
+
+    ``TelegramAdapter`` inherits ``TelegramDmTopicMixin``; every extracted
+    name must resolve through the adapter to the exact same function object
+    the mixin defines (classmethods unwrapped via ``__func__``). This pins
+    name resolution for tests and monkeypatches that target the adapter
+    namespace, and keeps the mixin ahead of ``BasePlatformAdapter`` in the
+    MRO so overrides like ``create_handoff_thread`` keep winning.
+    """
+    assert TelegramDmTopicMixin in TelegramAdapter.__mro__
+    assert TelegramAdapter.__mro__.index(TelegramDmTopicMixin) < TelegramAdapter.__mro__.index(
+        BasePlatformAdapter
+    )
+
+    for name in _DM_TOPIC_MIXIN_METHODS:
+        mixin_attr = _underlying(TelegramDmTopicMixin, name)
+        adapter_attr = _underlying(TelegramAdapter, name)
+        assert adapter_attr is mixin_attr, f"seam broken for {name}: adapter resolves a different object"
+        assert name not in TelegramAdapter.__dict__, f"adapter shadows {name} in its own __dict__"
+
+    # Behavior through the adapter namespace still resolves and executes.
+    assert TelegramAdapter._message_thread_id_for_send("1") is None
+    assert TelegramAdapter._message_thread_id_for_send("7") == 7
+    assert TelegramAdapter._thread_kwargs_for_send(
+        "111", "7", {"telegram_dm_topic_reply_fallback": True}, reply_to_message_id=42
+    ) == {"message_thread_id": 7}
+    assert TelegramAdapter._dm_topic_missing_anchor_error().startswith(
+        "Telegram DM topic delivery requires a reply anchor"
+    )
 
 
