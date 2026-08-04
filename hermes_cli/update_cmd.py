@@ -2911,7 +2911,14 @@ def _detect_venv_python_processes(
         if not is_holder:
             continue
         name = info.get("name") or Path(exe).name
-        matches.append((int(pid), str(name), cmdline_raw[:120]))
+        # Full cmdline — callers classify on it (the pausable-gateway
+        # exemption) before anyone displays it. Truncating at capture broke
+        # that: a long ``.hermes-runtime`` interpreter path pushes ``gateway
+        # run`` past 120 chars, so the matcher saw no subcommand and the
+        # Desktop preflight reported a pausable gateway as an unpausable
+        # blocker, dead-ending every update. Truncation belongs at the
+        # display sites.
+        matches.append((int(pid), str(name), cmdline_raw))
     return matches
 
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
@@ -2926,7 +2933,7 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
             hint = "  ← Hermes Desktop backend (close the desktop app)"
         elif "gateway" in low:
             hint = "  ← gateway"
-        lines.append(f"  PID {pid}  {name}  {cmdline}{hint}")
+        lines.append(f"  PID {pid}  {name}  {cmdline[:120]}{hint}")
     if len(matches) > 6:
         lines.append(f"  ... and {len(matches) - 6} more")
     lines.append("")
@@ -3026,9 +3033,10 @@ def _leftover_pausable_gateway_pids(
     to exempt them (``_is_pausable_gateway``), so the preflight's exemption
     and this guard's tolerance cannot drift apart — matcher drift between
     two views of the same process table is what produced the launcher/worker
-    dead-end fixed above. The scan captures only a 120-char cmdline prefix,
-    so the live argv is re-read where psutil allows; an unreadable argv
-    falls back to the captured prefix.
+    dead-end fixed above. The scan captures the full argv, but it is re-read
+    live where psutil allows so a process that re-execed since the scan is
+    classified on what it is running now; an unreadable argv falls back to
+    the captured cmdline.
 
     Returns ``None`` when any holder is not a pausable gateway — an operator
     REPL, a stray script, or the Desktop backend has no pause machinery
