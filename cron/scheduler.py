@@ -2341,7 +2341,7 @@ def _run_job_script(
             # now-isolated group, with nothing else left to reach them.
             if sys.platform != "win32":
                 try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)  # windows-footgun: ok — guarded by sys.platform check above
                 except ProcessLookupError:
                     pass
             proc.kill()
