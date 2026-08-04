@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 
@@ -37,6 +38,89 @@ def test_execution_transitions_are_durable(monkeypatch, tmp_path):
 
     persisted = executions.list_executions(job_id="job-1")
     assert persisted == [completed]
+
+
+def test_delivery_outcome_is_persisted_on_exact_execution(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    claimed = executions.create_execution("digest-job", source="builtin")
+    executions.mark_execution_running(claimed["id"])
+
+    completed = executions.finish_execution(
+        claimed["id"], success=True, delivery_outcome="delivered"
+    )
+
+    assert completed is not None
+    assert completed["delivery_outcome"] == "delivered"
+    assert executions.list_executions(job_id="digest-job")[0]["delivery_outcome"] == "delivered"
+
+
+def test_existing_execution_schema_migrates_delivery_outcome(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                 process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+                 process_started_at INTEGER, status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    claimed = executions.create_execution("migrated-job", source="builtin")
+    completed = executions.finish_execution(
+        claimed["id"], success=True, delivery_outcome="delivered"
+    )
+
+    assert completed is not None
+    assert completed["delivery_outcome"] == "delivered"
+
+
+def test_concurrent_legacy_schema_migration_is_idempotent(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+                 process_id TEXT NOT NULL, pid INTEGER NOT NULL,
+                 process_started_at INTEGER, status TEXT NOT NULL,
+                 claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+
+    alter_barrier = threading.Barrier(2)
+    errors = []
+
+    def migrate():
+        conn = sqlite3.connect(executions.EXECUTIONS_FILE, timeout=5)
+        conn.execute("PRAGMA busy_timeout=5000")
+
+        def synchronize_alters(statement):
+            if statement.startswith("ALTER TABLE executions"):
+                alter_barrier.wait(timeout=5)
+
+        conn.set_trace_callback(synchronize_alters)
+        try:
+            executions._initialize_schema(conn)
+        except Exception as exc:
+            errors.append(exc)
+        finally:
+            conn.close()
+
+    workers = [threading.Thread(target=migrate) for _ in range(2)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(timeout=10)
+
+    assert all(not worker.is_alive() for worker in workers)
+    assert errors == []
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(executions)")}
+    assert "delivery_outcome" in columns
 
 
 def test_terminal_execution_cannot_be_rewritten(monkeypatch, tmp_path):
@@ -221,10 +305,13 @@ def test_run_one_job_records_running_then_terminal(monkeypatch):
     monkeypatch.setattr(scheduler, "_deliver_result", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(scheduler, "mark_job_run", lambda *_args, **_kwargs: None)
 
-    assert scheduler.run_one_job({"id": "job-3", "execution_id": "exec-3"}) is True
+    assert scheduler.run_one_job({
+        "id": "job-3", "execution_id": "exec-3", "deliver": "email"
+    }) is True
     assert events[0] == ("running", "exec-3")
     assert events[-1][0:2] == ("finish", "exec-3")
     assert events[-1][2]["success"] is True
+    assert events[-1][2]["delivery_outcome"] == "delivered"
 
 
 def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):

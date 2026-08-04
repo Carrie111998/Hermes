@@ -111,13 +111,20 @@ def test_cron_run_job_codex_path_handles_internal_401_refresh(monkeypatch):
     _Codex401ThenSuccessAgent.last_init = {}
 
     success, output, final_response, error = cron_scheduler.run_job(
-        {"id": "job-1", "name": "Codex Refresh Test", "prompt": "ping", "model": "gpt-5.3-codex"}
+        {
+            "id": "job-1",
+            "name": "Codex Refresh Test",
+            "prompt": "ping",
+            "model": "gpt-5.3-codex",
+            "execution_id": "execution-output-test",
+        }
     )
 
     assert success is True
     assert error is None
     assert final_response == "Recovered via refresh"
     assert "Recovered via refresh" in output
+    assert "**Execution ID:** execution-output-test" in output
     assert _Codex401ThenSuccessAgent.refresh_attempts == 1
     assert _Codex401ThenSuccessAgent.last_init["provider"] == "openai-codex"
     assert _Codex401ThenSuccessAgent.last_init["api_mode"] == "codex_responses"
