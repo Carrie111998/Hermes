@@ -1382,6 +1382,70 @@ def test_writer_activation_bridge_invokes_only_packaged_sealed_module() -> None:
     assert observed["kwargs"]["input_bytes"] == frame
 
 
+def test_stopped_release_remote_input_builds_frame_after_authorization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = object.__new__(launcher.IapStoppedReleaseTransport)
+    events: list[str] = []
+    snapshot = (_digest("instance"), _digest("project"), _digest("profile"))
+
+    class Identity:
+        def require_stable(self) -> None:
+            events.append("owner-stable")
+
+    class Executable:
+        def trusted_command_prefix(self) -> tuple[str, ...]:
+            return ("/trusted/python",)
+
+    transport._owner_identity = Identity()
+    transport._gcloud_executable = Executable()
+    transport._gcloud_configuration = object()
+    transport._authorization_snapshot = lambda _account: (
+        events.append("authorization") or snapshot
+    )
+    transport._remote_argv = lambda _remote, *, account: (
+        events.append("remote-argv") or ("/trusted/gcloud", account)
+    )
+    transport._validate_dry_run = lambda _argv: events.append("dry-run")
+    transport._postflight = lambda: events.append("postflight")
+    monkeypatch.setattr(
+        launcher,
+        "_owner_gcloud_environment",
+        lambda *_args, **_kwargs: {},
+    )
+
+    def run(argv, **kwargs):
+        events.append("remote-run")
+        assert kwargs["input"] == b"fresh-frame"
+        return subprocess.CompletedProcess(argv, 0, stdout=b'{}\n')
+
+    transport._preflight_runner = run
+
+    def build_frame() -> bytes:
+        events.append("frame-factory")
+        return b"fresh-frame"
+
+    completed = transport._run_remote_input(
+        ("/fixed/remote",),
+        account="owner@example.com",
+        input_factory=build_frame,
+    )
+
+    assert completed.returncode == 0
+    assert events == [
+        "authorization",
+        "remote-argv",
+        "dry-run",
+        "authorization",
+        "frame-factory",
+        "owner-stable",
+        "postflight",
+        "remote-run",
+        "postflight",
+        "authorization",
+    ]
+
+
 def test_writer_activation_bridge_rejects_noncanonical_remote_json() -> None:
     release_sha = "a" * 40
     transport = object.__new__(launcher.IapWriterActivationBridgeTransport)
@@ -1440,10 +1504,19 @@ def test_stopped_writer_activation_orchestrates_only_fixed_packaged_sequence(
         arguments,
         account,
         stdin_frame=None,
+        stdin_frame_factory=None,
         **_kwargs,
     ):
         assert _release_sha == release_sha
         assert account == "owner@example.com"
+        assert not (
+            stdin_frame is not None and stdin_frame_factory is not None
+        )
+        if module == launcher.WRITER_ACTIVATION_BRIDGE_MODULE:
+            assert stdin_frame is None
+            assert callable(stdin_frame_factory)
+        if stdin_frame_factory is not None:
+            stdin_frame = stdin_frame_factory()
         calls.append((module, tuple(arguments), stdin_frame))
         return {"call": len(calls)}
 
