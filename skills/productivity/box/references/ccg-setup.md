@@ -7,11 +7,11 @@ Use two identities deliberately:
 - **Service Account — control plane:** Box creates this API-only identity when an administrator authorizes the CCG app. Use it only to provision and administer the integration, such as creating the App User. It starts with an empty root; its capabilities depend on the app's scopes and enterprise authorization.
 - **App User — Hermes runtime identity:** Create one dedicated App User for each Hermes deployment or isolation boundary. Configure the normal Hermes CLI environment to act as this user. Its root also starts empty, and it can access only folders explicitly shared with it.
 
-Do not configure normal Hermes work to run as the Service Account. Although a Service Account is not automatically an enterprise administrator, the CCG credentials can carry broader application capabilities than the runtime needs. Use a dedicated CCG Platform App with **App Access Only**, the minimum scopes, and **Generate User Access Tokens** enabled. Store its credentials in the runtime's secret store; do not print them or put them in chat.
+Do not configure normal Hermes work to run as the Service Account. Although a Service Account is not automatically an enterprise administrator, the CCG credentials can carry broader application capabilities than the runtime needs. Use a dedicated CCG Platform App with **App Access Only**, the minimum scopes, **Manage users**, and **Generate User Access Tokens** enabled. Store its credentials in the runtime's secret store; do not print them or put them in chat.
 
 ## Create and authorize the app
 
-Open the [Box Developer Console](https://app.box.com/developers/console) with browser tools when available, then create a **Platform App** using **Client Credentials Grant**. Select **App Access Only**, enable **Generate User Access Tokens**, and choose only the scopes required for the work; the authorization method is fixed at creation. Reauthorize the app if changing these settings requires it.
+Open the [Box Developer Console](https://app.box.com/developers/console) with browser tools when available, then create a **Platform App** using **Client Credentials Grant**. Select **App Access Only**, enable **Manage users** and **Generate User Access Tokens**, and choose only the remaining scopes required for the work; the authorization method is fixed at creation. **Manage users is required to create the App User through this CCG app.** Reauthorize the app if changing these settings requires it.
 
 Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Find the Client ID, Client Secret, and Enterprise ID in the app's **App Details** sidebar. Never ask for a Client Secret in chat. Ask the human to store the values directly in the active Hermes home's `.env` file, then resume after they confirm it is ready:
 
@@ -35,6 +35,8 @@ The returned `login` is the Service Account email. Do not routinely print enviro
 ```bash
 box users:create "Hermes Production Agent" --app-user --json --fields id,name,login
 ```
+
+Immediately pause the setup. Ask the person who receives the App User confirmation email to open it and follow its activation link. Do not configure Hermes as the App User or make its first API call until they confirm activation is complete; Box can reject actions against an unactivated App User.
 
 ## Add the App User runtime environment
 

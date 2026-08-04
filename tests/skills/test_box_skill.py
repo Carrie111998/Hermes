@@ -205,8 +205,12 @@ def test_ccg_uses_a_dedicated_app_user_for_normal_hermes_work():
     assert "Do not configure normal Hermes work to run as the Service Account" in ccg
     assert "**App Details** sidebar" in ccg
     assert "**App Access Only**" in ccg
+    assert "**Manage users**" in ccg
+    assert "Manage users is required to create the App User" in ccg
     assert "**Generate User Access Tokens**" in ccg
     assert 'box users:create "Hermes Production Agent" --app-user' in ccg
+    assert "confirmation email" in ccg
+    assert "Do not configure Hermes as the App User or make its first API call" in ccg
     assert "--ccg-user <APP_USER_ID> --name hermes-agent --set-as-current" in ccg
     assert "returned `id` is exactly `<APP_USER_ID>`" in ccg
     assert "<APP_USER_EMAIL>" in ccg
