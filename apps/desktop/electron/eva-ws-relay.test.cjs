@@ -322,6 +322,139 @@ test('relay denies managed billing RPCs before they reach upstream', async t => 
   assert.equal(events.filter(event => event === 'client_rpc_denied').length, 11)
 })
 
+test('relay denies hidden billing commands inside generic dispatch RPCs before they reach upstream', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const events = []
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' }),
+    onEvent: event => events.push(event)
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const blockedMessages = [
+    { id: 1, jsonrpc: '2.0', method: 'slash.exec', params: { command: '/subscription change' } },
+    { id: 2, jsonrpc: '2.0', method: 'slash.exec', params: { command: 'topup' } },
+    { id: 3, jsonrpc: '2.0', method: 'command.dispatch', params: { arg: 'now', name: '/upgrade' } },
+    { id: 4, jsonrpc: '2.0', method: 'cli.exec', params: { argv: ['subscription'] } },
+    { params: { command: 'upgrade' }, id: 5, jsonrpc: '2.0', method: 'slash.exec' },
+    {
+      id: 'long-args',
+      jsonrpc: '2.0',
+      method: 'slash.exec',
+      params: { command: `/subscription ${'x'.repeat(2_048)}` }
+    },
+    [
+      { id: 6, jsonrpc: '2.0', method: 'session.status', params: {} },
+      { params: { name: 'topup' }, id: 7, jsonrpc: '2.0', method: 'command.dispatch' }
+    ]
+  ]
+
+  for (const message of blockedMessages) {
+    const result = await upgrade(await relay.mintTicket())
+    result.socket.write(clientFrame(JSON.stringify(message)))
+    await waitForClose(result.socket)
+  }
+
+  const fragmented = await upgrade(await relay.mintTicket())
+  fragmented.socket.write(
+    Buffer.concat([
+      clientFrame('{"id":8,"jsonrpc":"2.0","method":"slash.exec","params":{"command":"sub', {
+        fin: false,
+        opcode: 0x1
+      }),
+      clientFrame('scription confirm"}}', { opcode: 0x0 })
+    ])
+  )
+  await waitForClose(fragmented.socket)
+
+  assert.equal(upstream.tunneled().length, 0)
+  assert.equal(events.filter(event => event === 'client_rpc_denied').length, blockedMessages.length + 1)
+})
+
+test('relay preserves allowed generic dispatch RPCs, including fragmented traffic', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const allowedFrames = [
+    clientFrame(
+      JSON.stringify({
+        id: 1,
+        jsonrpc: '2.0',
+        method: 'slash.exec',
+        params: { command: 'my-billing-skill report' }
+      })
+    ),
+    clientFrame(
+      JSON.stringify({
+        id: 2,
+        jsonrpc: '2.0',
+        method: 'command.dispatch',
+        params: { arg: 'subscription', name: 'status' }
+      })
+    ),
+    clientFrame(
+      JSON.stringify({
+        id: 3,
+        jsonrpc: '2.0',
+        method: 'cli.exec',
+        params: { argv: ['sessions', 'list'] }
+      })
+    ),
+    clientFrame(
+      JSON.stringify({
+        id: 'long-allowed',
+        jsonrpc: '2.0',
+        method: 'slash.exec',
+        params: { command: `my-billing-skill ${'x'.repeat(2_048)}` }
+      })
+    ),
+    clientFrame(
+      JSON.stringify([
+        { id: 'batch-1', jsonrpc: '2.0', method: 'session.status', params: {} },
+        {
+          id: 'batch-2',
+          jsonrpc: '2.0',
+          method: 'command.dispatch',
+          params: { arg: 'subscription', name: 'status' }
+        }
+      ])
+    ),
+    Buffer.concat([
+      clientFrame('{"id":4,"jsonrpc":"2.0","method":"slash.exec","params":{"command":"sta', {
+        fin: false,
+        opcode: 0x1
+      }),
+      clientFrame('tus subscription"}}', { opcode: 0x0 })
+    ])
+  ]
+  const expected = Buffer.concat(allowedFrames)
+  let expectedLength = 0
+
+  for (const frame of allowedFrames) {
+    const result = await upgrade(await relay.mintTicket())
+    result.socket.write(frame)
+    expectedLength += frame.length
+    await waitForTunnel(upstream, expectedLength)
+    result.socket.destroy()
+  }
+
+  await waitForTunnel(upstream, expected.length)
+  assert.deepEqual(upstream.tunneled(), expected)
+})
+
 test('relay passes an unknown future gateway RPC frame through unchanged', async t => {
   const upstream = fakeUpstream()
   await upstream.start()

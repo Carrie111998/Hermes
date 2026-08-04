@@ -60,6 +60,7 @@ const EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS = new Set([
   'usage.bars'
 ])
 const EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES = ['billing.', 'subscription.']
+const EVA_MANAGED_HIDDEN_NOUS_COMMANDS = new Set(['subscription', 'topup', 'upgrade'])
 const EVA_MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_KEYS = Object.freeze([
   'hermes.desktop.composerQueue.v1',
@@ -258,6 +259,50 @@ function isEvaManagedGatewayMethodBlocked(value) {
     EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS.has(method) ||
     EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES.some(prefix => method.startsWith(prefix))
   )
+}
+
+function normalizeEvaManagedCommandName(value) {
+  return String(value || '')
+    .trim()
+    .replace(/^\/+/, '')
+    .split(/\s+/, 1)[0]
+    .toLowerCase()
+}
+
+function evaManagedCliCommand(argv) {
+  if (!Array.isArray(argv)) return ''
+
+  let index = 0
+  while (index < argv.length) {
+    const value = String(argv[index] || '')
+    if (value === '--profile' || value === '-p') {
+      index += 2
+      continue
+    }
+    if (value.startsWith('--profile=')) {
+      index += 1
+      continue
+    }
+    return value.startsWith('-') ? '' : normalizeEvaManagedCommandName(value)
+  }
+  return ''
+}
+
+function isEvaManagedGatewayRequestBlocked(methodValue, params = {}) {
+  const method = String(methodValue || '')
+  if (isEvaManagedGatewayMethodBlocked(method)) return true
+  if (!params || typeof params !== 'object') return false
+
+  let command = ''
+  if (method === 'slash.exec') {
+    command = normalizeEvaManagedCommandName(params.command)
+  } else if (method === 'command.dispatch') {
+    command = normalizeEvaManagedCommandName(params.name)
+  } else if (method === 'cli.exec') {
+    command = evaManagedCliCommand(params.argv)
+  }
+
+  return EVA_MANAGED_HIDDEN_NOUS_COMMANDS.has(command)
 }
 
 function normalizeDeviceCodeVerifier(value) {
@@ -468,40 +513,56 @@ async function brokerPost(body, options = {}) {
   }
 
   let response
+  let payload = null
   const requestController = new AbortController()
   const externalSignal = options.signal
   const abortFromExternal = () => requestController.abort(externalSignal?.reason)
   const timeoutMs = options.timeoutMs ?? policy.brokerRequestTimeoutMs
-  const timeout = setTimeout(() => requestController.abort(), timeoutMs)
+  const timeoutReason = new Error('eva broker request deadline exceeded')
+  let abortListener
+  const abortPromise = new Promise((_, reject) => {
+    abortListener = () => reject(requestController.signal.reason ?? timeoutReason)
+    requestController.signal.addEventListener('abort', abortListener, { once: true })
+  })
+  const timeout = setTimeout(() => requestController.abort(timeoutReason), timeoutMs)
   if (externalSignal?.aborted) {
     abortFromExternal()
   } else {
     externalSignal?.addEventListener('abort', abortFromExternal, { once: true })
   }
   try {
-    response = await fetchImpl(policy.brokerUrl, {
-      method: 'POST',
-      redirect: 'error',
-      cache: 'no-store',
-      signal: requestController.signal,
-      headers: {
-        'Content-Type': 'application/json',
-        'X-Client-Info': `evaos-agent/${EVA_DESKTOP_PACKAGE_VERSION}`,
-        ...(options.desktopSession ? { Authorization: `Bearer ${options.desktopSession}` } : {})
-      },
-      body: JSON.stringify(body)
-    })
+    response = await Promise.race([
+      fetchImpl(policy.brokerUrl, {
+        method: 'POST',
+        redirect: 'error',
+        cache: 'no-store',
+        signal: requestController.signal,
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Client-Info': `evaos-agent/${EVA_DESKTOP_PACKAGE_VERSION}`,
+          ...(options.desktopSession ? { Authorization: `Bearer ${options.desktopSession}` } : {})
+        },
+        body: JSON.stringify(body)
+      }),
+      abortPromise
+    ])
+    try {
+      payload = await Promise.race([response.json(), abortPromise])
+    } catch (error) {
+      if (requestController.signal.aborted) throw error
+      payload = null
+    }
   } catch (error) {
-    if (error?.name === 'AbortError') {
+    if (requestController.signal.aborted || error?.name === 'AbortError') {
       throw new EvaBrokerError('evaOS Agent sign-in timed out.', 408, 'timeout')
     }
     throw new EvaBrokerError('evaOS Agent could not reach Electric Sheep.', null, 'transport-error')
   } finally {
     clearTimeout(timeout)
+    requestController.signal.removeEventListener('abort', abortListener)
     externalSignal?.removeEventListener('abort', abortFromExternal)
   }
 
-  const payload = await response.json().catch(() => null)
   if (!response.ok) {
     const safeMessage =
       payload && typeof payload.error === 'string' && payload.error.length <= 240
@@ -619,6 +680,7 @@ module.exports = {
   evaDesktopCodeChallenge,
   expiresSoon,
   isEvaManagedGatewayMethodBlocked,
+  isEvaManagedGatewayRequestBlocked,
   launchEvaHermesRuntime,
   makeAuthState,
   makeEvaDesktopCodeVerifier,

@@ -15,6 +15,7 @@ const {
   buildEvaManagedWsUrl,
   evaDesktopCodeChallenge,
   isEvaManagedGatewayMethodBlocked,
+  isEvaManagedGatewayRequestBlocked,
   launchEvaHermesRuntime,
   makeEvaDesktopCodeVerifier,
   normalizeHermesEnrollment,
@@ -102,6 +103,29 @@ test('managed gateway policy blocks hidden Nous billing methods and their future
   assert.equal(isEvaManagedGatewayMethodBlocked('plugin.billing-helper.run'), false)
 })
 
+test('managed gateway policy blocks only hidden commands inside supported generic dispatch envelopes', () => {
+  for (const [method, params] of [
+    ['slash.exec', { command: '/subscription change' }],
+    ['slash.exec', { command: 'TOPUP' }],
+    ['command.dispatch', { arg: 'now', name: '/upgrade' }],
+    ['cli.exec', { argv: ['subscription'] }],
+    ['cli.exec', { argv: ['--profile', 'research', 'topup'] }],
+    ['cli.exec', { argv: ['--profile=research', 'upgrade'] }]
+  ]) {
+    assert.equal(isEvaManagedGatewayRequestBlocked(method, params), true)
+  }
+
+  for (const [method, params] of [
+    ['slash.exec', { command: 'my-billing-skill report' }],
+    ['slash.exec', { command: 'status subscription' }],
+    ['command.dispatch', { arg: 'subscription', name: 'status' }],
+    ['cli.exec', { argv: ['sessions', 'rename', 'abc', 'subscription'] }],
+    ['future.dispatch', { command: 'subscription' }]
+  ]) {
+    assert.equal(isEvaManagedGatewayRequestBlocked(method, params), false)
+  }
+})
+
 test('evaOS Agent auth URL carries an S256 challenge and never leaks its verifier', () => {
   const verifier = makeEvaDesktopCodeVerifier({ randomBytes: () => Buffer.alloc(32, 7) })
   const challenge = evaDesktopCodeChallenge(verifier)
@@ -140,6 +164,59 @@ test('broker requests identify the actual Desktop package version', async () => 
   )
 
   assert.equal(clientInfo, `evaos-agent/${desktopPackageVersion}`)
+})
+
+test('broker request deadline covers a stalled response body and exposes no raw transport detail', async () => {
+  let aborted = false
+  const rawDetail = 'socket stalled at internal-broker-host'
+  const request = brokerPost(
+    { action: 'body-stall-probe' },
+    {
+      policy: {
+        brokerUrl: 'https://broker.example.invalid/runtime',
+        brokerRequestTimeoutMs: 15
+      },
+      fetchImpl: async (_url, init) =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(Buffer.from('{"ok":'))
+              init.signal.addEventListener(
+                'abort',
+                () => {
+                  aborted = true
+                  controller.error(Object.assign(new Error(rawDetail), { name: 'AbortError' }))
+                },
+                { once: true }
+              )
+            }
+          }),
+          {
+            status: 200,
+            headers: { 'Content-Type': 'application/json' }
+          }
+        )
+    }
+  )
+
+  let rejection = null
+  const state = await Promise.race([
+    request.then(
+      () => 'resolved',
+      error => {
+        rejection = error
+        return 'rejected'
+      }
+    ),
+    new Promise(resolve => setTimeout(() => resolve('still-pending'), 100))
+  ])
+
+  assert.equal(state, 'rejected')
+  assert.equal(aborted, true)
+  assert.ok(rejection instanceof EvaBrokerError)
+  assert.equal(rejection.statusCode, 408)
+  assert.equal(rejection.code, 'timeout')
+  assert.doesNotMatch(rejection.message, new RegExp(rawDetail))
 })
 
 test('device-code polling treats an unregistered code as pending and then accepts the opaque session', async () => {

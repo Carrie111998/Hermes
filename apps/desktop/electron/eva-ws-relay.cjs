@@ -2,7 +2,11 @@ const crypto = require('node:crypto')
 const http = require('node:http')
 const tls = require('node:tls')
 
-const { buildEvaManagedWsUrl, isEvaManagedGatewayMethodBlocked } = require('./eva-managed.cjs')
+const {
+  buildEvaManagedWsUrl,
+  isEvaManagedGatewayMethodBlocked,
+  isEvaManagedGatewayRequestBlocked
+} = require('./eva-managed.cjs')
 
 const TICKET_TTL_MS = 30_000
 const MAX_UPSTREAM_HEADER_BYTES = 64 * 1024
@@ -15,6 +19,7 @@ const MAX_CLIENT_MESSAGE_BYTES = 384 * 1024 * 1024
 const MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const PLUGIN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const FORBIDDEN_ENDPOINT_QUERY_KEYS = new Set(['eva_session', 'profile', 'session_token', 'ticket', 'token'])
+const GENERIC_DISPATCH_GATEWAY_METHODS = new Set(['cli.exec', 'command.dispatch', 'slash.exec'])
 
 function hasAsciiControl(value) {
   return Array.from(value).some(character => {
@@ -140,30 +145,56 @@ function buildUpgradeRequest(request, upstreamUrl, options = {}) {
 }
 
 // Incrementally inspect top-level JSON-RPC objects (or objects in a root batch)
-// without retaining their params. Strings are captured only when they can be an
-// object key or an eligible object's method value, so a 300+ MiB base64
-// file.attach payload adds only a small, fixed amount of policy memory.
+// without retaining bulk params. Strings are captured only when they can be an
+// object key, an eligible object's method, or a supported generic-dispatch
+// selector, so a 300+ MiB base64 file.attach payload adds only a small, fixed
+// amount of policy memory.
 function createGatewayRpcInspector({ onBlocked, onMethod }) {
   const decoder = new TextDecoder('utf-8')
   const stack = []
   let inString = false
   let escaped = false
-  let captureString = false
+  let captureMode = null
   let capturedString = ''
+  let capturedValue = null
   let captureOverflow = false
   let inPrimitive = false
+
+  const blockRpc = rpc => {
+    if (rpc?.blocked) return
+    if (rpc) {
+      rpc.blocked = true
+      if (rpc.batch) rpc.batch.blocked = true
+    }
+    onBlocked()
+  }
 
   const parentStartsValue = token => {
     const parent = stack.at(-1)
     if (!parent) return
     if (parent.type === 'object' && parent.state === 'value') {
       if (token.type === 'string' && parent.eligible && parent.key === 'method' && typeof token.value === 'string') {
-        if (isEvaManagedGatewayMethodBlocked(token.value)) onBlocked()
-        else onMethod(token.value)
+        parent.rpc.method = token.value
+        if (isEvaManagedGatewayMethodBlocked(token.value)) blockRpc(parent.rpc)
+        else if (!GENERIC_DISPATCH_GATEWAY_METHODS.has(token.value)) {
+          parent.rpc.released = true
+          if (parent.rpc.batch) parent.rpc.batch.releasePending = true
+          else onMethod(token.value)
+        }
+      } else if (
+        token.type === 'string' &&
+        parent.role === 'params' &&
+        (parent.key === 'command' || parent.key === 'name') &&
+        typeof token.value === 'string'
+      ) {
+        parent.rpc.params[parent.key] = token.value
       }
       parent.key = null
       parent.state = 'commaOrEnd'
     } else if (parent.type === 'array' && parent.state === 'valueOrEnd') {
+      if (parent.role === 'argv' && token.type === 'string' && typeof token.value === 'string') {
+        parent.rpc.params.argv.push(token.value)
+      }
       parent.state = 'commaOrEnd'
     }
   }
@@ -174,21 +205,45 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
     if (token.type === '{') {
       const eligible =
         stack.length === 0 || (stack.length === 1 && parent?.type === 'array' && parent.rootBatch === true)
+      const valueKey = parent?.type === 'object' && parent.state === 'value' ? parent.key : null
+      const rpc = eligible
+        ? {
+            batch: parent?.rootBatch === true ? parent : null,
+            blocked: false,
+            method: null,
+            params: {},
+            released: false
+          }
+        : (parent?.rpc ?? null)
+      const role = parent?.eligible && valueKey === 'params' ? 'params' : null
       parentStartsValue(token)
-      stack.push({ eligible, key: null, state: 'keyOrEnd', type: 'object' })
+      stack.push({ eligible, key: null, role, rpc, state: 'keyOrEnd', type: 'object' })
       return
     }
     if (token.type === '[') {
       const rootBatch = stack.length === 0
+      const valueKey = parent?.type === 'object' && parent.state === 'value' ? parent.key : null
+      const rpc = parent?.rpc ?? null
+      const role = parent?.role === 'params' && valueKey === 'argv' ? 'argv' : null
+      if (role === 'argv') rpc.params.argv = []
       parentStartsValue(token)
-      stack.push({ rootBatch, state: 'valueOrEnd', type: 'array' })
+      stack.push({ blocked: false, releasePending: false, role, rootBatch, rpc, state: 'valueOrEnd', type: 'array' })
       return
     }
     if (!parent) return
 
     if (parent.type === 'object') {
       if (token.type === '}' && (parent.state === 'keyOrEnd' || parent.state === 'commaOrEnd')) {
-        stack.pop()
+        const completed = stack.pop()
+        if (completed.eligible && !completed.rpc.blocked) {
+          if (isEvaManagedGatewayRequestBlocked(completed.rpc.method, completed.rpc.params)) {
+            blockRpc(completed.rpc)
+          } else if (!completed.rpc.released && typeof completed.rpc.method === 'string') {
+            completed.rpc.released = true
+            if (completed.rpc.batch) completed.rpc.batch.releasePending = true
+            else onMethod(completed.rpc.method)
+          }
+        }
       } else if (parent.state === 'keyOrEnd' && token.type === 'string') {
         parent.key = token.value
         parent.state = 'colon'
@@ -203,7 +258,8 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
     }
 
     if (token.type === ']' && (parent.state === 'valueOrEnd' || parent.state === 'commaOrEnd')) {
-      stack.pop()
+      const completed = stack.pop()
+      if (completed.rootBatch && completed.releasePending && !completed.blocked) onMethod('batch')
     } else if (parent.state === 'valueOrEnd') {
       parentStartsValue(token)
     } else if (parent.state === 'commaOrEnd' && token.type === ',') {
@@ -211,17 +267,48 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
     }
   }
 
-  const shouldCaptureString = () => {
+  const stringCaptureMode = () => {
     const parent = stack.at(-1)
-    return (
-      parent?.type === 'object' &&
-      (parent.state === 'keyOrEnd' || (parent.state === 'value' && parent.eligible && parent.key === 'method'))
-    )
+    if (parent?.type === 'object') {
+      if (parent.state === 'keyOrEnd' || (parent.state === 'value' && parent.eligible && parent.key === 'method')) {
+        return 'full'
+      }
+      if (parent.state === 'value' && parent.role === 'params' && (parent.key === 'command' || parent.key === 'name')) {
+        return 'command'
+      }
+    }
+    if (parent?.type === 'array' && parent.role === 'argv' && parent.state === 'valueOrEnd') return 'full'
+    return null
+  }
+
+  const captureCommandPrefix = () => {
+    let decoded
+    try {
+      decoded = JSON.parse(`"${capturedString}"`)
+    } catch {
+      return
+    }
+
+    const normalized = decoded.trimStart().replace(/^\/+/, '')
+    if (!normalized) {
+      capturedString = ''
+      return
+    }
+    const separator = normalized.search(/\s/)
+    if (separator >= 0) {
+      capturedValue = normalized.slice(0, separator)
+      capturedString = ''
+    } else if (normalized.length > 128) {
+      // Hidden managed command names are short. Once a first token exceeds
+      // this bound it cannot later become one, so stop retaining it.
+      capturedValue = normalized.slice(0, 129)
+      capturedString = ''
+    }
   }
 
   const finishString = () => {
-    let value = null
-    if (captureString && !captureOverflow) {
+    let value = capturedValue
+    if (value === null && captureMode && !captureOverflow) {
       try {
         value = JSON.parse(`"${capturedString}"`)
       } catch {
@@ -231,8 +318,9 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
     consumeToken({ type: 'string', value })
     inString = false
     escaped = false
-    captureString = false
+    captureMode = null
     capturedString = ''
+    capturedValue = null
     captureOverflow = false
   }
 
@@ -240,8 +328,10 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
     for (let index = 0; index < text.length; index += 1) {
       const character = text[index]
       if (inString) {
-        if (captureString && !captureOverflow) {
+        const terminatesString = !escaped && character === '"'
+        if (captureMode && capturedValue === null && !captureOverflow && !terminatesString) {
           capturedString += character
+          if (captureMode === 'command') captureCommandPrefix()
           if (capturedString.length > 512) {
             capturedString = ''
             captureOverflow = true
@@ -252,7 +342,6 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
         } else if (character === '\\') {
           escaped = true
         } else if (character === '"') {
-          if (captureString && !captureOverflow) capturedString = capturedString.slice(0, -1)
           finishString()
         }
         continue
@@ -269,8 +358,9 @@ function createGatewayRpcInspector({ onBlocked, onMethod }) {
       if (/\s/.test(character)) continue
       if (character === '"') {
         inString = true
-        captureString = shouldCaptureString()
+        captureMode = stringCaptureMode()
         capturedString = ''
+        capturedValue = null
         captureOverflow = false
       } else if ('{}[]:,'.includes(character)) {
         consumeToken({ type: character })
