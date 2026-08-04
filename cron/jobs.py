@@ -954,6 +954,7 @@ def create_job(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: bool = False,
+    start_paused: bool = False,
     attach_to_session: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """
@@ -999,6 +1000,8 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        start_paused: When True, persist the new job atomically as disabled and
+                paused. It cannot fire before an explicit resume.
 
     Returns:
         The created job dict
@@ -1030,6 +1033,7 @@ def create_job(
     normalized_toolsets = normalized_toolsets or None
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
+    normalized_start_paused = bool(start_paused)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
 
     # no_agent jobs are meaningless without a script — the script IS the job.
@@ -1105,10 +1109,10 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
-        "paused_reason": None,
+        "enabled": not normalized_start_paused,
+        "state": "paused" if normalized_start_paused else "scheduled",
+        "paused_at": now if normalized_start_paused else None,
+        "paused_reason": "created paused" if normalized_start_paused else None,
         "created_at": now,
         "next_run_at": next_run_at,
         "last_run_at": None,

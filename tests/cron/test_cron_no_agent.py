@@ -12,6 +12,9 @@ Covers:
 from __future__ import annotations
 
 import json
+import os
+import sys
+import venv
 from unittest.mock import patch
 
 import pytest
@@ -77,6 +80,23 @@ def test_create_job_default_is_not_no_agent(hermes_env):
     assert job.get("no_agent") is False
 
 
+def test_create_job_can_persist_atomically_paused(hermes_env):
+    from cron.jobs import create_job, get_job
+
+    job = create_job(
+        prompt="hold",
+        schedule="0 0 1 1 *",
+        deliver="local",
+        start_paused=True,
+    )
+    persisted = get_job(job["id"])
+    assert persisted is not None
+    assert persisted["enabled"] is False
+    assert persisted["state"] == "paused"
+    assert persisted["paused_at"]
+    assert persisted["paused_reason"] == "created paused"
+
+
 def test_update_job_roundtrips_no_agent_flag(hermes_env):
     from cron.jobs import create_job, update_job, get_job
 
@@ -126,6 +146,23 @@ def test_cronjob_tool_create_no_agent_with_script_succeeds(hermes_env):
     assert result.get("success") is True
     assert result["job"]["no_agent"] is True
     assert result["job"]["script"] == "alert.sh"
+
+
+def test_cronjob_tool_create_can_start_paused(hermes_env):
+    from tools.cronjob_tools import cronjob
+
+    result = json.loads(
+        cronjob(
+            action="create",
+            schedule="0 0 1 1 *",
+            prompt="hold",
+            deliver="local",
+            start_paused=True,
+        )
+    )
+    assert result.get("success") is True
+    assert result["job"]["enabled"] is False
+    assert result["job"]["state"] == "paused"
 
 
 def test_cronjob_tool_update_toggles_no_agent(hermes_env):
@@ -333,10 +370,12 @@ def test_run_job_script_isolated_python_ignores_startup_environment(
         "print('UNREVIEWED_PYTHON_STARTUP')\n", encoding="utf-8"
     )
     monkeypatch.setenv("PYTHONPATH", str(poison))
+
     script_path = hermes_env / "scripts" / "report.isolated.py"
     script_path.write_text(
         "import os\n"
         "assert 'PYTHONPATH' not in os.environ\n"
+
         "print('ISOLATED_PYTHON_OK')\n",
         encoding="utf-8",
     )
@@ -344,6 +383,55 @@ def test_run_job_script_isolated_python_ignores_startup_environment(
     ok, output = _run_job_script("report.isolated.py")
     assert ok is True
     assert output == "ISOLATED_PYTHON_OK"
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="macOS launcher variable")
+def test_run_job_script_isolated_python_ignores_macos_venv_launcher(
+    hermes_env, tmp_path, monkeypatch
+):
+    """macOS's launcher override must not select an unreviewed venv."""
+    from cron.scheduler import _run_job_script
+
+    poison_venv = tmp_path / "poison-venv"
+    venv.EnvBuilder(with_pip=False).create(poison_venv)
+    site_packages = next((poison_venv / "lib").glob("python*/site-packages"))
+    (site_packages / "sitecustomize.py").write_text(
+        "import os\n"
+        "print('UNREVIEWED_PYVENV_STARTUP', flush=True)\n"
+        "os._exit(0)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("__PYVENV_LAUNCHER__", str(poison_venv / "bin/python"))
+    script_path = hermes_env / "scripts" / "report.isolated.py"
+    script_path.write_text("print('ISOLATED_PYTHON_OK')\n", encoding="utf-8")
+
+    ok, output = _run_job_script("report.isolated.py")
+    assert ok is True
+    assert output == "ISOLATED_PYTHON_OK"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="symlink semantics differ on Windows")
+def test_run_job_script_isolated_symlink_cannot_downgrade_startup_isolation(
+    hermes_env, tmp_path, monkeypatch
+):
+    """The configured trust-marker suffix must survive in-tree resolution."""
+    from cron.scheduler import _run_job_script
+
+    poison = tmp_path / "poison"
+    poison.mkdir()
+    (poison / "sitecustomize.py").write_text(
+        "print('UNREVIEWED_PYTHON_STARTUP')\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("PYTHONPATH", str(poison))
+
+    scripts = hermes_env / "scripts"
+    target = scripts / "target.py"
+    target.write_text("print('ISOLATED_SYMLINK_OK')\n", encoding="utf-8")
+    (scripts / "alias.isolated.py").symlink_to(target.name)
+
+    ok, output = _run_job_script("alias.isolated.py")
+    assert ok is True
+    assert output == "ISOLATED_SYMLINK_OK"
 
 
 def test_run_job_script_path_traversal_still_blocked(hermes_env):

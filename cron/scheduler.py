@@ -2048,6 +2048,10 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     scripts_dir_resolved = scripts_dir.resolve()
 
     raw = Path(script_path).expanduser()
+    # The trust-marker suffix belongs to the configured job path.  Derive it
+    # before resolving symlinks so an in-tree alias cannot silently downgrade
+    # isolated startup to ordinary Python semantics.
+    isolated_python = raw.name.lower().endswith(".isolated.py")
     if raw.is_absolute():
         path = raw.resolve()
     else:
@@ -2077,8 +2081,9 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     # shebang: the scripts dir is trusted, but keeping the interpreter
     # choice explicit here keeps the allowed surface small and auditable.
     suffix = path.suffix.lower()
-    isolated_python = path.name.lower().endswith(".isolated.py")
-    if suffix in {".sh", ".bash"}:
+    if isolated_python:
+        argv = [sys.executable, "-I", "-B", str(path)]
+    elif suffix in {".sh", ".bash"}:
         # Resolve bash dynamically so Windows (Git Bash) and Linux/macOS
         # all work.  On native Windows without Git for Windows installed
         # shutil.which returns None — fall back to a clear error rather
@@ -2095,10 +2100,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             )
         argv = [_bash, str(path)]
     else:
-        argv = [sys.executable]
-        if isolated_python:
-            argv.extend(["-I", "-B"])
-        argv.append(str(path))
+        argv = [sys.executable, str(path)]
 
     try:
         from tools.environments.local import _sanitize_subprocess_env
@@ -2112,7 +2114,12 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
                     or key.startswith("BASH_FUNC_")
                     or key.startswith("LD_")
                     or key.startswith("DYLD_")
-                    or key in {"BASH_ENV", "ENV"}
+                    or key in {
+                        "__PYVENV_LAUNCHER__",
+                        "BASH_ENV",
+                        "ENV",
+                        "VIRTUAL_ENV",
+                    }
                 ):
                     run_env.pop(key, None)
         result = subprocess.run(

@@ -67,6 +67,13 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--paused",
+        dest="start_paused",
+        action="store_true",
+        default=False,
+        help="Persist the new job atomically paused; it cannot fire until explicitly resumed.",
+    )
+    cron_create.add_argument(
         "--workdir",
         help="Absolute path for the job to run from. Injects AGENTS.md / CLAUDE.md / .cursorrules from that directory and uses it as the cwd for terminal/file/code_exec tools. Omit to preserve old behaviour (no project context files).",
     )

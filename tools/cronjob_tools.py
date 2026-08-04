@@ -676,6 +676,7 @@ def cronjob(
     enabled_toolsets: Optional[List[str]] = None,
     workdir: Optional[str] = None,
     no_agent: Optional[bool] = None,
+    start_paused: bool = False,
     attach_to_session: Optional[bool] = None,
     task_id: str = None,
 ) -> str:
@@ -749,6 +750,7 @@ def cronjob(
                 enabled_toolsets=enabled_toolsets or None,
                 workdir=_normalize_optional_job_value(workdir),
                 no_agent=_no_agent,
+                start_paused=bool(start_paused),
                 attach_to_session=attach_to_session,
             )
             _notify_provider_jobs_changed_safe()

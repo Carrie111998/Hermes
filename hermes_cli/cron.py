@@ -310,6 +310,7 @@ def cron_create(args):
         script=getattr(args, "script", None),
         workdir=getattr(args, "workdir", None),
         no_agent=getattr(args, "no_agent", False) or None,
+        start_paused=getattr(args, "start_paused", False),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
@@ -326,8 +327,11 @@ def cron_create(args):
         print("  Mode: no-agent (script stdout delivered directly)")
     if job_data.get("workdir"):
         print(f"  Workdir: {job_data['workdir']}")
-    print(f"  Next run: {result['next_run_at']}")
-    _warn_if_gateway_not_running()
+    if job_data.get("state") == "paused" or not job_data.get("enabled", True):
+        print("  State: paused (explicit resume required)")
+    else:
+        print(f"  Next run: {result['next_run_at']}")
+        _warn_if_gateway_not_running()
     return 0
 
 
