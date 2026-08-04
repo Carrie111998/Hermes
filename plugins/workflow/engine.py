@@ -2830,6 +2830,10 @@ class WorkflowEngine:
                                 session_info=_session_info)
                 self._update_execution(workflow.run_id, status="completed",
                                       current_layer=len(layers) - 1)
+                # Mark terminal state so auto-resume can re-open this run
+                # when a card is manually reset to ready.
+                self._clear_state(workflow_name, run_id=workflow.run_id,
+                                  final_status="completed")
 
                 # Fire completion notification for simple (no-loop) workflows
                 self._fire_completion_notification(workflow_name, workflow, states, layers, len(layers) - 1, context, session_info=_session_info)
