@@ -76,6 +76,8 @@ export function useGatewayBoot({
   refreshSessions
 }: GatewayBootOptions) {
   const navigate = useNavigate()
+  const navigateRef = useRef(navigate)
+  navigateRef.current = navigate
 
   const callbacksRef = useRef({
     beforeConnectionSwitch,
@@ -564,7 +566,7 @@ export function useGatewayBoot({
               running: false
             })
             setSessionsLoading(false)
-            navigate(`${SETTINGS_ROUTE}?tab=gateway`, { replace: true })
+            navigateRef.current(`${SETTINGS_ROUTE}?tab=gateway`, { replace: true })
 
             return
           }
@@ -655,5 +657,5 @@ export function useGatewayBoot({
       setPrimaryGateway(null)
       $gateway.set(null)
     }
-  }, [navigate])
+  }, [])
 }

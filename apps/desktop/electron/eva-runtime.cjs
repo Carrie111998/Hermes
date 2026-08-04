@@ -465,9 +465,40 @@ function createEvaManagedRuntime(options) {
     }
   }
 
+  async function requestMedia(request, retry = true) {
+    if (typeof options.fetchMedia !== 'function') {
+      throw new EvaBrokerError('Managed media streaming is unavailable.', 501, 'managed-media-unavailable')
+    }
+
+    const runtime = await ensureRuntimeEnrollment()
+    const allowed = assertEvaManagedApiRequestAllowed({
+      method: 'GET',
+      path: request?.path,
+      profile: request?.profile
+    })
+    if (allowed.pathname !== '/api/files/download') {
+      throw new EvaBrokerError('Managed media streaming blocked an unsupported endpoint.', 403, 'managed-policy')
+    }
+
+    const response = await options.fetchMedia(`${runtime.baseUrl}${allowed.path}`, runtime.token, request?.headers)
+    if (retry && response?.status === 401) {
+      clearRuntimeEnrollment()
+      const refreshed = await ensureRuntimeEnrollment({ force: true })
+      const next = assertEvaManagedApiRequestAllowed({
+        method: 'GET',
+        path: request?.path,
+        profile: request?.profile
+      })
+      return options.fetchMedia(`${refreshed.baseUrl}${next.path}`, refreshed.token, request?.headers)
+    }
+    return response
+  }
+
   async function close() {
     invalidateAuthWork()
-    await wsRelay?.close()
+    const relay = wsRelay
+    wsRelay = null
+    await relay?.close()
     rememberLog('[eva-managed] local relay closed')
   }
 
@@ -484,6 +515,7 @@ function createEvaManagedRuntime(options) {
       })
     },
     requestApi,
+    requestMedia,
     resolveBackend,
     signIn: async () => {
       const status = await signIn()

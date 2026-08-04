@@ -256,9 +256,25 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // the call; each pooled backend already has its own HERMES_HOME, so no backend
 // change is needed. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
+const apiProfileListeners = new Set<(profile: null | string) => void>()
 
 export function setApiRequestProfile(profile: null | string): void {
-  _apiProfile = profile || null
+  const next = profile || null
+
+  if (_apiProfile === next) {
+    return
+  }
+
+  _apiProfile = next
+  for (const listener of apiProfileListeners) {
+    listener(next)
+  }
+}
+
+export function subscribeApiRequestProfile(listener: (profile: null | string) => void): () => void {
+  apiProfileListeners.add(listener)
+
+  return () => apiProfileListeners.delete(listener)
 }
 
 function profileScoped(profile?: null | string): { profile?: string } {
@@ -335,29 +351,79 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
   const endpointPath = `/api/plugins/${pluginId}${suffix}`
 
   let socket: null | WebSocket = null
+  let reconnectTimer: null | number = null
   let disposed = false
   let attempt = 0
+  let generation = 0
+
+  const clearReconnectTimer = () => {
+    if (reconnectTimer !== null) {
+      window.clearTimeout(reconnectTimer)
+      reconnectTimer = null
+    }
+  }
+
+  const scheduleReconnect = (immediate = false) => {
+    if (disposed || reconnectTimer !== null) {
+      return
+    }
+
+    const delay = immediate
+      ? 0
+      : reconnectBackoffDelayMs(attempt, {
+          baseDelayMs: 500,
+          capMs: 30_000
+        })
+
+    if (!immediate) attempt += 1
+    reconnectTimer = window.setTimeout(() => {
+      reconnectTimer = null
+      void connect()
+    }, delay)
+  }
 
   const connect = async () => {
+    const connectingGeneration = generation
     const desktop = window.hermesDesktop
     const profile = getApiRequestProfile()
     const connection = await desktop?.getConnection(profile).catch(() => null)
 
-    if (disposed || !desktop || !connection) {
+    if (disposed || connectingGeneration !== generation) {
+      return
+    }
+    if (!desktop || !connection) {
+      scheduleReconnect()
       return
     }
 
-    const wsUrl = await resolveGatewayWsUrl(desktop, connection, endpointPath).catch(() => null)
+    // Managed loopback tickets are single-use and endpoint-bound. Falling back
+    // to the cached core-gateway URL after a broker failure would either reuse
+    // a stale ticket or retarget a credential minted for another endpoint.
+    let wsUrl: null | string = null
 
-    if (disposed || !wsUrl) {
+    if (connection.baseUrl.startsWith('eva-managed://')) {
+      const result = await desktop.getGatewayWsUrl?.(profile, endpointPath).catch(() => null)
+      wsUrl = typeof result === 'string' ? result : result?.ok ? result.wsUrl : null
+    } else {
+      wsUrl = await resolveGatewayWsUrl(desktop, connection, endpointPath).catch(() => null)
+    }
+
+    if (disposed || connectingGeneration !== generation) {
+      return
+    }
+    if (!wsUrl) {
+      scheduleReconnect()
       return
     }
 
-    socket = new WebSocket(wsUrl)
+    const nextSocket = new WebSocket(wsUrl)
+    socket = nextSocket
 
-    socket.onmessage = event => {
-      attempt = 0
+    nextSocket.onopen = () => {
+      if (socket === nextSocket) attempt = 0
+    }
 
+    nextSocket.onmessage = event => {
       try {
         onMessage(JSON.parse(String(event.data)))
       } catch {
@@ -365,25 +431,33 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       }
     }
 
-    socket.onclose = () => {
+    nextSocket.onclose = () => {
+      if (socket !== nextSocket) return
       socket = null
-
-      if (!disposed) {
-        // Full-jitter exponential backoff: same rationale as the gateway
-        // socket reconnect loops — an immediate-retry loop across many
-        // desktop clients floods the gateway with connection attempts
-        // during a restart.
-        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
-        attempt += 1
-      }
+      scheduleReconnect()
     }
   }
+
+  const unsubscribeProfile = subscribeApiRequestProfile(() => {
+    generation += 1
+    attempt = 0
+    clearReconnectTimer()
+    const previous = socket
+    socket = null
+    previous?.close()
+    scheduleReconnect(true)
+  })
 
   void connect()
 
   return () => {
     disposed = true
-    socket?.close()
+    generation += 1
+    unsubscribeProfile()
+    clearReconnectTimer()
+    const previous = socket
+    socket = null
+    previous?.close()
   }
 }
 

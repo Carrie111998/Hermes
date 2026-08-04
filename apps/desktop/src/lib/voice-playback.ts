@@ -96,7 +96,7 @@ export function stopVoicePlayback() {
 // instead of after full synthesis + base64 transfer.
 // ---------------------------------------------------------------------------
 
-async function resolveSpeakStreamUrl(): Promise<null | string> {
+export async function resolveSpeakStreamUrl(): Promise<null | string> {
   const desktop = window.hermesDesktop
 
   if (!desktop?.getConnection) {
@@ -113,7 +113,7 @@ async function resolveSpeakStreamUrl(): Promise<null | string> {
 
     const url = new URL(wsUrl)
 
-    if (!url.pathname.endsWith('/api/audio/speak-stream')) {
+    if (url.pathname !== '/api/audio/speak-stream') {
       return null
     }
 

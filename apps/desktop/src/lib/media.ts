@@ -92,7 +92,22 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
   }
 
   if (window.hermesDesktop && ['audio', 'video'].includes(mediaKind(path))) {
-    return isRemoteGateway() ? mediaExternalUrl(path) : mediaStreamUrl(path)
+    if (isRemoteGateway()) {
+      const connection = $connection.get()
+
+      if (connection?.baseUrl?.startsWith('eva-managed://') && window.hermesDesktop.getMediaStreamUrl) {
+        const streamUrl = await window.hermesDesktop.getMediaStreamUrl(
+          filePathFromMediaPath(path),
+          connection.profile ?? null
+        )
+
+        if (streamUrl) return streamUrl
+      }
+
+      return mediaExternalUrl(path)
+    }
+
+    return mediaStreamUrl(path)
   }
 
   return resolveMediaDisplaySrc(path)

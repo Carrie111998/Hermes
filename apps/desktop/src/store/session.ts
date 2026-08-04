@@ -176,6 +176,11 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
   if (configured) {
     const { cwd } = await sanitize(configured)
+    if ($connection.get()?.mode === 'remote') {
+      alignRemoteWorkspace()
+
+      return
+    }
     seedLiveCwd(cwd)
 
     return
@@ -183,6 +188,11 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
 
   if (remembered) {
     const { cwd } = await sanitize(remembered)
+    if ($connection.get()?.mode === 'remote') {
+      alignRemoteWorkspace()
+
+      return
+    }
     seedLiveCwd(cwd)
   }
 }

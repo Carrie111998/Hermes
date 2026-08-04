@@ -128,6 +128,8 @@ declare global {
       readFileDataUrl: (filePath: string) => Promise<string>
       /** Remote non-image attach: higher dedicated cap than preview/Settings default. */
       readFileDataUrlForAttach?: (filePath: string) => Promise<string>
+      /** Main-process authenticated, seekable managed-remote audio/video URL. */
+      getMediaStreamUrl?: (filePath: string, profile?: null | string) => Promise<null | string>
       /** Settings → Chat: max size for local files loaded as data URLs (attach/preview). */
       dataUrlReadMax?: {
         get: () => Promise<{ defaultMaxMb: number; maxBytes: number; maxMb: number }>

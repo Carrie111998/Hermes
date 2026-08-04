@@ -512,6 +512,65 @@ test('a stale in-flight launch cannot restore backoff after auth invalidation', 
   assert.equal(backend.baseUrl, 'eva-managed://customer-one')
 })
 
+test('closing the runtime drops the cached relay before a later reconnect', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-relay-reopen-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  let relays = 0
+  const closed = []
+  const runtime = makeManagedRuntime(statePath, {
+    createWsRelay: () => {
+      const id = ++relays
+      return {
+        mintTicket: async () => `ws://127.0.0.1:${12_000 + id}/managed`,
+        disconnectAll: () => undefined,
+        close: async () => closed.push(id)
+      }
+    }
+  })
+
+  const first = await runtime.resolveBackend()
+  await runtime.close()
+  const second = await runtime.resolveBackend()
+
+  assert.equal(relays, 2)
+  assert.deepEqual(closed, [1])
+  assert.notEqual(first.wsUrl, second.wsUrl)
+})
+
+test('managed media keeps Range and runtime credentials in the main-process fetch seam', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-media-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  const calls = []
+  const response = { status: 206 }
+  const runtime = makeManagedRuntime(statePath, {
+    fetchMedia: async (url, token, headers) => {
+      calls.push({ headers, token, url })
+      return response
+    }
+  })
+
+  const result = await runtime.requestMedia({
+    headers: { range: 'bytes=100-199' },
+    path: '/api/files/download?path=%2Fsrv%2Frender.mp4',
+    profile: 'research'
+  })
+
+  assert.equal(result, response)
+  assert.deepEqual(calls, [
+    {
+      headers: { range: 'bytes=100-199' },
+      token: 'runtime-token',
+      url: 'https://hermes-customer-one.ecs.electricsheephq.com/api/files/download?path=%2Fsrv%2Frender.mp4&profile=research'
+    }
+  ])
+})
+
 test('a runtime 401 clears older transient backoff before requiring sign-in', async t => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-sign-in-backoff-'))
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }))

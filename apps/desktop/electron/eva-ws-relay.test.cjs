@@ -3,7 +3,7 @@ const net = require('node:net')
 const { Duplex } = require('node:stream')
 const test = require('node:test')
 
-const { TICKET_TTL_MS, createEvaWsRelay } = require('./eva-ws-relay.cjs')
+const { TICKET_TTL_MS, connectTls, createEvaWsRelay } = require('./eva-ws-relay.cjs')
 
 const BASE_URL = 'https://hermes-jackie-david.ecs.electricsheephq.com'
 
@@ -214,6 +214,27 @@ test('validated plugin tickets preserve the namespaced path and query upstream',
   assert.match(upstream.observed(), /^Sec-WebSocket-Extensions: permessage-deflate$/im)
 })
 
+test('plugin endpoint path replacement characters stay literal upstream', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const result = await upgrade(await relay.mintTicket({ path: '/api/plugins/kanban/$&events' }))
+  assert.match(result.response, /^HTTP\/1\.1 101/)
+  result.socket.destroy()
+
+  const requestLine = upstream.observed().split('\r\n', 1)[0]
+  const upstreamUrl = new URL(`https://upstream.invalid${requestLine.split(' ')[1]}`)
+  assert.equal(upstreamUrl.pathname, '/api/plugins/kanban/$&events')
+})
+
 test('relay only mints supported core and plugin WebSocket endpoints', async t => {
   const relay = createEvaWsRelay({
     getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
@@ -330,7 +351,7 @@ test('relay passes an unknown future gateway RPC frame through unchanged', async
   result.socket.destroy()
 })
 
-test('relay preserves fragmented binary gateway traffic and rejects fragmented text', async t => {
+test('relay preserves fragmented binary and allowed text while denying a fragmented blocked RPC', async t => {
   const upstream = fakeUpstream()
   await upstream.start()
   const relay = createEvaWsRelay({
@@ -352,15 +373,54 @@ test('relay preserves fragmented binary gateway traffic and rejects fragmented t
   assert.deepEqual(upstream.tunneled(), fragments)
   binary.socket.destroy()
 
-  const text = await upgrade(await relay.mintTicket())
-  text.socket.write(
-    clientFrame('{"id":1,"jsonrpc":"2.0","method":"billing.state"', {
-      fin: false,
-      opcode: 0x1
-    })
+  const allowed = await upgrade(await relay.mintTicket())
+  const allowedFragments = Buffer.concat([
+    clientFrame('{"id":1,"jsonrpc":"2.0","method":"future.', { fin: false, opcode: 0x1 }),
+    clientFrame('gateway.rpc","params":{"value":"ok"}}', { opcode: 0x0 })
+  ])
+  allowed.socket.write(allowedFragments)
+  await waitForTunnel(upstream, fragments.length + allowedFragments.length)
+  assert.deepEqual(upstream.tunneled(), Buffer.concat([fragments, allowedFragments]))
+  allowed.socket.destroy()
+
+  const blocked = await upgrade(await relay.mintTicket())
+  blocked.socket.write(
+    Buffer.concat([
+      clientFrame('{"id":1,"jsonrpc":"2.0","method":"billing.', { fin: false, opcode: 0x1 }),
+      clientFrame('state","params":{}}', { opcode: 0x0 })
+    ])
   )
-  await waitForClose(text.socket)
-  assert.deepEqual(upstream.tunneled(), fragments)
+  await waitForClose(blocked.socket)
+  assert.deepEqual(upstream.tunneled(), Buffer.concat([fragments, allowedFragments]))
+})
+
+test('relay streams a multi-megabyte file.attach frame without changing its bytes', async t => {
+  const upstream = fakeUpstream()
+  await upstream.start()
+  const relay = createEvaWsRelay({
+    connectUpstream: () => upstream.connect(),
+    getUpstream: async () => ({ baseUrl: BASE_URL, token: 'runtime-secret' })
+  })
+  t.after(async () => {
+    await relay.close()
+    await upstream.stop()
+  })
+
+  const result = await upgrade(await relay.mintTicket())
+  const payload = JSON.stringify({
+    id: 1,
+    jsonrpc: '2.0',
+    method: 'file.attach',
+    params: { content: 'A'.repeat(8 * 1024 * 1024), filename: 'large.bin' }
+  })
+  const frame = clientFrame(payload)
+  for (let offset = 0; offset < frame.length; offset += 32 * 1024) {
+    result.socket.write(frame.subarray(offset, offset + 32 * 1024))
+  }
+
+  await waitForTunnel(upstream, frame.length)
+  assert.deepEqual(upstream.tunneled(), frame)
+  result.socket.destroy()
 })
 
 test('an upstream authentication rejection invalidates the managed enrollment', async t => {
@@ -397,6 +457,22 @@ test('an upstream connection that never completes fails within the setup deadlin
   const result = await upgrade(await relay.mintTicket())
   assert.match(result.response, /^HTTP\/1\.1 502/)
   result.socket.destroy()
+})
+
+test('the default TLS connector destroys a blackholed handshake at its deadline', async () => {
+  class PendingTlsSocket extends Duplex {
+    _read() {}
+    _write(_chunk, _encoding, callback) {
+      callback()
+    }
+  }
+
+  const socket = new PendingTlsSocket()
+  await assert.rejects(
+    connectTls(new URL(BASE_URL), 10, () => socket),
+    error => error?.code === 'ETIMEDOUT'
+  )
+  assert.equal(socket.destroyed, true)
 })
 
 test('an upstream reset after the WebSocket handshake closes the relay without crashing', async t => {

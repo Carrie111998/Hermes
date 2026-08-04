@@ -7,12 +7,17 @@ class FakeWebSocket {
 
   onclose: null | (() => void) = null
   onmessage: null | ((event: { data: unknown }) => void) = null
+  onopen: null | (() => void) = null
+  closed = false
 
   constructor(readonly url: string) {
     FakeWebSocket.opened.push(this)
   }
 
-  close(): void {}
+  close(): void {
+    this.closed = true
+    this.onclose?.()
+  }
 }
 
 describe('pluginSocket', () => {
@@ -25,7 +30,8 @@ describe('pluginSocket', () => {
   }))
 
   const getGatewayWsUrl = vi.fn(
-    async (_profile: null | string, endpointPath: string) => `ws://127.0.0.1:4123${endpointPath}&ticket=fresh`
+    async (_profile: null | string, endpointPath: string) =>
+      `ws://127.0.0.1:4123${endpointPath}${endpointPath.includes('?') ? '&' : '?'}ticket=fresh`
   )
 
   beforeEach(() => {
@@ -35,11 +41,23 @@ describe('pluginSocket', () => {
       getConnection,
       getGatewayWsUrl
     }
-    getConnection.mockClear()
-    getGatewayWsUrl.mockClear()
+    getConnection.mockReset()
+    getConnection.mockImplementation(async profile => ({
+      authMode: 'token',
+      baseUrl: 'eva-managed://customer-one',
+      profile,
+      token: '',
+      wsUrl: 'ws://127.0.0.1:4123/api/ws?ticket=stale'
+    }))
+    getGatewayWsUrl.mockReset()
+    getGatewayWsUrl.mockImplementation(
+      async (_profile, endpointPath) =>
+        `ws://127.0.0.1:4123${endpointPath}${endpointPath.includes('?') ? '&' : '?'}ticket=fresh`
+    )
   })
 
   afterEach(() => {
+    vi.useRealTimers()
     setApiRequestProfile(null)
     delete (window as { hermesDesktop?: unknown }).hermesDesktop
     vi.unstubAllGlobals()
@@ -59,5 +77,34 @@ describe('pluginSocket', () => {
   it('rejects plugin ids that could escape their namespace', () => {
     expect(() => pluginSocket('../other', '/events', vi.fn())).toThrow(/invalid plugin id/)
     expect(getGatewayWsUrl).not.toHaveBeenCalled()
+  })
+
+  it('closes the old socket and reconnects immediately for the new active profile', async () => {
+    setApiRequestProfile('research')
+    const dispose = pluginSocket('kanban', '/events', vi.fn())
+    await vi.waitFor(() => expect(getGatewayWsUrl).toHaveBeenCalledTimes(1))
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toHaveLength(1))
+
+    setApiRequestProfile('operations')
+    expect(FakeWebSocket.opened[0].closed).toBe(true)
+    await vi.waitFor(() => expect(FakeWebSocket.opened).toHaveLength(2))
+    expect(getConnection.mock.calls.map(call => call[0])).toEqual(['research', 'operations'])
+    expect(getGatewayWsUrl.mock.calls.at(-1)?.[0]).toBe('operations')
+    dispose()
+  })
+
+  it('keeps retrying when connection or endpoint-ticket minting fails before a socket exists', async () => {
+    vi.useFakeTimers()
+    getGatewayWsUrl.mockRejectedValueOnce(new Error('ticket broker unavailable'))
+    const dispose = pluginSocket('kanban', '/events', vi.fn())
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(getGatewayWsUrl).toHaveBeenCalledTimes(1)
+    expect(FakeWebSocket.opened).toHaveLength(0)
+    await vi.advanceTimersByTimeAsync(500)
+
+    expect(getGatewayWsUrl).toHaveBeenCalledTimes(2)
+    expect(FakeWebSocket.opened).toHaveLength(1)
+    dispose()
   })
 })

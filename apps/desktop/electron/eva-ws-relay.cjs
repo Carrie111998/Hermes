@@ -7,6 +7,11 @@ const { buildEvaManagedWsUrl, isEvaManagedGatewayMethodBlocked } = require('./ev
 const TICKET_TTL_MS = 30_000
 const MAX_UPSTREAM_HEADER_BYTES = 64 * 1024
 const UPSTREAM_SETUP_TIMEOUT_MS = 15_000
+// Desktop backend contract v5 accepts one-shot file.attach requests up to the
+// gateway's 384 MiB WebSocket ceiling. Keep the relay on the same bound while
+// parsing incrementally so a renderer cannot make Electron buffer arbitrarily
+// large frames.
+const MAX_CLIENT_MESSAGE_BYTES = 384 * 1024 * 1024
 const MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const PLUGIN_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
 const FORBIDDEN_ENDPOINT_QUERY_KEYS = new Set(['eva_session', 'profile', 'session_token', 'ticket', 'token'])
@@ -91,6 +96,7 @@ function normalizeEvaWsEndpoint(value = '/api/ws') {
 }
 
 function safeDestroy(socket) {
+  if (!socket) return
   try {
     socket.destroy()
   } catch {
@@ -133,104 +139,366 @@ function buildUpgradeRequest(request, upstreamUrl, options = {}) {
   return `${lines.join('\r\n')}\r\n\r\n`
 }
 
-function containsBlockedGatewayMethod(payload) {
-  let parsed
-  try {
-    parsed = JSON.parse(payload.toString('utf8'))
-  } catch {
+// Incrementally inspect top-level JSON-RPC objects (or objects in a root batch)
+// without retaining their params. Strings are captured only when they can be an
+// object key or an eligible object's method value, so a 300+ MiB base64
+// file.attach payload adds only a small, fixed amount of policy memory.
+function createGatewayRpcInspector({ onBlocked, onMethod }) {
+  const decoder = new TextDecoder('utf-8')
+  const stack = []
+  let inString = false
+  let escaped = false
+  let captureString = false
+  let capturedString = ''
+  let captureOverflow = false
+  let inPrimitive = false
+
+  const parentStartsValue = token => {
+    const parent = stack.at(-1)
+    if (!parent) return
+    if (parent.type === 'object' && parent.state === 'value') {
+      if (token.type === 'string' && parent.eligible && parent.key === 'method' && typeof token.value === 'string') {
+        if (isEvaManagedGatewayMethodBlocked(token.value)) onBlocked()
+        else onMethod(token.value)
+      }
+      parent.key = null
+      parent.state = 'commaOrEnd'
+    } else if (parent.type === 'array' && parent.state === 'valueOrEnd') {
+      parent.state = 'commaOrEnd'
+    }
+  }
+
+  const consumeToken = token => {
+    const parent = stack.at(-1)
+
+    if (token.type === '{') {
+      const eligible =
+        stack.length === 0 || (stack.length === 1 && parent?.type === 'array' && parent.rootBatch === true)
+      parentStartsValue(token)
+      stack.push({ eligible, key: null, state: 'keyOrEnd', type: 'object' })
+      return
+    }
+    if (token.type === '[') {
+      const rootBatch = stack.length === 0
+      parentStartsValue(token)
+      stack.push({ rootBatch, state: 'valueOrEnd', type: 'array' })
+      return
+    }
+    if (!parent) return
+
+    if (parent.type === 'object') {
+      if (token.type === '}' && (parent.state === 'keyOrEnd' || parent.state === 'commaOrEnd')) {
+        stack.pop()
+      } else if (parent.state === 'keyOrEnd' && token.type === 'string') {
+        parent.key = token.value
+        parent.state = 'colon'
+      } else if (parent.state === 'colon' && token.type === ':') {
+        parent.state = 'value'
+      } else if (parent.state === 'value') {
+        parentStartsValue(token)
+      } else if (parent.state === 'commaOrEnd' && token.type === ',') {
+        parent.state = 'keyOrEnd'
+      }
+      return
+    }
+
+    if (token.type === ']' && (parent.state === 'valueOrEnd' || parent.state === 'commaOrEnd')) {
+      stack.pop()
+    } else if (parent.state === 'valueOrEnd') {
+      parentStartsValue(token)
+    } else if (parent.state === 'commaOrEnd' && token.type === ',') {
+      parent.state = 'valueOrEnd'
+    }
+  }
+
+  const shouldCaptureString = () => {
+    const parent = stack.at(-1)
+    return (
+      parent?.type === 'object' &&
+      (parent.state === 'keyOrEnd' || (parent.state === 'value' && parent.eligible && parent.key === 'method'))
+    )
+  }
+
+  const finishString = () => {
+    let value = null
+    if (captureString && !captureOverflow) {
+      try {
+        value = JSON.parse(`"${capturedString}"`)
+      } catch {
+        value = null
+      }
+    }
+    consumeToken({ type: 'string', value })
+    inString = false
+    escaped = false
+    captureString = false
+    capturedString = ''
+    captureOverflow = false
+  }
+
+  const consumeText = text => {
+    for (let index = 0; index < text.length; index += 1) {
+      const character = text[index]
+      if (inString) {
+        if (captureString && !captureOverflow) {
+          capturedString += character
+          if (capturedString.length > 512) {
+            capturedString = ''
+            captureOverflow = true
+          }
+        }
+        if (escaped) {
+          escaped = false
+        } else if (character === '\\') {
+          escaped = true
+        } else if (character === '"') {
+          if (captureString && !captureOverflow) capturedString = capturedString.slice(0, -1)
+          finishString()
+        }
+        continue
+      }
+
+      if (inPrimitive) {
+        if (!/[\s,}\]]/.test(character)) continue
+        inPrimitive = false
+        consumeToken({ type: 'primitive' })
+        index -= 1
+        continue
+      }
+
+      if (/\s/.test(character)) continue
+      if (character === '"') {
+        inString = true
+        captureString = shouldCaptureString()
+        capturedString = ''
+        captureOverflow = false
+      } else if ('{}[]:,'.includes(character)) {
+        consumeToken({ type: character })
+      } else {
+        inPrimitive = true
+      }
+    }
+  }
+
+  return {
+    finish() {
+      consumeText(decoder.decode())
+      if (inPrimitive) {
+        inPrimitive = false
+        consumeToken({ type: 'primitive' })
+      }
+    },
+    push(bytes) {
+      consumeText(decoder.decode(bytes, { stream: true }))
+    }
+  }
+}
+
+// Parse renderer frames incrementally and forward their raw bytes while
+// inspecting gateway JSON-RPC text. The last payload byte of a completed text
+// message is withheld until inspection finishes. A blocked method therefore
+// never becomes a complete upstream WebSocket message, while allowed large
+// frames never need to be copied into one giant Electron buffer.
+function createClientFrameGuard({ onFrame, onReject }) {
+  const PRELUDE_MAX_BYTES = 64 * 1024
+  let header = Buffer.alloc(0)
+  let frame = null
+  let fragmentedOpcode = null
+  let inspector = null
+  let messageBytes = 0
+  let methodSeen = false
+  let prelude = []
+  let preludeBytes = 0
+  let rejected = false
+
+  const reject = event => {
+    if (rejected) return false
+    rejected = true
+    onReject(event)
     return false
   }
 
-  const messages = Array.isArray(parsed) ? parsed : [parsed]
-  return messages.some(
-    message =>
-      message !== null &&
-      typeof message === 'object' &&
-      typeof message.method === 'string' &&
-      isEvaManagedGatewayMethodBlocked(message.method)
-  )
-}
+  const flushPrelude = () => {
+    for (const chunk of prelude) onFrame(chunk)
+    prelude = []
+    preludeBytes = 0
+  }
 
-function createClientFrameGuard({ onFrame, onReject }) {
-  let buffered = Buffer.alloc(0)
-  let fragmentedOpcode = null
+  const forwardInspected = chunk => {
+    if (!chunk?.length) return
+    if (methodSeen || preludeBytes + chunk.length > PRELUDE_MAX_BYTES) {
+      flushPrelude()
+      onFrame(chunk)
+      return
+    }
+    prelude.push(chunk)
+    preludeBytes += chunk.length
+  }
 
-  return chunk => {
-    if (chunk?.length) buffered = Buffer.concat([buffered, Buffer.from(chunk)])
+  const finishTextMessage = tail => {
+    inspector?.finish()
+    inspector = null
+    fragmentedOpcode = null
+    messageBytes = 0
+    if (rejected) return false
+    flushPrelude()
+    if (tail?.length) onFrame(tail)
+    methodSeen = false
+    return true
+  }
 
-    while (buffered.length >= 2) {
-      const first = buffered[0]
-      const second = buffered[1]
-      const fin = (first & 0x80) !== 0
-      const reserved = first & 0x70
-      const opcode = first & 0x0f
-      const masked = (second & 0x80) !== 0
-      let payloadLength = second & 0x7f
-      let headerLength = 2
+  const beginFrame = rawHeader => {
+    const first = rawHeader[0]
+    const second = rawHeader[1]
+    const fin = (first & 0x80) !== 0
+    const reserved = first & 0x70
+    const opcode = first & 0x0f
+    const masked = (second & 0x80) !== 0
+    const shortLength = second & 0x7f
+    let payloadLength = shortLength
+    let offset = 2
+    if (shortLength === 126) {
+      payloadLength = rawHeader.readUInt16BE(offset)
+      offset += 2
+    } else if (shortLength === 127) {
+      const wideLength = rawHeader.readBigUInt64BE(offset)
+      if (wideLength > BigInt(MAX_CLIENT_MESSAGE_BYTES)) return reject('client_frame_rejected')
+      payloadLength = Number(wideLength)
+      offset += 8
+    }
+    const mask = masked ? rawHeader.subarray(offset, offset + 4) : null
 
-      if (payloadLength === 126) {
-        if (buffered.length < 4) return true
-        payloadLength = buffered.readUInt16BE(2)
-        headerLength = 4
-      } else if (payloadLength === 127) {
-        if (buffered.length < 10) return true
-        const wideLength = buffered.readBigUInt64BE(2)
-        if (wideLength > BigInt(Number.MAX_SAFE_INTEGER)) {
-          onReject('client_frame_rejected')
-          return false
-        }
-        payloadLength = Number(wideLength)
-        headerLength = 10
-      }
-
-      const maskLength = masked ? 4 : 0
-      if (payloadLength > Number.MAX_SAFE_INTEGER - headerLength - maskLength) {
-        onReject('client_frame_rejected')
-        return false
-      }
-      const frameLength = headerLength + maskLength + payloadLength
-      if (buffered.length < frameLength) return true
-
-      const frame = buffered.subarray(0, frameLength)
-      buffered = buffered.subarray(frameLength)
-
-      if (opcode === 0x1) {
-        if (!fin || reserved !== 0 || fragmentedOpcode !== null) {
-          onReject('client_text_frame_rejected')
-          return false
-        }
-
-        const payloadOffset = headerLength + maskLength
-        let payload = frame.subarray(payloadOffset)
-        if (masked) {
-          const mask = frame.subarray(headerLength, headerLength + 4)
-          payload = Buffer.from(payload)
-          for (let index = 0; index < payload.length; index += 1) {
-            payload[index] ^= mask[index % 4]
-          }
-        }
-        if (containsBlockedGatewayMethod(payload)) {
-          onReject('client_rpc_denied')
-          return false
-        }
-      } else if (opcode === 0x2) {
-        if (fragmentedOpcode !== null) {
-          onReject('client_frame_rejected')
-          return false
-        }
-        if (!fin) fragmentedOpcode = opcode
-      } else if (opcode === 0x0) {
-        if (fragmentedOpcode === null) {
-          onReject('client_frame_rejected')
-          return false
-        }
-        if (fin) fragmentedOpcode = null
-      }
-
-      onFrame(frame)
+    if (!masked || reserved !== 0 || payloadLength > MAX_CLIENT_MESSAGE_BYTES) {
+      return reject('client_frame_rejected')
+    }
+    if (opcode >= 0x8 && (!fin || payloadLength > 125)) {
+      return reject('client_frame_rejected')
     }
 
-    return true
+    let inspectText = false
+    if (opcode === 0x1) {
+      if (fragmentedOpcode !== null) return reject('client_frame_rejected')
+      methodSeen = false
+      prelude = []
+      preludeBytes = 0
+      inspector = createGatewayRpcInspector({
+        onBlocked: () => reject('client_rpc_denied'),
+        onMethod: () => {
+          methodSeen = true
+          if (!rejected) flushPrelude()
+        }
+      })
+      inspectText = true
+      fragmentedOpcode = fin ? null : opcode
+      messageBytes = payloadLength
+    } else if (opcode === 0x2) {
+      if (fragmentedOpcode !== null) return reject('client_frame_rejected')
+      fragmentedOpcode = fin ? null : opcode
+      messageBytes = payloadLength
+    } else if (opcode === 0x0) {
+      if (fragmentedOpcode === null) return reject('client_frame_rejected')
+      inspectText = fragmentedOpcode === 0x1
+      messageBytes += payloadLength
+      if (messageBytes > MAX_CLIENT_MESSAGE_BYTES) return reject('client_frame_rejected')
+    } else if (opcode < 0x8) {
+      return reject('client_frame_rejected')
+    }
+
+    frame = {
+      fin,
+      inspectText,
+      mask,
+      maskOffset: 0,
+      payloadRemaining: payloadLength
+    }
+
+    // Empty final text frames must be inspected before their header is sent;
+    // non-empty frames are safe to stream because the payload remains
+    // incomplete until finishTextMessage releases its held tail byte.
+    if (!(inspectText && fin && payloadLength === 0)) {
+      if (inspectText) forwardInspected(rawHeader)
+      else onFrame(rawHeader)
+    }
+    if (payloadLength === 0) {
+      frame = null
+      if (inspectText && fin) {
+        if (!finishTextMessage()) return false
+        onFrame(rawHeader)
+      } else if (fin && opcode === 0x0) {
+        fragmentedOpcode = null
+        messageBytes = 0
+      }
+    }
+    return !rejected
+  }
+
+  return chunk => {
+    if (rejected || !chunk?.length) return !rejected
+    const input = Buffer.from(chunk)
+    let offset = 0
+
+    while (offset < input.length && !rejected) {
+      if (!frame) {
+        const neededPrefix = header.length < 2 ? 2 : 0
+        if (neededPrefix) {
+          const take = Math.min(neededPrefix - header.length, input.length - offset)
+          header = Buffer.concat([header, input.subarray(offset, offset + take)])
+          offset += take
+          if (header.length < 2) break
+        }
+        const shortLength = header[1] & 0x7f
+        const fullHeaderLength = 2 + (shortLength === 126 ? 2 : shortLength === 127 ? 8 : 0) + 4
+        if (header.length < fullHeaderLength) {
+          const take = Math.min(fullHeaderLength - header.length, input.length - offset)
+          header = Buffer.concat([header, input.subarray(offset, offset + take)])
+          offset += take
+          if (header.length < fullHeaderLength) break
+        }
+        const rawHeader = header
+        header = Buffer.alloc(0)
+        if (!beginFrame(rawHeader)) return false
+        if (!frame) continue
+      }
+
+      const take = Math.min(frame.payloadRemaining, input.length - offset)
+      if (take === 0) break
+      const raw = input.subarray(offset, offset + take)
+      const completesFrame = take === frame.payloadRemaining
+      const holdTail = frame.inspectText && frame.fin && completesFrame
+      const forwarded = holdTail ? raw.subarray(0, -1) : raw
+      const tail = holdTail ? raw.subarray(-1) : null
+
+      if (frame.inspectText) {
+        const decoded = Buffer.from(raw)
+        for (let index = 0; index < decoded.length; index += 1) {
+          decoded[index] ^= frame.mask[(frame.maskOffset + index) % 4]
+        }
+        inspector?.push(decoded)
+      }
+      if (rejected) return false
+      if (forwarded.length) {
+        if (frame.inspectText) forwardInspected(forwarded)
+        else onFrame(forwarded)
+      }
+
+      frame.maskOffset = (frame.maskOffset + take) % 4
+      frame.payloadRemaining -= take
+      offset += take
+
+      if (frame.payloadRemaining === 0) {
+        const finalText = frame.inspectText && frame.fin
+        const finalContinuation = frame.fin && fragmentedOpcode !== null
+        frame = null
+        if (finalText) {
+          if (!finishTextMessage(tail)) return false
+        } else if (finalContinuation) {
+          fragmentedOpcode = null
+          messageBytes = 0
+        }
+      }
+    }
+
+    return !rejected
   }
 }
 
@@ -240,20 +508,36 @@ function policyCloseFrame() {
   return Buffer.concat([Buffer.from([0x88, payload.length]), payload])
 }
 
-function connectTls(upstreamUrl) {
+function connectTls(upstreamUrl, timeoutMs = UPSTREAM_SETUP_TIMEOUT_MS, tlsConnect = tls.connect) {
   return new Promise((resolve, reject) => {
-    const socket = tls.connect({
+    const socket = tlsConnect({
       host: upstreamUrl.hostname,
       port: Number(upstreamUrl.port || 443),
       rejectUnauthorized: true,
       servername: upstreamUrl.hostname
     })
-    const fail = error => {
+    let settled = false
+    const timeout = setTimeout(() => {
+      const error = Object.assign(new Error('Upstream TLS handshake timed out.'), { code: 'ETIMEDOUT' })
+      fail(error)
+    }, timeoutMs)
+    timeout.unref?.()
+    const cleanup = () => {
+      clearTimeout(timeout)
+      socket.removeListener('error', fail)
       socket.removeListener('secureConnect', ready)
+    }
+    const fail = error => {
+      if (settled) return
+      settled = true
+      cleanup()
+      safeDestroy(socket)
       reject(error)
     }
     const ready = () => {
-      socket.removeListener('error', fail)
+      if (settled) return
+      settled = true
+      cleanup()
       resolve(socket)
     }
     socket.once('error', fail)
@@ -362,12 +646,15 @@ function createEvaWsRelay(options) {
         return
       }
       const upstreamUrl = new URL(buildEvaManagedWsUrl(upstream.baseUrl, upstream.token))
-      upstreamUrl.pathname = upstreamUrl.pathname.replace(/\/api\/ws$/, grant.endpoint.pathname)
+      if (!upstreamUrl.pathname.endsWith('/api/ws')) {
+        throw new Error('Managed upstream base URL does not expose /api/ws.')
+      }
+      upstreamUrl.pathname = `${upstreamUrl.pathname.slice(0, -'/api/ws'.length)}${grant.endpoint.pathname}`
       for (const [key, value] of new URLSearchParams(grant.endpoint.search).entries()) {
         upstreamUrl.searchParams.append(key, value)
       }
       if (grant.profile) upstreamUrl.searchParams.set('profile', grant.profile)
-      upstreamSocket = track(await connectUpstream(upstreamUrl))
+      upstreamSocket = track(await connectUpstream(upstreamUrl, upstreamSetupTimeoutMs))
       if (setupFinished) {
         safeDestroy(upstreamSocket)
         return
@@ -541,8 +828,10 @@ function createEvaWsRelay(options) {
 }
 
 module.exports = {
+  MAX_CLIENT_MESSAGE_BYTES,
   TICKET_TTL_MS,
   buildUpgradeRequest,
+  connectTls,
   createEvaWsRelay,
   normalizeEvaWsEndpoint,
   normalizeEvaWsProfile

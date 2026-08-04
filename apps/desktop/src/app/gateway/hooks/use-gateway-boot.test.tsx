@@ -1,5 +1,5 @@
 import { act, cleanup, render } from '@testing-library/react'
-import { MemoryRouter, useLocation } from 'react-router'
+import { MemoryRouter, useLocation, useNavigate } from 'react-router'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { $desktopBoot } from '@/store/boot'
@@ -22,9 +22,11 @@ import { useGatewayBoot } from './use-gateway-boot'
 type Listener = (ev: unknown) => void
 let connectionApplied: null | (() => void) = null
 let currentLocation = ''
+let navigateRoute: ReturnType<typeof useNavigate> | null = null
 
 function LocationProbe() {
   const location = useLocation()
+  navigateRoute = useNavigate()
   currentLocation = `${location.pathname}${location.search}`
   return null
 }
@@ -165,6 +167,7 @@ beforeEach(() => {
   FakeWebSocket.instances = []
   connectionApplied = null
   currentLocation = ''
+  navigateRoute = null
   ;(globalThis as { WebSocket: unknown }).WebSocket = FakeWebSocket
   ;(window as { hermesDesktop?: unknown }).hermesDesktop = fakeDesktop()
   $gatewayState.set('idle')
@@ -232,6 +235,22 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     expect($desktopBoot.get().error).toBeNull()
     expect($sessionsLoading.get()).toBe(false)
     expect(currentLocation).toBe('/settings?tab=gateway')
+  })
+
+  it('keeps the live gateway mounted when declarative router navigation changes navigate identity', async () => {
+    renderHarness()
+    await flushAsync()
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(FakeWebSocket.instances[0].readyState).toBe(FakeWebSocket.OPEN)
+
+    await act(async () => {
+      navigateRoute?.('/settings')
+      await vi.advanceTimersByTimeAsync(0)
+    })
+
+    expect(currentLocation).toBe('/settings')
+    expect(FakeWebSocket.instances).toHaveLength(1)
+    expect(FakeWebSocket.instances[0].readyState).toBe(FakeWebSocket.OPEN)
   })
 
   it('INITIAL boot against a dead VPS: getConnection hangs (waitForHermes) → app sits in the connecting combo, then fails', async () => {

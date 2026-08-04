@@ -97,6 +97,7 @@ const {
   buildEvaAccountRendererResetScript,
   EVA_MANAGED_POLICY
 } = require('./eva-managed.cjs')
+const { createEvaMediaGrantCodec } = require('./eva-media-grant.cjs')
 const { createEvaManagedRuntime } = require('./eva-runtime.cjs')
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
@@ -1003,6 +1004,7 @@ app.setAboutPanelOptions(
 // handler removes the size cap and gives the <video> element seekable,
 // range-aware playback. Must be registered before the app is ready.
 const MEDIA_PROTOCOL = 'hermes-media'
+const evaMediaGrants = createEvaMediaGrantCodec()
 
 // Only audio/video may be streamed. Without this the handler would read any
 // non-blocklisted local file (no size cap) for any `fetch(hermes-media://…)`.
@@ -1034,12 +1036,36 @@ protocol.registerSchemesAsPrivileged([
 
 function registerMediaProtocol() {
   protocol.handle(MEDIA_PROTOCOL, async request => {
+    const mediaUrl = new URL(request.url)
+
+    if (mediaUrl.hostname === 'managed') {
+      if (!EVA_MANAGED_BUILD) {
+        return new Response('Managed media unavailable', { status: 404 })
+      }
+
+      const grant = evaMediaGrants.verify(mediaUrl.pathname.replace(/^\/+/, ''))
+      if (!grant) {
+        return new Response('Managed media grant expired or invalid', { status: 403 })
+      }
+      if (!STREAMABLE_MEDIA_EXTS.has(path.extname(grant.path).toLowerCase())) {
+        return new Response('Unsupported media type', { status: 415 })
+      }
+
+      try {
+        return await evaManagedRuntime.requestMedia({
+          headers: request.headers,
+          path: `/api/files/download?path=${encodeURIComponent(grant.path)}`,
+          profile: grant.profile
+        })
+      } catch {
+        return new Response('Managed media unavailable', { status: 502 })
+      }
+    }
+
     let resolvedPath
 
     try {
-      const url = new URL(request.url)
-
-      const filePath = decodeURIComponent(url.pathname.replace(/^\/+/, ''))
+      const filePath = decodeURIComponent(mediaUrl.pathname.replace(/^\/+/, ''))
 
       ;({ resolvedPath } = await resolveReadableFileForIpc(filePath, { purpose: 'Media stream' }))
     } catch {
@@ -6875,6 +6901,19 @@ const evaManagedRuntime = createEvaManagedRuntime({
   openExternal: url => shell.openExternal(url),
   waitForHermes,
   fetchJson,
+  fetchMedia: (url, token, requestHeaders) => {
+    const headers = new Headers(requestHeaders)
+    headers.delete('authorization')
+    headers.delete('cookie')
+    headers.delete('x-hermes-session-token')
+    headers.set('x-hermes-session-token', token)
+
+    return electronNet.fetch(url, {
+      bypassCustomProtocolHandlers: true,
+      headers,
+      redirect: 'error'
+    })
+  },
   resolveTimeoutMs: value => resolveTimeoutMs(value, DEFAULT_FETCH_TIMEOUT_MS),
   rememberLog,
   advanceBootProgress,
@@ -10656,6 +10695,18 @@ ipcMain.handle('hermes:readFileDataUrlForAttach', async (_event, filePath) => {
   })
 })
 
+ipcMain.handle('hermes:media:stream-url', async (_event, filePath, profile) => {
+  if (!EVA_MANAGED_BUILD) return null
+
+  const candidate = String(filePath || '').trim()
+  if (!candidate || !STREAMABLE_MEDIA_EXTS.has(path.extname(candidate).toLowerCase())) {
+    throw new Error('Unsupported managed media path')
+  }
+
+  const grant = evaMediaGrants.mint({ path: candidate, profile })
+  return `${MEDIA_PROTOCOL}://managed/${grant}`
+})
+
 ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
   const { resolvedPath, stat } = await resolveReadableFileForIpc(filePath, {
     maxBytes: TEXT_PREVIEW_SOURCE_MAX_BYTES,
@@ -11019,15 +11070,21 @@ ipcMain.handle('hermes:openPreviewInBrowser', async (_event, url) => {
 // settings mount and seeds the value into the picker; writing back persists
 // it via writeDefaultProjectDir so resolveHermesCwd picks it up on the next
 // session spawn (no app restart needed).
-ipcMain.handle('hermes:setting:defaultProjectDir:get', async () => ({
-  dir: readDefaultProjectDir(),
-  defaultLabel: app.getPath('home'),
-  resolvedCwd: resolveHermesCwd()
-}))
+ipcMain.handle('hermes:setting:defaultProjectDir:get', async () => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Reading the local default project directory')
+
+  return {
+    dir: readDefaultProjectDir(),
+    defaultLabel: app.getPath('home'),
+    resolvedCwd: resolveHermesCwd()
+  }
+})
 
 ipcMain.handle('hermes:workspace:sanitize', async (_event, cwd) => sanitizeWorkspaceCwd(cwd))
 
 ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Changing the local default project directory')
+
   const next = typeof dir === 'string' && dir.trim() ? dir.trim() : null
 
   if (next) {
@@ -11044,6 +11101,8 @@ ipcMain.handle('hermes:setting:defaultProjectDir:set', async (_event, dir) => {
 })
 
 ipcMain.handle('hermes:setting:defaultProjectDir:pick', async () => {
+  assertEvaManagedLocalMutationAllowed(EVA_MANAGED_BUILD, 'Choosing a local default project directory')
+
   const result = await dialog.showOpenDialog({
     title: 'Choose default project directory',
     properties: ['openDirectory', 'createDirectory'],

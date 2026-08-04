@@ -38,6 +38,7 @@ import { Slot } from '@/contrib/react/slot'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { discoverRuntimePlugins } from '@/contrib/runtime-loader'
+import { isManagedEvaosAgent } from '@/i18n/managed-brand'
 import { sessionTitle as storedSessionTitle } from '@/lib/chat-runtime'
 import { FileText, LayoutDashboard, PanelBottom, Terminal, Zap } from '@/lib/icons'
 import { type KeybindContribution, KEYBINDS_AREA } from '@/lib/keybinds/actions'
@@ -272,16 +273,20 @@ registry.registerMany([
   }),
   // The agent's write -> see loop: rescan <hermes home>/desktop-plugins
   // without relaunching (same-id reloads dispose the previous incarnation).
-  {
-    id: 'plugins.reload',
-    area: PALETTE_AREA,
-    data: {
-      id: 'plugins.reload',
-      label: 'Reload desktop plugins',
-      keywords: ['plugins', 'reload', 'refresh', 'desktop'],
-      run: () => void discoverRuntimePlugins()
-    } satisfies PaletteContribution
-  },
+  ...(!isManagedEvaosAgent()
+    ? [
+        {
+          id: 'plugins.reload',
+          area: PALETTE_AREA,
+          data: {
+            id: 'plugins.reload',
+            label: 'Reload desktop plugins',
+            keywords: ['plugins', 'reload', 'refresh', 'desktop'],
+            run: () => void discoverRuntimePlugins()
+          } satisfies PaletteContribution
+        }
+      ]
+    : []),
   {
     id: 'layout.reset',
     area: PALETTE_AREA,

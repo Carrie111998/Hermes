@@ -115,6 +115,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   requestMicrophoneAccess: () => ipcRenderer.invoke('hermes:requestMicrophoneAccess'),
   readFileDataUrl: filePath => ipcRenderer.invoke('hermes:readFileDataUrl', filePath),
   readFileDataUrlForAttach: filePath => ipcRenderer.invoke('hermes:readFileDataUrlForAttach', filePath),
+  getMediaStreamUrl: (filePath, profile) => ipcRenderer.invoke('hermes:media:stream-url', filePath, profile),
   dataUrlReadMax: {
     get: () => ipcRenderer.invoke('hermes:data-url-read-max:get'),
     set: maxMb => ipcRenderer.invoke('hermes:data-url-read-max:set', maxMb)
