@@ -1,0 +1,5 @@
+name: kmdaily
+version: 1.0.0
+description: "Trigger an on-demand KMDaily run (ingest/digest/notion sync) from Telegram via the /kmdaily slash command."
+author: "cwliao"
+hooks: []
