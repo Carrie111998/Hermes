@@ -576,7 +576,7 @@ export function ToolsetConfigPanel({ toolset, onConfiguredChange }: ToolsetConfi
     // Managed agents cannot complete the local Nous Portal entitlement flow.
     // Fail closed unless the backend has already confirmed this managed
     // provider is ready, so a failed selection cannot be persisted first.
-    if (managedEva && provider.requires_nous_auth && provider.status !== 'ready') {
+    if (managedEva && provider.requires_nous_auth && providerStatus(provider, envState) !== 'ready') {
       notify({
         kind: 'warning',
         title: copy.managedUnavailableTitle,

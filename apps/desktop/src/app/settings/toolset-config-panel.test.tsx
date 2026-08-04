@@ -810,6 +810,83 @@ describe('ToolsetConfigPanel', () => {
         ]
       })
 
+    it('allows a managed provider after its last required key is saved locally', async () => {
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { eva: {} },
+        writable: true
+      })
+      getToolsetConfig.mockResolvedValue(
+        config({
+          providers: [
+            {
+              name: 'Nous Subscription',
+              badge: 'subscription',
+              tag: 'Managed provider',
+              env_vars: [
+                { key: 'MANAGED_API_KEY', prompt: 'Managed API key', url: 'https://x', default: null, is_set: false }
+              ],
+              post_setup: null,
+              requires_nous_auth: true,
+              is_active: false,
+              status: 'needs_keys'
+            }
+          ]
+        })
+      )
+
+      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+      render(<ToolsetConfigPanel toolset="tts" />)
+
+      const trigger = await screen.findByRole('button', { name: /^Actions$/ })
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'Set' }))
+      fireEvent.change(await screen.findByPlaceholderText('Managed API key'), { target: { value: 'sk-live' } })
+      fireEvent.click(screen.getByRole('button', { name: 'Save' }))
+      await screen.findByText('Ready')
+      fireEvent.click(screen.getByRole('button', { name: /Use this backend/ }))
+
+      await waitFor(() => expect(selectToolsetProvider).toHaveBeenCalledWith('tts', 'Nous Subscription'))
+    })
+
+    it('blocks a managed provider after a required key is cleared locally', async () => {
+      Object.defineProperty(window, 'hermesDesktop', {
+        configurable: true,
+        value: { eva: {} },
+        writable: true
+      })
+      vi.spyOn(window, 'confirm').mockReturnValue(true)
+      getToolsetConfig.mockResolvedValue(
+        config({
+          providers: [
+            {
+              name: 'Nous Subscription',
+              badge: 'subscription',
+              tag: 'Managed provider',
+              env_vars: [
+                { key: 'MANAGED_API_KEY', prompt: 'Managed API key', url: 'https://x', default: null, is_set: true }
+              ],
+              post_setup: null,
+              requires_nous_auth: true,
+              is_active: false,
+              status: 'ready'
+            }
+          ]
+        })
+      )
+
+      const { ToolsetConfigPanel } = await import('./toolset-config-panel')
+      render(<ToolsetConfigPanel toolset="tts" />)
+
+      const trigger = await screen.findByRole('button', { name: /^Actions$/ })
+      fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false, pointerType: 'mouse' })
+      fireEvent.click(await screen.findByRole('menuitem', { name: 'Clear' }))
+      await waitFor(() => expect(deleteEnvVar).toHaveBeenCalledWith('MANAGED_API_KEY'))
+      fireEvent.click(screen.getByRole('button', { name: /Use this backend/ }))
+
+      await waitFor(() => expect(selectToolsetProvider).not.toHaveBeenCalled())
+    })
+
     it('surfaces a sign-in notice when the PUT reports needs_nous_auth', async () => {
       // Regression (Windows 11 Capabilities journey): the GUI wrote
       // browser.cloud_provider but skipped the Portal entitlement handshake,
