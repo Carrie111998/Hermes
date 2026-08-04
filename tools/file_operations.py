@@ -892,23 +892,31 @@ class ShellFileOperations(FileOperations):
         if ext in BINARY_EXTENSIONS:
             return True
         
-        # Content analysis: >30% non-printable chars = binary
+        # Content analysis: zero-byte detection (primary) + truncation-safe
+        # replacement-char fallback (secondary).
         if content_sample:
-            # Undecodable bytes: the terminal env decodes stdout with
-            # errors="replace", so any non-UTF-8 byte arrives here already
-            # turned into U+FFFD. That char is "printable" (ord 65533), so the
-            # non-printable ratio below never catches it — and returning the
-            # lossy text would let a read→edit→write round-trip silently
-            # overwrite the original bytes with mojibake. Treat a file whose
-            # sample carries the replacement char as binary (read-only) so the
-            # agent can't corrupt it. Legitimate UTF-8 text effectively never
-            # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+
+            # NUL byte = strong binary signal. 0x00 is valid UTF-8, so it
+            # survives the terminal's errors="replace" decode as U+0000 —
+            # unlike U+FFFD this never depends on decode/truncation, and no
+            # common text encoding puts 0x00 in content.
+            if "\x00" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+
+            # Genuine non-UTF-8 bytes decode to U+FFFD (mojibake) — still flag
+            # those so read→edit→write can't corrupt the file. BUT `head -c
+            # 1000` counts bytes, not chars: it splits a 3-byte CJK char into a
+            # spurious trailing U+FFFD. Ignore a FFFD that is only the last
+            # char; real mojibake is spread through the body.
+            body = sample[:-1] if sample.endswith("\ufffd") else sample
+            if "\ufffd" in body:
+                return True
+
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
-        
+            return non_printable / max(len(sample), 1) > 0.30
+
         return False
     
     def _is_image(self, path: str) -> bool:

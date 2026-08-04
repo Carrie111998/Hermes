@@ -259,6 +259,8 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
             command,
             shell=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             capture_output=True,
             input=kwargs.get("stdin_data"),
         )
@@ -673,3 +675,24 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_large_chinese_utf8_read_not_binary(self, tmp_path):
+        """E2E: a large Chinese UTF-8 file must read as text, not binary.
+
+        Reproduces the original bug: ``read_file`` samples with
+        ``head -c 1000`` (a byte count), which splits a 3-byte CJK character
+        at the boundary; the terminal's ``errors="replace"`` decode turns the
+        fragment into a spurious trailing U+FFFD, which previously made
+        ``_is_likely_binary`` return True for every large CJK file.
+        """
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        path = tmp_path / "chinese.txt"
+        # ~2400 bytes of pure CJK — well past the 1000-byte sample window.
+        path.write_bytes(("你好世界这是一个测试" * 80).encode("utf-8"))
+
+        result = ops.read_file(str(path))
+        assert result.is_binary is False, (
+            f"Chinese UTF-8 file misclassified as binary (error={result.error!r})"
+        )
+        assert result.content is not None
+        assert "你好世界" in result.content

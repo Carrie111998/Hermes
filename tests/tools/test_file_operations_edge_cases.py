@@ -35,8 +35,12 @@ class TestIsLikelyBinary:
 
 
     def test_just_above_threshold(self, ops):
-        """301/1000 = 30.1% non-printable → should be binary."""
-        sample = "\x00" * 301 + "a" * 699
+        """301/1000 = 30.1% non-printable control chars → should be binary.
+
+        Uses \\x01 (SOH) rather than NUL so it exercises the 30% ratio rule
+        specifically — NUL is now a hard binary signal (zero-byte detection).
+        """
+        sample = "\x01" * 301 + "a" * 699
         assert ops._is_likely_binary("data.xyz", content_sample=sample) is True
 
     def test_tabs_and_newlines_excluded(self, ops):
@@ -46,10 +50,67 @@ class TestIsLikelyBinary:
 
     def test_content_sample_longer_than_1000(self, ops):
         """Only the first 1000 characters should be analysed."""
-        # First 1000 chars: 200 NUL + 800 printable = 20% → not binary
-        # Remaining 1000 chars: all NUL → ignored by [:1000] slice
-        sample = "\x00" * 200 + "a" * 800 + "\x00" * 1000
+        # First 1000 chars: 200 control chars + 800 printable = 20% → not binary
+        # Remaining 1000 chars: all control chars → ignored by [:1000] slice.
+        # Uses \\x01 (not NUL) so it tests the ratio + slice, not zero-byte.
+        sample = "\x01" * 200 + "a" * 800 + "\x01" * 1000
         assert ops._is_likely_binary("file.xyz", content_sample=sample) is False
+
+    # --- CJK truncation regression ------------------------------------------
+    # `head -c 1000` counts BYTES; a UTF-8 CJK char is 3 bytes, so byte 1000
+    # splits a character and errors="replace" turns the fragment into a
+    # spurious U+FFFD at the *tail* of the sample. That artifact used to make
+    # every large Chinese/Japanese/Korean UTF-8 file look binary. These tests
+    # build the exact sample the terminal produces and assert it is treated as
+    # text.
+
+    def test_chinese_utf8_head_truncation_not_binary(self, ops):
+        """Simulate `head -c 1000` on a large Chinese UTF-8 file."""
+        chinese = ("你好世界这是一个测试" * 80)  # ~2400 bytes of CJK
+        sample_bytes = chinese.encode("utf-8")[:1000]      # head -c 1000
+        truncated = sample_bytes.decode("utf-8", errors="replace")
+        # Sanity: the truncation did produce a trailing replacement char…
+        assert truncated.endswith("\ufffd")
+        # …which must NOT be treated as binary.
+        assert ops._is_likely_binary("zh.txt", content_sample=truncated) is False
+
+    def test_japanese_utf8_head_truncation_not_binary(self, ops):
+        """Same regression for 3-byte Japanese hiragana/katakana/kanji."""
+        jp = "こんにちは世界テスト" * 80
+        truncated = jp.encode("utf-8")[:1000].decode("utf-8", errors="replace")
+        assert truncated.endswith("\ufffd")
+        assert ops._is_likely_binary("ja.txt", content_sample=truncated) is False
+
+    def test_emoji_4byte_truncation_not_binary(self, ops):
+        """4-byte sequences (emoji, astral plane) also split at 1000 bytes."""
+        emoji = "😀😀😀😀😀" * 300
+        truncated = emoji.encode("utf-8")[:1000].decode("utf-8", errors="replace")
+        assert ops._is_likely_binary("emo.txt", content_sample=truncated) is False
+
+    # --- Genuine binary & mojibake still caught -----------------------------
+
+    def test_null_byte_flagged_binary(self, ops):
+        """VSCode-style zero-byte detection: NUL anywhere → binary."""
+        png = bytes([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]) \
+              + b"\x00\x00\x00\x0dIHDR" + b"\x00" * 20 + b"data"
+        sample = png.decode("utf-8", errors="replace")
+        assert ops._is_likely_binary("image.dat", content_sample=sample) is True
+
+    def test_body_replacement_char_flagged_binary(self, ops):
+        """Non-trailing U+FFFD (real non-UTF-8 / GBK mojibake) stays binary.
+
+        A GBK file decoded as UTF-8 yields U+FFFD throughout the body, not just
+        at the tail — this must still be flagged so a read→edit→write round-trip
+        can't overwrite the original bytes with mojibake.
+        """
+        gbk = "你好世界".encode("gbk").decode("utf-8", errors="replace")
+        assert "\ufffd" in gbk
+        assert ops._is_likely_binary("gbk.txt", content_sample=gbk) is True
+
+    def test_replacement_char_only_at_tail_is_text(self, ops):
+        """A single trailing U+FFFD (pure truncation artifact) is text."""
+        sample = "普通文本内容" + "\ufffd"
+        assert ops._is_likely_binary("zh.txt", content_sample=sample) is False
 
 
 # =========================================================================
