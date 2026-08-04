@@ -16,6 +16,7 @@ from hermes_cli.cron import (
     _contains_gateway_lifecycle_command,
     cron_command,
 )
+from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
 
 
 # ---------------------------------------------------------------------------
@@ -857,3 +858,27 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+# ---------------------------------------------------------------------------
+# Regression: embedded NUL in a referenced-script path must not crash the guard
+# ---------------------------------------------------------------------------
+
+class TestEmbeddedNulPath:
+    """``os.open`` raises ``ValueError`` (not ``OSError``) on NUL paths.
+
+    A prior fix (#76762) only wrapped ``os.open`` in ``except OSError``, so a
+    referenced-script token containing an embedded NUL byte escaped as an
+    unhandled ``ValueError: embedded null byte`` and failed the command closed.
+    """
+
+    def test_nul_in_referenced_script_token_does_not_crash(self):
+        cmd = "source /root/.env\x00bogus"
+        assert contains_gateway_lifecycle_command_or_referenced_script(cmd, cwd="/root") is False
+
+    def test_binary_executable_path_is_not_scanned_as_script(self):
+        cmd = "/usr/bin/ls --help 2>&1 | head -5"
+        assert contains_gateway_lifecycle_command_or_referenced_script(cmd, cwd="/root") is False
+
+    def test_embedded_nul_still_blocks_real_lifecycle_command(self):
+        assert _contains_gateway_lifecycle_command("hermes gateway restart") is True
