@@ -4482,6 +4482,10 @@ class GatewaySlashCommandsMixin:
                 # Evict cached agent so next turn rebuilds system prompt
                 # from current files (SOUL.md, memory, etc.).
                 self._evict_cached_agent(session_key)
+                # Off-loop + bounded: temporary-agent teardown can block on
+                # subprocess/network/SQLite work.  Cancellation already
+                # attached this cleanup to the still-running worker, so do not
+                # race it with a second close from this finally block.
                 if not _compress_cleanup_deferred:
                     await self._cleanup_agent_resources_off_loop(
                         tmp_agent,
