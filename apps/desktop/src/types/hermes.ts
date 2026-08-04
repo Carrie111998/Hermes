@@ -1120,6 +1120,28 @@ export interface StatusResponse {
   version: string
 }
 
+export interface DashboardRemoteAccessResponse {
+  public_url: string
+}
+
+export interface DashboardHandoffTicketResponse {
+  ticket: string
+  ttl_seconds: number
+  session_id: string
+  profile: string
+}
+
+export interface LinkedDevice {
+  id: string
+  label: string
+  created_at: number
+  last_seen_at: number
+}
+
+export interface LinkedDevicesResponse {
+  devices: LinkedDevice[]
+}
+
 export interface ActionResponse {
   name: string
   ok: boolean

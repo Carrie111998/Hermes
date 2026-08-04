@@ -450,10 +450,20 @@ def _require_token(request: Request) -> None:
     if getattr(request.app.state, "auth_required", False):
         # Gate is authoritative. It attaches ``request.state.session`` on
         # success and 401s otherwise, so a request that reached us is already
-        # authenticated. Belt-and-braces: confirm the session is present.
-        if getattr(request.state, "session", None) is not None:
-            return
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        # authenticated. Belt-and-braces: confirm the session is present and
+        # is full-dashboard (resume-scoped cookies must not pass admin
+        # endpoints that call _require_token).
+        sess = getattr(request.state, "session", None)
+        if sess is None:
+            raise HTTPException(status_code=401, detail="Unauthorized")
+        from hermes_cli.dashboard_auth.scopes import session_is_restricted
+
+        if session_is_restricted(sess):
+            raise HTTPException(
+                status_code=403,
+                detail="Insufficient scope for this operation",
+            )
+        return
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -469,16 +479,25 @@ _LOOPBACK_HOST_VALUES: frozenset = frozenset({
 })
 
 
-def should_require_auth(host: str, allow_public: bool = False) -> bool:
+def should_require_auth(
+    host: str,
+    allow_public: bool = False,
+    public_url: str = "",
+) -> bool:
     """Return True iff the dashboard auth gate must be active.
 
     Truth table:
-      host == loopback        → False (no auth — local-only, trusted operator)
-      host != loopback        → True  (gate engages — OAuth or password required)
+      host != loopback                   → True
+      host == loopback, external URL     → True
+      host == loopback, no/local URL     → False
 
     "Loopback" is 127.0.0.1, localhost, ::1. RFC1918 / CGNAT / link-local are
     deliberately treated as PUBLIC — a hostile device on the same LAN is exactly
     the threat model the gate is designed for.
+
+    An operator-declared external ``dashboard.public_url`` means a reverse proxy
+    or tunnel can reach a loopback bind. Treat that as public too so the proxy
+    path cannot serve the long-lived loopback token in the SPA.
 
     ``allow_public`` (the legacy ``--insecure`` escape hatch) NO LONGER disables
     the gate. It is accepted for backward-compat with old launch scripts and
@@ -488,15 +507,31 @@ def should_require_auth(host: str, allow_public: bool = False) -> bool:
     MCP-persistence campaign, where ``--insecure --host 0.0.0.0`` left the
     config/MCP/agent surface open to internet scanners.
     """
-    return host not in _LOOPBACK_HOST_VALUES
+    if host not in _LOOPBACK_HOST_VALUES:
+        return True
+
+    if not public_url:
+        return False
+
+    try:
+        public_host = urllib.parse.urlparse(public_url).hostname
+    except ValueError:
+        return False
+
+    return bool(public_host and public_host not in _LOOPBACK_HOST_VALUES)
 
 
-def _is_accepted_host(host_header: str, bound_host: str) -> bool:
+def _is_accepted_host(
+    host_header: str,
+    bound_host: str,
+    public_host: str = "",
+) -> bool:
     """True if the Host header targets the interface we bound to.
 
     Accepts:
     - Exact bound host (with or without port suffix)
     - Loopback aliases when bound to loopback
+    - Exact operator-declared public host for a reverse-proxied loopback bind
     - Any host when bound to 0.0.0.0 (explicit opt-in to non-loopback,
       no protection possible at this layer)
     """
@@ -526,6 +561,9 @@ def _is_accepted_host(host_header: str, bound_host: str) -> bool:
     if bound_host in {"0.0.0.0", "::"}:
         return True
 
+    if public_host and host_only == public_host.lower():
+        return True
+
     # Loopback bind: accept the loopback names
     bound_lc = bound_host.lower()
     if bound_lc in _LOOPBACK_HOST_VALUES:
@@ -552,7 +590,8 @@ async def host_header_middleware(request: Request, call_next):
     bound_host = getattr(app.state, "bound_host", None)
     if bound_host:
         host_header = request.headers.get("host", "")
-        if not _is_accepted_host(host_header, bound_host):
+        public_host = getattr(app.state, "public_host", "")
+        if not _is_accepted_host(host_header, bound_host, public_host):
             return JSONResponse(
                 status_code=400,
                 content={
@@ -14401,6 +14440,30 @@ else:
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
 
+
+async def _linked_ws_device_allowed(ws: "WebSocket") -> bool:
+    """Fail closed when a WS ticket's linked device is revoked or expired."""
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    device_id = ticket_info.get("device_id") if isinstance(ticket_info, dict) else ""
+    if not device_id:
+        return True
+
+    try:
+        from hermes_cli.dashboard_auth.linked_devices import is_active
+
+        allowed = is_active(device_id)
+    except Exception:
+        _log.warning("linked-device status check failed", exc_info=True)
+        allowed = False
+    if allowed:
+        return True
+
+    try:
+        await ws.close(code=4401, reason="linked device revoked")
+    except Exception:
+        pass
+    return False
+
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
 from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
@@ -14482,6 +14545,8 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
                 raw = text.encode("utf-8") if isinstance(text, str) else b""
             if not raw:
                 continue
+            if not await _linked_ws_device_allowed(ws):
+                break
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
             if match and match.end() == len(raw):
@@ -14587,7 +14652,8 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
 
     host_header = ws.headers.get("host", "")
-    if not _is_accepted_host(host_header, bound_host):
+    public_host = getattr(app.state, "public_host", "")
+    if not _is_accepted_host(host_header, bound_host, public_host):
         return f"host_mismatch host={host_header or '?'} bound={bound_host}"
 
     origin = ws.headers.get("origin", "")
@@ -14604,7 +14670,7 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     if not parsed.netloc:
         return f"origin_mismatch origin={origin} bound={bound_host}"
 
-    if not _is_accepted_host(parsed.netloc, bound_host):
+    if not _is_accepted_host(parsed.netloc, bound_host, public_host):
         return f"origin_mismatch origin={origin} bound={bound_host}"
     return None
 
@@ -14682,6 +14748,7 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             TicketInvalid,
             consume_internal_credential,
             consume_ticket,
+            resume_event_channel,
         )
 
         # Server-spawned children (PTY child → /api/ws, /api/pub) present the
@@ -14706,7 +14773,65 @@ def _ws_auth_reason(ws: "WebSocket") -> tuple[Optional[str], str]:
             return "no_credential", "none"
 
         try:
-            consume_ticket(ticket)
+            info = consume_ticket(ticket)
+            allowed = info.get("allowed_endpoints")
+            if allowed is not None:
+                path = ws.url.path or ""
+                if path not in set(allowed):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_endpoint_denied",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_endpoint_denied", "ticket"
+                expected_channel = resume_event_channel(
+                    user_id=str(info.get("user_id") or ""),
+                    session_id=str(info.get("bound_session_id") or ""),
+                    profile=str(info.get("bound_profile") or ""),
+                )
+                actual_channel = info.get("event_channel")
+                if (
+                    not isinstance(actual_channel, str)
+                    or not _VALID_CHANNEL_RE.fullmatch(actual_channel)
+                    or not hmac.compare_digest(actual_channel, expected_channel)
+                ):
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_invalid", "ticket"
+                if path == "/api/events":
+                    requested_channel = ws.query_params.get("channel", "")
+                    if (
+                        not _VALID_CHANNEL_RE.fullmatch(requested_channel)
+                        or not hmac.compare_digest(requested_channel, expected_channel)
+                    ):
+                        audit_log(
+                            AuditEvent.WS_TICKET_REJECTED,
+                            reason="ticket_event_channel_denied",
+                            ip=(ws.client.host if ws.client else ""),
+                            path=path,
+                        )
+                        return "ticket_event_channel_denied", "ticket"
+                try:
+                    ws.state.ws_ticket_event_channel = expected_channel
+                except Exception:
+                    audit_log(
+                        AuditEvent.WS_TICKET_REJECTED,
+                        reason="ticket_event_channel_state_invalid",
+                        ip=(ws.client.host if ws.client else ""),
+                        path=path,
+                    )
+                    return "ticket_event_channel_state_invalid", "ticket"
+            # Destination handlers (esp. /api/pty) force bound session/profile
+            # from the ticket and ignore hostile client query params.
+            try:
+                ws.state.ws_ticket_info = info
+            except Exception:
+                pass
             return None, "ticket"
         except TicketInvalid as exc:
             audit_log(
@@ -14998,6 +15123,8 @@ async def _broadcast_event(app: Any, channel: str, payload: str) -> None:
 
     for sub in subs:
         try:
+            if not await _linked_ws_device_allowed(sub):
+                continue
             await sub.send_text(payload)
         except Exception:
             # Subscriber went away mid-send; the /api/events finally clause
@@ -15621,6 +15748,32 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+def _pty_resume_params(ws: Any) -> tuple[Optional[str], Optional[str], bool]:
+    """Return PTY resume parameters, forcing a resume-ticket's immutable bind.
+
+    A resume-scoped WS ticket may reach ``/api/pty`` only after auth stashes
+    its ticket info on ``ws.state``. In that case the bound session/profile
+    win over all client query params and ``fresh`` is disabled. Full desk
+    tickets retain the normal client-selected behaviour.
+    """
+    resume = ws.query_params.get("resume") or None
+    profile = ws.query_params.get("profile") or None
+    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        return (
+            str(ticket_info.get("bound_session_id") or "").strip() or None,
+            str(ticket_info.get("bound_profile") or "").strip() or None,
+            False,
+        )
+    return resume, profile, force_fresh
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -15674,18 +15827,23 @@ async def pty_ws(ws: WebSocket) -> None:
         return
 
     # --- spawn PTY ------------------------------------------------------
-    raw_resume = ws.query_params.get("resume") or None
-    resume = raw_resume
-    profile = ws.query_params.get("profile") or None
-    channel = _channel_or_close_code(ws)
+    resume, profile, force_fresh = _pty_resume_params(ws)
+    # Preserve the explicit target for the attach registry before any active
+    # session-file fallback below. A ticket-bound resume is explicit too.
+    raw_resume = resume
+    channel = getattr(getattr(ws, "state", None), "ws_ticket_event_channel", None)
+    if channel is None:
+        channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
-    force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
-        "1",
-        "true",
-        "yes",
-        "on",
-    }
     active_session_file: Optional[Path] = None
+
+    ticket_info = getattr(getattr(ws, "state", None), "ws_ticket_info", None) or {}
+    if isinstance(ticket_info, dict) and ticket_info.get("allowed_endpoints") is not None:
+        _log.info(
+            "pty ticket bind session=%r profile=%r (client query ignored)",
+            resume,
+            profile,
+        )
 
     if channel:
         active_session_file = _active_session_file_for_channel(ws.app, channel)
@@ -15781,6 +15939,11 @@ async def pty_ws(ws: WebSocket) -> None:
                 raw = text.encode("utf-8") if isinstance(text, str) else b""
             if not raw:
                 continue
+
+            # A linked device may be revoked after this socket opened. Check
+            # before every client message so it cannot keep driving the PTY.
+            if not await _linked_ws_device_allowed(ws):
+                break
 
             # Resize escape is consumed locally, never written to the PTY.
             match = _RESIZE_RE.match(raw)
@@ -16464,6 +16627,25 @@ async def get_dashboard_themes():
         })
         seen.add(t["name"])
     return {"themes": themes, "active": active}
+
+
+@app.get("/api/dashboard/remote-access")
+async def get_dashboard_remote_access(profile: Optional[str] = None):
+    """Return the configured public URL used for authenticated remote access.
+
+    This route stays behind the normal dashboard authentication middleware.
+    The URL is configuration, not a credential. Desktop separately probes the
+    public target before presenting a session handoff so a stale or insecure
+    value never becomes a scannable link.
+    """
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    with _config_profile_scope(profile):
+        return {"public_url": resolve_public_url()}
+
+
+class ThemeSetBody(BaseModel):
+    name: str
 
 
 @app.put("/api/dashboard/theme")
@@ -17428,7 +17610,25 @@ def start_server(
     # injection / WS-auth paths can branch on it consistently.  Phase 3.5
     # uses this to decide whether to refuse the bind, log the gate-on
     # banner, and enable uvicorn proxy_headers.
-    app.state.auth_required = should_require_auth(host)
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    public_url = resolve_public_url()
+    public_host = urllib.parse.urlparse(public_url).hostname if public_url else ""
+    # Hermes Desktop's loopback backend only mints handoff tickets. The public
+    # URL terminates at a separate gated dashboard process which shares the
+    # hash-only handoff store. Keep the Desktop backend on legacy loopback auth
+    # and do not accept the public Host header there, even though it needs the
+    # configured URL to render the QR code.
+    desktop_sidecar_client = (
+        host in _LOOPBACK_HOST_VALUES
+        and os.environ.get("HERMES_DESKTOP") == "1"
+    )
+    app.state.auth_required = (
+        False
+        if desktop_sidecar_client
+        else should_require_auth(host, public_url=public_url)
+    )
+    app.state.public_host = "" if desktop_sidecar_client else (public_host or "")
 
     # ``--insecure`` no longer disables the auth gate (June 2026 hardening:
     # the hermes-0day MCP-persistence campaign abused unauthenticated public

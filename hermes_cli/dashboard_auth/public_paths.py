@@ -51,6 +51,12 @@ PUBLIC_API_PATHS: frozenset[str] = frozenset({
     # Read-only theme + plugin manifests for the dashboard skin engine.
     "/api/dashboard/themes",
     "/api/dashboard/plugins",
+    # Phone handoff bootstrap. The one-time ``hnd_`` capability in the JSON
+    # body is the authentication boundary. Keeping this exact path public lets
+    # a new phone exchange the fragment-carried ticket before it has a cookie.
+    # The handler requires same-origin fetch metadata and never returns agent
+    # data, even on success.
+    "/api/auth/handoff-consume",
     # Chronos managed-cron fire webhook (NAS -> agent). NOT cookie-gated: it
     # carries its own short-lived NAS-minted JWT (purpose=cron_fire), which the
     # handler verifies as the real auth. Must bypass the dashboard auth gate so

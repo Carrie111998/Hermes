@@ -13,9 +13,12 @@ The routes:
   GET  /api/auth/providers → list registered providers (login bootstrap)
   GET  /api/auth/me        → current Session as JSON (auth-required)
 """
+
 from __future__ import annotations
 
+import json
 import logging
+import secrets
 import threading
 import time
 from collections import defaultdict, deque
@@ -37,10 +40,12 @@ from hermes_cli.dashboard_auth.base import (
     ProviderError,
 )
 from hermes_cli.dashboard_auth.cookies import (
+    clear_linked_device_cookie,
     clear_pkce_cookie,
     clear_session_cookies,
     clear_sso_attempt_cookie,
     detect_https,
+    read_linked_device_cookie,
     read_pkce_cookie,
     read_session_cookies,
     set_pkce_cookie,
@@ -121,6 +126,7 @@ def _prefix(request: Request) -> str:
     ``hermes_cli.dashboard_auth.prefix`` for the normalisation rules.
     """
     from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
     return prefix_from_request(request)
 
 
@@ -135,9 +141,7 @@ async def login_page(request: Request) -> HTMLResponse:
     # the redirect URL. Validate against the same same-origin rules the
     # callback applies (defence in depth — the gate already filters,
     # but /login is reachable directly too).
-    next_path = _validate_post_login_target(
-        request.query_params.get("next", "")
-    )
+    next_path = _validate_post_login_target(request.query_params.get("next", ""))
     return HTMLResponse(
         render_login_html(next_path=next_path),
         headers={"Cache-Control": "no-store, no-cache, must-revalidate"},
@@ -165,9 +169,7 @@ async def api_auth_providers() -> Any:
             {
                 "name": p.name,
                 "display_name": p.display_name,
-                "supports_password": bool(
-                    getattr(p, "supports_password", False)
-                ),
+                "supports_password": bool(getattr(p, "supports_password", False)),
             }
             for p in providers
         ],
@@ -237,9 +239,12 @@ async def auth_login(request: Request, provider: str, next: str = ""):
     safe_next = _validate_post_login_target(next)
     if safe_next:
         from urllib.parse import quote
+
         pkce = f"{pkce};next={quote(safe_next, safe='')}"
     set_pkce_cookie(
-        resp, payload=pkce, use_https=detect_https(request),
+        resp,
+        payload=pkce,
+        use_https=detect_https(request),
         prefix=_prefix(request),
     )
     return resp
@@ -324,9 +329,7 @@ async def auth_native_authorize(
         if len(sess_providers) == 1:
             p = sess_providers[0]
     if p is None:
-        raise HTTPException(
-            status_code=404, detail=f"Unknown provider: {provider!r}"
-        )
+        raise HTTPException(status_code=404, detail=f"Unknown provider: {provider!r}")
     if not getattr(p, "supports_session", True) or getattr(
         p, "supports_password", False
     ):
@@ -370,7 +373,9 @@ async def auth_native_authorize(
         pkce = f"provider={p.name};{pkce}" if pkce else f"provider={p.name}"
     pkce = f"{pkce};broker={broker_state}"
     set_pkce_cookie(
-        resp, payload=pkce, use_https=detect_https(request),
+        resp,
+        payload=pkce,
+        use_https=detect_https(request),
         prefix=_prefix(request),
     )
     return resp
@@ -400,9 +405,7 @@ async def auth_callback(
     # ``next`` segment is optional (only present when /auth/login was
     # given a next= query). All keys live in the same flat namespace;
     # ``next`` carries a URL-encoded path so it never contains ``;``.
-    parts = dict(
-        seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg
-    )
+    parts = dict(seg.split("=", 1) for seg in pkce_raw.split(";") if "=" in seg)
     provider_name = parts.get("provider", "")
     expected_state = parts.get("state", "")
     verifier = parts.get("verifier", "")
@@ -499,9 +502,7 @@ async def auth_callback(
 
         try:
             pending = native_flow.get_pending(broker_state)
-            gw_code = native_flow.complete_pending(
-                broker_state, session=session
-            )
+            gw_code = native_flow.complete_pending(broker_state, session=session)
         except native_flow.NativeFlowError:
             audit_log(
                 AuditEvent.NATIVE_TOKEN_FAILURE,
@@ -571,6 +572,7 @@ def _validate_post_login_target(raw: str) -> str:
     if not raw:
         return ""
     from urllib.parse import unquote
+
     decoded = unquote(raw)
     if not decoded.startswith("/") or decoded.startswith("//"):
         return ""
@@ -752,7 +754,8 @@ async def auth_logout(request: Request):
             except Exception as e:  # noqa: BLE001 — best-effort
                 _log.warning(
                     "dashboard-auth: revoke on %r failed: %s",
-                    provider.name, e,
+                    provider.name,
+                    e,
                 )
 
     sess = getattr(request.state, "session", None)
@@ -765,7 +768,19 @@ async def auth_logout(request: Request):
 
     prefix = _prefix(request)
     resp = RedirectResponse(url=f"{prefix}/login", status_code=302)
+    # Revoke only a verified device. A full OAuth session can coexist with a
+    # linked-device cookie because full authority takes precedence.
+    from hermes_cli.dashboard_auth.linked_devices import authenticate, revoke
+
+    device_id = getattr(sess, "device_id", "")
+    if not device_id:
+        linked_secret = read_linked_device_cookie(request) or ""
+        linked_record = authenticate(linked_secret) if linked_secret else None
+        device_id = linked_record["id"] if linked_record else ""
+    if device_id:
+        revoke(device_id)
     clear_session_cookies(resp, prefix=prefix)
+    clear_linked_device_cookie(resp, prefix=prefix)
     clear_pkce_cookie(resp, prefix=prefix)
     return resp
 
@@ -788,6 +803,9 @@ async def api_auth_me(request: Request):
         "org_id": sess.org_id,
         "provider": sess.provider,
         "expires_at": sess.expires_at,
+        "scopes": list(getattr(sess, "scopes", ()) or ()),
+        "bound_session_id": getattr(sess, "bound_session_id", "") or "",
+        "bound_profile": getattr(sess, "bound_profile", "") or "",
     }
 
 
@@ -816,16 +834,344 @@ async def api_auth_ws_ticket(request: Request):
 
     # Import here so the routes module stays usable in test contexts that
     # don't load the ticket store.
-    from hermes_cli.dashboard_auth.ws_tickets import TTL_SECONDS, mint_ticket
+    from hermes_cli.dashboard_auth.scopes import (
+        RESUME_WS_ENDPOINTS,
+        session_is_restricted,
+        session_scopes,
+    )
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        TTL_SECONDS,
+        mint_ticket,
+        resume_event_channel,
+    )
 
-    ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+    if session_is_restricted(sess):
+        # Resume sessions may only mint tickets for chat-related WS paths.
+        ticket = mint_ticket(
+            user_id=sess.user_id,
+            provider=sess.provider,
+            scopes=session_scopes(sess),
+            bound_session_id=getattr(sess, "bound_session_id", "") or "",
+            bound_profile=getattr(sess, "bound_profile", "") or "",
+            allowed_endpoints=RESUME_WS_ENDPOINTS,
+            device_id=getattr(sess, "device_id", "") or "",
+        )
+        event_channel = resume_event_channel(
+            user_id=sess.user_id,
+            session_id=getattr(sess, "bound_session_id", "") or "",
+            profile=getattr(sess, "bound_profile", "") or "",
+        )
+    else:
+        ticket = mint_ticket(user_id=sess.user_id, provider=sess.provider)
+        event_channel = ""
     audit_log(
         AuditEvent.WS_TICKET_MINTED,
         provider=sess.provider,
         user_id=sess.user_id,
         ip=_client_ip(request),
     )
-    return {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+    response = {"ticket": ticket, "ttl_seconds": TTL_SECONDS}
+    if event_channel:
+        response["event_channel"] = event_channel
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Public: phone-handoff fragment bootstrap
+# ---------------------------------------------------------------------------
+
+
+def _canonical_origin(raw: str, *, require_origin_shape: bool = False) -> str:
+    """Return a normalised scheme + authority or ``""`` for invalid input."""
+    from urllib.parse import urlsplit
+
+    try:
+        parsed = urlsplit((raw or "").strip())
+        port = parsed.port
+    except ValueError:
+        return ""
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return ""
+    if require_origin_shape and parsed.path not in {"", "/"}:
+        return ""
+
+    host = parsed.hostname.lower()
+    if ":" in host:
+        host = f"[{host}]"
+    default_port = 443 if parsed.scheme == "https" else 80
+    authority = host if port in {None, default_port} else f"{host}:{port}"
+    return f"{parsed.scheme}://{authority}"
+
+
+def _expected_handoff_origin(request: Request) -> str:
+    """Resolve the browser origin from trusted config, then proxy-aware URL."""
+    from hermes_cli.dashboard_auth.prefix import resolve_public_url
+
+    public_url = resolve_public_url()
+    return _canonical_origin(public_url or str(request.url))
+
+
+def _render_handoff_bootstrap(prefix: str, nonce: str) -> str:
+    """Render a dependency-free page that exchanges a fragment ticket."""
+    api_path = json.dumps(f"{prefix}/api/auth/handoff-consume")
+    script = """
+(() => {
+  const status = document.getElementById('status');
+  const fail = () => {
+    status.textContent = 'This handoff link is invalid or has expired. Create a new QR code from Hermes Desktop.';
+    document.title = 'Handoff expired | Hermes';
+  };
+
+  const params = new URLSearchParams(window.location.hash.slice(1));
+  let ticket = params.get('ticket') || '';
+  history.replaceState(null, '', window.location.pathname + window.location.search);
+  if (!ticket) {
+    fail();
+    return;
+  }
+
+  const body = JSON.stringify({ ticket });
+  ticket = '';
+  fetch(__API_PATH__, {
+    method: 'POST',
+    credentials: 'include',
+    cache: 'no-store',
+    redirect: 'error',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Hermes-Handoff': '1'
+    },
+    body
+  }).then(async response => {
+    if (!response.ok) throw new Error('handoff rejected');
+    const payload = await response.json();
+    const next = new URL(payload.location || '', window.location.origin);
+    if (next.origin !== window.location.origin) throw new Error('invalid destination');
+    window.location.replace(next.pathname + next.search);
+  }).catch(fail);
+})();
+""".replace("__API_PATH__", api_path)
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <title>Opening Hermes</title>
+  <style nonce="{nonce}">
+    :root {{ color-scheme: dark; font-family: ui-sans-serif, system-ui, sans-serif; }}
+    body {{ align-items: center; background: #071411; color: #e9fff7; display: flex; justify-content: center; margin: 0; min-height: 100vh; }}
+    main {{ max-width: 32rem; padding: 2rem; text-align: center; }}
+    h1 {{ font-size: 1.5rem; margin: 0 0 .75rem; }}
+    p {{ color: #a9c7bd; line-height: 1.55; }}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Opening Hermes</h1>
+    <p id="status">Securing this session on your phone...</p>
+  </main>
+  <script nonce="{nonce}">{script}</script>
+</body>
+</html>"""
+
+
+@router.get("/handoff", name="handoff_bootstrap")
+async def handoff_bootstrap(request: Request) -> HTMLResponse:
+    """Load the fragment-only handoff exchange without exposing the SPA."""
+    nonce = secrets.token_urlsafe(18)
+    prefix = _prefix(request)
+    return HTMLResponse(
+        _render_handoff_bootstrap(prefix, nonce),
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate",
+            "Content-Security-Policy": (
+                "default-src 'none'; base-uri 'none'; connect-src 'self'; "
+                f"script-src 'nonce-{nonce}'; style-src 'nonce-{nonce}'; "
+                "form-action 'none'; frame-ancestors 'none'"
+            ),
+            "Cross-Origin-Opener-Policy": "same-origin",
+            "Permissions-Policy": "camera=(), microphone=(), geolocation=()",
+            "Referrer-Policy": "no-referrer",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
+
+
+@router.post("/api/auth/handoff-consume", name="auth_handoff_consume")
+async def api_auth_handoff_consume(request: Request):
+    """Exchange a same-origin fragment ticket for a linked-device cookie."""
+    content_type = request.headers.get("content-type", "").split(";", 1)[0].lower()
+    origin = _canonical_origin(
+        request.headers.get("origin", ""),
+        require_origin_shape=True,
+    )
+    expected_origin = _expected_handoff_origin(request)
+    fetch_site = request.headers.get("sec-fetch-site", "")
+    if (
+        content_type != "application/json"
+        or request.headers.get("x-hermes-handoff") != "1"
+        or not origin
+        or origin != expected_origin
+        or (fetch_site and fetch_site != "same-origin")
+    ):
+        return JSONResponse(
+            {"detail": "Handoff request rejected"},
+            status_code=403,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    try:
+        payload = await request.json()
+    except (ValueError, UnicodeDecodeError):
+        payload = None
+    if not isinstance(payload, dict) or not isinstance(payload.get("ticket"), str):
+        return JSONResponse(
+            {"detail": "Invalid handoff request"},
+            status_code=400,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    from hermes_cli.dashboard_auth.middleware import consume_handoff_response
+
+    response = consume_handoff_response(
+        request,
+        payload["ticket"].strip(),
+        require_legacy_chat_request=False,
+        json_response=True,
+    )
+    if response is None:
+        return JSONResponse(
+            {"detail": "Invalid or expired handoff"},
+            status_code=401,
+            headers={"Cache-Control": "no-store"},
+        )
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Auth-required: phone-handoff ticket (QR path)
+# ---------------------------------------------------------------------------
+
+
+class _HandoffTicketBody(BaseModel):
+    session_id: str
+    profile: str = ""
+
+
+def _full_dashboard_session_or_local_desk(request: Request):
+    """Return the authenticated full session, or loopback Desktop's local trust."""
+    import time as _time
+    from hermes_cli.dashboard_auth.base import Session as _Session
+    from hermes_cli.dashboard_auth.scopes import require_full_dashboard_session
+
+    sess = getattr(request.state, "session", None)
+    if sess is None and not getattr(request.app.state, "auth_required", False):
+        return _Session(
+            user_id="local-desk",
+            email="",
+            display_name="Local desk",
+            org_id="",
+            provider="loopback",
+            expires_at=int(_time.time()) + 3600,
+            access_token="",
+            refresh_token="",
+        )
+    require_full_dashboard_session(sess)
+    return sess
+
+
+@router.post("/api/auth/handoff-ticket", name="auth_handoff_ticket")
+async def api_auth_handoff_ticket(request: Request, body: _HandoffTicketBody):
+    """Mint a single-use phone-handoff ticket for a chat session.
+
+    Full desk session only (cookie / native bearer). On loopback binds
+    (``auth_required`` False) Hermes Desktop authenticates with the legacy
+    session token and has no OAuth cookie — mint as a synthetic local-desk
+    identity so Continue-on-phone can issue QR handoff tickets. The ticket
+    binds ``session_id`` + optional ``profile`` and, on fragment-bootstrap
+    consume, links that browser to the selected chat — never
+    ``API_SERVER_KEY`` / superuser / ``*`` scope.
+    """
+    from hermes_cli.dashboard_auth.scopes import (
+        validate_handoff_target,
+    )
+
+    sess = _full_dashboard_session_or_local_desk(request)
+
+    session_id = (body.session_id or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="session_id is required")
+
+    # F-02: bind only to an existing session (+ optional existing profile).
+    try:
+        canon_sid, canon_profile = validate_handoff_target(
+            session_id, body.profile or ""
+        )
+    except ValueError as exc:
+        msg = str(exc)
+        code = (
+            404
+            if "not found" in msg.lower() or "does not exist" in msg.lower()
+            else 400
+        )
+        raise HTTPException(status_code=code, detail=msg) from exc
+
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        HANDOFF_TTL_SECONDS,
+        mint_handoff_ticket,
+    )
+
+    try:
+        ticket = mint_handoff_ticket(
+            session_id=canon_sid,
+            profile=canon_profile,
+            user_id=sess.user_id,
+            provider=sess.provider,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    audit_log(
+        AuditEvent.HANDOFF_TICKET_MINTED,
+        provider=sess.provider,
+        user_id=sess.user_id,
+        ip=_client_ip(request),
+        session_id=canon_sid,
+        profile=canon_profile,
+    )
+    return {
+        "ticket": ticket,
+        "ttl_seconds": HANDOFF_TTL_SECONDS,
+        "session_id": canon_sid,
+        "profile": canon_profile,
+    }
+
+
+@router.get("/api/auth/linked-devices", name="auth_linked_devices")
+async def api_linked_devices(request: Request):
+    """List local linked browsers. Only a full dashboard session may manage them."""
+    from hermes_cli.dashboard_auth.linked_devices import list_devices
+
+    _full_dashboard_session_or_local_desk(request)
+    return JSONResponse(
+        {"devices": list_devices()},
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+@router.delete(
+    "/api/auth/linked-devices/{device_id}", name="auth_linked_devices_revoke"
+)
+async def api_revoke_linked_device(request: Request, device_id: str):
+    from hermes_cli.dashboard_auth.linked_devices import revoke
+
+    _full_dashboard_session_or_local_desk(request)
+    if not revoke(device_id):
+        raise HTTPException(status_code=404, detail="Linked device not found")
+    return JSONResponse({"ok": True}, headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------
@@ -927,7 +1273,8 @@ async def auth_native_refresh(request: Request, body: _NativeRefreshBody):
                 unreachable = provider.name
             _log.warning(
                 "dashboard-auth: provider %r unreachable during native refresh: %s",
-                provider.name, e,
+                provider.name,
+                e,
             )
             continue
         audit_log(

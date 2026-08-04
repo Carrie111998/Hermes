@@ -27,6 +27,8 @@ const { renameSession, request, activeGateway } = vi.hoisted(() => ({
 activeGateway.mockReturnValue({ request })
 
 vi.mock('@/hermes', () => ({
+  getDashboardHandoffTicket: vi.fn(),
+  getDashboardRemoteAccess: vi.fn(),
   renameSession: (...args: unknown[]) => renameSession(...(args as [])),
   // profile.ts calls this at import (its $activeGatewayProfile subscribe fires
   // immediately), pulled in transitively via session-states.

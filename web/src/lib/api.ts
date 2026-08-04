@@ -199,7 +199,11 @@ function pluginPath(name: string): string {
  * Tickets are single-use and TTL=30s — every WS connect attempt must
  * fetch a fresh ticket.
  */
-export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: number }> {
+export async function getWsTicket(): Promise<{
+  ticket: string;
+  ttl_seconds: number;
+  event_channel?: string;
+}> {
   const res = await fetch(`${BASE}/api/auth/ws-ticket`, {
     method: "POST",
     credentials: "include",
@@ -215,13 +219,20 @@ export async function getWsTicket(): Promise<{ ticket: string; ttl_seconds: numb
  * connect. In gated mode mints a fresh single-use ticket; in loopback
  * mode returns the injected session token.
  */
-export async function buildWsAuthParam(): Promise<[string, string]> {
+async function buildWsAuth(): Promise<{
+  authParam: [string, string];
+  eventChannel?: string;
+}> {
   if (window.__HERMES_AUTH_REQUIRED__) {
-    const { ticket } = await getWsTicket();
-    return ["ticket", ticket];
+    const { ticket, event_channel } = await getWsTicket();
+    return { authParam: ["ticket", ticket], eventChannel: event_channel };
   }
   const token = window.__HERMES_SESSION_TOKEN__ ?? "";
-  return ["token", token];
+  return { authParam: ["token", token] };
+}
+
+export async function buildWsAuthParam(): Promise<[string, string]> {
+  return (await buildWsAuth()).authParam;
 }
 
 /**
@@ -274,10 +285,13 @@ export async function buildWsUrl(
   path: string,
   params?: Record<string, string>,
 ): Promise<string> {
+  const { authParam, eventChannel } = await buildWsAuth();
   return buildHermesWebSocketUrl({
-    authParam: await buildWsAuthParam(),
+    authParam,
     basePath: BASE,
-    params,
+    params: eventChannel && (path === "/api/events" || path === "/api/pty")
+      ? { ...params, channel: eventChannel }
+      : params,
     path,
   });
 }
@@ -1336,6 +1350,9 @@ export interface AuthMeResponse {
   org_id: string;
   provider: string;
   expires_at: number;
+  scopes: string[];
+  bound_session_id: string;
+  bound_profile: string;
 }
 
 export interface ActionResponse {

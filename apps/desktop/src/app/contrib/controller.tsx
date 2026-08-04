@@ -62,6 +62,7 @@ import { watchSessionPins } from '@/store/session-pin-sync'
 import { $statusbarVisible } from '@/store/statusbar-prefs'
 
 import type { SessionDragPayload } from '../chat/composer/inline-refs'
+import { ContinueOnPhoneDialogHost } from '../chat/continue-on-phone-dialog'
 import { watchRouteTiles } from '../chat/route-tile'
 import { startSessionDrag } from '../chat/session-drag'
 import {
@@ -781,6 +782,7 @@ export function ContribController() {
               per-turn readouts stop with it. */}
           {statusbarVisible && <WiredPane part="statusbar" />}
         </div>
+        <ContinueOnPhoneDialogHost />
       </ContribWiring>
     </SidebarProvider>
   )

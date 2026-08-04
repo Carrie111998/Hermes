@@ -47,6 +47,26 @@ class TestHostHeaderValidator:
         # Loopback — reject (we bound to a specific non-loopback name)
         assert not _is_accepted_host("localhost", "my-server.corp.net")
 
+    def test_loopback_proxy_accepts_only_declared_public_host(self):
+        """A gated loopback proxy admits its configured host, not arbitrary DNS."""
+        from hermes_cli.web_server import _is_accepted_host
+
+        assert _is_accepted_host(
+            "hermes.example.com",
+            "127.0.0.1",
+            "hermes.example.com",
+        )
+        assert _is_accepted_host(
+            "hermes.example.com:443",
+            "127.0.0.1",
+            "hermes.example.com",
+        )
+        assert not _is_accepted_host(
+            "evil.example",
+            "127.0.0.1",
+            "hermes.example.com",
+        )
+
 
 
 class TestHostHeaderMiddleware:
@@ -90,6 +110,23 @@ class TestHostHeaderMiddleware:
         resp = client.get("/api/status")
         # Should get through to the status endpoint, not a 400
         assert resp.status_code != 400
+
+    def test_declared_public_host_passes_loopback_proxy_validation(self):
+        from fastapi.testclient import TestClient
+        from hermes_cli.web_server import app
+
+        app.state.bound_host = "127.0.0.1"
+        app.state.public_host = "hermes.example.com"
+        try:
+            client = TestClient(app)
+            resp = client.get(
+                "/api/status",
+                headers={"Host": "hermes.example.com"},
+            )
+            assert resp.status_code != 400
+        finally:
+            del app.state.bound_host
+            del app.state.public_host
 
 
 class TestWebSocketHostOriginGuard:

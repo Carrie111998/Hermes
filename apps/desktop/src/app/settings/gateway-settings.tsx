@@ -28,6 +28,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $profiles, refreshActiveProfile } from '@/store/profile'
 
 import { CONTROL_TEXT } from './constants'
+import { LinkedDevicesSettings } from './linked-devices-settings'
 import { EmptyState, ListRow, Pill, SettingsContent, SettingsSkeleton } from './primitives'
 import { enrichSelectedSshHost, selectSshHost } from './ssh-host-selection'
 
@@ -1456,6 +1457,8 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
       ) : null}
 
       {lastTest ? <div className="mt-4 text-xs text-primary">{lastTest}</div> : null}
+
+      {!embedded ? <LinkedDevicesSettings /> : null}
 
       {/* Test/Save apply to local + remote. Cloud connects via the agent picker
           above (which applies a cloud connection on select), so its only

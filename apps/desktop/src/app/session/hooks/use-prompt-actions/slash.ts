@@ -1,6 +1,7 @@
 import { skillInvocationText } from '@hermes/shared'
 import { type MutableRefObject, useCallback, useRef } from 'react'
 
+import { openContinueOnPhone } from '@/app/chat/continue-on-phone-state'
 import { getProfiles } from '@/hermes'
 import type { Translations } from '@/i18n'
 import { type ChatMessage, toChatMessages } from '@/lib/chat-messages'
@@ -28,6 +29,7 @@ import {
   $connection,
   $sessions,
   $yoloActive,
+  rememberedSessionProfile,
   resolveComposerSessionKey,
   setCurrentUsage,
   setModelPickerOpen,
@@ -761,6 +763,16 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             notify({ kind: 'success', message: copy.newChatsProfile(match.name) })
           } catch (err) {
             notifyError(err, copy.setProfileFailed)
+          }
+        },
+        remoteControl: async ({ sessionHint }) => {
+          const runtimeId = sessionHint || activeSessionIdRef.current
+          const storedSessionId = runtimeId ? $sessionStates.get()[runtimeId]?.storedSessionId : null
+          const sessionId = storedSessionId || selectedStoredSessionIdRef.current || runtimeId
+          const profile = rememberedSessionProfile($sessions.get(), sessionId, $activeGatewayProfile.get())
+
+          if (!sessionId || !openContinueOnPhone(sessionId, profile)) {
+            notify({ kind: 'error', title: copy.sessionUnavailable, message: copy.createSessionFailed })
           }
         },
         skin: async ({ arg, command, recordInput, sessionHint }) => {

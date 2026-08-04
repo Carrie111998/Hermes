@@ -10,9 +10,19 @@ from typing import Optional
 class Session:
     """A verified identity. Returned by ``complete_login`` and ``verify_session``.
 
-    All fields are mandatory. Providers that don't have a concept of orgs
-    should set ``org_id`` to an empty string. ``access_token`` and
-    ``refresh_token`` are opaque to Hermes — provider-specific.
+    All fields through ``refresh_token`` are mandatory. Providers that don't
+    have a concept of orgs should set ``org_id`` to an empty string.
+    ``access_token`` and ``refresh_token`` are opaque to Hermes —
+    provider-specific.
+
+    ``scopes`` is optional and defaults to empty (unscoped interactive
+    browser session = full dashboard). Handoff-minted sessions set
+    ``scopes=("resume",)`` and never carry superuser / ``*`` /
+    ``API_SERVER_KEY``. Non-empty scopes are default-deny; see
+    ``dashboard_auth.scopes``.
+
+    ``bound_session_id`` / ``bound_profile`` bind a resume session to one
+    chat row (and optional profile home). Empty for full-dashboard sessions.
     """
 
     user_id: str
@@ -23,6 +33,11 @@ class Session:
     expires_at: int  # unix seconds; the access_token's exp claim
     access_token: str
     refresh_token: str
+    scopes: tuple[str, ...] = ()
+    # Handoff/resume binding — empty for full-dashboard sessions.
+    bound_session_id: str = ""
+    bound_profile: str = ""
+    device_id: str = ""
 
 
 @dataclass(frozen=True)

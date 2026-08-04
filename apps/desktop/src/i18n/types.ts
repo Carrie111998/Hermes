@@ -626,6 +626,16 @@ export interface Translations {
       sshErrTimeout: string
       sshErrUpdateRequired: string
       sshErrUnknown: string
+      linkedDevicesTitle: string
+      linkedDevicesLoading: string
+      linkedDevicesError: string
+      linkedDevicesEmpty: string
+      linkedDevicesEmptyDesc: string
+      linkedDevicesDates: (linked: string, used: string) => string
+      linkedDevicesRevoke: string
+      linkedDevicesRevoking: string
+      linkedDevicesRevoked: string
+      linkedDevicesRevokeFailed: string
     }
     keys: {
       loading: string
@@ -1624,6 +1634,29 @@ export interface Translations {
       hideTabBar: string
       openInNewTab: string
       openInSplit: string
+      continueOnPhone: string
+      continueOnPhoneTitle: string
+      continueOnPhoneDesc: string
+      continueOnPhonePreparing: string
+      continueOnPhoneQrAlt: string
+      continueOnPhoneExpiresIn: (seconds: number) => string
+      continueOnPhoneAvailabilityHint: string
+      continueOnPhoneExpiredTitle: string
+      continueOnPhoneExpiredDesc: string
+      continueOnPhoneNewCode: string
+      continueOnPhoneNotConfiguredTitle: string
+      continueOnPhoneNotConfiguredDesc: string
+      continueOnPhoneInsecureUrlTitle: string
+      continueOnPhoneInsecureUrlDesc: string
+      continueOnPhoneUnreachableTitle: string
+      continueOnPhoneUnreachableDesc: string
+      continueOnPhoneBrowserAuthTitle: string
+      continueOnPhoneBrowserAuthDesc: string
+      continueOnPhoneTicketFailedTitle: string
+      continueOnPhoneTicketFailedDesc: string
+      continueOnPhoneCopyLink: string
+      continueOnPhoneOpenBrowser: string
+      continueOnPhoneOpenFailed: string
       copyIdFailed: string
       sessionActions: string
       sessionRunning: string

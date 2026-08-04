@@ -15,6 +15,16 @@ from fastapi.testclient import TestClient
 from hermes_cli import web_server
 
 
+@pytest.fixture(autouse=True)
+def restore_dashboard_app_state():
+    """Keep start_server state probes from leaking into later auth modules."""
+    state = web_server.app.state._state
+    before = dict(state)
+    yield
+    state.clear()
+    state.update(before)
+
+
 @pytest.fixture
 def client_loopback():
     # Pin the bound-host state for host_header_middleware so requests with
@@ -124,6 +134,10 @@ def _stub_uvicorn_run(monkeypatch):
 
 def test_start_server_loopback_sets_auth_required_false(monkeypatch):
     """Loopback bind: app.state.auth_required is False after start_server."""
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "",
+    )
     _stub_uvicorn_run(monkeypatch)
     # Force a fresh state to detect that start_server actually set it.
     web_server.app.state.auth_required = None
@@ -132,6 +146,55 @@ def test_start_server_loopback_sets_auth_required_false(monkeypatch):
         open_browser=False, allow_public=False,
     )
     assert web_server.app.state.auth_required is False
+
+
+def test_start_server_loopback_public_url_enables_gate(monkeypatch):
+    """An external public URL makes a loopback reverse-proxy bind gated."""
+    from hermes_cli.dashboard_auth import clear_providers, register_provider
+    from tests.hermes_cli.conftest_dashboard_auth import StubAuthProvider
+
+    clear_providers()
+    register_provider(StubAuthProvider())
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "https://hermes.example.com",
+    )
+    captured = _stub_uvicorn_run(monkeypatch)
+
+    try:
+        web_server.app.state.auth_required = None
+        web_server.start_server(
+            host="127.0.0.1",
+            port=9119,
+            open_browser=False,
+            allow_public=False,
+        )
+        assert web_server.app.state.auth_required is True
+        assert web_server.app.state.public_host == "hermes.example.com"
+        assert captured["kwargs"].get("proxy_headers") is True
+    finally:
+        clear_providers()
+
+
+def test_desktop_loopback_uses_separate_gated_public_sidecar(monkeypatch):
+    """Desktop may render a public QR without exposing its local backend."""
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setattr(
+        "hermes_cli.dashboard_auth.prefix.resolve_public_url",
+        lambda: "https://hermes.example.com",
+    )
+    captured = _stub_uvicorn_run(monkeypatch)
+
+    web_server.start_server(
+        host="127.0.0.1",
+        port=9119,
+        open_browser=False,
+        allow_public=False,
+    )
+
+    assert web_server.app.state.auth_required is False
+    assert web_server.app.state.public_host == ""
+    assert captured["kwargs"].get("proxy_headers") is False
 
 
 def test_start_server_insecure_public_no_longer_bypasses_gate(monkeypatch):
@@ -201,5 +264,3 @@ def test_start_server_gate_with_provider_proceeds_and_sets_proxy_headers(monkeyp
         assert captured["kwargs"].get("proxy_headers") is True
     finally:
         clear_providers()
-
-

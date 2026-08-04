@@ -14,6 +14,7 @@ The middleware is a no-op when ``auth_required`` is False (loopback
 mode); the legacy ``_SESSION_TOKEN`` ``auth_middleware`` handles those
 binds.
 """
+
 from __future__ import annotations
 
 import logging
@@ -28,15 +29,22 @@ from hermes_cli.dashboard_auth.base import (
     DashboardAuthProvider,
     ProviderError,
     RefreshExpiredError,
+    Session,
 )
 from hermes_cli.dashboard_auth.cookies import (
+    clear_linked_device_cookie,
     clear_sso_attempt_cookie,
+    detect_https,
+    read_linked_device_cookie,
     read_session_cookies,
     read_session_provider,
     read_sso_attempt_cookie,
+    set_linked_device_cookie,
+    set_session_cookies,
     set_session_provider_cookie,
     set_sso_attempt_cookie,
 )
+from hermes_cli.dashboard_auth.prefix import prefix_from_request
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
 
 _log = logging.getLogger(__name__)
@@ -64,6 +72,13 @@ _GATE_PUBLIC_PREFIXES: tuple[str, ...] = (
     "/fonts-terminal/",
 )
 
+# Exact public browser pages. These are kept separate from the prefix list so
+# ``/handoff-anything`` cannot accidentally inherit the handoff bootstrap's
+# unauthenticated status.
+_GATE_PUBLIC_PATHS: frozenset[str] = frozenset({
+    "/handoff",
+})
+
 
 def _path_is_public(path: str) -> bool:
     """True if ``path`` bypasses the OAuth auth gate.
@@ -80,9 +95,10 @@ def _path_is_public(path: str) -> bool:
     """
     if path in PUBLIC_API_PATHS:
         return True
+    if path in _GATE_PUBLIC_PATHS:
+        return True
     return any(
-        path == prefix or path.startswith(prefix)
-        for prefix in _GATE_PUBLIC_PREFIXES
+        path == prefix or path.startswith(prefix) for prefix in _GATE_PUBLIC_PREFIXES
     )
 
 
@@ -136,10 +152,7 @@ def _unauth_response(request: Request, *, reason: str) -> Response:
     path = request.url.path
     next_param = _safe_next_target(request)
     prefix = prefix_from_request(request)
-    login_url = (
-        f"{prefix}/login?next={next_param}" if next_param
-        else f"{prefix}/login"
-    )
+    login_url = f"{prefix}/login?next={next_param}" if next_param else f"{prefix}/login"
 
     if path.startswith("/api/"):
         # API routes never get redirects: the browser fetch() API would
@@ -199,6 +212,7 @@ def _auto_sso_response(request: Request) -> Response | None:
     # this user. Stop here, clear the marker, let /login render.
     if read_sso_attempt_cookie(request):
         from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
         resp = _unauth_response(request, reason="no_cookie")
         clear_sso_attempt_cookie(resp, prefix=prefix_from_request(request))
         return resp
@@ -219,6 +233,7 @@ def _auto_sso_response(request: Request) -> Response | None:
     prefix = prefix_from_request(request)
     next_param = _safe_next_target(request)
     from urllib.parse import quote
+
     auth_login = f"{prefix}/auth/login?provider={quote(provider.name, safe='')}"
     if next_param:
         auth_login = f"{auth_login}&next={next_param}"
@@ -229,8 +244,11 @@ def _auto_sso_response(request: Request) -> Response | None:
     # looping. Detect HTTPS for the Secure flag the same way the auth routes
     # do; bind Path via the active prefix.
     from hermes_cli.dashboard_auth.cookies import detect_https
+
     set_sso_attempt_cookie(
-        resp, use_https=detect_https(request), prefix=prefix,
+        resp,
+        use_https=detect_https(request),
+        prefix=prefix,
     )
     audit_log(
         AuditEvent.LOGIN_START,
@@ -255,10 +273,7 @@ def _safe_next_target(request: Request) -> str:
     if not path or not path.startswith("/") or path.startswith("//"):
         return ""
     # Don't redirect back to the auth routes themselves — that loops.
-    if any(
-        path == p or path.startswith(p)
-        for p in ("/login", "/auth/", "/api/auth/")
-    ):
+    if any(path == p or path.startswith(p) for p in ("/login", "/auth/", "/api/auth/")):
         return ""
     # Reject ALL ``/api/*`` paths. The 401-envelope code path fires for
     # any unauthenticated SPA fetch (e.g. ``GET /api/analytics/models``
@@ -275,6 +290,7 @@ def _safe_next_target(request: Request) -> str:
     target = f"{path}?{query}" if query else path
     # urlencode the whole thing as a single value.
     from urllib.parse import quote
+
     return quote(target, safe="")
 
 
@@ -305,7 +321,8 @@ def _verify_bearer(request: Request, *, access_token: str):
         except ProviderError as e:
             _log.warning(
                 "dashboard-auth: provider %r unreachable during bearer verify: %s",
-                provider.name, e,
+                provider.name,
+                e,
             )
             if unreachable_provider is None:
                 unreachable_provider = provider.name
@@ -366,6 +383,9 @@ async def gated_auth_middleware(
             )
         if bearer_session is not None:
             request.state.session = bearer_session
+            scope_block = _scope_denial_response(request, bearer_session)
+            if scope_block is not None:
+                return scope_block
             return await call_next(request)
         # A bearer was presented but didn't verify (expired/invalid/unknown).
         # Return the structured 401 so the desktop knows to refresh or
@@ -375,13 +395,92 @@ async def gated_auth_middleware(
     at, _rt = read_session_cookies(request)
     provider_hint = read_session_provider(request)
     if not at and not _rt:
-        # Neither token present — no session at all. Nothing to verify or
-        # refresh. Before falling back to the /login interstitial, try to
-        # silently bounce the user through the portal OAuth flow: the portal
-        # auto-approves org members and 302s straight back when they already
-        # hold a portal session, so the interstitial click is pure friction
-        # for the common case. The one-shot loop-guard inside _auto_sso_response
-        # prevents a ping-pong when the portal genuinely has no session.
+        # A linked browser is deliberately considered only after normal OAuth
+        # cookies: full dashboard authority always wins over resume authority.
+        linked_secret = read_linked_device_cookie(request)
+        if linked_secret:
+            from hermes_cli.dashboard_auth.linked_devices import authenticate
+
+            record = authenticate(linked_secret)
+            if record is not None:
+                session = Session(
+                    user_id=record["id"],
+                    email="",
+                    display_name=record["label"],
+                    org_id="",
+                    provider="linked-device",
+                    expires_at=0,
+                    access_token="",
+                    refresh_token="",
+                    scopes=("resume",),
+                    bound_session_id=record["session_id"],
+                    bound_profile=record["profile"],
+                    device_id=record["id"],
+                )
+                request.state.session = session
+                denied = _scope_denial_response(request, session)
+                if denied is not None:
+                    return denied
+                # Root, unbound and client-pivoted chat URLs always land at
+                # the immutable server-bound target.
+                requested_resume = (request.query_params.get("resume") or "").strip()
+                requested_profile = (request.query_params.get("profile") or "").strip()
+                needs_bound_redirect = (
+                    request.url.path == "/"
+                    or requested_resume != record["session_id"]
+                    or requested_profile != record["profile"]
+                )
+                if (
+                    request.method == "GET"
+                    and request.url.path in ("/", "/chat")
+                    and needs_bound_redirect
+                ):
+                    from hermes_cli.dashboard_auth.scopes import (
+                        handoff_redirect_location,
+                    )
+
+                    prefix = prefix_from_request(request)
+                    response = RedirectResponse(
+                        handoff_redirect_location(record, prefix=prefix),
+                        status_code=302,
+                    )
+                    set_linked_device_cookie(
+                        response,
+                        secret=linked_secret,
+                        use_https=detect_https(request),
+                        prefix=prefix,
+                    )
+                    return response
+                response = await call_next(request)
+                set_linked_device_cookie(
+                    response,
+                    secret=linked_secret,
+                    use_https=detect_https(request),
+                    prefix=prefix_from_request(request),
+                )
+                return response
+            response = _unauth_response(request, reason="invalid_or_expired_session")
+            clear_linked_device_cookie(response, prefix=prefix_from_request(request))
+            return response
+        # Neither token present — no session at all. Before bouncing to
+        # login / auto-SSO, try a single-use ?handoff=<ticket> consume
+        # (QR phone-path). Valid ticket → set a linked-device cookie and
+        # 302 to the same path with the handoff param
+        # stripped so the ticket never lingers in the URL/history.
+        # Invalid / expired / already-used ticket → normal unauth flow
+        # (no error leak about handoff state).
+        handoff = (request.query_params.get("handoff") or "").strip()
+        if handoff:
+            handoff_resp = consume_handoff_response(
+                request,
+                handoff,
+                require_legacy_chat_request=True,
+            )
+            if handoff_resp is not None:
+                return handoff_resp
+        # Silently bounce the user through the portal OAuth flow when
+        # eligible: the portal auto-approves org members and 302s
+        # straight back when they already hold a portal session.
         auto = _auto_sso_response(request)
         if auto is not None:
             return auto
@@ -403,49 +502,52 @@ async def gated_auth_middleware(
     # good refresh token — defeating the whole transparent-refresh feature.
     session = None
     if at:
-        # Try every registered provider's verify_session in turn. A provider
-        # that doesn't recognise the token returns None and we move on; the
-        # first provider that returns a Session wins.
-        #
-        # A provider may instead raise ProviderError (its IDP/JWKS is
-        # unreachable, so it can neither confirm nor deny the token). With
-        # multiple providers stacked, that MUST NOT abort the chain — the
-        # token may belong to a *different*, reachable provider. (Concretely:
-        # a self-hosted-OIDC session hits the `nous` provider first, which
-        # tries to reach Nous Portal's JWKS; if that's unreachable it raises,
-        # but the `self-hosted` provider can still verify the token.) So we
-        # remember the unreachable error and keep going. Only if NO provider
-        # verifies the token AND at least one was unreachable do we surface a
-        # 503 — distinguishing "transient IDP outage" (don't force re-login)
-        # from "token genuinely invalid" (fall through to refresh/relogin).
-        unreachable_provider: str | None = None
-        for provider in _ordered_session_providers(provider_hint):
-            try:
-                session = provider.verify_session(access_token=at)
-            except ProviderError as e:
-                _log.warning(
-                    "dashboard-auth: provider %r unreachable during verify: %s",
-                    provider.name, e,
+        session = None
+        if session is None:
+            # Try every registered provider's verify_session in turn. A provider
+            # that doesn't recognise the token returns None and we move on; the
+            # first provider that returns a Session wins.
+            #
+            # A provider may instead raise ProviderError (its IDP/JWKS is
+            # unreachable, so it can neither confirm nor deny the token). With
+            # multiple providers stacked, that MUST NOT abort the chain — the
+            # token may belong to a *different*, reachable provider. (Concretely:
+            # a self-hosted-OIDC session hits the `nous` provider first, which
+            # tries to reach Nous Portal's JWKS; if that's unreachable it raises,
+            # but the `self-hosted` provider can still verify the token.) So we
+            # remember the unreachable error and keep going. Only if NO provider
+            # verifies the token AND at least one was unreachable do we surface a
+            # 503 — distinguishing "transient IDP outage" (don't force re-login)
+            # from "token genuinely invalid" (fall through to refresh/relogin).
+            unreachable_provider: str | None = None
+            for provider in _ordered_session_providers(provider_hint):
+                try:
+                    session = provider.verify_session(access_token=at)
+                except ProviderError as e:
+                    _log.warning(
+                        "dashboard-auth: provider %r unreachable during verify: %s",
+                        provider.name,
+                        e,
+                    )
+                    audit_log(
+                        AuditEvent.SESSION_VERIFY_FAILURE,
+                        provider=provider.name,
+                        reason="provider_unreachable",
+                        ip=_client_ip(request),
+                    )
+                    if unreachable_provider is None:
+                        unreachable_provider = provider.name
+                    continue
+                if session is not None:
+                    break
+            if session is None and unreachable_provider is not None:
+                # No provider could verify the token and at least one couldn't be
+                # reached — treat as a transient outage rather than forcing a
+                # re-login through a (possibly also-unreachable) refresh.
+                return JSONResponse(
+                    {"detail": f"Auth provider {unreachable_provider!r} unreachable"},
+                    status_code=503,
                 )
-                audit_log(
-                    AuditEvent.SESSION_VERIFY_FAILURE,
-                    provider=provider.name,
-                    reason="provider_unreachable",
-                    ip=_client_ip(request),
-                )
-                if unreachable_provider is None:
-                    unreachable_provider = provider.name
-                continue
-            if session is not None:
-                break
-        if session is None and unreachable_provider is not None:
-            # No provider could verify the token and at least one couldn't be
-            # reached — treat as a transient outage rather than forcing a
-            # re-login through a (possibly also-unreachable) refresh.
-            return JSONResponse(
-                {"detail": f"Auth provider {unreachable_provider!r} unreachable"},
-                status_code=503,
-            )
 
     if session is None:
         # Access token is expired/invalid. Before forcing re-login, try to
@@ -470,6 +572,9 @@ async def gated_auth_middleware(
         if refreshed is not None:
             new_session, refreshing_provider = refreshed
             request.state.session = new_session
+            scope_block = _scope_denial_response(request, new_session)
+            if scope_block is not None:
+                return scope_block
             response = await call_next(request)
             # Persist the ROTATED tokens. Portal rotates the refresh token on
             # every refresh and runs reuse-detection, so writing the new RT
@@ -477,10 +582,8 @@ async def gated_auth_middleware(
             # token on the next refresh and (outside Portal's grace) revoke
             # the whole session. Bind cookie Secure/Path to the request shape.
             from hermes_cli.dashboard_auth.cookies import (
-                detect_https,
                 set_session_cookies,
             )
-            from hermes_cli.dashboard_auth.prefix import prefix_from_request
 
             set_session_cookies(
                 response,
@@ -512,16 +615,16 @@ async def gated_auth_middleware(
         # prefix so the deletion's Path matches the set-Path (otherwise
         # the browser ignores it).
         from hermes_cli.dashboard_auth.cookies import clear_session_cookies
-        from hermes_cli.dashboard_auth.prefix import prefix_from_request
+
         clear_session_cookies(response, prefix=prefix_from_request(request))
         return response
 
     request.state.session = session
+    scope_block = _scope_denial_response(request, session)
+    if scope_block is not None:
+        return scope_block
     response = await call_next(request)
     if not provider_hint and session.provider:
-        from hermes_cli.dashboard_auth.cookies import detect_https
-        from hermes_cli.dashboard_auth.prefix import prefix_from_request
-
         set_session_provider_cookie(
             response,
             provider=session.provider,
@@ -529,6 +632,130 @@ async def gated_auth_middleware(
             prefix=prefix_from_request(request),
         )
     return response
+
+
+def _scope_denial_response(request: Request, session) -> Response | None:
+    """If session is resume-scoped and path is outside allowlist, return 403."""
+    from hermes_cli.dashboard_auth.scopes import (
+        resume_request_allowed,
+        scope_denial_detail,
+        session_is_restricted,
+    )
+
+    if session is None or not session_is_restricted(session):
+        return None
+    if resume_request_allowed(request, session):
+        return None
+    return JSONResponse(
+        {"detail": scope_denial_detail(request, session)},
+        status_code=403,
+    )
+
+
+def consume_handoff_response(
+    request: Request,
+    handoff: str,
+    *,
+    require_legacy_chat_request: bool = True,
+    json_response: bool = False,
+) -> Response | None:
+    """Consume a single-use handoff ticket and link the browser.
+
+    By default, only exact GET ``/chat`` may consume. The fragment bootstrap
+    opts out only after its route has enforced exact path, same-origin fetch
+    metadata and JSON content type.
+
+    On success returns a 302 to ``/chat?resume=&profile=`` built from the
+    **ticket-bound** session_id/profile only (F-02 ticket wins) plus
+    Set-Cookie for a persistent least-privilege linked device. Requests made
+    with it become ``scopes=("resume",)`` sessions with no refresh token and
+    never receive superuser authority.
+
+    On invalid/expired/replay returns ``None`` so the caller falls through
+    to the normal unauth flow — intentionally no error leak about handoff
+    validity.
+    """
+    from hermes_cli.dashboard_auth.scopes import (
+        exact_handoff_scopes_or_none,
+        handoff_redirect_location,
+        is_handoff_consume_request,
+    )
+    from hermes_cli.dashboard_auth.ws_tickets import (
+        TicketInvalid,
+        consume_handoff_ticket,
+    )
+
+    # Compatibility for the original query-string transport: only exact ASGI
+    # GET /chat may consume. The fragment bootstrap calls this helper after
+    # its own exact-route, content-type and same-origin checks.
+    if require_legacy_chat_request and not is_handoff_consume_request(request):
+        return None
+
+    try:
+        info = consume_handoff_ticket(handoff)
+    except TicketInvalid as exc:
+        audit_log(
+            AuditEvent.HANDOFF_TICKET_REJECTED,
+            reason=str(exc)[:80],
+            ip=_client_ip(request),
+        )
+        return None
+
+    scopes = tuple(info.get("scopes") or ())
+    if exact_handoff_scopes_or_none(scopes) is None:
+        audit_log(
+            AuditEvent.HANDOFF_TICKET_REJECTED,
+            reason="forbidden_scope",
+            ip=_client_ip(request),
+        )
+        return None
+
+    from hermes_cli.dashboard_auth.cookies import (
+        read_linked_device_cookie,
+        set_linked_device_cookie,
+    )
+    from hermes_cli.dashboard_auth.linked_devices import create_or_rotate, device_label
+
+    previous = read_linked_device_cookie(request) or ""
+    previous_record = None
+    if previous:
+        from hermes_cli.dashboard_auth.linked_devices import authenticate
+
+        previous_record = authenticate(previous)
+    _device_id, secret = create_or_rotate(
+        existing_id=str(previous_record["id"]) if previous_record else "",
+        label=device_label(request.headers.get("user-agent", "")),
+        session_id=str(info.get("session_id") or ""),
+        profile=str(info.get("profile") or ""),
+    )
+    # F-02: redirect from ticket-bound targets only (ignore client query).
+    location = handoff_redirect_location(
+        info,
+        prefix=prefix_from_request(request) or "",
+    )
+    resp: Response
+    if json_response:
+        resp = JSONResponse(
+            {"location": location},
+            headers={"Cache-Control": "no-store"},
+        )
+    else:
+        resp = RedirectResponse(url=location, status_code=302)
+    set_linked_device_cookie(
+        resp,
+        secret=secret,
+        use_https=detect_https(request),
+        prefix=prefix_from_request(request),
+    )
+    audit_log(
+        AuditEvent.HANDOFF_TICKET_CONSUMED,
+        provider=str(info.get("provider") or ""),
+        user_id=str(info.get("user_id") or ""),
+        ip=_client_ip(request),
+        session_id=str(info.get("session_id") or ""),
+        profile=str(info.get("profile") or ""),
+    )
+    return resp
 
 
 def _expires_in_seconds(session) -> int:
@@ -544,7 +771,9 @@ def _expires_in_seconds(session) -> int:
     return max(60, int(session.expires_at) - int(time.time()))
 
 
-def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | None = None):
+def _attempt_refresh(
+    request: Request, *, refresh_token, provider_hint: str | None = None
+):
     """Try to rotate an expired session via the refresh token.
 
     The provider hint only changes candidate order. ``RefreshExpiredError``
@@ -573,7 +802,8 @@ def _attempt_refresh(request: Request, *, refresh_token, provider_hint: str | No
         except ProviderError as e:
             _log.warning(
                 "dashboard-auth: provider %r unreachable during refresh: %s",
-                provider.name, e,
+                provider.name,
+                e,
             )
             audit_log(
                 AuditEvent.REFRESH_FAILURE,

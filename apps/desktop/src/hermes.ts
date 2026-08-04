@@ -20,11 +20,14 @@ import type {
   CustomEndpointsResponse,
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
+  DashboardHandoffTicketResponse,
+  DashboardRemoteAccessResponse,
   DebugShareResponse,
   ElevenLabsVoicesResponse,
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  LinkedDevicesResponse,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -154,6 +157,8 @@ export type {
   CustomEndpointsResponse,
   CustomEndpointUpdate,
   CustomEndpointValidationResponse,
+  DashboardHandoffTicketResponse,
+  DashboardRemoteAccessResponse,
   DebugShareResponse,
   ElevenLabsVoice,
   ElevenLabsVoicesResponse,
@@ -673,6 +678,39 @@ export function getStatus(): Promise<StatusResponse> {
   return window.hermesDesktop.api<StatusResponse>({
     ...profileScoped(),
     path: '/api/status'
+  })
+}
+
+export function getDashboardRemoteAccess(profile?: string): Promise<DashboardRemoteAccessResponse> {
+  return window.hermesDesktop.api<DashboardRemoteAccessResponse>({
+    ...(profile ? { profile } : profileScoped()),
+    path: '/api/dashboard/remote-access'
+  })
+}
+
+export function getDashboardHandoffTicket(
+  sessionId: string,
+  profile?: string
+): Promise<DashboardHandoffTicketResponse> {
+  return window.hermesDesktop.api<DashboardHandoffTicketResponse>({
+    ...(profile ? { profile } : profileScoped()),
+    body: {
+      profile: profile || '',
+      session_id: sessionId
+    },
+    method: 'POST',
+    path: '/api/auth/handoff-ticket'
+  })
+}
+
+export function getLinkedDevices(): Promise<LinkedDevicesResponse> {
+  return window.hermesDesktop.api<LinkedDevicesResponse>({ path: '/api/auth/linked-devices' })
+}
+
+export function revokeLinkedDevice(id: string): Promise<{ ok: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean }>({
+    method: 'DELETE',
+    path: `/api/auth/linked-devices/${encodeURIComponent(id)}`
   })
 }
 

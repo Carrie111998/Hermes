@@ -161,7 +161,13 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
-export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+export default function ChatPage({
+  isActive = true,
+  resumeOnly = false,
+}: {
+  isActive?: boolean;
+  resumeOnly?: boolean;
+}) {
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -345,7 +351,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   }, [isActive, sessionTitle, setTitle]);
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (!resumeParam || resumeOnly) return;
 
     let cancelled = false;
 
@@ -362,10 +368,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, handleSessionTitleChange]);
+  }, [handleSessionTitleChange, resumeOnly, resumeParam, scopedProfile]);
 
   useEffect(() => {
-    if (!resumeParam) return;
+    if (!resumeParam || resumeOnly) return;
 
     let cancelled = false;
 
@@ -387,7 +393,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, searchParams, setSearchParams]);
+  }, [resumeOnly, resumeParam, scopedProfile, searchParams, setSearchParams]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -429,7 +435,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // Profiles "Build", …). Ownership rule: only write to the slot while
     // /chat is the active route AND the narrow layout needs the button;
     // the effect cleanup handles removal on every transition out.
-    if (!isActive || !narrow) return;
+    if (!isActive || !narrow || resumeOnly) return;
     setEnd(
       <Button
         ghost
@@ -449,7 +455,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       </Button>,
     );
     return () => setEnd(null);
-  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, setEnd]);
+  }, [isActive, narrow, mobilePanelOpen, modelToolsLabel, resumeOnly, setEnd]);
 
   const handleCopyLast = () => {
     const ws = wsRef.current;
@@ -1413,6 +1419,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   });
   const mobileModelToolsPortal =
     isActive &&
+    !resumeOnly &&
     narrow &&
     portalRoot &&
     createPortal(
@@ -1499,7 +1506,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-2">
-      <PluginSlot name="chat:top" />
+      {!resumeOnly && <PluginSlot name="chat:top" />}
       {mobileModelToolsPortal}
 
       {visibleBanner && (
@@ -1566,13 +1573,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
               <div className="text-sm tracking-wide text-white/80">
                 Session ended.
               </div>
-              <Button
-                onClick={startFreshPty}
-                prefix={<RotateCcw className="h-4 w-4" />}
-                aria-label="Start a new chat session"
-              >
-                Start new session
-              </Button>
+              {resumeOnly ? (
+                <div className="text-xs tracking-wide text-white/70">
+                  Link this chat again from Hermes Desktop to continue.
+                </div>
+              ) : (
+                <Button
+                  onClick={startFreshPty}
+                  prefix={<RotateCcw className="h-4 w-4" />}
+                  aria-label="Start a new chat session"
+                >
+                  Start new session
+                </Button>
+              )}
             </div>
           )}
 
@@ -1602,7 +1615,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </Button>
         </div>
 
-        {!narrow && (
+        {!narrow && !resumeOnly && (
           <div
             id="chat-side-panel"
             role="complementary"
@@ -1630,7 +1643,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           </div>
         )}
       </div>
-      <PluginSlot name="chat:bottom" />
+      {!resumeOnly && <PluginSlot name="chat:bottom" />}
     </div>
   );
 }

@@ -37,6 +37,7 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $sessions,
+  rememberedSessionProfile,
   resolveComposerSessionKey,
   sessionMatchesStoredId,
   sessionPinId,
@@ -55,6 +56,7 @@ import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { useComposerScope } from './composer/scope'
 import type { ChatBarState } from './composer/types'
+import { openContinueOnPhone } from './continue-on-phone-state'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { ProfileTag } from './profile-tag'
@@ -152,6 +154,7 @@ function ChatHeader({
           onDelete={selectedSessionId ? onDeleteSelectedSession : undefined}
           onPin={selectedSessionId ? onToggleSelectedPin : undefined}
           pinned={selectedIsPinned}
+          profile={activeStoredSession?.profile}
           sessionId={selectedSessionId || activeSessionId || ''}
           sideOffset={8}
           title={title}
@@ -397,6 +400,14 @@ export const ChatView = memo(function ChatView({
   // to send to until a retry rebinds one. Watch windows are pure spectators of a
   // subagent run driven elsewhere — no composer, transcript is read-only.
   const showChatBar = !loadingSession && !resumeExhausted && !isWatchWindow()
+  const continueOnPhoneSessionId = selectedSessionId || activeSessionId
+
+  const continueOnPhoneProfile = rememberedSessionProfile(
+    sessions,
+    continueOnPhoneSessionId,
+    activeGatewayProfile
+  )
+
   const threadKey = selectedSessionId || activeSessionId || (isRoutedSessionView ? location.pathname : 'new')
 
   const modelOptionsQuery = useQuery<ModelOptionsResponse>({
@@ -582,6 +593,11 @@ export const ChatView = memo(function ChatView({
               onAttachDroppedItems={onAttachDroppedItems}
               onAttachImageBlob={onAttachImageBlob}
               onCancel={onCancel}
+              onContinueOnPhone={
+                continueOnPhoneSessionId
+                  ? () => openContinueOnPhone(continueOnPhoneSessionId, continueOnPhoneProfile)
+                  : undefined
+              }
               onPasteClipboardImage={onPasteClipboardImage}
               onPickFiles={onPickFiles}
               onPickFolders={onPickFolders}

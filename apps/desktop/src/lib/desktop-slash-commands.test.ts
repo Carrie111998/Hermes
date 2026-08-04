@@ -175,6 +175,17 @@ describe('desktop slash command curation', () => {
     expect(desktopSlashUnavailableMessage('/journey')).toBeNull()
   })
 
+  it('routes remote control to the phone-link action and keeps the short alias hidden', () => {
+    expect(resolveDesktopCommand('/remote-control')?.surface).toEqual({
+      kind: 'action',
+      action: 'remoteControl'
+    })
+    expect(resolveDesktopCommand('/rc')?.surface).toEqual({ kind: 'action', action: 'remoteControl' })
+    expect(isDesktopSlashSuggestion('/remote-control')).toBe(true)
+    expect(isDesktopSlashSuggestion('/rc')).toBe(false)
+    expect(isDesktopSlashCommand('/rc')).toBe(true)
+  })
+
   it('allows aliases to execute without cluttering the popover', () => {
     expect(isDesktopSlashSuggestion('/reset')).toBe(false)
     expect(isDesktopSlashCommand('/reset')).toBe(true)

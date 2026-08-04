@@ -1,6 +1,6 @@
 """Cookie helpers for dashboard auth.
 
-Three cookies in play:
+Four cookies are used by dashboard auth:
   - hermes_session_at:   the OAuth access token
                          (HttpOnly, lifetime = token TTL, ~15 min)
   - hermes_session_rt:   the OAuth refresh token
@@ -14,6 +14,8 @@ Three cookies in play:
                          provider that omits the refresh token (empty string)
                          degrades gracefully to access-token-only sessions —
                          the RT cookie is simply not written.
+  - hermes_linked_device: a persistent, revocable, resume-only device
+                          credential. The Mac stores only its SHA-256 hash.
   - hermes_session_pkce: short-lived PKCE state + CSRF nonce + provider
                          hint (HttpOnly, lifetime = 10 minutes)
 
@@ -54,12 +56,15 @@ Refresh-token handling:
    live RT → rotate server-side, else 401 → /login") lives in
    ``middleware._attempt_refresh``.
 """
+
 from __future__ import annotations
 
 from typing import Optional, Tuple
 
 from fastapi import Request
 from fastapi.responses import Response
+
+from hermes_cli.dashboard_auth.linked_devices import DEVICE_COOKIE_TTL_SECONDS
 
 # Bare cookie names — the request-scoped ``_resolved_name`` helper
 # decides whether to prepend ``__Host-`` / ``__Secure-`` based on the
@@ -70,6 +75,7 @@ SESSION_RT_COOKIE = "hermes_session_rt"
 # refresh token from being handed to the wrong provider when several dashboard
 # auth plugins are enabled (for example Basic + Nous OAuth).
 SESSION_PROVIDER_COOKIE = "hermes_session_provider"
+LINKED_DEVICE_COOKIE = "hermes_linked_device"
 PKCE_COOKIE = "hermes_session_pkce"
 # One-shot loop-guard marker for the auto-SSO redirect (Phase 1,
 # cloud-auto-discovery). Set when the gate auto-initiates the portal OAuth
@@ -224,21 +230,37 @@ def clear_session_cookies(response: Response, *, prefix: str = "") -> None:
     path = _cookie_path(prefix)
     for variant in _NAME_VARIANTS:
         response.set_cookie(
-            f"{variant}{SESSION_AT_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+            f"{variant}{SESSION_AT_COOKIE}",
+            "",
+            max_age=0,
+            path=path,
+            httponly=True,
+            samesite="lax",
         )
         response.set_cookie(
-            f"{variant}{SESSION_RT_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+            f"{variant}{SESSION_RT_COOKIE}",
+            "",
+            max_age=0,
+            path=path,
+            httponly=True,
+            samesite="lax",
         )
         response.set_cookie(
-            f"{variant}{SESSION_PROVIDER_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+            f"{variant}{SESSION_PROVIDER_COOKIE}",
+            "",
+            max_age=0,
+            path=path,
+            httponly=True,
+            samesite="lax",
         )
 
 
 def set_pkce_cookie(
-    response: Response, *, payload: str, use_https: bool, prefix: str = "",
+    response: Response,
+    *,
+    payload: str,
+    use_https: bool,
+    prefix: str = "",
 ) -> None:
     response.set_cookie(
         _resolved_name(PKCE_COOKIE, use_https=use_https, prefix=prefix),
@@ -252,13 +274,18 @@ def clear_pkce_cookie(response: Response, *, prefix: str = "") -> None:
     path = _cookie_path(prefix)
     for variant in _NAME_VARIANTS:
         response.set_cookie(
-            f"{variant}{PKCE_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+            f"{variant}{PKCE_COOKIE}",
+            "",
+            max_age=0,
+            path=path,
+            httponly=True,
+            samesite="lax",
         )
 
 
 def _read_with_fallback(
-    request: Request, bare_name: str,
+    request: Request,
+    bare_name: str,
 ) -> Optional[str]:
     """Read a cookie by checking every prefix variant in order.
 
@@ -286,12 +313,50 @@ def read_session_provider(request: Request) -> Optional[str]:
     return _read_with_fallback(request, SESSION_PROVIDER_COOKIE)
 
 
+def set_linked_device_cookie(
+    response: Response,
+    *,
+    secret: str,
+    use_https: bool,
+    prefix: str = "",
+) -> None:
+    """Set or renew the linked-device credential's inactivity window."""
+    response.set_cookie(
+        _resolved_name(LINKED_DEVICE_COOKIE, use_https=use_https, prefix=prefix),
+        secret,
+        max_age=DEVICE_COOKIE_TTL_SECONDS,
+        **_common_attrs(use_https=use_https, prefix=prefix),
+    )
+
+
+def read_linked_device_cookie(request: Request) -> Optional[str]:
+    """Return the linked-device credential, including prefixed variants."""
+    return _read_with_fallback(request, LINKED_DEVICE_COOKIE)
+
+
+def clear_linked_device_cookie(response: Response, *, prefix: str = "") -> None:
+    """Delete every possible linked-device cookie name for this path."""
+    for variant in _NAME_VARIANTS:
+        response.set_cookie(
+            f"{variant}{LINKED_DEVICE_COOKIE}",
+            "",
+            max_age=0,
+            path=_cookie_path(prefix),
+            httponly=True,
+            samesite="lax",
+            secure=bool(variant),
+        )
+
+
 def read_pkce_cookie(request: Request) -> Optional[str]:
     return _read_with_fallback(request, PKCE_COOKIE)
 
 
 def set_sso_attempt_cookie(
-    response: Response, *, use_https: bool, prefix: str = "",
+    response: Response,
+    *,
+    use_https: bool,
+    prefix: str = "",
 ) -> None:
     """Set the one-shot auto-SSO loop-guard marker (Phase 1).
 
@@ -322,8 +387,12 @@ def clear_sso_attempt_cookie(response: Response, *, prefix: str = "") -> None:
     path = _cookie_path(prefix)
     for variant in _NAME_VARIANTS:
         response.set_cookie(
-            f"{variant}{SSO_ATTEMPT_COOKIE}", "", max_age=0,
-            path=path, httponly=True, samesite="lax",
+            f"{variant}{SSO_ATTEMPT_COOKIE}",
+            "",
+            max_age=0,
+            path=path,
+            httponly=True,
+            samesite="lax",
         )
 
 
