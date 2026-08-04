@@ -1100,6 +1100,14 @@ def _close_sessions_for_transport(
                 _schedule_ws_orphan_reap(sid)
             except Exception:
                 pass
+    # Sweep observer attachments too: observer-only sessions aren't "owned"
+    # above, and leaving the dead transport in their observer sets would aim
+    # later event writes at a closed socket.
+    with _session_observers_lock:
+        for session in _sessions.values():
+            observers = session.get("observer_transports")
+            if observers:
+                observers.discard(transport)
     return reaped, detached
 
 
@@ -1509,14 +1517,56 @@ def _default_session_cwd() -> str:
     return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
+# Per-session observer transports: extra clients that receive the session's
+# event frames WITHOUT owning it (second-screen viewers such as LazoChat via
+# the HermesBridge). The primary ``session["transport"]`` keeps its
+# last-resumer-wins ownership semantics (orphan reaping, close_on_disconnect);
+# observers are a pure fan-out set managed by ``session.observe`` and swept on
+# WS disconnect. Guarded by its own lock: emitters write from run threads
+# while observe/unobserve/teardown mutate from dispatch/teardown threads.
+_session_observers_lock = threading.Lock()
+
+
+def add_session_observer(sid: str, transport) -> bool:
+    """Attach ``transport`` as an event observer of the live session ``sid``.
+
+    Returns False when the session isn't live (nothing to observe) or the
+    transport is missing. Idempotent.
+    """
+    if transport is None:
+        return False
+    session = _sessions.get(sid)
+    if session is None:
+        return False
+    with _session_observers_lock:
+        observers = session.setdefault("observer_transports", set())
+        observers.add(transport)
+    return True
+
+
+def remove_session_observer(sid: str, transport) -> bool:
+    """Detach ``transport`` from the session's observer set. Idempotent."""
+    session = _sessions.get(sid)
+    if session is None:
+        return False
+    with _session_observers_lock:
+        observers = session.get("observer_transports")
+        if not observers:
+            return False
+        observers.discard(transport)
+    return True
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
     Precedence:
 
-    1. Event frames with a session id → the transport stored on that session,
-       so async events land with the client that owns the session even if
-       the emitting thread has no contextvar binding.
+    1. Event frames with a session id → the transport stored on that session
+       PLUS every registered observer transport (second-screen viewers), so
+       async events land with every client watching the session even if the
+       emitting thread has no contextvar binding. Observer writes are
+       best-effort and never poison the primary's delivery result.
     2. Otherwise the transport bound on the current context (set by
        :func:`dispatch` for the lifetime of a request).
     3. Otherwise the module-level stdio transport, matching the historical
@@ -1524,8 +1574,30 @@ def write_json(obj: dict) -> bool:
     """
     if obj.get("method") == "event":
         sid = ((obj.get("params") or {}).get("session_id")) or ""
-        if sid and (t := (_sessions.get(sid) or {}).get("transport")) is not None:
-            return t.write(obj)
+        if sid:
+            session = _sessions.get(sid) or {}
+            primary = session.get("transport")
+            with _session_observers_lock:
+                observers = [
+                    t
+                    for t in (session.get("observer_transports") or ())
+                    if t is not primary
+                ]
+            if primary is not None or observers:
+                delivered = False
+                if primary is not None:
+                    try:
+                        delivered = bool(primary.write(obj))
+                    except Exception:
+                        delivered = False
+                for observer in observers:
+                    try:
+                        delivered = bool(observer.write(obj)) or delivered
+                    except Exception:
+                        # A dead observer must not break delivery accounting —
+                        # the disconnect teardown sweeps it shortly.
+                        pass
+                return delivered
 
     return (current_transport() or _stdio_transport).write(obj)
 
