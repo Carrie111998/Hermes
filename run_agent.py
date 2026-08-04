@@ -205,6 +205,7 @@ from agent.tool_result_classification import (
 )
 from agent.trajectory import (
     convert_scratchpad_to_think,
+    resolve_trajectory_path,
     save_trajectory as _save_trajectory_to_file,
 )
 from agent.tool_dispatch_helpers import (
@@ -7900,6 +7901,8 @@ def main(
         print("💾 Trajectory saving: ENABLED")
         print("   - Successful conversations → trajectory_samples.jsonl")
         print("   - Failed conversations → failed_trajectories.jsonl")
+        print("   - Inside a git work tree these are written under "
+              "<HERMES_HOME>/trajectories/ instead (agent.trajectory_allow_git_cwd: true to override)")
     
     # Initialize agent with provided parameters
     try:
@@ -7948,7 +7951,10 @@ def main(
     # Save sample trajectory to UUID-named file if requested
     if save_sample:
         sample_id = str(uuid.uuid4())[:8]
-        sample_filename = f"sample_{sample_id}.json"
+        # Same class of write as save_trajectory: a full verbatim trajectory
+        # under a relative name, so it lands in the CWD — a source checkout as
+        # often as not. Route it through the same guard.
+        sample_filename = resolve_trajectory_path(f"sample_{sample_id}.json")
         
         # Convert messages to trajectory format (same as batch_runner)
         trajectory = agent._convert_to_trajectory_format(

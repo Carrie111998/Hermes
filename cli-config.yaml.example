@@ -821,6 +821,21 @@ agent:
   # Recommended: 20-30 for focused tasks, 50-100 for open exploration
   max_turns: 500
 
+  # Allow trajectory JSONL to be written into a git work tree (default: false).
+  #
+  # Trajectory saving (AIAgent(save_trajectories=True) /
+  # `run_agent.py --save_trajectories`) appends a full verbatim transcript —
+  # message text, tool results and tool-call arguments — to a CWD-relative
+  # file. Launched from a source checkout, that leaves an untracked
+  # trajectory_samples.jsonl next to your code, one `git add -A` away from
+  # being committed. By default such a write is redirected under
+  # <HERMES_HOME>/trajectories/ (nothing is dropped, only relocated) and a
+  # warning names the destination.
+  #
+  # Set true to restore writing to the working directory. Passing an absolute
+  # filename to save_trajectory() also bypasses the redirect.
+  # trajectory_allow_git_cwd: false
+
   # Inactivity timeout for gateway agent runs (seconds, 0 = unlimited).
   # The agent can run indefinitely when actively calling tools or receiving
   # API responses.  Only fires after the agent has been idle for this duration.
