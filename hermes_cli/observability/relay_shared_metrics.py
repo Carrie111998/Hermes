@@ -57,6 +57,7 @@ def _retry_ordinal(event: dict[str, Any]) -> int | None:
 @dataclass
 class _ModelCall:
     handle: Any
+    context: contextvars.Context
     task_id: str
     fields: dict[str, str]
     retry_ordinal: int | None = None
@@ -171,7 +172,13 @@ class _Runtime:
             with session.lock:
                 if session.closing or session.relay_session.context is None:
                     return None
-                task_context = session.relay_session.context.copy()
+                # A Context copy retains the same mutable NeMo Relay scope-stack
+                # object.  The core turn/logical-call scopes and shared-metrics
+                # task/model-call scopes have independent lifetimes, so sharing
+                # that stack makes one layer's close depend on the other layer's
+                # LIFO order.  Give metrics its own stack and preserve trace
+                # topology through the explicit parent handle below.
+                task_context = contextvars.Context()
                 start_fields = task_start_fields(event)
                 active_turn = relay_runtime.active_turn(session.session_id)
                 parent_handle = session.relay_session.handle
@@ -213,11 +220,20 @@ class _Runtime:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
+        return self._run_in_context(task.context, callback, *args, **kwargs)
+
+    def _run_in_context(
+        self,
+        context: contextvars.Context,
+        callback: Callable[..., Any],
+        *args: Any,
+        **kwargs: Any,
+    ) -> Any:
         def invoke() -> Any:
             self.relay.get_scope_stack()
             return callback(*args, **kwargs)
 
-        return task.context.copy().run(invoke)
+        return context.copy().run(invoke)
 
     def start_model_call(self, event: dict[str, Any]) -> None:
         task_id = str(event.get("task_id") or "")
@@ -255,33 +271,35 @@ class _Runtime:
                         retry_ordinal,
                     )
                 return
+            model_context = contextvars.Context()
             if task is not None:
                 task.model_call_ids.add(request_id)
                 if retry_ordinal is not None and retry_ordinal > 0:
                     # A real Hermes retry can advance api_request_id while
                     # carrying the retry ordinal. Count that physical attempt.
                     task.retry_count += 1
-                handle = self._run_in_task(
-                    task,
-                    self.relay.llm.call,
-                    MODEL_CALL_SCOPE,
-                    self.relay.LLMRequest({}, {}),
-                    handle=task.handle,
-                    metadata=self._event_metadata(),
-                    model_name=model_family,
-                )
+                parent_handle = task.handle
             else:
-                handle = self._run_in_session(
-                    session,
-                    self.relay.llm.call,
-                    MODEL_CALL_SCOPE,
-                    self.relay.LLMRequest({}, {}),
-                    handle=session.relay_session.handle,
-                    metadata=self._event_metadata(),
-                    model_name=model_family,
-                )
+                parent_handle = session.relay_session.handle
+            # Seed the stored context itself before executing through a copy.
+            # NeMo Relay keeps its mutable scope stack in a ContextVar; if the
+            # first get_scope_stack() happens only inside _run_in_context(),
+            # that stack belongs to the temporary copy and a later copy cannot
+            # inherit it. Initializing here makes start and end copies share
+            # one per-model stack while preserving task/session isolation.
+            model_context.run(self.relay.get_scope_stack)
+            handle = self._run_in_context(
+                model_context,
+                self.relay.llm.call,
+                MODEL_CALL_SCOPE,
+                self.relay.LLMRequest({}, {}),
+                handle=parent_handle,
+                metadata=self._event_metadata(),
+                model_name=model_family,
+            )
             session.model_calls[request_id] = _ModelCall(
                 handle=handle,
+                context=model_context,
                 task_id=str(event.get("task_id") or ""),
                 fields=fields,
                 retry_ordinal=retry_ordinal,
@@ -536,23 +554,13 @@ class _Runtime:
         if model_call is None:
             return
         try:
-            task = session.tasks.get(model_call.task_id)
-            if task is not None:
-                self._run_in_task(
-                    task,
-                    self.relay.llm.call_end,
-                    model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
-                    metadata=self._event_metadata(),
-                )
-            else:
-                self._run_in_session(
-                    session,
-                    self.relay.llm.call_end,
-                    model_call.handle,
-                    {**model_call.fields, "outcome": outcome},
-                    metadata=self._event_metadata(),
-                )
+            self._run_in_context(
+                model_call.context,
+                self.relay.llm.call_end,
+                model_call.handle,
+                {**model_call.fields, "outcome": outcome},
+                metadata=self._event_metadata(),
+            )
         except Exception:
             logger.warning(
                 "Hermes shared-metrics model call close failed", exc_info=True

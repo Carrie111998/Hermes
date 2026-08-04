@@ -488,6 +488,129 @@ def test_real_binding_drives_lifecycle_aggregation_export_and_snapshot(
         assert canary not in serialized_analytics
 
 
+def test_real_binding_keeps_metrics_scopes_off_the_core_turn_stack(
+    real_binding_runtime,
+):
+    from agent import relay_llm
+
+    lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+        profile_key=relay_runtime.current_profile_key(),
+        session_id="scope-isolation-session",
+        platform="telegram",
+    )
+    turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
+        lease,
+        turn_id="scope-isolation-turn",
+        task_id="scope-isolation-task",
+    )
+    metrics = relay_shared_metrics._get_runtime(host=lease.host)
+    assert metrics is not None
+    event = {
+        "session_id": lease.session_id,
+        "turn_id": turn.turn_id,
+        "task_id": turn.task_id,
+        "api_request_id": "scope-isolation-request",
+        "platform": lease.platform,
+        "provider": "custom",
+        "model": "test-model",
+        "api_mode": "custom",
+        "completed": True,
+    }
+
+    try:
+        metrics.start_task(event)
+        metrics.start_model_call(event)
+        result = relay_llm.execute(
+            {"model": "test-model", "messages": []},
+            lambda _request: {"content": "ok"},
+            session_id=lease.session_id,
+            name="test-provider",
+            model_name="test-model",
+            metadata=event,
+            defer_logical_completion=True,
+        )
+        metrics.end_model_call(event, "success")
+        relay_llm.complete_logical_call(
+            event["api_request_id"],
+            outcome="success",
+        )
+        metrics.finish_task(event)
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+
+        current_handle = lease.host.run_in_session(
+            lease.session,
+            lease.host.relay.scope.get_handle,
+        )
+
+        assert result == {"content": "ok"}
+        assert current_handle.uuid == lease.session.handle.uuid
+    finally:
+        metrics.shutdown()
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="failed")
+        relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
+
+
+def test_real_binding_closes_overlapping_metric_calls_out_of_order(
+    real_binding_runtime,
+):
+    lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
+        profile_key=relay_runtime.current_profile_key(),
+        session_id="overlapping-metrics-session",
+        platform="telegram",
+    )
+    turn = relay_runtime.SESSION_COORDINATOR.begin_turn(
+        lease,
+        turn_id="overlapping-metrics-turn",
+        task_id="overlapping-metrics-task",
+    )
+    metrics = relay_shared_metrics._get_runtime(host=lease.host)
+    assert metrics is not None
+    base_event = {
+        "session_id": lease.session_id,
+        "turn_id": turn.turn_id,
+        "task_id": turn.task_id,
+        "platform": lease.platform,
+        "provider": "custom",
+        "model": "test-model",
+        "api_mode": "custom",
+        "completed": True,
+    }
+    first = {**base_event, "api_request_id": "overlapping-request-1"}
+    second = {**base_event, "api_request_id": "overlapping-request-2"}
+
+    try:
+        metrics.start_task(base_event)
+        metrics.start_model_call(first)
+        metrics.start_model_call(second)
+        metrics.end_model_call(first, "success")
+        metrics.end_model_call(second, "success")
+        metrics.relay.subscribers.flush()
+
+        model_counters = [
+            counter
+            for counter in metrics.subscriber.store.counter_snapshot()
+            if counter["metric_name"] == "hermes.model_call.count"
+        ]
+        assert sum(counter["value"] for counter in model_counters) == 2
+        assert {
+            counter["dimensions"]["outcome"] for counter in model_counters
+        } == {"success"}
+
+        metrics.finish_task(base_event)
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="success")
+
+        current_handle = lease.host.run_in_session(
+            lease.session,
+            lease.host.relay.scope.get_handle,
+        )
+
+        assert current_handle.uuid == lease.session.handle.uuid
+    finally:
+        metrics.shutdown()
+        relay_runtime.SESSION_COORDINATOR.end_turn(turn, outcome="failed")
+        relay_runtime.SESSION_COORDINATOR.release_conversation(lease)
+
+
 
 
 
@@ -967,9 +1090,6 @@ def test_failed_flush_keeps_daily_export_open_for_later_task(
     assert metrics["hermes.task_run.finished"]["value"] == 2
     assert flush_attempts == 2
     assert "Hermes shared-metrics task flush failed" in caplog.text
-
-
-
 
 
 
