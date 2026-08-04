@@ -20,21 +20,13 @@ import {
 } from '@/store/composer'
 import { clearNotifications, notify, notifyError } from '@/store/notifications'
 import { requestDesktopOnboarding } from '@/store/onboarding'
-import {
-  $sessions,
-  resolveComposerSessionKey,
-  setAwaitingResponse,
-  setBusy,
-  setMessages,
-  touchSessionActivity
-} from '@/store/session'
+import { $sessions, resolveComposerSessionKey, setAwaitingResponse, setBusy, setMessages } from '@/store/session'
 import { $sessionStates } from '@/store/session-states'
 
 import type { ClientSessionState } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
-import { finalizeInterruptedMessages } from './rewind'
 import {
   _submitInFlight,
   type GatewayRequest,
@@ -199,40 +191,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       let sessionId: null | string = options?.sessionId ?? (isBackgroundQueueDrain ? null : activeSessionIdRef.current)
 
-      // A QUEUED runtime id is authoritative ONLY while it still belongs to its
-      // stored session. On a session switch the composer's queue key flips with
-      // the route while the foreground runtime id lags a resume behind, so a
-      // drain can fire with storedSessionId=B but sessionId=A-runtime — and the
-      // prompt.submit below would land B's queued prompt (and its whole answer
-      // turn) inside A. Verify the pair against the central binding and drop a
-      // stale queued id: the targetStoredSessionId resume path below then
-      // rebinds the right runtime, exactly as a background drain with an
-      // unknown binding does.
-      //
-      // Scoped to fromQueue on purpose. Only a drain pairs identifiers from two
-      // different clocks; every other explicit-target caller resolves both ids
-      // in the same tick and is authoritative by construction. A slash skill
-      // dispatch into a fresh ⌘T tab (slash.ts) passes exactly this shape —
-      // sessionId=tab-runtime, storedSessionId=tab-stored, no central binding
-      // recorded yet — so an unscoped check would null the target and silently
-      // drop the kickoff.
-      //
-      // The identity pair (storedSessionId === sessionId) is the fresh-chat
-      // fallback — an unpersisted conversation's queue key IS its runtime id,
-      // so it has no central binding to check against and is left untouched.
-      if (
-        options?.fromQueue &&
-        options.sessionId &&
-        options.storedSessionId &&
-        options.storedSessionId !== options.sessionId
-      ) {
-        const boundRuntimeId = getRuntimeIdForStoredSession(options.storedSessionId)
-
-        if (boundRuntimeId !== options.sessionId) {
-          sessionId = boundRuntimeId
-        }
-      }
-
       // Pin the foreground session context for the whole async submit pipeline.
       // Without this, a fast session switch during session.resume / file.attach
       // can redirect the user's text into a different chat (#54527). Mutable —
@@ -310,16 +268,10 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       const optimisticId = `user-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
 
-      // What the bubble shows. A `/skill` send carries the whole expanded
-      // skill body as its text — model-facing scaffolding — so the dispatcher
-      // hands us the invocation to render instead. Everything else shows what
-      // was typed.
-      const bubbleText = options?.displayText ?? visibleText
-
       const buildUserMessage = (): ChatMessage => ({
         id: optimisticId,
         role: 'user',
-        parts: [textPart(bubbleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
+        parts: [textPart(visibleText || (attachmentRefs.length ? '' : attachments.map(a => a.label).join(', ')))],
         attachmentRefs
       })
 
@@ -335,31 +287,18 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       // Idempotent optimistic insert — re-running with the resolved sessionId
       // after createBackendSessionForSend just overwrites with the same id.
-      const seedOptimistic = (sid: string) => {
-        // Recents jump on send — not stream start, not turn resolve.
-        const activity = bubbleText.trim() ? { preview: bubbleText.trim() } : undefined
-        touchSessionActivity(sid, activity)
-
-        if (targetStoredSessionId && targetStoredSessionId !== sid) {
-          touchSessionActivity(targetStoredSessionId, activity)
-        }
-
+      const seedOptimistic = (sid: string) =>
         updateSessionState(
           sid,
           state => ({
             ...state,
-            // A fresh user message may never land after a still-pending
-            // assistant bubble — settle any leftover (drop it when empty)
-            // before appending, or a stale spinner gets stranded
-            // mid-transcript above this message forever.
             messages: state.messages.some(m => m.id === optimisticId)
               ? state.messages
-              : [...finalizeInterruptedMessages(state.messages, state.streamId), buildUserMessage()],
+              : [...state.messages, buildUserMessage()],
             busy: true,
             awaitingResponse: true,
             pendingBranchGroup: null,
             sawAssistantPayload: false,
-            streamId: null,
             // Fresh submit = new turn — clear any leftover interrupt flag, else
             // mutateStream/completeAssistantMessage drop every delta of this turn
             // (what made drained-after-interrupt sends go silent).
@@ -367,7 +306,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           }),
           targetStoredSessionId
         )
-      }
 
       // After sync rewrites refs, refresh the optimistic message in place so the
       // transcript shows the resolved @file: ref rather than the local path.
@@ -484,7 +422,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
             session_id: targetStoredSessionId,
             source: 'desktop',
-            omit_messages: true,
             ...(resumeProfile ? { profile: resumeProfile } : {})
           })
 
@@ -529,7 +466,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
       if (!sessionId) {
         try {
-          sessionId = await createBackendSessionForSend(bubbleText)
+          sessionId = await createBackendSessionForSend(visibleText)
         } catch (err) {
           dropOptimistic(null)
           releaseBusy()
@@ -606,13 +543,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
         const submitParams = (targetId: string) => ({
           session_id: targetId,
           text,
-          ...(interrupted && { interrupted }),
-          // A queue drain is a "run after" message, never a live-turn
-          // correction. The flag tells the gateway's busy path to hold it for
-          // the next turn untouched — without it, losing the settle race
-          // (client saw idle, server still unwinding) redirects or interrupts
-          // the live turn with text the user explicitly queued.
-          ...(options?.fromQueue && { queued: true })
+          ...(interrupted && { interrupted })
         })
 
         // On sleep/wake the gateway's in-memory session may have been cleared
@@ -638,7 +569,6 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
             const resumed = await requestGateway<{ session_id: string }>('session.resume', {
               session_id: recoverStoredSessionId,
               source: 'desktop',
-              omit_messages: true,
               ...(resumeProfile ? { profile: resumeProfile } : {})
             })
 

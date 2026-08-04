@@ -1,17 +1,10 @@
 import { useEffect, useRef } from 'react'
-import { useNavigate } from 'react-router'
+import { useNavigate } from 'react-router-dom'
 
 import { closeActiveTab } from '@/app/chat/close-tab'
-import { setTerminalTakeover } from '@/app/right-sidebar/store'
+import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { closeActiveTerminal, createTerminal, cycleTerminal } from '@/app/right-sidebar/terminal/terminals'
-import {
-  activateTreeTabSlot,
-  cycleTreeTabInFocusedZone,
-  isPaneVisible,
-  layoutHasRootSide,
-  togglePaneVisible
-} from '@/components/pane-shell/tree/store'
-import { onReleaseTypingFocus } from '@/components/ui/keyboard-first'
+import { activateTreeTabSlot, cycleTreeTabInFocusedZone, layoutHasRootSide } from '@/components/pane-shell/tree/store'
 import { findBarClaimsCombo } from '@/lib/find-in-page'
 import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
 import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
@@ -40,7 +33,7 @@ import {
   switchToDefaultProfile,
   toggleShowAllProfiles
 } from '@/store/profile'
-import { openFolderAsProject, requestNewWorktree } from '@/store/projects'
+import { requestNewWorktree } from '@/store/projects'
 import { toggleReview } from '@/store/review'
 import { setModelPickerOpen } from '@/store/session'
 import { reopenLastClosedTile } from '@/store/session-states'
@@ -55,18 +48,15 @@ import {
   switcherActive,
   switcherJustClosed
 } from '@/store/session-switcher'
-import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
 import { openNewWindow } from '@/store/windows'
 import { useTheme } from '@/themes/context'
 
-import { requestComposerFocus, requestModelMenuToggle, requestVoiceToggle } from '../chat/composer/focus'
-import { openSession } from '../open-session'
+import { requestComposerFocus, requestVoiceToggle } from '../chat/composer/focus'
 import {
   AGENTS_ROUTE,
   ARTIFACTS_ROUTE,
   CRON_ROUTE,
   MESSAGING_ROUTE,
-  navigateToWorkspacePage,
   PROFILES_ROUTE,
   sessionRoute,
   SETTINGS_ROUTE,
@@ -111,7 +101,7 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
 
   const goToSession = (sessionId: null | string) => {
     if (sessionId) {
-      openSession(sessionId, navigate)
+      navigate(sessionRoute(sessionId))
     }
   }
 
@@ -141,22 +131,16 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'keybinds.openPanel': () => navigate(`${SETTINGS_ROUTE}?tab=keybinds`),
 
     'composer.focus': () => requestComposerFocus('active'),
-    // Toggle the composer pill's live model dropdown (pane under the pointer,
-    // else active composer); no chat surface on screen → the full dialog.
-    'composer.modelPicker': () => {
-      if (!requestModelMenuToggle()) {
-        setModelPickerOpen(true)
-      }
-    },
+    'composer.modelPicker': () => setModelPickerOpen(true),
     'composer.voice': requestVoiceToggle,
 
     'nav.commandPalette': toggleCommandPalette,
     'nav.commandCenter': deps.toggleCommandCenter,
     'nav.settings': () => navigate(SETTINGS_ROUTE),
     'nav.profiles': () => navigate(PROFILES_ROUTE),
-    'nav.skills': () => navigateToWorkspacePage(navigate, SKILLS_ROUTE),
-    'nav.messaging': () => navigateToWorkspacePage(navigate, MESSAGING_ROUTE),
-    'nav.artifacts': () => navigateToWorkspacePage(navigate, ARTIFACTS_ROUTE),
+    'nav.skills': () => navigate(SKILLS_ROUTE),
+    'nav.messaging': () => navigate(MESSAGING_ROUTE),
+    'nav.artifacts': () => navigate(ARTIFACTS_ROUTE),
     'nav.cron': () => navigate(CRON_ROUTE),
     'nav.agents': () => navigate(AGENTS_ROUTE),
 
@@ -180,9 +164,6 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // Only meaningful inside a git repo — a no-op otherwise (the key falls
     // through instead of silently doing nothing).
     'workspace.newWorktree': () => $repoStatus.get() && requestNewWorktree(),
-    // ⌘O: native folder picker → open the folder as a project (upsert) with a
-    // fresh session anchored there.
-    'workspace.openFolder': () => void openFolderAsProject(),
 
     // Narrow-viewport reveal is handled inside the store toggles now.
     'view.toggleSidebar': toggleSidebarOpen,
@@ -190,23 +171,21 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     // terminal-on-bottom) would leave it a dead key, so it falls back to the
     // terminal there. The single "secondary panel" toggle.
     'view.toggleRightSidebar': () =>
-      layoutHasRootSide('right') ? toggleFileBrowserOpen() : togglePaneVisible('terminal'),
+      layoutHasRootSide('right') ? toggleFileBrowserOpen() : setTerminalTakeover(!$terminalTakeover.get()),
     'view.toggleReview': toggleReview,
-    'view.toggleStatusbar': toggleStatusbarVisible,
     'view.showFiles': showFiles,
-    'view.showTerminal': () => togglePaneVisible('terminal'),
+    'view.showTerminal': () => setTerminalTakeover(!$terminalTakeover.get()),
     // Create first so the pane's open-effect ensure sees a non-empty set and
     // doesn't also spawn one — net effect is exactly one fresh terminal.
     'view.newTerminal': () => {
       createTerminal()
       setTerminalTakeover(true)
     },
-    // Switch / close only act while the terminal is actually ON SCREEN — ask
-    // the tree, not the toggle store (which stays true behind a stacked
-    // sibling tab or a minimized zone).
-    'view.nextTerminal': () => isPaneVisible('terminal') && cycleTerminal(1),
-    'view.prevTerminal': () => isPaneVisible('terminal') && cycleTerminal(-1),
-    'view.closeTerminal': () => isPaneVisible('terminal') && closeActiveTerminal(),
+    // Switch / close only act while the pane is open (no focus-scoping here, so
+    // this stands in for "terminal is showing").
+    'view.nextTerminal': () => $terminalTakeover.get() && cycleTerminal(1),
+    'view.prevTerminal': () => $terminalTakeover.get() && cycleTerminal(-1),
+    'view.closeTerminal': () => $terminalTakeover.get() && closeActiveTerminal(),
     'view.flipPanes': togglePanesFlipped,
     // ⌘W: close the focused tab (terminal / preview target / zone tree tab).
     // On the main tab with session tabs stacked, it shifts the next one in —
@@ -234,24 +213,6 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
     'profile.toggleAll': toggleShowAllProfiles,
     'profile.create': requestProfileCreate
   }
-
-  // A keyboard-driven overlay closing hands typing back to the composer: Radix
-  // restores focus to the trigger (a toolbar button for the model pill), so
-  // without this the Enter that committed a model also eats the next keystroke.
-  // Deferred one frame and skipped when something else editable has claimed
-  // focus, because a palette action can legitimately open a dialog or navigate
-  // — the release must never steal focus from the surface it just opened.
-  useEffect(
-    () =>
-      onReleaseTypingFocus(() =>
-        requestAnimationFrame(() => {
-          if (!isEditableTarget(document.activeElement)) {
-            requestComposerFocus('active')
-          }
-        })
-      ),
-    []
-  )
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {

@@ -217,19 +217,16 @@ The Tool Gateway settings live under their respective tool sections:
 
 ```yaml
 web:
-  backend: firecrawl
-  use_gateway: true   # web search/extract routes through Tool Gateway
+  backend: nous       # web search/extract routes through Tool Gateway
 
 image_gen:
-  use_gateway: true
+  provider: nous
 
 tts:
-  provider: openai
-  use_gateway: true
+  provider: nous
 
 browser:
-  cloud_provider: browser-use
-  use_gateway: true
+  backend: nous
 ```
 
 The OAuth refresh token is stored separately at `~/.hermes/auth.json` (not in `config.yaml` — credentials and configuration are kept separate by design).

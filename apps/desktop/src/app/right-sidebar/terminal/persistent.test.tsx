@@ -2,8 +2,6 @@ import { act, type ReactNode } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import { $paneStates } from '@/store/panes'
-
 import { PersistentTerminal, TerminalSlot } from './persistent'
 
 vi.mock('./terminals', () => ({
@@ -214,8 +212,7 @@ describe('PersistentTerminal rect tracking', () => {
 
     render(<Harness />)
 
-    expect(mutationObserveCalls.length).toBeGreaterThan(0)
-    expect(mutationObserveCalls.every(call => call.options?.subtree === false)).toBe(true)
+    expect(mutationObserveCalls.some(call => call.options?.subtree === true)).toBe(true)
 
     act(() => {
       raf.runNext()
@@ -245,27 +242,6 @@ describe('PersistentTerminal rect tracking', () => {
     })
 
     expect(raf.pending()).toBe(0)
-  })
-
-  it('remeasures from an explicit pane-layout state change', () => {
-    const raf = installRaf()
-    const before = $paneStates.get()
-    vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockReturnValue(rect(10, 20, 200, 100))
-
-    render(<Harness />)
-    raf.runNext()
-    expect(raf.pending()).toBe(0)
-
-    act(() => {
-      $paneStates.set({ ...before, __terminal_rect_test__: { open: true } })
-    })
-
-    expect(raf.pending()).toBe(1)
-
-    act(() => {
-      raf.runNext()
-      $paneStates.set(before)
-    })
   })
 
   it('does not schedule rect RAFs while the Electron window is paused, then resumes when visible', () => {

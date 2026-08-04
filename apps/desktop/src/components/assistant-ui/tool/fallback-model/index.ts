@@ -57,7 +57,7 @@ export function countDiffLineStats(diff: string): DiffLineStats {
   return { added, removed }
 }
 
-export function fileEditPath(args: Record<string, unknown>, result: Record<string, unknown>): string {
+function fileEditPath(args: Record<string, unknown>, result: Record<string, unknown>): string {
   return (
     firstStringField(args, ['path', 'file', 'filepath']) ||
     firstStringField(result, ['path', 'file', 'filepath', 'resolved_path']) ||
@@ -65,7 +65,7 @@ export function fileEditPath(args: Record<string, unknown>, result: Record<strin
   )
 }
 
-export function fileEditBasename(path: string): string {
+function fileEditBasename(path: string): string {
   const normalized = path.replace(/\\/g, '/').trim()
 
   return normalized.split('/').filter(Boolean).pop() || normalized
@@ -516,16 +516,6 @@ function toolResultCount(
     }
   }
 
-  // Memory success payloads put the live total on `entry_count` — keep the noun
-  // as entry/entries instead of falling through the generic `*_count` path.
-  if (part.toolName === 'memory') {
-    const entryTotal = countFromUnknown(resultRecord.entry_count)
-
-    if (entryTotal !== null) {
-      return countMetric(entryTotal, 'entry')
-    }
-  }
-
   const directCount = countFromRecord(resultRecord, fallbackNounByTool)
 
   if (directCount !== null) {
@@ -595,7 +585,7 @@ function summarizeBrowserSnapshot(snapshot: string): string {
   return labels.length ? `${stats}\nTop controls: ${labels.join(', ')}` : stats
 }
 
-export function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string {
+function firstStringField(record: Record<string, unknown>, keys: readonly string[]): string {
   for (const key of keys) {
     const value = record[key]
 
@@ -709,20 +699,14 @@ function toolStatus(part: ToolPart, resultRecord: Record<string, unknown>): Tool
     return 'running'
   }
 
-  // Explicit success wins over isError / nested-error heuristics. Memory writes
-  // return `{ success: true }` when the batch landed; a stale outer `isError`
-  // envelope must not paint a real save amber.
-  if (resultRecord.success === true || resultRecord.ok === true) {
-    return 'success'
-  }
-
   if (!toolErrorText(part, resultRecord)) {
     return 'success'
   }
 
   // A rejected memory write is a budget negotiation, not a failure: the store
-  // refuses an over-limit batch and the agent retries smaller. Soft warning —
-  // never destructive-red beside routine bookkeeping.
+  // refuses an over-limit batch and the agent immediately retries a smaller
+  // one. Painting the row destructive-red puts an alarm next to routine
+  // bookkeeping the user never has to act on. Amber says "noted" instead.
   return part.toolName === 'memory' ? 'warning' : 'error'
 }
 
@@ -1411,18 +1395,8 @@ export function buildToolView(part: ToolPart, inlineDiff: string): ToolView {
   const resultRecord = parseMaybeObject(part.result)
   const meta = toolMeta(part.toolName)
   const status = toolStatus(part, resultRecord)
-  // Skip residual error-heuristic text once status is success (stale isError
-  // envelope over a landed memory write would otherwise foul the subtitle).
-  const error = status === 'success' ? '' : toolErrorText(part, resultRecord)
-  // Over-budget memory refusals stay amber — don't claim "Saved".
-  const memoryMissed = part.toolName === 'memory' && part.result !== undefined && status !== 'success'
-
-  const baseTitle =
-    part.result === undefined
-      ? meta.pending
-      : memoryMissed
-        ? translateNow('assistant.tool.memoryWriteNoted')
-        : meta.done
+  const error = toolErrorText(part, resultRecord)
+  const baseTitle = part.result === undefined ? meta.pending : meta.done
 
   const titleParts = dynamicTitle(
     part,

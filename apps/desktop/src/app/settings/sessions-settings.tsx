@@ -12,7 +12,6 @@ import {
 } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
-import { pathLeaf } from '@/lib/display-path'
 import { triggerHaptic } from '@/lib/haptics'
 import { Archive, ArchiveOff, FolderOpen, Loader2, Trash2 } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
@@ -26,6 +25,22 @@ import { useDeepLinkHighlight } from './use-deep-link-highlight'
 const DEFAULT_AUTO_ARCHIVE_DAYS = 3
 
 const ARCHIVED_FETCH_LIMIT = 200
+
+function workspaceLabel(cwd: null | string | undefined): string {
+  const path = cwd?.trim()
+
+  if (!path) {
+    return ''
+  }
+
+  return (
+    path
+      .replace(/[/\\]+$/, '')
+      .split(/[/\\]/)
+      .filter(Boolean)
+      .pop() ?? path
+  )
+}
 
 export function SessionsSettings() {
   const { t } = useI18n()
@@ -124,7 +139,7 @@ export function SessionsSettings() {
       ) : (
         <div className="grid gap-1">
           {sessions.map(session => {
-            const label = pathLeaf(session.cwd)
+            const label = workspaceLabel(session.cwd)
             const busy = busyId === session.id
 
             return (

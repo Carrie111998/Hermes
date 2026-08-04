@@ -34,7 +34,6 @@ import re
 from typing import Any, Optional
 from urllib.parse import parse_qsl, quote, unquote, urljoin, urlparse, urlsplit, urlunsplit
 
-from hermes_constants import get_hermes_home_override
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -225,36 +224,23 @@ def _global_allow_private_urls() -> bool:
     2. ``security.allow_private_urls`` in config.yaml
     3. ``browser.allow_private_urls`` in config.yaml  (legacy / backward compat)
 
-    The single-profile result is cached for the process lifetime. Multiplexed
-    profile turns bypass that process-global cache because their config root is
-    context-local; ``read_raw_config()`` already provides path/mtime caching.
+    Result is cached for the process lifetime.
     """
     global _allow_private_resolved, _cached_allow_private
-
-    # A multiplex gateway serves several independently configured profiles in
-    # one process. Reusing the first profile's opt-out here would let it disable
-    # private-network blocking for every later profile in that process.
-    if get_hermes_home_override() is not None:
-        return _resolve_allow_private_urls()
-
     if _allow_private_resolved:
         return _cached_allow_private
 
     _allow_private_resolved = True
-    _cached_allow_private = _resolve_allow_private_urls()
-    return _cached_allow_private
-
-
-def _resolve_allow_private_urls() -> bool:
-    """Resolve the effective private-URL toggle from the active config scope."""
+    _cached_allow_private = False  # safe default
 
     # 1. Env var override (highest priority)
     env_val = os.getenv("HERMES_ALLOW_PRIVATE_URLS", "").strip().lower()
     if env_val in {"true", "1", "yes"}:
-        return True
+        _cached_allow_private = True
+        return _cached_allow_private
     if env_val in {"false", "0", "no"}:
         # Explicit false — don't fall through to config
-        return False
+        return _cached_allow_private
 
     # 2. Config file
     try:
@@ -265,18 +251,20 @@ def _resolve_allow_private_urls() -> bool:
         if isinstance(sec, dict) and is_truthy_value(
             sec.get("allow_private_urls"), default=False
         ):
-            return True
+            _cached_allow_private = True
+            return _cached_allow_private
         # browser.allow_private_urls (legacy fallback)
         browser = cfg.get("browser", {})
         if isinstance(browser, dict) and is_truthy_value(
             browser.get("allow_private_urls"), default=False
         ):
-            return True
+            _cached_allow_private = True
+            return _cached_allow_private
     except Exception:
         # Config unavailable (e.g. tests, early import) — keep default
         pass
 
-    return False
+    return _cached_allow_private
 
 
 def _reset_allow_private_cache() -> None:

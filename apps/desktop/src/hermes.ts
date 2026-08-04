@@ -1,6 +1,5 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
-import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -44,8 +43,6 @@ import type {
   OAuthStartResponse,
   OAuthSubmitResponse,
   PaginatedSessions,
-  PairingResponse,
-  PairingUser,
   ProfileCreatePayload,
   ProfileSetupCommand,
   ProfileSoul,
@@ -183,8 +180,6 @@ export type {
   ModelOptionProvider,
   ModelOptionsResponse,
   PaginatedSessions,
-  PairingResponse,
-  PairingUser,
   ProfileCreatePayload,
   ProfileInfo,
   ProfileSetupCommand,
@@ -252,13 +247,6 @@ function profileScoped(profile?: null | string): { profile?: string } {
   const selected = profile === undefined ? _apiProfile : profile
 
   return selected ? { profile: selected } : {}
-}
-
-/** Profile that profile-scoped REST/WS calls should target (null → primary).
- *  Read-only twin of setApiRequestProfile for modules (e.g. voice playback)
- *  that build their own connection URLs and must stay on the same backend. */
-export function getApiRequestProfile(): null | string {
-  return _apiProfile
 }
 
 /** Options for a plugin REST call — mirrors the app's own `hermesDesktop.api`
@@ -350,12 +338,8 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       socket = null
 
       if (!disposed) {
-        // Full-jitter exponential backoff: same rationale as the gateway
-        // socket reconnect loops — an immediate-retry loop across many
-        // desktop clients floods the gateway with connection attempts
-        // during a restart.
-        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
         attempt += 1
+        window.setTimeout(() => void connect(), Math.min(30_000, 1_000 * 2 ** attempt))
       }
     }
   }
@@ -965,10 +949,7 @@ export function editLearningNode(id: string, content: string): Promise<{ message
   })
 }
 
-export function setSkillEnabled(
-  name: string,
-  enabled: boolean
-): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
     ...profileScoped(),
     path: '/api/skills/toggle',
@@ -1042,7 +1023,7 @@ export function getToolsets(): Promise<ToolsetInfo[]> {
   })
 }
 
-export function setToolsetEnabled(
+export function toggleToolset(
   name: string,
   enabled: boolean
 ): Promise<{ ok: boolean; name: string; enabled: boolean }> {
@@ -1171,40 +1152,6 @@ export function testMessagingPlatform(platformId: string): Promise<MessagingPlat
   return window.hermesDesktop.api<MessagingPlatformTestResponse>({
     path: `/api/messaging/platforms/${encodeURIComponent(platformId)}/test`,
     method: 'POST'
-  })
-}
-
-// -- Pairing (who may DM the bot) --------------------------------------------
-// Unknown DMers get a one-time code and land in `pending` until an admin
-// approves them. Approval grants on the row's `request_id`, never on the code:
-// the code is the requester's proof that the channel is theirs and is never
-// returned by the API, while an authenticated admin is only ever identifying
-// a row they can already see.
-
-export function getPairing(): Promise<PairingResponse> {
-  return window.hermesDesktop.api<PairingResponse>({
-    ...profileScoped(),
-    path: '/api/pairing'
-  })
-}
-
-export function approvePairing(platform: string, requestId: string): Promise<{ ok: boolean; user: PairingUser }> {
-  return window.hermesDesktop.api<{ ok: boolean; user: PairingUser }>({
-    ...profileScoped(),
-    path: '/api/pairing/approve',
-    method: 'POST',
-    // These endpoints read the profile off the body, not the query string —
-    // `profileScoped()` alone would approve into the wrong profile's store.
-    body: { platform, request_id: requestId, ...profileScoped() }
-  })
-}
-
-export function revokePairing(platform: string, userId: string): Promise<{ ok: boolean }> {
-  return window.hermesDesktop.api<{ ok: boolean }>({
-    ...profileScoped(),
-    path: '/api/pairing/revoke',
-    method: 'POST',
-    body: { platform, user_id: userId, ...profileScoped() }
   })
 }
 
@@ -1566,7 +1513,6 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
   return window.hermesDesktop.api<AudioTranscriptionResponse>({
     path: '/api/audio/transcribe',
     method: 'POST',
-    ...profileScoped(),
     body: {
       data_url: dataUrl,
       mime_type: mimeType
@@ -1580,7 +1526,6 @@ export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<Aud
 
 export function speakText(text: string): Promise<AudioSpeakResponse> {
   return window.hermesDesktop.api<AudioSpeakResponse>({
-    ...profileScoped(),
     path: '/api/audio/speak',
     method: 'POST',
     body: { text },
@@ -1593,8 +1538,7 @@ export function speakText(text: string): Promise<AudioSpeakResponse> {
 
 export function getElevenLabsVoices(): Promise<ElevenLabsVoicesResponse> {
   return window.hermesDesktop.api<ElevenLabsVoicesResponse>({
-    path: '/api/audio/elevenlabs/voices',
-    ...profileScoped()
+    path: '/api/audio/elevenlabs/voices'
   })
 }
 

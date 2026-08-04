@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
-import type { NavigateFunction } from 'react-router'
+import type { NavigateFunction } from 'react-router-dom'
 
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
@@ -57,7 +57,6 @@ import {
   setYoloActive
 } from '@/store/session'
 import {
-  $sessionTiles,
   closeSessionTile,
   dropSessionState,
   openSessionTile,
@@ -69,7 +68,7 @@ import { broadcastSessionsChanged } from '@/store/session-sync'
 import { isWatchWindow } from '@/store/windows'
 import type { SessionCreateResponse, SessionMessage, SessionResumeResponse, UsageStats } from '@/types/hermes'
 
-import { navigateToWorkspacePage, NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
+import { NEW_CHAT_ROUTE, sessionRoute, SETTINGS_ROUTE } from '../../../routes'
 import type { ClientSessionState, SidebarNavItem } from '../../../types'
 import { sessionContextDrift } from '../session-context-drift'
 
@@ -459,7 +458,7 @@ export function useSessionActions({
       }
 
       if (item.route) {
-        navigateToWorkspacePage(navigate, item.route)
+        navigate(item.route)
       }
     },
     [navigate, startFreshSessionDraft]
@@ -482,7 +481,7 @@ export function useSessionActions({
       try {
         // Fresh tile → the caller's workspace when one was named (the sidebar
         // "+" on a project/worktree lane), else the resolved new-session cwd
-        // (focused session's project → project scope → default).
+        // (project/default) — never the primary composer's live cwd.
         const params = await desktopSessionCreateParams((options?.cwd || resolveNewSessionCwd()).trim())
         const created = await requestGateway<SessionCreateResponse>('session.create', params)
         const stored = created.stored_session_id
@@ -504,9 +503,7 @@ export function useSessionActions({
           upsertOptimisticSession(created, stored, null, null)
         }
 
-        // A tile lives in its OWN worktree — it must not publish its cwd/branch
-        // into the composer atoms the main pane renders from.
-        const runtimeInfo = applyRuntimeInfo(created.info, { foreground: false })
+        const runtimeInfo = applyRuntimeInfo(created.info)
         updateSessionState(created.session_id, state => (runtimeInfo ? { ...state, ...runtimeInfo } : state), stored)
 
         openSessionTile(stored, dir)
@@ -560,20 +557,6 @@ export function useSessionActions({
       resetViewSync()
       setSelectedStoredSessionId(storedSessionId)
       selectedStoredSessionIdRef.current = storedSessionId
-
-      // A session is EITHER the main thread OR a tile — never both. openSessionTile
-      // enforces this from the tile side (it refuses to tile the selected session);
-      // this enforces it from the main side. Loading an existing session into main
-      // (cold-start restore, a pasted/⌘K route, a notification jump) while it's also
-      // an open tile would paint the same transcript twice — the workspace pane from
-      // the route and the tile pane in parallel, both fighting one runtime. Drop the
-      // now-redundant tile so main owns it. Runs before the async awaits below (and
-      // before the selection listener homes focus) so the tile is gone the same tick
-      // the route takes over; the warm cache/runtime binding survives for main to reuse.
-      if ($sessionTiles.get().some(t => t.storedSessionId === storedSessionId)) {
-        closeSessionTile(storedSessionId)
-      }
-
       // Optimistically clear any prior resume-failure latch for this session:
       // we're attempting a fresh resume, so the self-heal in use-route-resume
       // must not keep treating it as stranded. It's re-armed below only if THIS
@@ -700,8 +683,7 @@ export function useSessionActions({
             try {
               activated = await requestGateway<SessionResumeResponse>('session.activate', {
                 session_id: cachedRuntimeId,
-                cols: 96,
-                omit_messages: true
+                cols: 96
               })
             } catch (error) {
               // Compatibility for older backends. Modern backends require
@@ -867,14 +849,12 @@ export function useSessionActions({
           session_id: storedSessionId,
           cols: 96,
           source: 'desktop',
-          // REST is the transcript authority for Desktop. Avoid duplicating a
-          // potentially huge compression lineage in the WebSocket response.
           // Watch windows attach lazily (live mirror). Every other cold resume
           // gets the gateway's default deferred build: the RPC returns the
           // transcript immediately instead of blocking the switch on _make_agent
           // (MCP discovery / prompt build), and the agent pre-warms in the
           // background while the prefetch above paints the transcript.
-          ...(watchWindow ? { lazy: true } : { omit_messages: true }),
+          ...(watchWindow ? { lazy: true } : {}),
           ...(sessionProfile ? { profile: sessionProfile } : {})
         })
 
@@ -1187,9 +1167,7 @@ export function useSessionActions({
           routedSessionId
         )
 
-        // The branch opens as its own tile in the parent's worktree, not as the
-        // primary session — keep its runtime out of the main composer atoms.
-        const runtimeInfo = applyRuntimeInfo(branched.info, { foreground: false })
+        const runtimeInfo = applyRuntimeInfo(branched.info)
         patchSessionWorkspace(routedSessionId, runtimeInfo?.cwd)
 
         if (runtimeInfo) {

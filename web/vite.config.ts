@@ -101,7 +101,7 @@ export default defineConfig({
           groups: [
             {
               name: "react-vendor",
-              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router)([\\/]|$)/,
+              test: /node_modules[\\/](react|react-dom|scheduler|react-router|react-router-dom)([\\/]|$)/,
             },
             {
               name: "xterm",

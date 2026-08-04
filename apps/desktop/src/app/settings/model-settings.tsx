@@ -619,12 +619,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     setError('')
 
     try {
-      const result = await setModelAssignment({
-        model: selectedModel,
-        provider: selectedProvider,
-        scope: 'main',
-        ...(selectedProviderRow?.api_url ? { base_url: selectedProviderRow.api_url } : {})
-      })
+      const result = await setModelAssignment({ model: selectedModel, provider: selectedProvider, scope: 'main' })
 
       if (profileEpoch.current !== epoch) {
         return
@@ -641,21 +636,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
     } finally {
       setApplying(false)
     }
-  }, [onMainModelChanged, refresh, selectedModel, selectedProvider, selectedProviderRow])
-
-  // Sibling of the applyMainModel endpoint passthrough (#65254): auxiliary
-  // assignments targeting a user-defined provider must carry that provider's
-  // endpoint too, or the backend pins the slot without a base_url and the
-  // aux resolver falls back to the (possibly different, possibly cleared)
-  // main endpoint.
-  const endpointForProvider = useCallback(
-    (provider: string) => {
-      const row = providers.find(entry => entry.slug === provider)
-
-      return row?.api_url ? { base_url: row.api_url } : {}
-    },
-    [providers]
-  )
+  }, [onMainModelChanged, refresh, selectedModel, selectedProvider])
 
   const setAuxiliaryToMain = useCallback(
     async (task: string) => {
@@ -667,13 +648,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setError('')
 
       try {
-        await setModelAssignment({
-          model: mainModel.model,
-          provider: mainModel.provider,
-          scope: 'auxiliary',
-          task,
-          ...endpointForProvider(mainModel.provider)
-        })
+        await setModelAssignment({ model: mainModel.model, provider: mainModel.provider, scope: 'auxiliary', task })
         await refresh()
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err))
@@ -681,7 +656,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [endpointForProvider, mainModel, refresh]
+    [mainModel, refresh]
   )
 
   const applyAuxiliaryDraft = useCallback(
@@ -694,13 +669,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
       setError('')
 
       try {
-        await setModelAssignment({
-          model: auxDraft.model,
-          provider: auxDraft.provider,
-          scope: 'auxiliary',
-          task,
-          ...endpointForProvider(auxDraft.provider)
-        })
+        await setModelAssignment({ model: auxDraft.model, provider: auxDraft.provider, scope: 'auxiliary', task })
         setEditingAuxTask(null)
         await refresh()
       } catch (err) {
@@ -709,7 +678,7 @@ export function ModelSettings({ onMainModelChanged }: ModelSettingsProps) {
         setApplying(false)
       }
     },
-    [auxDraft, endpointForProvider, refresh]
+    [auxDraft, refresh]
   )
 
   const beginAuxiliaryEdit = useCallback(

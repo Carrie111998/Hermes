@@ -99,31 +99,6 @@ class InsightsEngine:
         """
         self.db = db
         self._conn = db._conn
-        # INDEXED BY is a hard dependency (SQLite errors on a missing index).
-        # A read-only open of a state.db written by an older version skips
-        # schema init and lacks the partial index — probe once and fall back
-        # to the unpinned variants (identical rows, optimizer-chosen plan).
-        try:
-            self._has_assistant_calls_index = bool(
-                self._conn.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='index' AND name=?",
-                    (self._MESSAGES_ASSISTANT_CALLS_INDEX,),
-                ).fetchone()
-            )
-        except sqlite3.Error:
-            self._has_assistant_calls_index = False
-        if not self._has_assistant_calls_index:
-            _strip = f" INDEXED BY {self._MESSAGES_ASSISTANT_CALLS_INDEX}"
-            # Loop over every pinned statement so adding a new one can't
-            # forget its strip line (which would be a hard `no such index`
-            # crash on read-only DBs — the exact bug this fallback prevents).
-            for _attr in (
-                "_GET_TOOL_CALLS_WITH_SOURCE",
-                "_GET_TOOL_CALLS_ALL",
-                "_GET_SKILL_CALLS_WITH_SOURCE",
-                "_GET_SKILL_CALLS_ALL",
-            ):
-                setattr(self, _attr, getattr(self, _attr).replace(_strip, ""))
 
     def generate(self, days: int = 30, source: str = None) -> Dict[str, Any]:
         """
@@ -137,13 +112,6 @@ class InsightsEngine:
             Dict with all computed insights
         """
         cutoff = time.time() - (days * 86400)
-
-        # Token/cost totals may still sit on the SessionDB's async
-        # accounting queue; drain so the report reflects exact counters.
-        # (self.db may be a raw sqlite3 connection in tests — guard.)
-        flush = getattr(self.db, "flush_token_counts", None)
-        if callable(flush):
-            flush()
 
         # Gather raw data
         sessions = self._get_sessions(cutoff, source)
@@ -196,21 +164,6 @@ class InsightsEngine:
             "top_sessions": top_sessions,
         }
 
-    def get_usage_breakdown(self, days: int = 30, source: str = None) -> Dict[str, Any]:
-        """Return the analytics-usage payload without running a full generate().
-
-        Uses the instr()-prefiltered _get_skill_usage query so only messages
-        that reference skill_view or skill_manage are loaded from SQLite, while
-        still preserving the per-tool breakdown used by the dashboard route.
-        """
-        cutoff = time.time() - (days * 86400)
-        tool_usage = self._get_tool_usage(cutoff, source)
-        skill_usage = self._get_skill_usage(cutoff, source)
-        return {
-            "tools": self._compute_tool_breakdown(tool_usage),
-            "skills": self._compute_skill_breakdown(skill_usage),
-        }
-
     # =========================================================================
     # Data gathering (SQL queries)
     # =========================================================================
@@ -233,53 +186,6 @@ class InsightsEngine:
         f"SELECT {_SESSION_COLS} FROM sessions"
         " WHERE started_at >= ?"
         " ORDER BY started_at DESC"
-    )
-
-    # Assistant ``tool_calls`` scan for tool/skill usage.  ``INDEXED BY`` pins
-    # the partial index ``idx_messages_assistant_calls_by_session`` so the plan
-    # is deterministic on a freshly initialized state.db (before ANALYZE has
-    # run) for BOTH the unfiltered and source-filtered branches — without the
-    # hint the optimizer falls back to ``idx_messages_session_active`` for the
-    # source-filtered probe and scans each session's non-tool-call rows.
-    #
-    # The pin is a HARD dependency: SQLite raises ``no such index`` when the
-    # named index is absent. That happens in practice — the web dashboard's
-    # usage analytics open the DB ``read_only=True`` (skipping
-    # ``_init_schema``), so a state.db created by an older writer has no
-    # partial index yet. ``__init__`` probes for the index once and falls
-    # back to the unpinned (still-correct, just optimizer-chosen) variants.
-    _MESSAGES_ASSISTANT_CALLS_INDEX = "idx_messages_assistant_calls_by_session"
-    _GET_TOOL_CALLS_WITH_SOURCE = (
-        "SELECT m.tool_calls"
-        f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
-        " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ? AND s.source = ?"
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-    )
-    _GET_TOOL_CALLS_ALL = (
-        "SELECT m.tool_calls"
-        f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
-        " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ?"
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-    )
-    _GET_SKILL_CALLS_WITH_SOURCE = (
-        "SELECT m.tool_calls, m.timestamp"
-        f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
-        " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ? AND s.source = ?"
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-        " AND (instr(m.tool_calls, 'skill_view') > 0"
-        " OR instr(m.tool_calls, 'skill_manage') > 0)"
-    )
-    _GET_SKILL_CALLS_ALL = (
-        "SELECT m.tool_calls, m.timestamp"
-        f" FROM messages m INDEXED BY {_MESSAGES_ASSISTANT_CALLS_INDEX}"
-        " JOIN sessions s ON s.id = m.session_id"
-        " WHERE s.started_at >= ?"
-        " AND m.role = 'assistant' AND m.tool_calls IS NOT NULL"
-        " AND (instr(m.tool_calls, 'skill_view') > 0"
-        " OR instr(m.tool_calls, 'skill_manage') > 0)"
     )
 
     def _get_sessions(self, cutoff: float, source: str = None) -> List[Dict]:
@@ -330,10 +236,22 @@ class InsightsEngine:
         # (covers CLI sessions where tool_name is NULL on tool responses)
         if source:
             cursor2 = self._conn.execute(
-                self._GET_TOOL_CALLS_WITH_SOURCE, (cutoff, source)
+                """SELECT m.tool_calls
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ? AND s.source = ?
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
+                (cutoff, source),
             )
         else:
-            cursor2 = self._conn.execute(self._GET_TOOL_CALLS_ALL, (cutoff,))
+            cursor2 = self._conn.execute(
+                """SELECT m.tool_calls
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ?
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
+                (cutoff,),
+            )
 
         tool_calls_counts = Counter()
         for row in cursor2.fetchall():
@@ -376,10 +294,22 @@ class InsightsEngine:
 
         if source:
             cursor = self._conn.execute(
-                self._GET_SKILL_CALLS_WITH_SOURCE, (cutoff, source)
+                """SELECT m.tool_calls, m.timestamp
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ? AND s.source = ?
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
+                (cutoff, source),
             )
         else:
-            cursor = self._conn.execute(self._GET_SKILL_CALLS_ALL, (cutoff,))
+            cursor = self._conn.execute(
+                """SELECT m.tool_calls, m.timestamp
+                   FROM messages m
+                   JOIN sessions s ON s.id = m.session_id
+                   WHERE s.started_at >= ?
+                     AND m.role = 'assistant' AND m.tool_calls IS NOT NULL""",
+                (cutoff,),
+            )
 
         for row in cursor.fetchall():
             try:

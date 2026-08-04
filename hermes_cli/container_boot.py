@@ -83,13 +83,6 @@ class ReconcileAction:
     profile: str
     prior_state: str | None
     action: ReconcileActionLabel
-    # How the profile's previous gateway life ended: "clean" (exit path ran),
-    # "unclean" (sentinel still says running — SIGKILL/OOM/VM death), or
-    # "unknown" (no sentinel / never ran). See gateway.lifecycle_ledger
-    # (NS-608): at container boot this is the one place that can stamp
-    # "the previous container life ended violently" into a durable,
-    # volume-persisted log line.
-    prior_exit: str = "unknown"
 
 
 def reconcile_profile_gateways(
@@ -163,7 +156,6 @@ def reconcile_profile_gateways(
         profile="default",
         prior_state=default_prior_state,
         action="started" if default_should_start else "registered",
-        prior_exit=_read_prior_exit_label(hermes_home),
     ))
 
     profiles_root = hermes_home / "profiles"
@@ -203,7 +195,6 @@ def reconcile_profile_gateways(
                 profile=entry.name,
                 prior_state=prior_state,
                 action="started" if should_start else "registered",
-                prior_exit=_read_prior_exit_label(entry),
             ))
 
     if not dry_run:
@@ -332,10 +323,6 @@ def _strip_container_argv_prefix(argv: Sequence[str]) -> list[str]:
         # Defensive: an `init` prefix with no wrapper token in argv.
         args = args[1:]
 
-    # Non-PID-1 entrypoints go through the dispatch shim instead of /init.
-    if args and args[0].endswith("entrypoint-dispatch.sh"):
-        args = args[1:]
-
     # The wrapper re-execs `hermes <subcommand>`; peel an explicit hermes.
     if args and Path(args[0]).name == "hermes":
         args = args[1:]
@@ -416,20 +403,6 @@ def _cleanup_stale_runtime_files(profile_dir: Path) -> None:
     the newly-started gateway's process-mismatch checks."""
     for name in _STALE_RUNTIME_FILES:
         (profile_dir / name).unlink(missing_ok=True)
-
-
-def _read_prior_exit_label(profile_dir: Path) -> str:
-    """How the profile's previous gateway life ended (clean/unclean/unknown).
-
-    Thin, exception-free wrapper over
-    :func:`gateway.lifecycle_ledger.read_prior_exit_label` — cont-init runs
-    in a minimal environment and forensics must never block reconciliation
-    (NS-608)."""
-    try:
-        from gateway.lifecycle_ledger import read_prior_exit_label
-        return read_prior_exit_label(profile_dir)
-    except Exception:
-        return "unknown"
 
 
 def _register_service(scandir: Path, profile: str, *, start: bool) -> None:
@@ -568,7 +541,7 @@ def _write_reconcile_log(
         for a in actions:
             f.write(
                 f"{ts} profile={a.profile} prior_state={a.prior_state} "
-                f"action={a.action} prior_exit={a.prior_exit}\n"
+                f"action={a.action}\n"
             )
 
 

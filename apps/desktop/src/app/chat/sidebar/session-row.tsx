@@ -1,11 +1,9 @@
 import { useStore } from '@nanostores/react'
-import { memo } from 'react'
 import type * as React from 'react'
 
 import { ProfileTag } from '@/app/chat/profile-tag'
 import { startSessionDrag } from '@/app/chat/session-drag'
 import { PlatformAvatar } from '@/app/messaging/platform-icon'
-import { openSession } from '@/app/open-session'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip } from '@/components/ui/tooltip'
@@ -13,11 +11,11 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
-import { middleClickHandlers } from '@/lib/middle-click'
 import { handoffOriginSource, sessionSourceLabel } from '@/lib/session-source'
 import { coarseElapsed } from '@/lib/time'
 import { cn } from '@/lib/utils'
-import { $attentionSessionIds } from '@/store/session-states'
+import { $attentionSessionIds, openSessionTile } from '@/store/session-states'
+import { canOpenSessionWindow, openSessionInNewWindow } from '@/store/windows'
 
 import { SessionStatusDot } from '../session-status-dot'
 
@@ -56,7 +54,7 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
   return unit === 'second' ? r.ageNow : `${value}${r[AGE_KEY[unit]]}`
 }
 
-function SidebarSessionRowImpl({
+export function SidebarSessionRow({
   session,
   branchStem,
   isPinned,
@@ -118,9 +116,10 @@ function SidebarSessionRowImpl({
               profile={session.profile}
               sessionId={session.id}
               title={title}
+              tooltip={r.actionsFor(title)}
             >
               <Button
-                aria-label={r.sessionActions}
+                aria-label={r.actionsFor(title)}
                 className="size-5 rounded-[4px] bg-transparent text-transparent transition-colors duration-100 hover:bg-(--ui-control-active-background) hover:text-foreground focus-visible:bg-(--ui-control-active-background) focus-visible:text-foreground focus-visible:ring-0 data-[state=open]:bg-(--ui-control-active-background) data-[state=open]:text-foreground group-hover:text-(--ui-text-tertiary) [&_svg]:size-3.5!"
                 size="icon"
                 variant="ghost"
@@ -169,20 +168,25 @@ function SidebarSessionRowImpl({
         )}
         <SidebarRowBody
           className={cn('z-0 group-hover:pr-12', branchStem && 'pl-3.5')}
-          // Middle-click = open in a new tab (browser muscle memory).
-          {...middleClickHandlers(() => {
-            triggerHaptic('selection')
-            openSession(session.id, () => undefined, 'tab')
-          })}
+          // Middle-click = open in a new tab (browser muscle memory). Swallow
+          // the mousedown so Chromium doesn't enter autoscroll mode.
+          onAuxClick={event => {
+            if (event.button === 1) {
+              event.preventDefault()
+              event.stopPropagation()
+              triggerHaptic('selection')
+              openSessionTile(session.id, 'center')
+            }
+          }}
           onClick={event => {
             const mod = event.metaKey || event.ctrlKey
 
             // ⇧⌘-click → pop into its own window (needs standalone windows).
-            if (mod && event.shiftKey) {
+            if (mod && event.shiftKey && canOpenSessionWindow()) {
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'window')
+              void openSessionInNewWindow(session.id)
 
               return
             }
@@ -192,7 +196,7 @@ function SidebarSessionRowImpl({
               event.preventDefault()
               event.stopPropagation()
               triggerHaptic('selection')
-              openSession(session.id, () => undefined, 'tab')
+              openSessionTile(session.id, 'center')
 
               return
             }
@@ -209,6 +213,7 @@ function SidebarSessionRowImpl({
 
             onResume()
           }}
+          onMouseDown={event => event.button === 1 && event.preventDefault()}
         >
           {reorderable ? (
             <SidebarRowGrab
@@ -247,32 +252,3 @@ function SidebarSessionRowImpl({
     </SessionContextMenu>
   )
 }
-
-// The sidebar re-renders on every stream tick ($sessions/$workingSessionIds
-// churn), and it stays mounted beneath every overlay — so an unmemoized row
-// re-rendered the whole list (and its Codicon/label/status-dot subtree) on each
-// delta, bleeding churn into Settings, Cron, Profiles, Artifacts, etc.
-//
-// The callback props (onArchive/onResume/…) are fresh closures every render by
-// design (they close over the row's session id), so a default memo never bails.
-// They're pure id-forwarders, though — identical behavior for a given row — so
-// the comparator deliberately ignores them and compares only the DATA that
-// changes what the row paints. A row whose session/selection/working/pin state
-// is unchanged now bails out, even while a sibling session streams.
-function rowPropsEqual(a: SidebarSessionRowProps, b: SidebarSessionRowProps): boolean {
-  return (
-    a.session === b.session &&
-    a.isPinned === b.isPinned &&
-    a.isSelected === b.isSelected &&
-    a.isWorking === b.isWorking &&
-    a.branchStem === b.branchStem &&
-    a.reorderable === b.reorderable &&
-    a.dragging === b.dragging &&
-    a.showProfile === b.showProfile &&
-    a.dragHandleProps === b.dragHandleProps &&
-    a.className === b.className &&
-    a.style === b.style
-  )
-}
-
-export const SidebarSessionRow = memo(SidebarSessionRowImpl, rowPropsEqual)

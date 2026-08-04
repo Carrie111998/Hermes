@@ -112,16 +112,6 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
-    def _owns_kanban_dispatcher_lock(self) -> bool:
-        """Return whether this gateway currently owns the singleton lock."""
-        return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
-
-    def _release_kanban_dispatcher_lock(self) -> None:
-        """Clear notifier-visible ownership before releasing the OS lock."""
-        handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
-        self._kanban_dispatcher_lock_handle = None
-        _release_singleton_lock(handle)
-
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
@@ -137,15 +127,34 @@ class GatewayKanbanWatchersMixin:
         WAL lock. Failures in one tick don't stop subsequent ticks.
 
         **Multi-board:** iterates every board discovered on disk per
-        tick. Each gateway polls only subscriptions owned by profiles whose
-        adapters it hosts. The dispatch-owning gateway also handles legacy
-        subscriptions without a profile stamp.
+        tick. Subscriptions live inside each board's own DB and cannot
+        cross boards, so delivery semantics are unchanged — this is
+        purely a fan-out of the single-DB poll.
         """
-        # Dispatch and delivery have separate ownership. A deployment may run
-        # one dispatcher while each profile has its own gateway credentials;
-        # those adapter-owning gateways must still poll and deliver their own
-        # subscriptions. Legacy rows without a notifier_profile are visible
-        # only while this process holds the actual singleton dispatcher lock.
+        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
+        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
+        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
+        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("kanban notifier: config loader unavailable; disabled")
+            return
+        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
+        if env_override in {"0", "false", "no", "off"}:
+            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
+            return
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
+            return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not kanban_cfg.get("dispatch_in_gateway", True):
+            logger.info(
+                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
+            )
+            return
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -195,13 +204,6 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
-                    include_unowned = self._owns_kanban_dispatcher_lock()
-                    notifier_profiles = {notifier_profile}
-                    notifier_profiles.update(
-                        str(profile).strip()
-                        for profile in getattr(self, "_profile_adapters", {})
-                        if str(profile).strip()
-                    )
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
@@ -260,14 +262,10 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(
-                                board=slug,
-                                notifier_profiles=notifier_profiles,
-                                include_unowned=include_unowned,
-                            ) == 0:
+                            if _kb.count_notify_subs(board=slug) == 0:
                                 logger.debug(
-                                    "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
-                                    slug, sorted(notifier_profiles),
+                                    "kanban notifier: board %s has no subscriptions; skipping open",
+                                    slug,
                                 )
                                 continue
                         except Exception as exc:
@@ -294,11 +292,7 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(
-                                conn,
-                                notifier_profiles=notifier_profiles,
-                                include_unowned=include_unowned,
-                            )
+                            subs = _kb.list_notify_subs(conn)
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
@@ -1038,7 +1032,7 @@ class GatewayKanbanWatchersMixin:
         # Read max_spawn config to limit concurrent kanban tasks
         max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
-            logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
+            logger.info(f"kanban dispatcher: max_spawn={max_spawn}")
 
         # Cap the number of simultaneously running tasks so slow workers
         # (local LLMs, resource-constrained hosts) don't pile up and time
@@ -1063,7 +1057,7 @@ class GatewayKanbanWatchersMixin:
                     )
                     max_in_progress = None
                 else:
-                    logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
+                    logger.info(f"kanban dispatcher: max_in_progress={max_in_progress}")
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -1478,7 +1472,8 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
-                self._release_kanban_dispatcher_lock()
+                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+                self._kanban_dispatcher_lock_handle = None
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
@@ -1490,4 +1485,5 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
-        self._release_kanban_dispatcher_lock()
+        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
+        self._kanban_dispatcher_lock_handle = None

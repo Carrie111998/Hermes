@@ -27,7 +27,7 @@ import { ModelMenuPanel } from '@/app/shell/model-menu-panel'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
 import { CenteredThreadSpinner } from '@/components/assistant-ui/thread/status'
 import { findGroupOfPane } from '@/components/pane-shell/tree/model'
-import { $layoutTree, closeTreePane, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
+import { $layoutTree, moveTreePane, setTreeGroupHeaderHidden } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { transcribeAudio } from '@/hermes'
@@ -104,13 +104,6 @@ function buildTileView(storedSessionId: string): SessionView {
   }
 }
 
-// Module-level constants so these ChatView props are referentially stable —
-// tiles have no pin/delete affordance, and transcription needs no per-tile state.
-const noop = () => undefined
-
-const tileTranscribeAudio = async (audio: Blob) =>
-  (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript
-
 function TileChat({
   runtimeId,
   storedSessionId,
@@ -133,8 +126,9 @@ function TileChat({
   const scope = useMemo<ComposerScope>(
     () => ({
       $awaitingInput: sessionAwaitingInput(runtimeId),
-      $messages: view.$messages,
       attachments,
+      popoutAllowed: false,
+      readMessages: () => view.$messages.get(),
       target: `tile:${storedSessionId}`
     }),
     [attachments, runtimeId, storedSessionId, view.$messages]
@@ -150,29 +144,6 @@ function TileChat({
     requestGateway,
     scope: { add: attachments.add, remove: attachments.remove, target: scope.target }
   })
-
-  // ChatView is memo()d — every callback prop must be referentially stable or
-  // the memo never holds and each tile-level render (idle ticks, unrelated
-  // store updates) re-renders the whole chat shell. The individual composer
-  // functions are useCallback'd inside useComposerActions, so hoisting these
-  // wrappers onto them keeps identity stable across renders.
-  const { addContextRefAttachment, pasteClipboardImage, pickContextPaths, pickImages, removeAttachment } = composer
-
-  const onAddUrl = useCallback(
-    (url: string) => addContextRefAttachment(`@url:${formatRefValue(url)}`, url),
-    [addContextRefAttachment]
-  )
-
-  const onPasteClipboardImage = useCallback(
-    (opts?: { silent?: boolean }) => pasteClipboardImage(opts),
-    [pasteClipboardImage]
-  )
-
-  const onPickFiles = useCallback(() => void pickContextPaths('file'), [pickContextPaths])
-  const onPickFolders = useCallback(() => void pickContextPaths('folder'), [pickContextPaths])
-  const onPickImages = useCallback(() => void pickImages(), [pickImages])
-  const onRemoveAttachment = useCallback((id: string) => void removeAttachment(id), [removeAttachment])
-  const onRetryResume = useCallback(() => patchSessionTile(storedSessionId, { error: undefined }), [storedSessionId])
 
   // Per-tile model menu — rendered under this tile's SessionView so the pill
   // + switch target THIS runtime, not the primary (which may be mid-turn).
@@ -195,27 +166,27 @@ function TileChat({
         <ChatView
           gateway={gateway}
           modelMenuContent={modelMenuContent}
-          onAddContextRef={addContextRefAttachment}
-          onAddUrl={onAddUrl}
+          onAddContextRef={composer.addContextRefAttachment}
+          onAddUrl={url => composer.addContextRefAttachment(`@url:${formatRefValue(url)}`, url)}
           onAttachDroppedItems={composer.attachDroppedItems}
           onAttachImageBlob={composer.attachImageBlob}
           onCancel={actions.cancelRun}
-          onDeleteSelectedSession={noop}
+          onDeleteSelectedSession={() => undefined}
           onDismissError={actions.dismissError}
           onEdit={actions.editMessage}
-          onPasteClipboardImage={onPasteClipboardImage}
-          onPickFiles={onPickFiles}
-          onPickFolders={onPickFolders}
-          onPickImages={onPickImages}
+          onPasteClipboardImage={opts => composer.pasteClipboardImage(opts)}
+          onPickFiles={() => void composer.pickContextPaths('file')}
+          onPickFolders={() => void composer.pickContextPaths('folder')}
+          onPickImages={() => void composer.pickImages()}
           onReload={actions.reloadFromMessage}
-          onRemoveAttachment={onRemoveAttachment}
+          onRemoveAttachment={id => void composer.removeAttachment(id)}
           onRestoreToMessage={actions.restoreToMessage}
-          onRetryResume={onRetryResume}
+          onRetryResume={() => patchSessionTile(storedSessionId, { error: undefined })}
           onSteer={actions.steerPrompt}
           onSubmit={actions.submitText}
           onThreadMessagesChange={actions.handleThreadMessagesChange}
-          onToggleSelectedPin={noop}
-          onTranscribeAudio={tileTranscribeAudio}
+          onToggleSelectedPin={() => undefined}
+          onTranscribeAudio={async audio => (await transcribeAudio(await blobToDataUrl(audio), audio.type)).transcript}
         />
       </ComposerScopeProvider>
     </SessionViewProvider>
@@ -534,10 +505,9 @@ export function SessionTabMenu({
 }
 
 /** The MAIN tab's menu: the same session verbs targeting the primary's loaded
- *  session, plus Close (the tab empties to a fresh draft — the workspace pane
- *  itself never leaves the tree) and the bar's off switch (the bar sticky-shows
- *  once a tab is ever gained; this is the explicit way back). A fresh draft has
- *  no session — no menu. */
+ *  session, plus the bar's off switch (the bar sticky-shows once a tab is
+ *  ever gained; this is the explicit way back). A fresh draft has no session —
+ *  no menu. */
 export function WorkspaceTabMenu({ children }: { children: React.ReactElement }) {
   const selected = useStore($selectedStoredSessionId)
 
@@ -555,12 +525,7 @@ export function WorkspaceTabMenu({ children }: { children: React.ReactElement })
   }
 
   return (
-    <SessionTabMenu
-      onClose={() => closeTreePane('workspace')}
-      onHideTabBar={hideTabBar}
-      storedSessionId={selected}
-      tabPaneId="workspace"
-    >
+    <SessionTabMenu onHideTabBar={hideTabBar} storedSessionId={selected} tabPaneId="workspace">
       {children}
     </SessionTabMenu>
   )

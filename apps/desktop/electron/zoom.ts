@@ -2,11 +2,8 @@
  * Pure helpers for window zoom. The main process owns webContents.setZoomLevel,
  * so the menu items, the Ctrl/Cmd shortcuts, and the settings UI all funnel
  * through this one clamped scale. Percent is the user-facing unit (100 = the
- * Chromium actual-size baseline); Chromium's internal unit is the zoom level,
- * where factor = 1.2 ^ level.
- *
- * Our shipped default is the Appearance 90% preset — tight enough to feel
- * denser than Chromium 100%, and selected in the UI Scale control on first run.
+ * default size); Chromium's internal unit is the zoom level, where
+ * factor = 1.2 ^ level.
  */
 
 export const ZOOM_STORAGE_KEY = 'hermes:desktop:zoomLevel'
@@ -15,15 +12,9 @@ const ZOOM_FACTOR_BASE = 1.2
 const MIN_ZOOM_LEVEL = -9
 const MAX_ZOOM_LEVEL = 9
 
-/** Half Chromium's default step; matching the shortcuts and View menu. */
-export const ZOOM_STEP = 0.1
-
-/** Appearance 90% preset. Fresh installs + Actual Size / Ctrl+0. */
-export const DEFAULT_ZOOM_LEVEL = Math.log(0.9) / Math.log(ZOOM_FACTOR_BASE)
-
 export function clampZoomLevel(value) {
   if (!Number.isFinite(value)) {
-    return DEFAULT_ZOOM_LEVEL
+    return 0
   }
 
   return Math.min(Math.max(value, MIN_ZOOM_LEVEL), MAX_ZOOM_LEVEL)
@@ -35,7 +26,7 @@ export function zoomLevelToPercent(level) {
 
 export function percentToZoomLevel(percent) {
   if (!Number.isFinite(percent) || percent <= 0) {
-    return DEFAULT_ZOOM_LEVEL
+    return 0
   }
 
   return clampZoomLevel(Math.log(percent / 100) / Math.log(ZOOM_FACTOR_BASE))
@@ -108,8 +99,7 @@ export function installZoomReassertOnWindowEvents(win, reassert, platform = proc
 export const ZOOM_WINDOW_CONFIG = {
   chat: { zoom: true },
   petOverlay: { zoom: false },
-  quickEntry: { zoom: false },
-  wakeIndicator: { zoom: false }
+  quickEntry: { zoom: false }
 } as const
 
 export function zoomWiringForWindowKind(kind) {

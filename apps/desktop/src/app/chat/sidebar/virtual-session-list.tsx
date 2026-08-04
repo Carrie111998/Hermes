@@ -27,7 +27,7 @@ interface SessionRowCommonProps {
   showProfile?: boolean
 }
 
-export interface VirtualSessionListProps {
+interface VirtualSessionListProps {
   activeSessionId: null | string
   className?: string
   rows: SidebarListRow[]

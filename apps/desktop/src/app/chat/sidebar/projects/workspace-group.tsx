@@ -4,7 +4,6 @@ import { useState } from 'react'
 import { Codicon } from '@/components/ui/codicon'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
-import { displayPath } from '@/lib/display-path'
 import { setWorkspaceNodeOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
 import { newSessionInProfile } from '@/store/profile'
@@ -15,13 +14,7 @@ import { SidebarLoadMoreRow } from '../load-more-row'
 
 import { SIDEBAR_GROUP_PAGE, useWorkspaceNodeOpen } from './model'
 import type { SidebarSessionGroup } from './workspace-groups'
-import {
-  WorkspaceAddButton,
-  WorkspaceContextMenu,
-  WorkspaceHeader,
-  WorkspaceMenu,
-  WorkspaceShowMoreButton
-} from './workspace-header'
+import { WorkspaceAddButton, WorkspaceHeader, WorkspaceMenu, WorkspaceShowMoreButton } from './workspace-header'
 
 interface SidebarWorkspaceGroupProps {
   group: SidebarSessionGroup
@@ -111,31 +104,30 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
 
   return (
     <SidebarRowStack>
-      <WorkspaceContextMenu onRemove={onRemove} path={group.path}>
-        <WorkspaceHeader
-          action={
-            (onNewSession || isProfileGroup || onRemove) && (
-              <div className="flex items-center">
-                {(onNewSession || isProfileGroup) && (
-                  <WorkspaceAddButton
-                    label={s.newSessionIn(group.label)}
-                    // Profile groups start a fresh session in that profile but keep
-                    // the all-profiles browse view; workspace groups seed the new
-                    // session's cwd. Main checkout lanes are branch-targeted.
-                    onClick={() => void handleNewSession()}
-                  />
-                )}
-                {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
-              </div>
-            )
-          }
-          icon={leadingIcon}
-          label={group.label}
-          onToggle={toggleOpen}
-          open={open}
-          title={group.path ? displayPath(group.path) : undefined}
-        />
-      </WorkspaceContextMenu>
+      <WorkspaceHeader
+        action={
+          (onNewSession || isProfileGroup || onRemove) && (
+            <div className="flex items-center">
+              {(onNewSession || isProfileGroup) && (
+                <WorkspaceAddButton
+                  label={s.newSessionIn(group.label)}
+                  // Profile groups start a fresh session in that profile but keep
+                  // the all-profiles browse view; workspace groups seed the new
+                  // session's cwd. Main checkout lanes are branch-targeted.
+                  onClick={() => void handleNewSession()}
+                />
+              )}
+              {onRemove && <WorkspaceMenu onRemove={onRemove} path={group.path} />}
+            </div>
+          )
+        }
+        count={visibleSessions.length}
+        icon={leadingIcon}
+        label={group.label}
+        onToggle={toggleOpen}
+        open={open}
+        title={group.path ?? undefined}
+      />
       {open && (
         <>
           {visibleSessions.length === 0 ? (
