@@ -84,6 +84,11 @@ def test_passkey_v2_suites_run_under_exact_isolated_runtime(
                 / "tests/scripts/canary/"
                 "test_owner_gate_host_observation_isolated_runtime.py"
             ),
+            # This suite proves the exact owner-gate dependency closure.  The
+            # repository-wide conftest owns unrelated agent/provider autouse
+            # fixtures, so loading it would silently widen this runtime every
+            # time the general test harness gains a dependency.
+            f"--confcutdir={repository / 'tests/scripts/canary'}",
             "-q",
         ],
         cwd=repository,
