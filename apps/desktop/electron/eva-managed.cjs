@@ -60,6 +60,43 @@ const EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS = new Set([
 ])
 const EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES = ['billing.', 'subscription.']
 const EVA_MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_KEYS = Object.freeze([
+  'hermes.desktop.composerQueue.v1',
+  'hermes.desktop.dismissedAutoProjects',
+  'hermes.desktop.dismissedWorktrees',
+  'hermes.desktop.inflightTurnJournal.v1',
+  'hermes.desktop.lastRoute',
+  'hermes.desktop.lastSessionId',
+  'hermes.desktop.paneStates.v1',
+  'hermes.desktop.pinnedSessions',
+  'hermes.desktop.previewTabs.v2',
+  'hermes.desktop.profileColors',
+  'hermes.desktop.profileOrder',
+  'hermes.desktop.projectOrder',
+  'hermes.desktop.projectScope',
+  'hermes.desktop.routeTiles.v1',
+  'hermes.desktop.sessionOrder',
+  'hermes.desktop.sessionPreviews.v1',
+  'hermes.desktop.sessionTiles.v1',
+  'hermes.desktop.sessionTiles.v2',
+  'hermes.desktop.sidebarMessagingOpen',
+  'hermes.desktop.terminals.v1',
+  'hermes.desktop.toolDisclosure.v1',
+  'hermes.desktop.workspaceCollapsed',
+  'hermes.desktop.workspaceNodeOpen',
+  'hermes.desktop.workspaceOrder',
+  'hermes.desktop.workspaceParentOrder',
+  'hermes.desktop.workspace-cwd',
+  'hermes:composer-drafts:v3',
+  'hermes-desktop-active-profile-v1',
+  'hermes-desktop-profile-modes-v1',
+  'hermes-desktop-profile-themes-v1'
+])
+const EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_PREFIXES = Object.freeze([
+  'hermes.desktop.lastRoute.',
+  'hermes.desktop.lastSessionId.',
+  'hermes.desktop.workspace-cwd.remote.'
+])
 
 class EvaBrokerError extends Error {
   constructor(message, statusCode = null, code = 'broker-error') {
@@ -120,6 +157,21 @@ function hasAsciiControl(value) {
   })
 }
 
+function buildEvaAccountRendererResetScript() {
+  const exactKeys = JSON.stringify(EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_KEYS)
+  const prefixes = JSON.stringify(EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_PREFIXES)
+  return `(() => {
+    const exactKeys = new Set(${exactKeys});
+    const prefixes = ${prefixes};
+    for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+      const key = localStorage.key(index);
+      if (key && (exactKeys.has(key) || prefixes.some(prefix => key.startsWith(prefix)))) {
+        localStorage.removeItem(key);
+      }
+    }
+  })()`
+}
+
 function assertEvaManagedApiRequestAllowed(request) {
   const method = String(request?.method || 'GET').toUpperCase()
   if (!EVA_MANAGED_API_METHODS.has(method)) {
@@ -159,15 +211,20 @@ function assertEvaManagedApiRequestAllowed(request) {
     }
   }
 
-  const profile = request?.profile == null ? null : String(request.profile)
-  if (profile && !EVA_MANAGED_PROFILE_RE.test(profile)) {
+  const routingProfile = request?.profile == null ? null : String(request.profile)
+  if (routingProfile !== null && !EVA_MANAGED_PROFILE_RE.test(routingProfile)) {
     throw new EvaBrokerError('evaOS Agent blocked an invalid Hermes profile.', 400, 'managed-policy')
   }
-  if (profile && parsed.searchParams.has('profile') && parsed.searchParams.get('profile') !== profile) {
-    throw new EvaBrokerError('evaOS Agent blocked conflicting Hermes profiles.', 400, 'managed-policy')
+  const endpointProfiles = parsed.searchParams.getAll('profile')
+  if (endpointProfiles.length > 1) {
+    throw new EvaBrokerError('evaOS Agent blocked duplicate Hermes profiles.', 400, 'managed-policy')
   }
-  if (profile && !parsed.searchParams.has('profile')) {
-    parsed.searchParams.set('profile', profile)
+  if (endpointProfiles.length === 1) {
+    if (routingProfile === null || !EVA_MANAGED_PROFILE_RE.test(endpointProfiles[0])) {
+      throw new EvaBrokerError('evaOS Agent blocked an invalid Hermes profile.', 400, 'managed-policy')
+    }
+  } else if (routingProfile !== null) {
+    parsed.searchParams.set('profile', routingProfile)
   }
 
   const query = parsed.searchParams.toString()
@@ -540,6 +597,7 @@ module.exports = {
   assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
   brokerPost,
+  buildEvaAccountRendererResetScript,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
   claimEvaDeviceCode,

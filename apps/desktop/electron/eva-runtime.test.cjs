@@ -203,12 +203,113 @@ test('explicit refresh bypasses cooldown once, coalesces callers, and success re
   outcome = 'fail'
   await assert.rejects(runtime.refresh(), error => error === failure)
   assert.equal(launches, 3)
-  await assert.rejects(runtime.resolveBackend(), error => error === failure)
+  await runtime.resolveBackend()
   assert.equal(launches, 3)
 
   clock = 2_000
-  await assert.rejects(runtime.resolveBackend(), error => error === failure)
+  await runtime.resolveBackend()
+  assert.equal(launches, 3)
+  outcome = 'success'
+  await runtime.refresh()
   assert.equal(launches, 4)
+})
+
+test('forced refresh supersedes an automatic enrollment without reusing its stale promise', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-force-generation-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeEnrollment(statePath)
+
+  const releases = []
+  let launches = 0
+  const runtime = makeManagedRuntime(statePath, {
+    launchRuntime: async () => {
+      launches += 1
+      const index = launches
+      await new Promise(resolve => releases.push(resolve))
+      return {
+        schemaVersion: 'evaos.hermes_desktop_enrollment.v1',
+        customerId: 'customer-one',
+        runtime: 'hermes',
+        agentId: 'main',
+        baseUrl: 'https://hermes-customer-one.ecs.electricsheephq.com',
+        token: index === 1 ? 'stale-runtime-token' : 'forced-runtime-token',
+        expiresAt: FUTURE
+      }
+    }
+  })
+
+  const automatic = runtime.resolveBackend()
+  await new Promise(resolve => setImmediate(resolve))
+  const forced = runtime.refresh()
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(launches, 2)
+
+  releases[1]()
+  await forced
+  releases[0]()
+  await assert.rejects(
+    automatic,
+    error => error instanceof EvaBrokerError && error.code === 'stale-auth'
+  )
+
+  const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  assert.equal(persisted.runtime.token, 'forced-runtime-token')
+})
+
+test('failed forced refresh preserves the last-known-good runtime atomically', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-atomic-refresh-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  const failure = new EvaBrokerError('Runtime enrollment is temporarily unavailable.', 500, 'vm_lookup_failed')
+  const runtime = makeManagedRuntime(statePath, {
+    launchRuntime: async () => {
+      throw failure
+    }
+  })
+
+  await assert.rejects(runtime.refresh(), error => error === failure)
+  const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  assert.equal(persisted.runtime.token, 'runtime-token')
+  assert.equal(runtime.status().runtimeSessionActive, true)
+})
+
+test('production reauthentication errors trigger one runtime re-enrollment', async t => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'eva-runtime-production-401-'))
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }))
+  const statePath = path.join(directory, 'eva-enrollment.json')
+  writeActiveEnrollment(statePath)
+
+  let waits = 0
+  let launches = 0
+  const runtime = makeManagedRuntime(statePath, {
+    waitForHermes: async () => {
+      waits += 1
+      if (waits === 1) {
+        throw Object.assign(new Error('The remote session needs authentication.'), { isReauthRequired: true })
+      }
+    },
+    launchRuntime: async () => {
+      launches += 1
+      return {
+        schemaVersion: 'evaos.hermes_desktop_enrollment.v1',
+        customerId: 'customer-one',
+        runtime: 'hermes',
+        agentId: 'main',
+        baseUrl: 'https://hermes-customer-one.ecs.electricsheephq.com',
+        token: 'refreshed-runtime-token',
+        expiresAt: FUTURE
+      }
+    }
+  })
+
+  await runtime.resolveBackend()
+  assert.equal(waits, 2)
+  assert.equal(launches, 1)
+  const persisted = JSON.parse(fs.readFileSync(statePath, 'utf8'))
+  assert.equal(persisted.runtime.token, 'refreshed-runtime-token')
 })
 
 test('a stale in-flight launch cannot restore backoff after auth invalidation', async t => {

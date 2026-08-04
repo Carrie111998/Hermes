@@ -23,6 +23,7 @@ from hermes_cli.profiles import (
     normalize_profile_name,
     validate_profile_name,
     get_profile_dir,
+    profile_exists,
     create_profile,
     delete_profile,
     list_profiles,
@@ -115,6 +116,18 @@ class TestGetProfileDir:
     def test_unsafe_profile_name_cannot_escape_profiles_root(self, profile_env, name):
         with pytest.raises(ValueError):
             get_profile_dir(name)
+
+
+class TestProfileExists:
+    @pytest.mark.parametrize("name", [None, "", "../escape", "has space", "hermes"])
+    def test_invalid_names_return_false(self, profile_env, name):
+        assert profile_exists(name) is False
+
+    def test_missing_and_existing_profiles(self, profile_env):
+        assert profile_exists("missing") is False
+        (_get_profiles_root() / "coder").mkdir(parents=True)
+        assert profile_exists("Coder") is True
+        assert profile_exists("default") is True
 
 
 # ===================================================================
@@ -824,5 +837,4 @@ class TestProfilesToServe:
         assert set(serve) == {"default", "coder", "writer"}
         assert serve["default"] == _get_default_hermes_home()
         assert serve["coder"] == get_profile_dir("coder")
-
 

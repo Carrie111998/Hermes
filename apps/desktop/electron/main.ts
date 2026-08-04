@@ -94,6 +94,7 @@ const { createEvaAppUpdater } = require('./eva-app-updater.cjs')
 const {
   assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
+  buildEvaAccountRendererResetScript,
   EVA_MANAGED_POLICY
 } = require('./eva-managed.cjs')
 const { createEvaManagedRuntime } = require('./eva-runtime.cjs')
@@ -4266,6 +4267,12 @@ function multipartBody(upload) {
   return { body, contentType: `multipart/form-data; boundary=${boundary}` }
 }
 
+function httpStatusError(statusCode, detail) {
+  const error = new Error(`${statusCode}: ${detail}`) as Error & { statusCode: number }
+  error.statusCode = statusCode
+  return error
+}
+
 function fetchJson(url, token, options: any = {}) {
   return new Promise((resolve, reject) => {
     const { body, contentType } = options.upload
@@ -4309,7 +4316,7 @@ function fetchJson(url, token, options: any = {}) {
           const text = Buffer.concat(chunks).toString('utf8')
 
           if ((res.statusCode || 500) >= 400) {
-            reject(new Error(`${res.statusCode}: ${text || res.statusMessage}`))
+            reject(httpStatusError(res.statusCode || 500, text || res.statusMessage))
 
             return
           }
@@ -6839,8 +6846,9 @@ async function resetEvaRendererSessions() {
     return
   }
   const rendererSession = mainWindow.webContents.session
+  await mainWindow.webContents.executeJavaScript(buildEvaAccountRendererResetScript(), true).catch(() => undefined)
   await Promise.allSettled([
-    rendererSession.clearStorageData({ storages: ['cachestorage', 'indexdb', 'localstorage', 'serviceworkers'] }),
+    rendererSession.clearStorageData({ storages: ['cachestorage', 'indexdb', 'serviceworkers'] }),
     rendererSession.clearCache()
   ])
   if (!mainWindow.isDestroyed()) {

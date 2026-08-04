@@ -43,6 +43,7 @@ function createEvaManagedRuntime(options) {
 
   let signInPromise = null
   let runtimeEnrollmentPromise = null
+  let runtimeEnrollmentPromiseForced = false
   let runtimeEnrollmentFailure = null
   let pendingAuth = null
   let authGeneration = 0
@@ -160,7 +161,9 @@ function createEvaManagedRuntime(options) {
   }
 
   function clearRuntimeEnrollment() {
-    if (!runtimeEnrollmentPromise) runtimeGeneration += 1
+    runtimeGeneration += 1
+    runtimeEnrollmentPromise = null
+    runtimeEnrollmentPromiseForced = false
     runtimeSessionGeneration += 1
     const state = readState()
     if (state.desktop) writeState({ desktop: state.desktop, runtime: null })
@@ -195,6 +198,7 @@ function createEvaManagedRuntime(options) {
     pendingAuth = null
     signInPromise = null
     runtimeEnrollmentPromise = null
+    runtimeEnrollmentPromiseForced = false
     resetRuntimeEnrollmentFailure()
     resetConnection()
     wsRelay?.disconnectAll()
@@ -268,10 +272,24 @@ function createEvaManagedRuntime(options) {
     return requireSignIn()
   }
 
+  function statusCodeOf(error) {
+    const statusCode = Number(error?.statusCode)
+    if (Number.isInteger(statusCode) && statusCode >= 100 && statusCode <= 599) return statusCode
+    if (error?.isReauthRequired === true) return 401
+    const match = /^\s*(\d{3})(?::|\b)/.exec(String(error?.message || ''))
+    return match ? Number(match[1]) : null
+  }
+
   async function ensureRuntimeEnrollment(input = {}) {
     const force = input.force === true
-    if (runtimeEnrollmentPromise) return runtimeEnrollmentPromise
-    if (force) runtimeGeneration += 1
+    if (runtimeEnrollmentPromise) {
+      if (!force || runtimeEnrollmentPromiseForced) return runtimeEnrollmentPromise
+      runtimeGeneration += 1
+      runtimeEnrollmentPromise = null
+      runtimeEnrollmentPromiseForced = false
+    } else if (force) {
+      runtimeGeneration += 1
+    }
     const auth = authGeneration
     const runtime = runtimeGeneration
     const current = readState()
@@ -279,7 +297,6 @@ function createEvaManagedRuntime(options) {
     if (!force && runtimeEnrollmentFailure && now() < runtimeEnrollmentFailure.nextRetryAt) {
       throw runtimeEnrollmentFailure.error
     }
-    if (force && current.desktop) writeState({ desktop: current.desktop, runtime: null })
 
     const task = (async () => {
       try {
@@ -290,17 +307,19 @@ function createEvaManagedRuntime(options) {
         try {
           enrollment = await launchRuntime(desktop.token)
         } catch (error) {
-          if (!(error instanceof EvaBrokerError) || error.statusCode !== 401) throw error
+          if (!(error instanceof EvaBrokerError) || statusCodeOf(error) !== 401) throw error
           assertGeneration(auth, runtime)
           return requireSignIn()
         }
         assertGeneration(auth, runtime)
-        runtimeSessionGeneration += 1
         writeState({ desktop, runtime: enrollment })
+        runtimeSessionGeneration += 1
+        resetConnection()
+        wsRelay?.disconnectAll()
         resetRuntimeEnrollmentFailure()
         return enrollment
       } catch (error) {
-        if (error?.statusCode !== 401 && error?.code !== 'stale-auth') {
+        if (statusCodeOf(error) !== 401 && error?.code !== 'stale-auth') {
           assertGeneration(auth, runtime)
           recordRuntimeEnrollmentFailure(error)
         }
@@ -309,9 +328,13 @@ function createEvaManagedRuntime(options) {
     })()
 
     runtimeEnrollmentPromise = task
+    runtimeEnrollmentPromiseForced = force
     void task
       .finally(() => {
-        if (runtimeEnrollmentPromise === task) runtimeEnrollmentPromise = null
+        if (runtimeEnrollmentPromise === task) {
+          runtimeEnrollmentPromise = null
+          runtimeEnrollmentPromiseForced = false
+        }
       })
       .catch(() => undefined)
     return task
@@ -323,7 +346,7 @@ function createEvaManagedRuntime(options) {
     try {
       await options.waitForHermes(runtime.baseUrl, runtime.token)
     } catch (error) {
-      if (error?.statusCode !== 401) throw error
+      if (statusCodeOf(error) !== 401) throw error
       clearRuntimeEnrollment()
       runtime = await ensureRuntimeEnrollment({ force: true })
       await options.waitForHermes(runtime.baseUrl, runtime.token)
@@ -379,7 +402,6 @@ function createEvaManagedRuntime(options) {
   }
 
   async function refresh() {
-    clearRuntimeEnrollment()
     const runtime = await ensureRuntimeEnrollment({ force: true })
     const status = publicEvaEnrollmentStatus({ ...readState(), runtime })
     await resetRenderer()
@@ -398,7 +420,7 @@ function createEvaManagedRuntime(options) {
         timeoutMs
       })
     } catch (error) {
-      if (!retry || error?.statusCode !== 401) throw error
+      if (!retry || statusCodeOf(error) !== 401) throw error
       clearRuntimeEnrollment()
       const refreshed = await ensureRuntimeEnrollment({ force: true })
       const next = assertEvaManagedApiRequestAllowed(request)

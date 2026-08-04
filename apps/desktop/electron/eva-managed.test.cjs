@@ -1,5 +1,6 @@
 const assert = require('node:assert/strict')
 const test = require('node:test')
+const vm = require('node:vm')
 
 const {
   EVA_MANAGED_POLICY,
@@ -7,6 +8,7 @@ const {
   assertEvaManagedApiRequestAllowed,
   assertEvaManagedLocalMutationAllowed,
   assertEvaManagedLocalTerminalAllowed,
+  buildEvaAccountRendererResetScript,
   buildEvaDesktopAuthUrl,
   buildEvaManagedWsUrl,
   isEvaManagedGatewayMethodBlocked,
@@ -287,25 +289,57 @@ test('managed backend rejects absolute, non-API, and ambiguous request paths', (
   }
 })
 
-test('managed backend supports Hermes profiles within one assigned backend', () => {
+test('managed backend validates routing and endpoint profiles independently', () => {
   assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills', profile: 'research' }), {
     method: 'GET',
     path: '/api/skills?profile=research',
     pathname: '/api/skills'
   })
-  assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=research', profile: 'research' }), {
+  assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=all', profile: 'research' }), {
     method: 'GET',
-    path: '/api/skills?profile=research',
+    path: '/api/skills?profile=all',
     pathname: '/api/skills'
   })
-  assert.throws(
-    () => assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=default', profile: 'research' }),
-    error => error instanceof EvaBrokerError && error.code === 'managed-policy'
-  )
-  assert.throws(
-    () => assertEvaManagedApiRequestAllowed({ path: '/api/skills', profile: '../other-agent' }),
-    error => error instanceof EvaBrokerError && error.code === 'managed-policy'
-  )
+  for (const request of [
+    { path: '/api/skills?profile=research' },
+    { path: '/api/skills?profile=research&profile=all', profile: 'research' },
+    { path: '/api/skills?profile=../other-agent', profile: 'research' },
+    { path: '/api/skills', profile: '../other-agent' }
+  ]) {
+    assert.throws(
+      () => assertEvaManagedApiRequestAllowed(request),
+      error => error instanceof EvaBrokerError && error.code === 'managed-policy'
+    )
+  }
+})
+
+test('account reset clears renderer account state while preserving global preferences', () => {
+  const values = new Map([
+    ['hermes.desktop.lastSessionId.research', 'session-secret'],
+    ['hermes.desktop.workspace-cwd.remote.eva-managed%3A%2F%2Fcustomer.default', '/srv/customer'],
+    ['hermes:composer-drafts:v3', '{"session-secret":"draft"}'],
+    ['hermes-desktop-theme-v2', 'nord'],
+    ['hermes.desktop.keybinds', '{"newChat":"Cmd+N"}']
+  ])
+  const localStorage = {
+    get length() {
+      return values.size
+    },
+    key(index) {
+      return [...values.keys()][index] ?? null
+    },
+    removeItem(key) {
+      values.delete(key)
+    }
+  }
+
+  vm.runInNewContext(buildEvaAccountRendererResetScript(), { localStorage })
+
+  assert.equal(values.has('hermes.desktop.lastSessionId.research'), false)
+  assert.equal(values.has('hermes.desktop.workspace-cwd.remote.eva-managed%3A%2F%2Fcustomer.default'), false)
+  assert.equal(values.has('hermes:composer-drafts:v3'), false)
+  assert.equal(values.get('hermes-desktop-theme-v2'), 'nord')
+  assert.equal(values.get('hermes.desktop.keybinds'), '{"newChat":"Cmd+N"}')
 })
 
 test('managed enrollment accepts server-selected accounts and rejects mismatched or malformed identities', () => {
