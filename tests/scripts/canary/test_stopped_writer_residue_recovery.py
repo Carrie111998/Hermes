@@ -789,7 +789,10 @@ def _write_failed_native_bundle(
     recovery_tree: dict[str, Any],
     *,
     host_identity_convergence_failure: bool = False,
+    install_failure: bool = False,
 ) -> tuple[dict[Path, bytes], bytes, bytes]:
+    if host_identity_convergence_failure and install_failure:
+        raise ValueError("test failure shape must be exact")
     writer_unit = b"[Service]\nExecStart=/writer\n"
     gateway_unit = b"[Service]\nExecStart=/gateway\n"
     policy_receipt = recovery.ExternalIAMReceipt.from_mapping(
@@ -913,6 +916,57 @@ def _write_failed_native_bundle(
             "stage": "prepare_host_identities",
             "error_type": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_TYPE,
             "error_sha256": recovery._HOST_IDENTITY_CONVERGENCE_ERROR_SHA256,
+            "failed_at_unix": 201,
+            "host_preparation_sha256": recovery._sha256_json(
+                activation_host_state
+            ),
+            "host_preparation_evidence": host,
+        })
+    if install_failure:
+        evidence_root = (
+            recovery_tree["native_evidence_root"] / SOURCE_REVISION / native.sha256
+        )
+        archived_iam_path = evidence_root / "external-iam" / f"{iam.sha256}.json"
+        archived_iam_path.parent.mkdir(parents=True)
+        archived_iam_path.write_bytes(iam_raw)
+        exact_state = _exact_host_identity_snapshot()
+        host_path = evidence_root / "host-preparation.json"
+        host_unsigned = {
+            "schema": "muncho-writer-host-preparation.v1",
+            "revision": SOURCE_REVISION,
+            "native_observation_plan_sha256": native.sha256,
+            "owner_approval_receipt_sha256": owner.sha256,
+            "changed": False,
+            "before": exact_state,
+            "after": exact_state,
+            "prepared_at_unix": 200,
+            "receipt_path": str(host_path),
+        }
+        host = {
+            **host_unsigned,
+            "receipt_sha256": recovery._sha256_json(host_unsigned),
+        }
+        host_path.write_bytes(recovery._canonical_bytes(host))
+        activation_host_state = {
+            "changed": host["changed"],
+            "before": host["before"],
+            "after": host["after"],
+        }
+        failure.update({
+            "external_iam_evidence": {
+                "path": str(archived_iam_path),
+                "sha256": iam.sha256,
+                "policy_sha256": iam.policy_sha256,
+                "mode": "0400",
+                "owner_uid": 0,
+                "group_gid": 0,
+                "live_path": str(recovery.DEFAULT_EXTERNAL_IAM_LIVE_PATH),
+            },
+            "stage": "install",
+            "error_type": "ValueError",
+            "error_sha256": recovery.hashlib.sha256(
+                b"ValueError:activation parent path is unavailable"
+            ).hexdigest(),
             "failed_at_unix": 201,
             "host_preparation_sha256": recovery._sha256_json(
                 activation_host_state
@@ -1050,6 +1104,42 @@ def test_apply_archives_exact_host_identity_convergence_failure_chain(
     assert plan["failed_native_observation"]["sha256"] == _sha256(failure_raw)
     assert receipt["schema"] == recovery.FAILED_NATIVE_RECEIPT_SCHEMA
     assert receipt["failure_receipt_preserved"] is True
+
+
+def test_apply_archives_exact_native_install_failure_chain(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _extras, _native_raw, failure_raw = _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+    )
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 894,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert plan["schema"] == recovery.FAILED_NATIVE_PLAN_SCHEMA
+    assert plan["failed_native_observation"]["sha256"] == _sha256(failure_raw)
+    assert receipt["schema"] == recovery.FAILED_NATIVE_RECEIPT_SCHEMA
+    assert receipt["failure_receipt_preserved"] is True
+
+
+def test_install_failure_recovery_rejects_host_state_digest_drift(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(recovery_tree, install_failure=True)
+    failure = json.loads(recovery_tree["quarantine_path"].read_text())
+    failure["host_preparation_sha256"] = "f" * 64
+    failure_raw = recovery._canonical_bytes(failure)
+    Path(failure["failure_receipt_path"]).write_bytes(failure_raw)
+    recovery_tree["quarantine_path"].write_bytes(failure_raw)
+
+    with pytest.raises(ValueError, match="host preparation binding is invalid"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
 def test_host_identity_failure_recovery_rejects_nonexact_current_state(
