@@ -54,7 +54,7 @@ box users:get me --json --fields id,name,login
 box folders:items 0 --json --max-items 20 --fields id,name,type
 ```
 
-Use `--json` for machine-readable output and `--fields` to return only needed fields. Folder `0` is the current actor's root.
+Use `--json` for machine-readable output and `--fields` to return only needed fields. Folder `0` is the current actor's root, not a complete access inventory: do not use its listing to reject a shared file or folder, and never use it to discover Box Hubs.
 
 ## Environments and actors
 

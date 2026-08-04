@@ -143,6 +143,9 @@ def test_hubs_route_large_reusable_qa_with_governance_and_safe_mutations():
     assert "Confirm before bulk additions or removals" in hubs
     assert "up to an hour" in hubs
     assert "https://app.box.com/hubs/<HUB_ID>" in hubs
+    assert "never use `folders:items 0` to discover or reject a Hub invitation" in hubs
+    assert "box hubs --scope all --max-items 1000 --json" in hubs
+    assert "proves Hub access, not access to every underlying file" in hubs
 
 
 def test_box_skill_never_mentions_box_drive():
@@ -217,3 +220,24 @@ def test_ccg_uses_a_dedicated_app_user_for_normal_hermes_work():
     assert "--ccg-user <APP_USER_ID> --name hermes-agent --set-as-current" in ccg
     assert "returned `id` is exactly `<APP_USER_ID>`" in ccg
     assert "<APP_USER_EMAIL>" in ccg
+
+
+def test_shared_resource_access_uses_type_specific_discovery_not_root_listing():
+    """Prevent an empty App User root from hiding a valid shared resource."""
+    skill = SKILL_MD.read_text(encoding="utf-8")
+    cli = (SKILL_DIR / "references" / "cli-guide.md").read_text(encoding="utf-8")
+    ccg = (SKILL_DIR / "references" / "ccg-setup.md").read_text(encoding="utf-8")
+    content = (SKILL_DIR / "references" / "content-workflows.md").read_text(
+        encoding="utf-8"
+    )
+    troubleshooting = (SKILL_DIR / "references" / "troubleshooting.md").read_text(
+        encoding="utf-8"
+    )
+
+    assert "it is not proof that a shared file, folder, or Hub is inaccessible" in skill
+    assert "not a complete access inventory" in cli
+    assert "never use it to discover Box Hubs" in cli
+    assert "never appears in folder `0`" in ccg
+    assert "box hubs:get <HUB_ID> --json" in ccg
+    assert "Do not use an absence from folder `0` as proof that access failed" in content
+    assert "Hub absent from root or 404" in troubleshooting

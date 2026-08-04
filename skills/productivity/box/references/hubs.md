@@ -4,16 +4,17 @@ Use a Box Hub for recurring Q&A over a curated knowledge base. A direct Box AI A
 
 ## Check eligibility and discover an existing Hub
 
-Before the first Hub request, explain that Box AI for Hubs requires eligible plan access, administrator enablement, and AI units. Explain that answers only use indexed files the current actor can access. Confirm the current actor, then search accessible Hubs before proposing a new one:
+Before the first Hub request, explain that Box AI for Hubs requires eligible plan access, administrator enablement, and AI units. Explain that answers only use indexed files the current actor can access. Hubs are not files or folders: never use `folders:items 0` to discover or reject a Hub invitation. Confirm the current actor, then list accessible Hubs before proposing a new one:
 
 ```bash
 box users:get me --json --fields id,name,login
+box hubs --scope all --max-items 1000 --json
 box hubs --query "Product" --scope all --sort relevance --json
 box hubs:get <HUB_ID> --json
 box hubs:items <HUB_ID> --max-items 100 --json
 ```
 
-Report each Hub as `https://app.box.com/hubs/<HUB_ID>`. Check `is_ai_enabled` before asking a question. If Hub AI is unavailable, explain whether the account lacks access, Hub AI is disabled, or content may still be indexing; do not silently download source files into Hermes' model context.
+For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list is empty. Report each Hub as `https://app.box.com/hubs/<HUB_ID>`. Check `is_ai_enabled` before asking a question. If Hub AI is unavailable, explain whether the account lacks access, Hub AI is disabled, or content may still be indexing; do not silently download source files into Hermes' model context.
 
 ## Ask questions across a Hub
 
@@ -58,7 +59,7 @@ box hubs:collaborations:create <HUB_ID> --role viewer --user-id <USER_ID> --json
 
 ## Handle indexing, permissions, and limits
 
-Newly added content usually indexes within minutes but can take up to an hour. Verify the item addition, wait or retry a bounded number of times, and report a retryable indexing state instead of declaring the source absent. Diagnose permissions separately: Hub answers respect the querying actor's access to underlying files.
+Newly added content usually indexes within minutes but can take up to an hour. Verify the item addition, wait or retry a bounded number of times, and report a retryable indexing state instead of declaring the source absent. Diagnose permissions separately: a successful `box hubs` or `box hubs:get` proves Hub access, not access to every underlying file. Hub answers respect the querying actor's access to underlying files.
 
 Box AI for Hubs has a service limit per Hub and across the enterprise. Box's dedicated Hubs guidance currently documents 20,000 files per Hub; verify current account or product documentation when operating near the boundary. Do not present that number as an immutable guarantee. Only the first 4 MB of a supported document's text representation is indexed. Explain AI-unit use before the first request and confirm a material batch or broad Hub population.
 

@@ -1,6 +1,6 @@
 # Client Credentials Grant (CCG) setup
 
-Use CCG when Hermes needs a separate, unattended identity: a background agent, a shared gateway, or a bot whose access should be granted folder by folder.
+Use CCG when Hermes needs a separate, unattended identity: a background agent, a shared gateway, or an agent whose access should be granted folder by folder.
 
 Use two identities deliberately:
 
@@ -49,9 +49,9 @@ box users:get me --json --fields id,name,login
 
 Confirm that the returned `id` is exactly `<APP_USER_ID>` before any ordinary Hermes file operation. Keep `hermes-agent` as the current environment; switch to `hermes-provisioner` only for an approved control-plane action, then immediately switch back and verify the App User again.
 
-## Give the App User content access
+## Give the App User content or Hub access
 
-The App User begins with its own empty root and cannot see a human's existing Box content until it is invited.
+The App User begins with its own empty root. A shared file or folder can be verified directly by ID even if it is absent from folder `0`; a Box Hub is a separate resource and never appears in folder `0`.
 
 Open the selected top-level folder in [Box](https://app.box.com), then open its sharing flow and add the App User email from the provisioning result. Request approval before changing collaboration. Choose the narrowest role: Viewer for read/search, Editor for upload/move/version, and Co-owner only when required. Share the parent folder when Hermes needs the subtree.
 
@@ -61,7 +61,16 @@ When the current actor is already an editor, create the collaboration through th
 box collaborations:create <FOLDER_ID> folder --role editor --login <APP_USER_EMAIL> --json
 ```
 
-If a CCG operation yields 404 or an empty search, verify that `hermes-agent` is current, that its actor ID is the App User ID, and that the App User has the required collaboration before assuming the object is missing.
+After the invite, use the App User environment to verify the exact resource, not its root listing:
+
+```bash
+box files:get <FILE_ID> --json --fields id,name,parent
+box folders:get <FOLDER_ID> --json --fields id,name,parent
+box hubs --scope all --max-items 1000 --json
+box hubs:get <HUB_ID> --json
+```
+
+Use ordinary file/folder collaboration for a file or folder, and Hub collaboration for a Hub; neither proves access to the other. If a CCG operation yields 404 or an empty search, verify that `hermes-agent` is current, that its actor ID is the App User ID, and that the App User has the required resource-specific collaboration before assuming the object is missing. Read [Box Hubs](hubs.md) before sharing or verifying a Hub.
 
 ## Advanced impersonation
 

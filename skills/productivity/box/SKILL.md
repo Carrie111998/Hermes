@@ -53,7 +53,7 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
    command -v box
    box users:get me --json --fields id,name,login
    ```
-   If this succeeds, record the actor and continue. Do not ask about authentication again.
+   If this succeeds, record the actor and continue. Do not ask about authentication again. Treat `folders:items 0` only as a listing of the actor's root; it is not proof that a shared file, folder, or Hub is inaccessible. For a known file or folder, verify its ID directly; for a Hub, use the Hubs discovery path in [Box Hubs](references/hubs.md).
 2. If authentication is absent, ask which identity the user wants:
    - **Act as me (OAuth):** fastest setup for one person using Hermes as an extension of themselves. Read [OAuth setup](references/oauth-setup.md).
    - **Act as its own agent (CCG):** use a dedicated App User for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).

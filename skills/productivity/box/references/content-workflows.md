@@ -12,6 +12,18 @@ box folders:create <PARENT_ID> "Customer-123" --json --fields id,name,parent
 
 Duplicate names in one parent return `409`. Reuse the existing folder ID instead of retrying blindly.
 
+## Verify a shared file or folder
+
+When an App User receives a file or folder invite, use the ID from its Box URL if available and fetch that exact item. Do not use an absence from folder `0` as proof that access failed; it is only the App User's root listing. If only a name is known, use Box search to resolve the ID, then fetch the item:
+
+```bash
+box search "Quarterly plan" --json --limit 20 --fields id,name,type,parent
+box files:get <FILE_ID> --json --fields id,name,parent
+box folders:get <FOLDER_ID> --json --fields id,name,parent
+```
+
+Use [Box Hubs](hubs.md) for a Hub invite: Hubs are not files or folders and are discovered separately.
+
 ## Upload, download, and version files
 
 ```bash
