@@ -1,12 +1,10 @@
 import { atom } from 'nanostores'
 
-import {
-  liveSessionProjectId,
-  NO_PROJECT_ID,
-  type SidebarProjectTree
-} from '@/app/chat/sidebar/projects/workspace-groups'
+import { liveSessionProjectId, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import type { ClientSessionState } from '@/app/types'
 import type { HermesGitBaseBranch, HermesGitBranch } from '@/global'
 import { getHermesConfig, type HermesGateway } from '@/hermes'
+import type { SessionInfo } from '@/hermes'
 import { translateNow } from '@/i18n'
 import { desktopDefaultCwd, isDesktopFsRemoteMode, selectDesktopPaths, writeDesktopFileText } from '@/lib/desktop-fs'
 import { desktopGit } from '@/lib/desktop-git'
@@ -17,14 +15,12 @@ import { setSidebarAgentsGrouped } from '@/store/layout'
 import { notify } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
 import {
-  $currentCwd,
   $selectedStoredSessionId,
   $sessions,
   idsShareLineage,
   sessionMatchesStoredId,
   workspaceCwdForNewSession
 } from '@/store/session'
-import { $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
 import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
@@ -201,84 +197,68 @@ export function goToProject(id: string, options?: { newSession?: boolean }): voi
 
 // The cwd a NEW chat should start in.
 //
-// Priority (first hit wins):
-//   1. Explicit sidebar project scope (drilled into a project / Home bucket)
-//   2. The FOCUSED session's workspace — so ⌘N / ⌘T from a chat that's already
-//      in a project/worktree stay there without requiring a sidebar drill-in
-//   3. Configured default project dir / remote remembered cwd (detached otherwise)
-//
-// The "active project" is just an atom ($projectScope) — so when you're inside
-// a project, a new session (cmd-n, the trunk "+") starts at that project's root
-// (its primary repo = the default-branch checkout). Outside a project it used
-// to fall straight to the plain default (detached), which dropped the workspace
-// of the chat you were looking at — that's the case (2) covers.
+// A new session's workspace comes from exactly two places, and neither is the
+// sidebar's navigation state:
+//   1. An explicit workspace action (Start Work / a project's "new session"
+//      button) passes a path through the composer's one-shot workspace target —
+//      that path never flows through this resolver (see startFreshSessionDraft
+//      and workspace-session-target).
+//   2. Otherwise the configured default wins: the default project dir on local
+//      backends, the remembered remote cwd otherwise — detached when unset.
+// The sidebar project scope ($projectScope) is display-only navigation state:
+// it must not feed session-creation decisions, and neither may the focused
+// session's workspace — "new chat" means "the configured default", not
+// "wherever I'm looking right now" (regression from 883076ccd7, which added
+// the focused-session inheritance ahead of the configured fallback).
 export function resolveNewSessionCwd(): string {
-  const scope = $projectScope.get()
-
-  // Inside Home, "no folder" is the point: a new chat must stay detached rather
-  // than silently attaching to the configured default dir and leaving Home.
-  if (scope === NO_PROJECT_ID) {
-    return ''
-  }
-
-  if (scope !== ALL_PROJECTS) {
-    const cwd = projectRootCwd($projectTree.get().find(node => node.id === scope))
-
-    if (cwd) {
-      return cwd
-    }
-  }
-
-  // Inherit the focused chat's workspace. ⌘N/⌘T from a session that already
-  // has a project/pwd should stay there — drilling into the sidebar project
-  // is the uncommon path, not the requirement.
-  const focusedCwd = focusedSessionWorkspaceCwd()
-
-  if (focusedCwd) {
-    return focusedCwd
-  }
-
   return workspaceCwdForNewSession()
 }
 
-/** Live workspace of the session the user is looking at (tile or primary). */
-function focusedSessionWorkspaceCwd(): string {
-  const focusedStoredId = $focusedStoredSessionId.get()
-  const state = $focusedSessionState.get()
-
-  // Prefer the live runtime slice when it belongs to the focused chat
-  // (agent can relocate mid-turn). Cold tabs / mid-switch lag fall through
-  // to the stored session row.
-  const stateCwd = state?.cwd?.trim() || ''
-  const stateStoredId = state?.storedSessionId?.trim() || ''
-
-  if (
-    stateCwd &&
-    (!focusedStoredId ||
-      !stateStoredId ||
-      stateStoredId === focusedStoredId ||
-      idsShareLineage(focusedStoredId, stateStoredId, $sessions.get()))
-  ) {
-    return stateCwd
+/**
+ * The named project the sidebar should scope to when `focusedId` becomes the
+ * focused session, or null when the session carries no workspace info or no
+ * named project owns it. Pure decision helper for the sidebar's
+ * focused-session projection — the sidebar is a display projection of the
+ * session's own workspace, and this never feeds session-creation decisions.
+ *
+ * The live runtime slice is trusted only when it belongs to the focused
+ * session (stored id match or shared lineage): right after a switch the
+ * runtime may still describe the PREVIOUS chat, and projecting its cwd would
+ * scope the sidebar to the wrong project. Otherwise the stored row's cwd /
+ * git repo root is the anchor.
+ */
+export function projectScopeForFocusedSession(
+  focusedId: null | string,
+  sessions: readonly SessionInfo[],
+  projects: readonly ProjectInfo[],
+  focusedState: Pick<ClientSessionState, 'cwd' | 'storedSessionId'> | undefined
+): null | string {
+  if (!focusedId) {
+    return null
   }
 
-  if (focusedStoredId) {
-    const row = $sessions.get().find(s => sessionMatchesStoredId(s, focusedStoredId))
-    const rowCwd = row?.cwd?.trim() || ''
+  const stateOwnsFocus =
+    !!focusedState?.storedSessionId &&
+    (focusedState.storedSessionId === focusedId || idsShareLineage(focusedId, focusedState.storedSessionId, sessions))
 
-    if (rowCwd) {
-      return rowCwd
-    }
+  const stateCwd = stateOwnsFocus ? focusedState?.cwd?.trim() || '' : ''
 
-    // Focused a real session with no workspace → stay detached. Do NOT fall
-    // through to `$currentCwd` (it may still hold a remembered path from an
-    // earlier chat and would re-attach a project the user left).
-    return ''
+  const session = sessions.find(s => sessionMatchesStoredId(s, focusedId))
+  const rowCwd = session?.cwd?.trim() || session?.git_repo_root?.trim() || ''
+
+  const anchor = stateCwd || rowCwd
+
+  if (!anchor) {
+    return null
   }
 
-  // No focused stored session: primary draft. The composer atom is the draft's
-  // workspace target (set by startFreshSession / startSessionInWorkspace).
-  return $currentCwd.get().trim()
+  const projectId = liveSessionProjectId({ cwd: anchor } as SessionInfo, projects)
+
+  // liveSessionProjectId falls back to the cwd's repo-root AUTO project when
+  // no named project owns it; the sidebar projection intentionally re-scopes
+  // only to NAMED projects (auto lanes surface through the backend tree and
+  // yanking the view to them would fight the overview grouping).
+  return projectId?.startsWith('p_') ? projectId : null
 }
 
 const underPath = (parent: string, child: string): boolean =>

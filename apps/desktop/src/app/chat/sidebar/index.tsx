@@ -77,6 +77,7 @@ import {
   exitProjectScope,
   fetchProjectSessions,
   openProjectCreate,
+  projectScopeForFocusedSession,
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
@@ -96,7 +97,12 @@ import {
   sessionPinId,
   setCurrentCwd
 } from '@/store/session'
-import { $focusedStoredSessionId, $workingSessionIds, type SplitDir } from '@/store/session-states'
+import {
+  $focusedSessionState,
+  $focusedStoredSessionId,
+  $workingSessionIds,
+  type SplitDir
+} from '@/store/session-states'
 
 import {
   type AppView,
@@ -792,6 +798,33 @@ export function ChatSidebar({
     syncProjectCwd(enteredProject)
     lastProjectCwdSyncRef.current = enteredProject.id
   }, [inProject, enteredProject, syncProjectCwd])
+
+  // The sidebar is a PROJECTION of the focused session, not an independent
+  // navigation origin: switching into a session whose workspace lives in a
+  // named project must bring the sidebar's project view along. The project
+  // scope itself never feeds back into session-creation decisions (see
+  // resolveNewSessionCwd) — display-only here.
+  // Conservative by design: only sessions that resolve to a NAMED project
+  // re-scope the sidebar. Drafts (null), detached / auto-project / kanban
+  // sessions keep the user's current navigation state — guessing Home or an
+  // auto project risks yanking the view to a bucket the backend groups
+  // differently.
+  useEffect(() => {
+    const unsubscribe = $focusedStoredSessionId.subscribe(focusedId => {
+      const projectId = projectScopeForFocusedSession(
+        focusedId,
+        $sessions.get(),
+        $projects.get(),
+        $focusedSessionState.get()
+      )
+
+      if (projectId) {
+        enterProject(projectId)
+      }
+    })
+
+    return unsubscribe
+  }, [])
 
   // A persisted scope can go stale (project archived/removed, or a profile
   // switch swapped the whole catalog). Once projects have loaded, drop back to

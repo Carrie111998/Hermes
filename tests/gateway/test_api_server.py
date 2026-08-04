@@ -104,7 +104,6 @@ class TestResponseStore:
         assert store.get("resp_2") is not None
         assert len(store) == 3
 
-
     def test_delete_clears_conversation_mapping(self):
         """Deleting a response also removes conversation mappings that reference it."""
         store = ResponseStore(max_size=10)
@@ -113,6 +112,45 @@ class TestResponseStore:
         assert store.get_conversation("chat-a") == "resp_1"
         store.delete("resp_1")
         assert store.get_conversation("chat-a") is None
+
+
+class TestSessionResponse:
+    """The /api/sessions row serializer.
+
+    The sidebar's focused-session projection resolves a session's named
+    project from its stored workspace, so the list must carry cwd /
+    git_repo_root — dropping them made switching sessions stop re-scoping the
+    sidebar (regression covered by the desktop projectScopeForFocusedSession
+    tests). Internal snapshots stay hidden.
+    """
+
+    def test_carries_cwd_and_git_repo_root(self):
+        out = APIServerAdapter._session_response(
+            {"id": "s1", "cwd": "/www/app", "git_repo_root": "/www/app", "title": "work"}
+        )
+        assert out["cwd"] == "/www/app"
+        assert out["git_repo_root"] == "/www/app"
+
+    def test_omits_absent_workspace_fields(self):
+        out = APIServerAdapter._session_response({"id": "s1", "title": "work"})
+        assert "cwd" not in out
+        assert "git_repo_root" not in out
+
+    def test_keeps_workspace_fields_out_of_absent_keys(self):
+        out = APIServerAdapter._session_response({"id": "s1", "cwd": None, "git_repo_root": None})
+        # The key is present (value None) — the desktop projection treats that
+        # as "no workspace" via `?.trim() || ''`, so it is safe to ship.
+        assert out.get("cwd") is None
+        assert out.get("git_repo_root") is None
+
+    def test_does_not_leak_internal_snapshots(self):
+        out = APIServerAdapter._session_response(
+            {"id": "s1", "cwd": "/w", "system_prompt": "secret", "model_config": {"x": 1}}
+        )
+        assert "system_prompt" not in out
+        assert "model_config" not in out
+        assert out["has_system_prompt"] is True
+        assert out["has_model_config"] is True
 
 
 # ---------------------------------------------------------------------------

@@ -21,6 +21,7 @@ import {
   $newChatWorkspaceTarget,
   $resumeFailedSessionId,
   $selectedStoredSessionId,
+  applyConfiguredDefaultProjectDir,
   setActiveSessionId,
   setActiveSessionStoredIdRotation,
   setCurrentCwd,
@@ -447,6 +448,7 @@ describe('createBackendSessionForSend profile routing', () => {
     $currentProvider.set('')
     $currentReasoningEffort.set('')
     setNewChatWorkspaceTarget(undefined)
+    applyConfiguredDefaultProjectDir(null)
     vi.restoreAllMocks()
   })
 
@@ -546,7 +548,10 @@ describe('createBackendSessionForSend profile routing', () => {
     })
   })
 
-  it('falls back to the entered project cwd when the current cwd is blank', async () => {
+  it('falls back to the configured default cwd — not the entered project — when the current cwd is blank', async () => {
+    // The sidebar project scope is display-only navigation state: a blank
+    // draft cwd must resolve to the configured default, never to the project
+    // the sidebar happens to be scoped into.
     const params = await createWith(() => {
       $projectTree.set([
         {
@@ -559,9 +564,10 @@ describe('createBackendSessionForSend profile routing', () => {
       ])
       $projectScope.set('p_app')
       $currentCwd.set('')
+      applyConfiguredDefaultProjectDir('/repo/configured')
     })
 
-    expect(params).toMatchObject({ cwd: '/repo/app' })
+    expect(params).toMatchObject({ cwd: '/repo/configured' })
   })
 })
 

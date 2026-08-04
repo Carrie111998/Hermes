@@ -380,7 +380,7 @@ function isPathUnder(folder: string, target: string): boolean {
  * or a sibling worktree of a project repo), the folder match is authoritative;
  * only the repo-root AUTO-project fallback needs cwd-under-root confidence.
  */
-export function liveSessionProjectId(session: SessionInfo, explicitProjects: ProjectInfo[]): null | string {
+export function liveSessionProjectId(session: SessionInfo, explicitProjects: readonly ProjectInfo[]): null | string {
   const cwd = (session.cwd || '').trim()
   // A session may carry only a git_repo_root and no cwd — older/imported rows,
   // or ones captured before cwd tracking. The backend still groups those by repo

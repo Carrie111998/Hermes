@@ -2,9 +2,11 @@ import { atom } from 'nanostores'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { NO_PROJECT_ID, type SidebarProjectTree } from '@/app/chat/sidebar/projects/workspace-groups'
+import type { SessionInfo } from '@/hermes'
 import { $sidebarAgentsGrouped } from '@/store/layout'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaultProjectDir } from '@/store/session'
+import type { ProjectInfo } from '@/types/hermes'
 
 import {
   $activeProjectId,
@@ -23,6 +25,7 @@ import {
   openProjectCreate,
   pickProjectFolder,
   projectNameForCwd,
+  projectScopeForFocusedSession,
   refreshProjects,
   refreshProjectTree,
   refreshWorktrees,
@@ -132,22 +135,24 @@ describe('resolveNewSessionCwd', () => {
     $sessions.set([])
   })
 
-  it('starts a chat detached inside Home, ignoring the configured default dir', () => {
-    // Attaching the default dir here would move the new chat out of Home the
-    // moment it was created — "no folder" is what the bucket means.
+  it('starts a new chat at the configured default even inside Home scope', () => {
+    // Home's "no folder" was a scope-driven exception to the configured
+    // default; the sidebar scope is display-only and must not feed
+    // session-creation decisions, so a new chat always reads the default.
     enterProject(NO_PROJECT_ID)
 
-    expect(resolveNewSessionCwd()).toBe('')
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 
   it('still falls back to the configured default outside Home', () => {
     expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 
-  it('inherits the focused session workspace when not drilled into a project', () => {
-    // Simulate a primary session whose stored row carries a project cwd —
-    // the common case: you're in a chat that has a pwd, hit ⌘N/⌘T, and
-    // expect the new draft to stay in that project without sidebar drill-in.
+  it('ignores the focused session workspace — a new chat reads the configured default', () => {
+    // Regression: 883076ccd7 added focused-session inheritance ahead of the
+    // configured fallback, so ⌘N/⌘T from a project-bound chat recreated the
+    // project instead of the configured default. The focused session's cwd is
+    // NOT a data source for session creation.
     $selectedStoredSessionId.set('sess-a')
     $sessions.set([
       {
@@ -166,10 +171,10 @@ describe('resolveNewSessionCwd', () => {
       } as never
     ])
 
-    expect(resolveNewSessionCwd()).toBe('/Users/me/www/hermes-agent')
+    expect(resolveNewSessionCwd()).toBe('/home/user/configured')
   })
 
-  it('does not re-attach a remembered cwd when the focused session is detached', () => {
+  it('ignores a stale remembered cwd when the focused session is detached', () => {
     $currentCwd.set('/Users/me/stale-remembered')
     $selectedStoredSessionId.set('sess-detached')
     $sessions.set([
@@ -192,6 +197,131 @@ describe('resolveNewSessionCwd', () => {
     // Focused session has no workspace → fall through to configured default,
     // not the stale $currentCwd from an earlier chat.
     expect(resolveNewSessionCwd()).toBe('/home/user/configured')
+  })
+
+  it('detaches when no default project dir is configured', () => {
+    applyConfiguredDefaultProjectDir(null)
+
+    expect(resolveNewSessionCwd()).toBe('')
+  })
+})
+
+describe('projectScopeForFocusedSession', () => {
+  const session = (over: Partial<SessionInfo> & Pick<SessionInfo, 'id'>): SessionInfo =>
+    ({
+      archived: false,
+      cwd: null,
+      ended_at: null,
+      git_repo_root: null,
+      input_tokens: 0,
+      is_active: false,
+      last_active: 0,
+      message_count: 0,
+      model: null,
+      output_tokens: 0,
+      started_at: 0,
+      title: 't',
+      ...over
+    }) as never
+
+  const project = (id: string, folder: string): ProjectInfo =>
+    ({
+      archived: false,
+      color: null,
+      description: null,
+      folders: [{ path: folder }],
+      icon: null,
+      id,
+      name: id,
+      primary_path: folder
+    }) as never
+
+  it('scopes to the named project owning the focused row cwd', () => {
+    expect(
+      projectScopeForFocusedSession(
+        'sess-a',
+        [session({ id: 'sess-a', cwd: '/repo/app' })],
+        [project('p_app', '/repo/app')],
+        undefined
+      )
+    ).toBe('p_app')
+  })
+
+  it('prefers the live runtime cwd when the slice belongs to the focused session', () => {
+    expect(
+      projectScopeForFocusedSession(
+        'sess-a',
+        [session({ id: 'sess-a', cwd: '/repo/app' })],
+        [project('p_app', '/repo/app'), project('p_other', '/repo/other')],
+        { storedSessionId: 'sess-a', cwd: '/repo/other' }
+      )
+    ).toBe('p_other')
+  })
+
+  it('ignores a runtime slice that still describes the PREVIOUS session', () => {
+    // Right after a switch the focused slice may lag the selection — its cwd
+    // must not mask the stored row's (the ownership gate).
+    expect(
+      projectScopeForFocusedSession(
+        'sess-b',
+        [session({ id: 'sess-a', cwd: '/repo/other' }), session({ id: 'sess-b', cwd: '/repo/app' })],
+        [project('p_app', '/repo/app')],
+        { storedSessionId: 'sess-a', cwd: '/repo/other' }
+      )
+    ).toBe('p_app')
+  })
+
+  it('accepts a runtime slice sharing lineage with the focused session', () => {
+    // Compression rotates ids: the focused tip and the runtime slice's stored
+    // id share one lineage root, so the live cwd still belongs to the focus.
+    expect(
+      projectScopeForFocusedSession(
+        'sess-tip',
+        [
+          session({ _lineage_root_id: 'root-1', cwd: '/repo/other', id: 'root-1' }),
+          session({ _lineage_root_id: 'root-1', cwd: '/repo/app', id: 'sess-tip' })
+        ],
+        [project('p_other', '/repo/other'), project('p_app', '/repo/app')],
+        { storedSessionId: 'root-1', cwd: '/repo/other' }
+      )
+    ).toBe('p_other')
+  })
+
+  it('anchors on git_repo_root when the row has no cwd', () => {
+    expect(
+      projectScopeForFocusedSession(
+        'sess-a',
+        [session({ id: 'sess-a', cwd: null, git_repo_root: '/repo/app' })],
+        [project('p_app', '/repo/app')],
+        undefined
+      )
+    ).toBe('p_app')
+  })
+
+  it('returns null for a detached session (no workspace, no owning project)', () => {
+    expect(
+      projectScopeForFocusedSession(
+        'sess-detached',
+        [session({ id: 'sess-detached', cwd: null })],
+        [project('p_app', '/repo/app')],
+        undefined
+      )
+    ).toBeNull()
+  })
+
+  it('returns null when the cwd belongs to no named project', () => {
+    expect(
+      projectScopeForFocusedSession(
+        'sess-a',
+        [session({ id: 'sess-a', cwd: '/unregistered/dir' })],
+        [project('p_app', '/repo/app')],
+        undefined
+      )
+    ).toBeNull()
+  })
+
+  it('returns null for a draft (no focused stored session)', () => {
+    expect(projectScopeForFocusedSession(null, [], [], undefined)).toBeNull()
   })
 })
 
