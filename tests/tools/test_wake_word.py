@@ -624,3 +624,93 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         if process.is_alive():
             process.terminate()
         process.join(10)
+
+
+# ── Porcupine access-key resolution (credential-pool class, #68003) ──────
+
+
+def _fake_pool_with_key(key: str):
+    """Stand-in for ``agent.credential_pool.CredentialPool`` (peek-only)."""
+    from types import SimpleNamespace
+
+    entry = (
+        SimpleNamespace(runtime_api_key=key, access_token=key) if key else None
+    )
+    return SimpleNamespace(
+        has_credentials=lambda: bool(key),
+        peek=lambda: entry,
+    )
+
+
+class TestPorcupineCredentialResolution:
+    """The Porcupine wake-word key resolves through the shared voice-key
+    resolver (env / ~/.hermes/.env, then the credential pool) instead of a
+    raw ``os.getenv`` — the last voice credential read still bypassing the
+    #68003 fix."""
+
+    @pytest.fixture(autouse=True)
+    def _clean_env(self, monkeypatch):
+        """Keep the developer's real env / ~/.hermes/.env out of these tests."""
+        import hermes_cli.config as config_mod
+
+        monkeypatch.delenv("PORCUPINE_ACCESS_KEY", raising=False)
+        monkeypatch.setattr(config_mod, "load_env", lambda: {})
+        yield
+
+    def test_pooled_key_resolves_when_env_empty(self):
+        from unittest.mock import patch
+
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool_with_key("pool-porcupine-key"),
+        ):
+            assert ww._resolve_porcupine_access_key() == "pool-porcupine-key"
+
+    def test_env_wins_over_pool(self, monkeypatch):
+        from unittest.mock import patch
+
+        monkeypatch.setenv("PORCUPINE_ACCESS_KEY", "env-key")
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool_with_key("pool-porcupine-key"),
+        ) as lp:
+            assert ww._resolve_porcupine_access_key() == "env-key"
+        lp.assert_not_called()
+
+    def test_no_key_anywhere_returns_empty(self):
+        from unittest.mock import patch
+
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool_with_key(""),
+        ):
+            assert ww._resolve_porcupine_access_key() == ""
+
+    def test_requirements_gate_sees_pooled_key(self, monkeypatch):
+        """check_wake_word_requirements must agree with the engine: a pooled
+        key counts as configured (previously only raw env was consulted)."""
+        from unittest.mock import patch
+
+        _voice_loop_ready(monkeypatch)
+        monkeypatch.setattr(ww, "_audio_available", lambda: True)
+        monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool_with_key("pool-porcupine-key"),
+        ):
+            r = ww.check_wake_word_requirements({"provider": "porcupine"})
+        assert r["available"] is True
+
+    def test_requirements_gate_flags_missing_key(self, monkeypatch):
+        from unittest.mock import patch
+
+        _voice_loop_ready(monkeypatch)
+        monkeypatch.setattr(ww, "_audio_available", lambda: True)
+        monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
+        with patch(
+            "agent.credential_pool.load_pool",
+            return_value=_fake_pool_with_key(""),
+        ):
+            r = ww.check_wake_word_requirements({"provider": "porcupine"})
+        assert r["available"] is False
+        assert "PORCUPINE_ACCESS_KEY" in r["hint"]

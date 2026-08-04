@@ -673,6 +673,23 @@ class _SherpaKwsEngine(_Engine):
             pass
 
 
+def _resolve_porcupine_access_key() -> str:
+    """Resolve the Porcupine wake-word access key through the shared voice-key resolver.
+
+    Delegates to ``tools.tool_backend_helpers.resolve_provider_secret`` — the
+    single owner of STT/TTS/wake credential resolution (config > env/.env >
+    the credential pool, scope-aware under multiplexed gateway turns).
+    Previously this was a raw ``os.getenv`` read, so a key stored in
+    ``~/.hermes/.env`` (the standard Hermes location) or in the auth store
+    never reached the wake-word engine (#68003 class).
+    """
+    try:
+        from tools.tool_backend_helpers import resolve_provider_secret
+    except ImportError:  # pragma: no cover — helpers are in-repo
+        return (os.getenv("PORCUPINE_ACCESS_KEY") or "").strip()
+    return resolve_provider_secret("PORCUPINE_ACCESS_KEY", "porcupine")
+
+
 class _PorcupineEngine(_Engine):
     """Picovoice Porcupine — premium, on-device, needs an access key."""
 
@@ -683,7 +700,7 @@ class _PorcupineEngine(_Engine):
 
         import pvporcupine
 
-        access_key = (os.getenv("PORCUPINE_ACCESS_KEY") or "").strip()
+        access_key = _resolve_porcupine_access_key()
         if not access_key:
             raise RuntimeError(
                 "Porcupine wake word requires PORCUPINE_ACCESS_KEY "
@@ -831,7 +848,7 @@ def check_wake_word_requirements(cfg: Optional[Dict[str, Any]] = None) -> Dict[s
         if framework == "tflite":
             tflite_ok = ensure_tflite_runtime() or lazy_deps.is_available("wake.openwakeword.tflite") or lazy_ok
 
-    if provider == "porcupine" and not (os.getenv("PORCUPINE_ACCESS_KEY") or "").strip():
+    if provider == "porcupine" and not _resolve_porcupine_access_key():
         key_ok = False
         hint = "Set PORCUPINE_ACCESS_KEY (free key at https://console.picovoice.ai)."
     elif not deps_ok and not lazy_ok:
