@@ -47,6 +47,19 @@ mcp_servers:
       # les utilisateurs WordPress.
       exclude: ["wp_delete_*", "wp_create_user", "wp_update_user"]
 
+  # parse.bot — MCP distant officiel (Streamable HTTP, docs.parse.bot/mcp).
+  # Même clé que le REST (X-API-Key, préfixe pmx_). Sert la sync YachtWorld
+  # (call_endpoint sur get_broker_listings) ; le REST reste le fallback
+  # documenté dans le skill. Outils filtrés : lecture/appel seulement, pas de
+  # création/révision d'APIs depuis ce profil.
+  parse:
+    url: "https://api.parse.bot/mcp"
+    headers:
+      X-API-Key: "${PARSEBOT_API_KEY}"
+    enabled: true
+    tools:
+      include: ["call_endpoint", "get_api", "list_apis", "cancel_task"]
+
   # Google Search Console — service account (API Search Console activée,
   # e-mail du SA ajouté comme utilisateur sur la propriété préfixe
   # https://tanorient.com/). Clé JSON décodée par l'entrypoint depuis

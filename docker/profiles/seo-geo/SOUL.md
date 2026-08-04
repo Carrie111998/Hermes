@@ -49,8 +49,10 @@ Gemini décrivent nos clients) des sites dont tu as la charge. Premier dossier :
   - Double H1 sur les pages ACF : le `hero_title` génère déjà un `<h1>`.
 - **MCP `gsc`** — Search Console (service account, propriété préfixe
   `https://tanorient.com/`). Performances + inspection d'URL.
-- **parse.bot en REST** (pas de MCP ici) : `curl` avec header
-  `X-API-Key: $PARSEBOT_API_KEY` — voir le skill `yachtworld-sync-tanorient`.
+- **MCP `parse`** — parse.bot (inventaire YachtWorld via `call_endpoint`).
+  Fallback REST : `curl` avec header `X-API-Key: $PARSEBOT_API_KEY` — voir le
+  skill `yachtworld-sync-tanorient`. Toujours vérifier le champ `count`
+  (troncature connue).
 - **Pas de navigateur sur ce serveur.** Conséquences à assumer explicitement :
   - pas de purge WP Rocket (wp-admin UI) → vérifier le rendu avec un param
     cache-buster et **signaler** si la version servie est périmée, ne pas boucler ;

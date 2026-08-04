@@ -14,10 +14,16 @@ metadata:
 
 Synchronise le miroir des annonces YachtWorld de Tan Services sur la page
 **Brokerage Service** (post **1418**). Portage serveur de l'ancienne tâche
-Claude Desktop — sans navigateur : parse.bot passe en **REST**, et il n'y a
-**ni fallback scraping ni purge WP Rocket** (voir §5-6).
+Claude Desktop — sans navigateur : il n'y a **ni fallback scraping ni purge
+WP Rocket** (voir §5-6).
 
-## 1. Inventaire — parse.bot en REST
+## 1. Inventaire — parse.bot
+
+**Primaire — MCP `parse`** : `call_endpoint` avec
+`scraper_id "242b2dc6-c896-4c4c-bef5-3db255d870a9"`, `endpoint_name
+"get_broker_listings"`, méthode GET, params `{"owner_id":"11743","limit":20}`.
+
+**Fallback — REST** (même clé, si le MCP échoue ou tronque) :
 
 ```bash
 curl -s -X GET "https://api.parse.bot/scraper/242b2dc6-c896-4c4c-bef5-3db255d870a9/get_broker_listings?owner_id=11743&limit=20" \
@@ -30,11 +36,11 @@ curl -s -X GET "https://api.parse.bot/scraper/242b2dc6-c896-4c4c-bef5-3db255d870
   sail-antique→Classic), `location.address.city`+`country`,
   `price.type.amount.USD` (arrondi au millier), `attributes` (IN_STOCK),
   `portalLink`, première entrée `media` avec `mediaType:"image"`.
-- 🔴 **Vérifie `count`** : troncature récurrente observée (3 renvoyés sur 7).
-  Si le nombre de records ≠ `count`, retente avec pagination/offset. Si
-  l'inventaire reste incomplet : **NE MODIFIE RIEN** — rapporte l'échec
-  (« inventaire parse.bot incomplet : X/Y ») et termine. Pas de fallback
-  navigateur ici ; mieux vaut une page inchangée qu'un miroir amputé.
+- 🔴 **Vérifie `count`** : troncature récurrente observée côté MCP (3 renvoyés
+  sur 7). Si le nombre de records ≠ `count`, retente en REST puis avec
+  pagination/offset. Si l'inventaire reste incomplet : **NE MODIFIE RIEN** —
+  rapporte l'échec (« inventaire parse.bot incomplet : X/Y ») et termine. Pas
+  de fallback navigateur ici ; mieux vaut une page inchangée qu'un miroir amputé.
 
 ## 2. État actuel — post 1418
 
