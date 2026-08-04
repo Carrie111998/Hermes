@@ -252,3 +252,76 @@ class TestScopeReachesConstructionPaths:
         assert captured.get("checkpoint_scope") == "task", (
             f"checkpoint_scope never reached AIAgent; got {sorted(captured)}"
         )
+
+
+class TestOneshotPathCarriesTheScope:
+    """`hermes -z` builds its own AIAgent in hermes_cli/oneshot.py.
+
+    That construction sat outside the propagation added for the interactive
+    CLI and the gateway, so a profile with ``checkpoints.scope: task`` was
+    silently downgraded to turn scope for every oneshot run -- and a oneshot
+    worker is exactly where task scope matters, since the whole run is one
+    task.
+
+    Drives the real ``_run_agent`` and captures what AIAgent is constructed
+    with, rather than re-deriving the resolution in the test.
+    """
+
+    def _captured_kwargs(self, monkeypatch, checkpoints_cfg):
+        import hermes_cli.config as cfg_mod
+        import hermes_cli.runtime_provider as rp_mod
+        import hermes_cli.tools_config as tc_mod
+        import run_agent as ra_mod
+        from hermes_cli import oneshot
+
+        captured = {}
+
+        class _FakeAgent:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+                self.suppress_status_output = False
+                self.stream_delta_callback = None
+                self.tool_gen_callback = None
+
+            def run_conversation(self, *_a, **_k):
+                return {"final_response": "ok"}
+
+            def __getattr__(self, name):
+                return lambda *a, **k: None
+
+        # _run_agent imports these lazily inside the function, so the source
+        # modules are what must be patched.
+        monkeypatch.setattr(ra_mod, "AIAgent", _FakeAgent)
+        monkeypatch.setattr(
+            cfg_mod, "load_config",
+            lambda *a, **k: {"checkpoints": checkpoints_cfg, "model": {"default": "m"}},
+        )
+        monkeypatch.setattr(
+            rp_mod, "resolve_runtime_provider",
+            lambda *a, **k: {"api_key": "k", "base_url": "u", "provider": "p",
+                             "requested_provider": "p", "api_mode": "chat_completions"},
+        )
+        monkeypatch.setattr(tc_mod, "_get_platform_tools", lambda *a, **k: set())
+        monkeypatch.setattr(oneshot, "_create_session_db_for_oneshot", lambda: None)
+        monkeypatch.setattr(oneshot, "get_fallback_chain", lambda _c: [])
+
+        oneshot._run_agent("hello")
+        return captured
+
+    def test_task_scope_reaches_the_oneshot_agent(self, monkeypatch):
+        kwargs = self._captured_kwargs(monkeypatch, {"scope": "task"})
+        assert kwargs.get("checkpoint_scope") == "task", (
+            "hermes -z ignored checkpoints.scope -- the whole run would take "
+            f"turn-scoped snapshots despite the profile asking for task scope "
+            f"(got {kwargs.get('checkpoint_scope')!r})"
+        )
+
+    def test_default_is_turn(self, monkeypatch):
+        assert self._captured_kwargs(monkeypatch, {}).get("checkpoint_scope") == "turn"
+
+    def test_legacy_boolean_form_does_not_crash(self, monkeypatch):
+        """`checkpoints: true` is the old shape; it must still yield a scope."""
+        assert self._captured_kwargs(monkeypatch, True).get("checkpoint_scope") == "turn"
+
+    def test_malformed_checkpoints_block_falls_back_to_turn(self, monkeypatch):
+        assert self._captured_kwargs(monkeypatch, "nonsense").get("checkpoint_scope") == "turn"
