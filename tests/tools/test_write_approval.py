@@ -229,6 +229,31 @@ def test_migrated_namespaced_pending_record_round_trips(hermes_home):
     assert fetched["id"] == candidate_id
 
 
+def test_namespaced_claim_uses_encoded_filename_and_releases(hermes_home):
+    from tools import write_approval as wa
+
+    candidate_id = "pastoral:edaca6a49a734f408dd9fbad1f5408af"
+    pending_dir = Path(hermes_home) / "pending" / "memory"
+    pending_dir.mkdir(parents=True)
+    record = {
+        "id": candidate_id,
+        "candidate_id": candidate_id,
+        "subsystem": "memory",
+        "action": "add",
+        "summary": "migrated claim",
+        "payload": {"action": "add", "target": "memory", "content": "test"},
+        "created_at": 1,
+    }
+    (pending_dir / "pastoral-edaca6a49a734f408dd9fbad1f5408af.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+
+    claim = wa.claim_pending("memory", candidate_id)
+    assert claim is not None
+    assert "pastoral-edaca6a49a734f408dd9fbad1f5408af.json.applying" in claim["_claim_path"]
+    assert wa.release_claim("memory", claim, restore=False) is True
+
+
 def test_claim_pending_has_one_winner_and_can_restore(hermes_home):
     from tools import write_approval as wa
 

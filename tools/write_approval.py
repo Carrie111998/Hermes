@@ -502,7 +502,7 @@ def claim_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     if path.is_symlink() or (path.exists() and not path.is_file()):
         return None
     claim_id = uuid.uuid4().hex
-    claim_path = path.with_name(f"{pending_id}.json.applying.{claim_id}")
+    claim_path = path.with_name(f"{_pending_filename_id(pending_id)}.json.applying.{claim_id}")
     try:
         os.replace(path, claim_path)
         record = _read_pending_record(
@@ -533,7 +533,10 @@ def release_claim(subsystem: str, claim: Mapping[str, Any], *, restore: bool) ->
         or claim_path.is_symlink()
         or not claim_path.is_file()
         or claim_path.parent.resolve() != expected_parent
-        or not claim_path.name.startswith(f"{_pending_filename_id(pending_id)}.json.applying.")
+        or not any(
+            claim_path.name.startswith(f"{prefix}.json.applying.")
+            for prefix in (_pending_filename_id(pending_id), pending_id)
+        )
     ):
         return False
     try:
@@ -567,7 +570,10 @@ def list_claims(subsystem: str) -> List[Dict[str, Any]]:
         try:
             record = json.loads(path.read_text(encoding="utf-8"))
             pending_id = _validate_pending_id(str(record.get("id") or ""))
-            if not path.name.startswith(f"{pending_id}.json.applying."):
+            if not any(
+                path.name.startswith(f"{prefix}.json.applying.")
+                for prefix in (_pending_filename_id(pending_id), pending_id)
+            ):
                 continue
             record["_claim_path"] = str(path)
             record["_claim_id"] = path.name.rsplit(".", 1)[-1]
