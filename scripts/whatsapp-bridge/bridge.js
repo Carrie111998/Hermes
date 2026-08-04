@@ -140,6 +140,20 @@ function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+/**
+ * Wraps an async function with a timeout.  If the function doesn't resolve
+ * within `ms` milliseconds, the returned promise rejects with a timeout error.
+ * Used to guard `fetchLatestBaileysVersion()` which is a plain fetch() that
+ * can hang forever on network stalls.
+ */
+function fetchWithTimeout(fn, ms) {
+  let timer;
+  const timeoutPromise = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`Timed out after ${ms / 1000}s`)), ms);
+  });
+  return Promise.race([fn(), timeoutPromise]).finally(() => clearTimeout(timer));
+}
+
 function sendWithTimeout(chatId, payload, options = {}, timeoutMs = SEND_TIMEOUT_MS) {
   let timer;
   const timeoutPromise = new Promise((_, reject) => {
@@ -393,9 +407,14 @@ function emitPairEvent(event) {
   } catch {}
 }
 
+// Version-fetch timeout: plain fetch() to raw.githubusercontent.com can stall
+// forever on transient network issues, wedging the bridge in a permanently
+// disconnected state (Express keeps serving → gateway sees 503 forever).
+const VERSION_FETCH_TIMEOUT_MS = parseInt(process.env.WHATSAPP_VERSION_FETCH_TIMEOUT_MS || '15000', 10);
+
 async function startSocket() {
   const { state, saveCreds } = await useMultiFileAuthState(SESSION_DIR);
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchWithTimeout(fetchLatestBaileysVersion, VERSION_FETCH_TIMEOUT_MS);
 
   sock = makeWASocket({
     version,
@@ -449,7 +468,13 @@ async function startSocket() {
             console.log(`⚠️  Connection closed (reason: ${reason}). Reconnecting in 3s...`);
           }
         }
-        setTimeout(startSocket, reason === 515 ? 1000 : 3000);
+        setTimeout(() => {
+          startSocket().catch((err) => {
+            console.error(`⚠️  Reconnect failed: ${err?.message || err}`);
+            // Will retry on next connection.update close event, or the
+            // bridge stays disconnected until the gateway restarts it.
+          });
+        }, reason === 515 ? 1000 : 3000);
       }
     } else if (connection === 'open') {
       connectionState = 'connected';
@@ -1145,6 +1170,9 @@ if (PAIR_ONLY) {
       console.log(`👤 WHATSAPP_FORWARD_OWNER_MESSAGES=true — owner-typed messages will be forwarded with fromOwner:true`);
     }
     console.log();
-    startSocket();
+    startSocket().catch((err) => {
+      console.error(`❌ Initial connection failed: ${err?.message || err}`);
+      process.exit(1);
+    });
   });
 }
