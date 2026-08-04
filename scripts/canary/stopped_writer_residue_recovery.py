@@ -30,6 +30,10 @@ from gateway.canonical_writer_host_authority import (
     NativeObservationPlan,
     OwnerApprovalReceipt,
 )
+from gateway.canonical_writer_host_identity import (
+    _host_identities_are_exact as _pure_host_identities_are_exact,
+    _host_identity_snapshot as _pure_host_identity_snapshot,
+)
 from gateway.canonical_writer_release_contract import (
     GATEWAY_UNIT_NAME,
     WRITER_UNIT_NAME,
@@ -520,15 +524,11 @@ def _validate_failed_native_authority_bundle(
 
 
 def _host_identities_are_exact(value: Mapping[str, Any]) -> bool:
-    from gateway.canonical_writer_activation import _host_identities_are_exact
-
-    return _host_identities_are_exact(value)
+    return _pure_host_identities_are_exact(value)
 
 
 def _require_current_exact_host_identities() -> Mapping[str, Any]:
-    from gateway.canonical_writer_activation import _host_identity_snapshot
-
-    value = _host_identity_snapshot()
+    value = _pure_host_identity_snapshot()
     if not _host_identities_are_exact(value):
         raise RuntimeError("current canary host identities are not exact")
     return value
