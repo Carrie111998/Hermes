@@ -335,6 +335,8 @@ export interface Translations {
       intro: string
       enableAll: string
       enableAllDesc: string
+      closeToTray: string
+      closeToTrayDesc: string
       focusedHint: string
       kinds: Record<
         'approval' | 'backgroundDone' | 'credits' | 'input' | 'plugin' | 'turnDone' | 'turnError',
