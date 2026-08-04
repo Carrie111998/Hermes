@@ -97,8 +97,54 @@ def _audio_available() -> bool:
     try:
         _import_audio()
         return True
-    except (ImportError, OSError):
+    except ImportError:
         return False
+    except OSError:
+        # sounddevice is installed, but its PortAudio system library is not.
+        # Treat the Python dependencies as present so environment diagnostics
+        # can report the correct system-package fix instead of reinstalling pip
+        # wheels that are already available.
+        return True
+
+
+def _ensure_audio_capture_dependencies() -> None:
+    """Install the optional microphone-capture packages on first use."""
+    from tools.lazy_deps import ensure
+
+    ensure("voice.capture", prompt=False)
+
+    # A package installed into the running interpreter becomes importable
+    # immediately, but invalidate finder caches before the caller rechecks.
+    import importlib
+    importlib.invalidate_caches()
+
+
+def _import_audio_for_capture():
+    """Import capture dependencies, lazy-installing them when absent."""
+    try:
+        return _import_audio()
+    except ImportError as exc:
+        if _is_termux_environment():
+            raise RuntimeError(
+                "Voice mode requires Termux microphone dependencies.\n"
+                f"Install with: {_voice_capture_install_hint()}"
+            ) from exc
+        try:
+            _ensure_audio_capture_dependencies()
+        except Exception as exc:
+            raise RuntimeError(
+                "Voice mode requires sounddevice and numpy.\n"
+                f"Automatic install failed: {exc}\n"
+                f"Install with: {_voice_capture_install_hint()}"
+            ) from exc
+
+    try:
+        return _import_audio()
+    except ImportError as exc:
+        raise RuntimeError(
+            "Voice mode requires sounddevice and numpy.\n"
+            f"Install with: {_voice_capture_install_hint()}"
+        ) from exc
 
 
 def _default_input_samplerate(sd) -> int:
@@ -120,23 +166,36 @@ def _default_input_samplerate(sd) -> int:
 from hermes_constants import is_termux as _is_termux_environment
 
 
+def _is_windows_command_shell() -> bool:
+    """Return whether recovery commands should use Windows cmd quoting."""
+    return os.name == "nt"
+
+
+def _quote_install_arg(value: str) -> str:
+    """Quote one recovery-command argument for the user's native shell."""
+    if _is_windows_command_shell():
+        return subprocess.list2cmdline([value])
+    return shlex.quote(value)
+
+
 def _voice_capture_install_hint() -> str:
     if _is_termux_environment():
         return "pkg install python-numpy portaudio && python -m pip install sounddevice"
-    # If we're running inside a venv (e.g. the bundled Hermes venv at
-    # ~/.hermes/profiles/<name>/hermes-agent/venv/), `pip install` on the
-    # user's PATH won't reach the right site-packages — the bare hint sends
-    # them off to whichever Python their shell resolves first, which on macOS
-    # is often a system Python under Rosetta with a totally separate wheel
-    # index. Point them at the actual interpreter pip is sitting next to.
-    try:
-        if sys.prefix != getattr(sys, "base_prefix", sys.prefix):
-            pip_in_venv = Path(sys.prefix) / "bin" / "pip"
-            if pip_in_venv.exists():
-                return f"{pip_in_venv} install sounddevice numpy"
-    except Exception:
-        pass
-    return "pip install sounddevice numpy"
+
+    from hermes_cli.managed_uv import resolve_uv
+    from tools.lazy_deps import LAZY_DEPS
+
+    # Source the pins from the same registry used by the automatic installer
+    # so recovery guidance cannot drift from the packages Hermes installs.
+    specs = " ".join(_quote_install_arg(spec) for spec in LAZY_DEPS["voice.capture"])
+
+    uv_bin = resolve_uv()
+    if uv_bin:
+        return (
+            f"{_quote_install_arg(uv_bin)} pip install --python "
+            f"{_quote_install_arg(sys.executable)} {specs}"
+        )
+    return f"{_quote_install_arg(sys.executable)} -m pip install {specs}"
 
 
 def _termux_microphone_command() -> Optional[str]:
@@ -1039,7 +1098,7 @@ class AudioRecorder:
         or if a recording is already in progress.
         """
         try:
-            sd, _ = _import_audio()
+            sd, _ = _import_audio_for_capture()
         except OSError as e:
             # sounddevice imports but PortAudio's shared library is missing —
             # a pip install can't fix that; point at the system package
@@ -1055,11 +1114,6 @@ class AudioRecorder:
                 "PortAudio system library not found -- install it first:\n"
                 f"{portaudio_hint}\n"
                 "Then retry /voice on."
-            ) from e
-        except ImportError as e:
-            raise RuntimeError(
-                "Voice mode requires sounddevice and numpy.\n"
-                f"Install with: {sys.executable} -m pip install sounddevice numpy"
             ) from e
 
         with self._lock:
@@ -2173,8 +2227,11 @@ def _check_plugin_stt_provider(provider: str) -> bool:
         return False
 
 
-def check_voice_requirements() -> Dict[str, Any]:
+def check_voice_requirements(*, install_audio: bool = False) -> Dict[str, Any]:
     """Check if all voice mode requirements are met.
+
+    ``install_audio`` opts action paths into the standard lazy-dependency
+    installer. Status/probe callers keep the default read-only behavior.
 
     Returns:
         Dict with ``available``, ``audio_available``, ``stt_available``,
@@ -2216,6 +2273,18 @@ def check_voice_requirements() -> Dict[str, Any]:
     missing: List[str] = []
     termux_capture = _termux_voice_capture_available()
     has_audio = _audio_available() or termux_capture
+
+    if (
+        install_audio
+        and not has_audio
+        and not termux_capture
+        and not _is_termux_environment()
+    ):
+        try:
+            _ensure_audio_capture_dependencies()
+        except Exception as exc:
+            logger.warning("Voice capture dependency install failed: %s", exc)
+        has_audio = _audio_available()
 
     if not has_audio:
         missing.extend(["sounddevice", "numpy"])

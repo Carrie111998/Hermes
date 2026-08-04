@@ -143,6 +143,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Speech-to-text providers ──────────────────────────────────────────
     "stt.mistral": ("mistralai==2.4.8",),
+    # Microphone capture is shared by every STT provider. Keep it separate
+    # from faster-whisper so cloud/plugin STT users do not pull the local
+    # inference stack just to record audio.
+    "voice.capture": (
+        "sounddevice==0.5.5",
+        "numpy==2.4.3",
+    ),
     "stt.faster_whisper": (
         "faster-whisper==1.2.1",
         "sounddevice==0.5.5",

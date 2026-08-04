@@ -268,6 +268,67 @@ class TestDetectAudioEnvironment:
 # check_voice_requirements
 # ============================================================================
 
+class TestAudioAvailability:
+    def test_portaudio_oserror_means_python_packages_are_installed(self, monkeypatch):
+        monkeypatch.setattr(
+            "tools.voice_mode._import_audio",
+            MagicMock(side_effect=OSError("PortAudio library not found")),
+        )
+
+        from tools.voice_mode import _audio_available
+
+        assert _audio_available() is True
+
+
+class TestVoiceCaptureInstallHint:
+    def test_managed_uv_targets_running_interpreter_and_registry_specs(self, monkeypatch, tmp_path):
+        venv_dir = tmp_path / "venv"
+        (venv_dir / "bin").mkdir(parents=True)
+        interpreter = venv_dir / "bin" / "python"
+        (venv_dir / "bin" / "pip").touch()
+        monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: False)
+        monkeypatch.setattr("tools.voice_mode.sys.prefix", str(venv_dir))
+        monkeypatch.setattr("tools.voice_mode.sys.base_prefix", "/usr")
+        monkeypatch.setattr("tools.voice_mode.sys.executable", str(interpreter))
+        monkeypatch.setattr("tools.voice_mode.shutil.which", lambda command: None)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: "/managed/hermes/bin/uv")
+        monkeypatch.setitem(
+            __import__("tools.lazy_deps", fromlist=["LAZY_DEPS"]).LAZY_DEPS,
+            "voice.capture",
+            ("sounddevice==9.9.9", "numpy==8.8.8"),
+        )
+
+        from tools.voice_mode import _voice_capture_install_hint
+
+        hint = _voice_capture_install_hint()
+
+        assert hint.startswith(f"/managed/hermes/bin/uv pip install --python {interpreter}")
+        assert "sounddevice==9.9.9" in hint
+        assert "numpy==8.8.8" in hint
+
+    def test_windows_cmd_quotes_paths_without_posix_single_quotes(self, monkeypatch):
+        interpreter = r"C:\Program Files\Hermes\venv\Scripts\python.exe"
+        managed_uv = r"C:\Program Files\Hermes\bin\uv.exe"
+        monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: False)
+        monkeypatch.setattr(
+            "tools.voice_mode._is_windows_command_shell",
+            lambda: True,
+            raising=False,
+        )
+        monkeypatch.setattr("tools.voice_mode.sys.executable", interpreter)
+        monkeypatch.setattr("hermes_cli.managed_uv.resolve_uv", lambda: managed_uv)
+
+        from tools.voice_mode import _voice_capture_install_hint
+
+        hint = _voice_capture_install_hint()
+
+        assert hint.startswith(
+            '"C:\\Program Files\\Hermes\\bin\\uv.exe" pip install --python '
+            '"C:\\Program Files\\Hermes\\venv\\Scripts\\python.exe"'
+        )
+        assert "'" not in hint
+
+
 class TestCheckVoiceRequirements:
     def test_all_requirements_met(self, monkeypatch):
         monkeypatch.setattr("tools.voice_mode._audio_available", lambda: True)
@@ -282,6 +343,50 @@ class TestCheckVoiceRequirements:
         assert result["audio_available"] is True
         assert result["stt_available"] is True
         assert result["missing_packages"] == []
+
+    def test_install_audio_lazily_before_rechecking_requirements(self, monkeypatch):
+        audio_checks = iter((False, True))
+        ensure_calls = []
+        monkeypatch.setattr("tools.voice_mode._audio_available", lambda: next(audio_checks))
+        monkeypatch.setattr(
+            "tools.voice_mode._ensure_audio_capture_dependencies",
+            lambda: ensure_calls.append("voice.capture"),
+            raising=False,
+        )
+        monkeypatch.setattr("tools.voice_mode.detect_audio_environment",
+                            lambda: {"available": True, "warnings": []})
+        monkeypatch.setattr("tools.transcription_tools._get_provider", lambda cfg: "openai")
+
+        from tools.voice_mode import check_voice_requirements
+
+        result = check_voice_requirements(install_audio=True)
+
+        assert ensure_calls == ["voice.capture"]
+        assert result["available"] is True
+        assert result["audio_available"] is True
+        assert result["missing_packages"] == []
+
+    def test_termux_does_not_run_python_lazy_installer(self, monkeypatch):
+        ensure_calls = []
+        monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: True)
+        monkeypatch.setattr("tools.voice_mode._termux_voice_capture_available", lambda: False)
+        monkeypatch.setattr("tools.voice_mode._audio_available", lambda: False)
+        monkeypatch.setattr(
+            "tools.voice_mode._ensure_audio_capture_dependencies",
+            lambda: ensure_calls.append("voice.capture"),
+        )
+        monkeypatch.setattr(
+            "tools.voice_mode.detect_audio_environment",
+            lambda: {"available": False, "warnings": ["Termux:API missing"]},
+        )
+        monkeypatch.setattr("tools.transcription_tools._get_provider", lambda cfg: "openai")
+
+        from tools.voice_mode import check_voice_requirements
+
+        result = check_voice_requirements(install_audio=True)
+
+        assert ensure_calls == []
+        assert result["audio_available"] is False
 
 
     def test_plugin_stt_provider(self, monkeypatch):
@@ -381,16 +486,65 @@ class TestTermuxAudioRecorder:
 
 
 class TestAudioRecorder:
+    def test_start_lazy_installs_audio_capture_when_import_missing(self, monkeypatch):
+        sd = MagicMock()
+        np = MagicMock()
+        import_calls = 0
+        ensure_calls = []
+
+        def _import_after_install():
+            nonlocal import_calls
+            import_calls += 1
+            if import_calls == 1:
+                raise ImportError("no sounddevice")
+            return sd, np
+
+        monkeypatch.setattr("tools.voice_mode._import_audio", _import_after_install)
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure",
+            lambda feature, *, prompt: ensure_calls.append((feature, prompt)),
+        )
+
+        from tools.voice_mode import AudioRecorder
+
+        recorder = AudioRecorder()
+        recorder.start()
+
+        assert ensure_calls == [("voice.capture", False)]
+        sd.InputStream.assert_called_once()
+        sd.InputStream.return_value.start.assert_called_once()
+        assert recorder.is_recording is True
+
     def test_start_raises_without_audio_libs(self, monkeypatch):
         def _fail_import():
             raise ImportError("no sounddevice")
         monkeypatch.setattr("tools.voice_mode._import_audio", _fail_import)
+        monkeypatch.setattr(
+            "tools.lazy_deps.ensure",
+            MagicMock(side_effect=RuntimeError("install unavailable")),
+        )
 
         from tools.voice_mode import AudioRecorder
 
         recorder = AudioRecorder()
         with pytest.raises(RuntimeError, match="sounddevice and numpy"):
             recorder.start()
+
+    def test_termux_direct_recorder_does_not_lazy_install_python_audio(self, monkeypatch):
+        ensure = MagicMock()
+        monkeypatch.setattr(
+            "tools.voice_mode._import_audio",
+            MagicMock(side_effect=ImportError("no sounddevice")),
+        )
+        monkeypatch.setattr("tools.voice_mode._is_termux_environment", lambda: True)
+        monkeypatch.setattr("tools.lazy_deps.ensure", ensure)
+
+        from tools.voice_mode import AudioRecorder
+
+        with pytest.raises(RuntimeError, match="pkg install python-numpy portaudio"):
+            AudioRecorder().start()
+
+        ensure.assert_not_called()
 
     def test_start_oserror_points_at_portaudio_not_pip(self, monkeypatch):
         """OSError from _import_audio means PortAudio's shared library is

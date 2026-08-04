@@ -12137,9 +12137,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         """Start capturing audio from the microphone."""
         if getattr(self, '_should_exit', False):
             return
-        from tools.voice_mode import create_audio_recorder, check_voice_requirements
+        from tools.voice_mode import (
+            _voice_capture_install_hint,
+            check_voice_requirements,
+            create_audio_recorder,
+        )
 
-        reqs = check_voice_requirements()
+        reqs = check_voice_requirements(install_audio=True)
         if not reqs["audio_available"]:
             if _is_termux_environment():
                 details = reqs.get("details", "")
@@ -12156,7 +12160,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 )
             raise RuntimeError(
                 "Voice mode requires sounddevice and numpy.\n"
-                f"Install with: {sys.executable} -m pip install sounddevice numpy"
+                f"Install with: {_voice_capture_install_hint()}"
             )
         if not reqs.get("stt_available", reqs.get("stt_key_set")):
             raise RuntimeError(
@@ -12696,18 +12700,24 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             _cprint(f"{_DIM}Voice mode is already enabled.{_RST}")
             return
 
-        from tools.voice_mode import check_voice_requirements, detect_audio_environment
+        from tools.voice_mode import (
+            _voice_capture_install_hint,
+            check_voice_requirements,
+            detect_audio_environment,
+        )
 
-        # Environment detection -- warn and block in incompatible environments
+        # Install optional capture packages before probing the environment;
+        # otherwise the probe mistakes a missing wheel for an incompatible host.
+        reqs = check_voice_requirements(install_audio=True)
         env_check = detect_audio_environment()
-        if not env_check["available"]:
-            _cprint(f"\n{_ACCENT}Voice mode unavailable in this environment:{_RST}")
-            for warning in env_check["warnings"]:
-                _cprint(f"  {_DIM}{warning}{_RST}")
-            return
-
-        reqs = check_voice_requirements()
-        if not reqs["available"]:
+        requirements_met = (
+            reqs.get("audio_available", reqs.get("available", False))
+            and reqs.get(
+                "stt_available",
+                reqs.get("stt_key_set", reqs.get("available", False)),
+            )
+        )
+        if not requirements_met:
             _cprint(f"\n{_ACCENT}Voice mode requirements not met:{_RST}")
             for line in reqs["details"].split("\n"):
                 _cprint(f"  {_DIM}{line}{_RST}")
@@ -12717,7 +12727,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                     _cprint(f"  {_DIM}Then install/update the Termux:API Android app for microphone capture{_RST}")
                     _cprint(f"  {_BOLD}Option 2: pkg install python-numpy portaudio && python -m pip install sounddevice{_RST}")
                 else:
-                    _cprint(f"\n  {_BOLD}Install: {sys.executable} -m pip install {' '.join(reqs['missing_packages'])}{_RST}")
+                    _cprint(f"\n  {_BOLD}Install: {_voice_capture_install_hint()}{_RST}")
+            return
+
+        # Once imports succeed, surface actual host/device incompatibilities.
+        if not env_check["available"]:
+            _cprint(f"\n{_ACCENT}Voice mode unavailable in this environment:{_RST}")
+            for warning in env_check["warnings"]:
+                _cprint(f"  {_DIM}{warning}{_RST}")
             return
 
         with self._voice_lock:

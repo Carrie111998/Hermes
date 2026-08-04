@@ -120,6 +120,57 @@ class TestEnableVoiceModeReal:
         cli = _make_voice_cli()
         cli._enable_voice_mode()
         assert cli._voice_mode is True
+        _req.assert_called_once_with(install_audio=True)
+
+    def test_installs_audio_before_environment_probe(self):
+        events = []
+        requirements = {"available": True, "details": "OK"}
+        environment = {"available": True, "warnings": []}
+
+        with patch("cli._cprint"), \
+             patch("hermes_cli.config.load_config", return_value={"voice": {}}), \
+             patch(
+                 "tools.voice_mode.check_voice_requirements",
+                 side_effect=lambda **kwargs: events.append(("requirements", kwargs)) or requirements,
+             ), \
+             patch(
+                 "tools.voice_mode.detect_audio_environment",
+                 side_effect=lambda: events.append(("environment", {})) or environment,
+             ):
+            cli = _make_voice_cli()
+            cli._enable_voice_mode()
+
+        assert events == [
+            ("requirements", {"install_audio": True}),
+            ("environment", {}),
+        ]
+        assert cli._voice_mode is True
+
+    def test_portaudio_failure_reports_environment_not_python_packages(self):
+        requirements = {
+            "available": False,
+            "audio_available": True,
+            "stt_available": True,
+            "details": "Environment: PortAudio system library not found",
+            "missing_packages": [],
+        }
+        environment = {
+            "available": False,
+            "warnings": ["PortAudio system library not found; install libportaudio2"],
+        }
+
+        with patch("cli._cprint") as mock_print, \
+             patch("tools.voice_mode.check_voice_requirements", return_value=requirements), \
+             patch("tools.voice_mode.detect_audio_environment", return_value=environment):
+            cli = _make_voice_cli()
+            cli._enable_voice_mode()
+
+        output = "\n".join(str(call.args[0]) for call in mock_print.call_args_list)
+        assert "Voice mode unavailable in this environment" in output
+        assert "PortAudio system library not found" in output
+        assert "Voice mode requirements not met" not in output
+        assert "Install:" not in output
+        assert cli._voice_mode is False
 
 
     @patch("cli._cprint")
@@ -136,6 +187,27 @@ class TestEnableVoiceModeReal:
 
 class TestVoiceBeepConfigReal:
     """Tests the CLI voice beep toggle."""
+
+    @patch("tools.voice_mode._voice_capture_install_hint", return_value="uv pip install --python /venv/bin/python audio")
+    @patch(
+        "tools.voice_mode.check_voice_requirements",
+        return_value={
+            "available": False,
+            "audio_available": False,
+            "stt_available": True,
+            "details": "Audio capture: MISSING",
+            "missing_packages": ["sounddevice", "numpy"],
+        },
+    )
+    def test_missing_audio_reports_pipless_venv_install_command(self, _req, _hint):
+        cli = _make_voice_cli()
+
+        with pytest.raises(RuntimeError) as exc_info:
+            cli._voice_start_recording()
+
+        message = str(exc_info.value)
+        assert "uv pip install --python /venv/bin/python audio" in message
+        assert " -m pip install " not in message
 
     @patch("hermes_cli.config.load_config", return_value={"voice": {"beep_enabled": False}})
     def test_beeps_can_be_disabled(self, _cfg):
@@ -177,6 +249,7 @@ class TestVoiceBeepConfigReal:
         cli = _make_voice_cli()
         cli._voice_start_recording()
 
+        _req.assert_called_once_with(install_audio=True)
         recorder.start.assert_called_once()
         mock_beep.assert_not_called()
 
