@@ -2501,6 +2501,7 @@ def _credential_pool_for_provider(provider: Optional[str]):
 
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
+    from hermes_cli.fallback_config import InvalidFallbackPolicyError
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         # Canonical gateway loader: managed overlay + ${VAR} expansion +
@@ -2513,10 +2514,17 @@ def _try_resolve_fallback_provider() -> dict | None:
         for entry in fb_list:
             try:
                 from hermes_cli.fallback_config import (
+                    FALLBACK_FAILURE_POLICY_INVALID,
                     fallback_entry_allows_continuation,
+                    fallback_failure_policy,
                     resolve_entry_api_key,
                 )
 
+                if fallback_failure_policy(entry) == FALLBACK_FAILURE_POLICY_INVALID:
+                    logger.error(
+                        "Gateway fallback runtime resolution stopped at invalid failure_policy"
+                    )
+                    raise InvalidFallbackPolicyError()
                 if not fallback_entry_allows_continuation(entry):
                     # No AIAgent/session exists at this credential-resolution
                     # boundary. Fail closed rather than turning a triage-only
@@ -2553,11 +2561,15 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
                 }
+            except InvalidFallbackPolicyError:
+                raise
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
                 continue
+    except InvalidFallbackPolicyError:
+        raise
     except Exception:
-        pass
+        logger.debug("Gateway fallback chain resolution failed", exc_info=True)
     return None
 
 

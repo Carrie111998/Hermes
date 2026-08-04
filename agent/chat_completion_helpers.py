@@ -1704,6 +1704,13 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     auth resolution and client construction — no duplicated provider→key
     mappings.
     """
+    # A policy hold is terminal for this turn. A repeated activation request
+    # must not advance the chain behind the held boundary. Hold state is always
+    # a concrete dict; the type check avoids treating a dynamically fabricated
+    # mock/proxy attribute as an armed policy boundary.
+    if isinstance(getattr(agent, "_fallback_triage_state", None), dict):
+        return True
+
     if reason in {FailoverReason.rate_limit, FailoverReason.billing, FailoverReason.upstream_rate_limit}:
         # Only start cooldown when leaving the primary provider.  If we're
         # already on a fallback and chain-switching, the primary wasn't the
@@ -1745,6 +1752,39 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         return False
     fb = agent._fallback_chain[agent._fallback_index]
     agent._fallback_index += 1
+
+    # Policy is the first decision boundary. Invalid and triage-only entries
+    # must hold before local availability checks, same-backend deduplication,
+    # client resolution, or recursion into a later continuation entry.
+    from hermes_cli.fallback_config import (
+        FALLBACK_FAILURE_POLICY_INVALID,
+        FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY,
+        fallback_failure_policy,
+    )
+
+    failure_policy = fallback_failure_policy(fb)
+    if failure_policy == FALLBACK_FAILURE_POLICY_INVALID:
+        from agent.fallback_triage import arm_invalid_fallback_policy_hold
+
+        arm_invalid_fallback_policy_hold(agent, reason)
+        logger.error(
+            "Fallback chain held at entry %d because failure_policy is invalid",
+            agent._fallback_index - 1,
+        )
+        return True
+    if failure_policy == FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY:
+        from agent.fallback_triage import arm_triage_and_notify_hold
+
+        arm_triage_and_notify_hold(agent, fb, reason)
+        logger.warning(
+            "Fallback triage-and-notify armed instead of continuation: "
+            "provider=%s model=%s platform=%s",
+            (fb.get("provider") or "").strip().lower(),
+            (fb.get("model") or "").strip(),
+            getattr(agent, "platform", ""),
+        )
+        return True
+
     fb_key = _fallback_entry_key(fb)
     unavailable = getattr(agent, "_unavailable_fallback_keys", None)
     if unavailable is None:
@@ -1793,27 +1833,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_provider, fb_model, current_ident.base_url or current_ident.provider,
         )
         return agent._try_activate_fallback(reason)
-
-    # A triage-and-notify entry is an explicit non-continuation policy.  Do
-    # not construct/swap a client, regenerate the prompt, or replay the turn.
-    # The conversation loop observes this state at the retry boundary and
-    # finalizes the existing session as a durable held checkpoint.
-    from hermes_cli.fallback_config import (
-        FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY,
-        fallback_failure_policy,
-    )
-
-    if fallback_failure_policy(fb) == FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY:
-        from agent.fallback_triage import arm_triage_and_notify_hold
-
-        arm_triage_and_notify_hold(agent, fb, reason)
-        logger.warning(
-            "Fallback triage-and-notify armed instead of continuation: provider=%s model=%s platform=%s",
-            fb_provider,
-            fb_model,
-            getattr(agent, "platform", ""),
-        )
-        return True
 
     # Use centralized router for client construction.
     # raw_codex=True because the main agent needs direct responses.stream()

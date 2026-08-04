@@ -7303,6 +7303,16 @@ def run_conversation(
         # Retain a machine-readable result marker for gateways/schedulers while
         # the durable assistant response remains the resume/checkpoint record.
         result["held"] = True
+        result["completed"] = False
+        result["work_status"] = "held"
+        _triage_exit = str(result.get("turn_exit_reason") or "")
+        result["fallback_notification_succeeded"] = (
+            True
+            if _triage_exit == "fallback_triage_notified"
+            else False
+            if _triage_exit == "fallback_triage_local_failed"
+            else None
+        )
     return result
 
 

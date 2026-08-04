@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -46,11 +47,68 @@ from hermes_cli.config import (
     cron_model_drift_guard_enabled,
     load_config,
 )
-from hermes_cli.fallback_config import get_fallback_chain
+from hermes_cli.fallback_config import (
+    InvalidFallbackPolicyError,
+    get_fallback_chain,
+)
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class CronRunOutcome:
+    """Explicit held-work metadata with legacy four-value unpacking.
+
+    Normal cron results remain their historical tuple. Held results use this
+    object so the scheduler can distinguish original work from the bounded
+    notification event without breaking direct callers that unpack four
+    values from ``run_job``.
+    """
+
+    success: bool
+    output: str
+    final_response: str
+    error: Optional[str]
+    work_status: str = "held"
+    watcher_succeeded: Optional[bool] = None
+    hold_detail: Optional[str] = None
+
+    def _legacy_tuple(self) -> tuple[bool, str, str, Optional[str]]:
+        return self.success, self.output, self.final_response, self.error
+
+    def __iter__(self):
+        return iter(self._legacy_tuple())
+
+    def __len__(self) -> int:
+        return 4
+
+    def __getitem__(self, index):
+        return self._legacy_tuple()[index]
+
+
+def _cron_held_detail(turn_exit_reason: str) -> str:
+    """Return a deterministic, credential-free held-work persistence detail."""
+    if turn_exit_reason == "fallback_triage_notified":
+        return (
+            "Original scheduled work held; bounded notifier succeeded; "
+            "consequential work did not complete; no automatic replay."
+        )
+    if turn_exit_reason == "fallback_triage_local_failed":
+        return (
+            "Original scheduled work held; bounded notifier failed; no "
+            "continuation ran; no automatic replay."
+        )
+    if turn_exit_reason == "fallback_policy_invalid":
+        return (
+            "Original scheduled work held; invalid failure_policy configuration; "
+            "no continuation ran; no automatic replay."
+        )
+    return (
+        "Original scheduled work held; consequential work did not complete; "
+        "no continuation ran; no automatic replay."
+    )
 
 
 def _set_cron_session_title(session_db, session_id, base_title):
@@ -2763,7 +2821,7 @@ def _guard_job_credential_exfil(job: dict) -> None:
 
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
-) -> tuple[bool, str, str, Optional[str]]:
+) -> tuple[bool, str, str, Optional[str]] | CronRunOutcome:
     """
     Execute a single cron job.
 
@@ -3347,10 +3405,19 @@ def run_job(
                     continue
                 try:
                     from hermes_cli.fallback_config import (
+                        FALLBACK_FAILURE_POLICY_INVALID,
                         fallback_entry_allows_continuation,
+                        fallback_failure_policy,
                         resolve_entry_api_key,
                     )
 
+                    if fallback_failure_policy(entry) == FALLBACK_FAILURE_POLICY_INVALID:
+                        logger.error(
+                            "Job '%s': invalid failure_policy stopped pre-agent "
+                            "fallback resolution",
+                            job_id,
+                        )
+                        raise InvalidFallbackPolicyError()
                     if not fallback_entry_allows_continuation(entry):
                         # Runtime resolution occurs before an AIAgent/session
                         # exists. Do not silently run the complete cron prompt
@@ -3381,6 +3448,8 @@ def run_job(
                         fb_model,
                     )
                     break
+                except InvalidFallbackPolicyError:
+                    raise
                 except Exception as fb_exc:
                     logger.debug("Job '%s': fallback %s failed: %s", job_id, fb_provider, fb_exc)
             if runtime is None:
@@ -3673,14 +3742,27 @@ def run_job(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
             )
 
+        # Preserve held work as a first-class outcome before ordinary failure
+        # classification. A successful bounded notifier is not completion of
+        # the consequential scheduled task; a failed notifier is not an
+        # ordinary task failure that authorizes fallback recursion or replay.
+        turn_exit_reason = str(result.get("turn_exit_reason") or "")
+        held_work = result.get("held") is True or result.get("work_status") == "held"
+        watcher_succeeded = result.get("fallback_notification_succeeded")
+        if not isinstance(watcher_succeeded, bool):
+            watcher_succeeded = (
+                True
+                if turn_exit_reason == "fallback_triage_notified"
+                else False
+                if turn_exit_reason == "fallback_triage_local_failed"
+                else None
+            )
+        hold_detail = _cron_held_detail(turn_exit_reason) if held_work else None
+
         # If the agent itself reported failure (e.g. all retries exhausted on
         # API errors, model abort, mid-run interrupt), do not silently mark the
-        # job as successful. run_agent populates `failed=True`/`completed=False`
-        # on these paths and may put the error into `final_response`, which
-        # would otherwise be delivered as if it were the agent's reply and the
-        # job's `last_status` set to "ok". Raise so the except handler below
-        # builds the proper failure tuple. (issue #17855)
-        turn_exit_reason = str(result.get("turn_exit_reason") or "")
+        # job as successful. Held work is handled explicitly above and bypasses
+        # this ordinary failed/completed classifier.
         final_response_text = (result.get("final_response") or "").strip()
         max_iteration_summary = (
             result.get("failed") is not True
@@ -3688,7 +3770,10 @@ def run_job(
             and turn_exit_reason.startswith("max_iterations_reached(")
             and bool(final_response_text)
         )
-        if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
+        if not held_work and (
+            result.get("failed") is True
+            or (result.get("completed") is False and not max_iteration_summary)
+        ):
             _err_text = (
                 result.get("error")
                 or final_response_text
@@ -3730,6 +3815,34 @@ def run_job(
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
+
+        if held_work:
+            output = f"""# Cron Job: {job_name} (HELD)
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+**Work Status:** HELD
+**Hold Detail:** {hold_detail}
+
+## Prompt
+
+{prompt}
+
+## Response
+
+{logged_response}
+"""
+            logger.warning("Job '%s' held without completing original work", job_name)
+            return CronRunOutcome(
+                success=False,
+                output=output,
+                final_response=final_response,
+                error=hold_detail,
+                work_status="held",
+                watcher_succeeded=watcher_succeeded,
+                hold_detail=hold_detail,
+            )
         
         output = f"""# Cron Job: {job_name}
 
@@ -3971,9 +4084,22 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         # interpreter-shutdown guard in _deliver_result.
         _deferred_agents: list = []
         try:
-            success, output, final_response, error = run_job(
+            run_outcome = run_job(
                 job, defer_agent_teardown=_deferred_agents
             )
+            if isinstance(run_outcome, CronRunOutcome):
+                success = run_outcome.success
+                output = run_outcome.output
+                final_response = run_outcome.final_response
+                error = run_outcome.error
+                work_status = run_outcome.work_status
+                watcher_succeeded = run_outcome.watcher_succeeded
+                hold_detail = run_outcome.hold_detail
+            else:
+                success, output, final_response, error = run_outcome
+                work_status = "ok" if success else "failed"
+                watcher_succeeded = None
+                hold_detail = None
         except BaseException:
             # run_job's finally still hands back the agent when it raises; tear
             # it down here so a failed run never leaks its async resources
@@ -4015,7 +4141,17 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             # Deliver the final response to the origin/target chat.
             # If the agent responded with [SILENT], skip delivery (but
             # output is already saved above).  Failed jobs always deliver.
-            deliver_content = final_response if success else _summarize_cron_failure_for_delivery(job, error)
+            # Deliver a held policy response as a hold notice, not as an
+            # ordinary cron failure summary. The original work still has
+            # success=False and is persisted separately as work_status=held.
+            held_outcome = work_status == "held"
+            deliver_content = (
+                (final_response or hold_detail or "Scheduled work held.")
+                if held_outcome
+                else final_response
+                if success
+                else _summarize_cron_failure_for_delivery(job, error)
+            )
             # Treat whitespace-only final responses the same as empty
             # responses: do not deliver a blank message, and let the
             # empty-response guard below mark the run as a soft failure.
@@ -4056,7 +4192,23 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            if work_status == "held":
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                    work_status="held",
+                    hold_detail=hold_detail,
+                    notification_succeeded=watcher_succeeded,
+                )
+            else:
+                mark_job_run(
+                    job["id"],
+                    success,
+                    error,
+                    delivery_error=delivery_error,
+                )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -4066,12 +4218,21 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             delivery_outcome = "delivered"
         else:
             delivery_outcome = "suppressed"
-        finish_execution(
-            execution_id,
-            success=success,
-            error=error,
-            delivery_outcome=delivery_outcome,
-        )
+        if work_status == "held":
+            finish_execution(
+                execution_id,
+                success=False,
+                error=error,
+                delivery_outcome=delivery_outcome,
+                work_status="held",
+            )
+        else:
+            finish_execution(
+                execution_id,
+                success=success,
+                error=error,
+                delivery_outcome=delivery_outcome,
+            )
         return True
 
     except BaseException as e:  # noqa: BLE001 — deliberate: see below

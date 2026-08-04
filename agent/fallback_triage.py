@@ -85,6 +85,15 @@ def _scheduled_failure_response() -> str:
     )
 
 
+def _invalid_policy_response() -> str:
+    return (
+        "⚠️ Invalid fallback failure_policy configuration held this turn after "
+        "the primary provider failed. No fallback client, normal continuation, "
+        "tool loop, or external side effect was run. Configure the entry with "
+        "failure_policy 'continue' or 'triage_and_notify' before retrying."
+    )
+
+
 def _run_bounded_scheduled_triage(state: dict[str, Any], entry: dict[str, Any]) -> None:
     """Run exactly one isolated local notification/liveness completion.
 
@@ -189,8 +198,43 @@ def arm_triage_and_notify_hold(
     return state
 
 
+def arm_invalid_fallback_policy_hold(
+    agent: Any,
+    reason: FailoverReason | None,
+) -> dict[str, Any]:
+    """Hold immediately when a present fallback policy is malformed.
+
+    The malformed raw value and full config entry are intentionally excluded
+    from state and operator output. This is a deterministic configuration
+    failure, not a provider-resolution candidate.
+    """
+    reason_label = _reason_label(reason)
+    alert = _invalid_policy_response()
+    state: dict[str, Any] = {
+        "reason": reason_label,
+        "scheduled": False,
+        "policy_invalid": True,
+        "alert": alert,
+        "local_triage_succeeded": None,
+        "local_triage_error": None,
+    }
+    agent._fallback_triage_state = state
+    agent._pending_fallback_notice = None
+    try:
+        agent._clear_status_buffer()
+    except Exception:
+        pass
+    try:
+        agent._emit_status(alert)
+    except Exception:
+        logger.debug("Invalid fallback policy status delivery failed", exc_info=True)
+    return state
+
+
 def triage_turn_outcome(state: dict[str, Any]) -> tuple[str, bool, str]:
     """Return ``(response, failed, exit_reason)`` for a pending policy hold."""
+    if state.get("policy_invalid"):
+        return _invalid_policy_response(), True, "fallback_policy_invalid"
     if state.get("scheduled"):
         if state.get("local_triage_succeeded") is True:
             return _scheduled_success_response(), False, "fallback_triage_notified"

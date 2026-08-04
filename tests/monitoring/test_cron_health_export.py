@@ -80,6 +80,34 @@ def test_terminal_execution_emission_flushes_and_failures_are_fail_open(monkeypa
     assert calls == [("emit", "completed"), ("flush", 1.0)]
 
 
+def test_held_execution_is_a_distinct_terminal_monitoring_state(monkeypatch):
+    from agent.monitoring import cron_health, emitter
+
+    calls = []
+
+    class FakeEmitter:
+        def emit(self, event):
+            calls.append(("emit", event.status, event.error_class))
+
+        def flush(self, timeout):
+            calls.append(("flush", timeout))
+
+    monkeypatch.setattr(emitter, "get_emitter", lambda: FakeEmitter())
+
+    record = {
+        "job_id": "private",
+        "source": "builtin",
+        "status": "held",
+        "error": "Original scheduled work held; no automatic replay.",
+    }
+    event = cron_health.project_execution_event(record)
+    cron_health.emit_execution_state(record)
+
+    assert event.status == "held"
+    assert event.status not in {"completed", "failed", "unknown"}
+    assert calls == [("emit", "held", "unknown"), ("flush", 1.0)]
+
+
 
 
 

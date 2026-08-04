@@ -105,6 +105,67 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     assert failed["error"] == "provider exploded"
 
 
+def test_held_execution_is_a_distinct_durable_terminal_work_status(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+
+    record = executions.create_execution("held-work", source="builtin")
+    executions.mark_execution_running(record["id"])
+    held = executions.finish_execution(
+        record["id"],
+        success=False,
+        error="original work held; no automatic replay",
+        work_status="held",
+    )
+
+    assert held["status"] == "held"
+    assert held["status"] not in {"completed", "failed"}
+    assert held["error"] == "original work held; no automatic replay"
+    assert executions.latest_execution("held-work") == held
+
+
+def test_legacy_execution_schema_migrates_without_losing_history(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        conn.execute(
+            """CREATE TABLE executions (
+                 id TEXT PRIMARY KEY,
+                 job_id TEXT NOT NULL,
+                 source TEXT NOT NULL,
+                 process_id TEXT NOT NULL,
+                 pid INTEGER NOT NULL,
+                 process_started_at INTEGER,
+                 status TEXT NOT NULL CHECK(status IN
+                   ('claimed','running','completed','failed','unknown')),
+                 claimed_at TEXT NOT NULL,
+                 started_at TEXT,
+                 finished_at TEXT,
+                 error TEXT
+               )"""
+        )
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at,
+                finished_at, error)
+               VALUES ('legacy-1', 'legacy-job', 'builtin', 'old-process', 1,
+                       'completed', '2026-08-01T00:00:00Z',
+                       '2026-08-01T00:01:00Z', NULL)"""
+        )
+
+    current = executions.create_execution("new-held-job", source="builtin")
+    held = executions.finish_execution(
+        current["id"],
+        success=False,
+        error="held after migration",
+        work_status="held",
+    )
+
+    assert held["status"] == "held"
+    legacy = executions.latest_execution("legacy-job")
+    assert legacy["id"] == "legacy-1"
+    assert legacy["status"] == "completed"
+
+
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("still-live", source="builtin")

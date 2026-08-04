@@ -5285,7 +5285,10 @@ def _try_main_fallback_chain(
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.fallback_config import (
+            FALLBACK_FAILURE_POLICY_INVALID,
+            InvalidFallbackPolicyError,
             fallback_entry_allows_continuation,
+            fallback_failure_policy,
             get_fallback_chain,
         )
 
@@ -5306,6 +5309,14 @@ def _try_main_fallback_chain(
     for i, entry in enumerate(chain):
         if not isinstance(entry, dict):
             continue
+        if fallback_failure_policy(entry) == FALLBACK_FAILURE_POLICY_INVALID:
+            logger.error(
+                "Auxiliary %s: invalid failure_policy at fallback_providers[%d]; "
+                "stopping before provider resolution",
+                task or "call",
+                i,
+            )
+            raise InvalidFallbackPolicyError()
         if not fallback_entry_allows_continuation(entry):
             # ``triage_and_notify`` is not an auxiliary task provider.  The
             # bounded local notifier is owned solely by the cron conversation

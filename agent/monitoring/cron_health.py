@@ -22,7 +22,7 @@ from cron.scheduler import get_running_job_ids
 from hermes_time import now as _hermes_now
 
 logger = logging.getLogger(__name__)
-_KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "unknown"}
+_KNOWN_STATUSES = {"claimed", "running", "completed", "failed", "held", "unknown"}
 _KNOWN_SOURCES = {"builtin", "direct", "external"}
 _KNOWN_DELIVERY_OUTCOMES = {"delivered", "failed", "suppressed", "not_configured"}
 
@@ -105,7 +105,7 @@ def project_execution_event(
         ),
         error_class=(
             classify_cron_error(record.get("error"))
-            if status in {"failed", "unknown"}
+            if status in {"failed", "held", "unknown"}
             else None
         ),
     )
@@ -123,7 +123,7 @@ def emit_execution_state(
         event = project_execution_event(record, delivery_outcome=delivery_outcome)
         target = emitter.get_emitter()
         target.emit(event)
-        if event.status in {"completed", "failed", "unknown"}:
+        if event.status in {"completed", "failed", "held", "unknown"}:
             target.flush(timeout=1.0)
     except Exception:
         logger.debug("cron execution telemetry emit failed", exc_info=True)

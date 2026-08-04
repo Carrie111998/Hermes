@@ -153,6 +153,175 @@ def test_policy_absent_preserves_existing_fallback_continuation():
     resolve_fallback.assert_called_once()
 
 
+def test_explicit_continue_preserves_existing_fallback_continuation():
+    agent = _make_agent(
+        fallback_model=[
+            {
+                "provider": "custom",
+                "model": "qwen3:8b",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "failure_policy": "continue",
+            }
+        ]
+    )
+    fallback_client = MagicMock()
+    fallback_client.base_url = "http://127.0.0.1:11434/v1"
+    fallback_client.api_key = "local-test-key"
+    api_calls: list[tuple[str, str]] = []
+
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fallback_client, "qwen3:8b"),
+    ) as resolve_fallback:
+        result = _run_turn(agent, api_calls)
+
+    assert result["completed"] is True
+    assert result.get("held") is not True
+    assert result["final_response"] == "continued by fallback"
+    assert api_calls == [
+        ("openai-codex", "gpt-5.6-terra"),
+        ("custom", "qwen3:8b"),
+    ]
+    resolve_fallback.assert_called_once()
+
+
+def test_malformed_policy_holds_before_resolution_tools_or_later_continuation():
+    agent = _make_agent(
+        fallback_model=[
+            {
+                "provider": "custom",
+                "model": "malformed-boundary",
+                "failure_policy": "triage_and_notfiy",
+            },
+            {
+                "provider": "openrouter",
+                "model": "must-not-run",
+                "failure_policy": "continue",
+            },
+        ]
+    )
+    api_calls: list[tuple[str, str]] = []
+    fallback_client = MagicMock()
+    fallback_client.base_url = "https://openrouter.ai/api/v1"
+    fallback_client.api_key = "must-not-be-used"
+
+    with patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(fallback_client, "must-not-run"),
+    ) as resolve_fallback:
+        result = _run_turn(agent, api_calls)
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["held"] is True
+    assert result["turn_exit_reason"] == "fallback_policy_invalid"
+    assert "invalid" in result["final_response"].lower()
+    assert "failure_policy" in result["final_response"]
+    assert api_calls == [("openai-codex", "gpt-5.6-terra")]
+    resolve_fallback.assert_not_called()
+    assert agent.provider == "openai-codex"
+    assert agent.model == "gpt-5.6-terra"
+
+
+def test_missing_auth_nous_triage_holds_before_later_continuation():
+    """Quinn Q-D2-C-01-002 exact normal-turn missing-auth regression."""
+    agent = _make_agent(
+        fallback_model=[
+            {
+                "provider": "nous",
+                "model": "local-emergency",
+                "failure_policy": "triage_and_notify",
+            },
+            {
+                "provider": "custom",
+                "model": "must-not-run",
+                "failure_policy": "continue",
+            },
+        ]
+    )
+    api_calls: list[tuple[str, str]] = []
+
+    with (
+        patch("hermes_cli.auth.get_provider_auth_state", return_value={}),
+        patch("agent.auxiliary_client.resolve_provider_client") as resolve_fallback,
+    ):
+        result = _run_turn(agent, api_calls)
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["held"] is True
+    assert result["turn_exit_reason"] == "fallback_triage_held"
+    assert api_calls == [("openai-codex", "gpt-5.6-terra")]
+    resolve_fallback.assert_not_called()
+
+
+def test_cron_missing_auth_nous_triage_reports_held_notifier_failure_without_continuation():
+    """Quinn Q-D2-C-01-002 exact cron missing-auth regression."""
+    agent = _make_agent(
+        platform="cron",
+        fallback_model=[
+            {
+                "provider": "nous",
+                "model": "local-emergency",
+                "failure_policy": "triage_and_notify",
+            },
+            {
+                "provider": "custom",
+                "model": "must-not-run",
+                "failure_policy": "continue",
+            },
+        ],
+    )
+    api_calls: list[tuple[str, str]] = []
+
+    with (
+        patch("hermes_cli.auth.get_provider_auth_state", return_value={}),
+        patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(None, None),
+        ) as resolve_fallback,
+    ):
+        result = _run_turn(agent, api_calls)
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["held"] is True
+    assert result["turn_exit_reason"] == "fallback_triage_local_failed"
+    assert api_calls == [("openai-codex", "gpt-5.6-terra")]
+    resolve_fallback.assert_called_once()
+    assert resolve_fallback.call_args.args[0] == "nous"
+
+
+def test_same_backend_triage_holds_before_later_continuation():
+    """Quinn Q-D2-C-01-002 exact same-backend regression."""
+    agent = _make_agent(
+        fallback_model=[
+            {
+                "provider": "openai-codex",
+                "model": "gpt-5.6-terra",
+                "base_url": "https://primary.invalid/v1",
+                "failure_policy": "triage_and_notify",
+            },
+            {
+                "provider": "custom",
+                "model": "must-not-run",
+                "failure_policy": "continue",
+            },
+        ]
+    )
+    api_calls: list[tuple[str, str]] = []
+
+    with patch("agent.auxiliary_client.resolve_provider_client") as resolve_fallback:
+        result = _run_turn(agent, api_calls)
+
+    assert result["completed"] is False
+    assert result["failed"] is True
+    assert result["held"] is True
+    assert result["turn_exit_reason"] == "fallback_triage_held"
+    assert api_calls == [("openai-codex", "gpt-5.6-terra")]
+    resolve_fallback.assert_not_called()
+
+
 def test_normal_triage_policy_alerts_and_holds_without_local_continuation():
     """A normal high-capability turn is held, not continued on the local model."""
     agent = _make_agent(
@@ -313,7 +482,7 @@ def test_scheduled_triage_uses_only_bounded_toolless_local_notification_context(
     ):
         result = agent.run_conversation(huge_primary_context)
 
-    assert result["completed"] is True
+    assert result["completed"] is False
     assert result["failed"] is False
     assert result["held"] is True
     assert result["turn_exit_reason"] == "fallback_triage_notified"

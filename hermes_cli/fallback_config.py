@@ -6,26 +6,45 @@ from typing import Any
 
 
 # Per-entry schema values for ``fallback_providers`` / legacy ``fallback_model``.
-# Missing or unrecognized values intentionally retain historic continuation.
+# Only an absent key retains historic continuation. A present malformed value
+# is a fail-closed configuration boundary and must never authorize inference.
 FALLBACK_FAILURE_POLICY_CONTINUE = "continue"
 FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY = "triage_and_notify"
+FALLBACK_FAILURE_POLICY_INVALID = "invalid"
 _SUPPORTED_FAILURE_POLICIES = frozenset({
     FALLBACK_FAILURE_POLICY_CONTINUE,
     FALLBACK_FAILURE_POLICY_TRIAGE_AND_NOTIFY,
 })
+INVALID_FALLBACK_POLICY_MESSAGE = (
+    "invalid failure_policy on fallback entry; expected 'continue' or "
+    "'triage_and_notify'"
+)
+
+
+class InvalidFallbackPolicyError(ValueError):
+    """A present fallback policy is not one of the explicit supported values."""
+
+    def __init__(self) -> None:
+        super().__init__(INVALID_FALLBACK_POLICY_MESSAGE)
 
 
 def fallback_failure_policy(entry: dict[str, Any]) -> str:
     """Return the supported failure behavior for one fallback entry.
 
     ``failure_policy`` is per-entry so a chain can mix ordinary continuity
-    fallbacks with an emergency local endpoint. Missing/unknown values fail
-    open to ``continue`` for backwards-compatible config.yaml upgrades.
+    fallbacks with an emergency local endpoint. An absent key preserves the
+    historical ``continue`` behavior. A present unsupported, blank, or
+    non-string value is invalid and fails closed.
     """
-    value = str(entry.get("failure_policy") or "").strip().lower().replace("-", "_")
+    if "failure_policy" not in entry:
+        return FALLBACK_FAILURE_POLICY_CONTINUE
+    raw_value = entry.get("failure_policy")
+    if not isinstance(raw_value, str):
+        return FALLBACK_FAILURE_POLICY_INVALID
+    value = raw_value.strip().lower().replace("-", "_")
     if value in _SUPPORTED_FAILURE_POLICIES:
         return value
-    return FALLBACK_FAILURE_POLICY_CONTINUE
+    return FALLBACK_FAILURE_POLICY_INVALID
 
 
 def fallback_entry_allows_continuation(entry: dict[str, Any]) -> bool:

@@ -1686,25 +1686,65 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    work_status: Optional[str] = None,
+    hold_detail: Optional[str] = None,
+    notification_succeeded: Optional[bool] = None,
+):
     """
     Mark a job as having been run.
     
     Updates last_run_at, last_status, increments completed count,
     computes next_run_at, and auto-deletes if repeat limit reached.
 
+    ``work_status='held'`` records the consequential task separately from
+    its bounded notifier. Held recurring work advances only to the next normal
+    occurrence without replay; held one-shots require manual recreation.
+
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
     """
+    if work_status not in {None, "held"}:
+        raise ValueError(f"Unsupported cron work_status: {work_status}")
+
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
-                job["last_error"] = error if not success else None
+                if work_status == "held":
+                    detail = str(
+                        hold_detail
+                        or error
+                        or "Original scheduled work held; no automatic replay."
+                    )
+                    job["last_status"] = "held"
+                    job["last_error"] = detail
+                    job["held_at"] = now
+                    job["last_notification_status"] = (
+                        "ok"
+                        if notification_succeeded is True
+                        else "error"
+                        if notification_succeeded is False
+                        else "not_attempted"
+                    )
+                    job["last_notification_error"] = (
+                        "bounded notifier failed"
+                        if notification_succeeded is False
+                        else None
+                    )
+                else:
+                    job["last_status"] = "ok" if success else "error"
+                    job["last_error"] = error if not success else None
+                    job["held_at"] = None
+                    job["last_notification_status"] = None
+                    job["last_notification_error"] = None
+                    job["recovery_disposition"] = None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
                 # Clear any external-fire claim so a re-armed recurring job can
@@ -1715,6 +1755,36 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 # is claimable again. No-op if the job never carried a claim.
                 if job.get("run_claim") is not None:
                     job["run_claim"] = None
+
+                if work_status == "held":
+                    kind = job.get("schedule", {}).get("kind")
+                    if kind in {"cron", "interval"}:
+                        # This is the next independent scheduled occurrence,
+                        # never a replay/continuation of the held occurrence.
+                        job["next_run_at"] = compute_next_run(job["schedule"], now)
+                        job["recovery_disposition"] = (
+                            "next_scheduled_occurrence_no_replay"
+                        )
+                        if job["next_run_at"] is None:
+                            job["state"] = "error"
+                            logger.error(
+                                "Held recurring job '%s' could not compute its next run; "
+                                "leaving enabled without replay",
+                                job.get("name", job_id),
+                            )
+                        else:
+                            job["state"] = "scheduled"
+                    else:
+                        # A one-shot's dispatch was consumed before side effects
+                        # began. Keep an explicit terminal hold record and require
+                        # deliberate recreation; never auto-replay consequential
+                        # work whose side-effect state may be uncertain.
+                        job["enabled"] = False
+                        job["state"] = "held"
+                        job["next_run_at"] = None
+                        job["recovery_disposition"] = "manual_recreate_required"
+                    save_jobs(jobs)
+                    return
                 
                 # Increment completed count.  Finite one-shot jobs are
                 # pre-claimed by claim_dispatch() BEFORE the side effect runs

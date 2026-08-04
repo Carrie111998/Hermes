@@ -19,14 +19,58 @@ from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
 MAX_TERMINAL_EXECUTIONS = 1000
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+_TERMINAL_STATES = ("completed", "failed", "held", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
+_EXECUTIONS_TABLE_SQL = """CREATE TABLE IF NOT EXISTS executions (
+     id TEXT PRIMARY KEY,
+     job_id TEXT NOT NULL,
+     source TEXT NOT NULL,
+     process_id TEXT NOT NULL,
+     pid INTEGER NOT NULL,
+     process_started_at INTEGER,
+     status TEXT NOT NULL CHECK(status IN
+       ('claimed','running','completed','failed','held','unknown')),
+     claimed_at TEXT NOT NULL,
+     started_at TEXT,
+     finished_at TEXT,
+     error TEXT
+   )"""
 
 
 def _connect() -> sqlite3.Connection:
     EXECUTIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
     return sqlite3.connect(EXECUTIONS_FILE, timeout=5)
+
+
+def _ensure_held_status_schema(conn: sqlite3.Connection) -> None:
+    """Create or transactionally migrate the status CHECK for ``held``."""
+    existing = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone()
+    if existing is None:
+        conn.execute(_EXECUTIONS_TABLE_SQL)
+        return
+    schema_sql = str(existing[0] or "").lower()
+    if "'held'" in schema_sql or '"held"' in schema_sql:
+        return
+
+    # SQLite cannot ALTER a CHECK constraint. Rename/copy/drop in the caller's
+    # transaction so existing history is either wholly preserved or unchanged.
+    legacy_table = "executions_pre_held_schema"
+    conn.execute(f"ALTER TABLE executions RENAME TO {legacy_table}")
+    conn.execute(_EXECUTIONS_TABLE_SQL)
+    conn.execute(
+        f"""INSERT INTO executions
+            (id, job_id, source, process_id, pid, process_started_at, status,
+             claimed_at, started_at, finished_at, error)
+            SELECT id, job_id, source, process_id, pid, process_started_at,
+                   status, claimed_at, started_at, finished_at, error
+            FROM {legacy_table}"""
+    )
+    # Old index names remain reserved while attached to the renamed table.
+    # Dropping it releases those names before indexes are recreated below.
+    conn.execute(f"DROP TABLE {legacy_table}")
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -36,22 +80,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     conn.execute("PRAGMA busy_timeout=5000")
     apply_wal_with_fallback(conn, db_label="cron/executions.db")
     conn.execute("PRAGMA synchronous=FULL")
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
-             id TEXT PRIMARY KEY,
-             job_id TEXT NOT NULL,
-             source TEXT NOT NULL,
-             process_id TEXT NOT NULL,
-             pid INTEGER NOT NULL,
-             process_started_at INTEGER,
-             status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
-             claimed_at TEXT NOT NULL,
-             started_at TEXT,
-             finished_at TEXT,
-             error TEXT
-           )"""
-    )
+    _ensure_held_status_schema(conn)
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -125,7 +154,7 @@ def _prune_unlocked(conn: sqlite3.Connection) -> None:
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
+             WHERE status IN ('completed','failed','held','unknown')
              ORDER BY claimed_at DESC, id DESC LIMIT -1 OFFSET ?
            )""",
         (limit,),
@@ -175,11 +204,19 @@ def mark_execution_running(execution_id: str) -> Optional[Dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None,
+    work_status: Optional[str] = None,
 ) -> Optional[Dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten."""
+    if work_status not in {None, "held"}:
+        raise ValueError(f"Unsupported cron execution work_status: {work_status}")
     now = _hermes_now().isoformat()
-    status = "completed" if success else "failed"
-    detail = None if success else (str(error) if error else "unknown failure")
+    status = "held" if work_status == "held" else "completed" if success else "failed"
+    if status == "held":
+        detail = str(error) if error else "held without detail"
+    elif success:
+        detail = None
+    else:
+        detail = str(error) if error else "unknown failure"
     with _transaction() as conn:
         cur = conn.execute(
             """UPDATE executions SET status=?, finished_at=?, error=?
