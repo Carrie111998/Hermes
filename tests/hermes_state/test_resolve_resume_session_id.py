@@ -113,10 +113,17 @@ def test_create_session_db_returns_session_db(tmp_path):
 
 
 def test_create_session_db_default_path(tmp_path, monkeypatch):
-    """Factory uses DEFAULT_DB_PATH when no db_path is passed."""
-    from hermes_state import create_session_db, DEFAULT_DB_PATH
+    """Factory uses DEFAULT_DB_PATH when no db_path is passed.
 
-    monkeypatch.setattr("hermes_state.create_session_db", lambda db_path=None: create_session_db.__wrapped__(tmp_path / "state.db"))
-    db = create_session_db()
+    Patches ``hermes_state.DEFAULT_DB_PATH`` so the factory reads the patched
+    module attribute when ``db_path`` is omitted, then asserts the resulting
+    ``SessionDB`` instance is built against that same path.
+    """
+    import hermes_state
+
+    target_path = tmp_path / "state.db"
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", target_path)
+    db = hermes_state.create_session_db()
     assert isinstance(db, SessionDB)
+    assert db.db_path == target_path
     db.close()
