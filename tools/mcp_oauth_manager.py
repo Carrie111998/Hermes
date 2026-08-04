@@ -664,6 +664,16 @@ class MCPOAuthManager:
             if mtime_ns != entry.last_mtime_ns:
                 old = entry.last_mtime_ns
                 entry.last_mtime_ns = mtime_ns
+                if old == 0:
+                    # First observation — the provider was just created and
+                    # already loaded its state from disk.  Record the mtime
+                    # so future checks can detect genuine external refreshes
+                    # without spuriously invalidating.  (#77369)
+                    logger.debug(
+                        "MCP OAuth '%s': recording initial mtime %d",
+                        server_name, mtime_ns,
+                    )
+                    return False
                 # Force the SDK's OAuthClientProvider to reload from storage
                 # on its next auth flow. `_initialized` is private API but
                 # stable across the MCP SDK versions we pin (>=1.26.0).
