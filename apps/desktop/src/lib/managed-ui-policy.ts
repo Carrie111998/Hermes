@@ -20,6 +20,10 @@ export function isManagedConfigFieldVisible(key: string, managed: boolean): bool
   return !managed || !MANAGED_HIDDEN_ADVANCED_FIELDS.has(key)
 }
 
+export function isManagedTerminalUiVisible(managed: boolean): boolean {
+  return !managed
+}
+
 export function isManagedBillingSlashCommand(command: string, managed: boolean): boolean {
   if (!managed) {
     return false

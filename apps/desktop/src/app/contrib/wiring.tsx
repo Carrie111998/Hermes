@@ -923,7 +923,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     [actions, currentView]
   )
 
-  const terminalNode = useMemo(() => <TerminalSurface />, [])
+  const terminalNode = useMemo(() => (managedEva ? null : <TerminalSurface />), [managedEva])
 
   const statusbarNode = useMemo(
     () => (
@@ -1109,7 +1109,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
       <FloatingPet />
 
       {/* Single persistent xterm host chasing the terminal pane's slot rect. */}
-      <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />
+      {!managedEva && <PersistentTerminal onAddSelectionToChat={composer.addTerminalSelectionAttachment} />}
     </ContribWiringContext.Provider>
   )
 }

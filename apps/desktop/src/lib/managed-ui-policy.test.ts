@@ -4,7 +4,8 @@ import {
   assertManagedGatewayMethodAllowed,
   isManagedBillingSlashCommand,
   isManagedConfigFieldVisible,
-  isManagedSettingsViewVisible
+  isManagedSettingsViewVisible,
+  isManagedTerminalUiVisible
 } from './managed-ui-policy'
 
 describe('managed renderer policy', () => {
@@ -31,6 +32,11 @@ describe('managed renderer policy', () => {
     expect(isManagedConfigFieldVisible('terminal.timeout', true)).toBe(true)
     expect(isManagedConfigFieldVisible('agent.max_turns', true)).toBe(true)
     expect(isManagedConfigFieldVisible('toolsets', false)).toBe(true)
+  })
+
+  it('omits terminal UI entry points only for managed builds', () => {
+    expect(isManagedTerminalUiVisible(true)).toBe(false)
+    expect(isManagedTerminalUiVisible(false)).toBe(true)
   })
 
   it('denies only managed billing commands and their legacy alias', () => {
