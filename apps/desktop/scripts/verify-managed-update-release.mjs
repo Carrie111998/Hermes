@@ -100,7 +100,7 @@ export function renderArtifactName(manifest, { arch, ext, version }) {
   return rendered
 }
 
-async function hashFile(filePath) {
+export async function hashFile(filePath) {
   const sha256 = crypto.createHash('sha256')
   const sha512 = crypto.createHash('sha512')
   let bytes = 0
@@ -120,6 +120,16 @@ async function hashFile(filePath) {
     bytes,
     sha256: sha256.digest('hex'),
     sha512: sha512.digest('base64')
+  }
+}
+
+export function getManagedReleaseAssetNames(manifest, { arch, version }) {
+  return {
+    dmg: renderArtifactName(manifest, { arch, ext: 'dmg', version }),
+    dmgBlockmap: renderArtifactName(manifest, { arch, ext: 'dmg.blockmap', version }),
+    updateInfo: 'latest-mac.yml',
+    zip: renderArtifactName(manifest, { arch, ext: 'zip', version }),
+    zipBlockmap: renderArtifactName(manifest, { arch, ext: 'zip.blockmap', version })
   }
 }
 
@@ -252,13 +262,7 @@ export async function verifyManagedUpdateRelease(options = {}) {
     throw new Error('Managed macOS release verification must run on macOS.')
   }
 
-  const names = {
-    dmg: renderArtifactName(manifest, { arch, ext: 'dmg', version }),
-    dmgBlockmap: renderArtifactName(manifest, { arch, ext: 'dmg.blockmap', version }),
-    updateInfo: 'latest-mac.yml',
-    zip: renderArtifactName(manifest, { arch, ext: 'zip', version }),
-    zipBlockmap: renderArtifactName(manifest, { arch, ext: 'zip.blockmap', version })
-  }
+  const names = getManagedReleaseAssetNames(manifest, { arch, version })
   const required = [names.dmg, names.dmgBlockmap, names.zip, names.zipBlockmap, names.updateInfo]
 
   for (const name of required) {

@@ -4,7 +4,9 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import test from 'node:test'
+import zlib from 'node:zlib'
 
+import { refreshAndVerifyManagedUpdateRelease } from './refresh-managed-update-metadata.mjs'
 import {
   parseManagedUpdateInfo,
   renderArtifactName,
@@ -193,6 +195,74 @@ test('fails before extraction when the appcast SHA-512 does not match the ZIP', 
       }),
       /SHA-512 does not match/
     )
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('rejects a stapled DMG while its pre-staple update metadata is stale', async () => {
+  const fixture = createReleaseFixture()
+  const dmgPath = path.join(fixture.releaseDir, `evaOS-Agent-${manifest.version}-arm64.dmg`)
+  fs.appendFileSync(dmgPath, ' stapled ticket')
+
+  try {
+    await assert.rejects(
+      verifyManagedUpdateRelease({
+        manifest,
+        platform: 'darwin',
+        releaseDir: fixture.releaseDir,
+        runCommand: async () => {
+          throw new Error('artifact extraction must not run')
+        }
+      }),
+      /size does not match .*\.dmg/
+    )
+  } finally {
+    fixture.cleanup()
+  }
+})
+
+test('regenerates the stapled DMG blockmap and metadata without changing ZIP identity', async () => {
+  const fixture = createReleaseFixture()
+  const base = `evaOS-Agent-${manifest.version}-arm64`
+  const dmgPath = path.join(fixture.releaseDir, `${base}.dmg`)
+  const blockmapPath = path.join(fixture.releaseDir, `${base}.dmg.blockmap`)
+  const updateInfoPath = path.join(fixture.releaseDir, 'latest-mac.yml')
+  const originalInfo = parseManagedUpdateInfo(fs.readFileSync(updateInfoPath, 'utf8'))
+  const originalZip = originalInfo.files.find(file => file.url === `${base}.zip`)
+  fs.appendFileSync(dmgPath, ' stapled ticket')
+
+  try {
+    const result = await refreshAndVerifyManagedUpdateRelease({
+      manifest,
+      platform: 'darwin',
+      releaseDir: fixture.releaseDir,
+      runCommand: fakeMacCommands([])
+    })
+    const refreshedInfo = parseManagedUpdateInfo(fs.readFileSync(updateInfoPath, 'utf8'))
+    const refreshedZip = refreshedInfo.files.find(file => file.url === `${base}.zip`)
+    const refreshedDmg = refreshedInfo.files.find(file => file.url === `${base}.dmg`)
+    const firstBlockmap = fs.readFileSync(blockmapPath)
+    const firstUpdateInfo = fs.readFileSync(updateInfoPath, 'utf8')
+    const decodedBlockmap = JSON.parse(zlib.gunzipSync(firstBlockmap).toString('utf8'))
+
+    assert.deepEqual(refreshedZip, originalZip)
+    assert.equal(refreshedInfo.path, originalInfo.path)
+    assert.equal(refreshedInfo.sha512, originalInfo.sha512)
+    assert.equal(refreshedDmg.size, fs.statSync(dmgPath).size)
+    assert.equal(refreshedDmg.sha512, digest(fs.readFileSync(dmgPath)))
+    assert.equal(result.refreshed.size, refreshedDmg.size)
+    assert.equal(decodedBlockmap.files[0].sizes.reduce((total, size) => total + size, 0), refreshedDmg.size)
+    assert.equal(result.verified.version, manifest.version)
+
+    await refreshAndVerifyManagedUpdateRelease({
+      manifest,
+      platform: 'darwin',
+      releaseDir: fixture.releaseDir,
+      runCommand: fakeMacCommands([])
+    })
+    assert.deepEqual(fs.readFileSync(blockmapPath), firstBlockmap)
+    assert.equal(fs.readFileSync(updateInfoPath, 'utf8'), firstUpdateInfo)
   } finally {
     fixture.cleanup()
   }
