@@ -59,6 +59,11 @@ def _bare_adapter():
     a._fatal_error_retryable = True
     a._polling_network_error_count = 0
     a._polling_conflict_count = 0
+    # `_polling_conflict_recovery_generation` is set in __init__ (adapter.py);
+    # __new__ bypasses it, and _on_polling_io_progress dereferences it, so a
+    # bare adapter must carry the same default (None) or progress recording
+    # raises AttributeError.
+    a._polling_conflict_recovery_generation = None
     a._polling_error_callback_ref = None
     a._background_tasks = set()
     a._send_path_degraded = False
