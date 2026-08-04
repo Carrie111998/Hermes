@@ -839,9 +839,20 @@ def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
     return str(raw_desc).strip().strip("'\"") if raw_desc else ""
 
 
+def _normalize_skill_routing(frontmatter: Dict[str, Any]) -> str:
+    """Normalize the optional short routing hint from frontmatter."""
+    raw_routing = frontmatter.get("routing", "")
+    return str(raw_routing).strip().strip("'\"") if raw_routing else ""
+
+
 def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
-    """Extract a system-prompt-length description from parsed frontmatter."""
-    desc = _normalize_skill_description(frontmatter)
+    """Extract the short routing hint used in the system-prompt skill index.
+
+    ``routing`` is preferred when present so a detailed human-facing
+    ``description`` can remain intact without consuming prompt budget.
+    Legacy skills continue to use ``description`` and are truncated as before.
+    """
+    desc = _normalize_skill_routing(frontmatter) or _normalize_skill_description(frontmatter)
     if not desc:
         return ""
     if len(desc) > SKILL_PROMPT_DESC_LIMIT:
@@ -850,8 +861,8 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
 
 
 def is_skill_description_truncated_for_prompt(frontmatter: Dict[str, Any]) -> bool:
-    """True when the description will be truncated in the system prompt skill index."""
-    desc = _normalize_skill_description(frontmatter)
+    """True when the effective routing hint is truncated in the system prompt."""
+    desc = _normalize_skill_routing(frontmatter) or _normalize_skill_description(frontmatter)
     return len(desc) > SKILL_PROMPT_DESC_LIMIT
 
 

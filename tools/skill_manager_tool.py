@@ -604,13 +604,17 @@ def _validate_frontmatter(content: str, *, new_skill: bool = False) -> Optional[
     desc = str(parsed["description"])
     if len(desc) > MAX_DESCRIPTION_LENGTH:
         return f"Description exceeds {MAX_DESCRIPTION_LENGTH} characters."
-    if new_skill and len(desc.strip().strip("'\"")) > SKILL_PROMPT_DESC_LIMIT:
+    routing = str(parsed.get("routing", "")).strip().strip("'\"")
+    if routing and len(routing) > SKILL_PROMPT_DESC_LIMIT:
         return (
-            f"Description is {len(desc.strip())} chars — new skills must fit the "
-            f"{SKILL_PROMPT_DESC_LIMIT}-char system-prompt budget (one sentence, "
-            f"trigger first, ends with a period). The skill index truncates "
-            f"longer descriptions to {SKILL_PROMPT_DESC_LIMIT - 3} chars + '...', "
-            f"destroying the routing signal. Move detail into the skill body."
+            f"Routing description exceeds {SKILL_PROMPT_DESC_LIMIT} characters; "
+            "keep the routing hint short and move detail into 'description' or the skill body."
+        )
+    if new_skill and len(desc.strip().strip("'\"")) > SKILL_PROMPT_DESC_LIMIT and not routing:
+        return (
+            f"Description is {len(desc.strip())} chars — add a short 'routing' "
+            f"field of {SKILL_PROMPT_DESC_LIMIT} characters or fewer for the "
+            "system-prompt skill index."
         )
 
     body = content[end_match.end() + 3:].strip()

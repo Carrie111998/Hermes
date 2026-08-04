@@ -566,13 +566,12 @@ See `skills/gifs/gif-search/` and `skills/email/himalaya/` for examples.
 
 Every new or modernized skill — bundled, optional, or contributed — must meet these standards before merge. Reviewers reject PRs that violate them.
 
-1. **`description` ≤ 60 characters, one sentence, ends with a period.** Long descriptions bloat the skill listing UI and dilute the model's attention when many skills are loaded. State the capability, not the implementation. No marketing words ("powerful", "comprehensive", "seamless", "advanced"). Don't repeat the skill name. Verify with:
+1. **The `routing` hint must be ≤ 60 characters, one sentence, and end with a period.** Use the optional frontmatter `routing:` field for the system-prompt skill index. Keep `description:` human-readable and complete (up to 1024 characters); it is not silently truncated when `routing:` is present. State the capability, not the implementation. No marketing words ("powerful", "comprehensive", "seamless", "advanced"). Don't repeat the skill name. If `routing:` is absent, legacy skills fall back to truncated `description:` behavior. Verify with:
    ```python
-   import re, pathlib
-   m = re.search(r'^description: (.*)$',
-                 pathlib.Path('skills/<cat>/<name>/SKILL.md').read_text(),
-                 re.MULTILINE)
-   assert len(m.group(1)) <= 60, len(m.group(1))
+   import re, pathlib, yaml
+   fm = pathlib.Path('skills/<cat>/<name>/SKILL.md').read_text()
+   data = yaml.safe_load(fm.split('---', 2)[1])
+   assert len(data.get('routing', data['description'])) <= 60
    ```
 
    Good: `Search arXiv papers by keyword, author, category, or ID.`

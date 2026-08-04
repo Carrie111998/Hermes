@@ -388,7 +388,7 @@ Cómo confirma el agente que funcionó.
 
 Todo skill nuevo o modernizado — incluido, opcional o contribuido — debe cumplir estos estándares antes del merge:
 
-1. **`description` ≤ 60 caracteres, una oración, termina con punto.** Las descripciones largas saturan la UI de listado de habilidades. Indica la capacidad, no la implementación. Sin palabras de marketing ("potente", "completo", "fluido", "avanzado").
+1. **La pista `routing` debe tener ≤ 60 caracteres, ser una oración y terminar en punto.** Usa el campo opcional `routing:` del frontmatter para el índice del system prompt. Mantén `description:` completa y legible (hasta 1024 caracteres); con `routing:` presente no se trunca silenciosamente. Si falta `routing:`, las habilidades antiguas usan el comportamiento heredado de truncar `description:`.
 
 2. **Las herramientas referenciadas en el cuerpo de SKILL.md deben ser herramientas nativas de Hermes o servidores MCP que la habilidad espere explícitamente.** Usa los nombres de herramientas en comillas invertidas: `` `terminal` ``, `` `web_extract` ``, `` `web_search` ``, `` `read_file` ``, `` `write_file` ``, etc.
 

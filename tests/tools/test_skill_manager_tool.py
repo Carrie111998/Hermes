@@ -114,6 +114,17 @@ class TestValidateFrontmatter:
     def test_invalid_yaml(self):
         content = "---\n: invalid: yaml: {{{\n---\n\nBody.\n"
         assert "YAML frontmatter parse error" in _validate_frontmatter(content)
+    def test_long_description_with_routing_field_is_valid_for_new_skill(self):
+        content = "---\nname: long-desc\ndescription: " + ("A" * 120) + "\nrouting: Use for long descriptions.\n---\n\nBody.\n"
+        assert _validate_frontmatter(content, new_skill=True) is None
+
+    def test_long_description_without_routing_field_is_rejected_for_new_skill(self):
+        content = "---\nname: long-desc\ndescription: " + ("A" * 120) + "\n---\n\nBody.\n"
+        assert "system-prompt skill index" in _validate_frontmatter(content, new_skill=True)
+
+    def test_routing_field_must_fit_prompt_budget(self):
+        content = "---\nname: long-desc\ndescription: Full description.\nrouting: " + ("A" * 61) + "\n---\n\nBody.\n"
+        assert "routing" in _validate_frontmatter(content, new_skill=True)
 
 
 # ---------------------------------------------------------------------------

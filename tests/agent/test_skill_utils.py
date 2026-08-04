@@ -12,6 +12,8 @@ from agent.skill_utils import (
     is_skill_support_path,
     iter_skill_index_files,
     parse_frontmatter,
+    extract_skill_description,
+    is_skill_description_truncated_for_prompt,
     resolve_skill_config_values,
     skill_matches_platform,
     skill_matches_platform_list,
@@ -28,7 +30,24 @@ from agent.skill_utils import (
 
 
 
-def test_skill_config_helpers_share_raw_config_parse_cache(tmp_path, monkeypatch):
+def test_skill_prompt_uses_short_routing_field_for_long_description():
+    frontmatter = {
+        "description": "A detailed description that is intentionally much longer than the prompt routing budget and remains available in the skill metadata.",
+        "routing": "Use for Sion elder financial reports.",
+    }
+
+    assert extract_skill_description(frontmatter) == "Use for Sion elder financial reports."
+    assert is_skill_description_truncated_for_prompt(frontmatter) is False
+
+
+def test_legacy_long_description_still_truncates_without_routing_field():
+    frontmatter = {"description": "A" * 80}
+
+    assert extract_skill_description(frontmatter).endswith("...")
+    assert is_skill_description_truncated_for_prompt(frontmatter) is True
+
+
+def test_skill_config_helpers_share_raw_config_cache(tmp_path, monkeypatch):
     """Repeated skill config helpers should parse config.yaml only once."""
     from agent import skill_utils
 
