@@ -8,6 +8,7 @@ import time
 import pytest
 import psutil
 
+import agent.local_endpoint_lane as lane_module
 from agent.local_endpoint_lane import (
     lane_dir_for_endpoint,
     local_endpoint_lane,
@@ -84,6 +85,20 @@ def test_lane_path_is_endpoint_scoped_without_leaking_url(tmp_path: Path) -> Non
     assert first != other_port
     assert "10240" not in first.name
     assert "127.0.0.1" not in first.name
+
+
+def test_default_lane_root_is_shared_across_hermes_profiles(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(lane_module.tempfile, "gettempdir", lambda: str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-a"))
+    first = lane_dir_for_endpoint(ENDPOINT)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile-b"))
+    second = lane_dir_for_endpoint(ENDPOINT)
+
+    assert first == second
+    assert first.parent.parent == tmp_path
 
 
 def test_fifo_order_across_threads(tmp_path: Path) -> None:

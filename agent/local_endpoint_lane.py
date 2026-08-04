@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import tempfile
 import threading
 import time
 from typing import Callable, Iterator
@@ -22,10 +23,16 @@ import uuid
 import psutil
 
 from agent.model_metadata import is_local_endpoint
-from hermes_constants import get_hermes_home
 
 
 _LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _default_state_root() -> Path:
+    """Return one per-user runtime root shared by all Hermes profiles."""
+
+    suffix = f"-{os.getuid()}" if hasattr(os, "getuid") else ""
+    return Path(tempfile.gettempdir()) / f"hermes-local-endpoint-lanes{suffix}"
 
 
 @dataclass(frozen=True)
@@ -55,7 +62,7 @@ def lane_dir_for_endpoint(
 ) -> Path:
     """Return a privacy-preserving, origin-scoped directory for *base_url*."""
 
-    root = state_root or (get_hermes_home() / "state" / "local-endpoint-lanes")
+    root = state_root or _default_state_root()
     lane_id = hashlib.sha256(_endpoint_origin(base_url).encode("utf-8")).hexdigest()[:24]
     return Path(root) / lane_id
 
@@ -188,7 +195,7 @@ def local_endpoint_lane(
         raise ValueError("timeout_s cannot be negative")
 
     lane_dir = lane_dir_for_endpoint(base_url, state_root=state_root)
-    lane_dir.mkdir(parents=True, exist_ok=True)
+    lane_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
     lane_id = lane_dir.name
     ticket = lane_dir / (
         f"ticket-{time.time_ns():020d}-{os.getpid():010d}-{uuid.uuid4().hex}.json"
