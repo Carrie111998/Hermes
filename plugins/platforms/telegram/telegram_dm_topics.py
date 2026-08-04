@@ -36,8 +36,6 @@ logger = logging.getLogger("plugins.platforms.telegram.adapter")
 class TelegramDmTopicMixin:
     """DM-topic routing/creation/persistence methods for TelegramAdapter."""
 
-
-
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
         if not metadata:
