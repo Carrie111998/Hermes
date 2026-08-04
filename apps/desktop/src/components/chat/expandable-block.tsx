@@ -33,7 +33,11 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
     <div className="relative">
       <div
         className={cn(
-          'expandable-block-scroll overflow-y-auto',
+          // `expandable-block-scroll` ensures that the fade is removed when user scrolls to the bottom
+          // CSS of this class defined in apps/deskop/src/style.css
+          // `scrollbar-overlay` opts out of the app-wide classic thin gutters so
+          // this scroller keeps platform overlay bars (no always-on track).
+          'expandable-block-scroll scrollbar-overlay overflow-y-auto overflow-x-auto',
           expanded ? 'max-h-[40dvh]' : 'max-h-[7.5rem]',
           className
         )}
@@ -42,15 +46,19 @@ export function ExpandableBlock({ children, className }: ExpandableBlockProps) {
         {children}
       </div>
       {overflowing && (
-        <button
-          aria-expanded={expanded}
-          aria-label={expanded ? 'Collapse' : 'Expand'}
-          className="absolute inset-x-0 bottom-0 flex h-7 cursor-pointer items-end justify-center pb-1 text-muted-foreground/70 transition-colors hover:text-foreground"
-          onClick={() => setExpanded(v => !v)}
-          type="button"
-        >
-          <ChevronDown className={cn('size-3.5 transition-transform', expanded && 'rotate-180')} />
-        </button>
+        // The button should not span the full bottom edge so that both sideways
+        // scrolling and rtext selection are not intercepted
+        <div className="pointer-events-none absolute inset-x-0 bottom-0 flex h-7 justify-end bg-linear-to-t">
+          <button
+            aria-expanded={expanded}
+            aria-label={expanded ? 'Collapse' : 'Expand'}
+            className="pointer-events-auto flex h-7 w-9 cursor-pointer items-end justify-center pb-1 text-muted-foreground/70 transition-colors hover:text-foreground"
+            onClick={() => setExpanded(v => !v)}
+            type="button"
+          >
+            <ChevronDown className={cn('size-3.5 transition-transform', expanded && 'rotate-180')} />
+          </button>
+        </div>
       )}
     </div>
   )
