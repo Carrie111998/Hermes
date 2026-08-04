@@ -54,6 +54,9 @@ RUN_SETUP=true
 SKIP_RUST=false
 WITH_SEMANTIC_MEMORY=false
 WITH_AGENT_GRAPH=false
+WITH_CLAIM_LEDGER=false
+WITH_CEA_GRAPH=false
+WITH_PILOT_BRIDGE=false
 WITH_JOSH_SETUP=false
 
 # ── Logging ─────────────────────────────────────────────────────────
@@ -92,8 +95,11 @@ show_help() {
     echo
     echo "  --with-semantic-memory   Install semantic-memory MCP server (knowledge base)"
     echo "  --with-agent-graph       Install agent-graph MCP server (multi-agent graphs)"
-    echo "  --with-all-mcp           Install both MCP servers above"
-    echo "  --with-josh-setup        Full Josh's setup: skills + hooks + MCP servers"
+    echo "  --with-claim-ledger      Install claim-ledger MCP server (evidence verification)"
+    echo "  --with-cea-graph         Install cea-graph MCP server (causal edit attribution)"
+    echo "  --with-pilot-bridge      Install pilot-bridge MCP server (forge-pilot OODA loops)"
+    echo "  --with-all-mcp           Install all five MCP servers above"
+    echo "  --with-josh-setup        Full setup: all MCP + 70+ skills + 12 hooks"
     echo "  --help                   Show this message"
     echo
     echo "Disable Rust acceleration after install:"
@@ -110,7 +116,10 @@ while [ $# -gt 0 ]; do
         --branch)       BRANCH="$2"; shift 2 ;;
         --with-semantic-memory)  WITH_SEMANTIC_MEMORY=true; shift ;;
         --with-agent-graph)      WITH_AGENT_GRAPH=true; shift ;;
-        --with-all-mcp) WITH_SEMANTIC_MEMORY=true; WITH_AGENT_GRAPH=true; shift ;;
+        --with-claim-ledger)     WITH_CLAIM_LEDGER=true; shift ;;
+        --with-cea-graph)        WITH_CEA_GRAPH=true; shift ;;
+        --with-pilot-bridge)     WITH_PILOT_BRIDGE=true; shift ;;
+        --with-all-mcp) WITH_SEMANTIC_MEMORY=true; WITH_AGENT_GRAPH=true; WITH_CLAIM_LEDGER=true; WITH_CEA_GRAPH=true; WITH_PILOT_BRIDGE=true; shift ;;
         --with-josh-setup) WITH_JOSH_SETUP=true; shift ;;
         --help)         show_help ;;
         *)              warn "Unknown option: $1"; show_help ;;
@@ -399,6 +408,106 @@ UNITEOF
                 warn "Could not enable agent-graph systemd unit"
             info "Edit $env_file with your API key, then: systemctl --user start agent-graph-mcpd"
         fi
+
+        # ── claim-ledger ──────────────────────────────────────────
+        if [ "$WITH_CLAIM_LEDGER" = true ]; then
+            echo
+            step "Installing claim-ledger MCP server..."
+            info "  Evidence/claim verification ledger. Hash-chained proof debt tracking."
+            info "  Verifies claims, judges support state, exports cryptographic receipts."
+
+            local asset="claim-ledger-mcp"
+            local url="https://github.com/RecursiveIntell/hermes-agent/releases/latest/download/${asset}"
+            local dest="$HOME/.local/bin/claim-ledger-mcp"
+
+            if [ "$OS" != "linux" ]; then
+                warn "  Prebuilt binary only available for Linux. Build from source:"
+                warn "    cargo install claim-ledger-mcp"
+            elif curl -fsSL "$url" -o "$dest" 2>/dev/null; then
+                chmod +x "$dest"
+                ok "claim-ledger-mcp → $dest"
+                # Register in Hermes config with --ledger-dir
+                if [ "$USE_VENV" = true ]; then
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.claim_ledger.command "$dest" 2>/dev/null
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.claim_ledger.enabled true 2>/dev/null
+                else
+                    hermes config set mcp_servers.claim_ledger.command "$dest" 2>/dev/null
+                    hermes config set mcp_servers.claim_ledger.enabled true 2>/dev/null
+                fi
+                installed_any=true
+            else
+                fail "claim-ledger-mcp download failed. Build from source:"
+                fail "  cargo install claim-ledger-mcp"
+            fi
+        fi
+
+        # ── cea-graph ─────────────────────────────────────────────
+        if [ "$WITH_CEA_GRAPH" = true ]; then
+            echo
+            step "Installing cea-graph MCP server..."
+            info "  Causal Edit Attribution — predicts edit risk from real causal graph."
+            info "  Analyzes code edits for correctness risk before they land."
+
+            local asset="cea-graph-mcp-linux-x64.tar.gz"
+            local url="https://github.com/RecursiveIntell/hermes-agent/releases/latest/download/${asset}"
+            local tarball="/tmp/cea-graph.tar.gz"
+            local dest_dir="$HOME/.local/lib/cea-graph-mcp"
+
+            if [ "$OS" != "linux" ]; then
+                warn "  Prebuilt package only available for Linux"
+            elif curl -fsSL "$url" -o "$tarball" 2>/dev/null; then
+                mkdir -p "$dest_dir"
+                tar -xzf "$tarball" -C "$dest_dir" 2>/dev/null && \
+                    chmod +x "$dest_dir/cea-graph" "$dest_dir/cea-graph-mcp.py" 2>/dev/null
+                rm -f "$tarball"
+                ok "cea-graph → $dest_dir/"
+                # Register in Hermes config
+                if [ "$USE_VENV" = true ]; then
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.cea_graph.command "$dest_dir/cea-graph-mcp.py" 2>/dev/null
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.cea_graph.enabled true 2>/dev/null
+                else
+                    hermes config set mcp_servers.cea_graph.command "$dest_dir/cea-graph-mcp.py" 2>/dev/null
+                    hermes config set mcp_servers.cea_graph.enabled true 2>/dev/null
+                fi
+                installed_any=true
+            else
+                fail "cea-graph download failed"
+            fi
+        fi
+
+        # ── pilot-bridge ──────────────────────────────────────────
+        if [ "$WITH_PILOT_BRIDGE" = true ]; then
+            echo
+            step "Installing pilot-bridge MCP server..."
+            info "  Forge-pilot closed-loop evaluation. Observe, bootstrap, evaluate"
+            info "  Rust workspaces with governed OODA loops and lineage receipts."
+
+            local asset="pilot-bridge-mcp-linux-x64.tar.gz"
+            local url="https://github.com/RecursiveIntell/hermes-agent/releases/latest/download/${asset}"
+            local tarball="/tmp/pilot-bridge.tar.gz"
+            local dest_dir="$HOME/.local/lib/pilot-bridge-mcp"
+
+            if [ "$OS" != "linux" ]; then
+                warn "  Prebuilt package only available for Linux"
+            elif curl -fsSL "$url" -o "$tarball" 2>/dev/null; then
+                mkdir -p "$dest_dir"
+                tar -xzf "$tarball" -C "$dest_dir" 2>/dev/null && \
+                    chmod +x "$dest_dir/pilot-bridge" "$dest_dir/pilot-bridge-mcp.py" 2>/dev/null
+                rm -f "$tarball"
+                ok "pilot-bridge → $dest_dir/"
+                # Register in Hermes config
+                if [ "$USE_VENV" = true ]; then
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.pilot_bridge.command "$dest_dir/pilot-bridge-mcp.py" 2>/dev/null
+                    "$INSTALL_DIR/.venv/bin/hermes" config set mcp_servers.pilot_bridge.enabled true 2>/dev/null
+                else
+                    hermes config set mcp_servers.pilot_bridge.command "$dest_dir/pilot-bridge-mcp.py" 2>/dev/null
+                    hermes config set mcp_servers.pilot_bridge.enabled true 2>/dev/null
+                fi
+                installed_any=true
+            else
+                fail "pilot-bridge download failed"
+            fi
+        fi
     fi
 }
 
@@ -415,10 +524,13 @@ install_josh_setup() {
     echo
 
     # Enable MCP servers if not already selected
-    if [ "$WITH_SEMANTIC_MEMORY" != true ] || [ "$WITH_AGENT_GRAPH" != true ]; then
-        info "Enabling MCP servers (required for full setup)..."
+    if [ "$WITH_SEMANTIC_MEMORY" != true ] || [ "$WITH_AGENT_GRAPH" != true ] || [ "$WITH_CLAIM_LEDGER" != true ] || [ "$WITH_CEA_GRAPH" != true ] || [ "$WITH_PILOT_BRIDGE" != true ]; then
+        info "Enabling all MCP servers (required for full setup)..."
         WITH_SEMANTIC_MEMORY=true
         WITH_AGENT_GRAPH=true
+        WITH_CLAIM_LEDGER=true
+        WITH_CEA_GRAPH=true
+        WITH_PILOT_BRIDGE=true
         install_mcp_servers
     fi
 
@@ -520,6 +632,12 @@ if '${WITH_SEMANTIC_MEMORY}' == 'true':
     cfg.setdefault('mcp_servers', {})
     sm = cfg['mcp_servers'].setdefault('semantic_memory', {})
     sm.setdefault('args', ['--memory-dir', os.path.expanduser('$HERMES_HOME/semantic-memory.db')])
+
+# Set claim-ledger args if installed
+if '${WITH_CLAIM_LEDGER}' == 'true':
+    cfg.setdefault('mcp_servers', {})
+    cl = cfg['mcp_servers'].setdefault('claim_ledger', {})
+    cl.setdefault('args', ['--ledger-dir', os.path.expanduser('$HERMES_HOME/claim-ledger')])
 
 # Set agent-graph socket args if installed
 if '${WITH_AGENT_GRAPH}' == 'true':
