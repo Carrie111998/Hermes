@@ -1024,6 +1024,26 @@ _REMOVALS_JOURNAL_NAME = "removals.jsonl"
 _REMOVAL_MASS_DROP_THRESHOLD = 1
 _PID = os.getpid()
 
+# Fail-closed mark_job_run (t_95fbd07c C2): a completed execution whose
+# jobs.json write is dropped (job removed/zombie between run and mark, or a
+# stale-snapshot clobber) must be probe-visible, never a silent skip. Every
+# not-found mark_job_run appends here; the mechanism-liveness collector reads
+# this journal to surface a counter + last error.
+_MARK_JOB_RUN_SKIPS_JOURNAL_NAME = "mark_job_run_skips.jsonl"
+
+# Completion metadata fields that must NEVER regress on a shared job. When a
+# job exists in both the incoming list and the on-disk store, these fields come
+# from whichever side has the newer ``last_run_at``; everything else follows
+# the incoming (caller) intent. Prevents a stale snapshot writer (second CLI,
+# long-held load, checkout restore) from erasing a fresher completion's write.
+_COMPLETION_FIELDS = (
+    "last_run_at",
+    "last_status",
+    "last_error",
+    "last_delivery_error",
+    "next_run_at",
+)
+
 
 def _read_on_disk_job_list() -> List[Dict[str, Any]]:
     """Best-effort re-read of the on-disk jobs list (defensive, never raises)."""
@@ -1070,6 +1090,39 @@ def _journal_removed_job(job: Dict[str, Any]):
         logger.error("Lost-update guard: failed to append removal journal (%s)", e)
 
 
+def _journal_mark_job_run_skip(job_id: str, success: bool, error: Optional[str]):
+    """Append one append-only line to <cron dir>/mark_job_run_skips.jsonl.
+
+    Fail-closed audit (t_95fbd07c C2): when ``mark_job_run`` cannot find the
+    job in the store it must not silently drop the completion's last_run_at
+    write. Every such skip is journaled here so the mechanism-liveness
+    collector can surface a probe-visible counter + last_error instead of the
+    drop being invisible (the cf46180e12ee / b14dae422186 class). Never
+    raises — the audit trail must never break the write path.
+    """
+    try:
+        store = _current_cron_store()
+        journal_path = store.cron_dir / _MARK_JOB_RUN_SKIPS_JOURNAL_NAME
+        ensure_dirs()
+        line = {
+            "ts": _hermes_now().isoformat(),
+            "job_id": job_id,
+            "success": bool(success),
+            "error": error,
+            "pid": _PID,
+            "HERMES_PROFILE": os.getenv("HERMES_PROFILE", ""),
+            "HERMES_KANBAN_TASK": os.getenv("HERMES_KANBAN_TASK", ""),
+        }
+        with open(journal_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(line) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        _secure_file(journal_path)
+    except Exception as e:  # pragma: no cover - best-effort audit only
+        logger.error("mark_job_run skip journal: failed to append (%s)", e)
+
+
+
 def _merge_jobs_for_write(
     incoming: List[Dict[str, Any]],
     *,
@@ -1091,8 +1144,42 @@ def _merge_jobs_for_write(
     merged = dict(incoming_by_id)
     dropped_enabled = 0
 
+    def _pick_completion_fields(oid: str, incoming_job: Dict[str, Any], on_disk_job: Dict[str, Any]) -> Dict[str, Any]:  # noqa: ARG001 (oid kept for symmetry with loop variable typing)
+        """Merge completion metadata so it can never regress on a shared job.
+
+        The incoming (caller) dict carries the caller's intent for structural
+        fields (schedule, prompt, enabled, ...). But completion metadata
+        (last_run_at / last_status / last_error / last_delivery_error /
+        next_run_at) is monotonic in time: a stale snapshot must not erase a
+        fresher completion's write. Whichever side has the newer
+        ``last_run_at`` supplies those fields; everything else stays with the
+        incoming job. When only one side has a last_run_at, that side wins the
+        completion fields (a never-run snapshot must not blank a completion).
+        """
+        incoming_last = incoming_job.get("last_run_at")
+        disk_last = on_disk_job.get("last_run_at")
+
+        def _dt(value):
+            if not value:
+                return None
+            try:
+                return datetime.fromisoformat(str(value))
+            except ValueError:
+                return None
+
+        inc_dt = _dt(incoming_last)
+        disk_dt = _dt(disk_last)
+        if disk_dt is not None and (inc_dt is None or disk_dt > inc_dt):
+            merged_job = dict(incoming_job)
+            for field in _COMPLETION_FIELDS:
+                if field in on_disk_job:
+                    merged_job[field] = on_disk_job[field]
+            return merged_job
+        return incoming_job
+
     for oid, on_disk_job in on_disk_by_id.items():
         if oid in incoming_by_id:
+            merged[oid] = _pick_completion_fields(oid, incoming_by_id[oid], on_disk_job)
             continue
         if oid in removed_ids:
             continue
@@ -1855,6 +1942,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        _journal_mark_job_run_skip(job_id, success, error)
 
 
 def claim_dispatch(job_id: str) -> bool:

@@ -3268,6 +3268,163 @@ def _handle_cron_dead_pin(job: dict, script_path: str, script_output: str) -> No
         logger.error("Dead-pin auto-pause failed for job '%s': %s", job_id, e)
 
 
+# --- Missing-script startup preflight -------------------------------------
+# A cron job whose ``script`` path does not exist on disk fails *silently* in
+# production: ``_run_job_script`` hard-fails per run (``Script not found``) but
+# the error is only delivered to the job's own (often ``local`` / silent)
+# deliver target — never to a noise channel. The result is a black hole: a job
+# can error every tick for days (the elon preflight caught 3 jarvis jobs doing
+# exactly this for ~2 days) with no operator alert. We close that by asserting
+# at scheduler load / fleet startup that every enabled, script-bearing cron
+# job can actually resolve its script, and by routing any misses to
+# #critical-alerts (Discord). This is the structural complement to the existing
+# per-run error — it makes the failure LOUD on startup instead of silent.
+#
+# NOTE: this is the in-scope part of commit 50dafd6a0. The interpreter-teardown
+# guard that the same source commit also carried (t_dfd9b303) is intentionally
+# NOT ported here — it belongs to a different task and is handled elsewhere.
+# This port touches ONLY the missing-script preflight.
+# Classification mirrors the prior cron-doctor discipline: this is the
+# "missing-script" (black-hole) class — distinct from a *genuine* script
+# runtime error or a *designed* health-watchdog sentinel, which are handled
+# separately in run_job.
+# Minimum gap between repeated #critical-alerts preflight blasts so a broken
+# job does not spam the channel every 60s tick. ~6h keeps it loud without
+# noisome.
+_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS = 6 * 60 * 60
+# Module-level timestamp of the last preflight blast — keyed by job id so each
+# broken job re-alerts on its own cooldown, not globally.
+_script_preflight_last_alert_at: dict[str, float] = {}
+# Whether the startup (force) preflight has fired since this scheduler process
+# loaded. The first tick that acquires the lock runs the forced assertion; all
+# later ticks use cooldown-gated re-alerts. Reset on module reload (hermes
+# update) which is exactly the startup we want to re-assert.
+_script_preflight_startup_done: bool = False
+
+
+def _resolve_script_path(script_path: str) -> tuple[bool, "Path | None", "str | None"]:
+    """Resolve a cron job ``script`` value to a concrete on-disk path.
+
+    Shared by the startup preflight (``_run_cron_script_preflight``) so both
+    validate against the *exact* same rules as the per-run executor — no
+    divergence between "does it run" and "will it run at startup".
+
+    Returns:
+        ``(ok, resolved_path, error)`` where ``ok`` is True when the path is
+        inside ``HERMES_HOME/scripts`` and exists as a regular file. On failure
+        ``error`` carries the human-readable reason (one of the
+        ``Script not found`` / ``Blocked`` / ``not a file`` messages) and
+        ``resolved_path`` is None.
+    """
+    scripts_dir = _get_hermes_home() / "scripts"
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    scripts_dir_resolved = scripts_dir.resolve()
+
+    raw = Path(script_path).expanduser()
+    if raw.is_absolute():
+        path = raw.resolve()
+    else:
+        path = (scripts_dir / raw).resolve()
+
+    # Guard against path traversal, absolute path injection, and symlink
+    # escape — scripts MUST reside within HERMES_HOME/scripts/.
+    try:
+        path.relative_to(scripts_dir_resolved)
+    except ValueError:
+        return False, None, (
+            f"Blocked: script path resolves outside the scripts directory "
+            f"({scripts_dir_resolved}): {script_path!r}"
+        )
+
+    if not path.exists():
+        return False, None, f"Script not found: {path}"
+    if not path.is_file():
+        return False, None, f"Script path is not a file: {path}"
+
+    return True, path, None
+
+
+def _run_cron_script_preflight(force: bool = False) -> list[dict]:
+    """Startup assertion: every enabled, script-bearing job must resolve its script.
+
+    Scans the per-profile ``jobs.json`` (the same store ``tick`` reads) for
+    enabled jobs that declare a ``script`` which does NOT exist on disk, and
+    returns the list of failures. When ``force`` is True (scheduler load /
+    fleet startup) AND there are failures, it immediately blasts a single
+    consolidated #critical-alerts message naming each job id + missing path.
+
+    On subsequent (periodic) ticks ``force`` is False, so the blast is gated by
+    a per-job cooldown (``_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS``) — a broken job
+    re-alerts ~every 6h instead of every 60s tick, while a *fresh* break at
+    startup is still loud immediately.
+
+    Returns the list of failure dicts (empty when all good) so callers/tests
+    can assert on it directly. Never raises — a preflight must not take down
+    the scheduler.
+
+    Classification (mirrors the prior cron-doctor discipline): this is the
+    "missing-script" black-hole class. A *genuine* runtime error or a
+    *designed* health-watchdog sentinel is handled in ``run_job``, not
+    here — we only assert script *existence*, which is a load-time invariant.
+    """
+    failures: list[dict] = []
+    try:
+        from cron.jobs import load_jobs
+        jobs = load_jobs()
+    except Exception as e:
+        logger.error("script-preflight: failed to load jobs.json: %s", e)
+        return failures
+
+    now = time.time()
+    for job in jobs:
+        if not job.get("enabled", True):
+            continue
+        script_path = job.get("script")
+        if not script_path:
+            continue
+        ok, _resolved, error = _resolve_script_path(script_path)
+        if ok:
+            continue
+        job_id = job.get("id", "<unknown>")
+        failures.append({
+            "job_id": job_id,
+            "name": job.get("name"),
+            "script": script_path,
+            "error": error or f"Script not found: {script_path}",
+        })
+
+    if not failures:
+        return failures
+
+    # Decide whether to blast now.
+    due: list[dict] = []
+    for f in failures:
+        last = _script_preflight_last_alert_at.get(f["job_id"])
+        if force or last is None or (now - last) >= _SCRIPT_PREFLIGHT_COOLDOWN_SECONDS:
+            due.append(f)
+
+    if due:
+        lines = [
+            "🚨 CRON STARTUP PREFLIGHT — missing script(s) (jobs will error every tick):",
+        ]
+        for f in due:
+            lines.append(
+                f"  • job_id={f['job_id']} name={f.get('name')!r} "
+                f"script={f['script']!r} → {f['error']}"
+            )
+        lines.append(
+            "Fix: restore/relink the script into the profile's scripts dir, "
+            "or disable the job."
+        )
+        message = "\n".join(lines)
+        logger.error("%s", message)
+        _alert_critical_alerts(message)
+        for f in due:
+            _script_preflight_last_alert_at[f["job_id"]] = now
+
+    return failures
+
+
 def run_job(
     job: dict, *, defer_agent_teardown: Optional[list] = None
 ) -> tuple[bool, str, str, Optional[str]]:
@@ -4648,6 +4805,20 @@ def tick(
             sweep_stale_inflight(_all_jobs)
         except Exception as e:
             logger.warning("Stale in-flight sweep failed: %s", e)
+
+# --- Startup missing-script preflight assertion (loud, not silent) ---
+        # The first tick that acquires the lock after a scheduler/gateway load
+        # is treated as the startup assertion: it forces a #critical-alerts
+        # blast for any enabled script-bearing job whose script is missing
+        # (the black-hole class elon caught — 3 jarvis jobs errored hourly for
+        # ~2 days with no alert). Every later tick re-runs the scan but only
+        # re-alerts per broken job on its cooldown
+        # (_SCRIPT_PREFLIGHT_COOLDOWN_SECONDS), so a long-lived broken job
+        # keeps blaring ~every 6h instead of spamming every 60s or going
+        # silent. Wrapped so a preflight failure can NEVER block due jobs.
+        global _script_preflight_startup_done
+        _run_cron_script_preflight(force=not _script_preflight_startup_done)
+        _script_preflight_startup_done = True
 
         if not due_jobs:
             # Idle tick: skip config load + pool partitioning entirely

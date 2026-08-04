@@ -26,7 +26,7 @@ Board resolution order (highest precedence first, all optional):
 
 * ``board=`` argument passed directly to :func:`connect` / :func:`init_db`
   (explicit — used by the CLI ``--board`` flag and the dashboard
-  ``?board=...`` query param).
+  ``?board=...`` query param, and by ``scoped_current_board()``).
 * ``HERMES_KANBAN_BOARD`` env var (used by the dispatcher to pin workers
   to the board their task lives on — workers cannot see other boards).
 * ``HERMES_KANBAN_DB`` env var (pins the DB file path directly — legacy
@@ -35,6 +35,14 @@ Board resolution order (highest precedence first, all optional):
 * ``<root>/kanban/current`` — a one-line text file holding the slug of
   the "currently selected" board. Written by ``hermes kanban boards
   switch <slug>``. When absent, the active board is ``default``.
+
+When an explicit ``board=`` (or ``scoped_current_board``) is given AND
+``HERMES_KANBAN_DB`` is set AND the pinned path disagrees with the
+board's slug-derived path, the ``HERMES_KANBAN_BOARD`` identity is used to
+tell a same-board relocated pin (pin preserved — Docker/tmp/symlink
+layouts) from a genuine cross-board read (explicit board honoured, loud
+warning) from an ambiguous relocation (raise). See :func:`kanban_db_path`
+for the full decision table (kanban task t_e96dd0cb).
 
 In standard installs ``<root>`` is ``~/.hermes``. In Docker / custom
 deployments where ``HERMES_HOME`` points outside ``~/.hermes`` (e.g.
@@ -238,6 +246,256 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
         invoke_hook(event, task_id=task_id, profile_name=profile_name, **fields)
     except Exception as exc:  # pragma: no cover - defensive
         _log.debug("kanban lifecycle hook %s failed: %s", event, exc)
+
+
+def _fire_failure_alert(task_id: str, **fields: Any) -> None:
+    """Fire an observable fleet-level kanban failure alert hook.
+
+    Unlike ordinary kanban lifecycle hooks, this path is intentionally strict:
+    if the relay/plugin raises, the caller sees the failure. That prevents a
+    broken alert channel from hiding worker-stall storms.
+    """
+    from hermes_cli.plugins import invoke_hook_strict
+    from hermes_cli.profiles import get_active_profile_name
+
+    try:
+        profile_name = get_active_profile_name()
+    except Exception:
+        profile_name = "default"
+    invoke_hook_strict(
+        "kanban_failure_alert",
+        task_id=task_id,
+        profile_name=profile_name,
+        **fields,
+    )
+
+
+def _is_dead_pid_fingerprint(fingerprint: str) -> bool:
+    """Return True for worker-death fingerprints normalized by _error_fingerprint."""
+    fp = (fingerprint or "").lower()
+    return (
+        "pid n not alive" in fp
+        or "pid n exited with code" in fp
+        or "pid n killed by signal" in fp
+    )
+
+
+def _maybe_fire_kill_switch_alert(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failures: int,
+    error: str,
+    outcome: str,
+) -> None:
+    """Fire a LOUD, DELIVERED fleet alert when the absolute kill-switch trips.
+
+    Binding jarvis seat decision (t_458ab8d6): the kill-switch trip must be
+    observable through the failure-alert path (``kanban_failure_alert``
+    strict hook → deadpid-fleet-alert relay → fleet channel), not a silent
+    status change. Called AFTER ``_record_task_failure``'s write_txn commits
+    so a strict-hook relay failure can never roll back the block itself.
+
+    Uses a task-scoped synthetic fingerprint so each tripping task gets its
+    own delivered alert (dedup only suppresses repeat trips of the SAME task
+    within the relay window). Mirrors ``_maybe_fire_deadpid_fleet_alert``'s
+    contract: persist a dead-letter event, then re-raise so the
+    dispatcher/gateway logs see the relay breakage.
+    """
+    row = conn.execute(
+        "SELECT assignee, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    payload = {
+        "board": get_current_board(),
+        "assignee": row["assignee"],
+        "run_id": row["current_run_id"],
+        "consecutive_failures": failures,
+        "fingerprint": f"kill-switch:absolute-max:{task_id}",
+        "error": error[:500],
+        "kill_switch": True,
+        "limit_source": "absolute_max",
+    }
+    try:
+        _fire_failure_alert(task_id, **payload)
+    except Exception as exc:
+        # Dead-letter the relay failure so it is inspectable from the board,
+        # then re-raise (same contract as _maybe_fire_deadpid_fleet_alert).
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "kanban_failure_alert_failed",
+                    {**payload, "hook_error": str(exc)[:500]},
+                    run_id=row["current_run_id"],
+                )
+        except Exception:
+            _log.warning(
+                "failed to persist kanban_failure_alert dead-letter for %s",
+                task_id,
+                exc_info=True,
+            )
+        raise
+
+
+def _maybe_fire_deadpid_fleet_alert(
+    conn: sqlite3.Connection,
+    task_id: str,
+    fingerprint: str,
+    error: str,
+    *,
+    protocol_violation: bool,
+) -> None:
+    """Emit kanban_failure_alert when a dead-PID task reaches cf>=3."""
+    if protocol_violation or not _is_dead_pid_fingerprint(fingerprint):
+        return
+    row = conn.execute(
+        "SELECT assignee, consecutive_failures, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    failures = int(row["consecutive_failures"] or 0)
+    if failures < 3:
+        return
+    # If the absolute kill-switch just tripped (limit_source=absolute_max),
+    # _maybe_fire_kill_switch_alert already delivered a louder, more specific
+    # alert for THIS trip. Skip the generic dead-PID alert so the operator
+    # gets one loud signal, not two (t_458ab8d6).
+    last_gave_up = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'gave_up' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last_gave_up is not None and last_gave_up["payload"]:
+        try:
+            if (json.loads(last_gave_up["payload"]) or {}).get(
+                "limit_source"
+            ) == "absolute_max":
+                return
+        except (ValueError, TypeError):
+            pass
+
+    payload = {
+        "board": get_current_board(),
+        "assignee": row["assignee"],
+        "run_id": row["current_run_id"],
+        "consecutive_failures": failures,
+        "fingerprint": fingerprint,
+        "error": error[:500],
+    }
+    try:
+        _fire_failure_alert(task_id, **payload)
+    except Exception as exc:
+        # The alert hook is deliberately strict. Persist a dead-letter event so
+        # the failure is inspectable from the board, then re-raise so the
+        # dispatcher/gateway logs and supervisor see the relay breakage.
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    task_id,
+                    "kanban_failure_alert_failed",
+                    {**payload, "hook_error": str(exc)[:500]},
+                    run_id=row["current_run_id"],
+                )
+        except Exception:
+            _log.warning(
+                "failed to persist kanban_failure_alert dead-letter for %s",
+                task_id,
+                exc_info=True,
+            )
+        raise
+
+
+# Coalesce dead-PID / detector-gap alerts: ONE systemic alert per
+# (host, fingerprint) per window instead of N per-task alerts. Mirrors the
+# deadpid-fleet-alert plugin's delivery-side dedup window so the detector
+# and the relay agree on cadence (t_6a5a8d9e).
+_DEADPID_ALERT_COALESCE_WINDOW_SECONDS = 30 * 60
+_deadpid_alert_coalesce: "dict[tuple[str, str], float]" = {}
+
+
+def _maybe_fire_coalesced_deadpid_alert(
+    conn: sqlite3.Connection,
+    fingerprint: str,
+    error: str,
+    count: int,
+    sample_task_id: str,
+) -> None:
+    """Emit ONE ``kanban_failure_alert`` per (host, fingerprint) per window.
+
+    Detector-gap requeues (worker reaped outside the dispatcher's reap
+    window with no durable ``dispatch_death_reason``) are NOT real crashes —
+    they must not be counted as failures or tripped through the breaker
+    (95%+ of the historical ``pid N not alive`` fleet was the native-dispatch
+    teardown race, not per-worker bugs). Instead, group them by error
+    fingerprint and raise ONE systemic alert per fingerprint per host per
+    window, so a teardown-race storm surfaces as a single signal rather than
+    N silent requeues (t_6a5a8d9e).
+
+    The hook is deliberately strict (mirrors ``_maybe_fire_deadpid_fleet_alert``):
+    if the relay raises, the caller sees the failure so a broken alert
+    channel can't hide the storm.
+    """
+    if not _is_dead_pid_fingerprint(fingerprint):
+        return
+    host = _claimer_id().split(":", 1)[0]
+    key = (host, fingerprint)
+    now = time.time()
+    last = _deadpid_alert_coalesce.get(key)
+    if last is not None and (now - last) < _DEADPID_ALERT_COALESCE_WINDOW_SECONDS:
+        return  # already alerted this window
+    _deadpid_alert_coalesce[key] = now
+    # Prune stale keys so the cache can't grow unbounded.
+    stale = [
+        k for k, ts in _deadpid_alert_coalesce.items()
+        if now - ts >= _DEADPID_ALERT_COALESCE_WINDOW_SECONDS
+    ]
+    for k in stale:
+        _deadpid_alert_coalesce.pop(k, None)
+    row = conn.execute(
+        "SELECT assignee FROM tasks WHERE id = ?", (sample_task_id,),
+    ).fetchone()
+    assignee = row["assignee"] if row else None
+    try:
+        _fire_failure_alert(
+            sample_task_id,
+            board=get_current_board(),
+            assignee=assignee,
+            fingerprint=fingerprint,
+            error=error[:500],
+            consecutive_failures=count,
+            window_count=count,
+            coalesced=True,
+        )
+    except Exception as exc:
+        # Persist a dead-letter event so the failure is inspectable from the
+        # board, then re-raise so the dispatcher/gateway logs see the relay
+        # breakage (same contract as _maybe_fire_deadpid_fleet_alert).
+        try:
+            with write_txn(conn):
+                _append_event(
+                    conn,
+                    sample_task_id,
+                    "kanban_failure_alert_failed",
+                    {
+                        "coalesced": True,
+                        "fingerprint": fingerprint,
+                        "window_count": count,
+                        "hook_error": str(exc)[:500],
+                    },
+                )
+        except Exception:
+            _log.warning(
+                "failed to persist coalesced deadpid alert dead-letter",
+                exc_info=True,
+            )
+        raise
 
 
 # A running task's claim is valid for 15 minutes by default; after that the
@@ -592,6 +850,104 @@ def board_exists(board: Optional[str] = None) -> bool:
     return (d / "board.json").exists() or (d / "kanban.db").exists()
 
 
+def _resolve_board_db_path(board: Optional[str]) -> Path:
+    """Resolve the on-disk ``kanban.db`` path for ``board`` using pure
+    slug-based resolution, ignoring any ``HERMES_KANBAN_DB`` env pin.
+
+    Used by :func:`kanban_db_path` to detect when the env pin and an
+    explicit ``board=`` argument disagree (see t_e96dd0cb).
+    """
+    slug = _normalize_board_slug(board)
+    if slug is None:
+        slug = get_current_board()
+    if slug == DEFAULT_BOARD:
+        return kanban_home() / "kanban.db"
+    return board_dir(slug) / "kanban.db"
+
+
+def _paths_point_at_same_db(a: Path, b: Path) -> bool:
+    """True if ``a`` and ``b`` name the same kanban.db file.
+
+    Tolerates absolute vs relative, ``..`` segments, and symlinks without
+    requiring the files to exist on disk. Never raises for missing paths.
+    """
+    try:
+        aa = Path(os.path.abspath(str(a))).resolve()
+        bb = Path(os.path.abspath(str(b))).resolve()
+    except (OSError, ValueError):
+        aa = Path(os.path.abspath(str(a)))
+        bb = Path(os.path.abspath(str(b)))
+    return aa == bb
+
+
+def _infer_board_slug_from_pin_path(pinned: Path) -> Optional[str]:
+    """Return the board slug a pinned DB path belongs to, or ``None``.
+
+    Understands the two standard on-disk shapes (resolved through the
+    current kanban home):
+
+    * ``<home>/kanban.db`` → ``default`` (legacy back-compat path)
+    * ``<home>/kanban/boards/<slug>/kanban.db`` → ``<slug>``
+
+    Any other (relocated / custom) path returns ``None`` — the caller must
+    then treat the pin's board identity as unknowable.
+    """
+    try:
+        home = Path(os.path.abspath(str(kanban_home()))).resolve()
+        p = Path(os.path.abspath(str(pinned))).resolve()
+    except (OSError, ValueError):
+        return None
+    if p == home / "kanban.db":
+        return DEFAULT_BOARD
+    boards = home / "kanban" / "boards"
+    if p.parent.parent == boards and p.name == "kanban.db":
+        try:
+            return _normalize_board_slug(p.parent.name)
+        except ValueError:
+            return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Board-conflict warning de-dup / rate limiting (t_e96dd0cb rework)
+#
+# A genuine cross-board read inside a dispatched worker fires a warning so the
+# disagreement is never invisible. But the same conflict can be hit repeatedly
+# by hot callers (board watchers per tick, dashboard polls), so the warning is
+# rate-limited per (explicit_slug, pinned path) pair: at most one warning per
+# ``_BOARD_CONFLICT_WARN_WINDOW_SECONDS`` per pair, per process.
+# ---------------------------------------------------------------------------
+
+_BOARD_CONFLICT_WARN_WINDOW_SECONDS = 300.0
+_board_conflict_warned: dict[tuple[str, str], float] = {}
+
+
+def _warn_board_conflict_once(
+    explicit_slug: str,
+    pinned: Path,
+    resolved: Path,
+) -> None:
+    """Log the env-pin-vs-explicit-board conflict, at most once per window."""
+    key = (explicit_slug, str(pinned))
+    now = time.monotonic()
+    last = _board_conflict_warned.get(key)
+    if last is not None and (now - last) < _BOARD_CONFLICT_WARN_WINDOW_SECONDS:
+        return
+    _board_conflict_warned[key] = now
+    _log.warning(
+        "kanban_db_path(board=%r) conflict: HERMES_KANBAN_DB=%r "
+        "(set by the dispatcher handoff) does NOT correspond to board %r "
+        "(which would resolve to %r). The explicit board= argument is a "
+        "cross-board read, so it is honoured instead of the env pin — "
+        "previously this returned the wrong board silently. See kanban "
+        "task t_e96dd0cb.",
+        explicit_slug,
+        str(pinned),
+        explicit_slug,
+        str(resolved),
+    )
+
+
 def kanban_db_path(board: Optional[str] = None) -> Path:
     """Return the path to the ``kanban.db`` for ``board``.
 
@@ -600,15 +956,112 @@ def kanban_db_path(board: Optional[str] = None) -> Path:
     1. ``HERMES_KANBAN_DB`` env var — pins the path directly. Honoured for
        back-compat and for the dispatcher→worker handoff (defense in
        depth: dispatcher injects this into worker env so workers are
-       immune to any path-resolution disagreement).
+       immune to any path-resolution disagreement). It wins **unconditionally**
+       when no explicit ``board=`` is given, because that is exactly the
+       handoff case the docstring protects.
     2. When ``board`` arg is None, the active board from
        :func:`get_current_board` is used.
     3. Board ``default`` → ``<root>/kanban.db`` (back-compat path).
        Other boards → ``<root>/kanban/boards/<slug>/kanban.db``.
+
+    Conflict detection (t_e96dd0cb): when an explicit ``board=`` argument is
+    passed AND ``HERMES_KANBAN_DB`` is set AND the pinned path does **not**
+    correspond to that board's slug-derived path, the previous behaviour
+    silently returned the pinned (possibly wrong) board — a silent wrong
+    answer. The rework uses the dispatcher-injected ``HERMES_KANBAN_BOARD``
+    identity to tell the three cases apart:
+
+    * **Same board, physically relocated pin** (Docker / tmp / symlink
+      layouts): the pin is deliberately relocated for the board the process
+      belongs to. The pin is preserved — this is the dispatcher handoff, not
+      a conflict.
+    * **Genuine cross-board read**: the explicit ``board=`` names a board
+      different from the process's pinned identity. The explicit board wins
+      (the caller was specific) and a rate-limited warning fires so the
+      disagreement is never invisible.
+    * **Ambiguous** (relocated pin AND no usable ``HERMES_KANBAN_BOARD``
+      identity): neither the pin nor the board can be attributed — fail
+      loudly (raise) rather than silently choosing a potentially wrong DB.
+
+    When ``board=None`` (and no ``scoped_current_board`` override is active)
+    the env pin keeps winning exactly as before — that is the dispatcher→worker
+    handoff. A ``scoped_current_board()`` override (CLI ``--board`` /
+    dashboard ``?board=``) counts as an explicit request and is classified the
+    same way as a ``board=`` argument.
     """
     override = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if override:
-        return Path(override).expanduser()
+        pinned = Path(override).expanduser()
+        # An explicit board request can come from two places:
+        #   1. ``board=`` passed directly (kanban_* tools, connect(board=...))
+        #   2. ``scoped_current_board()`` ContextVar (CLI ``--board`` flag,
+        #      dashboard ``?board=``) — a deliberate per-call override.
+        # board=None WITHOUT a scoped override is the dispatcher→worker
+        # handoff: the env pin wins unconditionally (docstring contract).
+        explicit_slug = _normalize_board_slug(board)
+        if explicit_slug is None:
+            scoped = (_CURRENT_BOARD_OVERRIDE.get() or "").strip()
+            if scoped:
+                try:
+                    explicit_slug = _normalize_board_slug(scoped)
+                except ValueError:
+                    explicit_slug = None
+        if explicit_slug is None:
+            return pinned
+
+        resolved = _resolve_board_db_path(explicit_slug)
+        if _paths_point_at_same_db(pinned, resolved):
+            # Pin already corresponds to the requested board's slug-derived
+            # path — no conflict, nothing to decide.
+            return pinned
+
+        # Pin disagrees with the slug-derived path for the explicit board.
+        # Classify with the dispatcher-injected HERMES_KANBAN_BOARD identity.
+        # A malformed board env is treated as absent (same tolerance as
+        # get_current_board) — it must never crash path resolution.
+        env_board: Optional[str] = None
+        raw_env_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if raw_env_board:
+            try:
+                env_board = _normalize_board_slug(raw_env_board)
+            except ValueError:
+                env_board = None
+        if env_board is not None:
+            if env_board == explicit_slug:
+                # Same-board explicit call with a physically relocated pin
+                # (Docker / tmp / symlink layout). The dispatcher deliberately
+                # pinned this DB for THIS board — preserve it. Not a conflict.
+                return pinned
+            # env_board != explicit_slug → genuine cross-board read.
+            _warn_board_conflict_once(explicit_slug, pinned, resolved)
+            return resolved
+
+        # No HERMES_KANBAN_BOARD identity. Try to infer the pin's board from
+        # the pin path shape itself.
+        inferred = _infer_board_slug_from_pin_path(pinned)
+        if inferred is not None and inferred == explicit_slug:
+            return pinned
+        if inferred is not None:
+            # Pin is the slug-derived path of a *different* board → genuine
+            # cross-board read.
+            _warn_board_conflict_once(explicit_slug, pinned, resolved)
+            return resolved
+        # Pin relocated AND no board identity. For ``default`` this is the
+        # legacy single-DB install (``HERMES_KANBAN_DB`` predates boards and
+        # IS the default board's DB — the dispatcher at spawn time computes
+        # exactly this pin). Preserving it is the documented contract, not a
+        # wrong answer. For a *named* board the pin cannot be attributed to
+        # any board — fail loudly rather than silently choosing a potentially
+        # wrong DB.
+        if explicit_slug == DEFAULT_BOARD:
+            return pinned
+        raise ValueError(
+            "HERMES_KANBAN_DB=%r does not correspond to board %r and "
+            "HERMES_KANBAN_BOARD is not set; cannot tell whether this is a "
+            "same-board relocated pin or a cross-board read. Set "
+            "HERMES_KANBAN_BOARD (or unset HERMES_KANBAN_DB) to resolve "
+            "(kanban task t_e96dd0cb)." % (str(pinned), explicit_slug)
+        )
     slug = _normalize_board_slug(board)
     if slug is None:
         slug = get_current_board()
@@ -1326,7 +1779,18 @@ CREATE TABLE IF NOT EXISTS task_runs (
     --          gave_up | reclaimed | (null while still running)
     summary             TEXT,
     metadata            TEXT,
-    error               TEXT
+    error               TEXT,
+    -- Durable exit verdict for the run's worker subprocess, persisted by the
+    -- dispatcher's reap loop (``_record_worker_exit``) when it observes the
+    -- child exit. ``dispatch_death_reason`` is the classified kind
+    -- (clean_exit / nonzero_exit / signaled / rate_limited / unknown) and
+    -- ``dispatch_exit_code`` the exit code or signal number. Unlike the
+    -- volatile in-memory ``_recent_worker_exits`` reap registry, these
+    -- columns survive a dispatcher restart, so ``detect_crashed_workers``
+    -- can classify a dead worker with a SPECIFIC reason even when the reap
+    -- registry entry is gone (t_6a5a8d9e: the pid-not-alive teardown race).
+    dispatch_death_reason TEXT,
+    dispatch_exit_code    INTEGER
 );
 
 -- Files attached to a task (PDFs, images, source documents). The blob
@@ -2487,6 +2951,34 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ev_cols = {row["name"] for row in conn.execute("PRAGMA table_info(task_events)")}
     if "run_id" not in ev_cols:
         _add_column_if_missing(conn, "task_events", "run_id", "run_id INTEGER")
+
+    # task_runs gained durable exit-verdict columns (t_6a5a8d9e): the
+    # dispatcher's reap loop persists the classified worker exit here so
+    # detect_crashed_workers can name a SPECIFIC death reason even when the
+    # volatile in-memory reap registry entry is gone (dispatcher restart /
+    # reaped-outside-reap-tick race). Legacy rows keep NULL, which the
+    # detector treats exactly like the old "no reap registry entry" case
+    # (DETECTOR GAP) — the additive columns never change existing behavior.
+    # ``PRAGMA table_info`` returns an empty set for a table that does not
+    # exist, which is indistinguishable from "table exists but lacks the
+    # column" — so probe sqlite_master first. Partial/legacy schemas that
+    # predate ``task_runs`` must skip this migration rather than ALTER a
+    # missing table (same guard style as ``kanban_notify_subs`` below).
+    runs_table_exists = conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone()
+    if runs_table_exists:
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        if "dispatch_death_reason" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "dispatch_death_reason", "dispatch_death_reason TEXT"
+            )
+        if "dispatch_exit_code" not in run_cols:
+            _add_column_if_missing(
+                conn, "task_runs", "dispatch_exit_code", "dispatch_exit_code INTEGER"
+            )
 
     # Same ordering rule as the additive ``tasks`` indexes above: create the
     # index after the additive column migration so legacy ``task_events``
@@ -4357,6 +4849,10 @@ def recompute_ready(
     circuit breaker in ``_record_task_failure`` so the two never
     disagree about when a task is permanently blocked:
 
+      0. ``DISPATCHER_MAX_CONSECUTIVE_FAILURES`` — the ABSOLUTE catch-all
+         (t_458ab8d6), highest precedence: a task whose counter has
+         reached the absolute max is NEVER auto-promoted, no matter what
+         its ``max_retries`` / ``failure_limit`` say.
       1. per-task ``max_retries`` if set
       2. caller-supplied ``failure_limit`` (the dispatcher passes the
          ``kanban.failure_limit`` config value through ``dispatch_once``)
@@ -4413,6 +4909,13 @@ def recompute_ready(
                         else int(failure_limit)
                     )
                     if failures >= effective_limit:
+                        continue
+                    # Absolute catch-all (t_458ab8d6): a task at the
+                    # absolute max is never auto-promoted even when
+                    # per-task max_retries / config failure_limit would
+                    # otherwise allow it — the kill-switch must be able to
+                    # park a task permanently.
+                    if failures >= DISPATCHER_MAX_CONSECUTIVE_FAILURES:
                         continue
                     conn.execute(
                         "UPDATE tasks SET status = 'ready' "
@@ -5081,6 +5584,7 @@ def reclaim_task(
         )
         if cur.rowcount != 1:
             return False
+        was_blocked = row["status"] == "blocked"
         run_id = _end_run(
             conn, task_id,
             outcome="reclaimed", status="reclaimed",
@@ -5096,6 +5600,13 @@ def reclaim_task(
             "prev_lock": prev_lock,
         }
         payload.update(termination)
+        if was_blocked:
+            _append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {"reason": "reclaim", "prev_status": row["status"]},
+            )
         _append_event(
             conn, task_id, "reclaimed",
             payload,
@@ -6346,6 +6857,18 @@ def promote_task(
         )
         if upd.rowcount != 1:
             return False, f"task {task_id} status changed during promotion"
+        if row["status"] == "blocked":
+            _append_event(
+                conn,
+                task_id,
+                "unblocked",
+                {
+                    "reason": "promote",
+                    "actor": actor,
+                    "promote_reason": reason,
+                    "forced": force,
+                },
+            )
         _append_event(
             conn,
             task_id,
@@ -7206,6 +7729,16 @@ DEFAULT_FAILURE_LIMIT = 2
 # Legacy alias — callers / tests still reference the old name.
 DEFAULT_SPAWN_FAILURE_LIMIT = DEFAULT_FAILURE_LIMIT
 
+# ABSOLUTE catch-all consecutive-failure kill-switch (t_ceo_1784901556 /
+# t_458ab8d6). Unlike DEFAULT_FAILURE_LIMIT and per-task ``max_retries``,
+# this threshold can NEVER be overridden: per-task retries, the config
+# ``kanban.failure_limit``, a caller-supplied ``failure_limit``, and
+# ``force_trip=False`` all lose to it. Once the unified counter reaches this
+# value the circuit breaker MUST trip (``limit_source="absolute_max"``), so a
+# task with a high ``max_retries``/config limit plus interleaved failure
+# kinds cannot cycle forever.
+DISPATCHER_MAX_CONSECUTIVE_FAILURES = 10
+
 # Max bytes to keep in a single worker log file. The dispatcher truncates
 # and rotates on spawn if the file is larger than this at spawn time.
 DEFAULT_LOG_ROTATE_BYTES = 2 * 1024 * 1024   # 2 MiB
@@ -7249,6 +7782,98 @@ _RESPAWN_GUARD_PR_URL_RE = re.compile(
     r"https?://github\.com/[^/\s]+/[^/\s]+/pull/\d+",
     re.IGNORECASE,
 )
+
+# Capture groups for the PR URL: (owner, repo, pull_number).
+_GITHUB_PR_URL_RE = re.compile(
+    r"https?://github\.com/([^/\s]+)/([^/\s]+)/pull/(\d+)",
+    re.IGNORECASE,
+)
+
+# t_9799c507: the active_pr respawn guard was PR-state-BLIND — it blocked
+# re-spawn whenever a GitHub PR URL appeared in a recent comment, even after
+# the PR was MERGED/CLOSED. The 24.5d stall of sycode-trading/t_30c13209 was
+# exactly this: PR #856 MERGED but the guard kept firing every dispatcher tick.
+# We now resolve the ACTUAL GitHub PR state (read-only `gh pr view`); only a PR
+# that is still OPEN (or whose state cannot be determined — fail closed) blocks.
+# MERGED/CLOSED PRs must NOT block re-spawn.
+#
+# PR-state results are cached for a short TTL so the per-tick dispatcher probes
+# do not hammer the GitHub API. Overrides:
+#   HERMES_KANBAN_PR_STATE_CACHE_TTL=<seconds>  (0 disables caching)
+#   HERMES_KANBAN_PR_STATE_CHECK=0              (disable the state check; keeps
+#                                                the legacy URL-only guard)
+_PR_STATE_CACHE_TTL = 300  # 5 minutes
+_pr_state_cache: dict[tuple[str, str], tuple[float, "str | None"]] = {}
+
+
+def _pr_state_check_enabled() -> bool:
+    return os.environ.get("HERMES_KANBAN_PR_STATE_CHECK", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _github_pr_state(repo: str, number: str) -> "str | None":
+    """Return the GitHub PR state for ``repo`` (``owner/name``) ``number``.
+
+    Uses the read-only ``gh pr view <n> --repo <repo> --json state`` command.
+    Returns ``'OPEN'`` / ``'MERGED'`` / ``'CLOSED'`` (gh's state vocabulary),
+    or ``None`` when the state cannot be determined (gh missing, auth/network
+    failure, non-zero exit). Callers fail CLOSED on ``None`` — treat the PR as
+    still active and keep the guard.
+
+    Results are cached for ``_PR_STATE_CACHE_TTL`` seconds (overridable via
+    ``HERMES_KANBAN_PR_STATE_CACHE_TTL``). Never raises.
+    """
+    try:
+        ttl = int(os.environ.get("HERMES_KANBAN_PR_STATE_CACHE_TTL", str(_PR_STATE_CACHE_TTL)) or 0)
+    except ValueError:
+        ttl = _PR_STATE_CACHE_TTL
+    now = time.time()
+    key = (repo.strip().lower(), number.strip())
+    hit = _pr_state_cache.get(key)
+    if hit is not None and ttl > 0 and (now - hit[0]) < ttl:
+        return hit[1]
+    state: "str | None" = None
+    try:
+        proc = subprocess.run(
+            ["gh", "pr", "view", number, "--repo", repo, "--json", "state"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if proc.returncode == 0:
+            try:
+                data = json.loads(proc.stdout or "{}")
+            except ValueError:
+                data = {}
+            state = (data.get("state") or "").strip().upper() or None
+    except Exception:
+        # gh missing / timeout / network failure — caller fails closed.
+        state = None
+    if ttl > 0:
+        _pr_state_cache[key] = (now, state)
+    return state
+
+
+def _pr_urls_in_comments(conn: sqlite3.Connection, task_id: str, pr_cutoff: int) -> "list[tuple[str, str]]":
+    """Return ``(repo, number)`` pairs for GitHub PR URLs in recent comments.
+
+    Used by the active_pr respawn guard so it can resolve the ACTUAL PR state
+    instead of blocking on the mere presence of a URL (t_9799c507).
+    """
+    found: "list[tuple[str, str]]" = []
+    for c in conn.execute(
+        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
+        (task_id, pr_cutoff),
+    ).fetchall():
+        if not c["body"]:
+            continue
+        for m in _GITHUB_PR_URL_RE.finditer(c["body"]):
+            found.append((f"{m.group(1)}/{m.group(2)}", m.group(3)))
+    return found
 
 
 @dataclass
@@ -7310,6 +7935,14 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    detector_gap: list[str] = field(default_factory=list)
+    """Task ids whose worker died but whose death the detector could not
+    classify (no reap-registry entry AND no durable ``dispatch_death_reason``
+    on the run row — the pid-not-alive teardown race, t_6a5a8d9e). Released
+    back to ``ready`` WITHOUT counting a failure (not a real crash) and
+    surfaced here so telemetry can distinguish detector gaps from genuine
+    crashes. One fingerprint-coalesced fleet alert is raised per fingerprint
+    per host per window instead of N silent requeues."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -7322,6 +7955,16 @@ class DispatchResult:
     reached the ready queue (manual DB edit, missed event, code-path bug)
     is caught here: an audit event is logged and no spawn is attempted.
     This is the defense-in-depth guard for the dispatch tick."""
+
+    blocked_claim_attempts: list[str] = field(default_factory=list)
+    """Every blocked card the dispatcher refused to claim this tick
+    (t_73a70cde / t_a2ef2ea2). A superset of :attr:`skipped_block_gate`:
+    this also captures cards that reached the ready queue while still
+    carrying ``status='blocked'`` (the blind-spot guard's safety net), not
+    only cards with a sticky ``blocked`` event. Each entry corresponds to a
+    ``blocked_dispatch_attempt`` audit event in ``task_events`` carrying the
+    card id, a timestamp, and the dispatcher identifier — so fleet telemetry
+    / a soak watchdog can prove no blocked card was silently claimed."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7336,12 +7979,119 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: "dict[int, tuple[int, float]]" = {}
 
+# Live ``subprocess.Popen`` handles for workers spawned by THIS dispatcher
+# process, keyed by pid.
+#
+# Why this exists (t_6a5a8d9e, root cause of the 100%-NULL
+# ``dispatch_death_reason`` column):
+#
+# ``_default_spawn`` used to abandon the ``Popen`` handle ("fire and
+# forget"), relying on ``reap_worker_zombies``'s ``os.waitpid(-1, WNOHANG)``
+# to harvest the exit status. That never works. Python's ``subprocess``
+# module keeps its OWN global list of live ``Popen`` objects
+# (``subprocess._active``) and reaps them internally from ``Popen.__del__``
+# and the ``_cleanup()`` call at the top of every new ``Popen(...)``. The
+# abandoned handle is garbage-collected, its ``__del__`` calls
+# ``_internal_poll()``, and the child is reaped by the subprocess module
+# BEFORE the dispatcher's ``waitpid(-1)`` ever sees it. ``waitpid(-1)``
+# then returns nothing, ``_record_worker_exit`` is never called, and no
+# durable verdict is written — every death degrades to the generic
+# ``pid N not alive`` DETECTOR GAP.
+#
+# Empirically verified: spawn + abandon + gc + a later ``Popen`` ⇒
+# ``waitpid(-1, WNOHANG)`` reaps NOTHING (see the regression test
+# ``test_reap_worker_zombies_harvests_abandoned_handle_verdict``).
+#
+# Holding the handle makes the dispatcher the authoritative reaper: we call
+# ``poll()`` ourselves, get a real returncode for every death class
+# (clean_exit / nonzero_exit / signaled / rate_limited), and persist the
+# durable verdict. The dispatcher is a single long-lived process (the
+# gateway ``_kanban_dispatcher_watcher`` loop), so an in-process registry is
+# the right lifetime. Entries are removed as soon as they are harvested;
+# a size cap guards against a pathological leak.
+_WORKER_HANDLES_MAX = 4096
+_worker_handles: "dict[int, Any]" = {}
 
-def _record_worker_exit(pid: int, raw_status: int) -> None:
+
+def _register_worker_handle(pid: int, proc: Any) -> None:
+    """Retain a spawned worker's ``Popen`` handle for authoritative reaping.
+
+    Called by ``_default_spawn`` right after the child starts. Without this
+    the ``subprocess`` module reaps the child behind our back and the
+    durable ``dispatch_death_reason`` verdict can never be recorded
+    (t_6a5a8d9e). Never raises — spawning must not fail because bookkeeping
+    did.
+    """
+    if not pid or pid <= 0 or proc is None:
+        return
+    try:
+        _worker_handles[int(pid)] = proc
+        # Belt-and-braces: if a handle is somehow never harvested (child
+        # outlives the dispatcher's interest), drop the oldest entries so
+        # the registry cannot grow without bound.
+        if len(_worker_handles) > _WORKER_HANDLES_MAX:
+            for _pid in list(_worker_handles)[: len(_worker_handles) // 2]:
+                _worker_handles.pop(_pid, None)
+    except Exception:
+        pass
+
+
+def _harvest_worker_handles(
+    conn: Optional[sqlite3.Connection] = None,
+) -> "list[int]":
+    """Poll retained worker handles and record verdicts for the finished ones.
+
+    This is the reliable half of the reap path: ``poll()`` on a handle we
+    still own returns the child's returncode (negative for a signal death),
+    which we convert back into a raw wait-status so the existing
+    ``_classify_raw_status`` logic — and therefore the durable
+    ``dispatch_death_reason`` column — behaves identically to the
+    ``waitpid`` path.
+
+    Returns the list of pids harvested. Never raises.
+    """
+    harvested: "list[int]" = []
+    for pid, proc in list(_worker_handles.items()):
+        try:
+            rc = proc.poll()
+        except Exception:
+            _worker_handles.pop(pid, None)
+            continue
+        if rc is None:
+            continue  # still running — leave it registered
+        _worker_handles.pop(pid, None)
+        # Rebuild a raw wait-status so classification stays in ONE place.
+        # Popen.returncode is -N when the child died from signal N.
+        raw_status = (-rc) if rc < 0 else (rc << 8)
+        try:
+            _record_worker_exit(pid, raw_status, conn=conn)
+        except Exception:
+            _log.warning(
+                "failed to record harvested worker exit for pid %s", pid,
+                exc_info=True,
+            )
+        harvested.append(pid)
+    return harvested
+
+
+def _record_worker_exit(
+    pid: int,
+    raw_status: int,
+    conn: Optional[sqlite3.Connection] = None,
+) -> None:
     """Record a reaped child's exit status for later classification.
 
     Called from the reap loop in ``dispatch_once``. Safe to call many
     times; duplicate pids overwrite (pids can cycle, latest wins).
+
+    When ``conn`` is provided (the dispatcher reap path), the classified
+    verdict is ALSO persisted to the active run's ``task_runs`` row
+    (``dispatch_death_reason`` / ``dispatch_exit_code``) so a later
+    ``detect_crashed_workers`` — possibly in a NEW dispatcher process after
+    a restart — can classify this death SPECIFICALLY instead of falling
+    back to the generic ``pid N not alive`` DETECTOR GAP (t_6a5a8d9e). The
+    DB write is best-effort: the reap loop must never fail because a
+    verdict could not be persisted.
     """
     if not pid or pid <= 0:
         return
@@ -7358,6 +8108,129 @@ def _record_worker_exit(pid: int, raw_status: int) -> None:
         ordered = sorted(_recent_worker_exits.items(), key=lambda kv: kv[1][1])
         for _pid, _ in ordered[: len(ordered) // 2]:
             _recent_worker_exits.pop(_pid, None)
+
+    if conn is not None:
+        try:
+            kind, code = _classify_raw_status(int(raw_status))
+            with write_txn(conn):
+                conn.execute(
+                    """
+                    UPDATE task_runs
+                       SET dispatch_death_reason = ?,
+                           dispatch_exit_code = ?
+                     WHERE id = (
+                             SELECT t.current_run_id FROM tasks t
+                              WHERE t.worker_pid = ? AND t.status = 'running'
+                                AND t.current_run_id IS NOT NULL
+                              LIMIT 1
+                           )
+                       AND ended_at IS NULL
+                    """,
+                    (kind, code, int(pid)),
+                )
+        except Exception:
+            # Best-effort only: a durable-verdict write failure must never
+            # break the reap loop. The in-memory registry above still
+            # records the exit for same-process classification.
+            _log.warning(
+                "failed to persist durable worker exit for pid %s", pid,
+                exc_info=True,
+            )
+
+
+# Provider / API failure markers found in a WORKER LOG when the model API
+# call itself died (rate-limit / 404 model-not-found / auth / connection /
+# credit-cap) BEFORE the agent could emit a terminal kanban call. A clean rc=0
+# exit that also shows one of these in its worker log is a RETRYABLE provider
+# error, not a protocol violation: the worker never received a model response,
+# so it could not have called kanban_complete / kanban_block. t_85378990 /
+# t_74c6693e recurrence.
+_PROVIDER_API_FAILURE_RE = re.compile(
+    r"(rate[_\s-]?limit|429|too many requests|"
+    r"404|model[^\n]{0,60}not found|requires available credits|"
+    r"credit access paused|account balance|"
+    r"\b401\b|\b403\b|unauthorized|forbidden|"
+    r"api call failed|api error|connection error|connecterror|"
+    r"timeout|timed out|exceeded the rate limit|"
+    r"inference-api\.nousresearch\.com|provider:\s*nous|"
+    r"quota|billing|subscription|"
+    r"rate limited after|max retries.*exhausted)",
+    re.IGNORECASE,
+)
+
+
+def _first_match_snippet(re_obj: "re.Pattern", text: str, max_len: int = 220) -> str:
+    """Return a short, whitespace-collapsed excerpt around the first match."""
+    if not text:
+        return ""
+    m = re_obj.search(text)
+    if not m:
+        return ""
+    start = max(0, m.start() - 50)
+    end = min(len(text), m.end() + 90)
+    return re.sub(r"\s+", " ", text[start:end]).strip()[:max_len]
+
+
+def _worker_log_tail_for_task(
+    conn: sqlite3.Connection, task_id: str, max_bytes: int = 8192
+) -> str:
+    """Best-effort read of a worker log's tail to recover the REAL failure cause.
+
+    A task reclaimed as a clean rc=0 exit gives the dispatcher only the exit
+    code; the actual API error (429 / 404 / auth / connection) was printed to
+    the worker log. We read the tail so callers can tell a provider/API death
+    (retryable) from a genuine protocol violation (agent skipped the terminal
+    call). Returns '' if the log can't be located / read. Never raises.
+    """
+    try:
+        rows = conn.execute("PRAGMA database_list").fetchall()
+        db_file = None
+        for r in rows:
+            if r[1] == "main":
+                db_file = r[2]
+                break
+        if not db_file or not str(db_file).endswith("kanban.db"):
+            return ""
+        log_path = os.path.join(os.path.dirname(str(db_file)), "logs", f"{task_id}.log")
+        if not os.path.exists(log_path):
+            return ""
+        size = os.path.getsize(log_path)
+        with open(log_path, "rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+            data = f.read()
+        return data.decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+def _classify_raw_status(raw_status: int) -> "tuple[str, Optional[int]]":
+    """Classify a raw wait-status into ``(kind, code)``.
+
+    Shared by ``_classify_worker_exit`` (in-memory reap registry) and the
+    durable-exit persist path (``_record_worker_exit`` → ``task_runs``
+    columns), so both always agree on what a given raw status means.
+
+    * ``"clean_exit"`` — ``WIFEXITED`` with ``WEXITSTATUS == 0``.
+    * ``"rate_limited"`` — ``WIFEXITED`` with status
+      ``KANBAN_RATE_LIMIT_EXIT_CODE``.
+    * ``"nonzero_exit"`` — ``WIFEXITED`` with non-zero status.
+    * ``"signaled"`` — ``WIFSIGNALED`` (OOM killer, SIGKILL, etc).
+    * ``"unknown"`` — could not be classified (platform quirks).
+    """
+    try:
+        if os.WIFEXITED(raw_status):
+            code = os.WEXITSTATUS(raw_status)
+            if code == 0:
+                return ("clean_exit", 0)
+            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+                return ("rate_limited", code)
+            return ("nonzero_exit", code)
+        if os.WIFSIGNALED(raw_status):
+            return ("signaled", os.WTERMSIG(raw_status))
+    except Exception:
+        pass
+    return ("unknown", None)
 
 
 def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
@@ -7383,33 +8256,80 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     ``code`` is the exit status (for ``clean_exit`` / ``rate_limited`` /
     ``nonzero_exit``) or the signal number (for ``signaled``), or ``None``
     for ``unknown``.
+
+    NOTE: this consults the volatile in-memory reap registry only. The
+    durable verdict (``task_runs.dispatch_death_reason``) is the fallback
+    for pids missing here — see ``_durable_exit_verdict``.
     """
     entry = _recent_worker_exits.get(int(pid))
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    return _classify_raw_status(raw)
+
+
+def _durable_exit_verdict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    pid: int,
+) -> "tuple[str, Optional[int]]":
+    """Read the DURABLE worker-exit verdict persisted on the task's run row.
+
+    Returns ``(kind, code)`` from ``task_runs.dispatch_death_reason`` /
+    ``dispatch_exit_code``, or ``("unknown", None)`` when the run row has no
+    verdict (never reaped by a dispatcher that persisted one, or the run was
+    created before the columns existed — t_6a5a8d9e).
+
+    This is the fallback for ``detect_crashed_workers`` when the volatile
+    in-memory reap registry (``_recent_worker_exits``) has no entry for the
+    pid: the worker was reaped outside the dispatcher's reap-tick window
+    (init reaped it, or the dispatcher restarted between spawn and death),
+    but a PREVIOUS dispatcher process may have persisted the verdict when it
+    did observe the exit. A specific durable reason lets the detector name
+    the death (nonzero_exit / signaled / rate_limited / clean_exit) instead
+    of emitting the generic ``pid N not alive`` DETECTOR GAP.
+    """
+    if not pid or pid <= 0:
+        return ("unknown", None)
     try:
-        if os.WIFEXITED(raw):
-            code = os.WEXITSTATUS(raw)
-            if code == 0:
-                return ("clean_exit", 0)
-            if code == KANBAN_RATE_LIMIT_EXIT_CODE:
-                return ("rate_limited", code)
-            return ("nonzero_exit", code)
-        if os.WIFSIGNALED(raw):
-            return ("signaled", os.WTERMSIG(raw))
+        row = conn.execute(
+            """
+            SELECT tr.dispatch_death_reason, tr.dispatch_exit_code
+              FROM task_runs tr
+              JOIN tasks t ON t.current_run_id = tr.id
+             WHERE t.id = ? AND tr.worker_pid = ?
+             LIMIT 1
+            """,
+            (task_id, int(pid)),
+        ).fetchone()
     except Exception:
-        pass
-    return ("unknown", None)
+        return ("unknown", None)
+    if row is None or not row["dispatch_death_reason"]:
+        return ("unknown", None)
+    return (row["dispatch_death_reason"], row["dispatch_exit_code"])
 
 
-def reap_worker_zombies() -> "list[int]":
+def reap_worker_zombies(
+    conn: Optional[sqlite3.Connection] = None,
+) -> "list[int]":
     """Reap all zombie children of this process without blocking.
 
     Returns the list of reaped PIDs. Safe to call when there are no
     children (returns []). No-op on Windows.
+
+    ``conn`` is threaded to ``_record_worker_exit`` so each reaped exit
+    ALSO persists a durable verdict (``task_runs.dispatch_death_reason``),
+    which lets a later ``detect_crashed_workers`` classify the death
+    specifically even if the in-memory reap registry is gone (restart /
+    reaped-outside-reap-tick race, t_6a5a8d9e).
     """
     reaped: "list[int]" = []
+    # FIRST harvest handles we still own. Python's subprocess module reaps
+    # abandoned children behind our back, so waitpid(-1) below would other-
+    # wise return nothing and no durable verdict would ever be persisted
+    # (t_6a5a8d9e). Handles are the authoritative source; waitpid stays as a
+    # fallback for children spawned outside _default_spawn.
+    reaped.extend(_harvest_worker_handles(conn))
     if os.name != "nt":
         try:
             while True:
@@ -7419,7 +8339,7 @@ def reap_worker_zombies() -> "list[int]":
                     break
                 if pid == 0:
                     break
-                _record_worker_exit(pid, status)
+                _record_worker_exit(pid, status, conn=conn)
                 reaped.append(pid)
         except Exception:
             pass
@@ -8019,9 +8939,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     ``check_respawn_guard`` defers their respawn until the window clears.
     The ids are returned via the ``_last_rate_limited`` function attribute
     (the public return stays the crashed-only ``list[str]``).
+
+    DURABLE VERDICT (t_6a5a8d9e): when the reap registry has no entry for a
+    dead pid (worker reaped outside the dispatcher's reap-tick window, or the
+    dispatcher restarted between spawn and death), the detector falls back to
+    the durable ``task_runs.dispatch_death_reason`` the reap loop persisted at
+    exit time, so a SPECIFIC death reason (nonzero_exit / signaled /
+    rate_limited / clean_exit) survives the window instead of a generic
+    ``pid N not alive``.
+
+    When the death is STILL unclassifiable (no registry entry AND no durable
+    verdict), the task is a DETECTOR GAP: it is requeued to ``ready`` WITHOUT
+    counting a failure (not a real crash — historically 95%+ of these were the
+    native-dispatch teardown race, not per-worker bugs), flagged with a
+    ``detector_gap`` run outcome / event, and surfaced via the
+    ``_last_detector_gap`` function attribute. ONE fingerprint-coalesced fleet
+    alert is raised per fingerprint per host per window instead of N silent
+    requeues.
     """
     crashed: list[str] = []
     rate_limited: list[str] = []
+    # Detector-gap requeues: worker died but the detector could not classify
+    # the cause (no reap-registry entry AND no durable dispatch_death_reason).
+    # These are NOT real crashes — requeued to ready without counting a
+    # failure, surfaced via the fingerprint-coalesced alert + this
+    # side-channel (t_6a5a8d9e).
+    detector_gap_ids: list[str] = []
+    detector_gap_details: list[tuple[str, int, str, str]] = []
+    # (task_id, pid, claimer, error_text)
     # Per-crash details collected inside the main txn, used after it
     # closes to run ``_record_task_failure`` (which needs its own
     # write_txn so can't nest). ``protocol_violation`` flags the
@@ -8032,7 +8977,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # (task_id, pid, claimer, protocol_violation, error_text)
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, "
+            "last_failure_error FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
@@ -8054,34 +9000,89 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
 
             pid = int(row["worker_pid"])
             kind, code = _classify_worker_exit(pid)
+            # The volatile reap registry can miss the exit (worker reaped
+            # outside the dispatcher's reap-tick window, or the dispatcher
+            # restarted between spawn and death). Fall back to the DURABLE
+            # verdict persisted on the run row by the reap loop, so a
+            # specific death reason survives the window (t_6a5a8d9e).
+            if kind == "unknown":
+                dkind, dcode = _durable_exit_verdict(conn, row["id"], pid)
+                if dkind and dkind != "unknown":
+                    kind, code = dkind, dcode
             rate_limited_exit = False
+            detector_gap = False
             if kind == "clean_exit":
                 # Worker subprocess returned 0 but its task is still
                 # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
+                # ``kanban_complete`` / ``kanban_block``. Two distinct causes
+                # share this symptom, and they MUST be separated
+                # (t_85378990 / t_74c6693e recurrence):
+                #
+                #   (a) Genuine protocol violation: the agent answered
+                #       conversationally and skipped the terminal call. The
+                #       worker never reached the model API at all (or the API
+                #       succeeded and it still didn't call the tool). Retry
+                #       usually completes; trip the bounded violation streak.
+                #
+                #   (b) Provider / API death: the model API call failed (429
+                #       rate-limit / 404 model-not-found / auth / connection /
+                #       credit-cap) BEFORE the agent could emit a terminal
+                #       call, so the worker exited rc=0 with no model
+                #       response. This is NOT a contract skip — it is a
+                #       RETRYABLE provider error. Treat it like the quota-wall
+                #       path: release to ``ready`` WITHOUT a protocol_violation
+                #       mark and WITHOUT counting a failure, so the breaker
+                #       can't auto-block a card whose only sin was "its
+                #       provider was down", and the spawn-time fallback chain
+                #       / respawn guard can recover it.
+                #
+                # The dispatcher only sees the exit code; the real API error
+                # was printed to the worker log, so we read its tail to decide.
+                _log_tail = _worker_log_tail_for_task(conn, row["id"])
+                if _log_tail and _PROVIDER_API_FAILURE_RE.search(_log_tail):
+                    _snip = _first_match_snippet(_PROVIDER_API_FAILURE_RE, _log_tail)
+                    protocol_violation = False
+                    # Reuse the rate_limited treatment: release to ready, no
+                    # failure count, respawn guard defers then probes, and the
+                    # spawn-time provider fallback chain serves the retry.
+                    rate_limited_exit = True
+                    error_text = (
+                        f"worker exited cleanly (rc=0) but the MODEL API CALL "
+                        f"FAILED (provider/API failure, NOT a protocol "
+                        f"violation). Worker-log root cause: {_snip}. "
+                        f"Re-driven to ready; the dispatcher's provider "
+                        f"fallback/retry path serves the next attempt. If the "
+                        f"same provider stays down, fail over to a healthy "
+                        f"provider (e.g. set a task provider_override)."
+                    )
+                    event_kind = "provider_api_failure"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        "provider_api_failure": True,
+                        "root_cause_snippet": _snip,
+                    }
+                else:
+                    protocol_violation = True
+                    error_text = (
+                        "worker exited cleanly (rc=0) without calling "
+                        "kanban_complete or kanban_block — protocol violation. "
+                        "If the prior run already did the work, verify it and "
+                        "report the result via kanban_complete; a run that ends "
+                        "without a terminal kanban call counts as failed no "
+                        "matter what it did."
+                    )
+                    event_kind = "protocol_violation"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "exit_code": code,
+                        # Durable marker for _protocol_violation_streak: _end_run
+                        # copies this payload into the run metadata, which is how
+                        # the violation-only retry budget is derived later.
+                        "protocol_violation": True,
+                    }
             elif kind == "rate_limited":
                 # Worker bailed because the provider rate-limited / exhausted
                 # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
@@ -8104,17 +9105,59 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 }
             else:
                 protocol_violation = False
+                # Surface the worker's own last-failure error (stamped by the
+                # worker before it died, e.g. "API 429 after 3 retries") in the
+                # crash text so the auto-block comment written by
+                # _record_task_failure names the real cause on the card instead
+                # of a bare "pid exited with code 1". A bare pid text is what
+                # hid the provider class in t_44cfa735.
+                _prev_err = (
+                    row["last_failure_error"]
+                    if "last_failure_error" in row.keys()
+                    and row["last_failure_error"]
+                    else None
+                )
                 if kind == "nonzero_exit":
                     error_text = f"pid {pid} exited with code {code}"
                 elif kind == "signaled":
                     error_text = f"pid {pid} killed by signal {code}"
                 else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
+                    # kind is STILL "unknown" even after the durable-verdict
+                    # fallback: no reap-registry entry AND no persisted
+                    # dispatch_death_reason. This is a DETECTOR GAP — the
+                    # detector cannot name the cause (worker reaped outside
+                    # the dispatcher's reap window, or the dispatcher never
+                    # observed the exit at all). It is NOT logged as a real
+                    # crash: the task is requeued to ready WITHOUT counting a
+                    # failure against the breaker (95%+ of historical
+                    # ``pid N not alive`` was the native-dispatch teardown
+                    # race, not per-worker bugs — t_4f6b0ff5) and ONE
+                    # fingerprint-coalesced alert is raised per fingerprint
+                    # per host per window instead of N silent requeues.
+                    detector_gap = True
+                    error_text = (
+                        f"pid {pid} not alive (DETECTOR GAP: no "
+                        f"dispatch_death_reason recorded — worker reaped "
+                        f"outside the dispatcher reap window; requeued "
+                        f"without counting a failure; fingerprint-coalesced "
+                        f"alert raised)"
+                    )
+                if _prev_err:
+                    error_text = f"{_prev_err[:400]} (worker {error_text})"
+                if detector_gap:
+                    event_kind = "detector_gap"
+                    event_payload = {
+                        "pid": pid,
+                        "claimer": row["claim_lock"],
+                        "detector_gap": True,
+                        "dispatch_death_reason": "unknown",
+                    }
+                else:
+                    event_kind = "crashed"
+                    event_payload = {"pid": pid, "claimer": row["claim_lock"]}
+                    if code is not None:
+                        event_payload["exit_kind"] = kind
+                        event_payload["exit_code"] = code
 
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
@@ -8127,7 +9170,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 # Rate-limited requeues are a clean release, not a crash —
                 # record the run outcome as ``rate_limited`` so the board
                 # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
+                # Detector-gap requeues (unclassifiable death) use a distinct
+                # ``detector_gap`` outcome so the board shows the detector
+                # could not name the cause instead of a fake crash.
+                if detector_gap:
+                    _run_outcome = "detector_gap"
+                else:
+                    _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
                 run_id = _end_run(
                     conn, row["id"],
                     outcome=_run_outcome, status=_run_outcome,
@@ -8139,7 +9188,23 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload,
                     run_id=run_id,
                 )
-                if rate_limited_exit:
+                if detector_gap:
+                    # Requeue to ready WITHOUT counting a failure: the
+                    # detector could not observe/classify the death, so there
+                    # is no evidence the task is broken (95%+ of historical
+                    # ``pid N not alive`` was the teardown race). Stamp the
+                    # error so the board shows the gap, and surface via the
+                    # fingerprint-coalesced alert + ``_last_detector_gap``
+                    # side-channel instead of a silent requeue.
+                    conn.execute(
+                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
+                        (error_text[:500], row["id"]),
+                    )
+                    detector_gap_ids.append(row["id"])
+                    detector_gap_details.append(
+                        (row["id"], pid, row["claim_lock"], error_text)
+                    )
+                elif rate_limited_exit:
                     # Stamp the failure-error column so ``check_respawn_guard``
                     # recognizes this as a quota blocker and defers the
                     # respawn until the window clears — WITHOUT touching
@@ -8214,12 +9279,34 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
                     # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
+                    #
+                    # EXCEPT the ABSOLUTE catch-all (t_458ab8d6): when the
+                    # unified consecutive_failures counter has already
+                    # reached DISPATCHER_MAX_CONSECUTIVE_FAILURES, fall
+                    # through to the force-trip below instead of
+                    # ``continue``. The violation streak only bounds
+                    # violations; the absolute max bounds ALL consecutive
+                    # failures, and a task parked at the absolute max must
+                    # not escape through a below-budget violation branch
+                    # (the ``max_retries=99`` bypass).
+                    _cf_row = conn.execute(
+                        "SELECT consecutive_failures FROM tasks WHERE id = ?",
+                        (tid,),
+                    ).fetchone()
+                    if _cf_row is None:
+                        continue  # task deleted mid-loop
+                    if int(_cf_row["consecutive_failures"] or 0) < (
+                        DISPATCHER_MAX_CONSECUTIVE_FAILURES
+                    ):
+                        continue
+                # Streak reached the bound — or the unified counter reached
+                # the absolute max: trip the breaker. ``force_trip`` skips
+                # the threshold resolution inside ``_record_task_failure``
+                # because the decision — including the per-task
+                # ``max_retries`` override — was already made against the
+                # violation streak above (and the absolute-max provenance
+                # fix inside the recorder re-labels the trip when the
+                # counter is at the absolute max).
                 tripped = _record_task_failure(
                     conn, tid,
                     error=error_text,
@@ -8228,6 +9315,18 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
+                    block_kind="capability",
+                    block_comment=(
+                        f"AUTO-BLOCK (capability): protocol_violation streak "
+                        f"reached the bound ({streak}/{violation_limit}). The "
+                        f"worker exited rc=0 without calling kanban_complete / "
+                        f"kanban_block on {streak} consecutive runs. The "
+                        f"harness now auto-blocks such exits (t_44cfa735), so "
+                        f"this residual block means the worker kept narrating "
+                        f"instead of terminating even after nudges. A human "
+                        f"must verify completion (artifacts/comments) and "
+                        f"unblock for retry or complete it."
+                    ),
                     event_payload_extra={
                         "pid": pid,
                         "claimer": claimer,
@@ -8249,8 +9348,31 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
             )
+            _maybe_fire_deadpid_fleet_alert(
+                conn,
+                tid,
+                fp,
+                error_text,
+                protocol_violation=protocol_violation,
+            )
             if tripped:
                 auto_blocked.append(tid)
+    # DETECTOR GAP coalescing (t_6a5a8d9e): group unclassifiable dead-worker
+    # requeues by fingerprint and raise ONE systemic alert per fingerprint
+    # per host per window, instead of N silent requeues. Reuses the same
+    # fingerprint loop shape as the crash_details systemic check above.
+    if detector_gap_details:
+        _gap_fp_counts: dict[str, int] = {}
+        _gap_fp_sample: dict[str, tuple[str, str]] = {}
+        for _tid, _pid, _claimer, _err in detector_gap_details:
+            _fp = _error_fingerprint(_err)
+            _gap_fp_counts[_fp] = _gap_fp_counts.get(_fp, 0) + 1
+            _gap_fp_sample.setdefault(_fp, (_tid, _err))
+        for _fp, _count in _gap_fp_counts.items():
+            _sample_tid, _sample_err = _gap_fp_sample[_fp]
+            _maybe_fire_coalesced_deadpid_alert(
+                conn, _fp, _sample_err, _count, _sample_tid,
+            )
     # Stash auto-blocked ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
@@ -8259,6 +9381,10 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
+    # Detector-gap requeues — NOT crashes (no failure counted, no breaker
+    # trip), so they stay out of the ``crashed`` return too; the dispatch
+    # loop surfaces them on ``DispatchResult.detector_gap``.
+    detect_crashed_workers._last_detector_gap = detector_gap_ids  # type: ignore[attr-defined]
     return crashed
 
 
@@ -8273,6 +9399,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    block_kind: Optional[str] = None,
+    block_comment: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -8302,7 +9430,26 @@ def _record_task_failure(
     when the breaker trips, so callers can include outcome-specific
     context (e.g. pid on crash, elapsed on timeout).
 
+    ``block_kind`` / ``block_comment`` are recorded on the task when the
+    breaker trips (status → ``blocked``). Historically the auto-block path
+    left ``block_kind`` NULL and wrote no comment, so every auto-blocked
+    card looked identical to a generic human/legacy block and the *reason*
+    a card was auto-blocked was invisible on the card itself. That hidden
+    reason is exactly what masked the protocol-violation failure class in
+    t_44cfa735 — callers MUST pass a typed ``block_kind`` (one of
+    ``VALID_BLOCK_KINDS``) and a human-readable ``block_comment`` so the
+    card carries why it was auto-blocked. When ``block_kind`` is omitted the
+    dispatcher falls back to ``"capability"`` so the column is never NULL on
+    an auto-block (a NULL block_kind is treated as a generic untyped block,
+    which hid this class).
+
     Resolution order for the effective threshold:
+      0. ``DISPATCHER_MAX_CONSECUTIVE_FAILURES`` — the ABSOLUTE catch-all
+         kill-switch (t_458ab8d6), highest precedence. Once the unified
+         counter reaches it, no override — per-task ``max_retries``,
+         caller-supplied ``failure_limit``, or ``force_trip=False`` — can
+         keep the task retrying; the trip reports
+         ``limit_source="absolute_max"``.
       1. per-task ``max_retries`` if set (nothing else overrides)
       2. caller-supplied ``failure_limit`` (gateway passes the config
          value from ``kanban.failure_limit``; tests pass fixed values)
@@ -8342,6 +9489,19 @@ def _record_task_failure(
             effective_limit = int(failure_limit)
             limit_source = "dispatcher"
 
+        # Threshold #0 — the ABSOLUTE catch-all (t_458ab8d6). Highest
+        # precedence: once the unified counter reaches
+        # DISPATCHER_MAX_CONSECUTIVE_FAILURES, nothing can override it —
+        # per-task max_retries, config/caller failure_limit, or
+        # force_trip=False all lose. This is checked AFTER the effective
+        # limit resolution (so a high task/limit override is replaced) and
+        # applies EVEN when force_trip=True: a forced trip at or above the
+        # absolute max reports limit_source="absolute_max" rather than the
+        # caller's own provenance (the t_458ab8d6 provenance fix).
+        if failures >= DISPATCHER_MAX_CONSECUTIVE_FAILURES:
+            effective_limit = DISPATCHER_MAX_CONSECUTIVE_FAILURES
+            limit_source = "absolute_max"
+
         if force_trip or failures >= effective_limit:
             # Trip the breaker.
             if release_claim:
@@ -8349,9 +9509,12 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500],
+                     block_kind if block_kind in VALID_BLOCK_KINDS else "capability",
+                     task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -8359,9 +9522,12 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "block_kind = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (failures, error[:500],
+                     block_kind if block_kind in VALID_BLOCK_KINDS else "capability",
+                     task_id),
                 )
             run_id = None
             if end_run:
@@ -8389,6 +9555,32 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            # Record WHY the card was auto-blocked as a comment, so the reason
+            # is visible on the card itself (it was previously NULL block_kind
+            # + no comment, which hid the protocol-violation failure class in
+            # t_44cfa735). Prefer an explicit caller-supplied comment, else a
+            # synthesized one describing the trip. Written directly inside the
+            # surrounding write_txn (no nested txn) so it's atomic with the
+            # block transition.
+            _comment_body = block_comment or (
+                f"AUTO-BLOCK ({block_kind if block_kind in VALID_BLOCK_KINDS else 'capability'}): "
+                f"circuit breaker tripped after {failures} failure(s) "
+                f"(trigger_outcome={outcome}, limit_source={limit_source}, "
+                f"effective_limit={effective_limit}). {error[:300]}"
+            )
+            try:
+                conn.execute(
+                    "INSERT INTO task_comments (task_id, author, body, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, "kanban-dispatcher", _comment_body, int(time.time())),
+                )
+                _append_event(
+                    conn, task_id, "commented",
+                    {"author": "kanban-dispatcher", "len": len(_comment_body)},
+                )
+            except Exception:
+                # Never let a comment-write failure abort the auto-block.
+                _log.debug("auto-block comment write failed", exc_info=True)
             blocked = True
         else:
             # Below threshold.
@@ -8423,6 +9615,17 @@ def _record_task_failure(
                     run_id=run_id,
                 )
             # Timeout/crash path's caller already emitted its own event.
+    # LOUD DELIVERED event for the absolute kill-switch (t_458ab8d6): the
+    # trip must be observable through the failure-alert path, not a silent
+    # status change. Fired AFTER the write_txn commits so a strict-hook
+    # relay failure can never roll back the block itself.
+    if blocked and limit_source == "absolute_max":
+        _maybe_fire_kill_switch_alert(
+            conn, task_id,
+            failures=failures,
+            error=error,
+            outcome=outcome,
+        )
     return blocked
 
 
@@ -8527,8 +9730,11 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
 
     ``"active_pr"``
         A GitHub PR URL appears in a recent task comment (within
-        ``_RESPAWN_GUARD_PR_WINDOW`` seconds).  A prior worker already
+        ``_RESPAWN_GUARD_PR_WINDOW`` seconds) AND the PR is still OPEN (or its
+        state cannot be determined — fail closed).  A prior worker already
         opened a PR; re-spawning risks a duplicate PR on the same task.
+        (t_9799c507: a MERGED or CLOSED PR no longer blocks re-spawn — the
+        PR state is resolved read-only via ``gh pr view``.)
 
     Stale / dead claim locks are NOT a guard reason — they are handled
     by ``release_stale_claims`` and ``detect_crashed_workers`` which
@@ -8611,13 +9817,25 @@ def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]
             return "recent_success"
 
     # 4. GitHub PR URL in a recent comment — prior worker already opened a PR.
+    #    t_9799c507: the guard was PR-state-BLIND and stalled MERGED-PR cards
+    #    (sycode-trading/t_30c13209, 24.5d). We now resolve the ACTUAL GitHub PR
+    #    state (read-only `gh pr view`): only a still-OPEN PR (or one whose
+    #    state cannot be determined — fail closed) blocks re-spawn. A MERGED or
+    #    CLOSED PR must NOT block — the task is ready for landing follow-up.
+    #    The state check can be disabled via HERMES_KANBAN_PR_STATE_CHECK=0
+    #    (keeps the legacy URL-only behavior).
     pr_cutoff = now - _RESPAWN_GUARD_PR_WINDOW
-    for c in conn.execute(
-        "SELECT body FROM task_comments WHERE task_id = ? AND created_at >= ?",
-        (task_id, pr_cutoff),
-    ).fetchall():
-        if c["body"] and _RESPAWN_GUARD_PR_URL_RE.search(c["body"]):
-            return "active_pr"
+    pr_refs = _pr_urls_in_comments(conn, task_id, pr_cutoff)
+    if pr_refs:
+        if not _pr_state_check_enabled():
+            return "active_pr"  # legacy behavior: any recent PR URL blocks
+        for repo, number in pr_refs:
+            state = _github_pr_state(repo, number)
+            if state not in ("MERGED", "CLOSED"):
+                # OPEN, or unknown (gh failed) — fail closed, keep the guard.
+                return "active_pr"
+        # Every recent PR URL resolves to MERGED/CLOSED — do not block.
+        return None
 
     return None
 
@@ -8793,7 +10011,7 @@ def _dispatch_once_locked(
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    reap_worker_zombies(conn)
 
     result = DispatchResult()
     result.reclaimed = release_stale_claims(conn)
@@ -8817,6 +10035,14 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
+    # Detector-gap requeues (worker died, cause unclassifiable, no failure
+    # counted) — surface for telemetry / tests so they are distinguishable
+    # from genuine crashes (t_6a5a8d9e).
+    _crash_detector_gap = getattr(
+        detect_crashed_workers, "_last_detector_gap", []
+    )
+    if _crash_detector_gap:
+        result.detector_gap.extend(_crash_detector_gap)
     result.timed_out = enforce_max_runtime(conn)
     # Approval auto-clear (t_6009ccaa): promote approved-but-stuck cards out
     # of blocked/review/scheduled BEFORE dependency promotion, so a card
@@ -8900,19 +10126,85 @@ def _dispatch_once_locked(
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
 
-        # Block-gate audit (t_fc1fdf31): defense-in-depth — if a ready
-        # task has an unresolved block gate (worker/operator ``kanban_block``
-        # without a subsequent unblock), something went wrong: manual DB
-        # edit, missed event, or a code-path bug. Log an audit event and
-        # skip the spawn so no claim is sent for a blocked card.
-        if _has_sticky_block(conn, row["id"]):
-            result.skipped_block_gate.append(row["id"])
+        # Blocked-card exclusion + audit logging (t_73a70cde / t_a2ef2ea2).
+        #
+        # Acceptance criterion (a): the dispatcher MUST NEVER transition a
+        # blocked card to ``running`` without an explicit unblock event
+        # recorded in task_events. We treat a ready-row card as "blocked"
+        # under two unambiguous conditions:
+        #
+        #   1. status == 'blocked' — a card that somehow reached the ready
+        #      queue (manual DB edit, racy writer, recompute_ready bug) while
+        #      still carrying the blocked status column. The blind-spot guard
+        #      in recompute_ready is meant to prevent this, so reaching here
+        #      is a defense-in-depth safety net, not the happy path.
+        #   2. _has_sticky_block(...) — a card with an unresolved sticky block
+        #      event (worker/operator ``kanban_block`` without a subsequent
+        #      unblock). This is the normal "human parked this card" case.
+        #
+        # Acceptance criterion (b): for EVERY attempt to claim a blocked card,
+        # log an audit event carrying the required metadata — card id,
+        # timestamp, and dispatcher identifier — so fleet telemetry / a soak
+        # watchdog can prove no blocked card was silently claimed.
+        #
+        # Read the authoritative status fresh: the ready_rows cursor is a
+        # snapshot taken before the per-row loop, and a concurrent writer
+        # (e.g. an operator block or a racy recompute) could have flipped the
+        # card to 'blocked' in between. The claim gate only acts on 'ready'
+        # rows, so a snapshot status of 'blocked' can never be in this set —
+        # but re-reading keeps the backstop correct even if the WHERE clause
+        # or a future writer changes, so a blocked card can never transition
+        # to running without an explicit unblock event (acceptance (a)).
+        _blocked_row_status = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (row["id"],)
+        ).fetchone()
+        _blocked_row_status = (
+            _blocked_row_status["status"] if _blocked_row_status else None
+        )
+        _sticky = _has_sticky_block(conn, row["id"])
+        _is_blocked = (_blocked_row_status == "blocked") or _sticky
+        if _is_blocked:
+            # Back-compat telemetry bucket (t_fc1fdf31) — populated when the
+            # card is blocked by a sticky block event, matching the prior
+            # behaviour that downstream dashboards already read.
+            if _sticky:
+                result.skipped_block_gate.append(row["id"])
+            # t_73a70cde acceptance (b): every blocked-card claim attempt is
+            # logged with card id + timestamp + dispatcher id.
+            result.blocked_claim_attempts.append(row["id"])
             if not dry_run:
                 at = _claimer_id()
+                at_ts = int(time.time())
                 with write_txn(conn):
+                    # Legacy audit event — emit for the sticky-block path so
+                    # existing dashboards / soak watchers that read
+                    # ``block_gate_audit`` keep working (registered design at
+                    # Incidents/Audits/2026-07-28-t_f85428fe-...). The
+                    # non-sticky blind-spot case (status='blocked' with no
+                    # blocked event) is covered only by the new
+                    # ``blocked_dispatch_attempt`` event below.
+                    if _sticky:
+                        _append_event(
+                            conn, row["id"], "block_gate_audit",
+                            {
+                                "origin": at,
+                                "task_id": row["id"],
+                                "timestamp": at_ts,
+                            },
+                        )
+                    # New t_73a70cde audit event — every blocked-card claim
+                    # attempt (sticky OR blind-spot status='blocked') carries
+                    # the required metadata: card id, timestamp, dispatcher id.
                     _append_event(
-                        conn, row["id"], "block_gate_audit",
-                        {"origin": at, "task_id": row["id"]},
+                        conn, row["id"], "blocked_dispatch_attempt",
+                        {
+                            "task_id": row["id"],
+                            "dispatcher_id": at,
+                            "timestamp": at_ts,
+                            "status_column": _blocked_row_status,
+                            "sticky_block": _sticky,
+                            "reason": "dispatcher refused to claim a blocked card",
+                        },
                     )
             continue
 
@@ -9653,6 +10945,15 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
+    #
+    # We DO retain the Popen object itself (t_6a5a8d9e). Abandoning it lets
+    # the subprocess module's internal reaper harvest the child before the
+    # dispatcher's waitpid(-1) sees it, which silently destroys the exit
+    # status and forces every death to degrade into a generic
+    # ``pid N not alive`` DETECTOR GAP. Holding the handle lets
+    # ``_harvest_worker_handles`` read a real returncode and persist a
+    # specific ``dispatch_death_reason``.
+    _register_worker_handle(proc.pid, proc)
     return proc.pid
 
 
