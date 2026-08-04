@@ -722,4 +722,3 @@ class TelegramDmTopicMixin:
                 "[%s] Cached DM topic from message: %s -> thread_id=%s",
                 self.name, cache_key, thread_id,
             )
-
