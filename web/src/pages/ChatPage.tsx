@@ -48,6 +48,7 @@ import {
   shouldReconnectPtyOnPageResume,
 } from "@/lib/pty-reconnect";
 import {
+  PTY_RESUME_HYDRATION_WATCHDOG_MS,
   PTY_RESUME_LOADING_MAX_MS,
   PTY_RESUME_LOADING_MESSAGE,
   shouldFinishResumeHydrationOnChunk,
@@ -207,6 +208,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const connectInFlightRef = useRef(false);
   const connectingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const ptyInputLineRef = useRef("");
+  // Total raw bytes received from the PTY WebSocket. Sent as ?offset= on
+  // reconnect so the server can send an incremental replay instead of the
+  // full 1 MB RingBuffer (the xterm.js terminal buffer already has the
+  // history painted — ChatPage stays mounted across tab switches).
+  const ptyByteOffsetRef = useRef(0);
   const mobileReplacementInputUntilRef = useRef(0);
   const [ptyState, setPtyState] =
     useState<PtyConnectionState>("connecting");
@@ -240,6 +246,8 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    // Don't reset ptyByteOffsetRef — we want to send it as ?offset= so the
+    // server sends an incremental replay.
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
@@ -252,6 +260,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    ptyByteOffsetRef.current = 0;
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
@@ -267,6 +276,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
+    ptyByteOffsetRef.current = 0;
     setSearchParams(next, { replace: true });
     setBanner(null);
     setLastCloseCode(null);
@@ -930,7 +940,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         finishResumeHydration();
       }
     };
-    if (resumeParam) {
+    const forceFresh = forceFreshPtyRef.current;
+    forceFreshPtyRef.current = false;
+    // P2: only arm the resume-loading overlay when there is genuinely
+    // something to (re)load. If this connect carries a prior byte offset
+    // (>0), the client already has the terminal history painted — ChatPage
+    // stays mounted across tab switches, so the buffer was never lost — and
+    // the server will only send a small incremental delta (or, in the
+    // zero-delta case, nothing at all). Arming the overlay there re-blanks a
+    // perfectly good screen on every split-screen focus toggle, which is the
+    // black-screen the user reports. First attach (offset 0) and forced-fresh
+    // sessions still arm normally.
+    const hasPriorPtyBytes = ptyByteOffsetRef.current > 0 && !forceFresh;
+    if (resumeParam && !hasPriorPtyBytes) {
       setResumeHydrating(true);
       resumeMaxTimer = setTimeout(
         finishResumeHydration,
@@ -939,8 +961,6 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     } else {
       setResumeHydrating(false);
     }
-    const forceFresh = forceFreshPtyRef.current;
-    forceFreshPtyRef.current = false;
     // A connect attempt is now in flight — set synchronously (before the async
     // socket-open IIFE below awaits its ticket URL) so a page-resume event in
     // that gap doesn't fire a redundant reconnect (wsRef isn't assigned yet).
@@ -979,6 +999,12 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
+      // Incremental replay: send the total bytes we've already received so
+      // the server can skip re-sending history the xterm.js terminal already
+      // has painted. Only meaningful on reconnect (attach token is present).
+      if (ptyByteOffsetRef.current > 0 && !forceFresh) {
+        params.offset = String(ptyByteOffsetRef.current);
+      }
       const url = await api.buildWsUrl("/api/pty", params);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
@@ -1012,6 +1038,19 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (reconnectTimerRef.current) {
         clearTimeout(reconnectTimerRef.current);
         reconnectTimerRef.current = null;
+      }
+      // Hydration watchdog: the resume wait-notice is edge-triggered on the
+      // FIRST payload frame. A zero-delta incremental replay (client offset
+      // already at the tail) or an older server without the sentinel frame
+      // sends nothing, so the notice would stay up until the 30s wedged-resume
+      // cap. Force-finish hydration shortly after open unless a frame arrives
+      // first (in which case noteResumePtyChunk already clears it and clears
+      // this timer via finishResumeHydration → clearResumeLoadingTimers).
+      if (resumeParam && !forceFresh) {
+        resumeMaxTimer = setTimeout(
+          finishResumeHydration,
+          PTY_RESUME_HYDRATION_WATCHDOG_MS,
+        );
       }
       // Send the initial RESIZE immediately so Ink has *a* size to lay
       // out against on its first paint.  The double-rAF block above will
@@ -1053,6 +1092,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     }
 
     ws.onmessage = (ev) => {
+      // Track raw bytes for incremental replay offset. We count the raw
+      // payload size (not the sanitized/decoded text) so the offset matches
+      // the server's total_appended counter byte-for-byte.
+      if (typeof ev.data === "string") {
+        ptyByteOffsetRef.current += ev.data.length;
+      } else {
+        ptyByteOffsetRef.current += (ev.data as ArrayBuffer).byteLength;
+      }
       const text =
         typeof ev.data === "string"
           ? ev.data
@@ -1359,7 +1406,24 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       return;
     }
 
-    const onResume = () => maybeReconnectOnPageResume();
+    const onResume = () => {
+      maybeReconnectOnPageResume();
+      // P1: Chrome may discard/blur the terminal canvas while the tab is
+      // backgrounded (especially under split-screen focus toggling). When
+      // the tab becomes visible again, force a full xterm repaint so the
+      // buffered buffer content is re-composited instead of leaving a black
+      // viewport until the next PTY frame happens to arrive.
+      if (document.visibilityState === "visible") {
+        const term = termRef.current;
+        if (term && termRef.current?.rows) {
+          try {
+            term.refresh(0, termRef.current.rows - 1);
+          } catch {
+            /* terminal not ready yet */
+          }
+        }
+      }
+    };
 
     document.addEventListener("visibilitychange", onResume);
     window.addEventListener("pageshow", onResume);

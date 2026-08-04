@@ -6,6 +6,17 @@ import type { PtyConnectionState } from "@/lib/pty-reconnect";
  */
 export const PTY_RESUME_LOADING_MAX_MS = 30000;
 
+/**
+ * Hydration watchdog: after the PTY socket opens, the wait notice is
+ * edge-triggered on the FIRST payload frame. If the server sends nothing
+ * within this budget — e.g. an older server without the sentinel frame, or a
+ * zero-delta incremental replay where every byte was already consumed before
+ * the reconnect — force-finish hydration so the overlay cannot hang. Normal
+ * attaches receive their first frame in milliseconds, so this is far below
+ * the 30s wedged-resume cap and far above any legitimate first-frame latency.
+ */
+export const PTY_RESUME_HYDRATION_WATCHDOG_MS = 2000;
+
 export const PTY_RESUME_LOADING_MESSAGE =
   "Please wait while the conversation loads…";
 
