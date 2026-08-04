@@ -823,6 +823,46 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert "referenced script" in result["error"]
         assert any("cat" in c for c in calls)
 
+    def test_remote_read_of_binary_does_not_crash_the_guard(self, tmp_path):
+        """A binary read through the remote callback is 'nothing to scan'.
+
+        _read_referenced_script skips binaries locally (NUL byte in the first
+        chunk) and returns None. That None used to fall through to the remote
+        callback, which reads via `cat` and decodes with errors="replace" — NUL
+        bytes are valid UTF-8 and survive. The decoded machine code was then
+        tokenized as a command line, the linker path in the ELF string table
+        produced a candidate containing a NUL byte, and os.open raised
+        ValueError: embedded null byte. The guard crashed instead of deciding,
+        so every command invoked through an absolute binary or interpreter path
+        failed inside a gateway worker.
+
+        Without the fix this test raises ValueError; the assertion below is not
+        what fails first.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        # Shaped like a real ELF: header, NUL padding, string table. The linker
+        # path next to NUL bytes is what tokenizes into a NUL-bearing candidate.
+        binary = tmp_path / "chrome"
+        binary.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00"
+            + b"\x00" * 32
+            + b"/lib64/ld-linux-x86-64.so.2\x00libc.so.6\x00"
+        )
+        binary.chmod(0o755)
+
+        def read_remote(path):
+            """What tools/terminal_tool.py supplies: raw read, lossy decode."""
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(200_000).decode("utf-8", errors="replace")
+            except OSError:
+                return None
+
+        assert guard(f"{binary} --version", read_remote_script=read_remote) is False
+
 
 class TestCronCreateLifecycleBlockExtra:
     """Additional cron create lifecycle guard coverage."""

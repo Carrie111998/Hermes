@@ -258,7 +258,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: a path with an embedded NUL byte, which appears when
+        # decoded binary content is tokenized as a command line. The same case
+        # is already handled this way for Path.resolve below, with the same
+        # rationale: a guarded path must never crash the guard (#76762).
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -327,6 +331,23 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            # The callback has NO binary detection: it reads via `cat` and
+            # decodes with errors="replace". NUL bytes are valid UTF-8 and
+            # survive, so without the check below this branch undoes the
+            # protection _read_referenced_script established above — machine
+            # code gets tokenized, the linker path in the ELF string table
+            # yields a candidate containing a NUL byte, and os.open raises.
+            #
+            # Note that `script_text is None` above means two different things:
+            # "not present locally" and "deliberately skipped as a binary".
+            # Only tools/terminal_tool.py supplies this callback, so the crash
+            # never reproduces when the function is called directly — which is
+            # why manual testing does not surface it.
+            #
+            # Same rule as the local read (#76762): a binary is "nothing to
+            # scan", not a suspicion.
+            if script_text and "\x00" in script_text[:_MAX_REFERENCED_SCRIPT_BYTES]:
+                script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
