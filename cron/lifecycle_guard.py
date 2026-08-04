@@ -389,7 +389,12 @@ def _read_script_for_scanning(script_path: str) -> str:
     sentinel, while missing/unreadable paths remain empty so ordinary scheduler
     path validation can report them.
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
+    resolved_script = _resolve_script_path(script_path)
+    shell_invoked = resolved_script.suffix.lower() in {".sh", ".bash"}
+    script_text, unsafe = _read_referenced_script(
+        resolved_script,
+        shell_invoked=shell_invoked,
+    )
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""

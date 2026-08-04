@@ -724,6 +724,24 @@ class TestLifecycleGuardModule:
         script.write_bytes(b"#!/bin/bash\n\x00printf safe\n")
         assert contains_gateway_lifecycle_command_or_referenced_script(str(script)) is True
 
+    def test_plain_shell_script_with_nul_fails_closed(self, tmp_path):
+        """Cron treats .sh/.bash as shell scripts even without a shebang."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        script = tmp_path / "plain-nul.sh"
+        script.write_bytes(b"printf safe\n\x00hermes gateway restart\n")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", str(script))
+
+    def test_remote_plain_shell_script_with_nul_fails_closed(self):
+        """Remote reads must also fail closed for shell-invoked scripts."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/bash /remote/plain-nul.sh",
+            read_remote_script=lambda _path: "printf safe\n\x00hermes gateway restart\n",
+        ) is True
+
     def test_remote_nul_bearing_shell_script_fails_closed(self):
         """Remote script reads follow the same NUL fail-closed rule."""
         from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
