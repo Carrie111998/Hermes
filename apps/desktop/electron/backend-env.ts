@@ -149,10 +149,25 @@ function buildDesktopBackendEnv({
   }
 }
 
+function buildDesktopParentWatchdogEnv({
+  pid = process.pid,
+  nowMs = Date.now(),
+  uptimeSeconds = process.uptime()
+}: any = {}) {
+  const parentStartEpochSeconds = nowMs / 1000 - uptimeSeconds
+
+  return {
+    HERMES_DESKTOP: '1',
+    HERMES_DESKTOP_PARENT_PID: String(pid),
+    HERMES_DESKTOP_PARENT_START_EPOCH: parentStartEpochSeconds.toFixed(3)
+  }
+}
+
 export {
   appendUniquePathEntries,
   buildDesktopBackendEnv,
   buildDesktopBackendPath,
+  buildDesktopParentWatchdogEnv,
   delimiterForPlatform,
   hermesManagedNodePathEntries,
   normalizeHermesHomeRoot,

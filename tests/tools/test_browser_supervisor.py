@@ -33,12 +33,32 @@ import base64
 import json
 import os
 import shutil
-import socket
 import subprocess
 import tempfile
 import time
 
 import pytest
+
+
+_CHROME_CANDIDATES = (
+    "google-chrome",
+    "chromium",
+    "chromium-browser",
+    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+    "/Applications/Chromium.app/Contents/MacOS/Chromium",
+)
+
+
+def _chrome_binary() -> str | None:
+    for candidate in _CHROME_CANDIDATES:
+        if os.path.isabs(candidate):
+            if os.access(candidate, os.X_OK):
+                return candidate
+            continue
+        path = shutil.which(candidate)
+        if path:
+            return path
+    return None
 
 
 pytestmark = [
@@ -48,7 +68,7 @@ pytestmark = [
         reason="real-browser E2E: set HERMES_E2E_BROWSER=1 to opt in",
     ),
     pytest.mark.skipif(
-        not shutil.which("google-chrome") and not shutil.which("chromium"),
+        _chrome_binary() is None,
         reason="Chrome/Chromium not installed",
     ),
     pytest.mark.live_system_guard_bypass,
@@ -56,11 +76,64 @@ pytestmark = [
 
 
 def _find_chrome() -> str:
-    for candidate in ("google-chrome", "chromium", "chromium-browser"):
-        path = shutil.which(candidate)
-        if path:
-            return path
+    if path := _chrome_binary():
+        return path
     pytest.skip("no Chrome binary found")
+
+
+def _chrome_test_env() -> dict[str, str]:
+    """Return a subprocess env that cannot inherit a caller's CDP override."""
+
+    env = os.environ.copy()
+    for key in (
+        "BROWSER_CDP_URL",
+        "AGENT_BROWSER_CDP_URL",
+        "CHROME_REMOTE_DEBUGGING_PORT",
+        "REMOTE_DEBUGGING_PORT",
+    ):
+        env.pop(key, None)
+    return env
+
+
+def _read_chrome_devtools_active_port(
+    profile: str,
+    proc: subprocess.Popen,
+    *,
+    timeout: float = 15.0,
+) -> tuple[int, str]:
+    """Read Chrome's owned DevTools endpoint from its profile directory.
+
+    Launching with ``--remote-debugging-port=0`` makes Chrome choose a free
+    loopback port and write ``DevToolsActivePort`` into the exact user-data-dir
+    we created for this process. Reading that file is the ownership proof: the
+    fixture never guesses a fixed port and never probes an ambient listener.
+    """
+
+    active_port_path = os.path.join(profile, "DevToolsActivePort")
+    deadline = time.monotonic() + timeout
+    last_error = ""
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise RuntimeError(
+                "Chrome exited before writing DevToolsActivePort for its "
+                f"owned profile {profile!r}; refusing to attach to another listener"
+            )
+        try:
+            with open(active_port_path, encoding="utf-8") as f:
+                lines = [line.strip() for line in f.read().splitlines() if line.strip()]
+            port = int(lines[0])
+            browser_path = lines[1]
+            if not browser_path.startswith("/devtools/browser/"):
+                raise ValueError(f"unexpected browser path {browser_path!r}")
+            return port, browser_path
+        except (OSError, IndexError, ValueError) as exc:
+            last_error = str(exc)
+            time.sleep(0.05)
+    raise RuntimeError(
+        "Chrome did not write DevToolsActivePort for its owned profile "
+        f"{profile!r} within {timeout}s; refusing to attach to another listener"
+        + (f" (last error: {last_error})" if last_error else "")
+    )
 
 
 @pytest.fixture
@@ -72,9 +145,6 @@ def chrome_cdp(request):
     become real OOPIFs (needed by the iframe interaction tests).
     """
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as reservation:
-        reservation.bind(("127.0.0.1", 0))
-        port = reservation.getsockname()[1]
     profile = tempfile.mkdtemp(prefix="hermes-supervisor-test-")
     proc = None
 
@@ -104,7 +174,7 @@ def chrome_cdp(request):
     proc = subprocess.Popen(
         [
             _find_chrome(),
-            f"--remote-debugging-port={port}",
+            "--remote-debugging-port=0",
             f"--user-data-dir={profile}",
             "--no-first-run",
             "--no-default-browser-check",
@@ -114,28 +184,14 @@ def chrome_cdp(request):
         ],
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        env=_chrome_test_env(),
     )
 
-    ws_url = None
-    deadline = time.monotonic() + 15
-    while time.monotonic() < deadline:
-        if proc.poll() is not None:
-            pytest.fail(
-                f"Chrome exited before opening its assigned CDP port {port}; "
-                "refusing to attach to another listener"
-            )
-        try:
-            import urllib.request
-            with urllib.request.urlopen(
-                f"http://127.0.0.1:{port}/json/version", timeout=1
-            ) as r:
-                info = json.loads(r.read().decode())
-                ws_url = info["webSocketDebuggerUrl"]
-                break
-        except Exception:
-            time.sleep(0.25)
-    if ws_url is None:
-        pytest.skip("Chrome didn't expose CDP in time")
+    try:
+        port, browser_path = _read_chrome_devtools_active_port(profile, proc)
+    except RuntimeError as exc:
+        pytest.fail(str(exc))
+    ws_url = f"ws://127.0.0.1:{port}{browser_path}"
 
     yield ws_url, port
 
