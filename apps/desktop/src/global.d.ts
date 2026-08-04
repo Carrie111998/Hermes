@@ -142,6 +142,7 @@ declare global {
        *  older Electron shells predate it and fall back to the readdir poll. */
       watchDirectory?: (dir: string) => Promise<HermesPreviewWatch>
       stopPreviewFileWatch: (id: string) => Promise<boolean>
+      wirePreviewWebview?: (webContentsId: number) => Promise<boolean>
       setActiveWork?: (payload: HermesActiveWork) => void
       setTitleBarTheme?: (payload: HermesTitleBarTheme) => void
       setNativeTheme?: (mode: 'dark' | 'light' | 'system') => void

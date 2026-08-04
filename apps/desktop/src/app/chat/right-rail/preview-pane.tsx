@@ -6,11 +6,17 @@ import type { SetTitlebarToolGroup, TitlebarTool } from '@/app/shell/titlebar-co
 import { Tip } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
 import { isDesktopFsRemoteMode } from '@/lib/desktop-fs'
-import { Bug } from '@/lib/icons'
+import { Bug, ChevronLeft } from '@/lib/icons'
 import { rafCoalesce } from '@/lib/raf-coalesce'
 import { cn } from '@/lib/utils'
 import { notify, notifyError } from '@/store/notifications'
-import { $previewServerRestart, failPreviewServerRestart, type PreviewTarget } from '@/store/preview'
+import {
+  $previewCanGoBack,
+  $previewServerRestart,
+  failPreviewServerRestart,
+  type PreviewTarget,
+  setPreviewGoBackHandler
+} from '@/store/preview'
 
 import { ArtifactPreview } from './preview-artifact'
 import {
@@ -25,9 +31,13 @@ import { type ConsoleEntry, createPreviewConsoleState } from './preview-console-
 import { LocalFilePreview, PreviewEmptyState } from './preview-file'
 
 type PreviewWebview = HTMLElement & {
+  canGoBack?: () => boolean
   closeDevTools?: () => void
   getURL?: () => string
+  getWebContentsId?: () => number
+  goBack?: () => void
   isDevToolsOpened?: () => boolean
+  loadURL?: (url: string) => Promise<void>
   openDevTools?: () => void
   reload?: () => void
   reloadIgnoringCache?: () => void
@@ -35,6 +45,8 @@ type PreviewWebview = HTMLElement & {
 
 interface PreviewPaneProps {
   embedded?: boolean
+  onCanGoBackChange?: (canGoBack: boolean) => void
+  onGoBackReady?: (goBack: (() => void) | null) => void
   onRestartServer?: (url: string, context?: string) => Promise<string>
   reloadRequest?: number
   setTitlebarToolGroup?: SetTitlebarToolGroup
@@ -124,6 +136,8 @@ const TITLEBAR_GROUP_ID = 'preview'
 
 export function PreviewPane({
   embedded = false,
+  onCanGoBackChange,
+  onGoBackReady,
   onRestartServer,
   reloadRequest = 0,
   setTitlebarToolGroup,
@@ -142,6 +156,7 @@ export function PreviewPane({
   const previewServerRestart = useStore($previewServerRestart)
   const consoleHeight = useStore(consoleState.$height)
   const consoleOpen = useStore(consoleState.$open)
+  const [canGoBack, setCanGoBack] = useState(false)
   const [currentUrl, setCurrentUrl] = useState(target.url)
   const [devtoolsOpen, setDevtoolsOpen] = useState(false)
   const [loading, setLoading] = useState(true)
@@ -277,6 +292,45 @@ export function PreviewPane({
     }
   }, [appendConsoleEntry, consoleState, copy, currentUrl, onRestartServer])
 
+  const syncNavigationState = useCallback((webview: PreviewWebview | null = webviewRef.current) => {
+    setCanGoBack(Boolean(webview?.canGoBack?.()))
+  }, [])
+
+  const goBack = useCallback(() => {
+    const webview = webviewRef.current
+
+    if (!webview?.goBack) {
+      return
+    }
+
+    // Prefer the live webview history check, but still attempt goBack when the
+    // UI believes history exists — some guest navigations report canGoBack late.
+    if (!webview.canGoBack?.() && !$previewCanGoBack.get()) {
+      return
+    }
+
+    webview.goBack()
+    // canGoBack updates again on did-navigate / did-stop-loading; seed now so
+    // the Back control doesn't linger stale for a frame after a quick Esc.
+    window.requestAnimationFrame(() => syncNavigationState(webview))
+  }, [syncNavigationState])
+
+  useEffect(() => {
+    $previewCanGoBack.set(canGoBack)
+    onCanGoBackChange?.(canGoBack)
+  }, [canGoBack, onCanGoBackChange])
+
+  useEffect(() => {
+    setPreviewGoBackHandler(goBack)
+    onGoBackReady?.(goBack)
+
+    return () => {
+      setPreviewGoBackHandler(null)
+      onGoBackReady?.(null)
+      $previewCanGoBack.set(false)
+    }
+  }, [goBack, onGoBackReady])
+
   const toggleDevTools = useCallback(() => {
     const webview = webviewRef.current
 
@@ -303,6 +357,16 @@ export function PreviewPane({
     const tools: TitlebarTool[] = [
       ...(isWebPreview
         ? [
+            ...(canGoBack
+              ? [
+                  {
+                    icon: <ChevronLeft />,
+                    id: `${TITLEBAR_GROUP_ID}-back`,
+                    label: copy.goBack,
+                    onSelect: goBack
+                  }
+                ]
+              : []),
             {
               active: consoleOpen,
               icon: <PreviewConsoleTitlebarIcon consoleState={consoleState} />,
@@ -324,7 +388,17 @@ export function PreviewPane({
     setTitlebarToolGroup(TITLEBAR_GROUP_ID, tools)
 
     return () => setTitlebarToolGroup(TITLEBAR_GROUP_ID, [])
-  }, [consoleOpen, consoleState, copy, devtoolsOpen, isWebPreview, setTitlebarToolGroup, toggleDevTools])
+  }, [
+    canGoBack,
+    consoleOpen,
+    consoleState,
+    copy,
+    devtoolsOpen,
+    goBack,
+    isWebPreview,
+    setTitlebarToolGroup,
+    toggleDevTools
+  ])
 
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
@@ -519,6 +593,7 @@ export function PreviewPane({
     host.replaceChildren()
     webviewRef.current = null
     setCurrentUrl(target.url)
+    setCanGoBack(false)
     setDevtoolsOpen(false)
     setLoadError(null)
     consoleState.reset()
@@ -569,6 +644,8 @@ export function PreviewPane({
         setLoadError(null)
         setCurrentUrl(detail.url)
       }
+
+      syncNavigationState(webview)
     }
 
     const onFail = (event: Event) => {
@@ -594,10 +671,15 @@ export function PreviewPane({
         url: detail.validatedURL || webview.getURL?.() || target.url
       })
       setLoading(false)
+      syncNavigationState(webview)
     }
 
     const onStart = () => setLoading(true)
-    const onStop = () => setLoading(false)
+
+    const onStop = () => {
+      setLoading(false)
+      syncNavigationState(webview)
+    }
 
     webview.addEventListener('console-message', onConsole)
     webview.addEventListener('did-fail-load', onFail)
@@ -608,6 +690,27 @@ export function PreviewPane({
     host.appendChild(webview)
     webviewRef.current = webview
 
+    // Explicitly wire guest window.open + Escape→back after the guest exists.
+    // getWebContentsId throws if called before the webview is attached/ready.
+    const wireGuest = () => {
+      try {
+        const id = webview.getWebContentsId?.()
+
+        if (typeof id === 'number' && id > 0) {
+          void window.hermesDesktop?.wirePreviewWebview?.(id)
+        }
+      } catch {
+        // Not ready yet; dom-ready will retry.
+      }
+    }
+
+    const onDomReady = () => wireGuest()
+
+    webview.addEventListener('dom-ready', onDomReady)
+    // Prefer dom-ready; a delayed attempt covers guests that already fired it.
+    window.setTimeout(wireGuest, 0)
+    window.setTimeout(wireGuest, 250)
+
     return () => {
       webview.removeEventListener('console-message', onConsole)
       webview.removeEventListener('did-fail-load', onFail)
@@ -615,15 +718,28 @@ export function PreviewPane({
       webview.removeEventListener('did-navigate-in-page', onNavigate)
       webview.removeEventListener('did-start-loading', onStart)
       webview.removeEventListener('did-stop-loading', onStop)
+      webview.removeEventListener('dom-ready', onDomReady)
       webview.remove()
     }
-  }, [appendConsoleEntry, consoleState, copy, isWebPreview, target.url])
+  }, [appendConsoleEntry, consoleState, copy, isWebPreview, syncNavigationState, target.url])
 
   return (
     <aside className="relative flex h-full w-full min-w-0 flex-col overflow-hidden bg-transparent text-muted-foreground">
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
         {!embedded && (
           <div className="pointer-events-none flex min-h-(--titlebar-height) items-center gap-1.5 border-b border-border/60 bg-background px-2 py-1">
+            {canGoBack && (
+              <Tip label={copy.goBack}>
+                <button
+                  aria-label={copy.goBack}
+                  className="pointer-events-auto grid size-7 shrink-0 place-items-center rounded-md text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
+                  onClick={goBack}
+                  type="button"
+                >
+                  <ChevronLeft className="size-4" />
+                </button>
+              </Tip>
+            )}
             <div className="min-w-0 flex-1">
               <Tip label={copy.openTarget(currentUrl)}>
                 <a

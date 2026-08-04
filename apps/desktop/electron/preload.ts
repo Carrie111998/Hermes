@@ -131,6 +131,7 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   watchPreviewFile: url => ipcRenderer.invoke('hermes:watchPreviewFile', url),
   watchDirectory: dir => ipcRenderer.invoke('hermes:watchDirectory', dir),
   stopPreviewFileWatch: id => ipcRenderer.invoke('hermes:stopPreviewFileWatch', id),
+  wirePreviewWebview: webContentsId => ipcRenderer.invoke('hermes:wirePreviewWebview', webContentsId),
   setActiveWork: payload => ipcRenderer.send('hermes:active-work', payload),
   setTitleBarTheme: payload => ipcRenderer.send('hermes:titlebar-theme', payload),
   setNativeTheme: mode => ipcRenderer.send('hermes:native-theme', mode),

@@ -86,4 +86,86 @@ describe('PreviewPane console state', () => {
 
     expect(setTitlebarToolGroup).toHaveBeenCalledTimes(initialCalls)
   })
+
+  it('does not treat guest console output as a navigation command', async () => {
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          setTitlebarToolGroup={vi.fn()}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      loadURL?: (url: string) => Promise<void>
+    }
+
+    const loadURL = vi.fn(async () => undefined)
+    webview.loadURL = loadURL
+
+    act(() => {
+      webview.dispatchEvent(
+        Object.assign(new Event('console-message'), {
+          level: 0,
+          message: '__hermes_preview_navigate__:https://example.com/guest-controlled',
+          sourceId: 'http://localhost:5174/report.html'
+        })
+      )
+    })
+
+    expect(loadURL).not.toHaveBeenCalled()
+  })
+
+  it('surfaces a Back titlebar tool once the webview can go back', async () => {
+    const setTitlebarToolGroup = vi.fn()
+
+    let rendered!: ReturnType<typeof render>
+    await act(async () => {
+      rendered = render(
+        <PreviewPane
+          setTitlebarToolGroup={setTitlebarToolGroup}
+          target={{
+            kind: 'url',
+            label: 'Preview',
+            source: 'http://localhost:5174',
+            url: 'http://localhost:5174'
+          }}
+        />
+      )
+    })
+
+    const webview = rendered.container.querySelector('webview') as HTMLElement & {
+      canGoBack?: () => boolean
+      goBack?: () => void
+    }
+
+    expect(webview).toBeInstanceOf(HTMLElement)
+
+    const goBack = vi.fn()
+    webview.canGoBack = () => true
+    webview.goBack = goBack
+
+    await act(async () => {
+      webview.dispatchEvent(Object.assign(new Event('did-navigate'), { url: 'http://localhost:5174/shot.png' }))
+      webview.dispatchEvent(new Event('did-stop-loading'))
+    })
+
+    const latestTools = setTitlebarToolGroup.mock.calls.at(-1)?.[1] as Array<{ id: string; onSelect: () => void }>
+    const backTool = latestTools.find(tool => tool.id === 'preview-back')
+
+    expect(backTool).toBeTruthy()
+
+    act(() => {
+      backTool?.onSelect()
+    })
+
+    expect(goBack).toHaveBeenCalledTimes(1)
+  })
 })

@@ -90,6 +90,7 @@ import {
 } from './desktop-uninstall'
 import { describeDevCdpDecision, resolveDevCdpPort } from './dev-cdp'
 import { installEmbedReferer } from './embed-referer'
+import { installPreviewWebviewGuards, wirePreviewWebviewById } from './preview-webview'
 import { createEventDeduper } from './event-dedupe'
 import { findGitBash as _findGitBash } from './find-git-bash'
 import { installFoundInPageForwarder, performFind, stopFind } from './find-in-page'
@@ -10559,6 +10560,10 @@ ipcMain.handle('hermes:watchPreviewFile', (_event, url) => watchPreviewFile(Stri
 
 ipcMain.handle('hermes:watchDirectory', (_event, dir) => watchDirectory(String(dir || '')))
 
+ipcMain.handle('hermes:wirePreviewWebview', (_event, webContentsId) =>
+  wirePreviewWebviewById(Number(webContentsId))
+)
+
 ipcMain.handle('hermes:stopPreviewFileWatch', (_event, id) => stopPreviewFileWatch(String(id || '')))
 
 // Each renderer reports the turns it has in flight; the quit guard reads the
@@ -11825,6 +11830,10 @@ app.whenReady().then(() => {
   installMediaPermissions()
   registerMediaProtocol()
   installEmbedReferer()
+  // Preview <webview> guests: keep target=_blank attachment opens in-pane with
+  // history, and map Escape → goBack so HTML report image views are dismissible
+  // without closing the whole preview pane.
+  installPreviewWebviewGuards(app)
   registerDeepLinkProtocol()
   ensureWslWindowsFonts()
   configureSpellChecker()

@@ -2812,6 +2812,7 @@ export const zh: Translations = {
       showConsole: '显示预览控制台',
       hideDevTools: '隐藏预览 DevTools',
       openDevTools: '打开预览 DevTools',
+      goBack: '返回上一页',
       finishedRestarting: message => `Hermes 已完成预览服务器重启${message ? `: ${message}` : ''}`,
       failedRestarting: message => `服务器重启失败：${message}`,
       unknownError: '未知错误',
