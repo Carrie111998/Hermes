@@ -94,6 +94,8 @@ def make_env(k8s_sdk, monkeypatch):
             connection_config = {"name": "SandboxLocalTunnelConnectionConfig"}
 
         kwargs.setdefault("cwd", "/home/test")
+        kwargs.setdefault("warmpool", "test-warmpool")
+        kwargs.setdefault("namespace", "test-namespace")
         env = AgentSandboxBackend(
             connection_config_args=connection_config,
             persistent_filesystem=persistent,
@@ -135,10 +137,14 @@ class TestPersistence:
         env._mock_client.get_sandbox.assert_not_called()
 
     def test_non_persistent_skips_lookup(self, make_env):
-        env = make_env(persistent=False)
+        env = make_env(persistent=False, task_id="mytask")
         env._mock_client.get_sandbox.assert_not_called()
         env._mock_client.list_all_sandboxes.assert_not_called()
-        env._mock_client.create_sandbox.assert_called_once()
+        env._mock_client.create_sandbox.assert_called_once_with(
+            warmpool="test-warmpool",
+            namespace="test-namespace",
+            labels={"hermes_task_id": "mytask"}
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +209,7 @@ class TestExecute:
         call_args = sb.commands.run.call_args_list[-1]
         assert call_args[1]["timeout"] == 42
         # The command should NOT have a shell `timeout` prefix
-        cmd = call_args[0][0]
+        cmd = call_args[1]["command"]
         assert not cmd.startswith("timeout ")
 
     def test_nonzero_exit_code(self, make_env):
@@ -270,7 +276,7 @@ class TestConnectionConfig:
     def test_sandbox_in_cluster_connection_config(self, make_env, k8s_sdk):
         connection_config = {
             "name": "SandboxInClusterConnectionConfig",
-            "port_forward_ready_timeout": 8080,
+            "server_port": 8080,
             "use_pod_ip": True,
         }
         env = make_env(connection_config=connection_config)
