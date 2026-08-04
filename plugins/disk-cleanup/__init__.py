@@ -71,11 +71,19 @@ def _drain(task_id: str, session_id: str) -> Set[str]:
 
 def _attempt_track(path_str: str, task_id: str, session_id: str) -> None:
     """Best-effort auto-track. Never raises."""
+    # Reject absurd inputs before touching the filesystem: a garbage path arg
+    # (e.g. a multi-line blob from a confused model) can exceed NAME_MAX and
+    # make even stat() raise ENAMETOOLONG. Cheap guard, avoids the syscall.
+    if not isinstance(path_str, str) or not path_str or len(path_str) > 1024:
+        return
     try:
         p = Path(path_str).expanduser()
-    except Exception:
-        return
-    if not p.exists():
+        # exists()/resolve() can raise OSError for over-long components
+        # (ENAMETOOLONG) or permission-blocked parents (EACCES/EPERM) —
+        # e.g. /var/db/ConfigurationProfiles/Store on macOS. Swallow all.
+        if not p.exists():
+            return
+    except (OSError, ValueError, RuntimeError):
         return
     category = dg.guess_category(p)
     if category is None:

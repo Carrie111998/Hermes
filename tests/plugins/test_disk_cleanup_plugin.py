@@ -327,6 +327,46 @@ class TestPostToolCallHook:
         assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
 
+    def test_oversized_path_arg_does_not_raise(self, _isolate_env):
+        """Regression: a garbage multi-line ``path`` arg must not blow up the
+        post_tool_call hook with ENAMETOOLONG (Errno 63).
+
+        During provider outages the model can emit a blob (file listings,
+        newline-separated paths) as the ``path`` argument. The component
+        exceeds NAME_MAX, so even ``Path.exists()`` raises ``OSError`` — which
+        previously escaped the hook and spammed the error log.
+        """
+        pi = _load_plugin_init()
+        blob = "/Slang.doc\n---\n" + "\n".join(
+            f"/Users/hermes/Desktop/node_modules/pkg_{i}/deep/deep/deep/x" for i in range(60)
+        )
+        # Must not raise.
+        pi._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": blob, "content": "x"},
+            result="OK",
+            task_id="t5", session_id="s5",
+        )
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
+
+    def test_permission_blocked_path_does_not_raise(self, _isolate_env):
+        """Regression: paths whose stat() is blocked by macOS TCC/sandbox
+        (EACCES/EPERM, e.g. /var/db/ConfigurationProfiles/Store) must not
+        escape the hook either."""
+        pi = _load_plugin_init()
+        # Must not raise — even when the path is not tracked.
+        pi._on_post_tool_call(
+            tool_name="write_file",
+            args={"path": "/var/db/ConfigurationProfiles/Store", "content": "x"},
+            result="OK",
+            task_id="t6", session_id="s6",
+        )
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
+
+
 class TestOnSessionEndHook:
     def test_runs_quick_when_test_files_tracked(self, _isolate_env):
         pi = _load_plugin_init()
