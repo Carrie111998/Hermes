@@ -105,3 +105,161 @@ class RiPipeline:
     def __repr__(self) -> str:
         status = "native" if self.available else "unavailable"
         return f"RiPipeline(url={self.url}, model={self.model}, {status})"
+
+
+# ── Phase 2: RiChatCompletionsTransport (universal) ───────────────
+#
+# Plugs into the chat_completion_helpers dispatch. Active when
+# HERMES_RI_PIPELINE=1. Provider-agnostic — works for any
+# OpenAI-compatible provider. Set HERMES_RI_PIPELINE_PROVIDERS to
+# a comma-separated whitelist to restrict (e.g. 'ollama-launch,deepseek').
+# Falls through to the stock httpx/openai path on any error.
+
+import json as _json
+import os as _os
+from types import SimpleNamespace as _SimpleNamespace
+
+
+def _should_use_ri_pipeline(agent) -> bool:
+    """Return True when the RiPipeline fast path should be used.
+
+    Active when HERMES_RI_PIPELINE=1 and the native extension is available.
+    Provider-agnostic — works for any OpenAI-compatible provider (ollama-launch,
+    deepseek, openrouter, etc.). Set HERMES_RI_PIPELINE_PROVIDERS to a
+    comma-separated whitelist to restrict (e.g. 'ollama-launch,deepseek').
+    """
+    if not (_os.environ.get("HERMES_RI_PIPELINE") and _NATIVE_AVAILABLE):
+        return False
+
+    whitelist = _os.environ.get("HERMES_RI_PIPELINE_PROVIDERS", "")
+    if whitelist:
+        allowed = {p.strip() for p in whitelist.split(",") if p.strip()}
+        return getattr(agent, "provider", "") in allowed
+
+    # No whitelist — all providers eligible
+    return True
+
+
+def ri_pipeline_chat_completion(agent, api_kwargs: dict):
+    """Run a chat-completion request through the Rust llm-pipeline.
+
+    Accepts the same kwargs shape as ``client.chat.completions.create()``
+    and returns an OpenAI-compatible response namespace so the rest of
+    the agent loop is unchanged.
+    """
+    model = api_kwargs.get("model", agent.model)
+    messages = api_kwargs.get("messages", [])
+    base_url = getattr(agent, "base_url", "http://localhost:11434/v1")
+
+    # Inject API key into environment for the Rust pipeline.
+    # The Rust OpenAiBackend reads OPENAI_API_KEY from the environment.
+    _prev_key = _os.environ.get("OPENAI_API_KEY")
+    agent_api_key = getattr(agent, "api_key", None)
+    if callable(agent_api_key):
+        try:
+            agent_api_key = agent_api_key()
+        except Exception:
+            agent_api_key = None
+    if agent_api_key and isinstance(agent_api_key, str) and agent_api_key.strip():
+        _os.environ["OPENAI_API_KEY"] = agent_api_key
+    try:
+        return _ri_chat_completion_impl(
+            agent, api_kwargs, model, messages, base_url
+        )
+    finally:
+        if _prev_key is not None:
+            _os.environ["OPENAI_API_KEY"] = _prev_key
+        elif "OPENAI_API_KEY" in _os.environ:
+            del _os.environ["OPENAI_API_KEY"]
+
+
+def _ri_chat_completion_impl(agent, api_kwargs, model, messages, base_url):
+    # Build a text prompt from the messages list (basic: system + user + assistant)
+    system_prompt = ""
+    prompt_parts = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            # Multimodal content: extract text parts only
+            text_parts = [p.get("text", "") for p in content if isinstance(p, dict) and p.get("type") == "text"]
+            content = " ".join(text_parts)
+        if not isinstance(content, str):
+            content = str(content)
+        if role == "system":
+            system_prompt = content
+        elif role == "user":
+            prompt_parts.append(f"User: {content}")
+        elif role == "assistant":
+            prompt_parts.append(f"Assistant: {content}")
+        elif role == "tool":
+            prompt_parts.append(f"Tool output: {content}")
+
+    full_prompt = "\n".join(prompt_parts)
+
+    # Try to extract tool schemas for structured output
+    tools = api_kwargs.get("tools") or api_kwargs.get("functions")
+    use_json_mode = bool(tools and not api_kwargs.get("stream"))
+
+    pipe = RiPipeline(base_url, model)
+    if not pipe.available:
+        raise RuntimeError("RiPipeline native extension not available")
+
+    if use_json_mode:
+        # Tool-calling: use call_structured with a JSON schema for tool_choice
+        tool_names = [t.get("function", {}).get("name", "tool") for t in tools]
+        json_schema = _json.dumps({
+            "type": "object",
+            "properties": {
+                "tool": {"type": "string", "enum": tool_names},
+                "arguments": {"type": "object"},
+            },
+            "required": ["tool", "arguments"],
+        })
+        raw = pipe.call_structured(full_prompt, json_schema, system=system_prompt or None)
+    else:
+        raw = pipe.call(full_prompt, system=system_prompt or None)
+
+    # Parse tool calls if present (basic JSON extraction)
+    tool_calls = None
+    content = raw
+    if use_json_mode and raw.strip():
+        try:
+            parsed = _json.loads(raw)
+            tool_name = parsed.get("tool", "")
+            tool_args = parsed.get("arguments", {})
+            if tool_name:
+                import uuid as _uuid
+                tool_calls = [{
+                    "id": f"call_{_uuid.uuid4().hex[:8]}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": _json.dumps(tool_args),
+                    },
+                }]
+                content = None  # Tool call — no text content
+        except _json.JSONDecodeError:
+            pass
+
+    # Approximate token counts (rough character-based estimate)
+    prompt_chars = len(full_prompt) + len(system_prompt)
+    completion_chars = len(raw)
+
+    # Build response namespace matching OpenAI shape
+    message = _SimpleNamespace(
+        role="assistant",
+        content=content,
+        tool_calls=[_SimpleNamespace(**tc) for tc in tool_calls] if tool_calls else None,
+    )
+    choice = _SimpleNamespace(
+        index=0,
+        message=message,
+        finish_reason="tool_calls" if tool_calls else "stop",
+    )
+    usage = _SimpleNamespace(
+        prompt_tokens=max(1, prompt_chars // 4),
+        completion_tokens=max(1, completion_chars // 4),
+        total_tokens=max(2, (prompt_chars + completion_chars) // 4),
+    )
+    return _SimpleNamespace(choices=[choice], usage=usage, model=model)
