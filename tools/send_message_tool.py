@@ -610,12 +610,15 @@ def _parse_target_ref(platform_name: str, target_ref: str):
         if _PHOTON_DM_GUID_RE.fullmatch(target_ref.strip()):
             return target_ref.strip(), None, True
     if platform_name == "a2a":
-        # A2A chat ids are opaque context ids (ctx-...) minted per peer
-        # session; human-readable names like "a2a:macmini" resolve via the
-        # channel directory below. Without this branch every a2a target
-        # parsed to (None, None, False), so resolve_channel_name() results
-        # were re-parsed into None and send fell back to "No home channel".
-        if target_ref.strip().startswith("ctx-"):
+        # A2A targets are peer names (config.yaml a2a_agents keys, e.g.
+        # "macmini") or live-session context ids ("ctx-..."). Pass any
+        # non-empty ref through verbatim: the live adapter uses ctx ids to
+        # reply into a pending peer session, while the standalone sender
+        # (hermes send / cron) resolves peer names from a2a_agents. Without
+        # this branch every a2a target parsed to (None, None, False), so
+        # resolve_channel_name() results were re-parsed into None and send
+        # fell back to the misleading "No home channel" error.
+        if target_ref.strip():
             return target_ref.strip(), None, True
     if target_ref.lstrip("-").isdigit():
         return target_ref, None, True
