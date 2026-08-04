@@ -457,6 +457,8 @@ class APIServerCoreMixin:
         tool_complete_callback=None,
         gateway_session_key: Optional[str] = None,
         clarify_callback=None,
+        runtime_overrides: Optional[Dict[str, Any]] = None,
+        model_override: Optional[str] = None,
     ) -> Any:
         """
         Create an AIAgent instance using the gateway's runtime config.
@@ -482,9 +484,13 @@ class APIServerCoreMixin:
             GatewayRunner,
         )
 
-        runtime_kwargs = _resolve_runtime_agent_kwargs()
+        runtime_kwargs = (
+            dict(runtime_overrides)
+            if runtime_overrides is not None
+            else _resolve_runtime_agent_kwargs()
+        )
         reasoning_config = GatewayRunner._load_reasoning_config()
-        model = _resolve_gateway_model()
+        model = str(model_override or "").strip() or _resolve_gateway_model()
 
         user_config = _load_gateway_config()
         enabled_toolsets = _resolve_api_server_toolsets(user_config)

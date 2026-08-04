@@ -36,6 +36,7 @@ def run_agent_sync(
     prompt_notify_callback: Any = None,
     principal_scope: dict[str, Any] | None = None,
     agent_configurator: Any = None,
+    agent_creation_overrides: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, int]]:
     from gateway.session_context import clear_session_vars, set_session_vars
 
@@ -125,6 +126,7 @@ def run_agent_sync(
             from tools.terminal_tool import set_sudo_password_callback
 
             set_sudo_password_callback(_sudo_callback)
+        create_kwargs = dict(agent_creation_overrides or {})
         agent = adapter._create_agent(
             ephemeral_system_prompt=ephemeral_system_prompt,
             session_id=session_id,
@@ -135,6 +137,7 @@ def run_agent_sync(
             tool_complete_callback=tool_complete_callback,
             gateway_session_key=gateway_session_key,
             clarify_callback=_clarify_callback if prompt_callbacks_enabled else None,
+            **create_kwargs,
         )
         if agent_configurator is not None:
             agent_configurator(agent)
