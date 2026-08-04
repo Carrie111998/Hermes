@@ -245,6 +245,11 @@ def _resolve_int_env(name: str, default: int, *, min_value: int = 1) -> int:
     A parsed value below *min_value* also falls back so existing installs keep
     working. ``min_value=0`` permits an explicit ``0`` (used to disable a
     grace/cooldown in tests).
+
+    ponytail: deduped from four near-identical _resolve_* helpers
+    (_resolve_claim_ttl_seconds, _resolve_crash_grace_seconds,
+    _resolve_rate_limit_cooldown_seconds, _resolve_busy_timeout_ms) that all
+    read-env -> int -> fallback. One helper, one behavior.
     """
     raw = os.environ.get(name, "").strip()
     if raw:
@@ -1093,7 +1098,13 @@ def task_to_dict(
     conn: Optional[sqlite3.Connection] = None,
 ) -> dict[str, Any]:
     """Serialize a Task to a dict. ``summary=True`` omits heavy fields and
-    adds parent/child ids (requires ``conn``)."""
+    adds parent/child ids (requires ``conn``).
+
+    ponytail: single serializer replacing two hand-rolled copies
+    (hermes_cli.kanban._task_to_dict and tools.kanban_tools._task_summary_dict)
+    that had ~15 overlapping fields. One source of truth for the Task->dict
+    shape; callers pass summary=True where they previously used the tools copy.
+    """
     base = {
         "id": task.id,
         "title": task.title,
