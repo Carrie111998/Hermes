@@ -130,21 +130,27 @@ def _get_peer_uid(sock: socket.socket) -> Optional[int]:
         return uid
     except (AttributeError, OSError):
         try:
-            # macOS (Python 3.9+)
-            cred = sock.getsockopt(
-                socket.SOL_LOCAL, socket.LOCAL_PEERCRED, 12)
+            # macOS: SOL_LOCAL / LOCAL_PEERCRED 常量可能未定义
+            # （某些 Python 构建缺失），用数值回退。
+            #   SOL_LOCAL      = 0
+            #   LOCAL_PEERCRED = 1
+            sol_local = getattr(socket, "SOL_LOCAL", 0)
+            local_peercred = getattr(socket, "LOCAL_PEERCRED", 1)
+            # struct xucred: cr_version(4) + cr_uid(4) + cr_gid(4) ...
+            cred = sock.getsockopt(sol_local, local_peercred, 12)
             _, uid, _ = struct.unpack("3i", cred)
             return uid
         except (AttributeError, OSError) as exc:
             logger.error("无法获取对端 UID: %s", exc)
             return None
-        except TypeError:
-            # macOS fallback: 某些 Python 版本 LOCAL_PEERCRED
-            # 返回 4 字节而非 12
+        except struct.error:
+            # 某些 Python 版本 LOCAL_PEERCRED 返回不同长度，
+            # 读 8 字节取 cr_uid（第二个 int）
             try:
                 cred = sock.getsockopt(
-                    socket.SOL_LOCAL, socket.LOCAL_PEERCRED, 4)
-                uid = struct.unpack("i", cred)[0]
+                    getattr(socket, "SOL_LOCAL", 0),
+                    getattr(socket, "LOCAL_PEERCRED", 1), 8)
+                _, uid = struct.unpack("ii", cred)
                 return uid
             except Exception:
                 return None
