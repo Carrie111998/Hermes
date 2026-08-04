@@ -16,7 +16,7 @@ import hermes_cli.models as _models_mod
 
 LIVE_OPENROUTER_MODELS = [
     ("anthropic/claude-opus-4.6", "recommended"),
-    ("qwen/qwen3.7-max", ""),
+    ("qwen/qwen3.8-max", ""),
     ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
 ]
 
@@ -77,7 +77,7 @@ class TestFetchOpenRouterModels:
                 return False
 
             def read(self):
-                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
+                return b'{"data":[{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},{"id":"qwen/qwen3.8-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}},{"id":"nvidia/nemotron-3-super-120b-a12b:free","pricing":{"prompt":"0","completion":"0"}}]}'
 
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
         with patch("hermes_cli.models._urlopen_model_catalog_request", return_value=_Resp()):
@@ -85,7 +85,7 @@ class TestFetchOpenRouterModels:
 
         assert models == [
             ("anthropic/claude-opus-4.8", "recommended"),
-            ("qwen/qwen3.7-max", ""),
+            ("qwen/qwen3.8-max", ""),
             ("nvidia/nemotron-3-super-120b-a12b:free", "free"),
         ]
 
@@ -117,14 +117,14 @@ class TestFetchOpenRouterModels:
             def read(self):
                 # opus-4.6 advertises tools → kept
                 # nano-image has explicit supported_parameters that OMITS tools → dropped
-                # qwen3.7-max advertises tools → kept
+                # qwen3.8-max advertises tools → kept
                 return (
                     b'{"data":['
                     b'{"id":"anthropic/claude-opus-4.6","pricing":{"prompt":"0.000015","completion":"0.000075"},'
                     b'"supported_parameters":["temperature","tools","tool_choice"]},'
                     b'{"id":"google/gemini-3-pro-image-preview","pricing":{"prompt":"0.00001","completion":"0.00003"},'
                     b'"supported_parameters":["temperature","response_format"]},'
-                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"},'
+                    b'{"id":"qwen/qwen3.8-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"},'
                     b'"supported_parameters":["tools","temperature"]}'
                     b']}'
                 )
@@ -136,7 +136,7 @@ class TestFetchOpenRouterModels:
             [
                 ("anthropic/claude-opus-4.6", ""),
                 ("google/gemini-3-pro-image-preview", ""),
-                ("qwen/qwen3.7-max", ""),
+                ("qwen/qwen3.8-max", ""),
             ],
         )
         monkeypatch.setattr(_models_mod, "_openrouter_catalog_cache", None)
@@ -148,7 +148,7 @@ class TestFetchOpenRouterModels:
 
         ids = [mid for mid, _ in models]
         assert "anthropic/claude-opus-4.6" in ids
-        assert "qwen/qwen3.7-max" in ids
+        assert "qwen/qwen3.8-max" in ids
         # Image-only model advertised supported_parameters WITHOUT tools → must be dropped.
         assert "google/gemini-3-pro-image-preview" not in ids
 
@@ -172,7 +172,7 @@ class TestFetchOpenRouterModels:
                 return (
                     b'{"data":['
                     b'{"id":"anthropic/claude-opus-4.8","pricing":{"prompt":"0.000015","completion":"0.000075"}},'
-                    b'{"id":"qwen/qwen3.7-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}}'
+                    b'{"id":"qwen/qwen3.8-max","pricing":{"prompt":"0.000000325","completion":"0.00000195"}}'
                     b']}'
                 )
 
@@ -182,7 +182,7 @@ class TestFetchOpenRouterModels:
 
         ids = [mid for mid, _ in models]
         assert "anthropic/claude-opus-4.8" in ids
-        assert "qwen/qwen3.7-max" in ids
+        assert "qwen/qwen3.8-max" in ids
 
 
 class TestOpenRouterToolSupportHelper:

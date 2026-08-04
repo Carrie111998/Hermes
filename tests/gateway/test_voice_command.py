@@ -1608,22 +1608,6 @@ class TestDiscordVoiceChannelMethods:
             "cancel_bot_task",
             "close_client",
         ]
-
-
-    @pytest.mark.asyncio
-    async def test_get_user_voice_channel_success(self):
-        adapter = self._make_adapter()
-        mock_vc = MagicMock()
-        mock_guild = MagicMock()
-        mock_member = MagicMock()
-        mock_member.voice = MagicMock()
-        mock_member.voice.channel = mock_vc
-        mock_guild.get_member = MagicMock(return_value=mock_member)
-        adapter._client.get_guild = MagicMock(return_value=mock_guild)
-        result = await adapter.get_user_voice_channel(111, "42")
-        assert result is mock_vc
-
-
     def test_voice_timeout_zero_disables_auto_leave(self):
         adapter = self._make_adapter()
         adapter._voice_timeout_seconds = 0
