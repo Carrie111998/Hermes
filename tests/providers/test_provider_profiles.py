@@ -133,6 +133,15 @@ class TestNousProfile:
         body = p.build_extra_body()
         assert body["tags"] == nous_portal_tags()
 
+    def test_extra_body_ignores_provider_preferences(self):
+        """Nous Portal rejects caller-supplied provider routing prefs (HTTP 400)."""
+        p = get_provider_profile("nous")
+        body = p.build_extra_body(
+            provider_preferences={"allow": ["anthropic"], "sort": "price"}
+        )
+        assert "provider" not in body
+        assert "tags" in body
+
 
 
 

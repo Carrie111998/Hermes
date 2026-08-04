@@ -117,6 +117,19 @@ class TestNousParity:
         )
         assert kw["extra_body"]["tags"] == nous_portal_tags()
 
+    def test_provider_preferences_not_forwarded(self, transport):
+        """Nous Portal rejects provider routing prefs — they must not reach extra_body."""
+        prefs = {"allow": ["anthropic"], "sort": "price"}
+        kw = transport.build_kwargs(
+            model="hermes-3-llama-3.1-405b",
+            messages=_simple_messages(),
+            tools=None,
+            provider_profile=get_provider_profile("nous"),
+            provider_preferences=prefs,
+        )
+        assert "provider" not in kw["extra_body"]
+        assert kw["extra_body"]["tags"]
+
 
 
 
