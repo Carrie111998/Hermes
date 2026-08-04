@@ -20,6 +20,17 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from tests.run_agent.anthropic_test_gate import (
+    GateDecision,
+    decide_native_anthropic_test_gate,
+)
+
+# Captured during module collection, before pytest's per-test autouse fixture
+# replaces HERMES_HOME and clears HERMES_INFERENCE_PROVIDER.
+_NATIVE_ANTHROPIC_INTERRUPT_GATE_DECISION: GateDecision = (
+    decide_native_anthropic_test_gate()
+)
+
 from agent.codex_responses_adapter import _normalize_codex_response
 
 import run_agent
@@ -5433,7 +5444,7 @@ class TestAnthropicInterruptHandler:
             enforce_native_anthropic_test_gate,
         )
 
-        enforce_native_anthropic_test_gate()
+        enforce_native_anthropic_test_gate(_NATIVE_ANTHROPIC_INTERRUPT_GATE_DECISION)
 
         import threading
         import time

@@ -79,33 +79,20 @@ def _is_native_anthropic_provider(provider: Any) -> bool:
 
 
 def _provider_enabled(config: dict[str, Any], provider: Any) -> bool:
-    """Apply canonical ``providers.<name>.enabled`` semantics to one route."""
+    """Mirror runtime's raw-requested-provider enabled check exactly.
+
+    ``resolve_runtime_provider`` looks up ``providers.<requested_provider>``
+    before canonical resolution. The gate therefore must not scan equivalent
+    alias keys: canonicalization is only for classifying the eventual route.
+    """
     providers = config.get("providers")
-    if providers is None:
-        return True
     if not isinstance(providers, dict):
-        raise NativeAnthropicGateInspectionError
-
+        return True
     raw_name = str(provider or "").strip().lower()
-    canonical_name = _canonical_provider(provider)
-    for name in dict.fromkeys((raw_name, canonical_name)):
-        if name not in providers:
-            continue
-        provider_config = providers[name]
-        if not isinstance(provider_config, dict):
-            raise NativeAnthropicGateInspectionError
-        return is_provider_enabled(provider_config)
-
-    # Supported aliases may appear as a provider config key. The first two
-    # direct lookups preserve the runtime spelling/canonical preference; this
-    # canonical pass makes a lone alias setting apply to its equivalent route.
-    for name, provider_config in providers.items():
-        if not isinstance(name, str) or _canonical_provider(name) != canonical_name:
-            continue
-        if not isinstance(provider_config, dict):
-            raise NativeAnthropicGateInspectionError
-        return is_provider_enabled(provider_config)
-    return True
+    provider_config = providers.get(raw_name)
+    return not (
+        isinstance(provider_config, dict) and not is_provider_enabled(provider_config)
+    )
 
 
 def _read_native_selections(config_path: Path, scope: str) -> list[NativeAnthropicSelection]:
@@ -185,9 +172,16 @@ def decide_native_anthropic_test_gate() -> GateDecision:
     )
 
 
-def enforce_native_anthropic_test_gate() -> None:
-    """Skip or fail the caller according to the read-only gate decision."""
-    decision = decide_native_anthropic_test_gate()
+def enforce_native_anthropic_test_gate(decision: GateDecision | None = None) -> None:
+    """Skip or fail using a current decision or an immutable audited snapshot."""
+    if decision is None:
+        decision = decide_native_anthropic_test_gate()
+    elif not (
+        isinstance(decision, GateDecision)
+        and isinstance(decision.action, GateAction)
+        and isinstance(decision.reason, str)
+    ):
+        pytest.fail(_CONFIG_INSPECTION_FAILURE_REASON, pytrace=False)
     if decision.action is GateAction.SKIP:
         pytest.skip(decision.reason)
     if decision.action is GateAction.FAIL:

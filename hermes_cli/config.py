@@ -3160,8 +3160,9 @@ def load_effective_config_readonly(config_path: Path) -> Dict[str, Any]:
     deliberately does not call :func:`ensure_hermes_home`, seed files, or cache
     a fallback. It applies the same default merge, legacy normalization,
     environment expansion, and managed-scope overlay as runtime loading, while
-    propagating malformed/unreadable user-config failures so callers can fail
-    closed rather than mistake a runtime fallback for an inactive route.
+    propagating malformed/unreadable user or explicitly selected managed-config
+    failures so callers can fail closed rather than mistake a runtime fallback
+    for an inactive route.
     """
     return _load_config_impl(
         want_deepcopy=False,
@@ -3319,18 +3320,23 @@ def _load_config_impl(
         except FileNotFoundError:
             user_sig = None
 
-        # Managed scope: fold the managed config file's (mtime, size) into the
-        # cache signature so editing /etc/hermes/config.yaml invalidates the
-        # cached merged result. (0, 0) means "no managed config file".
+        # Managed scope: normal startup retains its fail-open cache/signature
+        # behavior. The explicit audit path instead reads the managed overlay
+        # strictly, once, and never caches an error as an inactive route.
         from hermes_cli import managed_scope
 
-        managed_dir = managed_scope.get_managed_dir()
-        managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
-        try:
-            mst = managed_cfg_path.stat() if managed_cfg_path else None
-            managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
-        except OSError:
+        managed_config: Any = {}
+        if strict:
+            managed_config = managed_scope.load_managed_config_for_audit()
             managed_sig = (0, 0)
+        else:
+            managed_dir = managed_scope.get_managed_dir()
+            managed_cfg_path = (managed_dir / "config.yaml") if managed_dir else None
+            try:
+                mst = managed_cfg_path.stat() if managed_cfg_path else None
+                managed_sig = (mst.st_mtime_ns, mst.st_size) if mst else (0, 0)
+            except OSError:
+                managed_sig = (0, 0)
 
         # Combined cache signature: user file + managed file. None only when the
         # user config is absent AND no managed file exists (nothing to cache on).
@@ -3422,7 +3428,9 @@ def _load_config_impl(
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config = (
+            managed_config if strict else managed_scope.load_managed_config()
+        )
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)

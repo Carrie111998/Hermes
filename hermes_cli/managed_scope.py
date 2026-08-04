@@ -20,6 +20,7 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import stat
 import threading
 from pathlib import Path
 from typing import Dict, Optional
@@ -36,6 +37,41 @@ _CACHE_LOCK = threading.Lock()
 # path_key -> (mtime_ns, size, parsed)
 _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
+
+
+class ManagedScopeAuditError(RuntimeError):
+    """An audit-only managed-scope read could not be safely classified."""
+
+
+def _audit_managed_dir() -> Optional[Path]:
+    """Resolve a managed directory without normal runtime's fail-open masking.
+
+    This is intentionally private to the audit read below. Runtime startup keeps
+    using :func:`get_managed_dir` and its fail-open semantics unchanged.
+    """
+    override = os.environ.get("HERMES_MANAGED_DIR", "").strip()
+    if override:
+        candidate = Path(override)
+        try:
+            mode = candidate.stat().st_mode
+        except OSError:
+            raise ManagedScopeAuditError from None
+        if not stat.S_ISDIR(mode):
+            raise ManagedScopeAuditError
+        return candidate
+
+    if _under_pytest():
+        return None
+
+    try:
+        mode = _DEFAULT_MANAGED_DIR.stat().st_mode
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ManagedScopeAuditError from None
+    if not stat.S_ISDIR(mode):
+        raise ManagedScopeAuditError
+    return _DEFAULT_MANAGED_DIR
 
 
 def _under_pytest() -> bool:
@@ -123,6 +159,36 @@ def load_managed_config() -> dict:
         lambda f: yaml.safe_load(f) or {},
     )
     return parsed if isinstance(parsed, dict) else {}
+
+
+def load_managed_config_for_audit() -> dict:
+    """Read a selected managed config exactly once and fail closed on errors.
+
+    This is an audit-only path for callers that must not mistake a failed
+    managed read for an inactive route. It has no cache, provisioning, config
+    mutation, credential resolution, or network behavior. A selected directory
+    without ``config.yaml`` represents an absent overlay; all directory, stat,
+    read, and parse failures are deliberately surfaced without source details.
+    """
+    managed_dir = _audit_managed_dir()
+    if managed_dir is None:
+        return {}
+    config_path = managed_dir / "config.yaml"
+    try:
+        config_path.stat()
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        raise ManagedScopeAuditError from None
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            parsed = yaml.safe_load(f) or {}
+    except Exception:  # noqa: BLE001 — audit callers fail closed
+        raise ManagedScopeAuditError from None
+    if not isinstance(parsed, dict):
+        raise ManagedScopeAuditError
+    return parsed
 
 
 def load_managed_env() -> Dict[str, str]:

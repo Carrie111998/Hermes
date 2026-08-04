@@ -30,7 +30,7 @@ def test_explicit_effective_loader_normalizes_legacy_root_and_expands_env(tmp_pa
     )
     monkeypatch.setenv("D2_C03_EFFECTIVE_PROVIDER", "anthropic")
     monkeypatch.setenv("D2_C03_EFFECTIVE_FALLBACK", "claude-code")
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "no-managed-scope"))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
     _reset_config_caches()
     from hermes_cli.config import load_effective_config_readonly
 
@@ -76,7 +76,7 @@ def test_explicit_effective_loader_applies_explicit_managed_overlay(tmp_path, mo
 def test_explicit_effective_loader_does_not_provision_missing_home(tmp_path, monkeypatch):
     """Auditing an absent config cannot create a Hermes home or seed SOUL.md."""
     home = tmp_path / "never-provisioned"
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "no-managed-scope"))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
     _reset_config_caches()
     from hermes_cli.config import load_effective_config_readonly
 
@@ -90,7 +90,7 @@ def test_explicit_effective_loader_propagates_malformed_config(tmp_path, monkeyp
     """Audit callers can fail closed instead of accepting runtime fallbacks."""
     config_path = tmp_path / "config.yaml"
     config_path.write_text("model: [anthropic\n", encoding="utf-8")
-    monkeypatch.setenv("HERMES_MANAGED_DIR", str(tmp_path / "no-managed-scope"))
+    monkeypatch.delenv("HERMES_MANAGED_DIR", raising=False)
     _reset_config_caches()
     from hermes_cli.config import load_effective_config_readonly
 
@@ -116,3 +116,121 @@ def test_pure_provider_selection_preserves_runtime_precedence():
         )
         == "claude-code"
     )
+
+
+@pytest.mark.parametrize("failure", ("malformed", "unreadable", "unstatable"))
+def test_explicit_effective_loader_rejects_explicit_managed_scope_failures(
+    tmp_path, monkeypatch, failure
+):
+    """Strict audit reads cannot silently erase an explicit managed overlay."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: openai/gpt-5.6\n",
+        encoding="utf-8",
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    managed_config = managed / "config.yaml"
+    if failure == "malformed":
+        managed_config.write_text("model: [anthropic\n", encoding="utf-8")
+    else:
+        managed_config.write_text(
+            "model:\n"
+            "  provider: anthropic\n"
+            "  default: claude-sonnet-4.6\n",
+            encoding="utf-8",
+        )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _reset_config_caches()
+    from hermes_cli.config import load_effective_config_readonly
+
+    if failure == "unreadable":
+        import builtins
+
+        real_open = builtins.open
+
+        def deny_managed_config(path, *args, **kwargs):
+            if Path(path) == managed_config:
+                raise PermissionError("managed-audit-unreadable")
+            return real_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(builtins, "open", deny_managed_config)
+    elif failure == "unstatable":
+        real_stat = Path.stat
+
+        def deny_managed_directory(path, *args, **kwargs):
+            if path == managed:
+                raise PermissionError("managed-audit-unstatable")
+            return real_stat(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "stat", deny_managed_directory)
+
+    with pytest.raises(Exception):
+        load_effective_config_readonly(config_path)
+
+
+def test_explicit_effective_loader_applies_valid_audit_overlay_once(tmp_path, monkeypatch):
+    """A valid strict managed overlay is read once and merged once."""
+    home = tmp_path / "home"
+    home.mkdir()
+    config_path = home / "config.yaml"
+    config_path.write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: openai/gpt-5.6\n",
+        encoding="utf-8",
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text(
+        "model:\n"
+        "  provider: anthropic\n"
+        "  default: claude-sonnet-4.6\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _reset_config_caches()
+    from hermes_cli import managed_scope
+    from hermes_cli.config import load_effective_config_readonly
+
+    real_load = managed_scope.load_managed_config_for_audit
+    calls = 0
+
+    def counted_load():
+        nonlocal calls
+        calls += 1
+        return real_load()
+
+    monkeypatch.setattr(managed_scope, "load_managed_config_for_audit", counted_load)
+
+    config = load_effective_config_readonly(config_path)
+
+    assert config["model"]["provider"] == "anthropic"
+    assert calls == 1
+
+
+def test_normal_runtime_loader_keeps_managed_scope_fail_open(tmp_path, monkeypatch):
+    """The audit-only strict path must not alter normal startup behavior."""
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: openrouter\n"
+        "  default: openai/gpt-5.6\n",
+        encoding="utf-8",
+    )
+    managed = tmp_path / "managed"
+    managed.mkdir()
+    (managed / "config.yaml").write_text("model: [anthropic\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed))
+    _reset_config_caches()
+    from hermes_cli.config import load_config
+
+    config = load_config()
+
+    assert config["model"]["provider"] == "openrouter"
