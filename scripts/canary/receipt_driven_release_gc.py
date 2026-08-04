@@ -1695,7 +1695,9 @@ def apply_plan(
     """Revalidate under the shared lock, then resume/apply exact approved units."""
 
     if require_root_linux and (
-        os.geteuid() != 0 or not sys.platform.startswith("linux")
+        not sys.platform.startswith("linux")
+        or not hasattr(os, "geteuid")
+        or os.geteuid() != 0  # windows-footgun: ok — guarded Linux root boundary
     ):
         raise PermissionError("canary GC apply requires root on Linux")
     if _SHA256_RE.fullmatch(str(approved_plan_sha256)) is None:

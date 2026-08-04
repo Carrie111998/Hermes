@@ -357,6 +357,20 @@ def test_apply_requires_current_exact_plan_digest_before_mutation(tmp_path):
     assert (layout.source_base / candidate).is_dir()
 
 
+def test_apply_fails_closed_before_posix_uid_lookup_off_linux(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(gc.sys, "platform", "win32")
+    monkeypatch.delattr(gc.os, "geteuid")
+
+    with pytest.raises(PermissionError, match="requires root on Linux"):
+        gc.apply_plan(
+            gc.GCLayout(),
+            production_sha="a" * 40,
+            approved_plan_sha256="b" * 64,
+        )
+
+
 def test_apply_rejects_new_pending_ref_after_plan(tmp_path):
     protected_ref = tmp_path / "pending.json"
     protected_ref.write_bytes(_canonical({"revisions": []}))
