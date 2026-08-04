@@ -209,6 +209,19 @@ _HOST_PREPARATION_FAILURE_KEYS = frozenset({
     "receipt_path",
     "receipt_sha256",
 })
+_HOST_PREPARATION_SCHEMA = "muncho-writer-host-preparation.v1"
+_HOST_PREPARATION_KEYS = frozenset({
+    "schema",
+    "revision",
+    "native_observation_plan_sha256",
+    "owner_approval_receipt_sha256",
+    "changed",
+    "before",
+    "after",
+    "prepared_at_unix",
+    "receipt_path",
+    "receipt_sha256",
+})
 _HOST_IDENTITY_CONVERGENCE_ERROR_TYPE = "RuntimeError"
 _HOST_IDENTITY_CONVERGENCE_ERROR_SHA256 = hashlib.sha256(
     b"RuntimeError:canary host identity reconciliation did not converge"
@@ -534,15 +547,13 @@ def _require_current_exact_host_identities() -> Mapping[str, Any]:
     return value
 
 
-def _validate_host_identity_convergence_failure(
+def _validate_native_failure_external_iam(
     value: Mapping[str, Any],
     *,
     source_revision: str,
     native: NativeObservationPlan,
-    owner: OwnerApprovalReceipt,
     iam: ExternalIAMReceipt,
-    require_current_host_state: bool,
-) -> None:
+) -> Path:
     external = value.get("external_iam_evidence")
     expected_evidence_root = (
         DEFAULT_NATIVE_OBSERVATION_EVIDENCE_ROOT
@@ -582,6 +593,24 @@ def _validate_host_identity_convergence_failure(
     )
     if archived_iam_raw != _canonical_bytes(iam.to_mapping()):
         raise ValueError("native failure archived IAM receipt drifted")
+    return expected_evidence_root
+
+
+def _validate_host_identity_convergence_failure(
+    value: Mapping[str, Any],
+    *,
+    source_revision: str,
+    native: NativeObservationPlan,
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
+    require_current_host_state: bool,
+) -> None:
+    expected_evidence_root = _validate_native_failure_external_iam(
+        value,
+        source_revision=source_revision,
+        native=native,
+        iam=iam,
+    )
 
     host = value.get("host_preparation_evidence")
     if not isinstance(host, Mapping) or set(host) != _HOST_PREPARATION_FAILURE_KEYS:
@@ -628,6 +657,60 @@ def _validate_host_identity_convergence_failure(
         _require_current_exact_host_identities()
 
 
+def _validate_native_install_failure(
+    value: Mapping[str, Any],
+    *,
+    source_revision: str,
+    native: NativeObservationPlan,
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
+    require_current_host_state: bool,
+) -> None:
+    expected_evidence_root = _validate_native_failure_external_iam(
+        value,
+        source_revision=source_revision,
+        native=native,
+        iam=iam,
+    )
+    host = value.get("host_preparation_evidence")
+    if not isinstance(host, Mapping) or set(host) != _HOST_PREPARATION_KEYS:
+        raise ValueError("native host preparation fields are not exact")
+    host_path = Path(str(host.get("receipt_path")))
+    expected_host_path = expected_evidence_root / "host-preparation.json"
+    host_unsigned = {
+        name: item for name, item in host.items() if name != "receipt_sha256"
+    }
+    activation_host_state = {
+        "changed": host.get("changed"),
+        "before": host.get("before"),
+        "after": host.get("after"),
+    }
+    if (
+        host.get("schema") != _HOST_PREPARATION_SCHEMA
+        or host.get("revision") != source_revision
+        or host.get("native_observation_plan_sha256") != native.sha256
+        or host.get("owner_approval_receipt_sha256") != owner.sha256
+        or type(host.get("changed")) is not bool
+        or not isinstance(host.get("before"), Mapping)
+        or not isinstance(host.get("after"), Mapping)
+        or host["changed"] != (host["before"] != host["after"])
+        or not _host_identities_are_exact(host["after"])
+        or type(host.get("prepared_at_unix")) is not int
+        or host["prepared_at_unix"] < 0
+        or host_path != expected_host_path
+        or host.get("receipt_sha256") != _sha256_json(host_unsigned)
+        or value.get("host_preparation_sha256")
+        != _sha256_json(activation_host_state)
+        or value.get("failed_at_unix") < host["prepared_at_unix"]
+    ):
+        raise ValueError("native host preparation binding is invalid")
+    host_raw = _trusted_publication(host_path, maximum=_MAX_RECEIPT_BYTES)
+    if host_raw != _canonical_bytes(host):
+        raise ValueError("native host preparation receipt drifted")
+    if require_current_host_state:
+        _require_current_exact_host_identities()
+
+
 def _validate_native_failure_value(
     value: Mapping[str, Any],
     *,
@@ -670,6 +753,15 @@ def _validate_native_failure_value(
             raise ValueError("native failure quarantine binding is invalid")
     elif value.get("stage") == "prepare_host_identities":
         _validate_host_identity_convergence_failure(
+            value,
+            source_revision=source_revision,
+            native=native,
+            owner=owner,
+            iam=iam,
+            require_current_host_state=require_current_host_state,
+        )
+    elif value.get("stage") == "install":
+        _validate_native_install_failure(
             value,
             source_revision=source_revision,
             native=native,
