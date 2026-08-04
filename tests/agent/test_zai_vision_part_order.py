@@ -59,3 +59,32 @@ def test_non_zai_vision_preserves_caller_part_order():
         "text",
         "image_url",
     ]
+
+
+def test_zai_vision_moves_only_first_image_and_preserves_remaining_part_order():
+    """Starting with an image must not detach later text from later images."""
+    content = [
+        {"type": "text", "text": "Describe image A."},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,A"}},
+        {"type": "text", "text": "Compare image B with image A."},
+        {"type": "input_audio", "input_audio": {"data": "AAAA", "format": "wav"}},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,B"}},
+    ]
+    messages = [{"role": "user", "content": content}]
+
+    kwargs = _build_call_kwargs(
+        "custom",
+        "glm-4.6v-flash",
+        messages,
+        base_url="https://api.z.ai/api/paas/v4",
+        task="vision",
+    )
+
+    assert kwargs["messages"][0]["content"] == [
+        content[1],
+        content[0],
+        content[2],
+        content[3],
+        content[4],
+    ]
+    assert messages[0]["content"] == content

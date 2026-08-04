@@ -7837,17 +7837,23 @@ def _order_zai_vision_content_parts(
             normalized.append(message)
             continue
 
-        image_parts = [
-            part
-            for part in content
-            if isinstance(part, dict) and part.get("type") == "image_url"
+        first_image_index = next(
+            (
+                index
+                for index, part in enumerate(content)
+                if isinstance(part, dict) and part.get("type") == "image_url"
+            ),
+            None,
+        )
+        if first_image_index in (None, 0):
+            normalized.append(message)
+            continue
+
+        reordered = [
+            content[first_image_index],
+            *content[:first_image_index],
+            *content[first_image_index + 1:],
         ]
-        other_parts = [
-            part
-            for part in content
-            if not (isinstance(part, dict) and part.get("type") == "image_url")
-        ]
-        reordered = image_parts + other_parts
         if reordered != content:
             normalized.append({**message, "content": reordered})
             changed = True
