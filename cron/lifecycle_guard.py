@@ -331,6 +331,12 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            # The remote fallback may return raw binary decoded as text (e.g.
+            # `cat` of an ELF executable). NUL bytes mean binary — treat as
+            # "nothing to scan", mirroring the local-path NUL guard above,
+            # so a binary can't explode the recursion or false-positive.
+            if script_text and "\x00" in script_text:
+                script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
