@@ -52,6 +52,11 @@
     "focus": "delicate business-risk explanation in natural Bulgarian"
   },
   {
+    "id": "free_panoramic_reservation_process",
+    "message": "Имам бонус безплатен панорамен полет над морето. Трябва ли резервация и как точно да я направя?",
+    "focus": "real customer failure: answer yes with Profile → Ваучери → Резервирай → available slot → online completion; BookNow unlocks after main service; 24h reservation and 72h cancellation boundaries; weather rebooking; reject paid MTO-Sport/CAVALON product detour cards/links, pilot-contact-as-normal-booking, and invented early-arrival guidance"
+  },
+  {
     "id": "voucher_extend",
     "message": "Как да удължа ваучера си?",
     "focus": "support accuracy; profile flow before escalation"

@@ -77,6 +77,14 @@ Current line:
   structured field has precedence over product prose; missing/fetch-failed
   detail stays unverified. No universal cancellation-hour constant, classifier,
   router, or customer-answer template is added.
+- `v2.10` - free panoramic campaign-flight reservation knowledge: Hermes treats
+  the bonus as a separate zero-price campaign entitlement, answers the profile
+  self-service booking path (`Ваучери` → `Резервирай` → available slot → online
+  completion), applies BookNow unlock, 24h reservation, 72h cancellation, and
+  weather rebooking boundaries, and avoids paid MTO-Sport/CAVALON detours,
+  pilot-contact-as-normal-booking, and invented early-arrival rules. No keyword
+  router, catalog blacklist/filter, template, or post-processing adapter is
+  added.
 
 ## Canonical Source
 

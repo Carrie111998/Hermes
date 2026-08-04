@@ -725,6 +725,26 @@ def test_campaign_knowledge_returns_public_sales_and_terms_facts() -> None:
     assert campaign["bonus_product"]["duration"] == "10 мин."
     assert campaign["bonus_product"]["location"] == "Летище Приморско"
     assert "винаги се изпълнява от летище Приморско" in campaign["bonus_product"]["location_note"]
+    assert campaign["bonus_product"]["price_eur"] == "0.00"
+    reservation = campaign["campaign_2026_facts"]["reservation_process"]
+    assert reservation["advance_reservation_required"] is True
+    assert reservation["booking_channel"] == "SkyVision profile self-service"
+    assert reservation["steps"] == [
+        "отворете профила в SkyVision",
+        "отворете секция „Ваучери“",
+        "натиснете „Резервирай“ срещу бонуса за безплатен панорамен полет",
+        "изберете свободен таймслот",
+        "завършете онлайн резервацията",
+    ]
+    assert "след изпълнение на основната услуга" in reservation["booknow_unlock_rule"]
+    assert "24 часа" in reservation["reserve_before_timeslot"]
+    assert "72 часа" in reservation["self_service_cancel_before_timeslot"]
+    assert "лошо време" in reservation["weather_rebooking"]
+    assert "избере нов свободен таймслот" in reservation["weather_rebooking"]
+    assert reservation["normal_booking_method"] == "profile_vouchers_reserve_button"
+    assert reservation["support_escalation_when_missing"] == (
+        "ако бонусът, профилната връзка или бутонът „Резервирай“ липсват, насочи към официалната поддръжка за проверка по акаунта без публично искане на пълни идентификатори"
+    )
     assert "клиентът пита" in result["founder_transfer_facts"]["context"]
     founder_facts = result["founder_transfer_facts"]["facts"]
     assert founder_facts["default_owner"].startswith("купувачът")
