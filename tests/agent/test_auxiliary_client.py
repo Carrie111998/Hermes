@@ -506,6 +506,43 @@ class TestNormalizeAuxProvider:
         assert _normalize_aux_provider("github-copilot-acp") == "copilot-acp"
         assert _normalize_aux_provider("copilot-acp-agent") == "copilot-acp"
 
+    def test_maps_kiro_acp_aliases(self):
+        assert _normalize_aux_provider("kiro") == "kiro-acp"
+        assert _normalize_aux_provider("kiro-cli") == "kiro-acp"
+
+
+def test_resolve_provider_client_builds_kiro_acp_client(monkeypatch):
+    import agent.auxiliary_client as aux
+
+    fake_client = MagicMock()
+    monkeypatch.setattr(
+        "hermes_cli.auth.resolve_external_process_provider_credentials",
+        lambda provider: {
+            "provider": provider,
+            "api_key": "kiro-acp",
+            "base_url": "acp://kiro",
+            "command": "/usr/local/bin/kiro-cli",
+            "args": ["acp"],
+        },
+    )
+    with patch(
+        "agent.copilot_acp_client.CopilotACPClient",
+        return_value=fake_client,
+    ) as client_cls:
+        client, model = aux.resolve_provider_client(
+            "kiro-acp",
+            model="claude-opus-5",
+        )
+
+    assert client is fake_client
+    assert model == "claude-opus-5"
+    assert client_cls.call_args.kwargs["command"] == "/usr/local/bin/kiro-cli"
+    assert client_cls.call_args.kwargs["args"] == [
+        "acp",
+        "--model",
+        "claude-opus-5",
+    ]
+
 
 class TestReadCodexAccessToken:
     def test_valid_auth_store(self, tmp_path, monkeypatch):

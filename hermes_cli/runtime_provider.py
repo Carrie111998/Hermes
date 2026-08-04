@@ -2010,15 +2010,21 @@ def resolve_runtime_provider(
                 "requested_provider": requested_provider,
             }
 
-    if provider == "copilot-acp":
+    if provider in {"copilot-acp", "kiro-acp"}:
         creds = resolve_external_process_provider_credentials(provider)
+        args = list(creds.get("args") or [])
+        if provider == "kiro-acp":
+            selected_model = str(
+                target_model or model_cfg.get("default") or "claude-sonnet-5"
+            ).strip()
+            args.extend(["--model", selected_model])
         return {
-            "provider": "copilot-acp",
+            "provider": provider,
             "api_mode": "chat_completions",
             "base_url": creds.get("base_url", "").rstrip("/"),
             "api_key": creds.get("api_key", ""),
             "command": creds.get("command", ""),
-            "args": list(creds.get("args") or []),
+            "args": args,
             "source": creds.get("source", "process"),
             "requested_provider": requested_provider,
         }

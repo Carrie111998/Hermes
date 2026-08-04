@@ -74,6 +74,10 @@ _DEFAULT_PROVIDER_MODELS = {
     "copilot-acp": [
         "copilot-acp",
     ],
+    "kiro-acp": [
+        "claude-sonnet-5",
+        "claude-opus-5",
+    ],
     "copilot": [
         "gpt-5.4",
         "gpt-5.4-mini",

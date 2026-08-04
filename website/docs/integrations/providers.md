@@ -198,6 +198,25 @@ hermes chat --provider copilot-acp --model copilot-acp
 # Requires the GitHub Copilot CLI in PATH and an existing `copilot login` session
 ```
 
+**`kiro-acp` — Kiro ACP agent backend**. Spawns the authenticated Kiro CLI as
+an ACP subprocess. Claude Sonnet 5 is the default; Claude Opus 5 remains
+selectable:
+
+```bash
+# One session
+hermes chat --provider kiro-acp --model claude-sonnet-5
+
+# Make Kiro + Sonnet 5 the default orchestrator
+hermes config set model.provider kiro-acp
+hermes config set model.default claude-sonnet-5
+```
+
+Kiro CLI must be installed, available as `kiro-cli`, and logged in. You can
+also run `hermes model`, choose **Kiro ACP**, and select **Claude Sonnet 5**.
+The provider change takes effect in a new Hermes session; it does not replace
+the model inside a conversation that is already running. Set `KIRO_CLI_PATH`
+when the executable is not on `PATH`.
+
 **Permanent config:**
 ```yaml
 model:
