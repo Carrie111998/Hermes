@@ -197,6 +197,38 @@ def test_stage_write_creates_linked_learning_candidate(hermes_home):
     assert candidate["evidence"]["excerpt"] == "Keep it concise"
 
 
+def test_pending_id_accepts_migrated_namespace(hermes_home):
+    from tools import write_approval as wa
+
+    candidate_id = "pastoral:edaca6a49a734f408dd9fbad1f5408af"
+    assert wa._validate_pending_id(candidate_id) == candidate_id
+
+
+def test_migrated_namespaced_pending_record_round_trips(hermes_home):
+    from tools import write_approval as wa
+
+    candidate_id = "pastoral:edaca6a49a734f408dd9fbad1f5408af"
+    pending_dir = Path(hermes_home) / "pending" / "memory"
+    pending_dir.mkdir(parents=True)
+    record = {
+        "id": candidate_id,
+        "candidate_id": candidate_id,
+        "subsystem": "memory",
+        "action": "add",
+        "summary": "migrated record",
+        "payload": {"action": "add", "target": "memory", "content": "test"},
+        "created_at": 1,
+    }
+    (pending_dir / "pastoral-edaca6a49a734f408dd9fbad1f5408af.json").write_text(
+        json.dumps(record), encoding="utf-8"
+    )
+
+    assert wa.list_pending("memory")[0]["id"] == candidate_id
+    fetched = wa.get_pending("memory", candidate_id)
+    assert fetched is not None
+    assert fetched["id"] == candidate_id
+
+
 def test_claim_pending_has_one_winner_and_can_restore(hermes_home):
     from tools import write_approval as wa
 

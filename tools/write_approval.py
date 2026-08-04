@@ -97,7 +97,9 @@ def _atomic_pending_json_write(path: Path, data: Mapping[str, Any], *, create: b
 MEMORY = "memory"
 SKILLS = "skills"
 _SUBSYSTEMS = (MEMORY, SKILLS)
-_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Pending IDs may be namespaced when records are migrated from another
+# profile (for example ``pastoral:<uuid>``). Keep the separator explicit.
+_ID_RE = re.compile(r"^(?:[A-Za-z0-9_-]+:)?[A-Za-z0-9_-]{1,64}$")
 
 # Config key (per subsystem). A single boolean: the approval gate is OFF by
 # default (writes flow freely, the pre-gate behaviour), and ON means stage /
@@ -164,6 +166,20 @@ def _validate_pending_id(pending_id: str) -> str:
     if not _ID_RE.fullmatch(value):
         raise ValueError("pending id contains invalid characters")
     return value
+
+
+def _pending_filename_id(pending_id: str) -> str:
+    """Encode a logical ID for a safe pending filename.
+
+    Migrated records historically encoded the single namespace separator as a
+    hyphen in filenames while retaining ``namespace:<id>`` in the envelope.
+    Preserve that on-disk compatibility without weakening ID validation.
+    """
+    return pending_id.replace(":", "-", 1)
+
+
+def _pending_path(subsystem: str, pending_id: str) -> Path:
+    return _pending_dir(subsystem) / f"{_pending_filename_id(pending_id)}.json"
 
 
 def _risk_for(subsystem: str, action: str) -> str:
@@ -415,7 +431,7 @@ def _read_pending_record(
         if not isinstance(record, dict):
             return None
         record_id = _validate_pending_id(str(record.get("id") or ""))
-        if record_id != expected_id:
+        if record_id != expected_id and _pending_filename_id(record_id) != expected_id:
             return None
         raw_candidate_id = record.get("candidate_id")
         if raw_candidate_id in {None, ""}:
@@ -459,16 +475,17 @@ def list_pending(subsystem: str) -> List[Dict[str, Any]]:
 def get_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Return a single pending record by id, or None."""
     pending_id = _validate_pending_id(pending_id)
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    path = _pending_path(subsystem, pending_id)
     if not path.exists():
         return None
-    return _read_pending_record(path, subsystem=subsystem, expected_id=pending_id)
+    expected_id = _pending_filename_id(pending_id)
+    return _read_pending_record(path, subsystem=subsystem, expected_id=expected_id)
 
 
 def discard_pending(subsystem: str, pending_id: str) -> bool:
     """Delete a pending record. Returns True if it existed."""
     pending_id = _validate_pending_id(pending_id)
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    path = _pending_path(subsystem, pending_id)
     try:
         if path.exists():
             path.unlink()
@@ -481,7 +498,7 @@ def discard_pending(subsystem: str, pending_id: str) -> bool:
 def claim_pending(subsystem: str, pending_id: str) -> Optional[Dict[str, Any]]:
     """Atomically claim one pending payload for apply/reject."""
     pending_id = _validate_pending_id(pending_id)
-    path = _pending_dir(subsystem) / f"{pending_id}.json"
+    path = _pending_path(subsystem, pending_id)
     if path.is_symlink() or (path.exists() and not path.is_file()):
         return None
     claim_id = uuid.uuid4().hex
@@ -516,12 +533,12 @@ def release_claim(subsystem: str, claim: Mapping[str, Any], *, restore: bool) ->
         or claim_path.is_symlink()
         or not claim_path.is_file()
         or claim_path.parent.resolve() != expected_parent
-        or not claim_path.name.startswith(f"{pending_id}.json.applying.")
+        or not claim_path.name.startswith(f"{_pending_filename_id(pending_id)}.json.applying.")
     ):
         return False
     try:
         if restore:
-            canonical = _pending_dir(subsystem) / f"{pending_id}.json"
+            canonical = _pending_path(subsystem, pending_id)
             # Never overwrite a fresh canonical proposal created while this
             # claim was in flight.  A failed restore remains an explicit claim
             # for reconciliation instead of losing either payload.
