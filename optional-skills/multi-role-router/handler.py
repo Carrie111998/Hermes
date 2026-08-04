@@ -164,24 +164,6 @@ def _save_meta(data: Dict[str, Any]) -> None:
         logger.warning("[multi-role-router] Could not write meta.yaml: %s", exc)
 
 
-def _update_meta_session(role: str, session_id: str, current_role: str, message: str, response: str) -> None:
-    """Update meta.yaml with the new current session and append to history.
-
-    Uses a threading lock + atomic write so concurrent hook invocations cannot
-    interleave their load/mutate/save cycles or leave a partial file on disk.
-    """
-    with _META_LOCK:
-        meta = _load_meta()
-        meta.setdefault("sessions", {})[role] = session_id
-        meta["current_role"] = role
-        # Rolling history — list of {role, user, assistant} dicts
-        history: List[Dict[str, str]] = meta.get("history", [])
-        history.append({"role": current_role, "user": message[:300], "assistant": response[:300]})
-        # Trim to window
-        meta["history"] = history[-(HISTORY_WINDOW * 2):]
-        _save_meta(meta)
-
-
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -286,12 +268,19 @@ Valid role names: {", ".join(roles.keys())}"""
 
 
 async def _call_auxiliary_llm(prompt: str, aux_cfg: Dict[str, Any], config: Dict[str, Any]) -> Optional[str]:
-    """Call the auxiliary LLM and return the raw text response, or None on failure."""
-    # Prefer the gateway-internal auxiliary_client (fast, handles all providers)
+    """Call the auxiliary LLM and return the raw text response, or None on failure.
+
+    Uses the async client (``async_call_llm``) so the hook never blocks the
+    gateway's event loop while waiting on the classifier. The task slot is
+    ``triage_specifier`` to match the config read in ``_get_auxiliary_config``
+    (a user who configures ``auxiliary.triage_specifier`` gets that model used,
+    not the ``compression`` slot).
+    """
+    # Prefer the gateway-internal async auxiliary_client (fast, handles all providers).
     try:
-        from agent.auxiliary_client import call_llm
-        resp = call_llm(
-            task="compression",  # use compression slot — cheap text, no vision
+        from agent.auxiliary_client import async_call_llm
+        resp = await async_call_llm(
+            task="triage_specifier",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.0,
             max_tokens=32,
@@ -433,12 +422,13 @@ async def handle(event_type: str, context: Dict[str, Any]) -> Optional[Dict[str,
     # NOTE (TOCTOU): _load_meta() is called here without _META_LOCK.  This is a
     # deliberate trade-off: the gateway invokes message:pre_route hooks serially
     # (one hook at a time per turn), so concurrent writes to meta.yaml from this
-    # hook are not possible in normal operation.  The only writer is
-    # _update_meta_session(), which runs under _META_LOCK.  A concurrent turn on
-    # a different session could race, but hermes-agent's single-agent-per-session
-    # model means turns for the same user are also serialised.  If this hook is
-    # ever invoked from a multi-threaded context, load current_role and history
-    # inside _META_LOCK instead.
+    # hook are not possible in normal operation.  All writes go through
+    # _save_meta() (atomic temp+rename) and the decision block below runs under
+    # _META_LOCK.  A concurrent turn on a different session could race, but
+    # hermes-agent's single-agent-per-session model means turns for the same
+    # user are also serialised.  If this hook is ever invoked from a
+    # multi-threaded context, load current_role and history inside _META_LOCK
+    # instead.
     meta = _load_meta()
 
     current_role: str = meta.get("current_role", "default")

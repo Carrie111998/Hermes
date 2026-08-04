@@ -4,10 +4,11 @@ Covers:
 - Continuation fast-path detection (short acks, partial sentences, substantive messages)
 - _get_roles: empty/missing config, user roles replacing defaults, invalid entries, field fallback
 - _classify_message / _parse_role via the classifier pipeline
-- _load_meta / _save_meta / _update_meta_session state helpers
+- _load_meta / _save_meta state helpers
 - multi_role_router config flag (auto=False, null config, missing key)
 - handle() integration: returns None when auto=False, switches session on different role,
-  returns None on same role, None on LLM exception, None on missing session for target role
+  returns None on same role, None on LLM exception, switches to a fresh isolated session
+  for a role with no prior session
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ from handler import (  # noqa: E402
     _get_roles,
     _load_meta,
     _save_meta,
-    _update_meta_session,
     handle,
 )
 
@@ -347,47 +347,6 @@ class TestMetaYaml:
 
         # The meta file should NOT have been created (write failed before replace)
         assert not meta_path.exists()
-
-    def test_update_meta_session_updates_current_role(self, _isolate_meta_file):
-        meta_path: Path = _isolate_meta_file
-        meta_path.write_text(
-            "current_role: default\nsessions:\n  default: sess-old\n",
-            encoding="utf-8",
-        )
-        _update_meta_session(
-            role="code-worker",
-            session_id="sess-new",
-            current_role="default",
-            message="fix the bug",
-            response="done",
-        )
-        loaded = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
-        assert loaded["current_role"] == "code-worker"
-
-    def test_update_meta_session_updates_sessions_dict(self, _isolate_meta_file):
-        meta_path: Path = _isolate_meta_file
-        _update_meta_session(
-            role="ops-worker",
-            session_id="sess-ops",
-            current_role="default",
-            message="deploy it",
-            response="deployed",
-        )
-        loaded = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
-        assert loaded["sessions"]["ops-worker"] == "sess-ops"
-
-    def test_update_meta_session_appends_history(self, _isolate_meta_file):
-        meta_path: Path = _isolate_meta_file
-        _update_meta_session(
-            role="code-worker",
-            session_id="sess-c",
-            current_role="default",
-            message="hello",
-            response="world",
-        )
-        loaded = yaml.safe_load(meta_path.read_text(encoding="utf-8"))
-        assert len(loaded["history"]) == 1
-        assert loaded["history"][0]["user"] == "hello"
 
 
 # ---------------------------------------------------------------------------
