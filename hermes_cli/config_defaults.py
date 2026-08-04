@@ -2687,6 +2687,17 @@ DEFAULT_CONFIG = {
         # GBs of disk on heavy users.  Opt in only if you have an external
         # tool that consumes the JSON files directly.
         "write_json_snapshots": False,
+        # Retention cap for API-error request dumps
+        # (``~/.hermes/sessions/request_dump_*.json``, written by
+        # agent_runtime_helpers.dump_api_request_debug on non-retryable 4xx and
+        # exhausted retries).  Each filename carries a microsecond timestamp so
+        # dumps never overwrite each other, and each embeds the full request
+        # body (system prompt + tool schemas + message history) — up to ~1 MB
+        # apiece.  The only other cleanup is session-scoped, so without a cap
+        # the directory grew forever (#77472).  Keeps the N newest dumps, which
+        # are the ones worth reading after a failure; 0 or negative disables
+        # pruning for operators who manage cleanup externally.
+        "request_dump_retention": 20,
         # Search-index (FTS) storage optimization — the compact v23 layout
         # that drops duplicate content copies and stops trigram-indexing tool
         # output (typically reclaims ~60%+ of state.db on heavy users). It is

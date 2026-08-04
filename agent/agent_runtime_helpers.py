@@ -39,7 +39,13 @@ from agent.trajectory import convert_scratchpad_to_think
 from agent.credential_pool import STATUS_EXHAUSTED, credential_pool_matches_provider
 from agent.error_classifier import FailoverReason
 from agent.turn_context import drop_stale_api_content
-from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write
+from utils import (
+    base_url_host_matches,
+    base_url_hostname,
+    env_var_enabled,
+    atomic_json_write,
+    prune_oldest_files,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1816,6 +1822,59 @@ def extract_reasoning(agent, assistant_message) -> Optional[str]:
 
 
 
+# Request dumps are written one-per-API-error with a microsecond-precision
+# timestamp in the filename, so no two ever collide and nothing is reclaimed by
+# rewriting.  The only existing cleanup is session-scoped
+# (``SessionDB._remove_session_files``, which runs when a session row is
+# deleted or pruned at 90 days), so a directory of dumps from live/recent
+# sessions grows without bound (#77472: 171 dumps / 47 MB observed, individual
+# dumps up to ~1 MB because each embeds the full system prompt, tool schema and
+# message history).  Cap the directory instead, keeping the newest N — the ones
+# a user is actually trying to read after a failure.
+#
+# Default 20: enough to cover a burst of 4xx retries plus several prior
+# incidents (the worst observed single session produced 9 dumps), while
+# bounding the directory to single-digit MB in typical use.  A count cap rather
+# than a byte cap keeps every retained dump complete — truncating a dump body
+# would destroy the debuggability the feature exists for.
+_REQUEST_DUMP_DEFAULT_KEEP = 20
+
+
+def _request_dump_keep() -> int:
+    """Resolve the request-dump retention cap (``sessions.request_dump_retention``).
+
+    Behavioral setting, so it lives in ``config.yaml`` — not an env var.  Any
+    resolution failure falls back to the default rather than disabling
+    retention, so a malformed config cannot silently restore unbounded growth.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+        sessions_cfg = cfg.get("sessions", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(sessions_cfg, dict):
+            return _REQUEST_DUMP_DEFAULT_KEEP
+        return int(sessions_cfg.get("request_dump_retention", _REQUEST_DUMP_DEFAULT_KEEP))
+    except Exception:
+        return _REQUEST_DUMP_DEFAULT_KEEP
+
+
+def prune_request_dumps(logs_dir: Path) -> int:
+    """Bound ``request_dump_*.json`` growth in *logs_dir*. Returns count deleted.
+
+    The glob is a fixed literal — deliberately NOT keyed to the session id, so
+    retention bounds the whole directory rather than per-session islands (a new
+    session id per run is exactly how the directory grew unbounded).  Because
+    the pattern is a constant, a hostile session id cannot widen it; the
+    write-side sanitization in ``_safe_session_filename_component`` keeps the
+    id from escaping ``logs_dir`` in the first place, and pruning inherits that
+    guarantee by only ever matching ``request_dump_*.json`` directly inside the
+    resolved directory.
+    """
+    return prune_oldest_files(
+        logs_dir, "request_dump_*.json", _request_dump_keep(), log=logger,
+    )
+
+
 def dump_api_request_debug(
     agent,
     api_kwargs: Dict[str, Any],
@@ -1898,6 +1957,18 @@ def dump_api_request_debug(
         _serialized = json.dumps(dump_payload, ensure_ascii=False, indent=2, default=str)
         _redacted_payload = json.loads(redact_sensitive_text(_serialized, force=True))
         atomic_json_write(dump_file, _redacted_payload, default=str)
+
+        # Bound directory growth immediately after the write, so the cap holds
+        # even for a process that only ever errors once (#77472).  Pruning runs
+        # after ``dump_file`` exists and is fully written, and keeps the newest
+        # N — so the dump just written is never the one deleted.  Its own
+        # failures are swallowed inside ``prune_oldest_files``; the extra guard
+        # here means even an unexpected raise cannot cost us the return value
+        # or the user-facing path notice below.
+        try:
+            prune_request_dumps(agent.logs_dir)
+        except Exception as prune_error:
+            logger.debug("Request dump retention skipped: %s", prune_error)
 
         agent._vprint(f"{agent.log_prefix}🧾 Request debug dump written to: {dump_file}")
 
@@ -4030,6 +4101,7 @@ __all__ = [
     "restore_primary_runtime",
     "extract_reasoning",
     "dump_api_request_debug",
+    "prune_request_dumps",
     "prompt_caching_disabled_from_config",
     "blank_cache_policy_stub",
     "plan_cache_sections_for_destination",

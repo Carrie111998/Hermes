@@ -243,6 +243,83 @@ def atomic_json_write(
         raise
 
 
+def prune_oldest_files(
+    directory: Union[str, Path],
+    pattern: str,
+    keep: int,
+    *,
+    log: logging.Logger | None = None,
+) -> int:
+    """Keep the *keep* newest files matching *pattern*; delete the rest.
+
+    Shared retention primitive for append-only debug/output artifacts that are
+    written under a fixed directory with a unique (timestamped) filename per
+    write, and therefore never overwrite each other.  Without a cap, such a
+    writer grows the directory forever.  Callers invoke this right after the
+    write so the directory is bounded at all times.
+
+    Newest-wins is deliberate: these artifacts exist to post-mortem a failure
+    that *just* happened, so the most recent ones carry all the value and the
+    tail is what should go.
+
+    Ordering is by mtime (newest first), with the filename as a deterministic
+    tiebreaker for filesystems with coarse timestamp granularity.  A reverse
+    *lexical* sort — as used by the older, artifact-specific prune helpers in
+    ``cron.jobs`` and ``hermes_cli.backup`` — is only correct when the
+    timestamp is the whole filename; it silently orders by the wrong field
+    when a variable component (e.g. a session id) precedes the timestamp.
+
+    Safety properties, because this deletes user files:
+
+    * Only direct children of *directory* are considered — ``glob`` is not
+      recursive here and *pattern* is caller-supplied, never user input.
+    * Symlinks are skipped, so a link planted in the directory can never be
+      followed to delete a file outside it.
+    * Non-files (directories, sockets) are skipped.
+    * ``keep <= 0`` disables pruning entirely (opt-out for operators who
+      manage cleanup externally).
+    * Every failure mode is swallowed and logged at debug level: retention is
+      housekeeping and must never break the write path it protects.
+
+    Returns the number of files deleted (0 on any failure).
+    """
+    if keep <= 0:
+        return 0
+    logger_ = log or logging.getLogger(__name__)
+    try:
+        candidates = []
+        for entry in Path(directory).glob(pattern):
+            try:
+                # is_symlink() first: is_file() follows links, so checking it
+                # alone would happily accept a symlink pointing outside the
+                # directory and then unlink our end of it.
+                if entry.is_symlink() or not entry.is_file():
+                    continue
+                candidates.append((entry.stat().st_mtime, entry.name, entry))
+            except OSError:
+                # Vanished or unreadable mid-scan (concurrent prune, network
+                # FS hiccup) — skip it rather than abandoning the sweep.
+                continue
+    except (OSError, ValueError) as exc:
+        logger_.debug("Could not scan %s for retention: %s", directory, exc)
+        return 0
+
+    if len(candidates) <= keep:
+        return 0
+
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    deleted = 0
+    for _mtime, name, stale in candidates[keep:]:
+        try:
+            stale.unlink()
+            deleted += 1
+        except OSError as exc:
+            # Windows refuses to unlink a file another process holds open;
+            # skipping it just defers that one file to the next prune.
+            logger_.debug("Failed to prune %s: %s", name, exc)
+    return deleted
+
+
 def warn_if_credential_file_broadly_readable(
     path: Union[str, Path],
     *,
