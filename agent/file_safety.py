@@ -98,8 +98,46 @@ def get_safe_write_roots() -> set[str]:
     return roots
 
 
+# Denial kind returned by ``_classify_write_denial`` when the target is (or
+# sits under) a git worktree ``.git`` pointer FILE.  Kept distinct from the
+# ``"credential"`` / ``"safe_root"`` kinds so ``get_write_denied_error`` can
+# surface the specific worktree-severing explanation.
+_WORKTREE_GIT_POINTER_DENIAL = "worktree_git_pointer"
+
+
+def find_git_worktree_pointer_file(resolved_path: str) -> Optional[str]:
+    """Return the on-disk path of a ``.git`` *file* (git worktree pointer)
+    that ``resolved_path`` touches, or ``None``.
+
+    A linked worktree stores its repository link as a plain FILE named
+    ``.git`` containing ``gitdir: <path>``.  Writing that file — or
+    anything below it — replaces/severs the pointer and the worktree
+    disappears from ``git worktree list``.  ``.git`` DIRECTORY components
+    (normal repositories, submodules) are not pointers and are
+    deliberately not matched.
+
+    ``resolved_path`` must already be realpath-resolved (the caller
+    resolves).  Missing components are skipped: a not-yet-created target
+    below an existing worktree pointer is still caught, while a brand-new
+    path under a nonexistent ``.git`` directory is not false-positived.
+    """
+    parts = Path(resolved_path).parts
+    for idx, part in enumerate(parts):
+        if part != ".git":
+            continue
+        candidate = os.path.join(*parts[: idx + 1])
+        try:
+            # isfile() follows symlinks and is False for directories.
+            if os.path.isfile(candidate):
+                return candidate
+        except OSError:
+            continue
+    return None
+
+
 def _classify_write_denial(path: str) -> Optional[str]:
-    """Return ``'credential'``, ``'safe_root'``, or ``None`` if writes are allowed."""
+    """Return ``'credential'``, ``'safe_root'``, ``'worktree_git_pointer'``,
+    or ``None`` if writes are allowed."""
     home = os.path.realpath(os.path.expanduser("~"))
     resolved = os.path.realpath(os.path.expanduser(str(path)))
 
@@ -145,6 +183,17 @@ def _classify_write_denial(path: str) -> Optional[str]:
         except Exception:
             pass
 
+    # Git worktree ``.git`` pointer FILES: a plain file named ``.git`` whose
+    # ``gitdir: <path>`` content links a linked worktree to its (bare)
+    # repository.  write_file's temp-file + ``mv -f`` — and delete/move —
+    # would replace or sever that pointer, making the worktree vanish from
+    # ``git worktree list``.  Refuse any target that IS such a pointer file
+    # or sits below one; ``.git`` DIRECTORY components (normal repos,
+    # submodules) remain writable.
+    worktree_git_pointer = find_git_worktree_pointer_file(resolved)
+    if worktree_git_pointer is not None:
+        return _WORKTREE_GIT_POINTER_DENIAL
+
     safe_roots = get_safe_write_roots()
     if safe_roots:
         allowed = False
@@ -173,6 +222,13 @@ def get_write_denied_error(path: str, *, verb: str = "Write") -> Optional[str]:
         return (
             f"{verb} denied: '{path}' is outside HERMES_WRITE_SAFE_ROOT "
             f"({roots_display}). Unset the variable or add this path's directory prefix."
+        )
+    if denial == _WORKTREE_GIT_POINTER_DENIAL:
+        return (
+            f"{verb} denied: '{path}' touches a git worktree .git pointer "
+            f"file. Writing here replaces the 'gitdir: <path>' link that "
+            f"attaches the worktree to its repository and severs the "
+            f"worktree from git. Use the terminal or git commands instead."
         )
     return f"{verb} denied: '{path}' is a protected system/credential file."
 
