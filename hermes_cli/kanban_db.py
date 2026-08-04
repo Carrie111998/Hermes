@@ -3050,9 +3050,16 @@ def create_task(
                             workspace_kind = "worktree"
 
         if project_obj is None:
-            # A project id/slug that doesn't resolve must not crash task
-            # creation or persist a dangling reference — drop the link and
-            # create the task as an ordinary (scratch) task.
+            # Preserve the legacy graceful fallback for ordinary scratch tasks,
+            # but never persist an explicit project-backed worktree that cannot
+            # possibly resolve. That combination otherwise survives creation
+            # and fails deterministically only after the dispatcher claims it.
+            if workspace_kind == "worktree":
+                raise ValueError(
+                    f"project {project_id!r} not found for worktree task; "
+                    "omit project/workspace fields to inherit the current task "
+                    "workspace, or register the project in this profile first"
+                )
             project_id = None
         else:
             # Canonicalise (a slug may have been passed) and anchor the
