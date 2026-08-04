@@ -8,6 +8,7 @@ closed for delegated children without mutating global os.environ for the parent.
 """
 from __future__ import annotations
 
+import sys
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Iterator, Mapping, MutableMapping
@@ -18,6 +19,7 @@ _DELEGATED_CHILD_CONTEXT: ContextVar[bool] = ContextVar(
 )
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
+_MAX_DELEGATED_ANCESTOR_DEPTH = 32
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
@@ -55,12 +57,47 @@ def is_delegated_child_context() -> bool:
     return bool(_DELEGATED_CHILD_CONTEXT.get())
 
 
+def _has_delegated_ancestor_marker() -> bool:
+    """Return whether a Linux ancestor retains the marker or the safe bound ends."""
+    if not sys.platform.startswith("linux"):
+        return False
+
+    import os
+
+    marker_prefix = f"{DELEGATED_CHILD_ENV_MARKER}=".encode()
+    pid = os.getpid()
+    for _ in range(_MAX_DELEGATED_ANCESTOR_DEPTH):
+        try:
+            with open(f"/proc/{pid}/status", encoding="utf-8") as status_file:
+                ppid = next(
+                    int(line.split(":", 1)[1].strip())
+                    for line in status_file
+                    if line.startswith("PPid:")
+                )
+            if ppid <= 1 or ppid == pid:
+                return False
+            with open(f"/proc/{ppid}/environ", "rb") as environ_file:
+                environ = environ_file.read().split(b"\0")
+        except (OSError, StopIteration, ValueError):
+            return False
+
+        if any(entry.startswith(marker_prefix) and entry != marker_prefix for entry in environ):
+            return True
+        pid = ppid
+
+    # A child can remove the marker at every hop.  Do not let a deliberately
+    # deep chain turn the bounded traversal into a mutation-bypass escape hatch.
+    return True
+
+
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
     import os
 
-    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(
-        os.environ.get(DELEGATED_CHILD_ENV_MARKER)
+    return (
+        bool(_DELEGATED_CHILD_CONTEXT.get())
+        or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+        or _has_delegated_ancestor_marker()
     )
 
 

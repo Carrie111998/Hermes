@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import shlex
+import subprocess
 import sys
 from pathlib import Path
 
@@ -168,6 +169,74 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_DB" not in env
     assert "HERMES_KANBAN_WORKSPACE" not in env
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc lineage")
+def test_unset_marker_subprocess_still_has_delegated_process_lineage():
+    """An unset child marker cannot evade the bounded ancestor check."""
+    inner = (
+        "import json, os; "
+        "from agent.delegation_context import is_delegated_child_process_context; "
+        "os.environ.pop('HERMES_DELEGATED_CHILD_CONTEXT', None); "
+        "print(json.dumps(is_delegated_child_process_context()))"
+    )
+    parent = (
+        "import os, subprocess, sys; "
+        "env = dict(os.environ); "
+        "env.pop('HERMES_DELEGATED_CHILD_CONTEXT', None); "
+        f"subprocess.run([sys.executable, '-c', {inner!r}], env=env, check=True)"
+    )
+    env = dict(os.environ)
+    env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", parent],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout.strip()) is True
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="Linux /proc lineage")
+def test_deep_unset_marker_lineage_fails_closed_at_safe_bound():
+    """A child cannot evade the guard by creating more hops than it inspects."""
+    from agent.delegation_context import _MAX_DELEGATED_ANCESTOR_DEPTH
+
+    source = """
+import json
+import os
+import subprocess
+import sys
+
+depth = int(os.environ["LINEAGE_TEST_DEPTH"])
+if depth:
+    env = dict(os.environ)
+    env.pop("HERMES_DELEGATED_CHILD_CONTEXT", None)
+    env["LINEAGE_TEST_DEPTH"] = str(depth - 1)
+    subprocess.run([sys.executable, "-c", env["LINEAGE_TEST_SOURCE"]], env=env, check=True)
+else:
+    from agent.delegation_context import is_delegated_child_process_context
+    print(json.dumps(is_delegated_child_process_context()))
+"""
+    env = dict(os.environ)
+    env["HERMES_DELEGATED_CHILD_CONTEXT"] = "1"
+    env["LINEAGE_TEST_DEPTH"] = str(_MAX_DELEGATED_ANCESTOR_DEPTH + 1)
+    env["LINEAGE_TEST_SOURCE"] = source
+    env["PYTHONPATH"] = str(_REPO_ROOT)
+
+    result = subprocess.run(
+        [sys.executable, "-c", source],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert json.loads(result.stdout.strip()) is True
 
 
 def test_delegate_child_kanban_cli_cannot_delete_parent_board(
