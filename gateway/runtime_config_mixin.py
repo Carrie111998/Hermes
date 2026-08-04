@@ -945,6 +945,7 @@ class GatewayRuntimeConfigMixin:
         cache_keys: dict | None = None,
         user_id: str | None = None,
         user_id_alt: str | None = None,
+        skip_context_files: bool = False,
     ) -> str:
         """Compute a stable string key from agent config values.
 
@@ -999,6 +1000,10 @@ class GatewayRuntimeConfigMixin:
                 _cache_keys_sorted,
                 str(user_id or ""),
                 str(user_id_alt or ""),
+                # skip_context_files changes the agent's frozen system prompt
+                # (context files in vs out) — a toggled config edit must
+                # rebuild the cached agent, not silently reuse it.
+                bool(skip_context_files),
             ],
             sort_keys=True,
             default=str,
