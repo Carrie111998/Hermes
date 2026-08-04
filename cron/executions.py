@@ -49,9 +49,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              claimed_at TEXT NOT NULL,
              started_at TEXT,
              finished_at TEXT,
-             error TEXT
+             error TEXT,
+             delivery_outcome TEXT
            )"""
     )
+    columns = {
+        row[1] for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+    }
+    if "delivery_outcome" not in columns:
+        try:
+            conn.execute("ALTER TABLE executions ADD COLUMN delivery_outcome TEXT")
+        except sqlite3.OperationalError:
+            # Another process may have migrated the profile after our PRAGMA.
+            # Suppress only that exact won race; every other DDL failure remains fatal.
+            columns = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(executions)").fetchall()
+            }
+            if "delivery_outcome" not in columns:
+                raise
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_executions_job_claimed "
         "ON executions(job_id, claimed_at DESC, id DESC)"
@@ -182,9 +198,9 @@ def finish_execution(
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         cur = conn.execute(
-            """UPDATE executions SET status=?, finished_at=?, error=?
+            """UPDATE executions SET status=?, finished_at=?, error=?, delivery_outcome=?
                WHERE id=? AND status IN ('claimed','running')""",
-            (status, now, detail, execution_id),
+            (status, now, detail, delivery_outcome, execution_id),
         )
         if cur.rowcount != 1:
             return None

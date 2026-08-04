@@ -98,11 +98,13 @@ def test_run_job_no_agent_success_returns_script_stdout(hermes_env):
     job = create_job(
         prompt=None, schedule="every 5m", script="alert.sh", no_agent=True, deliver="local"
     )
+    job["execution_id"] = "execution-output-test"
     success, doc, final_response, error = run_job(job)
     assert success is True
     assert error is None
     assert "RAM 92% on host" in final_response
     assert "RAM 92% on host" in doc
+    assert "**Execution ID:** execution-output-test" in doc
 
 
 # ---------------------------------------------------------------------------

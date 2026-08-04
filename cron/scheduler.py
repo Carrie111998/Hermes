@@ -1833,9 +1833,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #   cancel() == False -> the coroutine was already
                             #     running on the gateway loop when the timeout
                             #     fired; the request is in flight on the wire and
-                            #     cannot be un-sent.  Re-sending via standalone
-                            #     would be a guaranteed DUPLICATE, so treat it as
-                            #     delivered (assume-delivered).
+                            #     cannot be un-sent. Re-sending via standalone
+                            #     would be a guaranteed DUPLICATE, but the timeout
+                            #     is not a successful delivery receipt.
                             #
                             #   cancel() == True -> the scheduled callback never
                             #     started executing (loop wedged/backlogged for
@@ -1859,10 +1859,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 timed_out = True
                                 timeout_handled = True
+                                msg = (
+                                    f"live adapter send to {platform_name}:{chat_id} "
+                                    "timed out after dispatch; delivery outcome is unconfirmed"
+                                )
+                                delivery_errors.append(msg)
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
                                     "after 60s; already dispatched (in flight), "
-                                    "assuming delivered (skipping standalone fallback "
+                                    "delivery unconfirmed (skipping standalone fallback "
                                     "to avoid duplicate)",
                                     job["id"], platform_name, chat_id,
                                 )
@@ -2796,6 +2801,7 @@ def run_job(
     """
     job_id = job["id"]
     job_name = str(job.get("name") or job.get("prompt") or job_id or "cron job")
+    execution_id = str(job.get("execution_id") or "N/A")
 
     # ---------------------------------------------------------------
     # no_agent short-circuit — the script IS the job, no LLM involvement.
@@ -2859,6 +2865,7 @@ def run_job(
             doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                f"**Execution ID:** {execution_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** script failed\n\n"
@@ -2875,6 +2882,7 @@ def run_job(
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                f"**Execution ID:** {execution_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (wakeAgent=false)\n"
@@ -2886,6 +2894,7 @@ def run_job(
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                f"**Execution ID:** {execution_id}\n"
                 f"**Run Time:** {now_iso}\n"
                 f"**Mode:** no_agent (script)\n"
                 f"**Status:** silent (empty output)\n"
@@ -2895,6 +2904,7 @@ def run_job(
         doc = (
             f"# Cron Job: {job_name}\n\n"
             f"**Job ID:** {job_id}\n"
+            f"**Execution ID:** {execution_id}\n"
             f"**Run Time:** {now_iso}\n"
             f"**Mode:** no_agent (script)\n\n"
             f"---\n\n"
@@ -2996,6 +3006,7 @@ def run_job(
             silent_doc = (
                 f"# Cron Job: {job_name}\n\n"
                 f"**Job ID:** {job_id}\n"
+                f"**Execution ID:** {execution_id}\n"
                 f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
                 "Script gate returned `wakeAgent=false` — agent skipped.\n"
             )
@@ -3736,6 +3747,7 @@ def run_job(
         output = f"""# Cron Job: {job_name}
 
 **Job ID:** {job_id}
+**Execution ID:** {execution_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 
@@ -3758,6 +3770,7 @@ def run_job(
         output = f"""# Cron Job: {job_name} (FAILED)
 
 **Job ID:** {job_id}
+**Execution ID:** {execution_id}
 **Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
 **Schedule:** {job.get('schedule_display', 'N/A')}
 

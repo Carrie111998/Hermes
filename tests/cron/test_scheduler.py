@@ -1291,17 +1291,16 @@ class TestDeliverResultTimeoutCancelsFuture:
     """When future.result(timeout=60) raises TimeoutError in the live adapter
     delivery path, the outcome depends on whether the coroutine was already
     running.  future.cancel() returning False means it is in flight on the wire
-    (cannot be un-sent) → treat as DELIVERED and skip the standalone fallback to
-    avoid a duplicate (#38922).  future.cancel() returning True means it never
+    (cannot be un-sent) → skip the standalone fallback to avoid a duplicate, but
+    keep the delivery outcome unconfirmed. future.cancel() returning True means it never
     started (wedged loop) → nothing was sent, so fall through to standalone or
     the message is silently dropped.  Regression for #38922.
     """
 
-    def test_live_adapter_timeout_assumes_delivered_no_duplicate(self):
+    def test_live_adapter_timeout_is_unconfirmed_without_duplicate(self):
         """End-to-end: live adapter confirmation times out past the 60s budget.
-        The fix (#38922) treats the send as already-dispatched/delivered and
-        does NOT run the standalone fallback — otherwise the message is sent
-        twice."""
+        The send is already dispatched, so the standalone fallback must not run.
+        But a timeout is not a successful delivery receipt and must fail closed."""
         from gateway.config import Platform
         from concurrent.futures import Future
 
@@ -1357,10 +1356,11 @@ class TestDeliverResultTimeoutCancelsFuture:
 
         # 1. cancel() was attempted (returned False = in flight).
         assert cancel_calls == [True], "future.cancel() should be attempted on TimeoutError"
-        # 2. Delivery is reported successful (no error string returned).
-        assert result is None, f"expected successful delivery, got error: {result!r}"
-        # 3. The standalone fallback must NOT run — that is the #38922 fix:
-        #    an in-flight confirmation timeout is assume-delivered, not a resend.
+        # 2. Delivery remains unconfirmed, so durable state cannot treat it as sent.
+        assert result is not None
+        assert "unconfirmed" in result
+        # 3. The standalone fallback must NOT run: an in-flight confirmation
+        #    timeout is unconfirmed, but not a reason to send a duplicate now.
         standalone_send.assert_not_awaited()
 
 
