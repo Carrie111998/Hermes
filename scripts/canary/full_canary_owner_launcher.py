@@ -16781,7 +16781,8 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         remote_argv: Sequence[str],
         *,
         account: str,
-        input_bytes: bytes,
+        input_bytes: bytes | None = None,
+        input_factory: Callable[[], bytes] | None = None,
         timeout_seconds: float = 300.0,
         maximum_input_bytes: int = _WRITER_AUTHORITY_MAX_FRAME_BYTES + 8,
         maximum_output_bytes: int = _HTTP_RESPONSE_MAX_BYTES,
@@ -16789,16 +16790,21 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         """Run one exact remote command with bounded, secret-free framed stdin."""
 
         if (
-            not isinstance(input_bytes, bytes)
-            or not input_bytes
+            (input_bytes is None) == (input_factory is None)
+            or (input_factory is not None and not callable(input_factory))
             or not 0 < maximum_input_bytes <= (
                 _STOPPED_RELEASE_REMOTE_INPUT_MAX_BYTES
             )
-            or len(input_bytes) > maximum_input_bytes
             or not 0 < timeout_seconds <= 2_400
             or not 0 < maximum_output_bytes <= (
                 _STOPPED_RELEASE_REMOTE_OUTPUT_MAX_BYTES
             )
+        ):
+            raise OwnerLauncherError("stopped_release_remote_input_invalid")
+        if input_bytes is not None and (
+            not isinstance(input_bytes, bytes)
+            or not input_bytes
+            or len(input_bytes) > maximum_input_bytes
         ):
             raise OwnerLauncherError("stopped_release_remote_input_invalid")
         authorization_before = self._authorization_snapshot(account)
@@ -16806,6 +16812,34 @@ class IapStoppedReleaseTransport(IapCoordinatorTransport):
         self._validate_dry_run(argv)
         if self._authorization_snapshot(account) != authorization_before:
             raise OwnerLauncherError("iap_ssh_authorization_changed")
+        if input_factory is not None:
+            try:
+                input_bytes = input_factory()
+            except OwnerLauncherError:
+                self._postflight()
+                raise
+            except BaseException:
+                self._postflight()
+                raise OwnerLauncherError(
+                    "stopped_release_remote_input_invalid"
+                ) from None
+            if (
+                not isinstance(input_bytes, bytes)
+                or not input_bytes
+                or len(input_bytes) > maximum_input_bytes
+            ):
+                self._postflight()
+                raise OwnerLauncherError(
+                    "stopped_release_remote_input_invalid"
+                )
+            # The exact frame clock starts only after both external
+            # authorization snapshots.  Re-pin the already-selected human
+            # identity immediately before transfer without another slow
+            # inventory pass that would age the frame before the guest sees it.
+            self._owner_identity.require_stable()
+            self._postflight()
+        if input_bytes is None:  # Defensive narrowing after the exact XOR gate.
+            raise OwnerLauncherError("stopped_release_remote_input_invalid")
         command_prefix = self._gcloud_executable.trusted_command_prefix()
         try:
             completed = self._preflight_runner(
@@ -18350,6 +18384,7 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
         arguments: Sequence[str],
         account: str,
         stdin_frame: bytes | None = None,
+        stdin_frame_factory: Callable[[], bytes] | None = None,
         timeout_seconds: float = 900.0,
         allowed_returncodes: frozenset[int] = frozenset({0}),
     ) -> Mapping[str, Any]:
@@ -18363,6 +18398,11 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
                 or _CONTROL_RE.search(item) is not None
                 for item in arguments
             )
+            or (stdin_frame is not None and stdin_frame_factory is not None)
+            or (
+                stdin_frame_factory is not None
+                and not callable(stdin_frame_factory)
+            )
         ):
             raise OwnerLauncherError("writer_activation_command_invalid")
         interpreter = f"/opt/muncho-canary-releases/{release_sha}/venv/bin/python"
@@ -18375,7 +18415,7 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
             module,
             *arguments,
         )
-        if stdin_frame is None:
+        if stdin_frame is None and stdin_frame_factory is None:
             completed = self._run_remote(
                 remote,
                 account=account,
@@ -18389,6 +18429,7 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
                 remote,
                 account=account,
                 input_bytes=stdin_frame,
+                input_factory=stdin_frame_factory,
                 timeout_seconds=timeout_seconds,
             )
         if (
@@ -18917,25 +18958,35 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
         )
         if native_policy != policy_sha:
             raise OwnerLauncherError("writer_activation_policy_mismatch")
-        frame_now = now()
-        native_frame = build_writer_authority_frame(
-            action="stage-native-authority",
-            revision=release_sha,
-            plan_sha256=native_plan_sha,
-            owner_approval=native_approval,
-            external_iam_receipt=native_iam,
-            previous_owner_approval_sha256=None,
-            previous_external_iam_receipt_sha256=None,
-            now_unix=frame_now,
+        native_frame: bytes | None = None
+
+        def build_native_frame_after_authorization() -> bytes:
+            nonlocal native_frame
+            if native_frame is not None:
+                raise OwnerLauncherError("writer_authority_frame_reused")
+            native_frame = build_writer_authority_frame(
+                action="stage-native-authority",
+                revision=release_sha,
+                plan_sha256=native_plan_sha,
+                owner_approval=native_approval,
+                external_iam_receipt=native_iam,
+                previous_owner_approval_sha256=None,
+                previous_external_iam_receipt_sha256=None,
+                now_unix=now(),
+            )
+            return native_frame
+
+        native_stage_raw = self._run_packaged_json(
+            release_sha,
+            module=WRITER_ACTIVATION_BRIDGE_MODULE,
+            arguments=("stage-native-authority",),
+            account=account,
+            stdin_frame_factory=build_native_frame_after_authorization,
         )
+        if native_frame is None:
+            raise OwnerLauncherError("writer_authority_frame_not_built")
         native_stage = self._validate_authority_stage(
-            self._run_packaged_json(
-                release_sha,
-                module=WRITER_ACTIVATION_BRIDGE_MODULE,
-                arguments=("stage-native-authority",),
-                account=account,
-                stdin_frame=native_frame,
-            ),
+            native_stage_raw,
             action="stage-native-authority",
             release_sha=release_sha,
             plan_sha256=native_plan_sha,
@@ -19055,24 +19106,35 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
         final_iam, final_iam_sha, final_policy = self._external_iam_receipt(final_iam)
         if final_policy != policy_sha:
             raise OwnerLauncherError("writer_activation_policy_mismatch")
-        final_frame = build_writer_authority_frame(
-            action="replace-final-authority",
-            revision=release_sha,
-            plan_sha256=final_plan_sha,
-            owner_approval=final_approval,
-            external_iam_receipt=final_iam,
-            previous_owner_approval_sha256=native_approval_sha,
-            previous_external_iam_receipt_sha256=native_iam_sha,
-            now_unix=now(),
+        final_frame: bytes | None = None
+
+        def build_final_frame_after_authorization() -> bytes:
+            nonlocal final_frame
+            if final_frame is not None:
+                raise OwnerLauncherError("writer_authority_frame_reused")
+            final_frame = build_writer_authority_frame(
+                action="replace-final-authority",
+                revision=release_sha,
+                plan_sha256=final_plan_sha,
+                owner_approval=final_approval,
+                external_iam_receipt=final_iam,
+                previous_owner_approval_sha256=native_approval_sha,
+                previous_external_iam_receipt_sha256=native_iam_sha,
+                now_unix=now(),
+            )
+            return final_frame
+
+        final_stage_raw = self._run_packaged_json(
+            release_sha,
+            module=WRITER_ACTIVATION_BRIDGE_MODULE,
+            arguments=("replace-final-authority",),
+            account=account,
+            stdin_frame_factory=build_final_frame_after_authorization,
         )
+        if final_frame is None:
+            raise OwnerLauncherError("writer_authority_frame_not_built")
         final_stage = self._validate_authority_stage(
-            self._run_packaged_json(
-                release_sha,
-                module=WRITER_ACTIVATION_BRIDGE_MODULE,
-                arguments=("replace-final-authority",),
-                account=account,
-                stdin_frame=final_frame,
-            ),
+            final_stage_raw,
             action="replace-final-authority",
             release_sha=release_sha,
             plan_sha256=final_plan_sha,
