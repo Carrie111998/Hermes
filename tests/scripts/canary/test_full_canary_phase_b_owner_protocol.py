@@ -1160,6 +1160,104 @@ def test_trusted_canary_iam_runner_allows_only_exact_read_only_inventory(
     assert len(calls) == 1
 
 
+def test_fresh_writer_external_iam_reuses_one_immutable_inventory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import canonical_writer_host_authority as host_authority
+    from scripts.canary import foundation_preflight, host_preflight
+
+    shared = ("gcloud", "shared", "--format=json")
+    host_only = ("gcloud", "host-only", "--format=json")
+    calls: list[tuple[str, ...]] = []
+
+    class Identity:
+        stable_checks = 0
+
+        def require_stable(self) -> None:
+            self.stable_checks += 1
+
+        def run_canary_iam_read_only_json(self, argv):
+            logical = tuple(argv)
+            calls.append(logical)
+            return {"argv": list(logical), "source": "live"}
+
+    identity = Identity()
+
+    def collect_foundation(*, run_json):
+        observed = run_json(shared)
+        observed["mutated_by_foundation"] = True
+        return {"observed": observed}
+
+    def collect_host(*, run_json):
+        shared_observed = run_json(shared)
+        assert "mutated_by_foundation" not in shared_observed
+        return {
+            "shared": shared_observed,
+            "host_only": run_json(host_only),
+        }
+
+    foundation_report = {"kind": "foundation"}
+    host_report = {"kind": "host"}
+    monkeypatch.setattr(foundation_preflight, "collect", collect_foundation)
+    monkeypatch.setattr(
+        foundation_preflight,
+        "evaluate",
+        lambda evidence: (
+            foundation_report
+            if evidence["observed"]["source"] == "live"
+            else pytest.fail("foundation evidence drifted")
+        ),
+    )
+    monkeypatch.setattr(host_preflight, "collect", collect_host)
+    monkeypatch.setattr(
+        host_preflight,
+        "evaluate",
+        lambda evidence: (
+            host_report
+            if evidence["host_only"]["source"] == "live"
+            else pytest.fail("host evidence drifted")
+        ),
+    )
+
+    source_sha = _digest("source-approval")
+
+    class Receipt:
+        def require_fresh(
+            self,
+            now_unix: int,
+            *,
+            minimum_remaining_seconds: int,
+        ) -> None:
+            assert now_unix == 1_800_000_000
+            assert minimum_remaining_seconds == 720
+
+        def to_mapping(self) -> Mapping[str, Any]:
+            return {"schema": "external-iam", "source": source_sha}
+
+    def build_receipt(foundation, host, **kwargs):
+        assert foundation is foundation_report
+        assert host is host_report
+        assert kwargs == {
+            "source_approval_sha256": source_sha,
+            "now_unix": 1_800_000_000,
+        }
+        return Receipt()
+
+    monkeypatch.setattr(
+        host_authority,
+        "build_external_iam_receipt",
+        build_receipt,
+    )
+
+    assert launcher.collect_fresh_writer_external_iam(
+        owner_identity=identity,
+        source_approval_sha256=source_sha,
+        now_unix=1_800_000_000,
+    ) == {"schema": "external-iam", "source": source_sha}
+    assert calls == [shared, host_only]
+    assert identity.stable_checks == 2
+
+
 def test_owner_cli_routes_explicit_stopped_writer_activation(
     monkeypatch: pytest.MonkeyPatch,
     capfd: pytest.CaptureFixture[str],

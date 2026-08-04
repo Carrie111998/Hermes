@@ -18070,11 +18070,23 @@ def collect_fresh_writer_external_iam(
             evaluate as evaluate_host,
         )
 
-        runner = owner_identity.run_canary_iam_read_only_json
+        live_runner = owner_identity.run_canary_iam_read_only_json
+        inventory: dict[tuple[str, ...], Any] = {}
+
+        def shared_inventory_runner(argv: Sequence[str]) -> Any:
+            """Reuse one immutable observation for overlapping exact argv."""
+
+            logical = tuple(argv)
+            if logical not in inventory:
+                inventory[logical] = copy.deepcopy(live_runner(logical))
+            return copy.deepcopy(inventory[logical])
+
         foundation_report = evaluate_foundation(
-            collect_foundation(run_json=runner)
+            collect_foundation(run_json=shared_inventory_runner)
         )
-        host_report = evaluate_host(collect_host(run_json=runner))
+        host_report = evaluate_host(
+            collect_host(run_json=shared_inventory_runner)
+        )
         current = int(time.time()) if now_unix is None else now_unix
         receipt = build_external_iam_receipt(
             foundation_report,
