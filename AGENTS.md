@@ -77,6 +77,15 @@ conservative at the waist.
   integrate the same *category*, design one shared interface instead of merging
   them one at a time (see the ABC + orchestrator note under the Footprint
   Ladder).
+- **Ship working vertical slices.** Start with the smallest end-to-end
+  implementation that satisfies current requirements and fits the intended
+  architecture. Add capability from a working base; do not replace working
+  behavior with unfinished complexity.
+- **Check dependency capability before building.** Before reimplementing common
+  functionality or adding a package, inspect current dependencies,
+  documentation, types, and source. Prefer an existing project dependency or a
+  mature maintained library only when it reduces total complexity or improves
+  reliability.
 - **Behavior contracts over snapshots.** Tests should assert how two pieces of
   data must relate (invariants), not freeze a current value (model lists,
   config version literals, enumeration counts). See "Don't write
