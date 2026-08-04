@@ -52,6 +52,45 @@ class TestBlueBubblesHelpers:
 
         assert check_bluebubbles_requirements() is True
 
+    @pytest.mark.asyncio
+    async def test_standalone_send_does_not_start_webhook_listener(self, monkeypatch):
+        """Outbound-only sends must work while the gateway owns the webhook port."""
+        from aiohttp import web
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+        from tools.send_message_tool import _send_bluebubbles
+
+        api_get_paths = []
+        api_post_paths = []
+        listener_starts = []
+
+        async def fake_api_get(self, path):
+            api_get_paths.append(path)
+            if path == "/api/v1/server/info":
+                return {"data": {"private_api": True, "helper_connected": True}}
+            return {"status": 200}
+
+        async def fake_api_post(self, path, payload):
+            api_post_paths.append(path)
+            return {"status": 200, "data": {"guid": "message-guid"}}
+
+        async def fail_if_listener_starts(self):
+            listener_starts.append((self._host, self._port))
+            raise OSError("webhook port already in use")
+
+        monkeypatch.setattr(BlueBubblesAdapter, "_api_get", fake_api_get)
+        monkeypatch.setattr(BlueBubblesAdapter, "_api_post", fake_api_post)
+        monkeypatch.setattr(web.TCPSite, "start", fail_if_listener_starts)
+
+        result = await _send_bluebubbles(
+            {"server_url": "http://localhost:1234", "password": "secret"},
+            "iMessage;-;user@example.com",
+            "hello",
+        )
+
+        assert result["success"] is True
+        assert listener_starts == []
+        assert api_get_paths == ["/api/v1/ping", "/api/v1/server/info"]
+        assert api_post_paths == ["/api/v1/message/text"]
 
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
@@ -71,6 +110,70 @@ class TestBlueBubblesHelpers:
     def test_server_url_normalized(self, monkeypatch):
         adapter = _make_adapter(monkeypatch, server_url="http://localhost:1234/")
         assert adapter.server_url == "http://localhost:1234"
+
+
+class TestBlueBubblesLifecycle:
+    @pytest.mark.asyncio
+    async def test_outbound_only_connect_still_requires_credentials(self, monkeypatch):
+        monkeypatch.delenv("BLUEBUBBLES_SERVER_URL", raising=False)
+        monkeypatch.delenv("BLUEBUBBLES_PASSWORD", raising=False)
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        adapter = BlueBubblesAdapter(PlatformConfig(enabled=True, extra={}))
+
+        assert await adapter.connect(start_webhook_listener=False) is False
+        assert adapter.client is None
+        assert adapter._runner is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.filterwarnings("ignore:Bare functions are deprecated:DeprecationWarning")
+    async def test_default_connect_starts_and_registers_webhook_listener(self, monkeypatch):
+        from aiohttp import web
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+
+        adapter = _make_adapter(monkeypatch)
+        listener_starts = []
+        registrations = []
+        unregistrations = []
+
+        async def fake_api_get(self, path):
+            if path == "/api/v1/server/info":
+                return {"data": {"private_api": True, "helper_connected": True}}
+            return {"status": 200}
+
+        async def fake_register(self):
+            registrations.append(self._webhook_url)
+            return True
+
+        async def fake_unregister(self):
+            unregistrations.append(self._webhook_url)
+            return True
+
+        class FakeTCPSite:
+            def __init__(self, runner, host, port):
+                self.runner = runner
+                self.host = host
+                self.port = port
+
+            async def start(self):
+                listener_starts.append((self.host, self.port))
+
+        monkeypatch.setattr(BlueBubblesAdapter, "_api_get", fake_api_get)
+        monkeypatch.setattr(BlueBubblesAdapter, "_register_webhook", fake_register)
+        monkeypatch.setattr(BlueBubblesAdapter, "_unregister_webhook", fake_unregister)
+        monkeypatch.setattr(web, "TCPSite", FakeTCPSite)
+
+        assert await adapter.connect() is True
+        try:
+            assert listener_starts == [(adapter.webhook_host, adapter.webhook_port)]
+            assert registrations == [adapter._webhook_url]
+            assert adapter._runner is not None
+        finally:
+            await adapter.disconnect()
+
+        assert unregistrations == [adapter._webhook_url]
+        assert adapter.client is None
+        assert adapter._runner is None
 
 
 class _FakeBlueBubblesRequest:
