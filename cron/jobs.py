@@ -112,8 +112,16 @@ _jobs_lock_state = threading.local()
 # legitimate critical section (field updates only) while keeping the ticker's
 # worst-case stall well under one status-alarm threshold.
 _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
-OUTPUT_DIR = CRON_DIR / "output"
+_OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
+OUTPUT_DIR = _OUTPUT_DIR
+# Seconds within which a next_run_at "now" is treated as a manual trigger
+# (trigger_job) rather than a stale cron-scheduled time. Used by the
+# migration-repair branch in _get_due_jobs_locked to avoid swallowing the
+# dashboard "Run now" button (#78516). 60s covers the worst case where the
+# scheduler tick and trigger_job race, but is small enough that a genuinely
+# missed run (hours stale) is never mistaken for a manual trigger.
+_MANUAL_TRIGGER_PROXIMITY_SECS = 60
 
 
 @dataclass(frozen=True)
@@ -2373,9 +2381,16 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # the recompute lands on the same wall-clock time later the same period,
             # and DST-boundary collisions with a still-future stored wall clock are
             # rare relative to the double-fire bug this prevents (#28934).
+            #
+            # Exception: if next_run_dt is within a few seconds of now, it is almost
+            # certainly a manual trigger from trigger_job() rather than a stored
+            # migration-era timestamp. In that case we let the job fire and skip the
+            # recomputation, which would otherwise swallow the manual trigger
+            # (see #78516).
             if (
                 kind == "cron"
                 and next_run_dt <= now
+                and (now - next_run_dt).total_seconds() > _MANUAL_TRIGGER_PROXIMITY_SECS
                 and _timezone_offset_mismatch(raw_next_run_dt, now)
                 and _stored_wall_clock_is_future(raw_next_run_dt, now)
             ):

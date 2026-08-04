@@ -1114,7 +1114,6 @@ class TestJobsJsonUtf8Bom:
 
 
 
-
 class TestAdvanceNextRuns:
     """Tests for advance_next_runs() — the batched due-set advance.
 
@@ -1250,3 +1249,92 @@ class TestCompletedOneshotRetentionSweep:
         assert updated["enabled"] is True
         assert updated["state"] == "scheduled"
         assert updated["next_run_at"] is not None
+
+class TestManualTriggerProximity:
+    """Regression tests for #78516 — dashboard "Run now" swallowed by migration repair."""
+
+    def test_trigger_not_swallowed_when_within_proximity(self, tmp_cron_dir):
+        """trigger_job() sets next_run_at to now; migration repair must not
+        recompute it away when the offset mismatch is just from the trigger
+        itself (within 60s of now)."""
+        from cron.jobs import (
+            _get_due_jobs_locked,
+            _jobs_lock,
+            create_job,
+            load_jobs,
+            save_jobs,
+        )
+        from hermes_time import now as _hermes_now
+
+        job = create_job(
+            prompt="test",
+            schedule="0 8 * * *",
+        )
+        # Simulate trigger_job: set next_run_at to "now" with a deliberately
+        # different offset (e.g. UTC) so the offset-mismatch check fires.
+        from datetime import datetime, timezone, timedelta
+
+        trigger_now = _hermes_now()
+        # Force a UTC timestamp to simulate the bug scenario
+        utc_now = datetime.now(timezone.utc)
+        with _jobs_lock():
+            jobs = load_jobs()
+            for j in jobs:
+                if j["id"] == job["id"]:
+                    j["next_run_at"] = utc_now.isoformat()
+            save_jobs(jobs)
+
+        # _get_due_jobs_locked must NOT skip this job via the migration repair
+        # branch because next_run_dt is within 60s of now (a manual trigger).
+        due = _get_due_jobs_locked()
+        due_ids = {j["id"] for j in due}
+        assert job["id"] in due_ids
+
+    def test_trigger_swallowed_when_stale(self, tmp_cron_dir):
+        """If next_run_at is genuinely stale (>60s ago) with an offset
+        mismatch AND the stored wall-clock is in the future, the migration
+        repair SHOULD recompute it (normal TZ-migration case).
+
+        The four conditions must all hold simultaneously:
+        1. raw_dt <= now (stale)
+        2. (now - raw_dt).total_seconds() > 60 (stale by >60s)
+        3. raw_dt.utcoffset() != now.utcoffset() (offset mismatch)
+        4. raw_dt.replace(tzinfo=None) > now.replace(tzinfo=None) (wall-clock future)
+
+        Achieved by storing a +10 TZ time whose naive wall-clock (21:00) is ahead
+        of now's naive wall-clock (06:16), but whose UTC instant (11:00 UTC) is
+        16 min in the past of now (11:16 UTC).
+        """
+        from cron.jobs import (
+            _get_due_jobs_locked,
+            _jobs_lock,
+            create_job,
+            load_jobs,
+            save_jobs,
+        )
+        from hermes_time import now as _hermes_now
+        from datetime import datetime, timezone, timedelta
+
+        now = _hermes_now()
+        # +10 TZ time: 21:00+10 = 11:00 UTC (16 min ago), naive = 21:00 > 06:16
+        stored_dt = now.replace(
+            hour=21, minute=0, second=0,
+            tzinfo=timezone(timedelta(hours=10))
+        )
+        job = create_job(
+            prompt="test",
+            schedule="0 8 * * *",
+        )
+        with _jobs_lock():
+            jobs = load_jobs()
+            for j in jobs:
+                if j["id"] == job["id"]:
+                    j["next_run_at"] = stored_dt.isoformat()
+            save_jobs(jobs)
+
+        due = _get_due_jobs_locked()
+        due_ids = {j["id"] for j in due}
+        # The job is NOT due because the migration repair recomputed its
+        # next_run_at to the next cron occurrence (which is in the future).
+        assert job["id"] not in due_ids
+
