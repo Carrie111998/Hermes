@@ -898,6 +898,120 @@ _ENV_DUMP_WRAPPERS = frozenset(
     {"sudo", "command", "nice", "nohup", "stdbuf", "time", "doas", "setsid"}
 )
 
+# Wrappers that take their own positional arguments before the real command
+# (``timeout 5 env``, ``chroot / env``, ``setpriv --reuid=0 env``,
+# ``docker exec <container> env``, ``ssh <host> env``). Skipping a fixed
+# number of leading operands would be wrong — ``timeout`` takes one, ``docker
+# exec`` takes a subcommand plus a container. Instead we scan the whole
+# segment for a dump command that is not itself an operand of an earlier
+# non-wrapper command; see ``_segment_is_env_dump``.
+_ENV_DUMP_ARG_WRAPPERS = frozenset(
+    {
+        "timeout", "chroot", "setpriv", "unbuffer", "script", "xargs",
+        "ionice", "eatmydata", "su", "runuser", "chrt", "taskset",
+        "docker", "podman", "nerdctl", "kubectl", "lxc", "ssh", "rsh",
+        "flatpak", "toolbox", "distrobox", "systemd-run", "srun",
+    }
+)
+
+# Shell-style wrappers that accept an inline script via ``-c``. The payload is
+# a *nested command string*, so it is re-parsed recursively — this is what
+# makes the classification robust to arbitrary nesting
+# (``bash -c "sh -c 'env'"``) instead of enumerating each new spelling.
+_INLINE_SCRIPT_FLAGS = ("-c", "--command")
+
+# Depth cap for the recursive re-parse. Real commands nest one or two levels;
+# the cap only exists so a pathological input can't drive unbounded recursion.
+_MAX_NESTED_COMMAND_DEPTH = 4
+
+# Shell control operators. Splitting on these with a quote-aware lexer (rather
+# than a bare regex) keeps a quoted payload intact, so ``bash -c 'env | grep
+# TOKEN'`` is seen as ONE segment whose ``-c`` argument is re-parsed, instead
+# of being shredded at the ``|`` inside the quotes.
+_SHELL_OPERATORS = frozenset({"|", "||", "&&", ";", "&", "|&", ";;", "(", ")"})
+
+
+def _split_command_segments(command: str) -> list[list[str]]:
+    """Split ``command`` into per-segment token lists, respecting quotes.
+
+    Falls back to a naive whitespace split when the string cannot be lexed
+    (unbalanced quotes), preserving the conservative behavior of the previous
+    implementation.
+    """
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        tokens = command.split()
+
+    segments: list[list[str]] = []
+    current: list[str] = []
+    for token in tokens:
+        if token in _SHELL_OPERATORS:
+            if current:
+                segments.append(current)
+                current = []
+            continue
+        current.append(token)
+    if current:
+        segments.append(current)
+    return segments
+
+
+def _segment_is_env_dump(tokens: list[str], depth: int) -> bool:
+    """Return True if a single command segment resolves to an environment dump."""
+    idx = 0
+    # Skip leading wrappers plus the flags / assignments that belong to them,
+    # then match the real command's basename.
+    while idx < len(tokens):
+        if os.path.basename(tokens[idx]) in _ENV_DUMP_WRAPPERS:
+            idx += 1
+            while idx < len(tokens) and (
+                tokens[idx].startswith("-") or "=" in tokens[idx]
+            ):
+                idx += 1
+            continue
+        break
+
+    if idx >= len(tokens):
+        return False
+
+    if os.path.basename(tokens[idx]) in _ENV_DUMP_COMMANDS:
+        return True
+
+    # An inline script payload (``bash -c '<script>'``) is itself a command
+    # string: re-parse it. This closes the whole nesting class structurally.
+    if depth < _MAX_NESTED_COMMAND_DEPTH:
+        for pos in range(idx, len(tokens) - 1):
+            if tokens[pos] in _INLINE_SCRIPT_FLAGS and _is_env_dump_command(
+                tokens[pos + 1], depth + 1
+            ):
+                return True
+
+    # Argument-taking wrappers (``timeout 5 env``, ``docker exec <c> env``,
+    # ``ssh <host> env``): the dump command appears after operands we cannot
+    # count generically. Only trust a later token when the segment STARTS with
+    # a known wrapper — otherwise ``grep env file`` or ``echo env`` would be
+    # misclassified as a dump.
+    if os.path.basename(tokens[idx]) in _ENV_DUMP_ARG_WRAPPERS:
+        for token in tokens[idx + 1:]:
+            if os.path.basename(token) in _ENV_DUMP_COMMANDS:
+                return True
+
+    return False
+
+
+def _is_env_dump_command(command: str | None, depth: int = 0) -> bool:
+    if not command or not isinstance(command, str):
+        return False
+    if depth > _MAX_NESTED_COMMAND_DEPTH:
+        return False
+    for tokens in _split_command_segments(command):
+        if _segment_is_env_dump(tokens, depth):
+            return True
+    return False
+
 
 def is_env_dump_command(command: str | None) -> bool:
     """Return True if ``command`` dumps environment variables to stdout.
@@ -907,39 +1021,99 @@ def is_env_dump_command(command: str | None) -> bool:
     / ``||`` / ``|``). The command is matched by its basename so a full path
     (``/usr/bin/env``) counts, and a leading wrapper such as ``sudo`` /
     ``command`` (with its own ``-flags`` and ``VAR=val`` assignments) is
-    skipped so ``sudo env`` / ``sudo -E printenv`` are recognised. Conservative:
-    a parse failure or anything unrecognized returns False (callers then fall
-    back to the safer code_file=True path, which still masks prefix-shaped
-    keys).
+    skipped so ``sudo env`` / ``sudo -E printenv`` are recognised.
+
+    Two further wrapper shapes are handled because they run the very same dump
+    while needing no privilege, so an allowlist of *command names* alone never
+    converges:
+
+    * an inline script payload (``bash -c 'env'``, ``sh -c 'printenv | sort'``)
+      is re-parsed recursively, which covers arbitrary nesting
+      (``bash -c "sh -c 'env'"``) rather than one spelling at a time;
+    * wrappers that take their own operands before the command
+      (``timeout 5 env``, ``docker exec <container> env``, ``ssh <host> env``)
+      are matched by scanning the segment, but only when the segment begins
+      with a known wrapper — so ``grep env file`` stays a non-dump.
+
+    Conservative: a parse failure or anything unrecognized returns False
+    (callers then fall back to the safer code_file=True path, which still masks
+    prefix-shaped keys).
     """
-    if not command or not isinstance(command, str):
+    return _is_env_dump_command(command, 0)
+
+
+# Detection by OUTPUT SHAPE, used as a second layer behind command detection.
+#
+# Command-name detection cannot be complete: an env dump can be produced by a
+# command whose name says nothing about it (``python3 -c 'print(os.environ)'``,
+# a shell function, a script). Rather than keep enumerating spellings, also
+# look at what the command actually PRINTED, and run the ENV pass when the
+# output has the unmistakable shape of a process environment.
+#
+# The gate is deliberately narrow because the failure mode is mangling
+# legitimate source/config output. Running the ENV pass on *all* terminal
+# output was measured against this repository's own tree and would alter 880
+# of 6894 source files (12.8%) — far too blunt. Requiring, in addition to a
+# near-pure ``KEY=value`` body, several variables that a real process
+# environment always has and a source file essentially never has, brought
+# false positives on the same corpus to zero.
+_ENV_DUMP_LINE_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*)=")
+
+# Variables present in essentially every real process environment. A source or
+# config file that happens to be pure ``KEY=value`` (a Makefile, a constants
+# module, a .properties file) does not carry a quorum of these.
+_ENV_DUMP_CANONICAL_VARS = frozenset({
+    "PATH", "HOME", "PWD", "SHELL", "SHLVL",
+    "USER", "LOGNAME", "HOSTNAME", "TERM", "OLDPWD",
+})
+
+# Thresholds. A dump narrowed by ``grep`` falls below these and is NOT matched
+# here — that case is carried by command detection above. This layer only adds
+# coverage; it never removes any.
+_ENV_DUMP_MIN_LINES = 8
+_ENV_DUMP_MIN_RATIO = 0.9
+_ENV_DUMP_MIN_CANONICAL = 3
+_ENV_DUMP_SCAN_LINES = 400
+
+
+def looks_like_env_dump_output(output: str | None) -> bool:
+    """Return True if ``output`` has the shape of a process environment dump.
+
+    Requires ALL of: enough lines to be a dump rather than an incidental
+    ``KEY=value`` pair, a near-pure ``KEY=value`` body, and a quorum of
+    variables that only a real environment carries.
+
+    Cost is bounded: a single pass over at most ``_ENV_DUMP_SCAN_LINES``
+    lines, and the pass exits early as soon as too many non-``KEY=value``
+    lines make the ratio unreachable — so ordinary prose/source output (the
+    overwhelmingly common case) is rejected after a handful of lines.
+    """
+    if not output or "=" not in output:
         return False
-    # Split on shell separators, then inspect the effective command of each
-    # segment.
-    segments = re.split(r"[|;&]+", command)
-    for seg in segments:
-        seg = seg.strip()
-        if not seg:
+
+    considered = matched = 0
+    canonical: set[str] = set()
+    for line in output.split("\n"):
+        if not line.strip():
             continue
-        try:
-            tokens = shlex.split(seg)
-        except ValueError:
-            tokens = seg.split()
-        # Skip leading wrapper commands plus the flags / assignments that
-        # belong to them, then match the real command's basename.
-        idx = 0
-        while idx < len(tokens):
-            if os.path.basename(tokens[idx]) in _ENV_DUMP_WRAPPERS:
-                idx += 1
-                while idx < len(tokens) and (
-                    tokens[idx].startswith("-") or "=" in tokens[idx]
-                ):
-                    idx += 1
-                continue
+        considered += 1
+        match = _ENV_DUMP_LINE_RE.match(line)
+        if match:
+            matched += 1
+            name = match.group(1)
+            if name in _ENV_DUMP_CANONICAL_VARS:
+                canonical.add(name)
+        elif considered - matched > considered * (1 - _ENV_DUMP_MIN_RATIO) + 1:
+            # Too many non-assignment lines for the ratio to recover.
+            return False
+        if considered >= _ENV_DUMP_SCAN_LINES:
             break
-        if idx < len(tokens) and os.path.basename(tokens[idx]) in _ENV_DUMP_COMMANDS:
-            return True
-    return False
+
+    if considered < _ENV_DUMP_MIN_LINES:
+        return False
+    if matched / considered < _ENV_DUMP_MIN_RATIO:
+        return False
+    return len(canonical) >= _ENV_DUMP_MIN_CANONICAL
 
 
 def redact_terminal_output(
@@ -949,11 +1123,15 @@ def redact_terminal_output(
 
     Single redaction policy for ALL terminal-output surfaces — foreground
     ``terminal`` results AND background ``process(action=poll/log/wait)``
-    output — so they can't diverge. Picks ``code_file`` based on whether
-    ``command`` is an environment dump:
+    output — so they can't diverge. Picks ``code_file`` based on whether the
+    result is an environment dump, checked two ways:
 
-    - env-dump command (``env``/``printenv``/``set``/``export``/``declare``)
-      → ``code_file=False`` so the ENV-assignment pass masks opaque tokens.
+    - the COMMAND is an env dump (``env``/``printenv``/``set``/``export``/
+      ``declare``, including behind wrappers and inline ``-c`` scripts)
+      → ``code_file=False`` so the ENV-assignment pass masks opaque tokens;
+    - or the OUTPUT has the unmistakable shape of a process environment, which
+      catches dumps from commands whose name reveals nothing
+      (``python3 -c '…os.environ…'``, a script, a shell function);
     - anything else (or unknown command) → ``code_file=True`` to avoid
       false positives on source/config dumps.
 
@@ -962,8 +1140,8 @@ def redact_terminal_output(
     """
     if not output:
         return output
-    code_file = not is_env_dump_command(command or "")
-    return redact_sensitive_text(output, force=force, code_file=code_file)
+    is_dump = is_env_dump_command(command or "") or looks_like_env_dump_output(output)
+    return redact_sensitive_text(output, force=force, code_file=not is_dump)
 
 
 # Substrings used to gate ``_PREFIX_RE`` execution. If none of these appear in

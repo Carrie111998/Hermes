@@ -732,6 +732,146 @@ class TestTerminalOutputRedaction:
         assert "abc123randomopaquetokenvalue999" not in red
         assert "HOME=/home/u" in red
 
+    # --- Shell -c / argument-taking wrappers, and output-shape detection ---
+    #
+    # These assert the CONTRACT (a dump behind a wrapper is classified and
+    # masked like the bare dump; legitimate source output is left alone), not
+    # any particular list contents or message text.
+
+    OPAQUE_SECRET = "a9Xk2Lp7Qz4Rt8Vw1Nb6Mc3Ye5Uh0Ji"
+
+    def _env_dump_output(self, extra: str = "") -> str:
+        """A realistic `env` dump: canonical vars plus an opaque-named secret."""
+        return (
+            "PATH=/usr/local/bin:/usr/bin:/bin\n"
+            "HOME=/home/agent\n"
+            "PWD=/home/agent/project\n"
+            "SHELL=/bin/bash\n"
+            "SHLVL=1\n"
+            "USER=agent\n"
+            "LOGNAME=agent\n"
+            "TERM=xterm-256color\n"
+            "LANG=en_US.UTF-8\n"
+            f"DEPLOY_SESSION_TOKEN={self.OPAQUE_SECRET}\n"
+            + extra
+        )
+
+    def test_env_dump_behind_inline_shell_script_is_detected(self):
+        """`bash -c 'env'` runs the same dump as `env` and needs no privilege,
+        so it must classify the same way. Nesting is handled by re-parsing the
+        payload, so a doubly-wrapped form must hold too."""
+        from agent.redact import is_env_dump_command
+        assert is_env_dump_command("bash -c env")
+        assert is_env_dump_command("bash -c 'printenv'")
+        assert is_env_dump_command("sh -c env")
+        assert is_env_dump_command("bash -c 'env | grep TOKEN'")
+        assert is_env_dump_command("bash -c \"sh -c 'env'\"")
+
+    def test_env_dump_behind_argument_taking_wrapper_is_detected(self):
+        """Wrappers that take their own operands before the command still run
+        the dump, so they classify as dumps."""
+        from agent.redact import is_env_dump_command
+        assert is_env_dump_command("timeout 5 env")
+        assert is_env_dump_command("chroot / env")
+        assert is_env_dump_command("docker exec somecontainer env")
+        assert is_env_dump_command("ssh somehost printenv")
+
+    def test_non_dump_commands_are_not_reclassified(self):
+        """The wrapper handling must not turn ordinary commands into dumps —
+        a false positive here mangles legitimate output."""
+        from agent.redact import is_env_dump_command
+        assert not is_env_dump_command("bash -c 'ls -la'")
+        assert not is_env_dump_command("bash -c 'python app.py'")
+        assert not is_env_dump_command("docker exec somecontainer ls")
+        assert not is_env_dump_command("grep -r env .")
+        assert not is_env_dump_command("echo env")
+        assert not is_env_dump_command("python3 train.py --env prod")
+        assert not is_env_dump_command("cat settings.py")
+
+    def test_shell_c_dump_masks_opaque_token_end_to_end(self):
+        """The behavior that matters: an opaque-named secret dumped via
+        `bash -c` is masked exactly as it is for bare `env`, while an ordinary
+        variable survives."""
+        from agent.redact import redact_terminal_output
+        out = self._env_dump_output()
+        baseline = redact_terminal_output(out, "env", force=True)
+        wrapped = redact_terminal_output(out, "bash -c 'env'", force=True)
+        assert self.OPAQUE_SECRET not in baseline
+        assert self.OPAQUE_SECRET not in wrapped
+        assert "PATH=/usr/local/bin:/usr/bin:/bin" in wrapped
+
+    def test_grep_narrowed_shell_c_dump_is_masked(self):
+        """A dump narrowed by grep is too short for output-shape detection, so
+        this asserts command detection carries it on its own."""
+        from agent.redact import redact_terminal_output
+        out = f"DEPLOY_SESSION_TOKEN={self.OPAQUE_SECRET}"
+        red = redact_terminal_output(
+            out, "bash -c 'env | grep DEPLOY_SESSION_TOKEN'", force=True
+        )
+        assert self.OPAQUE_SECRET not in red
+
+    def test_env_dump_detected_from_output_shape_when_command_is_opaque(self):
+        """A dump can come from a command whose name says nothing about it.
+        Classification must then follow the output's shape."""
+        from agent.redact import looks_like_env_dump_output, redact_terminal_output
+        out = self._env_dump_output()
+        assert looks_like_env_dump_output(out)
+        red = redact_terminal_output(
+            out, "python3 -c 'import os;[print(f\"{k}={v}\") for k,v in os.environ.items()]'",
+            force=True,
+        )
+        assert self.OPAQUE_SECRET not in red
+
+    def test_source_output_is_not_treated_as_env_dump(self):
+        """The failure mode of output-shape detection is mangling legitimate
+        source/config output — these must NOT be classified as dumps."""
+        from agent.redact import looks_like_env_dump_output
+        python_constants = (
+            "MAX_TOKENS=100\n"
+            "DEFAULT_TIMEOUT=30\n"
+            "RETRY_COUNT=3\n"
+            "CACHE_TTL=600\n"
+            "BATCH_SIZE=8\n"
+            "SEED=42\n"
+            "TOP_P=0.9\n"
+            "TEMPERATURE=0.7\n"
+            "STREAM=True\n"
+        )
+        makefile = (
+            "CC=gcc\nCFLAGS=-O2\nLDFLAGS=-lm\nPREFIX=/usr/local\n"
+            "TARGET=app\nSRC=main.c\nOBJ=main.o\nBUILD=./build\nVERBOSE=1\n"
+        )
+        json_fixture = '{\n  "apiKey": "test",\n  "endpoint": "https://api.example.com"\n}\n'
+        docs = "Connect with postgresql://{user}:{pass}@host:5432/db\nand set MAX_TOKENS=100.\n"
+        for sample in (python_constants, makefile, json_fixture, docs):
+            assert not looks_like_env_dump_output(sample)
+
+    def test_source_output_survives_redaction_unmangled(self):
+        """End-to-end counterpart: source/config output passes through the
+        real entry point unchanged."""
+        from agent.redact import redact_terminal_output
+        python_constants = (
+            "MAX_TOKENS=100\nDEFAULT_TIMEOUT=30\nRETRY_COUNT=3\n"
+            "CACHE_TTL=600\nBATCH_SIZE=8\nSEED=42\nTOP_P=0.9\n"
+        )
+        json_fixture = '{\n  "apiKey": "test",\n  "endpoint": "https://api.example.com"\n}\n'
+        template = 'DB = f"postgresql://{user}:{password}@{host}:5432/db"\n'
+        for sample, cmd in (
+            (python_constants, "cat constants.py"),
+            (json_fixture, "cat fixture.json"),
+            (template, "cat db.py"),
+        ):
+            assert redact_terminal_output(sample, cmd, force=True) == sample
+
+    def test_output_shape_detection_never_narrows_command_detection(self):
+        """Output-shape detection is additive: anything the command predicate
+        classifies as a dump stays a dump regardless of output."""
+        from agent.redact import is_env_dump_command, redact_terminal_output
+        out = f"DEPLOY_SESSION_TOKEN={self.OPAQUE_SECRET}"
+        for cmd in ("env", "printenv", "sudo env", "/usr/bin/env", "bash -c env"):
+            assert is_env_dump_command(cmd)
+            assert self.OPAQUE_SECRET not in redact_terminal_output(out, cmd, force=True)
+
 
     def test_disabled_passes_through(self, monkeypatch):
         from agent.redact import redact_terminal_output
