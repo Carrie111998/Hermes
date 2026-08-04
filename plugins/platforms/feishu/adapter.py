@@ -167,56 +167,6 @@ _MULTISPACE_RE = re.compile(r"[ \t]{2,}")
 _POST_CONTENT_INVALID_RE = re.compile(r"content format of the post type is incorrect", re.IGNORECASE)
 
 
-def _wrap_markdown_tables_in_code(content: str) -> str:
-    """Wrap markdown table segments in fenced code blocks.
-
-    Feishu card/post 'md' elements do not render markdown tables (table content
-    can appear blank). Tables render fine inside a fenced code block, so we
-    isolate contiguous table blocks (header row + separator + body rows) and
-    wrap each one with ``` fences, leaving surrounding prose untouched.
-    """
-    if "```" not in content and not _MARKDOWN_TABLE_RE.search(content):
-        return content
-    lines = content.splitlines()
-    out: list[str] = []
-    i = 0
-    n = len(lines)
-    in_fence = False
-    while i < n:
-        line = lines[i]
-        stripped = line.strip()
-        # Track existing fences so we never wrap inside one.
-        if _MARKDOWN_FENCE_OPEN_RE.match(stripped):
-            in_fence = True
-            out.append(line)
-            i += 1
-            continue
-        if in_fence:
-            out.append(line)
-            if _MARKDOWN_FENCE_CLOSE_RE.match(stripped):
-                in_fence = False
-            i += 1
-            continue
-        # A table block: separator row at i, preceded by header at i-1
-        # (already appended), followed by zero or more body rows.
-        if _MARKDOWN_TABLE_SEP_RE.match(stripped):
-            # header is out[-1]; re-emit header + separator + body inside fences
-            header = out.pop() if out else ""
-            block = [header, line]
-            j = i + 1
-            while j < n and lines[j].strip().startswith("|"):
-                block.append(lines[j])
-                j += 1
-            out.append("```")
-            out.extend(block)
-            out.append("```")
-            i = j
-            continue
-        out.append(line)
-        i += 1
-    return "\n".join(out)
-
-
 def _parse_markdown_tables(content: str) -> tuple[list[dict], list[str]]:
     """Split markdown content into (tables, prose_segments).
 
