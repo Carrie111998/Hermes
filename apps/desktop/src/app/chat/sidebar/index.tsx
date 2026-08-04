@@ -717,8 +717,8 @@ export function ChatSidebar({
   // backend now seeds each project folder as an (empty) repo, so the overlay
   // always has a lane to place a new in-project session into.
   const enteredProjectContent = useMemo(
-    () => (enteredProject ? overlayLiveLanes(enteredProject, agentSessions, removedSessionIds) : undefined),
-    [enteredProject, agentSessions, removedSessionIds]
+    () => (enteredProject ? overlayLiveLanes(enteredProject, agentSessions, removedSessionIds, projects) : undefined),
+    [enteredProject, agentSessions, removedSessionIds, projects]
   )
 
   const scopedRepoPaths = useMemo(

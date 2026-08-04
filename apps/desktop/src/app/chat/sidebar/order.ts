@@ -1,10 +1,14 @@
 /** New ids first, then ids still present in the persisted order. */
 export function reconcileFreshFirst(currentIds: string[], orderIds: string[]): string[] {
-  const current = new Set(currentIds)
-  const retained = orderIds.filter(id => current.has(id))
+  // IDs normally belong to one subtree, but sibling explicit projects can share
+  // a repo root. Persisting that repeated identity makes every later render
+  // repeat the same row, so normalize both the live input and legacy storage.
+  const current = [...new Set(currentIds)]
+  const currentSet = new Set(current)
+  const retained = [...new Set(orderIds)].filter(id => currentSet.has(id))
   const retainedSet = new Set(retained)
 
-  return [...currentIds.filter(id => !retainedSet.has(id)), ...retained]
+  return [...current.filter(id => !retainedSet.has(id)), ...retained]
 }
 
 export function resolveManualSessionOrderIds(currentIds: string[], orderIds: string[], manual: boolean): string[] {
@@ -35,7 +39,7 @@ export function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: 
   for (const id of orderIds) {
     const item = byId.get(id)
 
-    if (item) {
+    if (item && !seen.has(id)) {
       ordered.push(item)
       seen.add(id)
     }
@@ -58,7 +62,7 @@ export function reconcileOrderIds(currentIds: string[], orderIds: string[]): str
   }
 
   if (!orderIds.length) {
-    return currentIds
+    return [...new Set(currentIds)]
   }
 
   return reconcileFreshFirst(currentIds, orderIds)
