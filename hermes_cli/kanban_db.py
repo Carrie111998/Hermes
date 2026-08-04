@@ -3300,7 +3300,6 @@ def create_task(
                         "provider_override": provider_override,
                     },
                 )
-                _inherit_notify_subs(conn, task_id, parents, created_at=now)
                 if task_status == "blocked":
                     # ``initial_status='blocked'`` is advertised as a way to
                     # create rows that require human/operator action before any
@@ -3311,6 +3310,11 @@ def create_task(
                     # as an explicit ``kanban block`` call. Without this event,
                     # the next dispatcher tick can promote a parent-free
                     # create-time blocked task to ready and select it.
+                    #
+                    # Keep this before parent notification inheritance: inherited
+                    # parent-chat subscriptions start at the child's current
+                    # event cursor, and create-time block markers are not future
+                    # child events that should notify the parent after creation.
                     _append_event(
                         conn,
                         task_id,
@@ -3321,6 +3325,7 @@ def create_task(
                             "recurrences": 1,
                         },
                     )
+                _inherit_notify_subs(conn, task_id, parents, created_at=now)
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:

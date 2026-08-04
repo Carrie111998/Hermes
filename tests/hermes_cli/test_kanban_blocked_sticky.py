@@ -201,6 +201,73 @@ def test_create_time_blocked_task_is_sticky_and_not_claimable(kanban_home: Path)
         assert claimed_control.id == control_id
 
 
+def test_initial_blocked_child_inherits_parent_notify_after_block_marker(
+    kanban_home: Path,
+) -> None:
+    """Parent-chat subscriptions inherited by a create-time blocked child
+    must start after both the child ``created`` and child ``blocked`` markers.
+    Otherwise the inherited parent notifier will later replay the child's
+    create-time blocked marker as if it were a future child event."""
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="subscribed parent", assignee="default")
+        conn.execute(
+            """
+            INSERT INTO kanban_notify_subs (
+                task_id, platform, chat_id, thread_id, user_id,
+                notifier_profile, created_at, last_event_id
+            ) VALUES (?, 'discord', 'parent-chat', '', 'u1', 'notifier', 0, 0)
+            """,
+            (parent_id,),
+        )
+        conn.commit()
+
+        child_id = kb.create_task(
+            conn,
+            title="blocked child",
+            assignee="default",
+            parents=[parent_id],
+            initial_status="blocked",
+        )
+
+        rows = conn.execute(
+            """
+            SELECT id, kind
+              FROM task_events
+             WHERE task_id = ?
+             ORDER BY id
+            """,
+            (child_id,),
+        ).fetchall()
+        assert [row["kind"] for row in rows] == ["created", "blocked"]
+        blocked_event_id = next(row["id"] for row in rows if row["kind"] == "blocked")
+
+        sub = conn.execute(
+            """
+            SELECT last_event_id
+              FROM kanban_notify_subs
+             WHERE task_id = ?
+               AND platform = 'discord'
+               AND chat_id = 'parent-chat'
+               AND thread_id = ''
+            """,
+            (child_id,),
+        ).fetchone()
+        assert sub is not None
+        assert sub["last_event_id"] >= blocked_event_id
+
+        future_inherited_parent_events = conn.execute(
+            """
+            SELECT kind
+              FROM task_events
+             WHERE task_id = ?
+               AND id > ?
+             ORDER BY id
+            """,
+            (child_id, sub["last_event_id"]),
+        ).fetchall()
+        assert [row["kind"] for row in future_inherited_parent_events] == []
+
+
 def test_idempotent_initial_blocked_reuse_backfills_legacy_nonsticky_row(
     kanban_home: Path,
 ) -> None:
