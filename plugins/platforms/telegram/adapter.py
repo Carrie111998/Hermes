@@ -719,6 +719,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # as plain text, which is worse than degraded table/task-list rendering
         # for command snippets and mobile handoffs.
         self._rich_messages_enabled: bool = self._coerce_bool_extra("rich_messages", False)
+        # Optional operator override: route every eligible final response
+        # through sendRichMessage, not only messages containing rich-only
+        # constructs. Keep this separate from rich_messages so the existing
+        # opt-in behavior remains reversible and backwards-compatible.
+        self._rich_messages_all: bool = self._coerce_bool_extra("rich_messages_all", False)
         # Rich draft previews use a separate opt-in. Telegram macOS / Desktop
         # can leave Bot API 10.1 rich draft frames visually overlaid until the
         # chat is redrawn, while final rich messages remain useful.
@@ -1662,6 +1667,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not content:
             return False
+        if getattr(self, "_rich_messages_all", False):
+            return True
         if any(_TABLE_SEPARATOR_RE.match(line) for line in content.splitlines()):
             return True
         if re.search(r"(?m)^\s*[-*]\s+\[[ xX]\]\s+", content):

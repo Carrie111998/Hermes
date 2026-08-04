@@ -844,6 +844,43 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     else:
         chunks = [message]
 
+    # --- Telegram: use the native adapter for rich final delivery when the
+    # operator enabled rich_messages_all. The standalone sender historically
+    # bypassed TelegramAdapter and therefore reintroduced the 4096-char limit
+    # for hermes send/cron deliveries. Media keeps the legacy path because
+    # captions and attachment ordering have separate handling.
+    if (
+        platform == Platform.TELEGRAM
+        and not media_files
+        and not force_document
+        and _telegram_available
+        and bool(getattr(pconfig, "extra", {}).get("rich_messages_all"))
+    ):
+        bot = None
+        try:
+            from plugins.platforms.telegram.adapter import TelegramAdapter as _RichTelegramAdapter
+            adapter = _RichTelegramAdapter(pconfig)
+            from telegram import Bot
+            bot = Bot(pconfig.token)
+            await bot.initialize()
+            adapter._bot = bot
+            result = await adapter.send(
+                chat_id,
+                message,
+                metadata={"thread_id": thread_id, "notify": True},
+            )
+            if result.success:
+                return {"success": True, "message_id": result.message_id}
+            return {"success": False, "error": result.error or "Telegram rich delivery failed"}
+        except Exception as exc:
+            return {"success": False, "error": str(exc)}
+        finally:
+            if bot is not None:
+                try:
+                    await bot.shutdown()
+                except Exception:
+                    pass
+
     # --- Telegram: special handling for media attachments ---
     # _send_telegram now owns text chunking internally — it formats the full
     # message (MarkdownV2/HTML) and then splits the *formatted* text on UTF-16

@@ -139,6 +139,30 @@ async def test_plain_markdown_stays_on_legacy_path():
 
 
 @pytest.mark.asyncio
+async def test_rich_messages_all_routes_plain_markdown_through_rich_path():
+    """Operator opt-in can use the 32K rich path for ordinary final replies."""
+    adapter = _make_adapter({"rich_messages_all": True})
+
+    result = await adapter.send("12345", "Hello **there**\n\nA normal reply.")
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_rich_messages_all_keeps_plain_response_under_rich_limit_in_one_send():
+    """Plain content over 4K but under 32K is not legacy-chunked."""
+    adapter = _make_adapter({"rich_messages_all": True})
+
+    result = await adapter.send("12345", "a" * 10000)
+
+    assert result.success is True
+    adapter._bot.do_api_request.assert_awaited_once()
+    adapter._bot.send_message.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_expect_edits_metadata_keeps_preview_on_legacy_path():
     adapter = _make_adapter()
 
