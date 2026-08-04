@@ -2299,6 +2299,40 @@ class TestConversationParameter:
 
 
 # ---------------------------------------------------------------------------
+# _session_response field allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestSessionResponse:
+    """_session_response is the funnel for every session-shaped API payload."""
+
+    def test_session_response_exposes_cost_status_and_source(self):
+        """cost_status / cost_source are the discriminators that tell a known
+        cost from an unknown one; the client-safe view must include them."""
+        row = {
+            "id": "s1",
+            "model": "hermes-agent",
+            "estimated_cost_usd": 0.0,
+            "actual_cost_usd": None,
+            "cost_status": "unknown",
+            "cost_source": "none",
+        }
+        payload = APIServerAdapter._session_response(row)
+        assert payload["cost_status"] == "unknown"
+        assert payload["cost_source"] == "none"
+        # The numbers they qualify are still present.
+        assert payload["estimated_cost_usd"] == 0.0
+
+    def test_session_response_omits_cost_fields_when_absent_from_row(self):
+        """An older row without the columns simply omits them (the `if key in
+        session` guard), rather than emitting None — forward/backward compatible."""
+        row = {"id": "s1", "model": "hermes-agent", "estimated_cost_usd": 0.5}
+        payload = APIServerAdapter._session_response(row)
+        assert "cost_status" not in payload
+        assert "cost_source" not in payload
+
+
+# ---------------------------------------------------------------------------
 # X-Hermes-Session-Id header (session continuity)
 # ---------------------------------------------------------------------------
 
