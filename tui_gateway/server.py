@@ -6414,6 +6414,16 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
+    # OpenRouter-only. Nous Portal hard-rejects caller-supplied ``provider``
+    # routing prefs (HTTP 400). Never attach global provider_routing when the
+    # resolved runtime is not OpenRouter.
+    _runtime_provider = str(runtime.get("provider") or "").strip().lower()
+    _runtime_base = str(runtime.get("base_url") or "").strip().lower()
+    _is_openrouter = (
+        _runtime_provider == "openrouter" or "openrouter.ai" in _runtime_base
+    )
+    if not _is_openrouter:
+        _pr = {}
     return AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
@@ -6444,6 +6454,7 @@ def _make_agent(
         # OpenRouter provider-routing prefs (config.yaml `provider_routing`).
         # Mirrors the messaging gateway + CLI so the desktop/TUI honors the same
         # routing instead of letting OpenRouter pick providers at random.
+        # Gated above to OpenRouter only — never forward to Nous Portal.
         providers_allowed=_pr.get("only"),
         providers_ignored=_pr.get("ignore"),
         providers_order=_pr.get("order"),

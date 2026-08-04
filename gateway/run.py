@@ -4341,6 +4341,11 @@ class TurnRunner:
             }
 
         pr = self._runner._provider_routing
+        # OpenRouter-only — Nous Portal hard-rejects caller-supplied provider routing.
+        _prov = str(runtime_kwargs.get("provider") or "").strip().lower()
+        _base = str(runtime_kwargs.get("base_url") or "").strip().lower()
+        if not (_prov == "openrouter" or "openrouter.ai" in _base):
+            pr = {}
         reasoning_config = self._runner._resolve_session_reasoning_config(
             source=ctx.source,
             session_key=ctx.session_key,
@@ -19274,6 +19279,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            # OpenRouter-only — Nous Portal hard-rejects caller-supplied provider routing.
+            _tr = turn_route.get("runtime") or runtime_kwargs or {}
+            _prov = str(_tr.get("provider") or "").strip().lower()
+            _base = str(_tr.get("base_url") or "").strip().lower()
+            if not (_prov == "openrouter" or "openrouter.ai" in _base):
+                pr = {}
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
