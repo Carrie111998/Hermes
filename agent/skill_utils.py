@@ -830,7 +830,7 @@ def resolve_skill_config_values(
 
 # ── Description extraction ────────────────────────────────────────────────
 
-SKILL_PROMPT_DESC_LIMIT = 60
+SKILL_PROMPT_DESC_LIMIT = 240
 
 
 def _normalize_skill_description(frontmatter: Dict[str, Any]) -> str:
