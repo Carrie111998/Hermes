@@ -695,6 +695,59 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_existing_binary_path_does_not_trigger_remote_fallback(self, tmp_path):
+        """A command referencing an existing binary by absolute path must not
+        invoke the remote ``cat`` fallback.
+
+        Regression: ``_read_referenced_script`` returns None for NUL-skipped
+        binaries ("nothing to scan"), and that None used to be misread as
+        "path missing" — so with a ``read_remote_script`` supplied (as
+        terminal_tool always does), the guard `cat`-ed the whole binary via
+        the environment and recursively scanned machine code for minutes
+        before crashing with ``ValueError: embedded null byte``. The fallback
+        must only fire when the local path is genuinely absent.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        binary = tmp_path / "tool.bin"
+        binary.write_bytes(b"\x7fELF\x00\x01\x02\x03")  # NUL bytes -> binary
+        calls = []
+
+        def spy(path):
+            calls.append(path)
+            return None
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f"{binary} --version",
+            cwd=str(tmp_path),
+            read_remote_script=spy,
+        )
+        assert result is False
+        assert calls == []
+
+    def test_missing_path_still_uses_remote_fallback(self, tmp_path):
+        """A genuinely absent path still goes to the remote backend — the
+        fallback exists for SSH/Modal/Daytona backends where the same path is
+        remote, and must keep working."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        missing = tmp_path / "no-such-script.sh"
+        calls = []
+
+        def spy(path):
+            calls.append(path)
+            return None
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing),
+            cwd=str(tmp_path),
+            read_remote_script=spy,
+        )
+        assert result is False
+        assert calls == [str(missing)]
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

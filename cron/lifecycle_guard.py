@@ -321,12 +321,28 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        try:
+            script_text, unsafe = _read_referenced_script(script_path)
+        except (OSError, ValueError):
+            # A NUL-laden path tokenized from binary content must never
+            # crash the guard (mirrors the resolve() guard above).
+            script_text, unsafe = None, False
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
-            script_text = read_remote_script(str(script_path))
+            # Only fall back to the remote backend when the local path is
+            # genuinely absent. _read_referenced_script deliberately returns
+            # None for NUL-skipped binaries ("nothing to scan") — treating
+            # that as "missing" made the guard `cat` the entire binary
+            # through the remote fallback and recursively scan machine code
+            # for minutes before crashing with ValueError: embedded null
+            # byte (same family as #76762, via the env.execute path).
+            try:
+                _local_missing = not resolved.exists() or not resolved.is_file()
+            except (OSError, ValueError):
+                _local_missing = True
+            if _local_missing:
+                script_text = read_remote_script(str(script_path))
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's

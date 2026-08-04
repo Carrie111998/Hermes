@@ -2549,10 +2549,21 @@ def terminal_tool(
                 except Exception:
                     pass
                 # Remote / sandboxed backend: read via the environment's shell.
+                # Cap the size and skip binary output: a NUL byte in the first
+                # chunk means an ELF/Mach-O binary, not a shell script. Without
+                # this, a command referencing a large binary by path made the
+                # guard `cat` the whole file through this fallback and
+                # recursively scan machine code for minutes before crashing
+                # with ValueError: embedded null byte.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        _out = result.get("output", "")
+                        if len(_out) > 1024 * 1024:
+                            return None
+                        if "\x00" in _out[:4096]:
+                            return None
+                        return _out
                 except Exception:
                     pass
                 return None
