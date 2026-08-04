@@ -1,7 +1,6 @@
-# evaOS Agent 2026.7.20-es.10
+# evaOS Agent 2026.7.20-es.11
 
-- Resyncs evaOS Agent with current Hermes Desktop while keeping the Electric Sheep managed experience.
-- Adds possession-bound Electric Sheep sign-in and reliable remote OpenAI/Codex reauthentication.
-- Restores remote chat, profiles, voice, media, files, Git/projects, and plugin WebSocket behavior.
-- Fixes managed updater retry, handoff, identity, and signed-release verification.
-- Keeps Nous billing and promotional surfaces hidden while preserving normal remote providers, tools, plugins, themes, and preferences.
+- Restores **Check for Updates…** in the evaOS Agent app and Help menus.
+- Adds **Check now** to About and restores the **Updates** command-palette action.
+- Keeps managed remote installations on the signed Electric Sheep client update feed.
+- Preserves the managed sign-in, assignment, provider, chat, voice, plugin, and preference behavior from es.10.
