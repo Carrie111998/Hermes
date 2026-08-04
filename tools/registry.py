@@ -218,24 +218,60 @@ _CHECK_FN_TTL_SECONDS = 30.0
 # as a flake (last-good True is served) rather than a real outage. Kept short
 # so a genuinely-down backend is reflected within a couple of turns.
 _CHECK_FN_FAILURE_GRACE_SECONDS = 60.0
-_check_fn_cache: Dict[tuple[Callable, str], tuple[float, bool]] = {}
+_CHECK_FN_CACHE_MAX = 512
+_check_fn_cache: Dict[tuple[Callable, Optional[str]], tuple[float, bool]] = {}
 # Monotonic timestamp of the most recent True result per check_fn.
-_check_fn_last_good: Dict[tuple[Callable, str], float] = {}
+_check_fn_last_good: Dict[tuple[Callable, Optional[str]], float] = {}
 _check_fn_cache_lock = threading.Lock()
+CHECK_FN_CACHE_BYPASS = ""
 
 
-def _check_fn_context_key() -> str:
-    """Scope availability verdicts to the active profile when one is bound."""
+def _prune_check_fn_caches(now: float) -> None:
+    """Expire stale entries and cap profile-dimensional cache growth.
+
+    Caller must hold ``_check_fn_cache_lock``.
+    """
+    for key, (timestamp, _) in list(_check_fn_cache.items()):
+        if now - timestamp >= _CHECK_FN_TTL_SECONDS:
+            _check_fn_cache.pop(key, None)
+    for key, timestamp in list(_check_fn_last_good.items()):
+        if now - timestamp >= _CHECK_FN_FAILURE_GRACE_SECONDS:
+            _check_fn_last_good.pop(key, None)
+    while len(_check_fn_cache) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_cache.pop(next(iter(_check_fn_cache)))
+    while len(_check_fn_last_good) >= _CHECK_FN_CACHE_MAX:
+        _check_fn_last_good.pop(next(iter(_check_fn_last_good)))
+
+
+def check_fn_cache_scope() -> Optional[str]:
+    """Return the active profile key when availability is profile-scoped.
+
+    Single-profile processes intentionally keep the historical process-wide
+    cache unless an explicit secret scope is bound. A multiplex gateway
+    installs a Hermes-home override for every profile turn, so the canonical
+    profile key is the stable isolation boundary across repeated turns for
+    that profile.
+    """
     try:
-        from agent.secret_scope import current_secret_scope
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
 
-        if current_secret_scope() is not None:
+        multiplex_active = is_multiplex_active()
+        if not multiplex_active and current_secret_scope() is None:
+            return None
+        from hermes_constants import get_hermes_home_override
+
+        override = get_hermes_home_override()
+        if not override:
+            if multiplex_active:
+                return CHECK_FN_CACHE_BYPASS
             from hermes_constants import get_hermes_home
 
-            return str(get_hermes_home())
+            return str(Path(get_hermes_home()).expanduser().resolve())
+        return str(Path(override).expanduser().resolve())
     except Exception:
-        pass
-    return ""
+        # Fail closed: bypass both cache layers rather than aliasing requests
+        # whose multiplex profile identity could not be resolved.
+        return CHECK_FN_CACHE_BYPASS
 
 
 def _check_fn_cached(fn: Callable) -> bool:
@@ -248,8 +284,21 @@ def _check_fn_cached(fn: Callable) -> bool:
     contention, probe timeout) from silently stripping tools mid-session.
     """
     now = time.monotonic()
-    cache_key = (fn, _check_fn_context_key())
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        try:
+            return bool(fn())
+        except Exception:
+            logger.warning(
+                "check_fn %s raised while profile cache scope was unresolved; "
+                "dependent tools will be unavailable this turn",
+                getattr(fn, "__qualname__", fn),
+                exc_info=True,
+            )
+            return False
+    cache_key = (fn, scope)
     with _check_fn_cache_lock:
+        _prune_check_fn_caches(now)
         cached = _check_fn_cache.get(cache_key)
         if cached is not None:
             ts, value = cached
@@ -264,6 +313,7 @@ def _check_fn_cached(fn: Callable) -> bool:
         raised = True
 
     with _check_fn_cache_lock:
+        _prune_check_fn_caches(now)
         if value:
             _check_fn_last_good[cache_key] = now
             _check_fn_cache[cache_key] = (now, True)
@@ -300,6 +350,30 @@ def invalidate_check_fn_cache() -> None:
     with _check_fn_cache_lock:
         _check_fn_cache.clear()
         _check_fn_last_good.clear()
+
+
+def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
+    """Return the current cached verdict for *fn* if its TTL is still valid.
+
+    Unlike :func:`_check_fn_cached`, this NEVER executes the probe. It is for
+    read-only surfaces (e.g. dashboard status panels) that need the last-known
+    availability without triggering network / auth / SDK work inside a request
+    path. Returns ``None`` when there is no fresh cached verdict.
+    """
+    now = time.monotonic()
+    scope = check_fn_cache_scope()
+    if scope == CHECK_FN_CACHE_BYPASS:
+        # Unresolved profile identity bypasses the cache entirely; there is no
+        # trustworthy cached verdict to report.
+        return None
+    with _check_fn_cache_lock:
+        cached = _check_fn_cache.get((fn, scope))
+        if cached is None:
+            return None
+        ts, value = cached
+        if now - ts < _CHECK_FN_TTL_SECONDS:
+            return value
+        return None
 
 
 class ToolRegistry:
