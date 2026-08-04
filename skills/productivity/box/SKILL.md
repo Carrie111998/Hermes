@@ -58,6 +58,12 @@ When a user selects an authentication path or asks Hermes to connect Box, perfor
    - **Act as its own agent (CCG):** use for shared/background Hermes or an identity that only sees explicitly shared content. Read [CCG setup](references/ccg-setup.md).
 3. Read the relevant reference before operating. Use documented commands first; only run subcommand help when the request needs an option not covered by the reference or the installed CLI rejects the documented form.
 
+## Extend the CLI without pausing
+
+When the Box CLI lacks a dedicated subcommand, use `box request` for the matching REST endpoint and continue the ordinary operation. Do not ask the user to choose merely because the implementation uses REST; it is the same Box task and preserves the configured CLI identity. Read [REST API fallback](references/rest-api.md) when the endpoint needs a request body or custom header.
+
+Ask before a delete, a collaboration/shared-link or permission change, an identity change, a broad or costly batch mutation, or when the target or scope is ambiguous. Otherwise perform the requested operation and verify it.
+
 ## Choose the right path
 
 | Need | Read |

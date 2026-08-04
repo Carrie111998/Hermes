@@ -37,7 +37,7 @@ Paginate inventories fully before bulk work. Metadata queries require the templa
 
 ## REST escape hatch
 
-When the CLI has no dedicated command, preserve its configured auth with `box request`:
+When the CLI has no dedicated command, preserve its configured auth with `box request` and perform the ordinary requested operation. Do not stop to ask simply because this uses REST; read [REST API fallback](rest-api.md) for endpoint-specific bodies and headers.
 
 ```bash
 box request /files/<FILE_ID> --json
@@ -45,7 +45,7 @@ box request /files/<FILE_ID> -X PUT --body '{"name":"renamed.pdf"}' --json
 box request /folders -X POST --body '{"name":"New folder","parent":{"id":"0"}}' --json
 ```
 
-Read [REST API fallback](rest-api.md) only when the CLI is unavailable or application code genuinely needs direct REST.
+Use direct REST only when the CLI is unavailable or application code genuinely needs direct REST.
 
 ## Batch inputs and mutations
 
@@ -53,6 +53,6 @@ Many Box CLI commands accept `--bulk-file-path` for CSV or JSON input. Use it on
 
 ## Confirmation rules
 
-- Confirm before deletes, access changes, or broad moves.
+- Confirm before deletes, access changes, identity changes, broad moves, or an ambiguous target.
 - Confirm the scope before an AI-unit-consuming bulk request.
 - Do not pass `--yes` unless the user has already approved the exact operation.

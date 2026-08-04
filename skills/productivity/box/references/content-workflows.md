@@ -25,6 +25,10 @@ box files:versions:download <FILE_ID> <VERSION_ID> --destination . --save-as old
 
 Download source bytes only when the task truly requires local editing or the user explicitly approves external analysis. Prefer a new version over replacing an unrelated file by name.
 
+## Create native Box Notes
+
+When the user asks for a Box Note, create a native note from Markdown through `box request`; do not substitute an uploaded text file named `.boxnote`. Read [REST API fallback](rest-api.md) for the exact request and verification command. Create it immediately when the destination is explicit or unambiguously the actor's root; otherwise ask which folder to use.
+
 ## Rename, tag, and move
 
 ```bash
