@@ -17459,11 +17459,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # prefill, empty-retry, fallback).  Sending the raw sentinel
             # looks like a bug; a short explanation is more helpful.
             if response == "(empty)" and not _intentional_silence:
-                response = (
-                    "⚠️ The model returned no response after processing tool "
-                    "results. This can happen with some models — try again or "
-                    "rephrase your question."
-                )
+                if _platform_name == "whatsapp":
+                    response = "Desculpa, tive um probleminha aqui. Pode repetir sua pergunta? 😊"
+                else:
+                    response = (
+                        "⚠️ The model returned no response after processing tool "
+                        "results. This can happen with some models — try again or "
+                        "rephrase your question."
+                    )
             agent_messages = agent_result.get("messages", [])
             _response_time = time.time() - _msg_start_time
             _api_calls = agent_result.get("api_calls", 0)

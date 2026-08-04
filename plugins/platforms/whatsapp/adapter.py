@@ -479,10 +479,10 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         # ``gateway.platforms.whatsapp.extra.text_batch_delay_seconds`` /
         # ``text_batch_split_delay_seconds``.
         self._text_batch_delay_seconds = self._coerce_float_extra(
-            "text_batch_delay_seconds", 5.0
+            "text_batch_delay_seconds", 35.0
         )
         self._text_batch_split_delay_seconds = self._coerce_float_extra(
-            "text_batch_split_delay_seconds", 10.0
+            "text_batch_split_delay_seconds", 40.0
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
@@ -979,8 +979,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 continuation_message_ids=tuple(sent_message_ids[:-1]),
                 raw_response={"message_ids": sent_message_ids},
             )
+        except asyncio.TimeoutError:
+            # asyncio.TimeoutError stringifies to "" which bypasses _is_timeout_error()
+            # and wrongly triggers plain-text fallback, causing duplicate messages.
+            return SendResult(success=False, error="bridge-timed-out: HTTP call exceeded 30s — message may have already been delivered")
         except Exception as e:
-            return SendResult(success=False, error=str(e))
+            return SendResult(success=False, error=str(e) or repr(e))
 
     async def edit_message(
         self,
@@ -1341,6 +1345,15 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
+                                    # Se há texto pendente no batch para esta sessão, funde com a mídia
+                                    # para que texto + mídia gerem UMA ÚNICA resposta da Sofia.
+                                    key = self._text_batch_key(event)
+                                    prior_task = self._pending_text_batch_tasks.pop(key, None)
+                                    if prior_task and not prior_task.done():
+                                        prior_task.cancel()
+                                    pending_text = self._pending_text_batches.pop(key, None)
+                                    if pending_text and pending_text.text:
+                                        event.text = f"{pending_text.text}\n{event.text}" if event.text else pending_text.text
                                     await self.handle_message(event)
             except asyncio.CancelledError:
                 break

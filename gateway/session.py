@@ -2632,6 +2632,16 @@ class SessionStore:
                 )
             except Exception as e:
                 print(f"[gateway] Warning: Failed to create SQLite session: {e}")
+        elif self._db and entry and not db_create_kwargs and session_key and source:
+            # Existing session loaded from routing index — ensure session_key is
+            # written to state.db in case it was missing (e.g. sessions.json
+            # imported at startup before state.db was populated).
+            self._record_gateway_session_peer(
+                entry.session_id,
+                session_key,
+                source,
+                display_name=entry.display_name,
+            )
 
         return entry
 
