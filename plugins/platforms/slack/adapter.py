@@ -1024,6 +1024,7 @@ class SlackAdapter(BasePlatformAdapter):
         self._socket_watchdog_task: Optional[asyncio.Task] = None
         self._socket_reconnect_lock = asyncio.Lock()
         self._socket_watchdog_interval_s = 15.0
+        self._socket_mode_generation = 0
         # Monotonic timestamp of the most recent Socket Mode handler (re)start,
         # used to grant a grace window for the first ping/pong after connect.
         self._socket_handler_started_monotonic: Optional[float] = None
@@ -1174,6 +1175,7 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app or not self._app_token:
             raise RuntimeError("Socket Mode requires an initialized app and app token")
 
+        self._socket_mode_generation += 1
         self._handler = AsyncSocketModeHandler(
             self._app, self._app_token, proxy=self._proxy_url
         )
@@ -1273,13 +1275,31 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         return (time.time() - last) > (ping_interval * self._socket_ping_stale_factor)
 
-    async def _restart_socket_mode(self, reason: str) -> None:
+    async def _restart_socket_mode(
+        self,
+        reason: str,
+        *,
+        expected_task: Optional[asyncio.Task] = None,
+        expected_generation: Optional[int] = None,
+    ) -> None:
         """Reconnect Socket Mode without rebuilding adapter state."""
         if not self._running:
             return
 
         async with self._socket_reconnect_lock:
             if not self._running or not self._app or not self._app_token:
+                return
+
+            if (
+                expected_task is not None and expected_task is not self._socket_mode_task
+            ) or (
+                expected_generation is not None
+                and expected_generation != self._socket_mode_generation
+            ):
+                logger.info(
+                    "[Slack] Dropping stale Socket Mode reconnect request (%s)",
+                    reason,
+                )
                 return
 
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
@@ -1306,22 +1326,35 @@ class SlackAdapter(BasePlatformAdapter):
                     break
 
                 task = self._socket_mode_task
+                generation = self._socket_mode_generation
                 if task is None:
                     await self._restart_socket_mode("socket task missing")
                     continue
 
                 if task.done():
-                    await self._restart_socket_mode("socket task stopped")
+                    await self._restart_socket_mode(
+                        "socket task stopped",
+                        expected_task=task,
+                        expected_generation=generation,
+                    )
                     continue
 
                 connected = await self._socket_transport_connected()
                 if connected is False:
-                    await self._restart_socket_mode("transport disconnected")
+                    await self._restart_socket_mode(
+                        "transport disconnected",
+                        expected_task=task,
+                        expected_generation=generation,
+                    )
                 elif self._socket_ping_pong_stale():
                     # is_connected() can lie when the aiohttp session is closed
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
-                    await self._restart_socket_mode("ping/pong stale")
+                    await self._restart_socket_mode(
+                        "ping/pong stale",
+                        expected_task=task,
+                        expected_generation=generation,
+                    )
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
@@ -1382,11 +1415,10 @@ class SlackAdapter(BasePlatformAdapter):
         else:
             logger.warning("[Slack] Socket Mode task exited unexpectedly")
 
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
-        loop.create_task(self._restart_socket_mode("socket task exited"))
+        logger.info(
+            "[Slack] Socket Mode watchdog will own reconnect for generation %s",
+            self._socket_mode_generation,
+        )
 
     def _describe_slack_api_error(
         self, response: Any, *, file_obj: Optional[Dict[str, Any]] = None
