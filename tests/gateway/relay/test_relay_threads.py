@@ -28,6 +28,7 @@ from gateway.relay.adapter import RelayAdapter
 from gateway.relay.command_manifest import build_relay_command_manifest
 from gateway.relay.descriptor import CONTRACT_VERSION, CapabilityDescriptor
 from gateway.relay.ws_transport import _event_from_wire
+from gateway.session import SessionSource
 
 from tests.gateway.relay.stub_connector import StubConnector
 
@@ -318,6 +319,44 @@ def _relay_channel_source():
         auto_thread_created=False,
         auto_thread_initial_name=None,
     )
+
+
+@pytest.mark.asyncio
+async def test_native_title_rename_does_not_receive_relay_only_kwargs():
+    """The shared semantic-title lane must respect the native adapter API.
+
+    Regression: relay guard/routing kwargs were passed unconditionally.  The
+    native Discord adapter rejected them with TypeError, which the best-effort
+    rename lane swallowed, leaving every native thread at its raw placeholder.
+    """
+    class NativeAdapter:
+        def __init__(self):
+            self.renames = []
+
+        async def rename_thread(
+            self, thread_id, name, *, only_if_current_name=None
+        ):
+            self.renames.append((thread_id, name, only_if_current_name))
+            return True
+
+    adapter = NativeAdapter()
+    runner = _mk_runner_stub()(adapter)
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="th-native",
+        chat_type="thread",
+        thread_id="th-native",
+        auto_thread_created=True,
+        auto_thread_initial_name="raw user prompt",
+    )
+
+    await runner._rename_discord_auto_thread_for_session_title(
+        source, "sess-native", "Semantic Native Title"
+    )
+
+    assert adapter.renames == [
+        ("th-native", "Semantic Native Title", "raw user prompt")
+    ]
 
 
 def test_relay_channel_lane_shape_gate():

@@ -20282,13 +20282,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             thread_name,
         )
         try:
-            renamed = await rename_thread(
-                target_thread_id,
-                thread_name,
-                prefer_connector_created=use_connector_guard,
-                only_if_current_name=guard_name,
-                parent_chat_id=parent_chat_id,
-            )
+            if use_connector_guard:
+                # RelayAdapter owns these connector-specific guard/routing
+                # arguments.  Do not leak them into native platform adapters:
+                # DiscordAdapter.rename_thread intentionally accepts only the
+                # current-name guard, and a shared superset call raises before
+                # the Discord API is ever reached.
+                renamed = await rename_thread(
+                    target_thread_id,
+                    thread_name,
+                    prefer_connector_created=True,
+                    parent_chat_id=parent_chat_id,
+                )
+            else:
+                renamed = await rename_thread(
+                    target_thread_id,
+                    thread_name,
+                    only_if_current_name=guard_name,
+                )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
                 target_thread_id,
