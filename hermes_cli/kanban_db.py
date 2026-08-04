@@ -1145,6 +1145,43 @@ class Run:
 
 
 @dataclass
+class DelegateRun:
+    """Bounded durable record of a delegate execution owned by a task.
+
+    Transcripts, reasoning, tool logs, and temporary file contents are
+    deliberately excluded. Large evidence remains in referenced artifacts.
+    """
+
+    id: int
+    task_id: str
+    delegate_id: str
+    goal: str
+    role: str
+    route: Optional[str]
+    model: Optional[str]
+    status: str
+    attempt: int
+    max_attempts: int
+    created_at: int
+    started_at: Optional[int]
+    ended_at: Optional[int]
+    summary: Optional[str]
+    artifact_path: Optional[str]
+    commit_sha: Optional[str]
+    verification: Optional[str]
+    error: Optional[str]
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "DelegateRun":
+        return cls(
+            **{
+                field_name: row[field_name]
+                for field_name in cls.__dataclass_fields__
+            }
+        )
+
+
+@dataclass
 class Comment:
     id: int
     task_id: str
@@ -1329,6 +1366,30 @@ CREATE TABLE IF NOT EXISTS task_runs (
     error               TEXT
 );
 
+-- Durable child-execution metadata for delegate_task calls made by a Kanban
+-- worker. Intentionally no transcript/log/reasoning/blob columns.
+CREATE TABLE IF NOT EXISTS delegate_runs (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id        TEXT NOT NULL,
+    delegate_id    TEXT NOT NULL,
+    goal           TEXT NOT NULL,
+    role           TEXT NOT NULL DEFAULT 'leaf',
+    route          TEXT,
+    model          TEXT,
+    status         TEXT NOT NULL DEFAULT 'queued',
+    attempt        INTEGER NOT NULL DEFAULT 1,
+    max_attempts   INTEGER NOT NULL DEFAULT 1,
+    created_at     INTEGER NOT NULL,
+    started_at     INTEGER,
+    ended_at       INTEGER,
+    summary        TEXT,
+    artifact_path  TEXT,
+    commit_sha     TEXT,
+    verification   TEXT,
+    error          TEXT,
+    UNIQUE(task_id, delegate_id, attempt)
+);
+
 -- Files attached to a task (PDFs, images, source documents). The blob
 -- lives on disk under ``attachments_root(board)/<task_id>/<stored_name>``;
 -- this row carries metadata + the absolute ``stored_path`` so the
@@ -1372,6 +1433,8 @@ CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, c
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
+CREATE INDEX IF NOT EXISTS idx_delegate_runs_task    ON delegate_runs(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_delegate_runs_status  ON delegate_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
 """
@@ -10280,3 +10343,103 @@ def latest_summaries(
         ids,
     ).fetchall()
     return {r["task_id"]: r["summary"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# Delegate runs (bounded child execution metadata)
+# ---------------------------------------------------------------------------
+
+_DELEGATE_TERMINAL_STATUSES = {"done", "failed", "cancelled", "timed_out"}
+_DELEGATE_STATUSES = {"queued", "running", *_DELEGATE_TERMINAL_STATUSES}
+
+
+def get_delegate_run(conn: sqlite3.Connection, run_id: int) -> Optional[DelegateRun]:
+    row = conn.execute("SELECT * FROM delegate_runs WHERE id = ?", (int(run_id),)).fetchone()
+    return DelegateRun.from_row(row) if row else None
+
+
+def list_delegate_runs(conn: sqlite3.Connection, task_id: str) -> list[DelegateRun]:
+    rows = conn.execute(
+        "SELECT * FROM delegate_runs WHERE task_id = ? ORDER BY created_at, id",
+        (task_id,),
+    ).fetchall()
+    return [DelegateRun.from_row(row) for row in rows]
+
+
+def create_delegate_run(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    delegate_id: str,
+    goal: str,
+    role: str = "leaf",
+    route: Optional[str] = None,
+    model: Optional[str] = None,
+    max_attempts: int = 1,
+    artifact_path: Optional[str] = None,
+    attempt: int = 1,
+) -> DelegateRun:
+    if conn.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone() is None:
+        raise ValueError(f"parent task {task_id!r} does not exist")
+    max_attempts = max(1, int(max_attempts))
+    attempt = max(1, int(attempt))
+    if attempt > max_attempts:
+        raise ValueError("delegate run attempt exceeds attempt limit")
+    now = int(time.time())
+    cur = conn.execute(
+        """INSERT INTO delegate_runs
+           (task_id, delegate_id, goal, role, route, model, status, attempt,
+            max_attempts, created_at, artifact_path)
+           VALUES (?, ?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)""",
+        (task_id, delegate_id, goal, role, route, model, attempt, max_attempts, now, artifact_path),
+    )
+    conn.commit()
+    if cur.lastrowid is None:
+        raise RuntimeError("delegate run insert did not return an id")
+    run = get_delegate_run(conn, cur.lastrowid)
+    assert run is not None
+    return run
+
+
+def start_delegate_run(conn: sqlite3.Connection, run_id: int) -> DelegateRun:
+    now = int(time.time())
+    cur = conn.execute(
+        "UPDATE delegate_runs SET status = 'running', started_at = ? WHERE id = ? AND status = 'queued'",
+        (now, int(run_id)),
+    )
+    if cur.rowcount != 1:
+        raise ValueError("delegate run must be queued before start")
+    conn.commit()
+    run = get_delegate_run(conn, run_id)
+    assert run is not None
+    return run
+
+
+def finish_delegate_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    status: str,
+    summary: Optional[str] = None,
+    artifact_path: Optional[str] = None,
+    commit_sha: Optional[str] = None,
+    verification: Optional[str] = None,
+    error: Optional[str] = None,
+) -> DelegateRun:
+    if status not in _DELEGATE_TERMINAL_STATUSES:
+        raise ValueError(f"invalid terminal delegate status: {status}")
+    now = int(time.time())
+    cur = conn.execute(
+        """UPDATE delegate_runs
+              SET status = ?, ended_at = ?, summary = ?,
+                  artifact_path = COALESCE(?, artifact_path), commit_sha = ?,
+                  verification = ?, error = ?
+            WHERE id = ? AND status IN ('queued', 'running')""",
+        (status, now, summary, artifact_path, commit_sha, verification, error, int(run_id)),
+    )
+    if cur.rowcount != 1:
+        raise ValueError("delegate run is missing or already terminal")
+    conn.commit()
+    run = get_delegate_run(conn, run_id)
+    assert run is not None
+    return run

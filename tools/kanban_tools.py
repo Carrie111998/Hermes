@@ -510,6 +510,7 @@ def _handle_show(args: dict, **kw) -> str:
             comments = kb.list_comments(conn, tid)
             events = kb.list_events(conn, tid)
             runs = kb.list_runs(conn, tid)
+            delegate_runs = kb.list_delegate_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
 
@@ -553,6 +554,20 @@ def _handle_show(args: dict, **kw) -> str:
                     for e in events[-50:]   # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
+                "delegate_runs": [
+                    {
+                        "id": r.id, "delegate_id": r.delegate_id,
+                        "goal": r.goal, "role": r.role, "route": r.route,
+                        "model": r.model, "status": r.status,
+                        "attempt": r.attempt, "max_attempts": r.max_attempts,
+                        "summary": r.summary, "artifact_path": r.artifact_path,
+                        "commit_sha": r.commit_sha, "verification": r.verification,
+                        "error": r.error,
+                        "created_at": r.created_at, "started_at": r.started_at,
+                        "ended_at": r.ended_at,
+                    }
+                    for r in delegate_runs
+                ],
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
@@ -2194,6 +2209,8 @@ registry.register(
     check_fn=_check_kanban_orchestrator_mode,
     emoji="📋",
 )
+
+
 
 registry.register(
     name="kanban_complete",

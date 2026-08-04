@@ -2089,6 +2089,90 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _bounded_delegate_run_text(value: Any, max_chars: int) -> Optional[str]:
+    """Serialize one delegate-run metadata field into bounded SQLite text."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    elif isinstance(value, (dict, list, tuple)):
+        text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
+    else:
+        text = str(value)
+    return text[:max_chars] or None
+
+
+def _start_kanban_delegate_run(child, goal: str) -> Optional[int]:
+    """Create/start a durable delegate row when running under a Kanban card."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    delegate_id = getattr(child, "_subagent_id", None)
+    if not task_id or not isinstance(delegate_id, str) or not delegate_id:
+        return None
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            run = kb.create_delegate_run(
+                conn,
+                task_id=task_id,
+                delegate_id=delegate_id,
+                goal=goal,
+                role=str(getattr(child, "_delegate_role", "leaf") or "leaf"),
+                route=getattr(child, "_delegate_route", None),
+                model=(
+                    getattr(child, "model", None)
+                    if isinstance(getattr(child, "model", None), str)
+                    else None
+                ),
+                max_attempts=1,
+            )
+            return kb.start_delegate_run(conn, run.id).id
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("Could not persist Kanban delegate start", exc_info=True)
+        return None
+
+
+def _finish_kanban_delegate_run(run_id: Optional[int], entry: Dict[str, Any]) -> None:
+    """Best-effort terminal update containing only bounded result metadata."""
+    if run_id is None:
+        return
+    raw_status = str(entry.get("status") or "error")
+    status = {
+        "completed": "done",
+        "failed": "failed",
+        "error": "failed",
+        "timeout": "timed_out",
+        "interrupted": "cancelled",
+    }.get(raw_status, "failed")
+    try:
+        from hermes_cli import kanban_db as kb
+
+        conn = kb.connect()
+        try:
+            kb.finish_delegate_run(
+                conn,
+                run_id,
+                status=status,
+                summary=_bounded_delegate_run_text(entry.get("summary"), 4096),
+                artifact_path=_bounded_delegate_run_text(
+                    entry.get("artifact_path") or entry.get("diagnostic_path"), 2048
+                ),
+                commit_sha=_bounded_delegate_run_text(entry.get("commit_sha"), 256),
+                verification=_bounded_delegate_run_text(
+                    entry.get("verification"), 4096
+                ),
+                error=_bounded_delegate_run_text(entry.get("error"), 4096),
+            )
+        finally:
+            conn.close()
+    except Exception:
+        logger.warning("Could not persist Kanban delegate completion", exc_info=True)
+
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2234,6 +2318,12 @@ def _run_single_child(
     # hand us a MagicMock don't carry stable ids; skip registration then.
     _raw_sid = getattr(child, "_subagent_id", None)
     _subagent_id = _raw_sid if isinstance(_raw_sid, str) else None
+    _kanban_delegate_run_id = _start_kanban_delegate_run(child, goal)
+
+    def _completed_entry(entry: Dict[str, Any]) -> Dict[str, Any]:
+        _finish_kanban_delegate_run(_kanban_delegate_run_id, entry)
+        return entry
+
     if _subagent_id:
         if owner_session_id is None:
             try:
@@ -2473,7 +2563,7 @@ def _run_single_child(
                     " [steer did not land before the subagent stopped: "
                     f"{_late_pending_steer}]"
                 )
-            return _error_entry
+            return _completed_entry(_error_entry)
         finally:
             # Shut down executor without waiting — if the child thread
             # is stuck on blocking I/O, wait=True would hang forever.
@@ -2724,7 +2814,7 @@ def _run_single_child(
             except Exception as e:
                 logger.debug("Progress callback completion failed: %s", e)
 
-        return entry
+        return _completed_entry(entry)
 
     except Exception as exc:
         _late_pending_steer = (
@@ -2759,7 +2849,7 @@ def _run_single_child(
                 " [steer did not land before the subagent stopped: "
                 f"{_late_pending_steer}]"
             )
-        return _error_entry
+        return _completed_entry(_error_entry)
 
     finally:
         # Stop the heartbeat thread so it doesn't keep touching parent activity
