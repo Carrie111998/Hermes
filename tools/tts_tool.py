@@ -2792,10 +2792,14 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 #
 # The chain is ``[provider] + fallback``. With no ``fallback`` key the chain
 # has one entry and behaviour is byte-identical to a single-provider install.
-# Unknown names are skipped with a warning rather than failing the call,
-# mirroring how the LLM fallback chain treats unusable entries in
-# ``agent/chat_completion_helpers.py`` — a typo in a *fallback* entry should
-# not take down synthesis that the primary can still serve.
+#
+# An unknown fallback name is a CONFIG ERROR, not a skipped entry (#65752:
+# "Unknown names are a config error - they do not silently fall into the Edge
+# catch-all"). Skipping looks friendlier but hides the failure the user needs
+# to see: a typo'd ``elevnlabs`` would quietly leave the chain shorter than
+# written, so a primary outage falls through to the Edge default and the user
+# never learns their fallback was never wired. Failing loudly at resolve time
+# names the bad entry while the primary still works.
 
 
 def _is_known_tts_provider(name: str, tts_config: Dict[str, Any]) -> bool:
@@ -2815,14 +2819,22 @@ def _is_known_tts_provider(name: str, tts_config: Dict[str, Any]) -> bool:
         return False
 
 
+class TTSFallbackConfigError(ValueError):
+    """``tts.fallback`` names a provider that cannot be resolved."""
+
+
 def _resolve_provider_chain(provider: str, tts_config: Dict[str, Any]) -> List[str]:
     """Return the ordered provider chain: the primary, then ``tts.fallback``.
 
-    Entries are normalized like ``_get_provider()``, de-duplicated with order
-    preserved, and filtered to names that actually resolve. The primary is
-    always kept even if it looks unknown, so an unresolvable primary still
-    produces today's error from the dispatcher rather than a different one
-    from here.
+    Entries are normalized like ``_get_provider()`` and de-duplicated with
+    order preserved. An entry that resolves to no built-in, command, or plugin
+    provider raises :class:`TTSFallbackConfigError` naming it -- a typo must
+    not silently shorten the chain (#65752).
+
+    The primary is always kept even if it looks unknown, so an unresolvable
+    ``tts.provider`` still produces today's error from the dispatcher rather
+    than a different one from here; only ``fallback`` entries are validated,
+    because only they are new surface.
     """
     chain = [provider]
     raw = tts_config.get("fallback") if isinstance(tts_config, dict) else None
@@ -2830,6 +2842,7 @@ def _resolve_provider_chain(provider: str, tts_config: Dict[str, Any]) -> List[s
         raw = [raw]
     if not isinstance(raw, (list, tuple)):
         return chain
+    unknown: List[str] = []
     for entry in raw:
         if not isinstance(entry, str):
             continue
@@ -2837,12 +2850,17 @@ def _resolve_provider_chain(provider: str, tts_config: Dict[str, Any]) -> List[s
         if not name or name in chain:
             continue
         if not _is_known_tts_provider(name, tts_config):
-            logger.warning(
-                "TTS fallback entry %r is not a known built-in, command, or "
-                "plugin provider - skipping it.", name,
-            )
+            unknown.append(name)
             continue
         chain.append(name)
+    if unknown:
+        known = ", ".join(sorted(BUILTIN_TTS_PROVIDERS))
+        raise TTSFallbackConfigError(
+            f"tts.fallback names {len(unknown)} unknown provider(s): "
+            f"{', '.join(repr(u) for u in unknown)}. Each entry must be a "
+            f"built-in ({known}), a provider declared under tts.commands, or "
+            f"an installed TTS plugin."
+        )
     return chain
 
 
@@ -3256,7 +3274,12 @@ def text_to_speech_tool(
     else:
         provider = _get_provider(tts_config)
 
-    chain = _resolve_provider_chain(provider, tts_config)
+    try:
+        chain = _resolve_provider_chain(provider, tts_config)
+    except TTSFallbackConfigError as exc:
+        # Config error, not a synthesis failure: report it instead of falling
+        # through to the primary, or the user never learns the chain is wrong.
+        return tool_error(str(exc), success=False)
 
     attempts: List[Tuple[str, str]] = []
     last_result = ""
@@ -3397,10 +3420,16 @@ def check_tts_requirements() -> bool:
     provider = _get_provider(tts_config)
     # Any entry in the chain being usable means the tool can run, so the
     # schema stays exposed when the primary is dead but a fallback is alive.
-    return any(
-        _provider_is_available(name, tts_config)
-        for name in _resolve_provider_chain(provider, tts_config)
-    )
+    try:
+        chain = _resolve_provider_chain(provider, tts_config)
+    except TTSFallbackConfigError as exc:
+        # This runs from the tool registry, where raising would take down
+        # schema assembly for every tool. Fall back to the primary alone and
+        # log why -- text_to_speech_tool() reports the misconfiguration when
+        # the user actually calls it.
+        logger.warning("TTS fallback chain is misconfigured: %s", exc)
+        chain = [provider]
+    return any(_provider_is_available(name, tts_config) for name in chain)
 
 
 

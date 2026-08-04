@@ -177,9 +177,13 @@ unaffected.
 - **If every entry fails**, one aggregated error names each provider and why
   it failed. With no fallback configured the single provider's original error
   is returned unchanged.
-- **An unknown name in `fallback` is skipped with a warning** rather than
-  failing the call, so a typo in a fallback entry can't take down synthesis
-  the primary can still serve.
+- **An unknown name in `fallback` is a configuration error.** `text_to_speech`
+  reports it and does not synthesise, naming every unresolvable entry at once.
+  Skipping would look friendlier but hide the failure that matters: a typo'd
+  entry leaves the chain shorter than written, so a primary outage falls
+  through to the Edge default and you never learn the fallback was never
+  wired. `tts.provider` itself is not validated here — an unusable primary
+  still produces the dispatcher's existing error.
 
 Tool availability follows the chain too: the `text_to_speech` tool stays
 exposed when the primary is unavailable but any fallback entry is usable.

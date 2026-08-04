@@ -53,12 +53,67 @@ class TestChainResolution:
             "openai", "edge",
         ]
 
-    def test_unknown_entry_skipped_not_fatal(self, caplog):
-        """A typo in a *fallback* entry must not break a working primary."""
-        chain = tts_tool._resolve_provider_chain(
-            "edge", {"fallback": ["definitely-not-a-provider", "neutts"]},
+    def test_unknown_entry_is_a_config_error(self):
+        """#65752: "Unknown names are a config error".
+
+        Skipping looks friendlier but hides the failure the user needs to see:
+        a typo would leave the chain shorter than written, so a primary outage
+        falls through to the Edge default and the user never learns their
+        fallback was never wired.
+        """
+        with pytest.raises(tts_tool.TTSFallbackConfigError) as exc:
+            tts_tool._resolve_provider_chain(
+                "edge", {"fallback": ["definitely-not-a-provider", "neutts"]},
+            )
+        msg = str(exc.value)
+        # Only the bad entry is reported as unknown; `neutts` still appears
+        # later in the message as one of the valid built-ins to choose from.
+        unknown_part = msg.split("unknown provider(s):")[1].split(".")[0]
+        assert "definitely-not-a-provider" in unknown_part
+        assert "neutts" not in unknown_part
+        assert "tts.commands" in msg                   # says how to declare one
+
+    def test_every_unknown_entry_is_named_at_once(self):
+        """One pass, not one error per run — fix the whole config in one go."""
+        with pytest.raises(tts_tool.TTSFallbackConfigError) as exc:
+            tts_tool._resolve_provider_chain("edge", {"fallback": ["nope-one", "nope-two"]})
+        assert "nope-one" in str(exc.value) and "nope-two" in str(exc.value)
+
+    def test_the_tool_reports_it_instead_of_synthesising(self, monkeypatch):
+        """text_to_speech_tool must surface the config error, not fall through.
+
+        Falling through to a working primary is exactly how the broken chain
+        would stay invisible.
+        """
+        import json as _json
+
+        monkeypatch.setattr(
+            tts_tool, "_load_tts_config",
+            lambda: {"provider": "edge", "fallback": ["definitely-not-a-provider"]},
         )
-        assert chain == ["edge", "neutts"]
+        called = []
+        monkeypatch.setattr(
+            tts_tool, "_attempt_tts_provider",
+            lambda *a, **k: called.append(a) or "{}",
+        )
+
+        out = _json.loads(tts_tool.text_to_speech_tool("hello"))
+
+        assert out.get("success") is False
+        assert "definitely-not-a-provider" in out.get("error", "")
+        assert called == [], "synthesis ran despite a misconfigured chain"
+
+    def test_the_registry_probe_does_not_raise_on_a_bad_chain(self, monkeypatch):
+        """check_tts_requirements runs during schema assembly for every tool."""
+        monkeypatch.setattr(
+            tts_tool, "_load_tts_config",
+            lambda: {"provider": "edge", "fallback": ["definitely-not-a-provider"]},
+        )
+        monkeypatch.setattr(tts_tool, "_provider_is_available", lambda n, c: n == "edge")
+
+        assert tts_tool.check_tts_requirements() is True, (
+            "a typo'd fallback entry took the whole tool schema down"
+        )
 
     def test_unknown_primary_is_kept_for_the_dispatcher_to_report(self):
         chain = tts_tool._resolve_provider_chain("definitely-not-a-provider", {})
