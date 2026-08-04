@@ -695,6 +695,60 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_nul_byte_path_does_not_crash_read_referenced_script(self):
+        """#77780: _read_referenced_script must never crash on a path with
+        an embedded NUL byte.
+
+        Before the fix, os.open() raised ValueError (not OSError) on a
+        NUL-bearing path and the except-OSError guard missed it, crashing
+        every terminal command routed through the lifecycle guard.
+        """
+        from pathlib import Path
+        from cron.lifecycle_guard import _read_referenced_script
+        text, unsafe = _read_referenced_script(Path("/tmp/\x00evil.sh"))
+        assert text is None
+        assert unsafe is False
+
+    def test_nul_byte_executable_path_does_not_crash_guard(self):
+        """#77780: a command whose executable path contains an embedded NUL
+        byte must not crash the guard.
+
+        The NUL can originate from binary output piped into a command,
+        heredoc content, or decoded binary from a remote backend — any path
+        the tokenizer yields reaches _read_referenced_script via os.open.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/\x00evil.sh arg"
+        )
+        assert result is False
+
+    def test_nul_byte_in_shell_payload_does_not_crash_guard(self):
+        """#77780: a NUL byte inside a ``sh -c`` payload that resolves to a
+        path must not crash the guard during recursive payload scanning."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            'sh -c "/\x00evil.sh"'
+        )
+        assert result is False
+
+    def test_remote_read_nul_path_in_content_does_not_crash_guard(self):
+        """#77703: when the remote-read fallback returns decoded content
+        whose tokenized executable path contains a NUL byte, the guard must
+        skip it instead of crashing."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash missing.sh",
+            read_remote_script=lambda _p: "/\x00evil.sh",
+        )
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

@@ -258,7 +258,12 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/missing/over-long path.
+        # ValueError: embedded NUL byte in the path string itself — a
+        # token shlex-splits out of binary output, heredoc content, or
+        # decoded remote-read bytes (#77780). A guarded read must never
+        # crash the guard; a NUL-bearing path can never be a real file.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -313,10 +318,16 @@ def _contains_unsafe_gateway_action(
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
-        except (OSError, ValueError):
-            # OSError: unreadable/long paths. ValueError: embedded NUL byte
-            # from a binary's decoded contents tokenized as a path — a
-            # guarded path must never crash the guard (#76762).
+        except ValueError:
+            # Embedded NUL byte in the path string itself — a token from
+            # binary output, heredoc content, or decoded remote-read bytes
+            # (#77780, #77703). A NUL-bearing path can never resolve to a
+            # real file, so skip it entirely instead of passing it to the
+            # reader (which would waste an os.open) or the remote backend.
+            continue
+        except OSError:
+            # Unreadable / over-long path — fall back to the unresolved
+            # path so the bounded reader still gets a chance.
             resolved = script_path
         if resolved in visited:
             continue
