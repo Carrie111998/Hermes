@@ -182,7 +182,7 @@ desconexão de rede comum de plataforma como falha de event loop.
 |---------|-------------|
 | `/new` or `/reset` | Iniciar uma conversa nova |
 | `/model [provider:model]` | Mostrar ou alterar o modelo (suporta sintaxe `provider:model`) |
-| `/personality [name]` | Definir uma personalidade |
+| `/personality [name]` | Definir uma personalidade (`none` para resetar) |
 | `/retry` | Tentar novamente a última mensagem |
 | `/undo` | Remover a última troca |
 | `/status` | Mostrar informações da sessão |

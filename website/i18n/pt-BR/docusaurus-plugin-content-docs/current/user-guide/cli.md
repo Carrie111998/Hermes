@@ -203,6 +203,8 @@ Defina uma personalidade predefinida para mudar o tom do agente:
 
 Personalidades integradas incluem: `helpful`, `concise`, `technical`, `creative`, `teacher`, `kawaii`, `catgirl`, `pirate`, `shakespeare`, `surfer`, `noir`, `uwu`, `philosopher`, `hype`.
 
+Para voltar ao padrão (sem overlay), use `/personality none` — `default` e `neutral` também funcionam.
+
 Você também pode definir personalidades personalizadas em `~/.hermes/config.yaml`:
 
 ```yaml

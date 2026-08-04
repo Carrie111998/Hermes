@@ -227,6 +227,18 @@ Depois alterne com:
 /personality codereviewer
 ```
 
+## Resetando para o padrão {#resetting-to-the-default}
+
+Para cancelar o overlay de personalidade ativo e voltar ao comportamento base (sua persona do `SOUL.md`), use qualquer um destes:
+
+```text
+/personality none
+/personality default
+/personality neutral
+```
+
+Os três limpam o overlay: o `agent.system_prompt` salvo é esvaziado e a mudança vale na próxima mensagem. Rodar `/personality` sem argumentos também lista `none` junto com os presets disponíveis.
+
 ## Fluxo de trabalho recomendado {#recommended-workflow}
 
 Uma configuração padrão sólida é:
