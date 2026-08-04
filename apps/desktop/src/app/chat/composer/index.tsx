@@ -32,6 +32,7 @@ import {
 import { ContextMenu } from './context-menu'
 import { COMPOSER_AREAS, runComposerMiddleware } from './contrib'
 import { ComposerControls } from './controls'
+import { ComposerDirectiveActions } from './directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from './drop-affordance'
 import { markActiveComposer } from './focus'
 import { HelpHint } from './help-hint'
@@ -57,6 +58,7 @@ import { ActionBadges } from './micro-actions'
 import { chipTypedPathOnSpace, pathifyRefs } from './path-refs'
 import { QueuePanel } from './queue-panel'
 import {
+  beginComposerComposition,
   composerPlainText,
   deleteChipBeforeCaret,
   deleteSelectionInEditor,
@@ -67,7 +69,7 @@ import {
 import { useComposerScope } from './scope'
 import { ComposerStatusStack } from './status-stack'
 import { CodingStatusRow } from './status-stack/coding-row'
-import { extractClipboardImageBlobs } from './text-utils'
+import { extractClipboardImageBlobs, openDirectiveScope } from './text-utils'
 import { ComposerTriggerPopover } from './trigger-popover'
 import type { ChatBarProps } from './types'
 import { isRedoShortcut, isUndoShortcut } from './undo-history'
@@ -444,18 +446,12 @@ export function ChatBar({
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
     const imageBlobs = extractClipboardImageBlobs(event.clipboardData)
 
-    if (imageBlobs.length > 0) {
-      event.preventDefault()
+    if (imageBlobs.length > 0 && onAttachImageBlob) {
+      triggerHaptic('selection')
 
-      if (onAttachImageBlob) {
-        triggerHaptic('selection')
-
-        for (const blob of imageBlobs) {
-          void onAttachImageBlob(blob)
-        }
+      for (const blob of imageBlobs) {
+        void onAttachImageBlob(blob)
       }
-
-      return
     }
 
     // Trim surrounding whitespace so a copy that dragged along leading/trailing
@@ -466,6 +462,10 @@ export function ChatBar({
 
     if (!pastedText) {
       event.preventDefault()
+
+      if (imageBlobs.length > 0) {
+        return
+      }
 
       // Under WSL2/WSLg the Windows host clipboard doesn't bridge *images* to
       // the Linux clipboard the DOM paste event reads, so a host screenshot
@@ -491,8 +491,13 @@ export function ChatBar({
     // Links in the paste land as `@url:` chips rather than a wall of URL text —
     // the same reference the "Add URL" dialog inserts, parsed in place so a link
     // mid-sentence keeps its position. Bare `@path` tokens promote the same way.
+    // A paste into an open `@url:`/`@file:` scope CONSUMES that scope instead of
+    // stacking on it — the scope is the browse mode the user is pasting into,
+    // not text they typed and want to keep (`@url:@url:\`https://…\``).
+    const scope = openDirectiveScope(event.currentTarget)
+
     recordUndoPoint()
-    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)))
+    insertComposerContentsAtCaret(event.currentTarget, pathifyRefs(linkifyUrls(pastedText)), scope)
     scheduleFlushEditorToDraft(event.currentTarget)
   }
 
@@ -941,7 +946,6 @@ export function ChatBar({
         autoCorrect="off"
         className={cn(
           'min-h-[1.625rem] min-h-(--composer-input-min-height) max-h-(--composer-input-max-height) cursor-text overflow-y-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere] bg-transparent pb-1 pr-1 pt-1 leading-normal text-foreground outline-none disabled:cursor-not-allowed',
-          'empty:before:content-[attr(data-placeholder)] empty:before:text-muted-foreground/60',
           '**:data-ref-text:cursor-default',
           stacked && 'pl-3',
           stacked ? 'w-full' : 'min-w-(--composer-input-inline-min-width) flex-1'
@@ -963,8 +967,13 @@ export function ChatBar({
           // until an unrelated edit forces a sync (#39614).
           flushEditorToDraft(event.currentTarget)
         }}
-        onCompositionStart={() => {
+        onCompositionStart={event => {
           composingRef.current = true
+
+          // Input events are skipped for the rest of the composition, so
+          // nothing else would clear the empty marker until it ends — and the
+          // hint would sit behind the preedit text the whole time (#75960).
+          beginComposerComposition(event.currentTarget)
         }}
         onDragOver={handleInputDragOver}
         onDrop={handleInputDrop}
@@ -979,6 +988,7 @@ export function ChatBar({
         spellCheck={false}
         suppressContentEditableWarning
       />
+      <ComposerDirectiveActions editorRef={editorRef} />
       {/* assistant-ui requires ComposerPrimitive.Input somewhere in the tree
         so the composer-state binding (text + IME + paste + form-submit hookup)
         wires up. We render the real input UI ourselves above via the
@@ -1138,6 +1148,7 @@ export function ChatBar({
                 loading={triggerLoading}
                 onHover={setTriggerActive}
                 onPick={replaceTriggerWithChip}
+                scope={trigger.scope}
               />
             )}
             {!poppedOut && (
@@ -1182,7 +1193,10 @@ export function ChatBar({
                   onBranchOff={handleBranchOff}
                   onConvertBranch={handleConvertBranch}
                   onListBranches={handleListBranches}
-                  onOpen={toggleReview}
+                  // A tile's rail reviews ITS worktree: pin the pane's scope to
+                  // this surface's cwd. Main keeps the classic follow-the-
+                  // active-session scope (null).
+                  onOpen={() => toggleReview(scope.target === 'main' ? null : (cwd ?? null))}
                   onOpenWorktree={openInWorktree}
                   onSwitchBranch={handleSwitchBranch}
                   repoPath={cwd}

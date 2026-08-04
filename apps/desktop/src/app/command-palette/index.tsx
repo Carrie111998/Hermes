@@ -2,10 +2,17 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { Dialog as DialogPrimitive } from 'radix-ui'
 import { memo, useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate } from 'react-router'
 
-import { HUD_HEADING, HUD_ITEM, HUD_POSITION, HUD_SURFACE, HUD_TEXT } from '@/app/floating-hud'
-import { setTerminalTakeover } from '@/app/right-sidebar/store'
+import {
+  HUD_HEADING,
+  HUD_ITEM,
+  HUD_NOTE,
+  HUD_NOTE_VARIANT,
+  HUD_POSITION,
+  HUD_SURFACE,
+  HUD_TEXT
+} from '@/app/floating-hud'
 import { codiconIcon } from '@/components/ui/codicon'
 import { Command, CommandGroup, CommandInput, CommandItem, CommandList } from '@/components/ui/command'
 import { HighlightMatches } from '@/components/ui/highlight-matches'
@@ -44,7 +51,6 @@ import {
   SlidersHorizontal,
   Starmap,
   Sun,
-  Terminal,
   Users,
   Wrench,
   Zap
@@ -59,7 +65,8 @@ import {
   closeCommandPalette,
   setCommandPaletteOpen
 } from '@/store/command-palette'
-import { $bindings } from '@/store/keybinds'
+import { $bindings, bindingsFor } from '@/store/keybinds'
+import { $dismissedAutoProjectIds, filterVisibleProjects } from '@/store/layout'
 import { openPetGenerate } from '@/store/pet-generate'
 import { $projectTree, goToProject, openFolderAsProject, requestStartWorkSession } from '@/store/projects'
 import { $connection } from '@/store/session'
@@ -106,8 +113,10 @@ interface PaletteItem {
   active?: boolean
   /** Static trailing combo hint for a modifier-variant select (e.g. `mod+enter`). */
   comboHint?: string
-  /** Muted text beside the label — state the row acts on (a version, a count). */
+  /** Short note beside the label — state the row acts on (a version, a count). */
   detail?: string
+  /** `state` when the row will change what `detail` says (a toggle's on/off). */
+  detailVariant?: keyof typeof HUD_NOTE_VARIANT
   icon: IconComponent
   id: string
   /** Keep the palette open after running (live-preview pickers like theme/mode). */
@@ -317,7 +326,9 @@ const PaletteRow = memo(function PaletteRow({
   const Icon = item.icon
   // The row's live keybind, else a static modifier-variant hint (⌘↵). One slot,
   // so every downstream `ml-auto` fallback below keeps working unchanged.
-  const combo = (item.action ? bindings[item.action]?.[0] : undefined) ?? item.comboHint
+  // `bindingsFor`, not a raw lookup: a plugin's action is contributed after
+  // $bindings was seeded, so its combo only resolves through the fallback chain.
+  const combo = (item.action ? bindingsFor(item.action, bindings)[0] : undefined) ?? item.comboHint
   // While ⌘/⌃ is held, a row with a modifier variant previews it: the label
   // swaps to the variant's copy so Enter reads as what it will actually do.
   const modPreview = modHeld && Boolean(item.modLabel)
@@ -340,7 +351,9 @@ const PaletteRow = memo(function PaletteRow({
           <HighlightMatches query={search.split(/\s+/)} text={item.label} />
         )}
       </span>
-      {item.detail && <span className="truncate text-muted-foreground/80">{item.detail}</span>}
+      {item.detail && (
+        <span className={cn(HUD_NOTE, HUD_NOTE_VARIANT[item.detailVariant ?? 'muted'])}>{item.detail}</span>
+      )}
       {combo && (
         <KbdCombo className={cn('ml-auto', modPreview ? 'opacity-90' : 'opacity-55')} combo={combo} size="sm" />
       )}
@@ -376,6 +389,7 @@ type NonConfigSettingsLabel =
   | 'keysSettings'
   | 'keysTools'
   | 'mcp'
+  | 'plugins'
   | 'providerAccounts'
   | 'providerApiKeys'
 
@@ -409,6 +423,12 @@ const NON_CONFIG_SETTINGS: ReadonlyArray<{
     keywords: ['gateway', 'proxy', 'server', 'webhook', 'env', 'egress proxy', 'iron proxy'],
     labelKey: 'keysSettings',
     tab: 'keys&kview=settings'
+  },
+  {
+    icon: Package,
+    keywords: ['plugins', 'extensions', 'desktop plugins', 'addon', 'add-on'],
+    labelKey: 'plugins',
+    tab: 'plugins'
   },
   { icon: Archive, keywords: ['history', 'archived'], labelKey: 'archivedChats', tab: 'sessions' },
   { icon: Info, keywords: ['version', 'about'], labelKey: 'about', tab: 'about' }
@@ -507,6 +527,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
   const bindings = useStore($bindings)
   const worktrees = useStore($repoWorktrees)
   const projectTree = useStore($projectTree)
+  const dismissedAutoProjects = useStore($dismissedAutoProjectIds)
   const navigate = useNavigate()
   const { availableThemes, mode, resolvedMode, setMode, setTheme, themeName } = useTheme()
   const [search, setSearch] = useState('')
@@ -652,7 +673,39 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     [t.settings.fieldLabels]
   )
 
+  // Running a keepOpen row (a toggle) changes state the rows themselves report,
+  // so the groups have to rebuild without the palette closing. A counter keeps
+  // that generic — the palette never learns which stores its contributions read.
+  const [selectTick, setSelectTick] = useState(0)
+
   const contributedItems = usePaletteContributions()
+
+  // The active repo's worktrees → "new conversation in <branch>". This is the
+  // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
+  // session anchored to that worktree's checkout (requestStartWorkSession),
+  // so git is the source of truth and edits land in the right tree.
+  const branchGroup = useMemo<PaletteGroup[]>(
+    () =>
+      worktrees.length > 0
+        ? [
+            {
+              heading: t.commandCenter.branches,
+              items: worktrees.map(wt => {
+                const name = wt.branch?.trim() || wt.path.split('/').pop() || wt.path
+
+                return {
+                  icon: GitBranch,
+                  id: `worktree-${wt.path}`,
+                  keywords: ['branch', 'worktree', 'switch', name, wt.path],
+                  label: t.commandCenter.startInBranch(name),
+                  run: () => requestStartWorkSession(wt.path)
+                }
+              })
+            }
+          ]
+        : [],
+    [t, worktrees]
+  )
 
   const baseGroups = useMemo<PaletteGroup[]>(() => {
     const settingsTab = (tab: string) => `${SETTINGS_ROUTE}?tab=${tab}`
@@ -675,7 +728,7 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
           label: cc.openFolder,
           run: () => void openFolderAsProject()
         },
-        ...projectTree.map(project => ({
+        ...filterVisibleProjects(projectTree, dismissedAutoProjects).map(project => ({
           comboHint: 'mod+enter',
           icon: codiconIcon(project.icon || (project.isNoProject ? 'home' : 'folder-library')),
           id: `project-${project.id}`,
@@ -688,30 +741,10 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
       ]
     }
 
-    // The active repo's worktrees → "new conversation in <branch>". This is the
-    // ⌘K-typed "I want to work on <branch>" reflex: each entry seeds a fresh
-    // session anchored to that worktree's checkout (requestStartWorkSession),
-    // so git is the source of truth and edits land in the right tree.
-    const branchGroup: PaletteGroup[] =
-      worktrees.length > 0
-        ? [
-            {
-              heading: cc.branches,
-              items: worktrees.map(wt => {
-                const name = wt.branch?.trim() || wt.path.split('/').pop() || wt.path
-
-                return {
-                  icon: GitBranch,
-                  id: `worktree-${wt.path}`,
-                  keywords: ['branch', 'worktree', 'switch', name, wt.path],
-                  label: cc.startInBranch(name),
-                  run: () => requestStartWorkSession(wt.path)
-                }
-              })
-            }
-          ]
-        : []
-
+    // Group order is the tiebreaker rankGroups falls back on (stable sort), and
+    // exact ties are the common case — "yolo" hits both "Toggle yolo" and a
+    // worktree named bb/yolo-* as a whole word. So this order IS the priority:
+    // where you're going, then what you can do, then what you can configure.
     return [
       {
         heading: cc.goTo,
@@ -736,14 +769,6 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
                 }
               ]
             : []),
-          {
-            action: 'view.showTerminal',
-            icon: Terminal,
-            id: 'nav-terminal',
-            keywords: ['terminal', 'shell', 'console'],
-            label: t.keybinds.actions['view.showTerminal'],
-            run: () => setTerminalTakeover(true)
-          },
           {
             action: 'nav.settings',
             icon: Settings,
@@ -793,7 +818,28 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
         ]
       },
       projectGroup,
-      ...branchGroup,
+      // Registry-contributed rows (core features + plugins) — one group,
+      // omitted while nothing contributes.
+      ...(contributedItems.length > 0
+        ? [
+            {
+              heading: cc.commands,
+              items: contributedItems.map(item => ({
+                action: item.action,
+                // Read on mount and after every select (the deps below), so a
+                // row that reports state can't show the state it just left.
+                detail: item.detail?.(),
+                detailVariant: item.detailVariant,
+                icon: item.icon ?? Zap,
+                id: item.key,
+                keepOpen: item.keepOpen,
+                keywords: item.keywords,
+                label: item.label,
+                run: item.run
+              }))
+            }
+          ]
+        : []),
       {
         heading: cc.commandCenter,
         items: [
@@ -889,26 +935,22 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             run: go(settingsTab(entry.tab))
           }))
         ]
-      },
-      // Registry-contributed rows (core features + plugins) — one group,
-      // omitted while nothing contributes.
-      ...(contributedItems.length > 0
-        ? [
-            {
-              heading: cc.commands,
-              items: contributedItems.map(item => ({
-                action: item.action,
-                icon: item.icon ?? Zap,
-                id: item.key,
-                keywords: item.keywords,
-                label: item.label,
-                run: item.run
-              }))
-            }
-          ]
-        : [])
+      }
     ]
-  }, [contributedItems, go, projectTree, settingsSectionLabel, t, updateVersionLabel, worktrees])
+    // `selectTick` is a deliberate re-read trigger, not a value: rows report
+    // live state through `detail()`, so the groups must rebuild after a select
+    // that kept the palette open — eslint only sees an unused dep.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [
+    contributedItems,
+    dismissedAutoProjects,
+    go,
+    projectTree,
+    selectTick,
+    settingsSectionLabel,
+    t,
+    updateVersionLabel
+  ])
 
   // The long, granular lists (settings fields, API keys, MCP servers, archived
   // chats) only surface once the user types — otherwise they'd bury the
@@ -1105,7 +1147,14 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
     themeName
   ])
 
-  const groups = useMemo(() => [...baseGroups, ...searchGroups], [baseGroups, searchGroups])
+  // Branch rows rank below BOTH the fixed groups and the typed-only lists: they
+  // scale with whatever worktrees happen to exist, so on a tie they're the least
+  // likely thing meant. Everything above is either always-present chrome or a
+  // list the search itself asked for.
+  const groups = useMemo(
+    () => [...baseGroups, ...searchGroups, ...branchGroup],
+    [baseGroups, branchGroup, searchGroups]
+  )
 
   // Nested palette pages (VS Code-style submenus). Reusable: add an entry here
   // and point a root item at it via `to`.
@@ -1208,7 +1257,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
 
     if (!item.keepOpen) {
       closeCommandPalette()
+
+      return
     }
+
+    // Staying open means the rows are still on screen — re-read anything they
+    // report (a toggle's on/off) so the note isn't showing the previous state.
+    setSelectTick(tick => tick + 1)
   }
 
   return (

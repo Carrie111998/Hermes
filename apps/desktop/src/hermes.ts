@@ -1,5 +1,6 @@
 import { JsonRpcGatewayClient } from '@hermes/shared'
 
+import { reconnectBackoffDelayMs } from '@/lib/reconnect-backoff'
 import type {
   ActionResponse,
   ActionStatusResponse,
@@ -349,8 +350,12 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
       socket = null
 
       if (!disposed) {
+        // Full-jitter exponential backoff: same rationale as the gateway
+        // socket reconnect loops — an immediate-retry loop across many
+        // desktop clients floods the gateway with connection attempts
+        // during a restart.
+        window.setTimeout(() => void connect(), reconnectBackoffDelayMs(attempt, { baseDelayMs: 500, capMs: 30_000 }))
         attempt += 1
-        window.setTimeout(() => void connect(), Math.min(30_000, 1_000 * 2 ** attempt))
       }
     }
   }
@@ -960,7 +965,10 @@ export function editLearningNode(id: string, content: string): Promise<{ message
   })
 }
 
-export function toggleSkill(name: string, enabled: boolean): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+export function setSkillEnabled(
+  name: string,
+  enabled: boolean
+): Promise<{ ok: boolean; name: string; enabled: boolean }> {
   return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
     ...profileScoped(),
     path: '/api/skills/toggle',
@@ -1034,7 +1042,7 @@ export function getToolsets(): Promise<ToolsetInfo[]> {
   })
 }
 
-export function toggleToolset(
+export function setToolsetEnabled(
   name: string,
   enabled: boolean
 ): Promise<{ ok: boolean; name: string; enabled: boolean }> {
