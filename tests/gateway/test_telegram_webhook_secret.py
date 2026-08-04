@@ -31,38 +31,55 @@ class TestTelegramWebhookSecretRequired:
     """
 
     def _get_source(self) -> str:
-        path = Path(_repo) / "plugins" / "platforms" / "telegram" / "adapter.py"
-        return path.read_text(encoding="utf-8")
+        """Return adapter + polling-mixin sources concatenated.
+
+        The webhook-start block (and its secret guard) moved into
+        ``telegram_polling.py`` as ``_start_webhook`` during the adapter
+        god-file slice; scanning both files keeps this pin valid across
+        either layout.
+        """
+        repo = Path(_repo)
+        adapter = (repo / "plugins" / "platforms" / "telegram" / "adapter.py").read_text(encoding="utf-8")
+        polling = (repo / "plugins" / "platforms" / "telegram" / "telegram_polling.py").read_text(encoding="utf-8")
+        return adapter + "\n" + polling
 
     def test_webhook_branch_checks_secret(self):
-        """The webhook-mode branch of connect() must read
-        TELEGRAM_WEBHOOK_SECRET and refuse when empty."""
+        """The webhook branch must read TELEGRAM_WEBHOOK_SECRET and refuse
+        when empty (GHSA-3vpc-7q5r-276h)."""
         src = self._get_source()
         # The guard must appear after TELEGRAM_WEBHOOK_URL is set
         assert re.search(
             r'TELEGRAM_WEBHOOK_SECRET.*?\.strip\(\)\s*\n\s*if not webhook_secret:',
             src, re.DOTALL,
         ), (
-            "TelegramAdapter.connect() must strip TELEGRAM_WEBHOOK_SECRET "
-            "and raise when the secret is empty — see GHSA-3vpc-7q5r-276h"
+            "The webhook transport (_start_webhook) must strip "
+            "TELEGRAM_WEBHOOK_SECRET and raise when the secret is empty — "
+            "see GHSA-3vpc-7q5r-276h"
         )
 
 
     def test_polling_branch_has_no_secret_guard(self):
-        """Polling mode (else-branch) must NOT require the webhook secret —
-        polling authenticates via the bot token, not a webhook secret."""
+        """Polling mode must NOT require the webhook secret — polling
+        authenticates via the bot token, not a webhook secret."""
         src = self._get_source()
-        # The guard should appear inside the `if webhook_url:` branch,
-        # not the `else:` polling branch. Rough check: the raise is
-        # followed (within ~60 lines) by an `else:` that starts the
-        # polling branch, and there's no secret-check in that polling
-        # branch.
+        # The guard must live inside the webhook-start block
+        # (_start_webhook's `if webhook_url:` branch), not in the polling
+        # branch that connect() falls into when webhook mode is off.
         webhook_block = re.search(
-            r'if webhook_url:\s*\n(.*?)\n            else:\s*\n(.*?)\n',
+            r'if webhook_url:\s*\n(.*?)\n\s*return bool\(webhook_url\)',
             src, re.DOTALL,
         )
-        if webhook_block:
-            webhook_body = webhook_block.group(1)
-            polling_body = webhook_block.group(2)
-            assert "TELEGRAM_WEBHOOK_SECRET" in webhook_body
-            assert "TELEGRAM_WEBHOOK_SECRET" not in polling_body
+        assert webhook_block, (
+            "telegram_polling.py _start_webhook() must gate webhook startup "
+            "on TELEGRAM_WEBHOOK_URL (see GHSA-3vpc-7q5r-276h)"
+        )
+        webhook_body = webhook_block.group(1)
+        assert "TELEGRAM_WEBHOOK_SECRET" in webhook_body
+        # The polling branch in connect() (after the _start_webhook dispatch)
+        # must not contain the secret guard.
+        polling_branch = re.search(
+            r'if not webhook_started:\s*\n(.*?)\n\s*self\._mark_connected\(\)',
+            src, re.DOTALL,
+        )
+        if polling_branch:
+            assert "TELEGRAM_WEBHOOK_SECRET" not in polling_branch.group(1)
