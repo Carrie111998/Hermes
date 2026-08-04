@@ -496,16 +496,131 @@ def _mask_token(token: str) -> str:
 
 # A quote that closes a *containing* document, plus any structural characters
 # that follow it, rather than part of the secret value. Anchored at the end of
-# the captured value; ``[}\],]*`` covers a container tail deeper than one level
+# the captured value; ``[}\],]`` covers a container tail deeper than one level
 # (``"MY_TOKEN=ab"}]`` captures ``ab"}]``).
-_TRAILING_DELIMITER_RE = re.compile(r"([\"'])[}\],]*$")
+#
+# The structural run is uncapped: how much of it may be re-emitted is decided
+# against the containers actually open at the match (see
+# ``_justified_delimiter_len``), not against a fixed length. A real tail is as
+# long as the document is deep — ``json.dumps`` defaults on a five-level
+# payload close with ``"}]}}}`` — while a secret's own random ``}}}}`` run is
+# rejected past the open depth. The group is split so the quote and the
+# structural run can be judged separately.
+_TRAILING_DELIMITER_RE = re.compile(r"([\"'])([}\],]*)$")
 # Quote characters a capture may have wrapped whole — see
 # ``_mask_preserving_delimiter``.
 _QUOTE_CHARS = "\"'"
+# Containers a redacted document can have open at a match, and the closer that
+# balances each.
+_CONTAINER_OPENERS = {"}": "{", "]": "["}
+# ``,`` closes nothing, so the open-container stack cannot bound how many of
+# them are re-emitted — a secret ending ``',,,,`` would republish the whole run.
+# In a real container tail a separator can only appear *once*, and only as the
+# final character: whatever follows a separator is the next member, never
+# another closer (``"}],`` is a legal capture, ``",}`` and ``",,`` are not).
+# So one is accepted, last, with a container open. ``json.dumps``' default item
+# separator produces exactly that: ``…"MY_TOKEN=x", "b": 1}`` captures ``x",``.
+_ITEM_SEPARATOR = ","
+
+
+class _DocumentStateScanner:
+    """Tracks the quote and containers open at a position in one ``sub()`` pass.
+
+    ``re.sub`` invokes its callback on non-overlapping matches in increasing
+    positional order, so this state can be carried forward across calls instead
+    of rescanned per match. That keeps a whole pass linear in the subject
+    length; re-deriving it per match (e.g. scanning ``text[:pos]``) is O(N·L)
+    overall, which on a 2 MB dump with a match every ~60 bytes is seconds, not
+    milliseconds.
+
+    Two pieces of state, both needed by ``_split_trailing_delimiter``:
+
+    * the quote open at the position, if any — a delimiter only closes
+      something that was opened;
+    * the stack of containers open at the position — which bounds how much of a
+      trailing ``}]}}`` run can be the *document's* rather than the secret's.
+
+    Escape-aware: a backslash consumes the next character, so the ``\\"`` inside
+    a serialized JSON string does not flip parity. Structural characters are
+    only counted while no quote is open, so a ``{`` inside a string is content.
+    """
+
+    __slots__ = ("_text", "_pos", "_open", "_stack")
+
+    def __init__(self, text: str) -> None:
+        self._text = text
+        self._pos = 0
+        self._open: str | None = None
+        self._stack: list[str] = []
+
+    def state_at(self, pos: int) -> tuple[str | None, list[str]]:
+        """Return ``(open quote or None, open-container stack)`` at ``pos``.
+
+        ``pos`` must be non-decreasing across calls, which ``re.sub`` guarantees.
+        The returned stack is the live list and is read-only to the caller.
+        """
+        text = self._text
+        i = self._pos
+        open_q = self._open
+        stack = self._stack
+        while i < pos:
+            ch = text[i]
+            if ch == "\\":
+                # Consume the escaped character with it. May step one past
+                # ``pos``; that character belongs to this match and the next
+                # call's ``pos`` is strictly greater, so no span is skipped.
+                i += 2
+                continue
+            if open_q is None:
+                if ch in _QUOTE_CHARS:
+                    open_q = ch
+                elif ch == "{" or ch == "[":
+                    stack.append(ch)
+                elif stack and stack[-1] == _CONTAINER_OPENERS.get(ch):
+                    # Only pop on a *matching* closer. A stray one in prose
+                    # ("}" in a log line) is not evidence a container closed.
+                    stack.pop()
+            elif ch == open_q:
+                open_q = None
+            i += 1
+        self._pos = i
+        self._open = open_q
+        return open_q, stack
+
+
+def _justified_delimiter_len(run: str, stack: list[str]) -> int:
+    """Length of the prefix of ``run`` that closes ``stack`` in order.
+
+    ``run`` is the structural tail a value capture absorbed after its closing
+    quote. The document's own closing run must be consistent with the
+    containers actually open at that point, so that is the test — rather than a
+    fixed cap, which cannot tell a five-level ``}]}}}`` tail (legitimate, from
+    ``json.dumps`` defaults) from a secret's ``}}}}`` (not).
+
+    Walks the stack top-down through an index rather than mutating it — the
+    caller's stack belongs to a scanner that is still carrying state forward. A
+    character that does not close the current top ends the justified prefix. A
+    separator is accepted only as the final character and only with a container
+    still open, which is the only place one can legally appear — otherwise its
+    length is bounded by nothing, since a separator closes no container.
+    """
+    remaining = len(stack)
+    for i, ch in enumerate(run):
+        if ch == _ITEM_SEPARATOR:
+            # Terminal, and only inside a container.
+            return i + 1 if remaining else i
+        if remaining == 0 or stack[remaining - 1] != _CONTAINER_OPENERS.get(ch):
+            return i
+        remaining -= 1
+    return len(run)
 
 
 def _split_trailing_delimiter(
-    value: str, *, quote: str = "", text: str = "", pos: int = 0
+    value: str,
+    *,
+    quote: str = "",
+    open_quote: str | None = None,
+    stack: list[str] | None = None,
 ) -> tuple[str, str]:
     """Split a trailing container delimiter off an unquoted captured value.
 
@@ -521,14 +636,33 @@ def _split_trailing_delimiter(
 
     Returns ``(secret, suffix)``; ``suffix`` is re-emitted after the mask.
 
-    A delimiter only closes something that was *opened*, so the split requires
-    the same quote character to appear in ``text`` before ``pos`` (the start of
-    this match). Without that requirement the run would be re-emitted verbatim
-    whenever it merely *looked* structural, which discloses secret bytes the
-    masker would otherwise have covered: ``MY_TOKEN=a'}}}}`` has no opening
-    quote, so its trailing run belongs to the secret and is masked. Skipped
-    entirely when the pattern captured its own opening ``quote`` — such a value
-    already ends at its own backreference.
+    A delimiter only closes something that was *open*, so the split requires
+    ``open_quote`` — from ``_DocumentStateScanner``, the quote actually unclosed
+    at the start of this match — to equal the captured trailing quote. Splitting
+    on shape alone re-emits the run verbatim whenever it merely *looked*
+    structural, which discloses secret bytes the masker would otherwise have
+    covered: ``MY_TOKEN=a'}}}}`` has nothing open, so its trailing run belongs
+    to the secret and is masked whole. Skipped entirely when the pattern
+    captured its own opening ``quote`` — such a value already ends at its own
+    backreference.
+
+    The structural run after that quote is bounded the same way, by ``stack``:
+    only the prefix that closes the containers actually open here is re-emitted
+    (``_justified_delimiter_len``). The rest cannot be the document's — nothing
+    is open for it to close — so it is secret and is dropped rather than
+    re-emitted or handed to the masker, where the head/tail window could
+    republish it. A five-level ``"}]}}}`` tail from ``json.dumps`` defaults
+    survives whole; ``MY_TOKEN=a'}}}}`` under a single open ``{`` keeps ``'}``
+    and loses the rest.
+
+    Residual: quote parity is a *syntactic* test, so a lone apostrophe in prose
+    ("it's", "couldn't") leaves a quote nominally open. A following
+    ``MY_TOKEN=a'}}}`` in a document with containers open therefore re-emits
+    ``'`` plus as many closers as are open — bounded by document depth, not by
+    the secret's length, which is what the earlier uncapped shape test got
+    wrong. In flat prose (nothing open) the residual is the single quote.
+    Distinguishing prose punctuation from a container delimiter is not decidable
+    by a text redactor; bounding it by document state is.
 
     Known limit: a value with no whitespace before the next JSON token (truly
     compact ``{"a":"MY_TOKEN=x","b":1}`` captures ``x","b":1}``) ends in ``}``
@@ -541,13 +675,19 @@ def _split_trailing_delimiter(
     match = _TRAILING_DELIMITER_RE.search(value)
     if match is None:
         return value, ""
-    # The delimiter must close a quote opened earlier in the document.
-    if match.group(1) not in text[:pos]:
+    # The delimiter must close the quote that is actually open here. ``None``
+    # (nothing open) can never equal the captured quote, so this one comparison
+    # covers both "nothing is open" and "a different quote is open".
+    if match.group(1) != open_quote:
         return value, ""
-    return value[: match.start()], match.group(0)
+    run = match.group(2)
+    keep = _justified_delimiter_len(run, stack or [])
+    return value[: match.start()], f"{open_quote}{run[:keep]}"
 
 
-def _mask_preserving_delimiter(value: str, *, text: str = "", pos: int = 0) -> str:
+def _mask_preserving_delimiter(
+    value: str, *, open_quote: str | None = None, stack: list[str] | None = None
+) -> str:
     """``_mask_token`` for a bare ``(\\S+)`` capture, keeping any delimiter.
 
     For the patterns whose value class is bare ``(\\S+)`` and which have no
@@ -556,14 +696,19 @@ def _mask_preserving_delimiter(value: str, *, text: str = "", pos: int = 0) -> s
     quotes it does not own:
 
     * wrapped in a matching pair (``x-api-key: "abc"``) — mask the inside and
-      re-emit both quotes, keeping the pair balanced;
+      re-emit both quotes, keeping the pair balanced. Reachable only from
+      ``_SECRET_HEADER_RE``: ``_YAML_ASSIGN_RE``'s lookahead rejects a value
+      that *starts* with a quote, deferring those to ``_JSON_FIELD_RE``;
     * a single trailing quote closing an enclosing document or shell string —
-      delegate to ``_split_trailing_delimiter``, which requires that quote to
-      have been opened earlier in ``text``.
+      delegate to ``_split_trailing_delimiter``, which requires that quote to be
+      the one actually open at this position and bounds the structural run that
+      follows it by the containers open there.
     """
     if len(value) >= 2 and value[0] in _QUOTE_CHARS and value[-1] == value[0]:
         return f"{value[0]}{_mask_token(value[1:-1])}{value[0]}"
-    secret, delimiter = _split_trailing_delimiter(value, text=text, pos=pos)
+    secret, delimiter = _split_trailing_delimiter(
+        value, open_quote=open_quote, stack=stack
+    )
     return f"{_mask_token(secret)}{delimiter}"
 
 
@@ -796,30 +941,41 @@ def redact_sensitive_text(
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
     if not code_file:
         if "=" in text:
-            def _redact_env(m):
-                name, quote, value = m.group(1), m.group(2), m.group(3)
-                # Programmatic env lookups reference variable *names*, not
-                # secret values — masking them corrupts code snippets in
-                # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
-                if _ENV_LOOKUP_VALUE_RE.match(value):
-                    return m.group(0)
-                # Keyword must sit at a word boundary within the key —
-                # ``author=Smith`` / ``press.secretary=…`` are prose, not
-                # credentials (ported from nearai/ironclaw#6129). All-caps
-                # keys (the _ENV_ASSIGN_RE shape) short-circuit to legacy
-                # embedded matching inside the helper.
-                if not _key_has_secret_keyword(name):
-                    return m.group(0)
-                # An unquoted value stops at whitespace, so it can absorb the
-                # quote that closes a *containing* document (serialized JSON).
-                # Hand the masker only the secret and re-emit the delimiter, or
-                # a short value's bare ``***`` would swallow it and leave the
-                # document unparseable.
-                value, delimiter = _split_trailing_delimiter(
-                    value, quote=quote, text=m.string, pos=m.start()
-                )
-                return f"{name}={quote}{_mask_token(value)}{quote}{delimiter}"
-            text = _ENV_ASSIGN_RE.sub(_redact_env, text)
+            # A scanner carries state forward only within the subject it was
+            # built for, and each ``sub()`` pass runs over a freshly rebuilt
+            # string. ``_redact_env`` is shared by three passes, so it is built
+            # per pass around its own scanner instead of closing over one.
+            def _make_redact_env(subject):
+                scanner = _DocumentStateScanner(subject)
+
+                def _redact_env(m):
+                    name, quote, value = m.group(1), m.group(2), m.group(3)
+                    # Programmatic env lookups reference variable *names*, not
+                    # secret values — masking them corrupts code snippets in
+                    # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    # Keyword must sit at a word boundary within the key —
+                    # ``author=Smith`` / ``press.secretary=…`` are prose, not
+                    # credentials (ported from nearai/ironclaw#6129). All-caps
+                    # keys (the _ENV_ASSIGN_RE shape) short-circuit to legacy
+                    # embedded matching inside the helper.
+                    if not _key_has_secret_keyword(name):
+                        return m.group(0)
+                    # An unquoted value stops at whitespace, so it can absorb the
+                    # quote that closes a *containing* document (serialized JSON).
+                    # Hand the masker only the secret and re-emit the delimiter, or
+                    # a short value's bare ``***`` would swallow it and leave the
+                    # document unparseable.
+                    open_quote, stack = scanner.state_at(m.start())
+                    value, delimiter = _split_trailing_delimiter(
+                        value, quote=quote, open_quote=open_quote, stack=stack
+                    )
+                    return f"{name}={quote}{_mask_token(value)}{quote}{delimiter}"
+
+                return _redact_env
+
+            text = _ENV_ASSIGN_RE.sub(_make_redact_env(text), text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
             # near the bottom of this function); _DB_CONNSTR_RE still guards
@@ -833,8 +989,8 @@ def redact_sensitive_text(
             # keyword scan prevents that pathological path on secret-free
             # text.
             if "://" not in text and _CFG_SECRET_WORD_RE.search(text):
-                text = _CFG_DOTTED_RE.sub(_redact_env, text)
-                text = _CFG_ANCHORED_RE.sub(_redact_env, text)
+                text = _CFG_DOTTED_RE.sub(_make_redact_env(text), text)
+                text = _CFG_ANCHORED_RE.sub(_make_redact_env(text), text)
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
@@ -852,6 +1008,8 @@ def redact_sensitive_text(
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips
         # quotes). Skip URLs — web-URL query params pass through by design.
         if ":" in text and "://" not in text:
+            _yaml_scanner = _DocumentStateScanner(text)
+
             def _redact_yaml(m):
                 key, sep, value = m.group(1), m.group(2), m.group(3)
                 # Same programmatic-env-lookup exception as _redact_env above
@@ -869,10 +1027,11 @@ def redact_sensitive_text(
                 # shell string, so ``sh -c '\npassword: xyz'`` masked to an
                 # unterminated quote. The lookahead only rejects a *leading*
                 # quote, so a trailing one still reaches the masker.
-                return (
-                    f"{key}{sep}"
-                    f"{_mask_preserving_delimiter(value, text=m.string, pos=m.start())}"
+                open_quote, stack = _yaml_scanner.state_at(m.start())
+                masked = _mask_preserving_delimiter(
+                    value, open_quote=open_quote, stack=stack
                 )
+                return f"{key}{sep}{masked}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -887,15 +1046,19 @@ def redact_sensitive_text(
     # API-key style headers (x-api-key, api-key, …). Header values are
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
-        text = _SECRET_HEADER_RE.sub(
+        _hdr_scanner = _DocumentStateScanner(text)
+
+        def _redact_secret_header(m):
             # Same unquoted-capture hazard as the KEY=VALUE passes above: the
             # ``(\S+)`` value class absorbs the quote closing an enclosing
             # JSON document, and a short header value masks to a bare ``***``
             # that would delete it.
-            lambda m: m.group(1)
-            + _mask_preserving_delimiter(m.group(2), text=m.string, pos=m.start()),
-            text,
-        )
+            open_quote, stack = _hdr_scanner.state_at(m.start())
+            return m.group(1) + _mask_preserving_delimiter(
+                m.group(2), open_quote=open_quote, stack=stack
+            )
+
+        text = _SECRET_HEADER_RE.sub(_redact_secret_header, text)
 
     # Telegram bot tokens — pattern requires ":<token>" with digits prefix
     if ":" in text:

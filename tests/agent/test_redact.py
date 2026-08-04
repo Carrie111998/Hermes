@@ -2,10 +2,16 @@
 
 import json
 import logging
+import re
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    _mask_token,
+    redact_cdp_url,
+    redact_sensitive_text,
+    RedactingFormatter,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1040,10 +1046,16 @@ class TestDelimiterSplitNeverDisclosesSecretBytes:
     32 of 33 characters that the bare ``***`` had covered. A redactor that
     emits *more* plaintext than before is a regression, not a fix.
 
-    The invariant: a delimiter only closes something that was **opened**, so the
-    split requires the same quote earlier in the text. These tests pin that
-    requirement rather than the current output, so widening the run class again
-    fails here.
+    Two invariants, both about what is actually **open** at the match:
+
+    * the trailing quote must be the quote left unclosed there — *present*
+      earlier in the text is not enough;
+    * the structural run after it may only go as far as it closes the
+      containers open there, so a secret's own ``}}}}`` is cut at the open
+      depth.
+
+    These tests pin those requirements rather than the current output, so
+    widening the run class again fails here.
     """
 
     # (secret, the substring that must not be republished). Each ends in a run
@@ -1066,6 +1078,170 @@ class TestDelimiterSplitNeverDisclosesSecretBytes:
 
         assert structural_tail not in result, result
         assert secret not in result, result
+
+    # Prefixes that put a quote earlier in the subject *without* leaving one
+    # open. A membership test ("does this quote appear earlier?") passes all of
+    # these and re-emits the run verbatim; a parity test ("is one open here?")
+    # rejects them. Every case above is prefix-free, so without these a mutant
+    # that always splits would survive the suite.
+    #
+    # Split by quote parity, because the two halves have different achievable
+    # contracts:
+    #
+    # * BALANCED — the prefix's quotes close each other, so parity at the key is
+    #   the same as with no prefix at all. Full behaviour, repair included.
+    # * ODD — the prefix leaves a quote nominally open (a prose apostrophe, or
+    #   one belonging to an earlier secret). Parity is *inverted* for the rest
+    #   of the subject: this is the residual, and it is a property of reading
+    #   quotes without a grammar, not of this fix. Anti-disclosure still holds;
+    #   repair is not attempted (see the two tests below).
+    BALANCED_QUOTE_PREFIXES = [
+        pytest.param("echo 'hi' && ", id="closed-shell-string"),
+        pytest.param('he said "hi" then ', id="closed-double-quote"),
+        pytest.param('{"a": 1, "b": 2} ', id="closed-json-object"),
+    ]
+    ODD_QUOTE_PREFIXES = [
+        pytest.param("it's fine, ", id="prose-apostrophe"),
+        pytest.param("couldn't parse; ", id="prose-contraction"),
+        pytest.param("A_TOKEN=ab'cd ", id="quote-inside-earlier-secret"),
+    ]
+    CLOSED_QUOTE_PREFIXES = BALANCED_QUOTE_PREFIXES + ODD_QUOTE_PREFIXES
+
+    @pytest.mark.parametrize("prefix", CLOSED_QUOTE_PREFIXES)
+    @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
+    def test_closed_quote_earlier_does_not_enable_the_split(
+        self, secret, structural_tail, prefix
+    ):
+        """An earlier quote that is already closed must not enable the split.
+
+        The distinction is *open* versus merely *present*. A lone apostrophe in
+        prose, an already-closed shell string, or a quote belonging to a
+        different secret all put the character earlier in the subject while
+        leaving nothing open at this position — so the trailing run still
+        belongs to the secret and must be masked with it.
+
+        Holds for both parities. Where the prefix leaves a quote nominally open
+        (``ODD_QUOTE_PREFIXES``) the split does fire, but the open-container
+        stack is empty in flat prose, so the run is cut to nothing and only the
+        quote itself is re-emitted — never the structural tail this asserts on.
+        """
+        result = redact_sensitive_text(f"{prefix}MY_TOKEN={secret}", force=True)
+
+        assert structural_tail not in result, result
+
+    @pytest.mark.parametrize("prefix", BALANCED_QUOTE_PREFIXES)
+    def test_closed_quote_prefix_still_repairs_a_later_open_container(self, prefix):
+        """Parity must not over-reject: a genuinely open quote still splits.
+
+        The counterpart to the test above. After a closed quote earlier in the
+        subject, a *newly* opened one must still be recognised, or the repair
+        this fix exists for would regress on any text containing prose.
+        """
+        result = redact_sensitive_text(f"{prefix}sh -c 'export MY_TOKEN=xyz'", force=True)
+
+        assert "xyz" not in result, result
+        assert result.endswith("'"), result
+
+    @pytest.mark.parametrize("prefix", ODD_QUOTE_PREFIXES)
+    def test_odd_quote_prefix_masks_but_does_not_repair(self, prefix):
+        """The documented residual, asserted as what it is.
+
+        An unbalanced quote earlier in the subject — a prose apostrophe, or one
+        inside an earlier secret — inverts parity for everything after it, so
+        the quote that really does close this shell string reads as *closing*
+        rather than opening and the repair is skipped. Reading quotes without a
+        grammar cannot tell the two apart.
+
+        What must still hold, and is what this pins: the secret is masked, and
+        the outcome is no worse than ``upstream/main``, which eats the closing
+        quote on every one of these inputs (verified in a clean worktree). So
+        this asserts masking, not corruption — a future improvement that repairs
+        the quote here should not have to edit this test.
+        """
+        result = redact_sensitive_text(f"{prefix}sh -c 'export MY_TOKEN=xyz'", force=True)
+
+        assert "xyz" not in result, result
+        assert "MY_TOKEN=***" in result, result
+
+    def test_escaped_quote_does_not_flip_parity(self):
+        """A ``\\"`` inside serialized JSON is content, not a delimiter.
+
+        ``json.dumps`` escapes an embedded quote, so a naive parity count would
+        see it as opening a string and mis-track every delimiter after it.
+        """
+        payload = {"note": 'he said "hi"', "c": "MY_TOKEN=ab"}
+        serialized = json.dumps(payload, ensure_ascii=False, indent=2)
+
+        reparsed = json.loads(redact_sensitive_text(serialized, force=True))
+
+        assert sorted(reparsed) == ["c", "note"]
+        assert "MY_TOKEN=ab" not in reparsed["c"]
+
+    @pytest.mark.parametrize("note", ['say "hi', 'a"b"c"d', 'trailing"', '"leading'])
+    @pytest.mark.parametrize("label,kwargs", [("compact", {}), ("indent", {"indent": 2})])
+    def test_odd_escaped_quote_count_does_not_flip_parity(self, note, label, kwargs):
+        """An *odd* number of escaped quotes is what actually has teeth.
+
+        With an even count, parity is unchanged whether or not the scanner
+        honours the backslash, so an even-count fixture cannot catch a scanner
+        that ignores escapes. Each ``note`` here serializes to an odd number of
+        ``\\"``, so ignoring the backslash inverts parity at the key and the
+        closing quote is eaten again — the exact corruption this PR removes.
+        """
+        payload = {"note": note, "c": "MY_TOKEN=ab"}
+        serialized = json.dumps(payload, ensure_ascii=False, **kwargs)
+        assert serialized.count('\\"') % 2 == 1, serialized
+
+        reparsed = json.loads(redact_sensitive_text(serialized, force=True))
+
+        assert reparsed["note"] == note
+        assert reparsed["c"] == "MY_TOKEN=***"
+
+    @pytest.mark.parametrize("prefix", BALANCED_QUOTE_PREFIXES)
+    @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
+    def test_balanced_prefix_discloses_exactly_what_the_baseline_does(
+        self, secret, structural_tail, prefix
+    ):
+        """With parity balanced, the redacted value is byte-identical to base.
+
+        Nothing is open at the key, so no split may fire and the emitted value
+        is exactly ``_mask_token(secret)`` — the unpatched behaviour. This is
+        the strict form of "never emit more plaintext than upstream": not a
+        bound, an equality.
+        """
+        result = redact_sensitive_text(f"{prefix}MY_TOKEN={secret}", force=True)
+
+        _, _, emitted = result.rpartition("MY_TOKEN=")
+        assert emitted == _mask_token(secret), (emitted, result)
+
+    @pytest.mark.parametrize("prefix", ODD_QUOTE_PREFIXES)
+    @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
+    def test_odd_prefix_discloses_at_most_one_quote_beyond_the_baseline(
+        self, secret, structural_tail, prefix
+    ):
+        """The residual, measured instead of excused.
+
+        An unbalanced quote earlier in the subject leaves one nominally open, so
+        a secret ending in that quote does split. These subjects are flat — no
+        ``{`` or ``[`` is open — so the justified structural run is empty and the
+        re-emitted suffix is at most the single quote character. Every longer
+        suffix of the secret, including the structural tail, is gone.
+
+        Asserted as ``base`` or ``base + the one quote``, so the residual cannot
+        grow silently: widening the run class, or dropping the stack check, emits
+        more than this and fails here.
+        """
+        result = redact_sensitive_text(f"{prefix}MY_TOKEN={secret}", force=True)
+
+        _, _, emitted = result.rpartition("MY_TOKEN=")
+        baseline = _mask_token(secret)
+        allowed = {baseline}
+        # The split only fires when the secret's own trailing quote is the one
+        # the prefix left open.
+        match = re.search(r"([\"'])[}\],]*$", secret)
+        if match and match.group(1) == "'":
+            allowed.add(_mask_token(secret[: match.start()]) + "'")
+        assert emitted in allowed, (emitted, sorted(allowed), result)
 
     @pytest.mark.parametrize("secret,structural_tail", STRUCTURAL_TAIL_SECRETS)
     def test_disclosure_never_exceeds_the_baseline(self, secret, structural_tail):
@@ -1103,6 +1279,119 @@ class TestDelimiterSplitNeverDisclosesSecretBytes:
         payload = json.dumps({"c": "MY_TOKEN=", "b": 1}, ensure_ascii=False, indent=2)
         reparsed = json.loads(redact_sensitive_text(payload, force=True))
         assert sorted(reparsed) == ["b", "c"]
+
+
+class TestDelimiterRunBoundedByOpenContainers:
+    """The structural run is bounded by document state, not by a fixed cap.
+
+    An earlier iteration of this fix capped the run at three characters to bound
+    disclosure. That cap is not a property of anything: ``json.dumps`` defaults
+    on a five-level payload close with ``"}]}}}`` — five structural characters —
+    so the cap rejected the real container tail and left exactly the corruption
+    the fix exists to remove, while still admitting three characters of a
+    secret's own ``}}}}``.
+
+    What bounds the run instead is the stack of containers actually open at the
+    match: a closing run may only go as far as it closes them, in order. That
+    admits a legitimate tail of any depth and cuts a secret's run at the open
+    depth.
+    """
+
+    def test_nesting_deeper_than_the_old_cap_round_trips(self):
+        """Five closers — the shape the {0,3} cap rejected."""
+        payload = {"request": {"body": {"messages": [{"content": "export MY_TOKEN=xyz"}]}}}
+        serialized = json.dumps(payload, ensure_ascii=False)
+        assert serialized.endswith('"}]}}}'), serialized
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        reparsed = json.loads(redacted)
+        content = reparsed["request"]["body"]["messages"][0]["content"]
+        assert content == "export MY_TOKEN=***"
+
+    @pytest.mark.parametrize("depth", [1, 2, 4, 6, 9])
+    def test_any_nesting_depth_round_trips(self, depth):
+        """No cap: the tail is as long as the document is deep."""
+        payload = {"c": "MY_TOKEN=xyz"}
+        for _ in range(depth):
+            payload = {"n": [payload]}
+        serialized = json.dumps(payload, ensure_ascii=False)
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        node = json.loads(redacted)
+        for _ in range(depth):
+            node = node["n"][0]
+        assert node["c"] == "MY_TOKEN=***"
+
+    def test_run_longer_than_the_open_depth_is_truncated(self):
+        """A secret's own run is cut where the open containers run out.
+
+        One ``{`` is open, so one ``}`` is justified; the other three belong to
+        the secret and are dropped rather than republished.
+        """
+        result = redact_sensitive_text("{ it's MY_TOKEN=a'}}}}", force=True)
+
+        assert result == "{ it's MY_TOKEN=***'}", result
+        assert "}}" not in result, result
+
+    def test_separator_needs_an_open_container(self):
+        """``,`` closes nothing, so it is only legal while something is open."""
+        inside = redact_sensitive_text('{"c": "MY_TOKEN=xyz", "b": 1}', force=True)
+        assert json.loads(inside)["b"] == 1
+        assert json.loads(inside)["c"] == "MY_TOKEN=***"
+
+        # Flat prose: nothing is open, so the trailing comma is secret.
+        flat = redact_sensitive_text("it's MY_TOKEN=pw',", force=True)
+        assert "'," not in flat, flat
+
+    @pytest.mark.parametrize(
+        "run", [",", ",,", ",,,,", ",}", ",]", "},", "}],"]
+    )
+    def test_separator_is_accepted_only_as_the_final_character(self, run):
+        """A separator ends the justified run — nothing may follow it.
+
+        The stack bounds *closers*, but a separator closes nothing, so it cannot
+        be bounded by depth: accepting a run of them would republish a secret's
+        whole ``',,,,`` tail. In a real container tail a separator can appear
+        only once and only last, because whatever follows one is the next member
+        — never another closer. So ``}],`` is a legal capture and ``,}`` is not.
+
+        Asserted through the public function, on a subject with one container
+        open, so the bound is a behaviour and not an implementation detail.
+        """
+        result = redact_sensitive_text(f"{{ it's MY_TOKEN=pw'{run}", force=True)
+
+        _, _, emitted = result.partition("MY_TOKEN=")
+        # everything after the mask must be a legal tail: closers that the one
+        # open "{" justifies, with at most one separator, and it last
+        suffix = emitted[len("***") :]
+        assert suffix.startswith("'"), (suffix, result)
+        structural = suffix[1:]
+        assert structural.count(",") <= 1, (suffix, result)
+        assert "," not in structural[:-1], (suffix, result)
+        assert len(structural.replace(",", "")) <= 1, (suffix, result)
+
+    def test_mismatched_closer_is_not_justified(self):
+        """``]`` does not close ``{`` — a stray closer is not a container tail."""
+        result = redact_sensitive_text('{"c": "MY_TOKEN=xyz"]}', force=True)
+
+        assert "xyz" not in result, result
+        assert result == '{"c": "MY_TOKEN=***"', result
+
+    def test_structural_characters_inside_a_string_are_content(self):
+        """A ``{`` inside a JSON string does not open a container.
+
+        Otherwise a value that merely mentions a brace would inflate the stack
+        and justify a longer run than the document actually has open.
+        """
+        payload = {"note": "use {braces} and [brackets]", "c": "MY_TOKEN=xyz"}
+        serialized = json.dumps(payload, ensure_ascii=False)
+
+        reparsed = json.loads(redact_sensitive_text(serialized, force=True))
+
+        assert reparsed["note"] == "use {braces} and [brackets]"
+        assert reparsed["c"] == "MY_TOKEN=***"
 
 
 class TestYamlAssignDelimiter:
