@@ -2911,7 +2911,7 @@ def _detect_venv_python_processes(
         if not is_holder:
             continue
         name = info.get("name") or Path(exe).name
-        matches.append((int(pid), str(name), cmdline_raw[:120]))
+        matches.append((int(pid), str(name), cmdline_raw))
     return matches
 
 def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> str:
@@ -2921,12 +2921,13 @@ def _format_venv_python_holders_message(matches: list[tuple[int, str, str]]) -> 
     ]
     for pid, name, cmdline in matches[:6]:
         hint = ""
-        low = cmdline.lower()
+        display_cmdline = cmdline[:120] if len(cmdline) > 120 else cmdline
+        low = display_cmdline.lower()
         if "serve" in low or "dashboard" in low:
             hint = "  ← Hermes Desktop backend (close the desktop app)"
         elif "gateway" in low:
             hint = "  ← gateway"
-        lines.append(f"  PID {pid}  {name}  {cmdline}{hint}")
+        lines.append(f"  PID {pid}  {name}  {display_cmdline}{hint}")
     if len(matches) > 6:
         lines.append(f"  ... and {len(matches) - 6} more")
     lines.append("")
