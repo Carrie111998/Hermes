@@ -1,6 +1,6 @@
 # Phase 2: Read-only-Upcaster
 
-**Datum:** 2026-07-22  
+**Datum:** 2026-07-22
 **Scope:** Bestehende Async-Delegationspayloads in `LaneTask` und `LaneResult` übersetzen, ohne Hermes-Runtime oder `state.db` zu verändern.
 
 ## Artefakte
