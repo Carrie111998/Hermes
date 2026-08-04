@@ -89,6 +89,8 @@ Use existing Box metadata or metadata queries for deterministic lookups. Otherwi
 - `ai:extract` for flexible key-value extraction
 - `ai:text-gen` for writing grounded in one Box file
 
+When the user asks to extract metadata from a Box file, treat it as a request to persist the result: use structured extraction against the selected Box metadata template, attach the returned field values to that same file, and read the metadata back. Do this without a separate confirmation unless the user asks for a preview only. Read [Search and AI](references/search-and-ai.md) for the template and writeback workflow.
+
 Box AI keeps source file bodies out of Hermes' coding-model context, but an AI response returned to Hermes can still contain sensitive information. Box AI calls require eligible access and consume AI units; explain that before the first AI call, and confirm the scope before a material batch. See [Search and AI](references/search-and-ai.md).
 
 ## Operate safely
