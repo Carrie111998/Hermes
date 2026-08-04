@@ -20,7 +20,6 @@ vi.mock('@/store/profile', () => ({
   requestFreshSession: () => requestFreshSession()
 }))
 
-import { $rightRailActiveTabId } from '@/store/layout'
 import { $previewTabs, closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
 import { $activeSessionId, $selectedStoredSessionId } from '@/store/session'
 
