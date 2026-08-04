@@ -12690,6 +12690,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except OSError:
                 pass
             self._voice_barge_capture.clear()
+            self._voice_barge_phase = None
             # No usable transcript: hand the mic back to the normal loop.
             if not submitted and self._voice_mode and self._voice_continuous and not self._voice_recording:
                 self._voice_restart_recording_async()
