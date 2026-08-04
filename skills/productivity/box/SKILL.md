@@ -33,8 +33,6 @@ When someone is exploring a cloud file system for Hermes, first give a short fit
 2. **Shared or background agent (CCG):** choose a Service Account for one shared agent identity, or dedicated App Users for isolated Hermes profiles. Both see only content explicitly shared with that identity.
 3. **Box-backed application or integration (SDK):** build with an official Box SDK and the appropriate app authentication.
 
-After the connection is selected and working, offer Box AI for document Q&A, extraction, summaries, or grounded writing when it fits the requested work; it is not a separate connection path.
-
 Do not run setup, show a command cookbook, propose account plans or folder taxonomies, or load every reference for a broad exploratory question. Wait for the user's answer, then load only the relevant path. When a request already names a concrete outcome, skip this discovery step and handle that outcome directly.
 
 ## Perform chosen setup interactively

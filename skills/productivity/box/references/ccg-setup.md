@@ -13,7 +13,7 @@ Both identities are API-only and begin with empty roots. A Service Account is au
 
 Open the [Box Developer Console](https://app.box.com/developers/console) with browser tools when available, then create a **Platform App** using **Client Credentials Grant**. Select **App Access Only** and choose only the scopes required for the work; the authorization method is fixed at creation. For an App User runtime, enable **Manage users** and **Generate User Access Tokens**: **Manage users is required to create the App User through this CCG app.** A direct Service Account runtime does not need either setting unless another approved workflow requires it. Reauthorize the app if changing these settings requires it.
 
-Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Find the Client ID, Client Secret, and Enterprise ID in the app's **App Details** sidebar. Never ask for a Client Secret in chat. Ask the human to store the values directly in the active Hermes home's `.env` file, then resume after they confirm it is ready:
+Complete every available browser step. Pause only when a Box administrator must approve the app or when the human must sign in. Instruct the user to find the Client ID, Client Secret, and Enterprise ID in the app's **App Details** sidebar. Never ask for a Client Secret in chat. Ask the human to store the values directly in the active Hermes home's `.env` file, then resume after they confirm it is ready:
 
 ```text
 BOX_CLIENT_ID=your_client_id
