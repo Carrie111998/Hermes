@@ -106,7 +106,8 @@ export function ProjectDialog() {
           for (const dir of dirs) {
             try {
               await addProjectFolder(projectId, dir)
-            } catch (e) {
+            } catch (err) {
+              console.error(`Failed to add folder ${dir}:`, err)
               failures.push(dir)
             }
           }
