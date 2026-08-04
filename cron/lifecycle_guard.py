@@ -114,7 +114,11 @@ _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
-    normalized = command.replace("\\\n", "")
+    # NUL bytes can leak into tokens when a scanned script's binary contents
+    # are decoded and tokenized as paths (see #76762). They are never valid
+    # shell characters; stripping them here keeps every downstream Path()
+    # construction crash-free (`ValueError: embedded null byte`).
+    normalized = command.replace("\\\n", "").replace("\x00", "")
     for line in normalized.splitlines() or [normalized]:
         try:
             lexer = shlex.shlex(
@@ -258,7 +262,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -374,7 +378,10 @@ def _resolve_script_path(script_path: str) -> Path:
     """
     from hermes_constants import get_hermes_home
 
-    raw = Path(script_path).expanduser()
+    # A NUL byte in the script value would raise `ValueError: embedded null
+    # byte` from Path(); such a path can never exist on disk, so strip it the
+    # same way the terminal-side scanner does (see #76762).
+    raw = Path(script_path.replace("\x00", "")).expanduser()
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw
