@@ -1469,8 +1469,20 @@ class WorkflowEngine:
         if path.exists():
             path.unlink()
 
-    def _find_latest_state(self, workflow_name: str) -> Optional[dict]:
-        """Find the most recent state file for a workflow (supports parallel runs)."""
+    def _find_latest_state(self, workflow_name: str,
+                           run_id: Optional[str] = None) -> Optional[dict]:
+        """Find the most recent state file for a workflow (supports parallel runs).
+
+        When ``run_id`` is provided, returns THAT run's state file exactly
+        (needed for targeted resume of a specific completed run). Otherwise
+        falls back to the most recent by filename sort.
+        """
+        if run_id:
+            exact = self._state_path(workflow_name, run_id)
+            if exact.exists():
+                with open(exact) as f:
+                    return json.load(f)
+            return None
         # Prefer run_id-tagged files
         tagged = sorted(self.STATE_DIR.glob(f"{workflow_name}_*_state.json"))
         if tagged:
@@ -2558,8 +2570,15 @@ class WorkflowEngine:
         # in template substitution so YAML authors can create unique
         # artifact filenames per run. Microsecond precision ensures
         # concurrent dispatches get unique IDs.
-        ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")[:21]  # YYYYMMDD-HHMMSS-ffffff → 21 chars
-        workflow.run_id = f"{workflow_name}-{ts}"
+        if run_id:
+            # Resume path: target the EXACT run (supervisor subprocess
+            # passes --run-id; auto-resume re-opens a completed run).
+            # Without this, every resume generated a fresh run_id and
+            # state selection fell back to filename sort — wrong run.
+            workflow.run_id = run_id
+        else:
+            ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S-%f")[:21]  # YYYYMMDD-HHMMSS-ffffff → 21 chars
+            workflow.run_id = f"{workflow_name}-{ts}"
 
         layers = self.topological_sort(workflow)
 
@@ -2569,7 +2588,7 @@ class WorkflowEngine:
         layer_idx = 0
 
         if resume:
-            saved = self._find_latest_state(workflow_name)
+            saved = self._find_latest_state(workflow_name, run_id=run_id)
             if saved:
                 print(f"Resuming {workflow_name} from layer {saved['current_layer']}")
                 layer_idx = saved["current_layer"]
