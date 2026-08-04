@@ -17,7 +17,7 @@ transport:
   command: "npx"
   args:
     - "-y"
-    - "apple-mail-mcp@2.9.1"
+    - "apple-mail-mcp@2.10.3"
 
 # Drives Apple Mail locally via AppleScript; no credentials.
 auth:

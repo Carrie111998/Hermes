@@ -17,7 +17,7 @@ transport:
   command: "npx"
   args:
     - "-y"
-    - "apple-photos-mcp@2.1.5"
+    - "apple-photos-mcp@2.1.6"
 
 # Reads the Photos library via an osxphotos Python sidecar; no credentials.
 auth:
