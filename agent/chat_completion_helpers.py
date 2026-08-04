@@ -1750,7 +1750,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         current_provider = (getattr(agent, "provider", "") or "").strip().lower()
         primary_provider = ((agent._primary_runtime or {}).get("provider") or "").strip().lower()
         if (not fallback_already_active) or (primary_provider and current_provider == primary_provider):
-            agent._rate_limited_until = time.monotonic() + 60
+            # Exponential backoff: keep upstream's 60s first-hit cooldown and
+            # escalate on CONSECUTIVE rate-limits: 60s → 2m → 4m → 8m → ... →
+            # 4h cap. The first 429 must NOT bench the primary for half an
+            # hour — fast primary restore is the common case; escalation only
+            # punishes providers that keep 429ing.
+            # Counter is reset by restore_primary_runtime on successful restore.
+            backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
+            agent._rate_limit_backoff_count = backoff_count + 1
+            # The cooldown caps after eight doublings. Cap the exponent too so
+            # a long-lived or restored agent with a large persisted counter
+            # cannot spend time allocating an arbitrarily large integer only
+            # for ``min`` to discard it.
+            capped_backoff_count = min(max(backoff_count, 0), 8)
+            backoff_seconds = min(60 * (2 ** capped_backoff_count), 14400)
+            agent._rate_limited_until = time.monotonic() + backoff_seconds
+            logging.info(
+                "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d)",
+                backoff_count, backoff_seconds, backoff_seconds / 60, backoff_count + 1,
+            )
     if agent._fallback_index >= len(agent._fallback_chain):
         # Chain exhausted.  If we actually walked a non-empty chain and the
         # failure was NOT a rate-limit/billing event (those already armed
