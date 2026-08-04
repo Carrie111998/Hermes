@@ -6,6 +6,7 @@ and implement the required methods.
 """
 
 import asyncio
+import functools
 import inspect
 import ipaddress
 import logging
@@ -197,12 +198,20 @@ def is_network_accessible(host: str) -> bool:
         return True
 
 
+@functools.lru_cache(maxsize=1)
 def _detect_macos_system_proxy() -> str | None:
     """Read the macOS system HTTP(S) proxy via ``scutil --proxy``.
 
     Returns an ``http://host:port`` URL string if an HTTP or HTTPS proxy is
     enabled, otherwise *None*.  Falls back silently on non-macOS or on any
     subprocess error.
+
+    Memoised (``lru_cache(maxsize=1)``): ``scutil --proxy`` is a blocking
+    subprocess call (capped at a 3s timeout) invoked from the otherwise
+    async ``resolve_proxy_url`` path.  Caching the result keeps the asyncio
+    event loop blocked for at most one call per process instead of once per
+    adapter connect.  System-proxy changes during a gateway's lifetime are
+    not tracked — set an explicit ``*_PROXY`` env var to override at runtime.
     """
     if sys.platform != "darwin":
         return None

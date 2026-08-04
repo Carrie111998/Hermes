@@ -229,7 +229,9 @@ def _make_chat_envelope(text="hello", sender_email="u@example.com", sender_type=
 
 class TestPlatformRegistration:
     def test_enum_value(self):
-        assert Platform.GOOGLE_CHAT.value == "google_chat"
+        # google_chat is a plugin platform, resolved as a dynamic enum member
+        # via Platform._missing_() rather than a static builtin attribute.
+        assert Platform("google_chat").value == "google_chat"
 
     def test_requirements_check_returns_true_when_available(self):
         # The shim flag is True in this test module.
