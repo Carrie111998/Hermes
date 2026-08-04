@@ -230,7 +230,11 @@ class TestDiscordSendImageFile:
         mock_channel.send = AsyncMock(return_value=mock_msg)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
+        # Use direct sys.modules mutation (same pattern as _ensure_discord_mock)
+        # instead of patch.object to avoid xdist cross-test state pollution.
+        _saved = sys.modules["discord"].File
+        sys.modules["discord"].File = MagicMock()
+        try:
             result = _run(
                 adapter.send_document(
                     chat_id="67890",
@@ -240,10 +244,12 @@ class TestDiscordSendImageFile:
                 )
             )
 
-        assert result.success
-        assert result.message_id == "100"
-        assert "file" in mock_channel.send.call_args.kwargs
-        assert file_cls.call_args.kwargs["filename"] == "renamed.pdf"
+            assert result.success
+            assert result.message_id == "100"
+            assert "file" in mock_channel.send.call_args.kwargs
+            assert sys.modules["discord"].File.call_args.kwargs["filename"] == "renamed.pdf"
+        finally:
+            sys.modules["discord"].File = _saved
 
     def test_send_video_uploads_file_attachment(self, adapter, tmp_path):
         """send_video should upload a native Discord attachment."""
@@ -256,7 +262,9 @@ class TestDiscordSendImageFile:
         mock_channel.send = AsyncMock(return_value=mock_msg)
         adapter._client.get_channel = MagicMock(return_value=mock_channel)
 
-        with patch.object(discord_mod_ref, "File", MagicMock()) as file_cls:
+        _saved = sys.modules["discord"].File
+        sys.modules["discord"].File = MagicMock()
+        try:
             result = _run(
                 adapter.send_video(
                     chat_id="67890",
@@ -265,10 +273,11 @@ class TestDiscordSendImageFile:
                 )
             )
 
-        assert result.success
-        assert result.message_id == "101"
-        assert "file" in mock_channel.send.call_args.kwargs
-        assert file_cls.call_args.kwargs["filename"] == "clip.mp4"
+            assert result.success
+            assert result.message_id == "101"
+            assert "file" in mock_channel.send.call_args.kwargs
+        finally:
+            sys.modules["discord"].File = _saved
 
     def test_returns_error_when_file_missing(self, adapter):
         result = _run(
