@@ -129,6 +129,7 @@ import {
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret as encryptDesktopSecretStrict,
   readFileDataUrlForIpc,
+  rejectSensitiveFilePath,
   resolveReadableFileForIpc,
   resolveRequestedPathForIpc,
   resolveTimeoutMs,
@@ -8712,7 +8713,19 @@ function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {})
     return { action: 'deny' }
   })
   win.webContents.on('will-navigate', (event, url) => {
-    if ((DEV_SERVER && url.startsWith(DEV_SERVER)) || (!DEV_SERVER && url.startsWith('file:'))) {
+    let internal = false
+    try {
+      const parsed = new URL(url)
+      if (DEV_SERVER) {
+        const dev = new URL(DEV_SERVER)
+        internal = parsed.protocol === dev.protocol && parsed.host === dev.host
+      } else {
+        internal = parsed.protocol === 'file:' && !parsed.host
+      }
+    } catch {
+      internal = false
+    }
+    if (internal) {
       return
     }
 
@@ -11071,7 +11084,9 @@ ipcMain.handle('hermes:fs:reveal', async (_event, targetPath) => {
   }
 
   try {
-    shell.showItemInFolder(target)
+    const resolved = resolveRequestedPathForIpc(expandUserPath(target), { purpose: 'Reveal path' })
+    rejectSensitiveFilePath(resolved, 'Reveal path')
+    shell.showItemInFolder(resolved)
 
     return true
   } catch {
@@ -11137,9 +11152,11 @@ ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
     throw new Error('Invalid rename')
   }
 
-  const dst = path.join(path.dirname(src), name)
+  const resolvedSrc = resolveRequestedPathForIpc(expandUserPath(src), { purpose: 'Rename path' })
+  rejectSensitiveFilePath(resolvedSrc, 'Rename path')
+  const dst = path.join(path.dirname(resolvedSrc), name)
 
-  if (dst === src) {
+  if (dst === resolvedSrc) {
     return { path: dst }
   }
 
@@ -11147,7 +11164,7 @@ ipcMain.handle('hermes:fs:rename', async (_event, targetPath, newName) => {
     throw new Error(`"${name}" already exists`)
   }
 
-  await fs.promises.rename(src, dst)
+  await fs.promises.rename(resolvedSrc, dst)
 
   return { path: dst }
 })
@@ -11189,7 +11206,9 @@ ipcMain.handle('hermes:fs:trash', async (_event, targetPath) => {
     throw new Error('Invalid delete')
   }
 
-  await shell.trashItem(target)
+  const resolved = resolveRequestedPathForIpc(expandUserPath(target), { purpose: 'Trash path' })
+  rejectSensitiveFilePath(resolved, 'Trash path')
+  await shell.trashItem(resolved)
 
   return true
 })

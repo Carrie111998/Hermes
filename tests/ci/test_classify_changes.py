@@ -67,6 +67,15 @@ CASES = {
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
+    "linux compose → docker meta": (["docker-compose.yml"], _lanes(docker_meta=True)),
+    "windows compose → docker meta": (
+        ["docker-compose.windows.yml"],
+        _lanes(docker_meta=True),
+    ),
+    "compose variant → docker meta": (
+        ["docker-compose.dev.yml", "docker-compose.override.yml"],
+        _lanes(docker_meta=True),
+    ),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
     "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),

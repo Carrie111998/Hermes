@@ -317,6 +317,15 @@ def quick() -> Dict[str, Any]:
         p = Path(item["path"])
         cat = item["category"]
 
+        # tracked.json is durable, user-editable state.  Re-validate every
+        # path at the destructive boundary instead of trusting that it once
+        # passed track(); stale or tampered entries must never escape the
+        # HERMES_HOME containment policy.
+        if not is_safe_path(p):
+            _log(f"REJECT tracked path outside HERMES_HOME: {p}")
+            errors.append(f"unsafe tracked path: {p}")
+            continue
+
         if not p.exists():
             _log(f"STALE: {p} (removed from tracking)")
             continue
@@ -465,6 +474,9 @@ def deep(
 
     for item in tracked:
         p = Path(item["path"])
+        if not is_safe_path(p):
+            _log(f"REJECT tracked path outside HERMES_HOME: {p}")
+            continue
         if not p.exists():
             continue
         age = (now - datetime.fromisoformat(item["timestamp"])).days
@@ -488,6 +500,9 @@ def deep(
             if confirm(item):
                 try:
                     p = Path(item["path"])
+                    if not is_safe_path(p):
+                        _log(f"REJECT tracked path outside HERMES_HOME: {p}")
+                        continue
                     if p.is_file():
                         p.unlink()
                     elif p.is_dir():

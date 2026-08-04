@@ -62,4 +62,35 @@ describe('JsonRpcGatewayClient connect() URL guard', () => {
       expect(client.connectionState).toBe('open')
     }
   })
+
+  it('coalesces concurrent connect() calls into a single socket open', async () => {
+    const factory = vi.fn(() => new FakeSocket() as unknown as WebSocket)
+    const client = new JsonRpcGatewayClient({ socketFactory: factory })
+
+    const [a, b] = await Promise.all([
+      client.connect('ws://127.0.0.1:1234/api/ws'),
+      client.connect('ws://127.0.0.1:1234/api/ws')
+    ])
+
+    expect(a).toBeUndefined()
+    expect(b).toBeUndefined()
+    // Both callers awaited the SAME in-flight connect; a second socket was
+    // never created and the client settled on exactly one 'open'.
+    expect(factory).toHaveBeenCalledTimes(1)
+    expect(client.connectionState).toBe('open')
+  })
+
+  it('revalidates the URL when a later connect() retries after a failure', async () => {
+    const factory = vi.fn(() => new FakeSocket() as unknown as WebSocket)
+    const client = new JsonRpcGatewayClient({ socketFactory: factory })
+
+    await expect(client.connect('not a url')).rejects.toThrow(/requires a ws:\/\/ or wss:\/\/ URL string/)
+    expect(factory).not.toHaveBeenCalled()
+
+    // A failed connect cleared the coalesced promise, so a fresh valid URL
+    // must start a NEW connection rather than replaying the rejection.
+    await client.connect('ws://127.0.0.1:1234/api/ws')
+    expect(client.connectionState).toBe('open')
+    expect(factory).toHaveBeenCalledTimes(1)
+  })
 })

@@ -226,6 +226,25 @@ class TestStaleCronEntryMigration:
 
 
 class TestTrackForgetQuick:
+    def test_quick_revalidates_tampered_tracked_path(self, _isolate_env, tmp_path):
+        """A forged registry entry must never delete outside HERMES_HOME."""
+        dg = _load_lib()
+        victim = tmp_path / "outside-victim.txt"
+        victim.write_text("keep me", encoding="utf-8")
+        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
+        tracked_file.parent.mkdir(parents=True)
+        tracked_file.write_text(json.dumps([{
+            "path": str(victim),
+            "category": "test",
+            "timestamp": "2020-01-01T00:00:00+00:00",
+            "size": victim.stat().st_size,
+        }]), encoding="utf-8")
+
+        summary = dg.quick()
+
+        assert summary["deleted"] == 0
+        assert victim.exists()
+
     def test_track_then_quick_deletes_test(self, _isolate_env):
         dg = _load_lib()
         p = _isolate_env / "test_a.py"
@@ -313,6 +332,26 @@ class TestPostToolCallHook:
         tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
         data = json.loads(tracked_file.read_text())
         assert any(Path(i["path"]) == p.resolve() for i in data)
+
+    def test_terminal_regex_captures_windows_drive_paths(self):
+        """Terminal result text with Windows drive paths (backslash form) must
+        be picked up — the scanner used to only match POSIX-style paths, so
+        Windows terminals reported created files that were never tracked."""
+        pi = _load_plugin_init()
+        result = "created C:\\Users\\dejan\\AppData\\Local\\Temp\\x\\tmp_created.log\n"
+        matches = pi._TERMINAL_PATH_REGEX.findall(result)
+        assert matches
+        assert matches[0].startswith("C:")
+
+    def test_terminal_command_extracts_windows_drive_token(self):
+        """A git-bash style `touch C:/Users/...` command token must be treated
+        as a candidate path."""
+        pi = _load_plugin_init()
+        paths = pi._extract_paths_from_terminal(
+            {"command": "touch C:/Users/dejan/tmp_created.log"},
+            "",
+        )
+        assert any("C:/Users/dejan/tmp_created.log" in p for p in paths)
 
     def test_ignores_unrelated_tool(self, _isolate_env):
         pi = _load_plugin_init()

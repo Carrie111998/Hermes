@@ -768,6 +768,14 @@ class MemoryStore:
         try:
             return path.read_text(encoding="utf-8"), True
         except (OSError, IOError, UnicodeDecodeError):
+            # A present-but-unreadable file is not an empty store.  Return
+            # ``("", False)`` so read-modify-write callers (``_reload_target``)
+            # abort with the ``_READ_FAILED`` sentinel instead of persisting
+            # over — and wiping — the on-disk memory.  Invalid UTF-8 counts as
+            # unreadable: those bytes can't be round-tripped, so a rewrite
+            # would corrupt or discard them.  Read-only callers
+            # (``load_from_disk``) degrade to ``[]`` — nothing is written back
+            # there, so a transient startup read blip never crashes the session.
             return "", False
 
     @staticmethod

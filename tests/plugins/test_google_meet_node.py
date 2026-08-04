@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -60,6 +61,91 @@ def test_registry_add_get_roundtrip_persists(tmp_path):
     assert entry["url"] == "ws://mac.local:18789"
     assert entry["token"] == "deadbeef"
     assert "added_at" in entry
+
+
+def test_registry_file_is_private(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    p = tmp_path / "nodes.json"
+    NodeRegistry(path=p).add("mac", "ws://mac.local:18789", "secret")
+    if os.name == "posix":
+        assert p.stat().st_mode & 0o077 == 0
+
+
+def test_registry_get_returns_none_when_missing(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    assert r.get("ghost") is None
+
+
+def test_registry_remove(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    r.add("a", "ws://a", "t")
+    assert r.remove("a") is True
+    assert r.get("a") is None
+    assert r.remove("a") is False  # idempotent
+
+
+def test_registry_list_all_sorted(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    r.add("zeta", "ws://z", "t1")
+    r.add("alpha", "ws://a", "t2")
+    names = [n["name"] for n in r.list_all()]
+    assert names == ["alpha", "zeta"]
+
+
+def test_registry_resolve_auto_picks_single(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    r.add("mac", "ws://mac", "t")
+    picked = r.resolve(None)
+    assert picked is not None
+    assert picked["name"] == "mac"
+
+
+def test_registry_resolve_ambiguous_returns_none(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    r.add("a", "ws://a", "t")
+    r.add("b", "ws://b", "t")
+    assert r.resolve(None) is None
+
+
+def test_registry_resolve_empty_returns_none(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    assert r.resolve(None) is None
+
+
+def test_registry_resolve_by_name(tmp_path):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    r = NodeRegistry(path=tmp_path / "n.json")
+    r.add("a", "ws://a", "t")
+    r.add("b", "ws://b", "t")
+    picked = r.resolve("b")
+    assert picked is not None
+    assert picked["name"] == "b"
+    assert r.resolve("ghost") is None
+
+
+def test_registry_defaults_to_hermes_home(tmp_path, monkeypatch):
+    from plugins.google_meet.node.registry import NodeRegistry
+
+    # _isolate_home already set HERMES_HOME to tmp_path/.hermes; the
+    # registry default path must live inside that tree.
+    r = NodeRegistry()
+    r.add("x", "ws://x", "t")
+    expected = Path(tmp_path) / ".hermes" / "workspace" / "meetings" / "nodes.json"
+    assert expected.is_file()
 
 
 # ---------------------------------------------------------------------------

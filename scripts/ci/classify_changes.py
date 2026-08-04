@@ -42,7 +42,18 @@ import sys
 
 _FRONTEND = ("ui-tui/", "web/", "apps/")  # TS typecheck-matrix packages
 _ROOT_NPM = {"package.json", "package-lock.json"}  # shifts every package's tree
-_DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
+_DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile")  # docker setup
+# docker-compose family: the two shipped files plus any ``docker-compose.*.yml``
+# variant (dev/override/prod/...). Matching only the exact names above would
+# let a variant fall through into the Python lane and silently skip the
+# docker lane that builds/tests it.
+_DOCKER_COMPOSE_FILES = ("docker-compose.yml", "docker-compose.windows.yml")
+
+
+def _is_docker_meta(p: str) -> bool:
+    return p.startswith(_DOCKER_META) or p in _DOCKER_COMPOSE_FILES or (
+        p.startswith("docker-compose.") and p.endswith(".yml")
+    )
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
@@ -75,7 +86,7 @@ def _is_docs(p: str) -> bool:
 
 
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or _is_docker_meta(p)
 
 
 def _py_test_only(p: str) -> bool:
@@ -117,7 +128,7 @@ def classify(files: list[str]) -> dict[str, bool]:
     ret = {
         "python": any(not _py_irrelevant(f) for f in files),
         "python_prod": any(not _py_irrelevant(f) and not _py_test_only(f) for f in files),
-        "docker_meta":  any(f.startswith(_DOCKER_META) for f in files),
+        "docker_meta":  any(_is_docker_meta(f) for f in files),
         "frontend": any(f.startswith(_FRONTEND) or f in _ROOT_NPM for f in files),
         "site": any(f.startswith(_SITE) for f in files),
         "scan": any(_is_scan(f) for f in files),

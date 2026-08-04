@@ -74,6 +74,7 @@ export class JsonRpcGatewayClient {
   private pending = new Map<GatewayRequestId, PendingCall>()
   private socket: WebSocketLike | null = null
   private state: ConnectionState = 'idle'
+  private connectPromise: Promise<void> | null = null
   private readonly eventHandlers = new Map<string, Set<(event: GatewayEvent) => void>>()
   private readonly stateHandlers = new Set<(state: ConnectionState) => void>()
   private readonly options: Required<Omit<GatewayClientOptions, 'socketFactory'>> &
@@ -122,10 +123,22 @@ export class JsonRpcGatewayClient {
       throw invalidUrl()
     }
 
-    if (this.socket?.readyState === WebSocket.OPEN || this.state === 'connecting') {
+    if (this.socket?.readyState === WebSocket.OPEN) {
       return
     }
+    if (this.connectPromise) {
+      return this.connectPromise
+    }
 
+    this.connectPromise = this.openConnection(wsUrl)
+    try {
+      await this.connectPromise
+    } finally {
+      this.connectPromise = null
+    }
+  }
+
+  private async openConnection(wsUrl: string): Promise<void> {
     this.setState('connecting')
 
     const socket = this.options.socketFactory?.(wsUrl) ?? new WebSocket(wsUrl)

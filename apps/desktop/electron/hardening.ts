@@ -356,6 +356,7 @@ export {
   DEFAULT_FETCH_TIMEOUT_MS,
   encryptDesktopSecret,
   readFileDataUrlForIpc,
+  rejectSensitiveFilePath,
   rejectUnsafePathSyntax,
   resolveDirectoryForIpc,
   resolveReadableFileForIpc,
