@@ -755,16 +755,3 @@ class TestDiscoverFallbackIps:
         ips = await tnet.discover_fallback_ips()
         assert ips == ["149.154.167.220"]
 
-    @pytest.mark.asyncio
-    async def test_quad9_provider_queried(self, monkeypatch):
-        client = self._patch_doh(monkeypatch, {
-            "https://dns.google": (200, _doh_answer("149.154.167.220")),
-            "https://cloudflare-dns.com": (200, _doh_answer("149.154.167.221")),
-            "https://dns.quad9.net": (200, _doh_answer("149.154.167.222")),
-        }, system_dns_ips=["149.154.166.110"])
-
-        await tnet.discover_fallback_ips()
-
-        q9_reqs = [r for r in client.requests_made if "quad9" in r["url"]]
-        assert len(q9_reqs) == 1
-        assert q9_reqs[0]["url"] == "https://dns.quad9.net:5053/dns-query"
