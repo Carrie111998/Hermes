@@ -31,6 +31,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 import time as _time
 from datetime import datetime
 from pathlib import Path
@@ -1210,6 +1211,283 @@ def _print_stash_cleanup_guidance(
         print(
             f"  Look for commit {stash_ref}, then drop its selector with: git stash drop stash@{{N}}"
         )
+
+
+class _LocalPatchApplyError(RuntimeError):
+    """Raised when a user-maintained local update patch cannot be applied safely."""
+
+
+def _local_update_patches_dir() -> Path:
+    """Return the root-profile patch stack shared by every Hermes profile."""
+    from hermes_constants import get_default_hermes_root
+
+    return get_default_hermes_root() / "local-patches" / "hermes-agent"
+
+
+def _local_patch_manual_command(cwd: Path, patch_path: Path) -> str:
+    return (
+        f"cd {shlex.quote(str(cwd))} && "
+        f"git apply --3way {shlex.quote(str(patch_path))}"
+    )
+
+
+def _ensure_no_unmerged_local_patch_paths(
+    git_cmd: list[str],
+    cwd: Path,
+    patch_path: Path,
+    *,
+    env: Optional[dict[str, str]] = None,
+) -> None:
+    """Fail closed if ``git apply --3way`` left unresolved conflict paths."""
+    result = subprocess.run(
+        git_cmd + ["diff", "--name-only", "--diff-filter=U"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        env=env,
+    )
+    if result.returncode != 0:
+        print(f"  ✗ Could not verify conflict state after {patch_path.name}")
+        if result.stderr.strip():
+            print(result.stderr.strip())
+        print("  Local patch was preserved; reapply manually after checking the repo:")
+        print(f"    {_local_patch_manual_command(cwd, patch_path)}")
+        raise _LocalPatchApplyError(f"could not verify local patch state: {patch_path}")
+
+    conflicted = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    if not conflicted:
+        return
+
+    print(f"  ✗ {patch_path.name} left unresolved conflict paths")
+    for path in conflicted[:10]:
+        print(f"    {path}")
+    if len(conflicted) > 10:
+        print(f"    ... and {len(conflicted) - 10} more")
+    print("  Resolve conflicts, then reapply/continue manually:")
+    print(f"    {_local_patch_manual_command(cwd, patch_path)}")
+    raise _LocalPatchApplyError(f"local patch left unresolved conflicts: {patch_path}")
+
+
+def _detect_applied_local_patch_stack(
+    git_cmd: list[str], cwd: Path, patches: list[Path]
+) -> set[Path]:
+    """Detect applied patches in reverse order using an isolated Git index.
+
+    Later patches may edit files introduced or changed by earlier patches, so
+    checking each patch in forward order with ``git apply --reverse --check``
+    reports false negatives once the full stack is present. Build a temporary
+    index from the current worktree, then peel applicable patches in reverse
+    order. The real index and worktree are never modified.
+    """
+    fd, index_name = tempfile.mkstemp(prefix="hermes-local-patches-index-")
+    os.close(fd)
+    index_path = Path(index_name)
+    index_path.unlink(missing_ok=True)
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = str(index_path)
+    run_kwargs = {
+        "cwd": cwd,
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "env": env,
+    }
+    try:
+        if subprocess.run(git_cmd + ["read-tree", "HEAD"], **run_kwargs).returncode != 0:
+            return set()
+        if subprocess.run(git_cmd + ["add", "-A"], **run_kwargs).returncode != 0:
+            return set()
+
+        applied: set[Path] = set()
+        for patch_path in reversed(patches):
+            check = subprocess.run(
+                git_cmd
+                + ["apply", "--cached", "--reverse", "--check", str(patch_path)],
+                **run_kwargs,
+            )
+            if check.returncode != 0:
+                continue
+            peeled = subprocess.run(
+                git_cmd + ["apply", "--cached", "--reverse", str(patch_path)],
+                **run_kwargs,
+            )
+            if peeled.returncode == 0:
+                applied.add(patch_path)
+        return applied
+    finally:
+        index_path.unlink(missing_ok=True)
+
+
+def _isolated_local_patch_apply_index(
+    git_cmd: list[str], cwd: Path
+) -> tuple[Path, dict[str, str]]:
+    """Clone the current Git index for three-way patch application.
+
+    ``git apply --3way`` implies ``--index``. Pointing it at a cloned index
+    preserves the caller's staged state while still allowing later patches in
+    an overlapping stack to see earlier patch results.
+    """
+    fd, index_name = tempfile.mkstemp(prefix="hermes-local-patch-apply-index-")
+    os.close(fd)
+    index_path = Path(index_name)
+    index_path.unlink(missing_ok=True)
+
+    result = subprocess.run(
+        git_cmd + ["rev-parse", "--git-path", "index"],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if result.returncode != 0:
+        index_path.unlink(missing_ok=True)
+        raise _LocalPatchApplyError("could not locate Git index for local patches")
+
+    real_index: Optional[Path] = None
+    if result.stdout.strip():
+        real_index = Path(result.stdout.strip())
+        if not real_index.is_absolute():
+            real_index = cwd / real_index
+    try:
+        if real_index is not None and real_index.exists():
+            shutil.copyfile(real_index, index_path)
+    except OSError as exc:
+        index_path.unlink(missing_ok=True)
+        raise _LocalPatchApplyError("could not clone Git index for local patches") from exc
+
+    env = os.environ.copy()
+    env["GIT_INDEX_FILE"] = str(index_path)
+    if not index_path.exists():
+        initialized = subprocess.run(
+            git_cmd + ["read-tree", "HEAD"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            env=env,
+        )
+        if initialized.returncode != 0:
+            index_path.unlink(missing_ok=True)
+            raise _LocalPatchApplyError("could not initialize Git index for local patches")
+    return index_path, env
+
+
+def _apply_local_update_patches(git_cmd: list[str], cwd: Path) -> bool:
+    """Apply external local patches after the upstream checkout is settled."""
+    if os.getenv("HERMES_SKIP_LOCAL_PATCHES", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }:
+        print("→ Local Hermes patches: skipped (HERMES_SKIP_LOCAL_PATCHES is set)")
+        return False
+
+    patches_dir = _m()._local_update_patches_dir()
+    try:
+        patches = sorted(
+            p for p in patches_dir.iterdir() if p.is_file() and p.suffix == ".patch"
+        )
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        print(f"✗ Could not read local Hermes patch directory: {patches_dir}")
+        print(f"  {exc}")
+        print("  Refusing to continue update post-steps without checking local patches.")
+        raise _LocalPatchApplyError(f"could not read local patch directory: {patches_dir}")
+
+    if not patches:
+        return False
+
+    print("→ Applying local Hermes patches...")
+    applied_any = False
+    already_applied = _detect_applied_local_patch_stack(git_cmd, cwd, patches)
+    apply_index_path, apply_env = _isolated_local_patch_apply_index(git_cmd, cwd)
+    try:
+        for patch_path in patches:
+            if patch_path in already_applied:
+                print(f"  ✓ {patch_path.name} already applied")
+                applied_any = True
+                continue
+
+            preflight = subprocess.run(
+                git_cmd + ["apply", "--check", "--3way", str(patch_path)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=apply_env,
+            )
+            if preflight.returncode != 0:
+                print(f"  ✗ {patch_path.name} failed")
+                if preflight.stdout.strip():
+                    print(preflight.stdout.strip())
+                if preflight.stderr.strip():
+                    print(preflight.stderr.strip())
+                print(
+                    "  Local patch was preserved; reapply manually after resolving conflicts:"
+                )
+                print(f"    {_local_patch_manual_command(cwd, patch_path)}")
+                raise _LocalPatchApplyError(
+                    f"local patch preflight failed: {patch_path}"
+                )
+
+            result = subprocess.run(
+                git_cmd + ["apply", "--3way", str(patch_path)],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=apply_env,
+            )
+            if result.returncode != 0:
+                print(f"  ✗ {patch_path.name} failed")
+                if result.stdout.strip():
+                    print(result.stdout.strip())
+                if result.stderr.strip():
+                    print(result.stderr.strip())
+                print(
+                    "  Local patch was preserved; reapply manually after resolving conflicts:"
+                )
+                print(f"    {_local_patch_manual_command(cwd, patch_path)}")
+                raise _LocalPatchApplyError(f"local patch failed: {patch_path}")
+            _m()._ensure_no_unmerged_local_patch_paths(
+                git_cmd, cwd, patch_path, env=apply_env
+            )
+            print(f"  ✓ {patch_path.name}")
+            applied_any = True
+    finally:
+        apply_index_path.unlink(missing_ok=True)
+
+    return applied_any
+
+
+def _apply_local_update_patches_or_exit(git_cmd: list[str], cwd: Path) -> bool:
+    """Apply local update patches and stop ``hermes update`` on unsafe state."""
+    try:
+        processed = _m()._apply_local_update_patches(git_cmd, cwd)
+    except _LocalPatchApplyError:
+        sys.exit(1)
+
+    if processed:
+        syntax_ok, failing_path, syntax_error = _m()._validate_critical_files_syntax(cwd)
+        if not syntax_ok:
+            print()
+            print("✗ Local Hermes patch produced a syntax error in a critical file:")
+            print(f"  {failing_path}")
+            if syntax_error:
+                for line in str(syntax_error).splitlines()[:6]:
+                    print(f"    {line}")
+            print("  Fix the local patch stack before continuing update post-steps.")
+            sys.exit(1)
+    return processed
 
 def _stash_apply_failed_only_on_existing_untracked(stderr: str) -> bool:
     """True when a ``git stash apply`` failure is ONLY about untracked files
@@ -3844,8 +4122,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
         commit_count = int(result.stdout.strip())
 
         if commit_count == 0:
-            _invalidate_update_cache()
-
             # Even if origin is up to date, the fork may be behind upstream
             if is_fork and branch == "main":
                 _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
@@ -3867,6 +4143,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     text=True, encoding="utf-8", errors="replace",
                     check=False,
                 )
+
+            _m()._apply_local_update_patches_or_exit(git_cmd, _m().PROJECT_ROOT)
+            _invalidate_update_cache()
 
             # "No new commits" does not mean the managed interpreter is safe.
             # uv can retain the same CPython patch while python-build-standalone
@@ -4059,6 +4338,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                         input_fn=gw_input_fn,
                     )
 
+        # Fork synchronization can change the checkout again after origin/main
+        # was merged, so settle it before restoring the durable local patch stack.
+        if is_fork and branch == "main":
+            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
+
+        _m()._apply_local_update_patches_or_exit(git_cmd, _m().PROJECT_ROOT)
         _invalidate_update_cache()
 
         # Clear stale .pyc bytecode cache — prevents ImportError on gateway
@@ -4070,10 +4355,6 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}"
             )
         _m()._record_bytecode_fingerprint()
-
-        # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
-            _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra
         # breaks on this machine, keep base deps and reinstall the remaining extras

@@ -5035,6 +5035,8 @@ def _clear_bytecode_cache(root: Path) -> int:
 # hermes_cli.main._run_pre_update_backup, ...) keep resolving unchanged.
 from hermes_cli.update_cmd import (  # noqa: F401
     _add_upstream_remote,
+    _apply_local_update_patches,
+    _apply_local_update_patches_or_exit,
     _atomic_replace_dir,
     _capture_head_sha,
     _cmd_update_check,
@@ -5046,6 +5048,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _discard_stashed_changes,
     _ensure_acp_launcher,
     _ensure_fhs_path_guard,
+    _ensure_no_unmerged_local_patch_paths,
     _ensure_uv_for_termux,
     _finish_dashboard_update_cleanup,
     _for_each_systemd_gateway_unit,
@@ -5060,6 +5063,8 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _is_android_python,
     _is_fork,
     _leftover_pausable_gateway_pids,
+    _local_patch_manual_command,
+    _local_update_patches_dir,
     _log_only_write,
     _mark_skip_upstream_prompt,
     _npm_bin_exists,
@@ -5103,6 +5108,7 @@ from hermes_cli.update_cmd import (  # noqa: F401
     _write_marker_file,
     _write_update_incomplete_marker,
     _write_update_planned_stop_marker,
+    _LocalPatchApplyError,
     _UPDATE_RUNTIME_RELOAD_MODULES,
     _UPDATE_CRITICAL_FILES,
     _UPDATE_CRITICAL_MODULES,
