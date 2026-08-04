@@ -763,7 +763,14 @@ def _effective_parent_toolsets(parent_agent) -> set[str]:
     disabled = {str(name) for name in raw_disabled}
     if parent_enabled is not None:
         if isinstance(parent_enabled, (list, tuple, set)):
-            return {str(name) for name in parent_enabled} - disabled
+            # Keep inherited pre-flight aligned with _build_child_agent(): a
+            # configured composite such as ``hermes-cli`` supplies its member
+            # toolsets to the child.  Expand through the established delegation
+            # helper before subtracting explicit disables, so ``file`` remains
+            # available for a composite parent unless it was disabled.
+            return _expand_parent_toolsets(
+                {str(name) for name in parent_enabled}
+            ) - disabled
         return set()
 
     loaded_names = getattr(parent_agent, "valid_tool_names", None)
@@ -2040,6 +2047,36 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _matches_delegated_profile_marker(profile_name: Any, profile_path: Path) -> bool:
+    """Return whether a worker's private marker maps to its canonical path.
+
+    Target construction records a validated durable-profile name and the result
+    of ``get_profile_dir``. Re-resolve that name here rather than trusting a
+    non-empty marker alongside an arbitrary absolute path. This retains custom
+    ``HERMES_HOME`` / test roots and the default-profile alias without deriving
+    a parallel profile-root policy in delegation.
+    """
+    if not isinstance(profile_name, str) or not profile_name.strip():
+        return False
+    try:
+        from hermes_cli.profiles import (
+            get_profile_dir,
+            normalize_profile_name,
+            validate_profile_name,
+        )
+
+        canonical_name = normalize_profile_name(profile_name)
+        validate_profile_name(canonical_name)
+        return (
+            profile_name == canonical_name
+            and profile_path == get_profile_dir(canonical_name)
+        )
+    except Exception:
+        # A worker must never acquire target scope when canonical resolution is
+        # unavailable or inconsistent; generic child execution remains unscoped.
+        return False
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2064,13 +2101,13 @@ def _run_single_child(
     # Only the trusted construction path sets both markers. ``MagicMock`` and
     # other generic test doubles can implement ``__fspath__`` and stringify to
     # relative pseudo-paths; an arbitrary child attribute must never switch
-    # its config/secret scope. Durable profiles are absolute directories from
-    # ``get_profile_dir`` paired with a validated durable-profile name.
+    # its config/secret scope. Re-resolving the marker through the canonical
+    # profile helper also prevents a valid-looking name from claiming a
+    # different absolute profile path.
     if (
-        isinstance(profile_name, str)
-        and bool(profile_name.strip())
-        and profile_path is not None
+        profile_path is not None
         and profile_path.is_absolute()
+        and _matches_delegated_profile_marker(profile_name, profile_path)
     ):
         try:
             with _delegated_profile_runtime_scope(profile_path):

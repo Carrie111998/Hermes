@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import threading
 import time
@@ -681,6 +682,92 @@ def test_required_toolsets_use_loaded_parent_capabilities_when_enabled_toolsets_
     assert counters == {"provider": 1, "child": 1}
 
 
+def test_required_toolsets_expand_configured_parent_composites_before_preflight(
+    monkeypatch,
+):
+    """A hermes-cli parent provides file through the real child expansion path."""
+    parent = _parent_agent(enabled_toolsets=["hermes-cli"])
+    counters = {"provider": 0, "child": 0}
+
+    def _fake_legacy_credentials(_cfg, _parent, model_override=None):
+        counters["provider"] += 1
+        return {
+            "model": "legacy-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    def _fake_build(**kwargs):
+        counters["child"] += 1
+        return SimpleNamespace(
+            model=kwargs["model"],
+            _delegate_role="leaf",
+            session_id="composite-parent-child",
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", _fake_legacy_credentials)
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_build)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "composite capability complete",
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": "leaf",
+            "_child_cost_usd": 0.0,
+        },
+    )
+
+    result = json.loads(
+        delegate_task(
+            goal="Read the local project files",
+            required_toolsets=["file"],
+            parent_agent=parent,
+        )
+    )
+
+    assert "error" not in result, result
+    assert result["results"][0]["status"] == "completed"
+    assert counters == {"provider": 1, "child": 1}
+
+
+def test_required_toolsets_respect_disabled_toolsets_after_composite_expansion(
+    monkeypatch,
+):
+    """A disabled file toolset remains unavailable even through hermes-cli."""
+    parent = _parent_agent(
+        enabled_toolsets=["hermes-cli"], disabled_toolsets=["file"]
+    )
+    counters = {"provider": 0, "child": 0}
+
+    def _provider_called(*_args, **_kwargs):
+        counters["provider"] += 1
+        raise AssertionError("pre-flight refusal must precede provider resolution")
+
+    def _child_constructed(*_args, **_kwargs):
+        counters["child"] += 1
+        raise AssertionError("pre-flight refusal must precede child construction")
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", _provider_called)
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _child_constructed)
+
+    result = json.loads(
+        delegate_task(
+            goal="Read a disabled local file",
+            required_toolsets=["file"],
+            parent_agent=parent,
+        )
+    )
+
+    assert "error" in result
+    assert "file" in result["error"]
+    assert counters == {"provider": 0, "child": 0}
+
+
 def test_empty_loaded_parent_capabilities_do_not_fall_back_to_global_tool_discovery(
     monkeypatch,
 ):
@@ -716,6 +803,225 @@ def test_empty_loaded_parent_capabilities_do_not_fall_back_to_global_tool_discov
 
     assert "error" in result
     assert "computer_use" in result["error"]
+    assert counters == {"provider": 0, "child": 0, "fallback": 0}
+
+
+def test_matching_profile_marker_and_canonical_path_enter_worker_scope(
+    monkeypatch, tmp_path
+):
+    """A trusted marker may re-enter only its canonical custom-home profile."""
+    import tools.delegate_tool as delegate_module
+    from hermes_cli.profiles import get_profile_dir
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_profile(hermes_home, "worker-specialist", "agent: {}\n")
+    profile_home = get_profile_dir("worker-specialist")
+    child = SimpleNamespace(
+        _delegate_profile_name="worker-specialist",
+        _delegate_profile_home=str(profile_home),
+    )
+    scope_homes: list[object] = []
+    fallback_calls = 0
+
+    @contextmanager
+    def _capture_scope(profile_path):
+        scope_homes.append(profile_path)
+        yield
+
+    def _capture_fallback(task_index, goal, child, parent_agent, **_kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return {"task_index": task_index, "status": "completed"}
+
+    monkeypatch.setattr(delegate_module, "_delegated_profile_runtime_scope", _capture_scope)
+    monkeypatch.setattr(
+        delegate_module, "_run_single_child_in_profile_scope", _capture_fallback
+    )
+
+    result = delegate_module._run_single_child(
+        0, "Run under the matching durable profile", child=child, parent_agent=_parent_agent()
+    )
+
+    assert result["status"] == "completed"
+    assert scope_homes == [profile_home]
+    assert fallback_calls == 1
+
+
+def test_mismatched_profile_marker_and_absolute_path_do_not_enter_worker_scope(
+    monkeypatch, tmp_path
+):
+    """A valid marker cannot switch scope to a different profile directory."""
+    import tools.delegate_tool as delegate_module
+    from hermes_cli.profiles import get_profile_dir
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_profile(hermes_home, "trusted-specialist", "agent: {}\n")
+    _write_profile(hermes_home, "different-specialist", "agent: {}\n")
+    trusted_home = get_profile_dir("trusted-specialist")
+    different_home = get_profile_dir("different-specialist")
+    child = SimpleNamespace(
+        _delegate_profile_name="trusted-specialist",
+        _delegate_profile_home=str(different_home),
+    )
+    scope_homes: list[object] = []
+    fallback_calls = 0
+
+    @contextmanager
+    def _capture_scope(profile_path):
+        scope_homes.append(profile_path)
+        yield
+
+    def _safe_fallback(task_index, goal, child, parent_agent, **_kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return {"task_index": task_index, "status": "completed"}
+
+    monkeypatch.setattr(delegate_module, "_delegated_profile_runtime_scope", _capture_scope)
+    monkeypatch.setattr(
+        delegate_module, "_run_single_child_in_profile_scope", _safe_fallback
+    )
+
+    result = delegate_module._run_single_child(
+        0, "Do not trust a mismatched profile path", child=child, parent_agent=_parent_agent()
+    )
+
+    assert result["status"] == "completed"
+    assert scope_homes == []
+    assert fallback_calls == 1
+    for profile_home in (trusted_home, different_home):
+        assert not (profile_home / "cache").exists()
+        assert not (profile_home / "SOUL.md").exists()
+
+
+def test_malformed_profile_marker_cannot_establish_worker_scope(monkeypatch, tmp_path):
+    """Traversal-like markers cannot turn an absolute path into a profile scope."""
+    import tools.delegate_tool as delegate_module
+    from hermes_cli.profiles import get_profile_dir
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    _write_profile(hermes_home, "worker-specialist", "agent: {}\n")
+    profile_home = get_profile_dir("worker-specialist")
+    scope_homes: list[object] = []
+    fallback_calls = 0
+
+    @contextmanager
+    def _capture_scope(profile_path):
+        scope_homes.append(profile_path)
+        yield
+
+    def _safe_fallback(task_index, goal, child, parent_agent, **_kwargs):
+        nonlocal fallback_calls
+        fallback_calls += 1
+        return {"task_index": task_index, "status": "completed"}
+
+    monkeypatch.setattr(delegate_module, "_delegated_profile_runtime_scope", _capture_scope)
+    monkeypatch.setattr(
+        delegate_module, "_run_single_child_in_profile_scope", _safe_fallback
+    )
+
+    for marker in ("../worker-specialist", "worker-specialist/../../other"):
+        child = SimpleNamespace(
+            _delegate_profile_name=marker,
+            _delegate_profile_home=str(profile_home),
+        )
+        result = delegate_module._run_single_child(
+            0, "Do not trust a traversal marker", child=child, parent_agent=_parent_agent()
+        )
+        assert result["status"] == "completed"
+
+    assert scope_homes == []
+    assert fallback_calls == 2
+    assert not (profile_home / "cache").exists()
+    assert not (profile_home / "SOUL.md").exists()
+
+
+def test_required_toolsets_accept_configured_atomic_parent_capability(monkeypatch):
+    """Configured atomic parent toolsets retain their existing preflight behavior."""
+    parent = _parent_agent(enabled_toolsets=["file"])
+    counters = {"provider": 0, "child": 0}
+
+    def _fake_credentials(_cfg, _parent, model_override=None):
+        counters["provider"] += 1
+        return {
+            "model": "legacy-model",
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+
+    def _fake_child(**kwargs):
+        counters["child"] += 1
+        return SimpleNamespace(
+            model=kwargs["model"], _delegate_role="leaf", session_id="atomic-child"
+        )
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", _fake_credentials)
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _fake_child)
+    monkeypatch.setattr(
+        "tools.delegate_tool._run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "atomic capability complete",
+            "api_calls": 0,
+            "duration_seconds": 0,
+            "_child_role": "leaf",
+            "_child_cost_usd": 0.0,
+        },
+    )
+
+    result = json.loads(
+        delegate_task(
+            goal="Read a configured local file",
+            required_toolsets=["file"],
+            parent_agent=parent,
+        )
+    )
+
+    assert result["results"][0]["status"] == "completed"
+    assert counters == {"provider": 1, "child": 1}
+
+
+def test_required_toolsets_refuse_explicit_empty_parent_configuration_without_discovery(
+    monkeypatch,
+):
+    """An explicit empty configured list is restrictive rather than all-tools."""
+    parent = _parent_agent(enabled_toolsets=[])
+    counters = {"provider": 0, "child": 0, "fallback": 0}
+
+    def _provider_called(*_args, **_kwargs):
+        counters["provider"] += 1
+        raise AssertionError("empty configured parents must refuse before provider resolution")
+
+    def _child_constructed(*_args, **_kwargs):
+        counters["child"] += 1
+        raise AssertionError("empty configured parents must refuse before child construction")
+
+    def _incorrect_global_fallback(**_kwargs):
+        counters["fallback"] += 1
+        return [{"function": {"name": "file"}}]
+
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials", _provider_called)
+    monkeypatch.setattr("tools.delegate_tool._build_child_preserving_parent_tools", _child_constructed)
+    monkeypatch.setattr("model_tools.get_tool_definitions", _incorrect_global_fallback)
+
+    result = json.loads(
+        delegate_task(
+            goal="Use a capability that was explicitly disabled by an empty configuration",
+            required_toolsets=["file"],
+            parent_agent=parent,
+        )
+    )
+
+    assert "error" in result
+    assert "file" in result["error"]
     assert counters == {"provider": 0, "child": 0, "fallback": 0}
 
 
