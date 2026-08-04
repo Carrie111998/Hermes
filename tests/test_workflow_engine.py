@@ -281,7 +281,11 @@ def test_state_save_and_load(engine):
     assert loaded["results"]["a"] == "done"
 
     engine._clear_state("test-state")
-    assert engine._load_state("test-state") is None
+    # State is retained (with final_status marker) so a manual card
+    # reset can re-open the run — auto-resume support.
+    retained = engine._load_state("test-state")
+    assert retained is not None
+    assert retained["final_status"] == "completed"
 
 
 def test_state_clear_nonexistent(engine):

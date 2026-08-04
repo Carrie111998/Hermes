@@ -932,6 +932,43 @@ class WorkflowEngine:
                                           card.get("reason",
                                                    card.get("description", "")))))
 
+    def _review_already_passed(self, card_id: str) -> bool:
+        """Return True when the last workflow-engine comment is a PASS
+        and no newer 'pending review' re-request has happened.
+
+        Round-aware guard: a manual re-trigger (auto-resume) resets a
+        completed run's card and re-blocks with 'pending review',
+        writing a NEWER ``blocked`` event than the stale PASS comment.
+        In that case the review round is fresh — this returns False so
+        the reviewer's verdict is applied instead of being skipped.
+        """
+        try:
+            with kanban_db.connect_closing(board=self.kanban_board) as _chk:
+                existing = _chk.execute(
+                    "SELECT body, created_at FROM task_comments "
+                    "WHERE task_id = ? AND author = 'workflow-engine' "
+                    "ORDER BY created_at DESC LIMIT 1",
+                    (card_id,),
+                ).fetchone()
+                if not existing or "Review Passed" not in (existing[0] or ""):
+                    return False
+                block_row = _chk.execute(
+                    "SELECT created_at FROM task_events "
+                    "WHERE task_id = ? AND kind = 'blocked' "
+                    "AND payload LIKE '%pending review%' "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (card_id,),
+                ).fetchone()
+                # No re-request since the pass comment → stale round.
+                if not block_row or block_row[0] <= existing[1]:
+                    return True
+                # A fresh pending-review block came AFTER the pass
+                # comment — the review was re-requested. Apply verdict.
+                return False
+        except Exception:
+            pass
+        return False
+
     def _check_pending_review(self, card_id: str) -> bool:
         """Check if a card is blocked with reason "pending review".
 
@@ -1463,11 +1500,29 @@ class WorkflowEngine:
         with open(path) as f:
             return json.load(f)
 
-    def _clear_state(self, workflow_name: str, run_id: str = None):
-        """Remove state file after successful completion."""
+    def _clear_state(self, workflow_name: str, run_id: str = None,
+                     final_status: str = "completed"):
+        """Retain terminal state instead of deleting (supports auto-resume).
+
+        The state file is kept with ``final_status`` set so a manual card
+        reset (done -> ready) can re-open the exact run: the kanban hook
+        flips the node back to running and re-spawns the supervisor with
+        ``--resume --run-id <exact>``. Disk usage stays bounded via
+        ``_prune_old_runs`` (STATE_RETENTION_PER_WORKFLOW).
+        """
         path = self._state_path(workflow_name, run_id)
-        if path.exists():
-            path.unlink()
+        if not path.exists():
+            return
+        try:
+            with open(path) as f:
+                state = json.load(f)
+            state["final_status"] = final_status
+            state["updated_at"] = datetime.now(timezone.utc).isoformat()
+            with open(path, "w") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            # Unreadable state — nothing to resume from; delete as before.
+            path.unlink(missing_ok=True)
 
     def _find_latest_state(self, workflow_name: str,
                            run_id: Optional[str] = None) -> Optional[dict]:
@@ -3226,7 +3281,8 @@ class WorkflowEngine:
         if final_status == "completed":
             self._fire_completion_notification(workflow_name, workflow, states, layers, layer_idx, context, session_info=(context or {}).get("_session_info"))
 
-        self._clear_state(workflow_name, run_id=workflow.run_id)
+        self._clear_state(workflow_name, run_id=workflow.run_id,
+                          final_status=final_status)
 
         return results
 
@@ -3407,21 +3463,17 @@ class WorkflowEngine:
                                 break
 
                         if reviewer_for:
-                            # Check if review already passed (avoid infinite loop)
+                            # Check if review already passed (avoid infinite
+                            # loop) — but only when this is the SAME round.
+                            # Auto-resume re-requests review with a fresh
+                            # 'pending review' block; that must NOT be
+                            # suppressed by a stale PASS comment.
                             upstream_state = states[reviewer_for]
                             if upstream_state.kanban_card_id:
-                                try:
-                                    with kanban_db.connect_closing(board=self.kanban_board) as _chk:
-                                        existing = _chk.execute(
-                                            "SELECT body FROM task_comments WHERE task_id = ? AND author = 'workflow-engine' ORDER BY created_at DESC LIMIT 1",
-                                            (upstream_state.kanban_card_id,)
-                                        ).fetchone()
-                                        if existing and "Review Passed" in (existing[0] or ""):
-                                            print(f"   ✓ {nid} completed — review already passed for {reviewer_for}, skipping")
-                                            pending.discard(nid)
-                                            reviewer_for = None
-                                except Exception:
-                                    pass
+                                if self._review_already_passed(upstream_state.kanban_card_id):
+                                    print(f"   ✓ {nid} completed — review already passed for {reviewer_for}, skipping")
+                                    pending.discard(nid)
+                                    reviewer_for = None
 
                         if reviewer_for:
                             # Reviewer completed — check result for pass/fail
