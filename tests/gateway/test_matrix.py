@@ -1817,6 +1817,223 @@ class TestMatrixDynamicRoomNames:
         assert names == ["🟡 Add dynamic Matrix room names", "🟢 Add dynamic Matrix room names"]
 
     @pytest.mark.asyncio
+    async def test_runner_stamps_work_profile_key_before_matrix_completion_probe(
+        self, monkeypatch, tmp_path,
+    ):
+        """The real runner path replaces Base's profile-agnostic fallback."""
+        from gateway.config import GatewayConfig
+        from gateway.platforms.base import MessageEvent, ProcessingOutcome
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+        import tools.async_delegation as async_delegation
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        runner = GatewayRunner(GatewayConfig(multiplex_profiles=True))
+        runner._profile_adapters = {"work": {Platform.MATRIX: self.adapter}}
+        runner._wire_adapter_background_work_probe(self.adapter)
+        # Stop after the runner's real ``_session_key_for_source`` path. The
+        # blocked claim keeps this test focused without manually stamping the
+        # event or running an agent turn.
+        runner._claim_active_session_slot = MagicMock(return_value=(None, "stop"))
+        source = SessionSource(
+            platform=Platform.MATRIX,
+            chat_id="!room:ex",
+            chat_type="dm",
+            user_id="u1",
+            profile="work",
+        )
+        event = MessageEvent(
+            text="add dynamic Matrix room names",
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={},
+            message_id="$work",
+            internal=True,
+        )
+
+        await runner._handle_message(event)
+
+        session_key = "agent:work:matrix:dm:!room:ex"
+        assert event._gateway_session_key == session_key
+        self.adapter._dynamic_room_name_bases["!room:ex"] = event.text
+        with async_delegation._records_lock:
+            async_delegation._records["delegation-work"] = {
+                "status": "running", "session_key": session_key,
+            }
+        try:
+            await self.adapter.on_processing_start(event)
+            await self._drain_room_name_tasks()
+            await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+            await self._drain_room_name_tasks()
+        finally:
+            with async_delegation._records_lock:
+                async_delegation._records.pop("delegation-work", None)
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
+            "🟡 add dynamic Matrix room names"
+        )
+
+    def test_background_probe_is_wired_for_default_and_multiplex_adapters(self):
+        """Both adapter maps receive the runner-owned activity predicate."""
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner.has_owned_background_work_for_session = lambda key: key == "owned"
+        default_adapter = _make_adapter()
+        work_adapter = _make_adapter()
+
+        GatewayRunner._wire_adapter_background_work_probe(runner, default_adapter)
+        GatewayRunner._wire_adapter_background_work_probe(runner, work_adapter)
+
+        assert default_adapter.has_session_background_work("owned") is True
+        assert work_adapter.has_session_background_work("other") is False
+        assert work_adapter.has_session_background_work("owned") is True
+
+    @pytest.mark.asyncio
+    async def test_same_session_async_delegation_keeps_room_busy_after_foreground_completion(self):
+        """An async delegate belongs to its spawning gateway session only."""
+        from gateway.platforms.base import ProcessingOutcome
+        import tools.async_delegation as async_delegation
+
+        session_key = "agent:main:matrix:dm:!room:ex"
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = event.text
+        event._gateway_session_key = session_key
+        with async_delegation._records_lock:
+            async_delegation._records["delegation-room"] = {
+                "status": "running",
+                "session_key": session_key,
+            }
+        self.adapter.set_session_background_work_probe(
+            async_delegation.has_active_for_session
+        )
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+        with async_delegation._records_lock:
+            async_delegation._records.pop("delegation-room", None)
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 add dynamic Matrix room names"]
+
+    @pytest.mark.asyncio
+    async def test_same_session_tracked_process_keeps_room_busy_after_foreground_completion(
+        self, monkeypatch
+    ):
+        """A tracked terminal process keeps only its own Matrix session busy."""
+        from gateway.platforms.base import ProcessingOutcome
+        from tools.process_registry import process_registry
+
+        session_key = "agent:main:matrix:dm:!room:ex"
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = event.text
+        event._gateway_session_key = session_key
+        monkeypatch.setattr(
+            process_registry,
+            "has_active_for_session",
+            lambda key: key == session_key,
+        )
+        self.adapter.set_session_background_work_probe(
+            process_registry.has_active_for_session
+        )
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 add dynamic Matrix room names"]
+
+    @pytest.mark.asyncio
+    async def test_other_session_background_work_does_not_keep_room_busy(self):
+        """Background work from a different session cannot leak into this DM."""
+        from gateway.platforms.base import ProcessingOutcome
+
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = event.text
+        event._gateway_session_key = "agent:main:matrix:dm:!room:ex"
+        self.adapter.set_session_background_work_probe(
+            lambda key: key == "agent:main:matrix:dm:!other-room:ex"
+        )
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        assert self.adapter._client.send_state_event.await_args.args[2]["name"] == (
+            "🟢 add dynamic Matrix room names"
+        )
+
+    @pytest.mark.asyncio
+    async def test_last_background_completion_refreshes_room_to_green(self):
+        """Watcher finalization refreshes the room even without an agent turn."""
+        from gateway.platforms.base import ProcessingOutcome
+
+        session_key = "agent:main:matrix:dm:!room:ex"
+        background_active = True
+        event = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = event.text
+        event._gateway_session_key = session_key
+        self.adapter.set_session_background_work_probe(lambda key: key == session_key and background_active)
+
+        await self.adapter.on_processing_start(event)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+        background_active = False
+        await self.adapter.on_session_background_work_changed(event.source, session_key)
+        await self._drain_room_name_tasks()
+
+        assert "!room:ex" not in self.adapter._dynamic_room_name_session_keys
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == [
+            "🟡 add dynamic Matrix room names",
+            "🟢 add dynamic Matrix room names",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_concurrent_foreground_and_background_work_cannot_turn_room_green_early(self):
+        from gateway.platforms.base import ProcessingOutcome
+
+        background_session_key = "agent:main:matrix:dm:!room:ex"
+        first = self._event()
+        self.adapter._dynamic_room_name_bases["!room:ex"] = first.text
+        first._gateway_session_key = background_session_key
+        second = self._event()
+        second.message_id = "$msg2"
+        second._gateway_session_key = "agent:main:matrix:dm:!room:ex:thread-two"
+        self.adapter.set_session_background_work_probe(
+            lambda key: key == background_session_key
+        )
+
+        await self.adapter.on_processing_start(first)
+        await self.adapter.on_processing_start(second)
+        await self._drain_room_name_tasks()
+        await self.adapter.on_processing_complete(first, ProcessingOutcome.SUCCESS)
+        await self.adapter.on_processing_complete(second, ProcessingOutcome.SUCCESS)
+        await self._drain_room_name_tasks()
+
+        names = [
+            call.args[2]["name"]
+            for call in self.adapter._client.send_state_event.await_args_list
+        ]
+        assert names == ["🟡 add dynamic Matrix room names"]
+
+    @pytest.mark.asyncio
     async def test_restart_preserves_existing_semantic_room_name(self):
         from gateway.platforms.base import ProcessingOutcome
 

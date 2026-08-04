@@ -75,6 +75,10 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 # wall deadlines plus readiness; other platforms retain the 30s isolation bound.
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
+# Completion events are published just before their durable record transitions
+# out of ``finalizing``.  This only needs to cover that immediate handoff; a
+# missing private signal must never stall the gateway watcher.
+_ASYNC_DELEGATION_FINALIZATION_WAIT_TIMEOUT_SECS = 0.25
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
@@ -6542,6 +6546,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile=_profile,
         )
 
+    def has_owned_background_work_for_session(self, session_key: str) -> bool:
+        """Return whether Hermes owns active background work for one exact key.
+
+        ``process_registry.has_active_for_session`` deliberately includes every
+        running process owned by the session, including long-lived daemons.
+        That is its established gateway-session ownership contract; dynamic
+        room status must report the same work rather than guessing which
+        commands a user is still awaiting.
+        """
+        if not session_key:
+            return False
+        try:
+            from tools.process_registry import process_registry
+            if process_registry.has_active_for_session(session_key):
+                return True
+        except Exception:
+            logger.debug("Background-process activity probe failed", exc_info=True)
+        try:
+            from tools.async_delegation import has_active_for_session
+            return has_active_for_session(session_key)
+        except Exception:
+            logger.debug("Async-delegation activity probe failed", exc_info=True)
+            return False
+
+    def _wire_adapter_background_work_probe(self, adapter: BasePlatformAdapter) -> None:
+        """Give an adapter the runner-owned exact-session activity predicate."""
+        install = getattr(adapter, "set_session_background_work_probe", None)
+        if callable(install):
+            install(self.has_owned_background_work_for_session)
+
     def _telegram_topic_mode_enabled(self, source: SessionSource) -> bool:
         """Return whether Telegram DM topic mode is active for this chat."""
         if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
@@ -10818,6 +10852,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
+            self._wire_adapter_background_work_probe(adapter)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
             _set_reaction = getattr(adapter, "set_reaction_handler", None)
             if callable(_set_reaction):
@@ -11919,6 +11954,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
+                    self._wire_adapter_background_work_probe(adapter)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
                     _set_reaction = getattr(adapter, "set_reaction_handler", None)
                     if callable(_set_reaction):
@@ -12861,6 +12897,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_profile_fatal_error_handler(profile_name, platform)
         )
         adapter.set_session_store(self.session_store)
+        self._wire_adapter_background_work_probe(adapter)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
         _set_reaction = getattr(adapter, "set_reaction_handler", None)
         if callable(_set_reaction):
@@ -13970,6 +14007,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+        # BasePlatformAdapter stamps a provisional key before it enters the
+        # runner.  This is the first runner-owned resolution and may include
+        # multiplex profile routing, so replace that fallback before any
+        # runner lifecycle or command path can observe the event.
+        setattr(event, "_gateway_session_key", _quick_key)
         _up_state = self._peek_session_state(_quick_key)
         if _up_state is not None and _up_state.persistent.update_prompt_pending:
             raw = (event.text or "").strip()
@@ -15750,6 +15792,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         session_entry = await self.async_session_store.get_or_create_session(source)
         session_key = session_entry.session_key
+        # SessionStore is the final authority (including source rewrites such
+        # as Telegram topic recovery). Keep lifecycle consumers on this exact
+        # same key that tools inherit through the session context.
+        setattr(event, "_gateway_session_key", session_key)
         pinned_session_id = str(
             (getattr(event, "metadata", None) or {}).get("gateway_session_id") or ""
         ).strip()
@@ -21605,6 +21651,63 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
+    async def _refresh_session_background_work(self, evt: dict) -> None:
+        """Notify the owning adapter that one background unit finalized.
+
+        This deliberately follows the persisted event session key and source
+        resolution used for completion delivery.  It is a generic adapter
+        lifecycle seam: adapters decide whether they expose a status surface;
+        gateway core never imports a platform implementation.
+        """
+        session_key = str(evt.get("session_key") or "").strip()
+        if not session_key:
+            return
+        source = self._build_process_event_source(evt)
+        if source is None:
+            return
+        adapter = self._adapter_for_source(source)
+        hook = getattr(adapter, "on_session_background_work_changed", None)
+        if not callable(hook):
+            return
+        try:
+            result = hook(source, session_key)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug(
+                "Background-work lifecycle refresh failed for session %s",
+                session_key,
+                exc_info=True,
+            )
+
+    async def _await_async_delegation_finalization(self, evt: dict) -> None:
+        """Bound the publish-before-terminal handoff for a live completion.
+
+        Async delegation intentionally persists and queues a completion while
+        its record is still ``finalizing``.  The private Event exists only on
+        that in-process queue item; restored durable events are already past
+        this handoff. Waiting happens off-loop, and the producer guarantees
+        that it signals from a ``finally`` block immediately after publishing.
+        A missing or corrupted signal times out and fails open to the status
+        refresh instead of wedging the watcher.
+        """
+        completion_signal = evt.get("_finalization_complete")
+        wait = getattr(completion_signal, "wait", None)
+        is_set = getattr(completion_signal, "is_set", None)
+        if not callable(wait) or (callable(is_set) and is_set()):
+            return
+        finalized = await asyncio.to_thread(
+            wait,
+            _ASYNC_DELEGATION_FINALIZATION_WAIT_TIMEOUT_SECS,
+        )
+        if not finalized:
+            logger.warning(
+                "Async delegation finalization signal timed out after %.2fs "
+                "for %s; refreshing background status fail-open",
+                _ASYNC_DELEGATION_FINALIZATION_WAIT_TIMEOUT_SECS,
+                evt.get("delegation_id", "unknown"),
+            )
+
     async def _inject_watch_notification(
         self, synth_text: str, evt: dict,
     ) -> Optional[bool]:
@@ -21978,17 +22081,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 for evt in requeue:
                     _pr.completion_queue.put(evt)
                 for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        continue
                     try:
-                        delivered = await self._deliver_completion_notification(synth_text, evt)
-                        if delivered is False:
-                            _pr.completion_queue.put(evt)
+                        self._enrich_async_delegation_routing(evt)
+                        synth_text = _format_gateway_process_notification(evt)
+                        if synth_text:
+                            delivered = await self._deliver_completion_notification(synth_text, evt)
+                            if delivered is False:
+                                _pr.completion_queue.put(evt)
                     except Exception as e:
                         _pr.completion_queue.put(evt)
                         logger.error("Async delegation injection error: %s", e)
+                    finally:
+                        # Completion delivery may be text-only, skipped, or
+                        # retryable.  The worker is terminal either way, so
+                        # refresh runtime-owned adapter state independently.
+                        await self._await_async_delegation_finalization(evt)
+                        await self._refresh_session_background_work(evt)
             except Exception as e:
                 logger.debug("Async delegation watcher error: %s", e)
             await asyncio.sleep(interval)
@@ -22032,6 +22140,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if session is None or session.exited:
                     break
             logger.debug("Process watcher ended (silent): %s", session_id)
+            await self._refresh_session_background_work({
+                "session_key": session_key,
+                "platform": platform_name,
+                "chat_type": watcher.get("chat_type", ""),
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "user_id": user_id,
+                "user_name": user_name,
+            })
             return
 
         last_output_len = 0
@@ -22182,6 +22299,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         logger.error("Watcher delivery error: %s", e)
 
         logger.debug("Process watcher ended: %s", session_id)
+        await self._refresh_session_background_work({
+            "session_key": session_key,
+            "platform": platform_name,
+            "chat_type": watcher.get("chat_type", ""),
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "user_id": user_id,
+            "user_name": user_name,
+        })
 
     _MAX_INTERRUPT_DEPTH = 3  # Cap recursive interrupt handling (#816)
 

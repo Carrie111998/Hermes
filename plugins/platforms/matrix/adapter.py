@@ -1158,6 +1158,7 @@ class MatrixAdapter(BasePlatformAdapter):
         self._dynamic_room_name_initialized: Set[str] = set()
         self._dynamic_room_name_active: Dict[str, int] = {}
         self._dynamic_room_name_active_turns: Set[tuple[str, str]] = set()
+        self._dynamic_room_name_session_keys: Dict[str, Set[str]] = {}
         self._dynamic_room_name_last_sent: Dict[str, str] = {}
         self._dynamic_room_name_superseded_sent: Dict[str, Set[str]] = {}
         self._dynamic_room_name_terminal_external_checks: Set[str] = set()
@@ -3741,7 +3742,7 @@ class MatrixAdapter(BasePlatformAdapter):
         # Room-name state is intentionally runtime-owned and binary. Outcomes
         # remain visible through message reactions, but can never control or be
         # smuggled into the room title by an AI-generated semantic title.
-        prefix = "🟡" if self._dynamic_room_name_active.get(room_id, 0) else "🟢"
+        prefix = "🟡" if self._dynamic_room_name_is_active(room_id) else "🟢"
         name = f"{prefix} {base}"
         return await self._send_dynamic_room_name(room_id, name)
 
@@ -3784,10 +3785,51 @@ class MatrixAdapter(BasePlatformAdapter):
         message_id = event.message_id or f"event:{id(event)}"
         return room_id, str(message_id)
 
+    def _remember_dynamic_room_name_session(
+        self, room_id: str, session_key: str,
+    ) -> None:
+        """Retain only keys that currently own background work for this room.
+
+        A room can legitimately have concurrent thread/session work, so this
+        is a set rather than one "latest" key.  Keys are removed as soon as
+        their probe goes inactive (and opportunistically on every render),
+        preventing session resets in a long-lived room from accumulating
+        stale namespaces.
+        """
+        if not session_key:
+            return
+        keys = self._dynamic_room_name_session_keys.setdefault(room_id, set())
+        if self.has_session_background_work(session_key):
+            keys.add(session_key)
+        else:
+            keys.discard(session_key)
+        if not keys:
+            self._dynamic_room_name_session_keys.pop(room_id, None)
+
+    def _dynamic_room_name_is_active(self, room_id: str) -> bool:
+        """Return foreground-or-owned-background activity for this DM only."""
+        if self._dynamic_room_name_active.get(room_id, 0):
+            return True
+        keys = self._dynamic_room_name_session_keys.get(room_id)
+        if not keys:
+            return False
+        active_keys = {
+            session_key for session_key in keys
+            if self.has_session_background_work(session_key)
+        }
+        if active_keys:
+            self._dynamic_room_name_session_keys[room_id] = active_keys
+            return True
+        self._dynamic_room_name_session_keys.pop(room_id, None)
+        return False
+
     async def _update_dynamic_room_name_for_start(self, event: MessageEvent) -> bool:
         if not self._dynamic_room_name_allowed(event):
             return True
         room_id = str(event.source.chat_id)
+        self._remember_dynamic_room_name_session(
+            room_id, str(getattr(event, "_gateway_session_key", "") or "")
+        )
         turn_key = self._dynamic_room_name_turn_key(event)
         if turn_key in self._dynamic_room_name_active_turns:
             return False
@@ -3806,16 +3848,39 @@ class MatrixAdapter(BasePlatformAdapter):
         if not self._dynamic_room_name_allowed(event):
             return True
         room_id = str(event.source.chat_id)
+        self._remember_dynamic_room_name_session(
+            room_id, str(getattr(event, "_gateway_session_key", "") or "")
+        )
         turn_key = self._dynamic_room_name_turn_key(event)
         if turn_key not in self._dynamic_room_name_active_turns:
             return False
         self._dynamic_room_name_active_turns.remove(turn_key)
         remaining = max(0, self._dynamic_room_name_active.get(room_id, 1) - 1)
         self._dynamic_room_name_active[room_id] = remaining
-        if not remaining:
+        if not remaining and not self._dynamic_room_name_is_active(room_id):
             self._dynamic_room_name_terminal_external_checks.add(room_id)
         self._schedule_dynamic_room_name_render(room_id)
         return True
+
+    async def on_session_background_work_changed(
+        self,
+        source: SessionSource,
+        session_key: str,
+    ) -> None:
+        """Refresh an opted-in DM after its exact background work changes."""
+        if not (
+            self._dynamic_room_name_enabled
+            and self._client
+            and session_key
+            and source.chat_id
+            and str(source.chat_type).lower() == "dm"
+        ):
+            return
+        room_id = str(source.chat_id)
+        self._remember_dynamic_room_name_session(room_id, session_key)
+        if not self._dynamic_room_name_is_active(room_id):
+            self._dynamic_room_name_terminal_external_checks.add(room_id)
+        self._schedule_dynamic_room_name_render(room_id)
 
     async def set_semantic_room_name(self, room_id: str, title: str) -> bool:
         """Apply an auto-generated session title while preserving runtime activity."""

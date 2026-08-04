@@ -158,6 +158,43 @@ async def test_consumed_completion_skips_raw_notification_without_agent_notify(
 
 
 @pytest.mark.asyncio
+async def test_terminal_process_refreshes_session_status_after_failed_agent_injection(
+    monkeypatch, tmp_path
+):
+    """A failed synthetic delivery cannot leave a completed DM marked busy."""
+    import tools.process_registry as pr_module
+
+    sessions = [SimpleNamespace(
+        output_buffer="done\n", exited=True, exit_code=0, command="echo done",
+        started_at=1.0,
+    )]
+    monkeypatch.setattr(pr_module, "process_registry", _FakeRegistry(sessions))
+
+    async def _instant_sleep(*_a, **_kw):
+        pass
+    monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    runner._deliver_completion_notification = AsyncMock(return_value=False)
+    runner._refresh_session_background_work = AsyncMock()
+    watcher = _watcher_dict()
+    watcher.update({
+        "session_key": "agent:main:matrix:dm:!room:ex",
+        "platform": "matrix",
+        "chat_type": "dm",
+        "chat_id": "!room:ex",
+        "notify_on_complete": True,
+    })
+
+    await runner._run_process_watcher(watcher)
+
+    runner._refresh_session_background_work.assert_awaited_once()
+    assert runner._refresh_session_background_work.await_args.args[0]["session_key"] == (
+        "agent:main:matrix:dm:!room:ex"
+    )
+
+
+@pytest.mark.asyncio
 async def test_inject_watch_notification_routes_from_session_store_origin(monkeypatch, tmp_path):
     from gateway.session import SessionSource
 

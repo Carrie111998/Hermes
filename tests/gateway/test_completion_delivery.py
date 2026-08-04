@@ -9,6 +9,7 @@ state (when available) is acknowledged through its authoritative SQLite API.
 import asyncio
 import json
 import queue
+import threading
 from collections import OrderedDict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -168,6 +169,7 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
         handle_message=AsyncMock(side_effect=[RuntimeError("temporary"), None])
     )
     runner = _runner(adapter)
+    runner._refresh_session_background_work = AsyncMock()
     _stop_after_sleeps(monkeypatch, runner, count=3)
 
     from tools import async_delegation
@@ -184,6 +186,97 @@ def test_failed_async_injection_is_retried_and_only_success_is_acked(
 
     assert adapter.handle_message.await_count == 2
     assert acknowledgements == ["deleg_duplicate"]
+    # A terminal delegate refreshes its owning status even when its first
+    # synthetic completion injection fails and is retried.
+    assert runner._refresh_session_background_work.await_count == 2
+
+
+def test_async_status_refresh_waits_for_terminal_finalization(
+    monkeypatch, isolated_registry,
+):
+    """A queue consumer cannot render from the producer's ``finalizing`` gap."""
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    terminal = threading.Event()
+    event = _async_event("deleg_finalizing_race")
+    event["_finalization_complete"] = terminal
+    isolated.put(event)
+
+    adapter = SimpleNamespace(handle_message=AsyncMock())
+    runner = _runner(adapter)
+
+    async def _delivery(_text, _event):
+        assert not terminal.is_set()
+        # Model the worker's immediately-following _finish_finalization().
+        asyncio.get_running_loop().call_soon(terminal.set)
+        return None
+
+    async def _refresh(_event):
+        assert terminal.is_set(), "refresh observed async record while finalizing"
+
+    runner._deliver_completion_notification = _delivery
+    runner._refresh_session_background_work = _refresh
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+
+def test_async_status_refresh_fails_open_after_unset_finalization_timeout(
+    monkeypatch, isolated_registry, caplog,
+):
+    """A corrupted never-set handoff signal cannot wedge the gateway watcher."""
+    import gateway.run as gateway_run
+
+    isolated = queue.Queue()
+    monkeypatch.setattr(isolated_registry, "completion_queue", isolated)
+    terminal = threading.Event()
+    event = _async_event("deleg_finalization_timeout")
+    event["_finalization_complete"] = terminal
+    isolated.put(event)
+    timeout = 0.01
+    wait = MagicMock(wraps=terminal.wait)
+    monkeypatch.setattr(terminal, "wait", wait)
+    monkeypatch.setattr(
+        gateway_run,
+        "_ASYNC_DELEGATION_FINALIZATION_WAIT_TIMEOUT_SECS",
+        timeout,
+    )
+
+    runner = _runner(SimpleNamespace(handle_message=AsyncMock()))
+    refreshed = AsyncMock()
+    runner._refresh_session_background_work = refreshed
+    _stop_after_sleeps(monkeypatch, runner, count=2)
+
+    # The real Event stays unset. Its timeout return lets the watcher proceed
+    # to the fail-open status refresh rather than awaiting the signal forever.
+    asyncio.run(runner._async_delegation_watcher(interval=0))
+
+    assert not terminal.is_set()
+    wait.assert_called_once_with(timeout)
+    refreshed.assert_awaited_once_with(event)
+    assert "finalization signal timed out" in caplog.text
+
+
+def test_background_status_refresh_uses_the_owning_multiplex_adapter():
+    default_adapter = SimpleNamespace(on_session_background_work_changed=AsyncMock())
+    profile_adapter = SimpleNamespace(on_session_background_work_changed=AsyncMock())
+    source = SessionSource(
+        platform=Platform.MATRIX,
+        chat_id="!room:ex",
+        chat_type="dm",
+        profile="work",
+    )
+    session_key = "agent:work:matrix:dm:!room:ex"
+    runner = _runner(default_adapter, origins={session_key: SimpleNamespace(origin=source)})
+    runner.adapters = {Platform.MATRIX: default_adapter}
+    runner._profile_adapters = {"work": {Platform.MATRIX: profile_adapter}}
+
+    asyncio.run(runner._refresh_session_background_work({"session_key": session_key}))
+
+    profile_adapter.on_session_background_work_changed.assert_awaited_once_with(
+        source, session_key
+    )
+    default_adapter.on_session_background_work_changed.assert_not_awaited()
 
 
 def _persist_pending_completion(event):

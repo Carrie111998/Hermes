@@ -548,6 +548,18 @@ def active_count() -> int:
         )
 
 
+def has_active_for_session(session_key: str) -> bool:
+    """Whether an exact gateway session still owns an async delegation."""
+    if not session_key:
+        return False
+    with _records_lock:
+        return any(
+            record.get("session_key") == session_key
+            and record.get("status") in {"running", "stalling", "finalizing"}
+            for record in _records.values()
+        )
+
+
 def active_task_count() -> int:
     """Number of async delegation TASKS (child subagents) currently running.
 
@@ -774,8 +786,12 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         return
     event_record, _interrupt_fn = claimed
 
-    _push_completion_event(event_record, result, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_completion_event(event_record, result, status)
+    finally:
+        # Keep publication before terminal state, but never strand a record in
+        # ``finalizing`` if durable persistence or queueing unexpectedly fails.
+        _finish_finalization(delegation_id, status)
 
 
 def _begin_finalization(
@@ -794,6 +810,10 @@ def _begin_finalization(
         interrupt_fn = record.get("interrupt_fn")
         record["interrupt_fn"] = None  # drop the closure; child is done
         record["progress_fn"] = None  # stop stale-monitor sampling
+        # The event is deliberately published before we flip the durable
+        # record terminal. Give same-process consumers a lifecycle handoff so a
+        # status refresh cannot observe this short-lived ``finalizing`` state.
+        record["_finalization_complete"] = threading.Event()
         event_record = dict(record)
 
     return event_record, interrupt_fn
@@ -804,7 +824,12 @@ def _finish_finalization(delegation_id: str, status: str) -> None:
         record = _records.get(delegation_id)
         if record is not None:
             record["status"] = status
+            completion_signal = record.get("_finalization_complete")
+        else:
+            completion_signal = None
         _prune_completed_locked()
+    if completion_signal is not None:
+        completion_signal.set()
 
 
 def _push_completion_event(
@@ -866,6 +891,12 @@ def _push_completion_event(
         if _k in result:
             evt[_k] = result[_k]
     _persist_completion(evt, result)
+    # This in-memory handoff never enters the durable payload. It preserves
+    # publish-before-terminal ordering while letting the gateway defer its
+    # cosmetic status refresh until ``_finish_finalization`` has run.
+    completion_signal = record.get("_finalization_complete")
+    if completion_signal is not None:
+        evt["_finalization_complete"] = completion_signal
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1017,8 +1048,10 @@ def _finalize_batch(
         return
     event_record, _interrupt_fn = claimed
 
-    _push_batch_completion_event(event_record, combined, status)
-    _finish_finalization(delegation_id, status)
+    try:
+        _push_batch_completion_event(event_record, combined, status)
+    finally:
+        _finish_finalization(delegation_id, status)
 
 
 def _push_batch_completion_event(
@@ -1075,6 +1108,9 @@ def _push_batch_completion_event(
         if _k in combined:
             evt[_k] = combined[_k]
     _persist_completion(evt, combined)
+    completion_signal = event_record.get("_finalization_complete")
+    if completion_signal is not None:
+        evt["_finalization_complete"] = completion_signal
     try:
         process_registry.completion_queue.put(evt)
     except Exception as exc:  # pragma: no cover
@@ -1239,32 +1275,34 @@ def _finalize_stalled(delegation_id: str) -> None:
         ),
         "stall_grace_seconds": _STALL_GRACE_SECONDS,
     }
-    if event_record.get("is_batch"):
-        _push_batch_completion_event(
-            event_record,
-            {
-                "results": [],
-                "error": error,
-                "total_duration_seconds": duration,
-                **stall_meta,
-            },
-            "stalled",
-        )
-    else:
-        _push_completion_event(
-            event_record,
-            {
-                "status": "stalled",
-                "summary": None,
-                "error": error,
-                "api_calls": 0,
-                "duration_seconds": duration,
-                "exit_reason": "stalled",
-                **stall_meta,
-            },
-            "stalled",
-        )
-    _finish_finalization(delegation_id, "stalled")
+    try:
+        if event_record.get("is_batch"):
+            _push_batch_completion_event(
+                event_record,
+                {
+                    "results": [],
+                    "error": error,
+                    "total_duration_seconds": duration,
+                    **stall_meta,
+                },
+                "stalled",
+            )
+        else:
+            _push_completion_event(
+                event_record,
+                {
+                    "status": "stalled",
+                    "summary": None,
+                    "error": error,
+                    "api_calls": 0,
+                    "duration_seconds": duration,
+                    "exit_reason": "stalled",
+                    **stall_meta,
+                },
+                "stalled",
+            )
+    finally:
+        _finish_finalization(delegation_id, "stalled")
 
 
 def _children_activity_from_token(token: Any, now: float) -> Optional[List]:

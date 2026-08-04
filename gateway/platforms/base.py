@@ -2843,6 +2843,10 @@ class BasePlatformAdapter(ABC):
         # cadence picks up changes, so updating this dict costs no extra
         # platform API calls. Cleared when the typing loop winds down.
         self._status_text: Dict[str, str] = {}
+        # Optional gateway-owned probe for session-scoped background work.
+        # Adapters may use it for a runtime status surface, but the registry
+        # ownership and lifecycle remain in the gateway/tools layers.
+        self._session_background_work_probe: Optional[Callable[[str], bool]] = None
 
     @property
     def message_len_fn(self) -> Callable[[str], int]:
@@ -4906,6 +4910,35 @@ class BasePlatformAdapter(ABC):
     async def on_processing_start(self, event: MessageEvent) -> None:
         """Hook called when background processing begins."""
 
+    def set_session_background_work_probe(
+        self, probe: Optional[Callable[[str], bool]],
+    ) -> None:
+        """Install the gateway's exact-session background-work probe."""
+        self._session_background_work_probe = probe if callable(probe) else None
+
+    def has_session_background_work(self, session_key: str) -> bool:
+        """Return whether Hermes still owns background work for *session_key*."""
+        if not session_key:
+            return False
+        probe = self._session_background_work_probe
+        if probe is None:
+            runner = getattr(self, "gateway_runner", None)
+            probe = getattr(runner, "has_owned_background_work_for_session", None)
+        if not callable(probe):
+            return False
+        try:
+            return bool(probe(session_key))
+        except Exception:
+            logger.debug("[%s] background-work probe failed", self.name, exc_info=True)
+            return False
+
+    async def on_session_background_work_changed(
+        self,
+        source: SessionSource,
+        session_key: str,
+    ) -> None:
+        """Hook after a session-owned background unit reaches a terminal state."""
+
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Hook called when background processing completes.
 
@@ -5808,6 +5841,10 @@ class BasePlatformAdapter(ABC):
             )
         
         try:
+            # Lifecycle hooks need the exact already-resolved key rather than
+            # reconstructing it from a source (which can lose multiplex
+            # profile routing or a thread discriminator).
+            setattr(event, "_gateway_session_key", session_key)
             await self._run_processing_hook("on_processing_start", event)
 
             # Call the handler (this can take a while with tool calls)

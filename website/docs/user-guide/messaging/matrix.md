@@ -131,8 +131,14 @@ Set `matrix.dynamic_room_name: true` to show the current Hermes activity in
 Matrix DM room names. This setting defaults to `false` and applies only to DMs.
 Hermes adds a status icon to the title:
 
-- `🟡` while one or more Hermes turns are active
-- `🟢` when no Hermes turns are active
+- `🟡` while one or more Hermes foreground turns are active, or Hermes-owned
+  background work for that DM's exact gateway session is still active
+- `🟢` only when that DM has no active foreground turns and no owned background
+  work
+
+“Owned background work” follows Hermes's existing session-process ownership:
+every running process tracked for that exact session counts, including a
+long-lived daemon. Hermes does not guess whether a process is still awaited.
 
 Hermes chooses the title from the active goal first, then the session title,
 and finally the existing room name. If none is available, the room name stays
