@@ -9,7 +9,7 @@ const read = relativePath => fs.readFileSync(path.join(desktopRoot, relativePath
 test('evaOS Agent package identity and customer artifact contract are exact', () => {
   const pkg = JSON.parse(read('package.json'))
   assert.equal(pkg.productName, 'evaOS Agent')
-  assert.equal(pkg.version, '2026.7.20-es.8')
+  assert.equal(pkg.version, '2026.7.20-es.9')
   assert.equal(pkg.build.appId, 'com.electricsheephq.evaos.agent')
   assert.equal(pkg.build.executableName, 'evaOS Agent')
   assert.deepEqual(pkg.build.protocols[0].schemes, ['evaos-agent'])

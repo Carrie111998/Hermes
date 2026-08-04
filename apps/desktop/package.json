@@ -2,7 +2,7 @@
   "name": "evaos-agent",
   "productName": "evaOS Agent",
   "private": true,
-  "version": "2026.7.20-es.8",
+  "version": "2026.7.20-es.9",
   "description": "Managed business agent client by Electric Sheep.",
   "author": "Electric Sheep",
   "type": "module",
