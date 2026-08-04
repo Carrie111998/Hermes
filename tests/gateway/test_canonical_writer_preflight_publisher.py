@@ -287,6 +287,7 @@ def test_public_native_preflight_wrapper_has_no_mutation_surface(monkeypatch):
     assert calls[0] == "root"
     assert calls[1][1]["require_installed"] is False
     assert calls[1][1]["require_original_boot"] is True
+    assert calls[1][1]["require_collector_fresh"] is True
     assert calls[2] == ("fresh", 120)
     assert result["observed_at_unix"] == 120
     assert result["collector_hba_expires_at_unix"] == 400
