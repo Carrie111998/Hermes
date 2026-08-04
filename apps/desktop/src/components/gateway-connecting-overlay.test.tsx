@@ -213,6 +213,28 @@ describe('connecting overlay vs recovery surface', () => {
     expect(isRecoveryShown()).toBe(false)
   })
 
+  it('managed Eva browser sign-in in progress keeps the Gateway sign-in surface clickable', () => {
+    setGatewayState('idle')
+    $desktopBoot.set({
+      ...$desktopBoot.get(),
+      phase: 'eva.sign-in',
+      message: 'Complete evaOS Agent sign-in in your browser',
+      progress: 14,
+      running: true,
+      visible: true
+    })
+
+    render(
+      <>
+        <GatewayConnectingOverlay />
+        <BootFailureOverlay />
+      </>
+    )
+
+    expect(isConnectingShown()).toBe(false)
+    expect(isRecoveryShown()).toBe(false)
+  })
+
   it('managed Eva hard failures expose only managed retry and sign-in recovery', () => {
     const originalDesktop = window.hermesDesktop
     window.hermesDesktop = {
