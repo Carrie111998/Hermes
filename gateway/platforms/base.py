@@ -2446,6 +2446,27 @@ def _invalidate_pending_stt_cache(event: MessageEvent) -> None:
             delattr(event, attr)
 
 
+def _sender_ids_match(
+    existing_source: Any,
+    incoming_source: Any,
+) -> Optional[bool]:
+    """Compare sender IDs only within their source-field namespace.
+
+    A match on either directly comparable field proves the same sender. When
+    comparable fields exist but all differ, the senders differ. ``None`` means
+    neither field was directly comparable and callers must stay conservative.
+    """
+    comparisons = []
+    for field in ("user_id_alt", "user_id"):
+        existing_value = getattr(existing_source, field, None)
+        incoming_value = getattr(incoming_source, field, None)
+        if existing_value and incoming_value:
+            comparisons.append(str(existing_value) == str(incoming_value))
+    if not comparisons:
+        return None
+    return any(comparisons)
+
+
 def pending_merge_sender_conflict(
     existing: Optional[MessageEvent],
     event: Optional[MessageEvent],
@@ -2473,17 +2494,7 @@ def pending_merge_sender_conflict(
     if existing_source is None or incoming_source is None:
         return False
 
-    comparisons = []
-    for field in ("user_id_alt", "user_id"):
-        existing_value = getattr(existing_source, field, None)
-        incoming_value = getattr(incoming_source, field, None)
-        if existing_value and incoming_value:
-            comparisons.append(str(existing_value) == str(incoming_value))
-
-    # Conditional alternate IDs are common. A match on either directly
-    # comparable field proves these are the same sender; report a conflict only
-    # when at least one comparable pair exists and every such pair differs.
-    return bool(comparisons) and not any(comparisons)
+    return _sender_ids_match(existing_source, incoming_source) is False
 
 
 def merge_pending_message_event(
@@ -5266,22 +5277,41 @@ class BasePlatformAdapter(ABC):
 
     def _can_merge_text_debounce_events(self, existing: MessageEvent, event: MessageEvent) -> bool:
         """Return True when two text debounce events came from the same sender."""
+        existing_source = getattr(existing, "source", None)
+        incoming_source = getattr(event, "source", None)
+        if existing_source is None or incoming_source is None:
+            return False
+        if _platform_name(getattr(existing_source, "platform", None)) != _platform_name(
+            getattr(incoming_source, "platform", None)
+        ):
+            return False
 
-        def _identity(candidate: MessageEvent) -> tuple[str, ...] | None:
-            source = getattr(candidate, "source", None)
-            if source is None:
-                return None
-            platform = _platform_name(getattr(source, "platform", None))
-            sender = getattr(source, "user_id_alt", None) or getattr(source, "user_id", None)
-            if sender:
-                return (platform, str(sender))
-            if getattr(source, "chat_type", None) in {"dm", "private"} and getattr(source, "chat_id", None):
-                return (platform, "dm", str(source.chat_id))
-            return None
+        sender_match = _sender_ids_match(existing_source, incoming_source)
+        if sender_match is not None:
+            return sender_match
 
-        existing_sender = _identity(existing)
-        incoming_sender = _identity(event)
-        return existing_sender is not None and existing_sender == incoming_sender
+        # Preserve the identity-free DM fallback. Do not use it when either
+        # side carries an ID: absent comparability cannot prove equivalence.
+        dm_types = {"dm", "private"}
+        existing_chat_id = getattr(existing_source, "chat_id", None)
+        incoming_chat_id = getattr(incoming_source, "chat_id", None)
+        existing_has_id = bool(
+            getattr(existing_source, "user_id_alt", None)
+            or getattr(existing_source, "user_id", None)
+        )
+        incoming_has_id = bool(
+            getattr(incoming_source, "user_id_alt", None)
+            or getattr(incoming_source, "user_id", None)
+        )
+        return (
+            not existing_has_id
+            and not incoming_has_id
+            and getattr(existing_source, "chat_type", None) in dm_types
+            and getattr(incoming_source, "chat_type", None) in dm_types
+            and bool(existing_chat_id)
+            and bool(incoming_chat_id)
+            and str(existing_chat_id) == str(incoming_chat_id)
+        )
 
     def _text_debounce_delay(self, session_key: str) -> float:
         """Return bounded busy-text debounce delay for ``session_key``."""

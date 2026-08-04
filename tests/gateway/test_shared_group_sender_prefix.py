@@ -760,6 +760,140 @@ async def test_three_sender_queue_debounce_never_loses_latest_sender():
 
 
 @pytest.mark.asyncio
+async def test_queue_text_debounce_rejects_cross_field_sender_id_collision():
+    """An alternate ID must never match another sender's raw ID."""
+    runner, adapter = _runner_with_adapter()
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = "telegram:group:cross-field-id-collision"
+    alice = _text_event(
+        "alice secret",
+        _group_source(
+            user_id="raw-alice",
+            user_id_alt="collision-token",
+            user_name="Alice",
+        ),
+        message_id="a1",
+    )
+    bob = _text_event(
+        "bob words",
+        _group_source(user_id="collision-token", user_name="Bob"),
+        message_id="b1",
+    )
+
+    await adapter._queue_text_debounce(session_key, alice)
+    await adapter._queue_text_debounce(session_key, bob)
+    await adapter._flush_text_debounce_now(session_key)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    state = adapter._text_debounce_store().get(session_key)
+    if state is not None:
+        turns.append(state.event)
+    assert [turn.text for turn in turns] == ["alice secret", "bob words"]
+    assert [turn.source.user_name for turn in turns] == ["Alice", "Bob"]
+
+
+@pytest.mark.asyncio
+async def test_queue_text_debounce_merges_same_raw_sender_with_asymmetric_alt():
+    """A conditionally populated alternate ID must not split one text burst."""
+    runner, adapter = _runner_with_adapter()
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = "telegram:group:asymmetric-alt"
+
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event(
+            "part one",
+            _group_source(
+                user_id="raw-9", user_id_alt="stable-9", user_name="Alice"
+            ),
+            message_id="a1",
+        ),
+    )
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event(
+            "part two",
+            _group_source(user_id="raw-9", user_name="Alice"),
+            message_id="a2",
+        ),
+    )
+    await adapter._flush_text_debounce_now(session_key)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert len(turns) == 1
+    assert turns[0].text == "part one\npart two"
+    assert turns[0].message_id == "a2"
+
+
+@pytest.mark.asyncio
+async def test_queue_text_debounce_preserves_identity_free_dm_chat_fallback():
+    """A stable private chat still identifies a sender when both IDs are absent."""
+    runner, adapter = _runner_with_adapter()
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = "telegram:dm:identity-free"
+
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event(
+            "part one",
+            _group_source(chat_type="dm"),
+            message_id="a1",
+        ),
+    )
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event(
+            "part two",
+            _group_source(chat_type="private"),
+            message_id="a2",
+        ),
+    )
+    await adapter._flush_text_debounce_now(session_key)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    assert len(turns) == 1
+    assert turns[0].text == "part one\npart two"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("existing_chat_id", "incoming_chat_id"),
+    [("", ""), ("None", None)],
+)
+async def test_queue_text_debounce_rejects_missing_identity_free_dm_chat_id(
+    existing_chat_id, incoming_chat_id
+):
+    """Missing chat identity must not turn the DM fallback into a wildcard."""
+    runner, adapter = _runner_with_adapter()
+    adapter._busy_text_debounce_seconds = 60.0
+    adapter._busy_text_hard_cap_seconds = 60.0
+    session_key = "telegram:dm:missing-identity"
+    existing_source = _group_source(chat_type="dm")
+    incoming_source = _group_source(chat_type="private")
+    existing_source.chat_id = existing_chat_id
+    incoming_source.chat_id = incoming_chat_id
+
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event("part one", existing_source, message_id="a1"),
+    )
+    await adapter._queue_text_debounce(
+        session_key,
+        _text_event("part two", incoming_source, message_id="a2"),
+    )
+    await adapter._flush_text_debounce_now(session_key)
+
+    turns = _queued_turns(runner, adapter, session_key)
+    state = adapter._text_debounce_store().get(session_key)
+    if state is not None:
+        turns.append(state.event)
+    assert [turn.text for turn in turns] == ["part one", "part two"]
+
+
+@pytest.mark.asyncio
 async def test_queue_text_debounce_preserves_a_b_a_arrival_order():
     """A debounced Alice tail must not merge into Alice's head past Bob."""
     runner, adapter = _runner_with_adapter()
