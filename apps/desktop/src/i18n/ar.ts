@@ -23,7 +23,9 @@ export const ar = defineLocale({
     docs: 'الوثائق',
     done: 'تم',
     error: 'خطأ',
+    expand: 'توسيع',
     failed: 'فشل',
+    formatJson: 'تنسيق JSON',
     free: 'مجاني',
     loading: 'جار التحميل...',
     notSet: 'غير مضبوط',
@@ -36,6 +38,7 @@ export const ar = defineLocale({
     set: 'ضبط',
     skip: 'تخطي',
     update: 'تحديث',
+    tryHint: term => `جرّب “${term}”`,
     on: 'مفعل',
     off: 'معطل'
   },
@@ -95,7 +98,10 @@ export const ar = defineLocale({
       signInFailed: 'فشل تسجيل الدخول',
       signInToRemoteGateway: 'تسجيل الدخول للبوابة البعيدة',
       signInWithProvider: provider => `تسجيل الدخول عبر ${provider}`,
-      identityProvider: 'مزود الهوية'
+      identityProvider: 'مزود الهوية',
+      gatewaySettings: 'إعدادات البوابة',
+      back: 'رجوع',
+      remoteFailureHint: 'تحقق من رابط البوابة وتسجيل الدخول ضمن إعدادات البوابة، أو بدّل إلى البوابة المحلية.'
     }
   },
   notifications: {
@@ -114,6 +120,7 @@ export const ar = defineLocale({
     updateReadyTitle: 'التحديث جاهز',
     updateReadyMessage: count => `${count} تغيير جديد متاح.`,
     seeWhatsNew: 'عرض الجديد',
+    installMethodUnsupportedTitle: 'طريقة تثبيت غير مدعومة',
     errors: {
       elevenLabsNeedsKey: 'يتطلب ElevenLabs STT المفتاح ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'رفض ElevenLabs مفتاح API (401).',
@@ -122,7 +129,8 @@ export const ar = defineLocale({
       microphonePermission: 'تم رفض إذن الميكروفون.',
       openaiRejectedApiKey: 'رفض OpenAI مفتاح API.',
       openaiRejectedApiKeyWithStatus: status => `رفض OpenAI مفتاح API (${status} invalid_api_key).`,
-      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.'
+      openaiTtsNeedsKey: 'يتطلب OpenAI TTS المفتاح VOICE_TOOLS_OPENAI_KEY أو OPENAI_API_KEY.',
+      gatewayAuthFailed: 'فشلت مصادقة البوابة — تحقق من المفتاح API_SERVER_KEY.'
     },
     voice: {
       configureSpeechToText: 'اضبط تحويل الكلام إلى نص لاستخدام وضع الصوت.',
@@ -154,11 +162,20 @@ export const ar = defineLocale({
       turnDoneBody: '',
       turnErrorTitle: 'فشلت الجولة',
       backgroundDoneTitle: 'انتهت المهمة في الخلفية',
-      backgroundFailedTitle: 'فشلت المهمة في الخلفية'
+      backgroundFailedTitle: 'فشلت المهمة في الخلفية',
+      creditsTitle: 'الرصيد'
     }
   },
   remoteDisplayBanner: {
     message: reason => `العرض البرمجي نشط — تم اكتشاف شاشة بعيدة (${reason}). تم تعطيل تسريع GPU لمنع الوميض.`
+  },
+  billingBlock: {
+    titleNous: 'نفد رصيد Nous',
+    titleProvider: provider => `نفد الرصيد — ${provider}`,
+    fallbackMessage: 'نفد رصيد حسابك. أضف رصيدا للمتابعة.',
+    openBilling: 'فتح الفوترة',
+    addCredits: 'إضافة رصيد',
+    dismiss: 'إغلاق'
   },
   titlebar: {
     hideSidebar: 'إخفاء الشريط الجانبي',
@@ -237,6 +254,14 @@ export const ar = defineLocale({
       'view.terminalPaste': 'لصق في الطرفية',
       'view.closePreviewTab': 'إغلاق علامة تبويب المعاينة',
       'view.flipPanes': 'تبديل جانبي الشريط الجانبي',
+      'view.toggleStatusbar': 'تبديل شريط الحالة',
+      'view.newTerminal': 'طرفية جديدة',
+      'view.nextTerminal': 'الطرفية التالية',
+      'view.prevTerminal': 'الطرفية السابقة',
+      'view.closeTerminal': 'إغلاق الطرفية',
+      'view.findInPage': 'البحث في الصفحة',
+      'view.findNext': 'التطابق التالي',
+      'view.findPrevious': 'التطابق السابق',
       'appearance.toggleMode': 'تبديل الفاتح / الداكن',
       'profile.default': 'الانتقال إلى الملف الشخصي الافتراضي',
       'profile.switch.1': 'الانتقال إلى الملف الشخصي 1',
@@ -264,6 +289,7 @@ export const ar = defineLocale({
       'composer.send': 'إرسال الرسالة',
       'composer.newline': 'إدراج سطر جديد',
       'composer.steer': 'توجيه الدور الجاري',
+      'composer.queue': 'وضع الرسالة في الطابور',
       'composer.sendQueued': 'إرسال الدور التالي في الطابور',
       'composer.mention': 'الإشارة إلى الملفات والمجلدات وعناوين URL',
       'composer.slash': 'لوحة الأوامر المائلة',
@@ -271,6 +297,10 @@ export const ar = defineLocale({
       'composer.history': 'التنقل في النافذة المنبثقة / السجل',
       'composer.cancel': 'إغلاق النافذة المنبثقة · إلغاء التشغيل'
     }
+  },
+  findInPage: {
+    next: 'التطابق التالي',
+    previous: 'التطابق السابق'
   },
   language: {
     label: 'اللغة',
@@ -302,7 +332,9 @@ export const ar = defineLocale({
       about: 'حول',
       notifications: 'الإشعارات',
       keybinds: 'اختصارات لوحة المفاتيح',
-      plugins: 'الإضافات'
+      plugins: 'الإضافات',
+      providerCustomEndpoints: 'نقاط النهاية المخصصة',
+      billing: 'الفوترة'
     },
     plugins: {
       title: 'إضافات سطح المكتب',
@@ -345,6 +377,10 @@ export const ar = defineLocale({
         backgroundDone: {
           label: 'اكتملت مهمة الخلفية',
           description: 'اكتمل أمر طرفية يعمل في الخلفية.'
+        },
+        credits: {
+          label: 'تنبيهات الرصيد',
+          description: 'توقّف الوصول إلى الرصيد أو استعادته.'
         }
       },
       test: 'إرسال إشعار تجريبي',
@@ -393,6 +429,9 @@ export const ar = defineLocale({
       intro: 'خصص مظهر Hermes Desktop.',
       colorMode: 'نمط الألوان',
       colorModeDesc: 'اختر الوضع الفاتح أو الداكن أو اتبع النظام.',
+      uiScaleTitle: 'مقياس الواجهة',
+      uiScaleDesc: percent =>
+        `يغيّر حجم النص وعناصر التحكم في التطبيق كله. تعمل أيضا Cmd/Ctrl مع + و - و 0. الحالي: ${percent}%.`,
       toolViewTitle: 'عرض الأدوات',
       toolViewDesc: 'تحكم في كيفية عرض نشاط الأدوات داخل المحادثة.',
       translucencyTitle: 'شفافية النافذة',
@@ -434,6 +473,8 @@ export const ar = defineLocale({
         off: 'إيقاف',
         scaleTitle: 'الحجم',
         scaleDesc: 'غيّر حجم التعويذة الطافية. يُطبّق في كل مكان فورا.',
+        roamTitle: 'التجوال',
+        roamDesc: 'دع الحيوان الأليف يتجول في النافذة من تلقاء نفسه أثناء الخمول.',
         chooseTitle: 'اختر حيوانا أليفا',
         chooseDesc: 'اختياره يثبّته (إن لزم) ويجعله نشطا.',
         searchPlaceholder: 'البحث عن حيوانات أليفة...',
@@ -470,6 +511,9 @@ export const ar = defineLocale({
       timezone: 'المنطقة الزمنية',
       'display.personality': 'أسلوب المساعد',
       'display.showReasoning': 'إظهار التفكير',
+      'desktop.repoScanEnabled': 'الاكتشاف التلقائي للمستودعات',
+      'desktop.repoScanRoots': 'جذور اكتشاف المستودعات',
+      'desktop.repoScanExcludePaths': 'مسارات المستودعات المستثناة',
       'agent.maxTurns': 'الحد الأقصى لخطوات الوكيل',
       'agent.imageInputMode': 'مرفقات الصور',
       'agent.apiMaxRetries': 'محاولات API',
@@ -503,6 +547,7 @@ export const ar = defineLocale({
       'voice.maxRecordingSeconds': 'أقصى مدة للتسجيل',
       'voice.autoTts': 'قراءة الردود صوتياً',
       'stt.enabled': 'تحويل الكلام إلى نص',
+      'stt.echoTranscripts': 'ترديد التفريغات النصية',
       'stt.provider': 'مزود تحويل الكلام إلى نص',
       'stt.local.model': 'نموذج التفريغ المحلي',
       'stt.local.language': 'لغة التفريغ',
@@ -521,6 +566,11 @@ export const ar = defineLocale({
       'tts.elevenlabs.modelId': 'نموذج ElevenLabs',
       'tts.xai.voiceId': 'صوت xAI (Grok)',
       'tts.xai.language': 'لغة xAI',
+      'tts.xai.speed': 'سرعة تشغيل xAI',
+      'tts.xai.autoSpeechTags': 'وسوم الكلام التلقائية لـ xAI',
+      'tts.xai.optimizeStreamingLatency': 'تحسين زمن بث xAI',
+      'tts.xai.sampleRate': 'معدل عينات xAI',
+      'tts.xai.bitRate': 'معدل بت xAI',
       'tts.minimax.model': 'نموذج MiniMax TTS',
       'tts.minimax.voiceId': 'صوت MiniMax',
       'tts.mistral.model': 'نموذج Mistral TTS',
@@ -532,6 +582,8 @@ export const ar = defineLocale({
       'tts.kittentts.model': 'نموذج KittenTTS',
       'tts.kittentts.voice': 'صوت KittenTTS',
       'tts.piper.voice': 'صوت Piper',
+      'tts.deepinfra.model': 'نموذج DeepInfra TTS',
+      'tts.deepinfra.voice': 'صوت DeepInfra',
       'memory.memoryEnabled': 'الذاكرة المستمرة',
       'memory.userProfileEnabled': 'ملف المستخدم',
       'memory.memoryCharLimit': 'ميزانية الذاكرة',
@@ -556,6 +608,9 @@ export const ar = defineLocale({
       fallbackProviders: 'إدخالات احتياطية بصيغة provider:model لتجربتها إذا فشل النموذج الافتراضي.',
       'display.personality': 'أسلوب المساعد الافتراضي للجلسات الجديدة.',
       'display.showReasoning': 'يعرض أقسام التفكير عندما توفرها الخلفية.',
+      'desktop.repoScanEnabled': 'يفحص المجلدات المحلية بحثا عن مستودعات Git لعرضها في المشاريع.',
+      'desktop.repoScanRoots': 'المجلدات التي تُفحص. اتركها فارغة لفحص مجلد المنزل.',
+      'desktop.repoScanExcludePaths': 'مجلدات تُتخطى هي وما بداخلها أثناء اكتشاف المستودعات.',
       timezone: 'تستخدم عندما يحتاج Hermes إلى سياق الوقت المحلي. اتركها فارغة لاستخدام منطقة النظام.',
       'agent.imageInputMode': 'يتحكم في طريقة إرسال مرفقات الصور إلى النموذج.',
       'agent.maxTurns': 'الحد الأعلى لدورات استدعاء الأدوات قبل أن يوقف Hermes التشغيل.',
@@ -579,8 +634,14 @@ export const ar = defineLocale({
       'voice.autoTts': 'ينطق ردود المساعد تلقائياً.',
       'tts.xai.voiceId': 'معرف صوت xAI مثل eve أو معرف صوت مخصص.',
       'tts.xai.language': 'رمز لغة النطق، مثل en.',
+      'tts.xai.speed': 'سرعة التشغيل. 0.7 = أبطأ، 1.0 = عادي، 1.5 = أسرع.',
+      'tts.xai.autoSpeechTags': 'يسمح لنموذج لغوي بإدراج وسوم صوتية تعبيرية ([laughing]، [sighs]) في النص قبل التوليف.',
+      'tts.xai.optimizeStreamingLatency': 'موازنة بين زمن الاستجابة والجودة. 0 = أفضل جودة، 2 = أقل زمن استجابة.',
+      'tts.xai.sampleRate': 'معدل عينات الصوت بالهرتز. الأعلى = جودة أفضل وملفات أكبر.',
+      'tts.xai.bitRate': 'معدل بت MP3 بوحدة bps. يسري فقط عندما يكون الترميز mp3.',
       'tts.neutts.device': 'جهاز الاستدلال المحلي لـ NeuTTS.',
       'stt.enabled': 'يفعل التفريغ الصوتي المحلي أو عبر مزود.',
+      'stt.echoTranscripts': 'ينشر التفريغ الخام 🎙️ للرسائل الصوتية في المحادثة.',
       'stt.elevenlabs.languageCode': 'رمز لغة ISO-639-3 اختياري. اتركه فارغاً للاكتشاف التلقائي.',
       'updates.nonInteractiveLocalChanges':
         'عندما يحدّث Hermes نفسه من التطبيق دون موجه طرفية، احتفظ بتعديلات المصدر المحلية أو تجاهلها.'
@@ -626,7 +687,15 @@ export const ar = defineLocale({
       failedLoad: 'فشل تحميل الإعدادات',
       autosaveFailed: 'فشل الحفظ التلقائي',
       imported: 'تم استيراد الإعدادات',
-      invalidJson: 'JSON غير صالح'
+      invalidJson: 'JSON غير صالح',
+      builtinOnly: 'المضمّن فقط',
+      keepAwakeTitle: 'إبقاء الحاسوب مستيقظا',
+      keepAwakeDesc: 'يمنع هذا الجهاز من النوم كي تستمر عمليات التشغيل الطويلة أو الليلية. يمكن للشاشة أن تخفت.',
+      attachmentSizeTitle: 'الحد الأقصى لحجم المعاينة / تحميل الصور',
+      attachmentSizeDesc:
+        'أقصى حجم لملف محلي يحمّله سطح المكتب للمعاينات وإرفاق الصور، بوحدة MB. الافتراضي 16. الإرفاق البعيد لغير الصور له حد منفصل قدره 256 MB. رفع هذه القيمة كثيرا يحمّل الملف كاملا في الذاكرة وقد يجمّد التطبيق أو يعطّله.',
+      attachmentSizeUnit: 'MB',
+      attachmentSizeLabel: 'الحد الأقصى لحجم المعاينة / تحميل الصور بالميغابايت'
     },
     quickEntry: {
       enabledTitle: 'الإدخال السريع',
@@ -654,7 +723,8 @@ export const ar = defineLocale({
       revealValue: 'إظهار القيمة',
       replace: 'استبدال',
       set: 'ضبط',
-      clear: 'مسح'
+      clear: 'مسح',
+      manageInKeys: 'الإدارة في مفاتيح API'
     },
     gateway: {
       loading: 'جار تحميل إعدادات البوابة...',
@@ -721,7 +791,75 @@ export const ar = defineLocale({
       signOutFailed: 'فشل تسجيل الخروج',
       testFailed: 'فشل اختبار البوابة البعيدة',
       applyFailed: 'تعذر تطبيق إعدادات البوابة',
-      saveFailed: 'تعذر حفظ إعدادات البوابة'
+      saveFailed: 'تعذر حفظ إعدادات البوابة',
+      modeTitle: 'نمط الاتصال',
+      remoteAuthHint: 'البوابات المستضافة تستخدم OAuth أو اسم مستخدم وكلمة مرور، والبوابات الذاتية قد تستخدم رمز جلسة.',
+      cloudTitle: 'Hermes Cloud',
+      cloudDesc: 'سجّل الدخول مرة واحدة إلى Hermes Cloud واختر من وكلاء حسابك — دون لصق أي رابط.',
+      cloudSignInTitle: 'Hermes Cloud',
+      cloudSignIn: 'تسجيل الدخول إلى Hermes Cloud',
+      cloudSignedIn: 'تم تسجيل الدخول إلى Hermes Cloud',
+      cloudNeedsSignIn: 'سجّل الدخول إلى Hermes Cloud لاكتشاف الوكلاء على حسابك.',
+      cloudSignedInDesc: 'أنت مسجل الدخول. اختر وكيلا أدناه؛ تتجدد الجلسة تلقائيا.',
+      cloudAgentsTitle: 'وكلاؤك',
+      cloudOrgPickerTitle: 'اختر منظمة',
+      cloudOrgSelect: 'اختيار',
+      cloudOrgChange: 'تغيير المنظمة',
+      cloudOrgRole: role => `الدور: ${role}`,
+      cloudLoadingAgents: 'جار تحميل وكلائك...',
+      cloudNoAgents: {
+        before: 'لا يوجد وكلاء على هذا الحساب. أنشئ واحدا في ',
+        linkText: 'بوابة Nous',
+        after: '، ثم حدّث.'
+      },
+      cloudRefresh: 'تحديث',
+      cloudConnect: 'اتصال',
+      cloudConnecting: 'جار الاتصال...',
+      cloudDiscoverFailed: 'تعذر تحميل وكلاء Hermes Cloud',
+      cloudConnectFailed: 'تعذر الاتصال بذلك الوكيل',
+      cloudSignInFailed: 'فشل تسجيل الدخول إلى Hermes Cloud',
+      cloudSignedOutTitle: 'تم تسجيل الخروج من Hermes Cloud',
+      cloudSignedOutMessage: 'تم مسح جلسة Hermes Cloud.',
+      cloudConnectedTitle: 'متصل',
+      cloudConnectedPill: 'متصل',
+      cloudConnectedTo: name => `متصل بـ ${name}.`,
+      cloudAgentProvisioning: 'جار التجهيز...',
+      cloudStatusLabel: status => `الحالة: ${status}`,
+      sshTitle: 'الاتصال عبر SSH',
+      sshDesc:
+        'يُشغَّل Hermes على الجهاز البعيد عبر SSH ويُوصَّل نفقيا إلى هذا التطبيق — لا شيء تشغّله أو تكشفه بنفسك. يتطلب وصول SSH بمفتاح يعمل إلى المضيف.',
+      sshTrustHint: 'يُوثَق مفتاح المضيف الأول المقدَّم ويُثبَّت؛ أي تغيير لاحق يُفشل الاتصال احترازيا.',
+      sshHostTitle: 'المضيف',
+      sshHostDesc: 'user@host، أو اسم Host من ~/.ssh/config.',
+      sshHostPick: 'اختر مضيفا...',
+      sshHostPickTitle: 'المضيف',
+      sshHostPickDesc: 'اسم Host من ~/.ssh/config، أو "مخصص" لكتابته يدويا.',
+      sshHostCustom: 'مخصص (إدخال يدوي)...',
+      sshUserTitle: 'المستخدم',
+      sshUserDesc: 'فارغ = ~/.ssh/config أو مستخدمك الحالي.',
+      sshUserPlaceholder: 'من ~/.ssh/config',
+      sshPortTitle: 'المنفذ',
+      sshPortDesc: 'فارغ = 22 أو منفذ ~/.ssh/config.',
+      sshKeyTitle: 'ملف الهوية',
+      sshKeyDesc: 'مسار المفتاح الخاص. فارغ = ssh-agent أو ~/.ssh/config.',
+      sshHermesPathTitle: 'مسار Hermes (اختياري)',
+      sshHermesPathDesc: 'المسار الكامل لملف hermes التنفيذي البعيد. فارغ = اكتشاف تلقائي.',
+      sshHermesPathPlaceholder: 'اكتشاف تلقائي',
+      sshTestConnection: 'اختبار SSH',
+      sshConnect: 'اتصال',
+      sshButtonsHint: 'الحفظ يسري عند التشغيل القادم. الاتصال يعيد الاتصال الآن.',
+      sshReachable: (host, platform) => `قابل للوصول: ${host} (${platform}) — تم العثور على Hermes`,
+      sshIncompleteHost: 'أدخل مضيف SSH قبل الاتصال.',
+      sshErrUnreachable: 'تعذر الوصول إلى ذلك المضيف عبر SSH. تحقق من المضيف والمنفذ وشبكتك.',
+      sshErrAuth:
+        'فشلت مصادقة SSH. حمّل مفتاحك في ssh-agent (عبر ssh-add) أو عيّن IdentityFile في ~/.ssh/config — يشغّل Hermes الأمر ssh دون تفاعل.',
+      sshErrHostKey: 'تغيّر مفتاح المضيف منذ آخر اتصال. تأكد أن هذا متوقع، ثم نفّذ ssh-keygen -R <host> وأعد الاتصال.',
+      sshErrNotInstalled:
+        'Hermes غير مثبت على المضيف البعيد. ثبّته هناك (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh) أو عيّن مسار Hermes.',
+      sshErrPlatform: 'منصة بعيدة غير مدعومة. يدعم وضع SSH في Hermes Desktop مضيفات Linux و macOS و Windows.',
+      sshErrTimeout: 'انتهت مهلة اتصال SSH. قد يكون المضيف غير قابل للوصول أو نائما.',
+      sshErrUpdateRequired: 'حدّث Hermes على المضيف البعيد قبل الاتصال عبر Desktop SSH.',
+      sshErrUnknown: 'فشل اتصال SSH.'
     },
     keys: {
       loading: 'جار تحميل مفاتيح API وبيانات الاعتماد...',
@@ -754,7 +892,45 @@ export const ar = defineLocale({
       name: 'الاسم',
       serverJson: 'JSON الخادم',
       remove: 'إزالة',
-      saveServer: 'حفظ الخادم'
+      saveServer: 'حفظ الخادم',
+      test: 'اختبار الاتصال',
+      testing: 'جار الاختبار...',
+      testOk: count => `متصل — ${count} أداة متاحة`,
+      testFailed: 'فشل الاتصال',
+      enableServer: name => `تفعيل ${name}`,
+      disableServer: name => `تعطيل ${name}`,
+      serverEnabled: name => `تم تفعيل ${name} — يسري على الجلسات الجديدة.`,
+      serverDisabled: name => `تم تعطيل ${name} — يسري على الجلسات الجديدة.`,
+      toggleFailed: (name, enabled) => `تعذر ${enabled ? 'تشغيل' : 'إيقاف'} ${name}`,
+      tabServers: 'الخوادم',
+      tabCatalog: 'الكتالوج',
+      catalogLoading: 'جار تحميل كتالوج MCP...',
+      catalogLoadFailed: 'فشل تحميل كتالوج MCP',
+      catalogEmpty: 'لا توجد إدخالات في الكتالوج.',
+      catalogInstalled: 'مثبّت',
+      catalogEnabled: 'مفعّل',
+      catalogNeedsInstall: 'يتطلب بناء',
+      catalogInstall: 'تثبيت',
+      catalogInstalling: 'جار التثبيت...',
+      catalogInstallStarted: name => `جار تثبيت ${name}... يسري على الجلسات الجديدة عند الانتهاء.`,
+      catalogInstallFailed: name => `فشل تثبيت ${name}`,
+      catalogEnvPrompt: name => `يتطلب ${name} بيانات اعتماد`,
+      catalogEnvRequired: 'املأ القيم المطلوبة قبل التثبيت.',
+      capabilitySummary: (tools, prompts, resources) =>
+        `مفعّل: ${[`${tools} أداة`, ...(prompts ? [`${prompts} موجّه`] : []), ...(resources ? [`${resources} مورد`] : [])].join('، ')}`,
+      statusConnecting: 'جار الاتصال...',
+      statusNeedsAuth: 'يتطلب مصادقة',
+      statusError: 'خطأ',
+      statusOff: 'إيقاف',
+      allServers: 'كل الخوادم',
+      authenticatedTitle: 'تمت المصادقة',
+      authenticatedMessage: (server, count) => `${server}: ${count} أداة`,
+      waitingForBrowser: 'في انتظار المتصفح...',
+      authenticate: 'مصادقة',
+      unsavedConnect: 'غير محفوظ — احفظ mcp.json للاتصال.',
+      enableTool: tool => `تفعيل ${tool}`,
+      disableTool: tool => `تعطيل ${tool}`,
+      noOutput: 'لا مخرجات بعد.'
     },
     model: {
       loading: 'جار تحميل إعدادات النموذج...',
@@ -773,6 +949,9 @@ export const ar = defineLocale({
       change: 'تغيير',
       autoUseMain: 'تلقائي · استخدام النموذج الرئيسي',
       providerDefault: '(افتراضي المزوّد)',
+      fallbackAdd: 'إضافة احتياطي',
+      fallbackEmpty: 'لا توجد نماذج احتياطية — يُستخدم النموذج الافتراضي ما لم يفشل.',
+      notInCatalog: 'ليس ضمن قائمة نماذج هذا المزوّد — قد تتحول الاستدعاءات إلى نموذج احتياطي.',
       tasks: {
         vision: {
           label: 'الرؤية',
@@ -860,7 +1039,13 @@ export const ar = defineLocale({
       unarchiveFailed: 'فشل إلغاء الأرشفة',
       deleteFailed: 'فشل الحذف',
       updateDirFailed: 'تعذر تحديث المجلد الافتراضي',
-      clearDirFailed: 'تعذر مسح المجلد الافتراضي'
+      clearDirFailed: 'تعذر مسح المجلد الافتراضي',
+      autoArchiveTitle: 'الأرشفة التلقائية للمحادثات الخاملة',
+      autoArchiveDesc:
+        'أرشف تلقائيا المحادثات التي لم تلمسها منذ مدة. المحادثات المثبتة لا تؤرشف أبدا، ولا يُحذف شيء — تنتقل المحادثات المؤرشفة إلى هنا فقط.',
+      autoArchiveDaysLabel: 'الأرشفة بعد',
+      autoArchiveDaysUnit: 'يوما من الخمول',
+      autoArchiveFailed: 'تعذر تحديث الأرشفة التلقائية'
     },
     toolsets: {
       loadingConfig: 'جار تحميل الإعدادات',
@@ -892,7 +1077,52 @@ export const ar = defineLocale({
       postSetupCompleteMessage: step => `تم تثبيت ${step}.`,
       postSetupErrorTitle: 'انتهى الإعداد بأخطاء',
       postSetupErrorMessage: step => `تحقق من سجل ${step}.`,
-      postSetupFailed: step => `فشل تشغيل إعداد ${step}`
+      postSetupFailed: step => `فشل تشغيل إعداد ${step}`,
+      needsSignIn: 'يتطلب تسجيل الدخول',
+      needsSetup: 'يتطلب إعدادا',
+      activeBackend: 'نشط',
+      activeBackendHint: 'هذه هي خلفيتك النشطة',
+      useBackend: 'استخدام هذه الخلفية',
+      nousAuthNeededTitle: 'سجّل الدخول إلى Nous Portal',
+      nousAuthNeededMessage: provider => `تم حفظ ${provider} لكنه لن يُفعّل حتى تسجّل الدخول إلى Nous Portal.`,
+      nousAuthSignIn: 'تسجيل الدخول',
+      nousAuthDoneTitle: 'تم الاتصال بـ Nous Portal',
+      nousAuthDoneMessage: 'خلفيات اشتراكك نشطة الآن.',
+      nousAuthFailed: 'لم يكتمل تسجيل الدخول إلى Nous Portal',
+      postSetupInstalledHint: 'مثبّت. أعد تشغيل الإعداد فقط إذا تعطل شيء.',
+      postSetupRerun: 'إعادة تشغيل الإعداد',
+      postSetupInstalled: 'مثبّت',
+      webSearchActive: backend => `البحث: ${backend}`,
+      webExtractActive: backend => `الاستخراج: ${backend}`,
+      webCapabilityUnset: 'غير مضبوط',
+      webUseForSearch: 'استخدام للبحث',
+      webUseForExtract: 'استخدام للاستخراج',
+      webUsedForSearch: 'خلفية البحث',
+      webUsedForExtract: 'خلفية الاستخراج',
+      webCapabilitySelectedMessage: (provider, capability) => `يتولى ${provider} الآن مهمة ${capability} على الويب.`,
+      failedSelectCapability: provider => `تعذر ضبط ${provider}`,
+      loadingModels: 'جار تحميل كتالوج النماذج...',
+      modelSectionTitle: 'النموذج',
+      modelCount: count => `${count} نموذج`,
+      modelInUse: 'قيد الاستخدام',
+      modelDefault: 'افتراضي',
+      modelInactiveHint: 'اختر هذه الخلفية أولا لتغيير نموذجها.',
+      modelSelectedTitle: 'تم اختيار النموذج',
+      modelSelectedMessage: model => `${model} يسري على الجلسات الجديدة.`,
+      failedSelectModel: model => `فشل اختيار ${model}`,
+      terminalBackend: {
+        sectionTitle: 'خلفية التنفيذ',
+        loading: 'جار فحص خلفيات التنفيذ...',
+        failedLoad: 'تعذر تحميل خلفيات الطرفية',
+        ready: 'جاهز',
+        needsSetup: 'يتطلب إعدادا',
+        unavailable: 'غير متاح',
+        inUse: 'قيد الاستخدام',
+        selectedTitle: 'تم اختيار الخلفية',
+        selectedMessage: backend => `أوامر الطرفية تعمل الآن عبر ${backend}. يسري على الجلسات الجديدة.`,
+        failedSelect: backend => `فشل اختيار ${backend}`,
+        needsSetupHint: 'يمكنك اختيار هذه الخلفية الآن — ستفشل الأوامر حتى يكتمل الإعداد.'
+      }
     }
   },
   skills: {
@@ -921,7 +1151,109 @@ export const ar = defineLocale({
     toolsetEnabled: 'تم تفعيل مجموعة الأدوات',
     toolsetDisabled: 'تم تعطيل مجموعة الأدوات',
     appliesToNewSessions: name => `ينطبق على الجلسات الجديدة في ${name}`,
-    failedToUpdate: name => `فشل تحديث ${name}`
+    failedToUpdate: name => `فشل تحديث ${name}`,
+    tabMcp: 'MCP',
+    tabHub: 'تصفّح المركز',
+    visionModelHint: 'تستخدم الرؤية إعداد النموذج المساعد — يُختار النموذج القادر على الصور هناك، لا لكل مزوّد هنا.',
+    visionModelLink: 'اختر نموذج الرؤية في الإعدادات → النماذج',
+    sortMostUsed: 'الأكثر استخداما',
+    sortAlpha: 'أ–ي',
+    sortMostUsedDesc: '↓ الأكثر استخداما',
+    sortLeastUsedAsc: '↑ الأقل استخداما',
+    enableAll: 'تفعيل الكل',
+    disableAll: 'تعطيل الكل',
+    disableUnused: 'تعطيل غير المستخدم',
+    bulkUpdated: count => `تم تحديث ${count} عنصر للجلسات الجديدة.`,
+    bulkNoChange: 'لا شيء لتغييره.',
+    usageCount: count => `استُخدمت ${count}×`,
+    provenance: {
+      agent: 'مُتعلَّمة',
+      bundled: 'مضمّنة',
+      hub: 'المركز'
+    },
+    emptyNoneFound: noun => `لا توجد ${noun}`,
+    emptyNothingMatches: query => `لا شيء يطابق “${query}”.`,
+    emptyNoneAvailable: noun => `لا توجد ${noun} متاحة بعد.`,
+    changesApplyNewSessions: 'تسري التغييرات على الجلسات الجديدة.',
+    skillUpdated: 'تم تحديث المهارة',
+    edit: 'تحرير',
+    archive: 'أرشفة',
+    skillArchivedTitle: 'تمت أرشفة المهارة',
+    skillArchivedMessage: 'يمكن استعادتها عبر hermes curator restore.',
+    hub: {
+      searchPlaceholder: 'البحث في مركز المهارات',
+      search: 'بحث',
+      searching: 'جار البحث...',
+      connectingHubs: 'جار الاتصال بمراكز المهارات...',
+      connectedHubs: 'المراكز المتصلة:',
+      featured: 'مهارات مميزة',
+      landingHint: 'ابحث في المركز لتصفح المهارات القابلة للتثبيت من الفهرس الرسمي و GitHub ومصادر المجتمع.',
+      noResults: 'لا توجد مهارات مطابقة في المركز.',
+      resultCount: (count, ms) => `${count} نتيجة${ms !== null ? ` خلال ${ms}ms` : ''}`,
+      timedOut: sources => `انتهت المهلة: ${sources}`,
+      installed: 'مثبّتة',
+      install: 'تثبيت',
+      installing: 'جار التثبيت...',
+      uninstall: 'إلغاء التثبيت',
+      uninstalling: 'جار إلغاء التثبيت...',
+      updateAll: 'تحديث المثبّتة',
+      updating: 'جار التحديث...',
+      preview: 'معاينة',
+      scan: 'فحص',
+      scanning: 'جار الفحص...',
+      close: 'إغلاق',
+      files: 'الملفات',
+      noReadme: 'هذه المهارة بلا معاينة SKILL.md.',
+      trust: {
+        builtin: 'مضمّنة',
+        trusted: 'موثوقة',
+        community: 'مجتمع'
+      },
+      verdictSafe: 'آمنة',
+      verdictCaution: 'حذر',
+      verdictDangerous: 'خطيرة',
+      policyAllow: 'التثبيت مسموح',
+      policyAsk: 'راجع قبل التثبيت',
+      policyBlock: 'التثبيت محظور بحكم السياسة',
+      findings: count => `${count} ملاحظة`,
+      noFindings: 'لا توجد ملاحظات أمنية.',
+      installStarted: name => `جار تثبيت ${name}...`,
+      uninstallStarted: name => `جار إلغاء تثبيت ${name}...`,
+      updateStarted: 'جار تحديث المهارات المثبّتة...',
+      actionFailed: 'فشل إجراء المهارة',
+      actionLog: 'سجل الإجراء',
+      loadFailed: 'فشل تحميل مركز المهارات',
+      previewFailed: 'فشلت معاينة المهارة',
+      scanFailed: 'فشل الفحص الأمني',
+      searchFailed: 'فشل البحث في المركز'
+    }
+  },
+  starmap: {
+    title: 'خريطة الذاكرة',
+    subtitle: (nodes, clusters) => `${nodes} مهارة عبر ${clusters} فئة`,
+    close: 'إغلاق خريطة الذاكرة',
+    refresh: 'تحديث',
+    memory: 'الذاكرة',
+    filterAll: 'الكل',
+    filterUsed: 'المستخدمة',
+    filterLearned: 'المتعلَّمة',
+    viewGraph: 'المخطط',
+    loadFailed: 'تعذر تحميل خريطة الذاكرة',
+    loading: 'جار التحميل...',
+    emptyTitle: 'لا شيء متعلَّم بعد',
+    emptyDesc: 'عندما يبني Hermes مهارات وذكريات لعملك، ستظهر هنا.',
+    share: 'مشاركة الخريطة',
+    shareHint: 'انسخ الرمز لمشاركة هذه الخريطة، أو ألصق رمزا لتحميله. يتضمن التخطيط فقط، لا نص ذاكرتك أو مهاراتك.',
+    shareTitle: 'استيراد / تصدير الخريطة',
+    sharePlaceholder: 'ألصق رمز خريطة...',
+    copy: 'نسخ رمز الخريطة',
+    copied: 'تم النسخ!',
+    importMap: 'استيراد خريطة',
+    importBtn: 'تحميل',
+    importEmpty: 'ألصق رمز خريطة لتحميله.',
+    importSuccess: nodes => `تم تحميل خريطة فيها ${nodes} عقدة.`,
+    importedBadge: 'خريطة مستوردة',
+    resetToMine: 'العودة إلى خريطتي'
   },
   agents: {
     close: 'إغلاق الوكلاء',
@@ -948,6 +1280,7 @@ export const ar = defineLocale({
     ageSeconds: seconds => `قبل ${seconds} ث`,
     ageMinutes: minutes => `قبل ${minutes} د`,
     ageHours: hours => `قبل ${hours} س`,
+    ageDays: days => `قبل ${days} ي`,
     durationSeconds: seconds => `${seconds} ث`,
     durationMinutes: (minutes, seconds) => `${minutes} د ${seconds} ث`,
     tokens: value => `${value} رمز`
@@ -961,6 +1294,10 @@ export const ar = defineLocale({
     goToSession: 'الانتقال إلى الجلسة',
     branches: 'الفروع',
     startInBranch: branch => `محادثة جديدة في ${branch}`,
+    projects: 'المشاريع',
+    openFolder: 'فتح مجلد كمشروع...',
+    openFolderAt: path => `فتح مجلد كمشروع — ${path}`,
+    newSessionInProject: project => `جلسة جديدة في ${project}`,
     commandCenter: 'مركز الأوامر',
     appearance: 'المظهر',
     settings: 'الإعدادات',
@@ -1012,6 +1349,7 @@ export const ar = defineLocale({
     },
     installTheme: {
       title: 'تثبيت سمة...',
+      pageTitle: 'تثبيت سمة',
       placeholder: 'البحث في VS Code Marketplace...',
       loading: 'جار البحث في Marketplace...',
       error: 'تعذّر الوصول إلى Marketplace.',
@@ -1028,12 +1366,14 @@ export const ar = defineLocale({
     sections: {
       sessions: 'الجلسات',
       system: 'النظام',
-      usage: 'الاستخدام'
+      usage: 'الاستخدام',
+      maintenance: 'الصيانة'
     },
     sectionDescriptions: {
       sessions: 'البحث في الجلسات وإدارتها',
       system: 'الحالة والسجلات وإجراءات النظام',
-      usage: 'نشاط الرموز والتكلفة والمهارات عبر الزمن'
+      usage: 'نشاط الرموز والتكلفة والمهارات عبر الزمن',
+      maintenance: 'التشخيصات والنسخ الاحتياطي والمنسّق وبيانات الذاكرة'
     },
     nav: {
       newChat: {
@@ -1111,7 +1451,54 @@ export const ar = defineLocale({
     noModelUsage: 'لا يوجد استخدام نماذج',
     topSkills: 'أكثر المهارات استخداما',
     noSkillActivity: 'لا يوجد نشاط مهارات',
-    actions: count => `${count} إجراء`
+    actions: count => `${count} إجراء`,
+    logFile: 'ملف السجل',
+    logLevel: 'المستوى',
+    logSearchPlaceholder: 'تصفية أسطر السجل...',
+    maintenance: {
+      runOps: 'التشخيصات',
+      doctor: 'تشغيل doctor',
+      doctorDesc: 'فحص صحة التثبيت والإعدادات والمزوّدين',
+      securityAudit: 'التدقيق الأمني',
+      securityAuditDesc: 'فحص الإعدادات والمهارات بحثا عن إعدادات خطرة',
+      backup: 'إنشاء نسخة احتياطية',
+      backupDesc: 'ضغط الإعدادات والذكريات والمهارات والجلسات في ملف zip',
+      debugShare: 'مشاركة التصحيح',
+      debugShareDesc: 'رفع تقرير وسجلات منقّحة والحصول على روابط قابلة للمشاركة (تُحذف تلقائيا خلال 6 ساعات)',
+      debugShareRunning: 'جار رفع تقرير التصحيح...',
+      debugShareLinks: 'روابط المشاركة',
+      debugShareFailed: 'فشلت مشاركة التصحيح',
+      copyLink: 'نسخ الرابط',
+      linkCopied: 'تم نسخ الرابط',
+      curator: 'منسّق المهارات',
+      curatorDesc: 'مراجعة خلفية تؤرشف المهارات الخاملة التي أنشأها الوكيل',
+      curatorPaused: 'متوقف مؤقتا',
+      curatorActive: 'نشط',
+      curatorDisabled: 'معطل',
+      curatorLastRun: when => `آخر تشغيل ${when}`,
+      curatorNeverRan: 'لم يعمل قط',
+      pause: 'إيقاف مؤقت',
+      resume: 'استئناف',
+      runNow: 'تشغيل الآن',
+      memoryData: 'بيانات الذاكرة',
+      memoryDataDesc: 'ملفات الذاكرة المضمّنة التي تُحقن في كل جلسة',
+      memoryProvider: name => `المزوّد النشط: ${name}`,
+      builtinMemory: 'مضمّن',
+      memoryFile: 'ذاكرة الوكيل (MEMORY.md)',
+      userFile: 'ملف المستخدم (USER.md)',
+      bytes: size => size,
+      empty: 'فارغ',
+      resetMemory: 'إعادة ضبط الذاكرة',
+      resetUser: 'إعادة ضبط الملف الشخصي',
+      resetAll: 'إعادة ضبط الاثنين',
+      resetConfirm: target => `حذف ${target}؟ لا يمكن التراجع عن هذا.`,
+      resetDone: files => `تم حذف ${files}.`,
+      resetFailed: 'فشلت إعادة ضبط الذاكرة',
+      actionStarted: name => `بدأ ${name} — جار متابعة السجل...`,
+      actionFailed: name => `فشل بدء ${name}`,
+      running: 'جار التشغيل...',
+      viewLog: 'سجل الإجراء'
+    }
   },
   messaging: {
     search: 'بحث',
@@ -1161,6 +1548,23 @@ export const ar = defineLocale({
     failedUpdate: name => `فشل تحديث ${name}`,
     failedSave: name => `فشل حفظ ${name}`,
     failedClear: key => `فشل مسح ${key}`,
+    pendingRequests: count => `طلبات معلقة (${count})`,
+    pendingAria: count => `${count} طلب اقتران معلق`,
+    approvedUsers: count => `مستخدمون معتمدون (${count})`,
+    approve: 'اعتماد',
+    approving: 'جار الاعتماد...',
+    revoke: 'سحب الوصول',
+    revoking: 'جار السحب...',
+    revokeAria: name => `سحب وصول ${name}`,
+    revokeTitle: 'سحب الوصول',
+    revokeDesc: name => `سيفقد ${name} الوصول ولن يُتعرف عليه اعتبارا من رسالته التالية.`,
+    approvedUser: name => `تم اعتماد ${name}`,
+    approvedHint: 'سيُتعرف عليهم تلقائيا عند رسالتهم التالية.',
+    revokedUser: name => `تم سحب وصول ${name}`,
+    failedApprove: name => `فشل اعتماد ${name}`,
+    failedRevoke: name => `فشل سحب وصول ${name}`,
+    pairingLockedOut: 'محاولات اعتماد فاشلة كثيرة — هذه المنصة موقوفة مؤقتا. حاول لاحقا.',
+    waitingSince: minutes => (minutes < 1 ? 'الآن' : `قبل ${minutes} د`),
     fieldCopy: {
       TELEGRAM_BOT_TOKEN: {
         label: 'رمز البوت (token)',
@@ -1286,6 +1690,71 @@ export const ar = defineLocale({
     },
     platformIntro: {}
   },
+  webhooks: {
+    search: 'البحث في الـ webhooks...',
+    loading: 'جار تحميل الـ webhooks...',
+    loadFailed: 'فشل تحميل الـ webhooks',
+    subscriptions: count => `الاشتراكات (${count})`,
+    hint: 'تغييرات الاشتراكات تُطبق فورا متى كان المستقبِل يعمل. الاشتراكات المعطلة ترفض الأحداث الواردة.',
+    empty: 'لا توجد اشتراكات webhook بعد.',
+    disabledTitle: 'مستقبِل الـ webhook معطل',
+    disabledBody:
+      'الـ webhooks منصة بوابة مستقلة. فعّلها هنا لقبول أحداث HTTP الواردة؛ قنوات المحادثة لازمة فقط عندما يسلّم اشتراك إلى Telegram أو Discord أو Slack أو قناة أخرى.',
+    enable: 'تفعيل الـ webhooks',
+    enabling: 'جار التفعيل...',
+    enabled: name => `تم التفعيل: "${name}"`,
+    disabled: name => `تم التعطيل: "${name}"`,
+    enableRow: 'تفعيل',
+    disableRow: 'تعطيل',
+    delete: 'حذف',
+    deleting: 'جار الحذف...',
+    deleted: 'تم حذف الـ webhook',
+    deleteTitle: 'حذف الـ webhook',
+    deleteDescPrefix: 'سيزيل هذا نهائيا ',
+    deleteDescSuffix: '. لا يمكن التراجع عن هذا.',
+    deleteFailed: name => `فشل حذف "${name}"`,
+    toggleFailed: (name, enabled) => `تعذر ${enabled ? 'تشغيل' : 'إيقاف'} "${name}"`,
+    newSubscription: 'اشتراك جديد',
+    restarting: 'جار إعادة تشغيل البوابة...',
+    restartNeeded: 'الـ webhooks مفعلة، لكن البوابة ما زالت بحاجة إلى إعادة تشغيل قبل أن يعمل المستقبِل.',
+    restartGateway: 'إعادة تشغيل البوابة',
+    restartingGateway: 'جار إعادة التشغيل...',
+    restartFailed: detail => `فشلت إعادة تشغيل البوابة${detail}`,
+    enabledRestarting: 'تم تفعيل الـ webhooks؛ جار إعادة تشغيل البوابة...',
+    all: '(الكل)',
+    deliverOnly: 'تسليم فقط',
+    createdTitle: 'تم إنشاء الاشتراك',
+    createdSecretHint: 'انسخ السر الآن — يُعرض مرة واحدة فقط.',
+    webhookUrl: 'رابط الـ webhook',
+    secretOnce: 'السر (يُعرض مرة واحدة)',
+    done: 'تم',
+    fieldName: 'الاسم',
+    fieldNamePlaceholder: 'مثل github-push',
+    fieldDescription: 'الوصف',
+    fieldDescriptionPlaceholder: 'ماذا يفعل هذا الـ webhook (اختياري)',
+    fieldEvents: 'الأحداث',
+    fieldEventsPlaceholder: 'مفصولة بفواصل، اتركها فارغة للكل',
+    fieldSkills: 'المهارات',
+    fieldSkillsPlaceholder: 'أسماء مهارات مفصولة بفواصل (اختياري)',
+    fieldDeliver: 'التسليم إلى',
+    fieldDeliverOnly: 'تسليم الحمولة فقط',
+    fieldPrompt: 'الموجّه',
+    fieldPromptPlaceholder: 'تعليمات للوكيل عند انطلاق هذا الـ webhook (اختياري)',
+    nameRequired: 'الاسم مطلوب',
+    create: 'إنشاء',
+    creating: 'جار الإنشاء...',
+    created: 'تم الإنشاء',
+    createFailed: detail => `فشل الإنشاء: ${detail}`,
+    copy: 'نسخ',
+    deliverOptions: {
+      log: 'السجل',
+      telegram: 'Telegram',
+      discord: 'Discord',
+      slack: 'Slack',
+      email: 'البريد الإلكتروني',
+      github_comment: 'تعليق GitHub'
+    }
+  },
   profiles: {
     close: 'إغلاق',
     nameHint: 'اسم الملف الشخصي',
@@ -1359,7 +1828,10 @@ export const ar = defineLocale({
     failedLoadSoul: 'فشل تحميل التعليمات',
     failedSaveSoul: 'فشل حفظ التعليمات',
     failedCreate: 'فشل الإنشاء',
-    failedRename: 'فشل إعادة التسمية'
+    failedRename: 'فشل إعادة التسمية',
+    search: 'البحث في الملفات الشخصية...',
+    renameMenu: 'إعادة تسمية…',
+    editSoul: 'تحرير SOUL.md…'
   },
   cron: {
     close: 'إغلاق',
@@ -1467,7 +1939,33 @@ export const ar = defineLocale({
     optional: 'اختياري',
     promptScheduleRequired: 'الرسالة والجدول مطلوبان',
     saveChanges: 'حفظ التغييرات',
-    createAction: 'إنشاء'
+    createAction: 'إنشاء',
+    title: 'المهام المجدولة',
+    count: count => `${count} مهمة`,
+    deliverNeedsHomeChannel: 'اضبط قناة رئيسية أولا',
+    modelLabel: 'النموذج',
+    modelDefault: 'الافتراضي (النموذج العام)',
+    promptRequired: 'الرسالة مطلوبة.',
+    scheduleRequired: 'الجدول مطلوب.',
+    scriptOnlyEditHint: 'مهمة سكربت فقط (بلا رسالة ذكاء اصطناعي). معرّف المهمة:',
+    tabs: {
+      jobs: 'المهام',
+      blueprints: 'القوالب'
+    },
+    blueprints: {
+      tab: 'القوالب',
+      startFrom: 'ابدأ من',
+      custom: 'مخصص',
+      subtitle: 'أتمتة جاهزة',
+      dialogDesc: 'املأ التفاصيل وجدولها.',
+      scheduleIt: 'جدولتها',
+      scheduling: 'جار الجدولة...',
+      scheduled: 'تمت جدولة القالب',
+      loading: 'جار تحميل القوالب...',
+      failedLoad: 'فشل تحميل القوالب',
+      emptyTitle: 'لا توجد قوالب متاحة',
+      emptyDesc: 'لا توجد قوالب أتمتة متاحة على هذه الخلفية.'
+    }
   },
   artifacts: {
     search: 'بحث',
@@ -1589,6 +2087,9 @@ export const ar = defineLocale({
       newWorktreeTitle: 'شجرة عمل جديدة',
       newWorktreeDesc: 'سمِّ الفرع لشجرة العمل هذه.',
       branchPlaceholder: 'مثال: my-feature',
+      branchOff: () => ({ after: '', before: 'تفريع من ' }),
+      baseBranchPlaceholder: 'البحث في الفروع…',
+      baseBranchNone: 'لم يتم العثور على فروع',
       startWorkFailed: 'تعذّر إنشاء شجرة العمل',
       convertBranch: 'تحويل فرع...',
       convertBranchTitle: 'تحويل فرع',
@@ -1610,7 +2111,16 @@ export const ar = defineLocale({
       enter: label => `فتح ${label}`,
       reorder: label => `إعادة ترتيب ${label}`,
       toggle: (label, open) => `${open ? 'إظهار' : 'إخفاء'} جلسات ${label}`,
-      back: 'كل المشاريع'
+      back: 'كل المشاريع',
+      staleBackend:
+        'حدّث خلفية Hermes لإنشاء المشاريع — خلفيتك أقدم من تطبيق سطح المكتب هذا (الإعدادات → التحديثات → الخلفية).'
+    },
+    dateDivider: {
+      today: 'سابقا اليوم',
+      yesterday: 'أمس',
+      thisWeek: 'سابقا هذا الأسبوع',
+      lastWeek: 'الأسبوع الماضي',
+      thisMonth: 'سابقا هذا الشهر'
     },
     newSessionIn: label => `جلسة جديدة في ${label}`,
     showMoreIn: (count, label) => `إظهار ${count} أخرى في ${label}`,
@@ -1762,7 +2272,15 @@ export const ar = defineLocale({
         description: 'اشرح كيفية عمل الكود المحدد واربطه بالملفات الرئيسية.',
         text: 'يرجى شرح كيفية عمل هذا وإرشادي إلى الملفات الرئيسية.'
       }
-    }
+    },
+    speakReplies: 'قراءة الردود صوتيا',
+    stopSpeakingReplies: 'إيقاف قراءة الردود صوتيا',
+    wakeWordListening: phrase => `كلمة التنبيه: "${phrase}" — يستمع`,
+    wakeWordOff: phrase => `كلمة التنبيه: "${phrase}" — متوقفة`,
+    wakeWordPausedVoice: phrase => `كلمة التنبيه: "${phrase}" — متوقفة مؤقتا أثناء المحادثة الصوتية`,
+    queuedPaused: count => `${count} في الطابور — متوقف مؤقتا`,
+    queueResume: 'استئناف',
+    queueResumeTip: 'أوقفه زر الإيقاف — استأنف إرسال الأدوار في الطابور'
   },
   statusStack: {
     agents: 'الوكلاء',
@@ -1773,6 +2291,10 @@ export const ar = defineLocale({
     stop: 'إيقاف',
     dismiss: 'تجاهل',
     exit: code => `خروج ${code}`,
+    goalActive: 'الهدف نشط',
+    goalDone: 'اكتمل الهدف',
+    goalPaused: 'الهدف متوقف مؤقتا',
+    goalWaiting: 'الهدف بانتظار',
     coding: {
       title: 'شجرة العمل',
       noBranch: 'لا يوجد فرع',
@@ -1912,7 +2434,40 @@ export const ar = defineLocale({
     transcriptSaved: 'تم حفظ النص الكامل في',
     copiedOutput: 'تم النسخ!',
     copyOutput: 'نسخ المخرجات',
-    reloadRetry: 'إعادة التحميل وإعادة المحاولة'
+    reloadRetry: 'إعادة التحميل وإعادة المحاولة',
+    setupChoiceTitle: 'إعداد Hermes Desktop',
+    setupChoiceDesc: 'صل هذا التطبيق ببوابة Hermes تشغّلها بالفعل، أو ثبّت Hermes محليا على هذا الحاسوب.',
+    connectExistingTitle: 'الاتصال بـ Hermes موجود',
+    connectExistingShort: 'اتصال بموجود',
+    connectExistingDesc: 'استخدم خلفية بعيدة برمز جلسة أو تسجيل دخول عبر المتصفح. لن يبدأ أي تثبيت محلي.',
+    installLocalTitle: 'تثبيت Hermes محليا',
+    installLocalDesc: 'نزّل Hermes وأنشئ بيئة Python الخاصة به وشغّل الخلفية على هذا الحاسوب.',
+    localStartUnavailable: 'تعذر بدء التثبيت المحلي. أعد تشغيل Hermes Desktop وحاول مجددا.',
+    remoteSetupTitle: 'الاتصال بـ Hermes موجود',
+    remoteSetupDesc: 'أدخل رابط بوابتك. سيكتشف Hermes Desktop ما إذا كانت تحتاج رمزا أو تسجيل دخول عبر المتصفح.',
+    remoteUrlTitle: 'رابط البوابة',
+    remoteUrlDesc: 'استخدم الرابط الأساسي لبوابة Hermes، متضمنا https:// عندما تكون بعيدة.',
+    remoteUrlPlaceholder: 'https://gateway.example.com/hermes',
+    probing: 'جار اكتشاف مصادقة البوابة...',
+    probeError: 'تعذر الوصول إلى بوابة Hermes تلك.',
+    identityProvider: 'مزود هويتك',
+    authTitle: 'المصادقة',
+    authNeedsOauth: provider => `سجّل الدخول عبر ${provider} قبل اختبار هذه البوابة.`,
+    authSignedIn: 'اكتمل تسجيل الدخول عبر المتصفح.',
+    connected: 'متصل',
+    signIn: 'تسجيل الدخول',
+    signInWith: provider => `تسجيل الدخول عبر ${provider}`,
+    enterUrlFirst: 'أدخل رابط البوابة أولا.',
+    signInIncomplete: 'أغلقت نافذة تسجيل الدخول قبل اكتمال المصادقة.',
+    tokenTitle: 'رمز الجلسة',
+    tokenDesc: 'ألصق رمز الجلسة من ملف .env الخاص بالبوابة البعيدة.',
+    pasteSessionToken: 'ألصق رمز الجلسة',
+    incompleteSignInTest: 'سجّل الدخول قبل اختبار هذه البوابة المحمية بـ OAuth.',
+    incompleteTokenTest: 'أدخل رمز جلسة قبل اختبار هذه البوابة.',
+    testConnection: 'اختبار الاتصال',
+    testSucceeded: (baseUrl, version) => `متصل بـ ${baseUrl}${version ? ` (${version})` : ''}.`,
+    applyRemote: 'تطبيق وإعادة الاتصال',
+    backToSetup: 'رجوع'
   },
   onboarding: {
     headerTitle: 'لنُعِدّ لك Hermes Agent',
@@ -1933,6 +2488,10 @@ export const ar = defineLocale({
       openrouter: {
         short: 'مفتاح واحد، نماذج كثيرة',
         description: 'يستضيف مئات النماذج خلف مفتاح واحد. خيار افتراضي جيد للتثبيتات الجديدة.'
+      },
+      fireworks: {
+        short: 'وصول مباشر للنماذج',
+        description: 'وصول مباشر إلى النماذج المستضافة لدى Fireworks AI.'
       },
       openai: {
         short: 'نماذج من فئة GPT',
@@ -2009,7 +2568,8 @@ export const ar = defineLocale({
     proNeedsSubscription: 'يتطلب اشتراكا',
     free: 'مجاني',
     freeTier: 'طبقة مجانية',
-    priceTitle: 'السعر'
+    priceTitle: 'السعر',
+    wasPrice: 'سابقا'
   },
   modelVisibility: {
     title: 'النماذج',
@@ -2038,9 +2598,21 @@ export const ar = defineLocale({
       low: 'منخفض',
       medium: 'متوسط',
       high: 'عالٍ',
+      xhigh: 'عالٍ جدا',
       max: 'أقصى',
+      ultra: 'فائق',
       updateFailed: 'فشل تحديث خيار النموذج',
       fastFailed: 'فشل تحديث الوضع السريع'
+    },
+    approvalMode: {
+      title: 'نمط الموافقة',
+      ariaLabel: mode => `نمط الموافقة: ${mode}`,
+      manual: 'يدوي',
+      manualDescription: 'اسأل قبل الإجراءات التي تتطلب موافقة',
+      smart: 'ذكي',
+      smartDescription: 'قيّم الإجراءات تلقائيا واسأل عند الحاجة',
+      off: 'إيقاف',
+      offDescription: 'التشغيل دون طلبات موافقة'
     },
     gatewayMenu: {
       gateway: 'البوابة',
@@ -2100,7 +2672,45 @@ export const ar = defineLocale({
       openModelPicker: 'فتح اختيار النموذج',
       modelPinned: 'النموذج مثبت',
       modelTitle: (provider, model) => `${provider}: ${model}`,
-      providerModelTitle: (provider, model) => `${provider}: ${model}`
+      providerModelTitle: (provider, model) => `${provider}: ${model}`,
+      connectionSsh: host => `SSH: ${host}`,
+      connectionRemote: host => `بعيد: ${host}`,
+      connectionCloud: host => `سحابي: ${host}`,
+      connectionCloudTooltip: host => `Hermes Cloud · ${host}`,
+      connectionSshTooltip: host => `SSH · ${host}`,
+      connectionRemoteTooltip: host => `بعيد · ${host}`,
+      customizeTitle: 'الإظهار في شريط الحالة',
+      hideStatusbar: 'إخفاء شريط الحالة',
+      toggleApprovalMode: 'الموافقات',
+      toggleBackendVersion: 'إصدار الخلفية',
+      toggleCommandCenter: 'مركز الأوامر',
+      toggleContextUsage: 'مقياس السياق',
+      toggleRunningTimer: 'مؤقت الدور',
+      toggleSessionTimer: 'مؤقت الجلسة',
+      toggleTerminal: 'الطرفية',
+      toggleVersion: 'الإصدار والتحديثات',
+      toggleWorkspace: 'مساحة العمل',
+      webhooks: 'Webhooks',
+      openWebhooks: 'فتح الـ webhooks',
+      starmap: 'خريطة الذاكرة',
+      openStarmap: 'فتح خريطة الذاكرة',
+      contextUsagePanel: {
+        categories: {
+          conversation: 'المحادثة',
+          mcp: 'MCP',
+          memory: 'الذاكرة',
+          rules: 'القواعد',
+          skills: 'المهارات',
+          subagent_definitions: 'تعريفات الوكلاء الفرعيين',
+          system_prompt: 'الموجّه النظامي',
+          tool_definitions: 'تعريفات الأدوات'
+        },
+        empty: 'لا توجد بيانات سياق بعد',
+        loading: 'جار تحميل التفصيل…',
+        percentFull: percent => `ممتلئ ${percent}%`,
+        title: 'استخدام السياق',
+        tokenSummary: (used, max) => `${used} / ${max} رمز`
+      }
     }
   },
   rightSidebar: {
@@ -2133,7 +2743,11 @@ export const ar = defineLocale({
     loadingTree: 'جار تحميل الشجرة...',
     loadingFiles: 'جار تحميل الملفات...',
     terminalHide: 'إخفاء الطرفية',
-    addToChat: 'إضافة للمحادثة'
+    addToChat: 'إضافة للمحادثة',
+    terminalsAria: 'الطرفيات',
+    terminalNew: 'طرفية جديدة',
+    terminalCloseOthers: 'إغلاق الأخرى',
+    terminalCloseAll: 'إغلاق الكل'
   },
   preview: {
     tab: 'معاينة',
@@ -2265,7 +2879,8 @@ export const ar = defineLocale({
     layoutNamePlaceholder: fallback => `اسم التخطيط (${fallback})`,
     saveApply: 'حفظ وتطبيق',
     notExpressible: 'هذا الترتيب متشابك — لا يمكن تمثيله كتقسيمات متداخلة بعد',
-    zoneCount: count => `${count} مناطق`
+    zoneCount: count => `${count} مناطق`,
+    newSessionTab: 'تبويب جلسة جديدة'
   },
   assistant: {
     thread: {
@@ -2304,7 +2919,8 @@ export const ar = defineLocale({
       restoreNext: 'استعادة التالي',
       goForward: 'تقدم',
       sendEdited: 'إرسال التعديل',
-      attachingFile: 'جار إرفاق الملف'
+      attachingFile: 'جار إرفاق الملف',
+      expandMessage: 'توسيع الرسالة'
     },
     approval: {
       gatewayDisconnected: 'البوابة غير متصلة',
@@ -2328,7 +2944,11 @@ export const ar = defineLocale({
       other: 'غير ذلك',
       placeholder: 'اكتب إجابتك...',
       skip: 'تخطي',
-      continueLabel: 'متابعة'
+      continueLabel: 'متابعة',
+      skipped: 'تم التخطي',
+      lateAnswer: (question, choice) => `بخصوص "${question}" — إجابتي: ${choice}`,
+      lateAnswerTip: 'صياغة هذه الإجابة كرسالة متابعة',
+      lateAnswerHint: 'لم يعد هذا السؤال بانتظار إجابة. اختر خيارا لصياغته كرسالة متابعة.'
     },
     tool: {
       copyCode: 'نسخ الكود',
@@ -2363,7 +2983,8 @@ export const ar = defineLocale({
         ran: 'تم التشغيل',
         running: 'جار التشغيل',
         ranCode: 'تم تشغيل الكود',
-        runningCode: 'جار البرمجة'
+        runningCode: 'جار البرمجة',
+        failedToOpen: 'فشل الفتح'
       },
       prefixes: {
         browser: 'المتصفح',
