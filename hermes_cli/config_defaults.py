@@ -753,6 +753,17 @@ DEFAULT_CONFIG = {
                                       # Example: 1800 = compact after 30 min idle.
     },
 
+    # Phase 3 principle self-distillation (see auto/PRINCIPLE_INTEGRATION_DESIGN.md).
+    # When enabled, each clean conversation turn that hit an injected principle
+    # distills a new principle record into ~/.hermes/data/principles/principles.jsonl
+    # and appends the learned line to the turn's final response. Default is
+    # DISABLED — the loop never imports or calls the distiller unless enabled.
+    # Env override: HERMES_PRINCIPLE_DISTILLER=1/true/yes/on enables; any other
+    # set value disables; unset falls through to this key.
+    "principle_distiller": {
+        "enabled": False,
+    },
+
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
     # cache_ttl: "5m" or "1h" (Anthropic-supported tiers). Other non-falsy
     # values are silently ignored. Falsy values (false, null, "off",

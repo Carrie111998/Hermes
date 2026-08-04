@@ -1102,6 +1102,38 @@ def build_turn_context(
     except Exception as exc:
         logger.warning("pre_llm_call hook failed: %s", exc)
 
+    # ── Phase 3 principle injection (optional, config-gated) ──────────
+    # Retrieves principles for this turn's user message, stashes the full
+    # hit dicts for the end-of-turn distill block and the ids for the next
+    # turn's reward hook (W1 in PRINCIPLE_DISTILLER_INTEGRATION_PLAN.md),
+    # and appends the hit texts to the user-message plugin context so they
+    # ride the api_content sidecar (byte-stable persisted == wire). Any
+    # failure degrades to empty stashes and never blocks the turn. Note:
+    # MoA / codex_app_server turns skip the sidecar stamp, so the injected
+    # block is dropped from the wire there, but the stash is still set and
+    # distillation still works.
+    if getattr(agent, "_principle_distiller_enabled", False):
+        agent._turn_had_tool_error = False
+        agent._prev_turn_principle_hits = []
+        agent._prev_turn_principle_ids = []
+        try:
+            from auto.principle_repo import PrincipleRepository
+
+            _pd_repo = PrincipleRepository()
+            _pd_repo.load()
+            _pd_hits = _pd_repo.retrieve(original_user_message, top_k=3)
+            agent._prev_turn_principle_hits = list(_pd_hits)
+            agent._prev_turn_principle_ids = [p.get("id") for p in _pd_hits]
+            if _pd_hits:
+                _pd_block = "\n".join(f"- {p.get('text', '')}" for p in _pd_hits)
+                plugin_user_context = (
+                    f"{plugin_user_context}\n\n{_pd_block}"
+                    if plugin_user_context
+                    else _pd_block
+                )
+        except Exception as _pd_exc:
+            logger.warning("Principle injection failed (%s); continuing", _pd_exc)
+
     # Gateway must-deliver notes (auto-reset note, first-contact intro,
     # voice-channel change) ride the same user-message injection channel as
     # plugin context so the ephemeral system prompt can stay byte-stable.
