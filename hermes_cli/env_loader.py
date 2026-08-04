@@ -237,9 +237,14 @@ def resolve_profile_secret_source_values(
         base_snapshot,
     )
     with _PROFILE_SECRET_SOURCE_LOCK:
+        existing = get_secret_source_values(home_path)
         cached_fingerprint = _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS.get(home_key)
         if cached_fingerprint == fingerprint:
-            return get_secret_source_values(home_path)
+            return existing
+        if cached_fingerprint is None and existing:
+            _PROFILE_SECRET_SOURCE_INPUT_FINGERPRINTS[home_key] = fingerprint
+            _PROFILE_SECRET_SOURCE_RESOLVED_HOMES.add(home_key)
+            return existing
 
         try:
             cfg = _load_secrets_config(home_path)
@@ -840,10 +845,10 @@ def _load_secrets_config(home_path: Path) -> dict:
 
 
 def _process_hermes_home() -> Path:
-    """The HERMES_HOME the shared config cache is keyed to."""
+    """The launch-time HERMES_HOME, ignoring any profile ContextVar override."""
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_constants import get_process_hermes_home
 
-        return get_hermes_home()
+        return get_process_hermes_home()
     except Exception:
         return Path.home() / ".hermes"

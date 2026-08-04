@@ -279,6 +279,40 @@ def test_bot_allowance_never_falls_back_to_process_env_in_multiplex(monkeypatch)
         ss.set_multiplex_active(False)
 
 
+def test_bot_allowance_uses_transport_profile_config(monkeypatch):
+    """Profile-local YAML policy must work without a process-global env bridge."""
+    from agent import secret_scope as ss
+    from gateway.run import GatewayRunner
+
+    monkeypatch.delenv("TELEGRAM_ALLOW_BOTS", raising=False)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner.adapters = {}
+    personal_adapter = MagicMock()
+    personal_adapter.config = PlatformConfig(extra={"allow_bots": "all"})
+    runner._profile_adapters = {
+        "personal": {Platform.TELEGRAM: personal_adapter}
+    }
+    runner.pairing_stores = {}
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id=None,
+        chat_id="-100-personal",
+        chat_type="group",
+        profile="personal",
+        is_bot=True,
+        _transport_profile="personal",
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        assert runner._is_user_authorized(source) is True
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
 def test_unauthorized_dm_behavior_never_inherits_process_allowlist(monkeypatch):
     """A primary allowlist must not force secondary unknown DMs into ignore mode."""
     from agent import secret_scope as ss
@@ -304,14 +338,18 @@ def test_unauthorized_dm_behavior_never_inherits_process_allowlist(monkeypatch):
 
 def test_routed_source_uses_transport_pairing_store():
     """A topic route changes runtime profile, not the receiving bot's whitelist."""
+    import dataclasses
     import weakref
     from gateway.run import GatewayRunner
 
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(multiplex_profiles=True)
     primary_adapter = MagicMock()
+    routed_adapter = MagicMock()
     runner.adapters = {Platform.TELEGRAM: primary_adapter}
-    runner._profile_adapters = {"x100": {}}
+    runner._profile_adapters = {
+        "x100": {Platform.TELEGRAM: routed_adapter}
+    }
     runner._active_profile_name = lambda: "default"
     runner.pairing_store = MagicMock(name="primary-pairing")
     routed_pairing = MagicMock(name="routed-profile-pairing")
@@ -327,8 +365,91 @@ def test_routed_source_uses_transport_pairing_store():
         profile="x100",
     )
     setattr(source, "_transport_adapter_ref", weakref.ref(primary_adapter))
+    source._transport_profile = "default"
+    source = dataclasses.replace(source, thread_id="recovered-topic")
 
     assert runner._pairing_store_for(source) is runner.pairing_store
+    assert runner._adapter_for_source(source) is primary_adapter
+    assert "_transport_adapter_ref" not in source.to_dict()
+    assert "transport_profile" not in source.to_dict()
+
+    persisted = source.to_dict(include_transport=True)
+    assert persisted["transport_profile"] == "default"
+    restored = SessionSource.from_dict(persisted)
+    assert restored._transport_adapter_ref is None
+    assert runner._pairing_store_for(restored) is runner.pairing_store
+    assert runner._adapter_for_source(restored) is primary_adapter
+
+
+def test_unknown_explicit_profile_does_not_fall_back_to_global_home(
+    tmp_path, monkeypatch
+):
+    """A stale or malformed route must not execute in the primary profile."""
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: tmp_path / name,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: False,
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home",
+        lambda: tmp_path / "primary",
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="owner",
+        chat_id="chat",
+        chat_type="group",
+        profile="missing-profile",
+    )
+
+    with pytest.raises(RuntimeError, match="missing-profile"):
+        runner._resolve_profile_home_for_source(source)
+
+
+def test_unknown_explicit_profile_keeps_legacy_fallback_outside_multiplex(
+    tmp_path, monkeypatch
+):
+    from gateway.run import GatewayRunner
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=False)
+    primary_home = tmp_path / "primary"
+
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_profile_dir",
+        lambda name: tmp_path / name,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists",
+        lambda name: False,
+    )
+    monkeypatch.setattr(
+        "hermes_constants.get_hermes_home",
+        lambda: primary_home,
+    )
+
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        user_id="owner",
+        chat_id="chat",
+        chat_type="group",
+        profile="missing-profile",
+    )
+
+    assert runner._resolve_profile_home_for_source(source) == primary_home
 
 
 def test_secondary_pairing_never_falls_back_to_primary_store(monkeypatch):

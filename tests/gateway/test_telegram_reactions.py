@@ -15,7 +15,11 @@ def _make_adapter(**extra_env):
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
-    adapter.config = PlatformConfig(enabled=True, token="fake-token")
+    adapter.config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra=dict(extra_env),
+    )
     adapter._bot = AsyncMock()
     adapter._bot.set_message_reaction = AsyncMock()
     return adapter
@@ -50,6 +54,13 @@ def test_reactions_enabled_when_set_true(monkeypatch):
     """Setting TELEGRAM_REACTIONS=true enables reactions."""
     monkeypatch.setenv("TELEGRAM_REACTIONS", "true")
     adapter = _make_adapter()
+    assert adapter._reactions_enabled() is True
+
+
+def test_reactions_profile_config_overrides_process_environment(monkeypatch):
+    """A multiplex profile must use its own snapshotted policy."""
+    monkeypatch.setenv("TELEGRAM_REACTIONS", "false")
+    adapter = _make_adapter(reactions=True)
     assert adapter._reactions_enabled() is True
 
 

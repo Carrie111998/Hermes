@@ -4,6 +4,7 @@ Verifies that unauthorized users are blocked before any text batching,
 event building, or response generation occurs.
 """
 import asyncio
+import os
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -68,6 +69,121 @@ def _make_message(text="hello", *, from_user_id=111, chat_id=-100, chat_type="gr
         document=None,
         sticker=None,
         media_group_id=None,
+    )
+
+
+def test_profile_yaml_auth_bridge_does_not_mutate_process_env(monkeypatch):
+    """Secondary YAML policy must stay in its PlatformConfig, never os.environ."""
+    from agent import secret_scope as ss
+    from plugins.platforms.telegram.adapter import _apply_yaml_config
+
+    env_names = (
+        "TELEGRAM_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_USERS",
+        "TELEGRAM_GROUP_ALLOWED_CHATS",
+        "TELEGRAM_GUEST_MODE",
+        "TELEGRAM_ALLOWED_CHATS",
+    )
+    for name in env_names:
+        monkeypatch.delenv(name, raising=False)
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope({})
+    try:
+        extras = _apply_yaml_config(
+            {},
+            {
+                "allow_from": ["secondary-user"],
+                "group_allow_from": ["secondary-group-user"],
+                "group_allowed_chats": ["secondary-chat"],
+                "guest_mode": True,
+                "allowed_chats": ["secondary-chat"],
+            },
+        )
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert all(name not in os.environ for name in env_names)
+    assert extras is not None
+    # Core's shared-key bridge owns these values and preserves their type and
+    # top-level-over-nested precedence. The Telegram hook must not re-emit and
+    # clobber them when its result is merged afterward.
+    assert "allow_from" not in extras
+    assert "group_allow_from" not in extras
+    assert "group_allowed_chats" not in extras
+    assert extras["guest_mode"] is True
+    assert "allowed_chats" not in extras
+
+
+def test_profile_env_intake_policy_is_snapshotted_into_adapter_config(
+    monkeypatch,
+):
+    from agent import secret_scope as ss
+    from plugins.platforms.telegram.adapter import _snapshot_telegram_policy_env
+
+    monkeypatch.setenv("TELEGRAM_GUEST_MODE", "primary-value")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "primary-chat")
+    config = PlatformConfig(
+        enabled=True,
+        token="fake-token",
+        extra={"guest_mode": "yaml-value"},
+    )
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope(
+        {
+            "TELEGRAM_GUEST_MODE": "true",
+            "TELEGRAM_ALLOWED_CHATS": "secondary-chat",
+        }
+    )
+    try:
+        _snapshot_telegram_policy_env(config)
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+    assert config.extra["guest_mode"] == "true"
+    assert config.extra["allowed_chats"] == "secondary-chat"
+    assert os.environ["TELEGRAM_GUEST_MODE"] == "primary-value"
+    assert os.environ["TELEGRAM_ALLOWED_CHATS"] == "primary-chat"
+
+
+def test_runtime_intake_policy_fallback_is_profile_scoped(monkeypatch):
+    from agent import secret_scope as ss
+
+    monkeypatch.setenv("TELEGRAM_GUEST_MODE", "true")
+    monkeypatch.setenv("TELEGRAM_ALLOWED_CHATS", "primary-chat")
+
+    ss.set_multiplex_active(True)
+    token = ss.set_secret_scope(
+        {
+            "TELEGRAM_GUEST_MODE": "false",
+            "TELEGRAM_ALLOWED_CHATS": "secondary-chat",
+        }
+    )
+    try:
+        adapter = _make_adapter()
+        assert adapter._telegram_guest_mode() is False
+        assert adapter._telegram_allowed_chats() == {"secondary-chat"}
+    finally:
+        ss.reset_secret_scope(token)
+        ss.set_multiplex_active(False)
+
+
+def test_profile_proxy_config_does_not_fall_back_to_process_global(monkeypatch):
+    import plugins.platforms.telegram.adapter as tg_adapter
+
+    adapter = _make_adapter()
+    adapter.config.extra["proxy_url"] = "http://profile-proxy.example:8080"
+    monkeypatch.setattr(
+        tg_adapter,
+        "resolve_proxy_url",
+        lambda *args, **kwargs: "http://primary-proxy.example:8080",
+    )
+
+    assert adapter._proxy_url_for_hosts(["api.telegram.org"]) == (
+        "http://profile-proxy.example:8080"
     )
 
 

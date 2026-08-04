@@ -6841,9 +6841,10 @@ class BasePlatformAdapter(ABC):
             auto_thread_created=auto_thread_created,
             auto_thread_initial_name=auto_thread_initial_name,
         )
-        # In-process transport provenance is deliberately not serialized by
-        # SessionSource.to_dict(). The live receiving adapter is authoritative
-        # for this turn even when profile_routes selects a different runtime.
+        # Keep the live receiving adapter as in-process provenance for this turn,
+        # even when profile_routes selects a different runtime.  The weakref is
+        # never serialized; the profile-scoped gateway handler stamps the
+        # serializable transport owner used by replay and delayed delivery.
         source._transport_adapter_ref = weakref.ref(self)
         return source
     

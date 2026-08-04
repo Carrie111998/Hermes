@@ -84,6 +84,10 @@ _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
+
+class _ProfileResolutionDenied(RuntimeError):
+    """An explicitly routed profile cannot be served without crossing scope."""
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -13534,9 +13538,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_home = Path(get_hermes_home())
 
         async def _handler(event):
-            try:
-                source = getattr(event, "source", None)
-                if source is not None:
+            source = getattr(event, "source", None)
+            if source is not None:
+                try:
                     setattr(source, "_transport_profile", profile_name)
                     if preserve_route:
                         source.profile = (
@@ -13544,8 +13548,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         source.profile = profile_name
-            except Exception:
-                pass
+                except Exception:
+                    logger.warning(
+                        "Dropping message after profile-route resolution failed "
+                        "for transport profile %s",
+                        profile_name,
+                        exc_info=True,
+                    )
+                    return None
             with _profile_runtime_scope(profile_home):
                 return await self._handle_message(event)
 
@@ -18781,8 +18791,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if success:
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
-            if hasattr(adapter, "_voice_sources"):
-                adapter._voice_sources[guild_id] = event.source.to_dict()
+            voice_sources = getattr(adapter, "_voice_sources", None)
+            if voice_sources is not None:
+                voice_sources[guild_id] = event.source.to_dict(
+                    include_transport=True
+                )
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
@@ -23982,7 +23995,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             profile_exists,
         )
         from hermes_constants import get_hermes_home
-        
+
+        multiplex = (
+            getattr(getattr(self, "config", None), "multiplex_profiles", False)
+            is True
+        )
+
         # Track whether a profile was explicitly requested (vs. falling back to default)
         explicit_profile = None
         try:
@@ -23997,28 +24015,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
+            # An explicit multiplex target is a security boundary.  A stale route
+            # or malformed source must never execute in the process/primary home.
             if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile,
-                    source.platform.value,
-                    source.chat_id,
-                    getattr(source, "guild_id", None),
+                message = (
+                    f"Profile {explicit_profile!r} does not exist for source "
+                    f"{source.platform.value}/{source.chat_id}"
                 )
+                if multiplex:
+                    logger.error("%s; refusing primary-profile fallback", message)
+                    raise _ProfileResolutionDenied(message)
+                logger.warning("%s; falling back to global HERMES_HOME", message)
                 return get_hermes_home()
             return profile_dir
-        except Exception:
+        except _ProfileResolutionDenied:
+            raise
+        except Exception as exc:
             # Catch normalization errors, path errors, etc.
+            message = (
+                "Failed to resolve profile directory for source "
+                f"{source.platform.value}/{source.chat_id}: "
+                f"{explicit_profile or '(no profile)'}"
+            )
+            if multiplex:
+                logger.error("%s; refusing primary-profile fallback", message)
+                raise _ProfileResolutionDenied(message) from exc
             logger.warning(
-                "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
-                "falling back to global HERMES_HOME: %s",
-                source.platform.value,
-                source.chat_id,
-                getattr(source, "guild_id", None),
-                explicit_profile or "(no profile)",
-                exc_info=True,
+                "%s; falling back to global HERMES_HOME", message, exc_info=True
             )
             return get_hermes_home()
 

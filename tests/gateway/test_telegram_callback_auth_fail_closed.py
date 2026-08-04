@@ -7,6 +7,7 @@ when TELEGRAM_ALLOWED_USERS is empty, instead of allowing everyone.
 import sys
 import types
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -126,5 +127,32 @@ class TestCallbackAuthFailClosed:
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
+
+    @pytest.mark.asyncio
+    async def test_model_picker_callback_requires_authorized_user(self):
+        """Another group member must not mutate someone else's model picker."""
+        adapter = _make_adapter()
+        state_key = ("group", "42")
+        adapter._model_picker_state = {state_key: {"providers": []}}
+        adapter._is_callback_user_authorized = lambda *args, **kwargs: False
+        query = SimpleNamespace(
+            from_user=SimpleNamespace(id=999, first_name="Other"),
+            message=SimpleNamespace(
+                chat_id="group",
+                message_id=42,
+                chat=SimpleNamespace(type="group"),
+                message_thread_id=None,
+            ),
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+        )
+
+        await adapter._handle_model_picker_callback(query, "mx", "group")
+
+        assert state_key in adapter._model_picker_state
+        query.edit_message_text.assert_not_awaited()
+        query.answer.assert_awaited_once_with(
+            text="⛔ You are not authorized to change models."
+        )
 
 

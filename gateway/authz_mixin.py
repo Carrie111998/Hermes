@@ -151,6 +151,12 @@ class GatewayAuthorizationMixin:
             # fail and suppress streamed delivery for those profiles.
             adapters = getattr(self, "adapters", None) or {}
             return adapters.get(Platform.RELAY)
+        stamped_transport_profile = getattr(source, "_transport_profile", None)
+        if isinstance(stamped_transport_profile, str) and stamped_transport_profile.strip():
+            return self._authorization_adapter(
+                getattr(source, "platform", None),
+                stamped_transport_profile.strip(),
+            )
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
@@ -194,8 +200,8 @@ class GatewayAuthorizationMixin:
                 if adapter is profile_adapters.get(platform):
                     return profile
         stamped_transport_profile = getattr(source, "_transport_profile", None)
-        if stamped_transport_profile:
-            return str(stamped_transport_profile)
+        if isinstance(stamped_transport_profile, str) and stamped_transport_profile.strip():
+            return stamped_transport_profile.strip()
         return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
@@ -514,7 +520,23 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _platform_gate_env(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
+            allow_bots_policy = None
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    extra = (
+                        getattr(getattr(adapter, "config", None), "extra", None)
+                        or {}
+                    )
+                    allow_bots_policy = extra.get("allow_bots")
+            except Exception:
+                allow_bots_policy = None
+            if allow_bots_policy is None and allow_bots_var:
+                allow_bots_policy = _platform_gate_env(allow_bots_var, "none")
+            if str(allow_bots_policy or "none").lower() in {
+                "mentions",
+                "all",
+            }:
                 return True
 
         if not user_id:

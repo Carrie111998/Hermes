@@ -249,12 +249,12 @@ def _fetch_with_timeout(
                 reset_source_environment(legacy_token)
             _FETCH_ENV.reset(fetch_token)
 
+    # ThreadPoolExecutor does not propagate ContextVars.  Capture the caller's
+    # profile home and secret scope before crossing the worker boundary; the
+    # worker then adds the explicit per-fetch environment on top.
+    caller_context = copy_context()
     try:
-        # ThreadPoolExecutor workers do not inherit ContextVars.  Snapshot
-        # the caller's context explicitly so profile/home/secret context is
-        # present while the source fetch (and any helper it calls) runs.
-        fetch_context = copy_context()
-        future = executor.submit(fetch_context.run, _fetch_in_scope)
+        future = executor.submit(caller_context.run, _fetch_in_scope)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:

@@ -191,18 +191,6 @@ class SessionSource:
     auto_thread_created: bool = False
     auto_thread_initial_name: Optional[str] = None
 
-    # Discord auto-thread session-continuity signal. Set by the connector on an
-    # inbound CHANNEL message (no thread_id yet) that its auto-thread policy WILL
-    # deliver into a newly-created thread. A Discord thread created from a message
-    # reuses that message's id as the thread id, so the connector knows the id
-    # before the thread exists. The gateway keys the session on this so a
-    # channel message and its thread follow-ups share ONE session: the channel
-    # message INITIATES it (keyed on the prospective thread id), and later
-    # messages arriving in that thread (real thread_id == this value) CONTINUE
-    # it. Without this, every channel message collapses into one parent-channel
-    # session and only the first auto-thread ever gets an auto-title/rename.
-    prospective_thread_id: Optional[str] = None
-
     # Internal, wire-INVISIBLE trust signal: True when this event was delivered
     # to the gateway over the per-instance-authenticated relay WebSocket (the
     # Team Gateway connector). The connector authenticates the gateway's socket
@@ -215,6 +203,33 @@ class SessionSource:
     # deliberately excluded from ``to_dict``/``from_dict`` so a peer can never
     # forge it across the wire or have it restored from persistence.
     delivered_via_upstream_relay: bool = False
+
+    # Discord auto-thread session-continuity signal. Set by the connector on an
+    # inbound CHANNEL message (no thread_id yet) that its auto-thread policy WILL
+    # deliver into a newly-created thread. A Discord thread created from a message
+    # reuses that message's id as the thread id, so the connector knows the id
+    # before the thread exists. The gateway keys the session on this so a
+    # channel message and its thread follow-ups share ONE session: the channel
+    # message INITIATES it (keyed on the prospective thread id), and later
+    # messages arriving in that thread (real thread_id == this value) CONTINUE
+    # it. Without this, every channel message collapses into one parent-channel
+    # session and only the first auto-thread ever gets an auto-title/rename.
+    # This field intentionally follows the relay flag so older positional
+    # constructors keep their established argument positions.
+    prospective_thread_id: Optional[str] = None
+
+    # Internal transport provenance. ``profile`` may name a routed runtime
+    # while replies and authorization stay bound to the receiving adapter.
+    # Keep these fields after every pre-existing public field so legacy
+    # positional constructors retain their original argument positions.
+    # ``dataclasses.replace`` then preserves both fields automatically. The
+    # weakref is never serialized; trusted local state may opt in to persisting
+    # the non-secret owner profile for replay/delayed delivery. Live inbound
+    # handlers overwrite that stamp before authorization.
+    _transport_adapter_ref: Any = field(default=None, repr=False, compare=False)
+    _transport_profile: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
 
     def __post_init__(self) -> None:
         # D-Q2.5 dual-field reconciliation: `scope_id` is canonical, `guild_id`
@@ -247,7 +262,7 @@ class SessionSource:
         
         return ", ".join(parts)
     
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self, *, include_transport: bool = False) -> Dict[str, Any]:
         d = {
             "platform": self.platform.value,
             "chat_id": self.chat_id,
@@ -276,6 +291,8 @@ class SessionSource:
             d["message_id"] = self.message_id
         if self.profile:
             d["profile"] = self.profile
+        if include_transport and self._transport_profile:
+            d["transport_profile"] = self._transport_profile
         if self.auto_thread_created:
             d["auto_thread_created"] = True
         if self.auto_thread_initial_name:
@@ -303,6 +320,7 @@ class SessionSource:
             parent_chat_id=data.get("parent_chat_id"),
             message_id=data.get("message_id"),
             profile=data.get("profile"),
+            _transport_profile=data.get("transport_profile"),
             auto_thread_created=bool(data.get("auto_thread_created", False)),
             auto_thread_initial_name=data.get("auto_thread_initial_name"),
             prospective_thread_id=data.get("prospective_thread_id"),
@@ -899,7 +917,7 @@ class SessionEntry:
             # unsanitized dict directly on the entry.
             result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
-            result["origin"] = self.origin.to_dict()
+            result["origin"] = self.origin.to_dict(include_transport=True)
         return result
     
     @classmethod
@@ -2000,7 +2018,7 @@ class SessionStore:
         try:
             origin_json = None
             try:
-                origin_json = json.dumps(source.to_dict())
+                origin_json = json.dumps(source.to_dict(include_transport=True))
             except Exception:
                 pass
             recorder(

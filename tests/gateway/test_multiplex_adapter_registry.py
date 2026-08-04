@@ -160,6 +160,39 @@ class TestProfileMessageHandler:
         }
 
     @pytest.mark.asyncio
+    async def test_primary_route_resolution_error_drops_stale_profile(
+        self, tmp_path, monkeypatch
+    ):
+        """A resolver failure must not execute a forged/stale foreign profile."""
+        monkeypatch.setattr(
+            "hermes_cli.profiles.get_profile_dir",
+            lambda name: tmp_path / name,
+        )
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.config = GatewayConfig(multiplex_profiles=True)
+        runner._active_profile_name = MagicMock(return_value="default")
+        runner._profile_name_for_source = MagicMock(
+            side_effect=RuntimeError("route lookup failed")
+        )
+        runner._handle_message = AsyncMock(return_value="must-not-run")
+        event = MessageEvent(
+            text="hello",
+            source=SessionSource(
+                platform=Platform.TELEGRAM,
+                chat_id="-1001",
+                chat_type="group",
+                user_id="owner",
+                profile="foreign-stale-profile",
+            ),
+        )
+
+        result = await runner._primary_message_handler()(event)
+
+        assert result is None
+        runner._handle_message.assert_not_awaited()
+        assert event.source._transport_profile == "default"
+
+    @pytest.mark.asyncio
     async def test_stamps_profile_on_unstamped_source(self):
         runner = GatewayRunner.__new__(GatewayRunner)
         seen = {}

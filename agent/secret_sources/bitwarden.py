@@ -79,6 +79,18 @@ _BWS_CHECKSUM_NAME = f"bws-sha256-checksums-{_BWS_VERSION}.txt"
 # How long to wait for bws subprocesses and HTTP downloads, in seconds.
 _BWS_DOWNLOAD_TIMEOUT = 60
 _BWS_RUN_TIMEOUT = 30
+_BWS_OPERATIONAL_ENV = (
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+    "no_proxy",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+)
 
 # In-process cache so repeated load_hermes_dotenv() calls (CLI startup,
 # gateway hot-reload, test suites) don't re-fetch from BSM.
@@ -671,12 +683,17 @@ def _run_bws_list(
     # never the process-wide post-dotenv credential set from another profile.
     from agent.secret_sources.base import run_secret_cli
 
+    source_env = secret_source_environ()
     extra_env = {"BWS_ACCESS_TOKEN": access_token}
     effective_server_url = server_url.strip()
     if not effective_server_url:
-        effective_server_url = secret_source_environ().get("BWS_SERVER_URL", "").strip()
+        effective_server_url = source_env.get("BWS_SERVER_URL", "").strip()
     if effective_server_url:
         extra_env["BWS_SERVER_URL"] = effective_server_url
+    for name in _BWS_OPERATIONAL_ENV:
+        value = source_env.get(name, "")
+        if value:
+            extra_env[name] = value
 
     proc = run_secret_cli(
         cmd,

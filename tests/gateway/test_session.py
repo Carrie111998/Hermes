@@ -56,6 +56,34 @@ class TestSessionSourceRoundtrip:
         assert restored.chat_id == "cli"
         assert restored.chat_type == "dm"  # default value preserved
 
+    def test_legacy_positional_fields_keep_their_original_positions(self):
+        source = SessionSource(
+            Platform.TELEGRAM,
+            "chat",
+            None,
+            "dm",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            None,
+            None,
+            None,
+            False,
+            None,
+            True,
+            "initial-title",
+            True,
+        )
+
+        assert source.auto_thread_created is True
+        assert source.auto_thread_initial_name == "initial-title"
+        assert source.delivered_via_upstream_relay is True
+
 
 class TestSessionSourceDescription:
     def test_local_cli(self):

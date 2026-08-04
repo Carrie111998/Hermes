@@ -515,6 +515,25 @@ def test_secondary_profile_dotenv_does_not_mutate_multiplex_process_env(
     assert os.environ["TELEGRAM_ALLOWED_USERS"] == "primary-user"
 
 
+def test_process_hermes_home_ignores_profile_context_override(
+    tmp_path, monkeypatch
+):
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    process_home = tmp_path / "process"
+    profile_home = tmp_path / "profile"
+    monkeypatch.setenv("HERMES_HOME", str(process_home))
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        assert env_loader._process_hermes_home() == process_home
+    finally:
+        reset_hermes_home_override(token)
+
+
 def test_profile_secret_snapshot_refreshes_when_bootstrap_changes(
     tmp_path, monkeypatch
 ):
@@ -547,6 +566,35 @@ def test_profile_secret_snapshot_refreshes_when_bootstrap_changes(
 
     assert first == {"TARGET_SECRET": "token-a"}
     assert second == {"TARGET_SECRET": "token-b"}
+
+
+def test_profile_resolution_retries_after_empty_process_fetch(tmp_path, monkeypatch):
+    """An earlier failed global fetch must not poison the profile snapshot."""
+    from types import SimpleNamespace
+    from agent.secret_sources import registry as reg
+
+    (tmp_path / "config.yaml").write_text(
+        "secrets:\n  synthetic:\n    enabled: true\n",
+        encoding="utf-8",
+    )
+    home_key = str(tmp_path.resolve())
+    env_loader._APPLIED_HOMES.add(home_key)
+    calls = {"n": 0}
+
+    def fake_apply_all(config, home_path, *, environ):
+        calls["n"] += 1
+        environ["TARGET_SECRET"] = "fresh-profile-value"
+        return SimpleNamespace(
+            sources=[SimpleNamespace(name="synthetic")],
+            provenance={"TARGET_SECRET": SimpleNamespace(source="synthetic")},
+        )
+
+    monkeypatch.setattr(reg, "apply_all", fake_apply_all)
+
+    values = env_loader.resolve_profile_secret_source_values(tmp_path, {})
+
+    assert calls["n"] == 1
+    assert values == {"TARGET_SECRET": "fresh-profile-value"}
 
 
 def test_apply_external_secret_sources_bad_ttl_does_not_crash(tmp_path, monkeypatch):

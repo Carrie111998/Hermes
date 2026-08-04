@@ -34,6 +34,53 @@ def _telegram_auth_env(name: str, default: str = "") -> str:
     return _auth_env(name, default)
 
 
+def _telegram_profile_scope_active() -> bool:
+    """True while config is being built for a multiplex-served profile."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return is_multiplex_active() and current_secret_scope() is not None
+    except Exception:
+        # If scope detection itself is unavailable, prefer profile-local config
+        # over publishing policy into process-global state.
+        return True
+
+
+_TELEGRAM_POLICY_ENV_EXTRAS = {
+    "TELEGRAM_ALLOWED_USERS": "allow_from",
+    "TELEGRAM_GROUP_ALLOWED_USERS": "group_allow_from",
+    "TELEGRAM_GROUP_ALLOWED_CHATS": "group_allowed_chats",
+    "TELEGRAM_REQUIRE_MENTION": "require_mention",
+    "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES": (
+        "observe_unmentioned_group_messages"
+    ),
+    "TELEGRAM_GUEST_MODE": "guest_mode",
+    "TELEGRAM_EXCLUSIVE_BOT_MENTIONS": "exclusive_bot_mentions",
+    "TELEGRAM_ALLOW_BOTS": "allow_bots",
+    "TELEGRAM_FREE_RESPONSE_CHATS": "free_response_chats",
+    "TELEGRAM_FREE_RESPONSE_TOPICS": "free_response_topics",
+    "TELEGRAM_ALLOWED_CHATS": "allowed_chats",
+    "TELEGRAM_ALLOWED_TOPICS": "allowed_topics",
+    "TELEGRAM_IGNORED_THREADS": "ignored_threads",
+    "TELEGRAM_REACTIONS": "reactions",
+    "TELEGRAM_PROXY": "proxy_url",
+}
+
+
+def _snapshot_telegram_policy_env(config) -> None:
+    """Freeze this profile's env-backed intake policy into its own config."""
+    extra = getattr(config, "extra", None)
+    if not isinstance(extra, dict):
+        extra = {}
+        config.extra = extra
+    for env_name, extra_name in _TELEGRAM_POLICY_ENV_EXTRAS.items():
+        value = _telegram_auth_env(env_name, "")
+        if value != "":
+            # Env retains its documented precedence over YAML, but the value is
+            # copied only into this PlatformConfig instead of process-global env.
+            extra[extra_name] = value
+
+
 def _redact_telegram_error_text(error: object) -> str:
     """Redact secrets from Telegram transport errors before logging or returning them."""
     text = "" if error is None else str(error)
@@ -299,6 +346,7 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_video_from_bytes,
     cache_document_from_bytes,
+    normalize_proxy_url,
     resolve_proxy_url,
     SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES,
@@ -911,9 +959,11 @@ class TelegramAdapter(BasePlatformAdapter):
             if self.config.extra.get("base_url")
             else 20 * 1024 * 1024
         )
-        # Interactive model picker state per chat
-        self._model_picker_state: Dict[str, dict] = {}
-        self._choice_picker_state: Dict[str, dict] = {}
+        # Interactive picker state per exact Telegram message. Binding to the
+        # message id prevents a stale button in another routed topic of the same
+        # chat from mutating the newest picker/runtime.
+        self._model_picker_state: Dict[tuple[str, str], dict] = {}
+        self._choice_picker_state: Dict[tuple[str, str], dict] = {}
         # Approval button state: message_id → session_key
         self._approval_state: Dict[int, str] = {}
         # Slash-confirm button state: confirm_id → session_key (for /reload-mcp
@@ -1517,6 +1567,17 @@ class TelegramAdapter(BasePlatformAdapter):
         if isinstance(configured, str):
             configured = configured.split(",")
         return parse_fallback_ip_env(",".join(str(v) for v in configured) if configured else None)
+
+    def _proxy_url_for_hosts(self, target_hosts: list[str]) -> str | None:
+        """Resolve Telegram proxy policy without crossing profile scope."""
+        configured = self.config.extra.get("proxy_url")
+        if configured:
+            return normalize_proxy_url(str(configured))
+        if _telegram_profile_scope_active():
+            # A secondary profile with no own proxy must not inherit the
+            # primary process's TELEGRAM_/HTTP(S)_PROXY policy.
+            return None
+        return resolve_proxy_url("TELEGRAM_PROXY", target_hosts=target_hosts)
 
     @staticmethod
     def _looks_like_polling_conflict(error: Exception) -> bool:
@@ -3964,7 +4025,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
 
             proxy_targets = ["api.telegram.org", *fallback_ips]
-            proxy_url = resolve_proxy_url("TELEGRAM_PROXY", target_hosts=proxy_targets)
+            proxy_url = self._proxy_url_for_hosts(proxy_targets)
             if fallback_ips and not proxy_url and not disable_fallback:
                 logger.info(
                     "[%s] Telegram fallback IPs active: %s",
@@ -5868,8 +5929,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            # Store picker state keyed by chat_id
-            self._model_picker_state[str(chat_id)] = {
+            state_key = (str(chat_id), str(msg.message_id))
+            self._model_picker_state[state_key] = {
                 "msg_id": msg.message_id,
                 "providers": providers,
                 "session_key": session_key,
@@ -5938,7 +5999,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 **self._link_preview_kwargs(),
             )
 
-            self._choice_picker_state[str(chat_id)] = {
+            state_key = (str(chat_id), str(msg.message_id))
+            self._choice_picker_state[state_key] = {
                 "msg_id": msg.message_id,
                 "choices": choices,
                 "session_key": session_key,
@@ -5953,15 +6015,22 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle choice picker button taps (cp:<index>)."""
-        state = self._choice_picker_state.get(chat_id)
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        state_key = (
+            (str(chat_id), str(query_message_id))
+            if query_message_id is not None
+            else None
+        )
+        state = self._choice_picker_state.get(state_key) if state_key else None
         if not state:
             await query.answer(text="Picker expired — run the command again.")
             return
+        assert state_key is not None
 
         # Same authorization gate as approval buttons: unauthorized users in a
         # shared group must not flip session/config state via someone else's
         # picker message.
-        query_message = getattr(query, "message", None)
         query_chat = getattr(query_message, "chat", None)
         if not self._is_callback_user_authorized(
             str(getattr(query.from_user, "id", "")),
@@ -6005,7 +6074,7 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         await query.answer()
-        self._choice_picker_state.pop(chat_id, None)
+        self._choice_picker_state.pop(state_key, None)
 
     _MODEL_PAGE_SIZE = 8
 
@@ -6118,9 +6187,37 @@ class TelegramAdapter(BasePlatformAdapter):
         self, query, data: str, chat_id: str
     ) -> None:
         """Handle model picker inline keyboard callbacks (mp:/mm:/mc:/mb:/mx:/mg:)."""
-        state = self._model_picker_state.get(chat_id)
+        query_message = getattr(query, "message", None)
+        query_message_id = getattr(query_message, "message_id", None)
+        state_key = (
+            (str(chat_id), str(query_message_id))
+            if query_message_id is not None
+            else None
+        )
+        state = self._model_picker_state.get(state_key) if state_key else None
         if not state:
             await query.answer(text="Picker expired — use /model again.")
+            return
+        assert state_key is not None
+
+        # Model/provider buttons mutate shared session configuration.  In a
+        # group, only a user authorized for this adapter/profile may use a
+        # picker message created by somebody else.
+        query_chat = getattr(query_message, "chat", None)
+        query_chat_type = getattr(query_chat, "type", None)
+        query_thread_id = getattr(query_message, "message_thread_id", None)
+        if not self._is_callback_user_authorized(
+            str(getattr(query.from_user, "id", "")),
+            chat_id=getattr(query_message, "chat_id", None),
+            chat_type=(
+                str(query_chat_type) if query_chat_type is not None else None
+            ),
+            thread_id=(
+                str(query_thread_id) if query_thread_id is not None else None
+            ),
+            user_name=getattr(query.from_user, "first_name", None),
+        ):
+            await query.answer(text="⛔ You are not authorized to change models.")
             return
 
         try:
@@ -6281,7 +6378,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await query.answer(
                 text="Switch failed." if switch_failed else "Model switched!"
             )
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mm:"):
             # --- Model selected: perform the switch ---
@@ -6364,7 +6461,7 @@ class TelegramAdapter(BasePlatformAdapter):
             )
 
             # Clean up state
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
 
         elif data.startswith("mpg:"):
             # --- Provider group selected: show member providers ---
@@ -6438,7 +6535,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         elif data == "mx":
             # --- Cancel ---
-            self._model_picker_state.pop(chat_id, None)
+            self._model_picker_state.pop(state_key, None)
             await query.edit_message_text(
                 text="Model selection cancelled.",
                 reply_markup=None,
@@ -8024,7 +8121,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_REQUIRE_MENTION", "false").lower() in {"true", "1", "yes", "on"}
+        return _telegram_auth_env("TELEGRAM_REQUIRE_MENTION", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
 
     def _telegram_observe_unmentioned_group_messages(self) -> bool:
         """Return whether skipped unmentioned group messages are stored as context.
@@ -8041,7 +8143,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false").lower() in {"true", "1", "yes", "on"}
+        return _telegram_auth_env(
+            "TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", "false"
+        ).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_guest_mode(self) -> bool:
         """Return whether non-allowlisted groups may trigger via direct @mention."""
@@ -8050,7 +8154,12 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_GUEST_MODE", "false").lower() in {"true", "1", "yes", "on"}
+        return _telegram_auth_env("TELEGRAM_GUEST_MODE", "false").lower() in {
+            "true",
+            "1",
+            "yes",
+            "on",
+        }
 
     def _telegram_exclusive_bot_mentions(self) -> bool:
         """Return whether explicit @...bot mentions exclusively route group messages."""
@@ -8059,7 +8168,9 @@ class TelegramAdapter(BasePlatformAdapter):
             if isinstance(configured, str):
                 return configured.lower() in {"true", "1", "yes", "on"}
             return bool(configured)
-        return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
+        return _telegram_auth_env(
+            "TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true"
+        ).lower() in {"true", "1", "yes", "on"}
 
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
@@ -8174,7 +8285,7 @@ class TelegramAdapter(BasePlatformAdapter):
         """Compile optional regex wake-word patterns for group triggers."""
         patterns = self.config.extra.get("mention_patterns")
         if patterns is None:
-            raw = os.getenv("TELEGRAM_MENTION_PATTERNS", "").strip()
+            raw = _telegram_auth_env("TELEGRAM_MENTION_PATTERNS", "").strip()
             if raw:
                 try:
                     loaded = json.loads(raw)
@@ -10181,8 +10292,13 @@ class TelegramAdapter(BasePlatformAdapter):
     # ── Message reactions (processing lifecycle) ──────────────────────────
 
     def _reactions_enabled(self) -> bool:
-        """Check if message reactions are enabled via config/env."""
-        return os.getenv("TELEGRAM_REACTIONS", "false").lower() not in {"false", "0", "no"}
+        """Check if message reactions are enabled via profile config/env."""
+        raw = self.config.extra.get("reactions")
+        if raw is None:
+            raw = _telegram_auth_env("TELEGRAM_REACTIONS", "false")
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() not in {"false", "0", "no", "off", ""}
 
     async def _set_reaction(self, chat_id: str, message_id: str, emoji: str) -> bool:
         """Set a single emoji reaction on a Telegram message."""
@@ -10302,6 +10418,7 @@ def _resolve_notifications_mode() -> str:
 def _build_adapter(config):
     """Factory wrapper that constructs TelegramAdapter and applies the
     notification mode (preserving the gateway/run.py post-construction step)."""
+    _snapshot_telegram_policy_env(config)
     adapter = TelegramAdapter(config)
     try:
         adapter._notifications_mode = _resolve_notifications_mode()
@@ -10388,17 +10505,53 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
     import json as _json
     extras: dict = {}
 
-    # Under multiplex, a secondary profile's config loads inside its runtime
-    # scope; its authorization gate values must NOT be written to the
-    # process-global env, where first-writer-wins would pin them for every
-    # other profile (issue #72348 Telegram mirror). They are seeded into
-    # PlatformConfig.extra / read via the profile secret scope instead.
-    try:
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
+    if _telegram_profile_scope_active():
+        # The legacy bridge below writes YAML values into os.environ.  That is
+        # acceptable for one standalone profile, but would publish a secondary
+        # profile's auth/intake policy to every adapter in a multiplex process.
+        # Keep all such values on this profile's PlatformConfig instead.
+        for key in (
+            "disable_topic_auto_rename",
+            "allow_bots",
+            "guest_mode",
+            "free_response_chats",
+            "free_response_topics",
+            "ignored_threads",
+            "reactions",
+            "proxy_url",
+            "disable_link_previews",
+        ):
+            if key in telegram_cfg:
+                extras[key] = telegram_cfg[key]
 
-        _skip_env_bridge = bool(is_multiplex_active() and current_secret_scope() is not None)
-    except Exception:
-        _skip_env_bridge = False
+        raw_telegram_extra = telegram_cfg.get("extra")
+        telegram_extra: dict = (
+            raw_telegram_extra if isinstance(raw_telegram_extra, dict) else {}
+        )
+        generic_merge_keys = {
+            "reply_prefix",
+            "reply_in_thread",
+            "reply_to_mode",
+            "unauthorized_dm_behavior",
+            "notice_delivery",
+            "require_mention",
+            "channel_skill_bindings",
+            "channel_prompts",
+            "topic_prompts",
+            "gateway_restart_notification",
+            "allow_from",
+            "allow_admin_from",
+            "dm_policy",
+            "group_policy",
+        }
+        for key, value in telegram_extra.items():
+            if key not in generic_merge_keys:
+                extras.setdefault(key, value)
+        return extras or None
+
+    # The profile-scoped branch above returns before the legacy environment
+    # bridge. Standalone mode intentionally preserves that bridge.
+    _skip_env_bridge = False
 
     if "disable_topic_auto_rename" in telegram_cfg:
         extras.setdefault("disable_topic_auto_rename", telegram_cfg["disable_topic_auto_rename"])

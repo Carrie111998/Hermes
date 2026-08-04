@@ -77,6 +77,23 @@ class TestProfilePathResolutionUnderMultiplexScope:
             (p / "state").mkdir(parents=True, exist_ok=True)
         return prof_a, prof_b
 
+    def test_scope_resets_home_when_secret_build_fails(self, tmp_path, monkeypatch):
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_hermes_home
+
+        original_home = get_hermes_home()
+
+        def _boom(_home):
+            raise RuntimeError("secret scope build failed")
+
+        monkeypatch.setattr("agent.secret_scope.build_profile_secret_scope", _boom)
+
+        with pytest.raises(RuntimeError, match="secret scope build failed"):
+            with _profile_runtime_scope(tmp_path / "broken-profile"):
+                pass
+
+        assert get_hermes_home() == original_home
+
     def test_skills_dir_follows_multiplex_scope(self, tmp_path):
         from gateway.run import _profile_runtime_scope
         import tools.skills_hub as sh

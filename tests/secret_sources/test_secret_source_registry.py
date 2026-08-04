@@ -218,6 +218,45 @@ class TestHelpers:
 
         assert env["SEEN_TOKEN"] == "secondary-token"
 
+    def test_fetch_worker_inherits_profile_context(self, tmp_path, monkeypatch):
+        """Executor isolation must preserve the caller's profile ContextVars."""
+        from agent import secret_scope as ss
+        from hermes_constants import (
+            get_hermes_home,
+            reset_hermes_home_override,
+            set_hermes_home_override,
+        )
+
+        process_home = tmp_path / "process"
+        profile_home = tmp_path / "profile"
+        monkeypatch.setenv("HERMES_HOME", str(process_home))
+        observed = {}
+
+        def _fetch(cfg, home):
+            observed["home"] = get_hermes_home()
+            observed["secret"] = ss.get_secret("SCOPE_MARKER")
+            return FetchResult()
+
+        reg.register_source(_make_source(fetch_fn=_fetch))
+        home_token = set_hermes_home_override(str(profile_home))
+        secret_token = ss.set_secret_scope({"SCOPE_MARKER": "profile-secret"})
+        ss.set_multiplex_active(True)
+        try:
+            reg.apply_all(
+                {"dummy": {"enabled": True}},
+                profile_home,
+                environ={"SCOPE_MARKER": "profile-secret"},
+            )
+        finally:
+            ss.set_multiplex_active(False)
+            ss.reset_secret_scope(secret_token)
+            reset_hermes_home_override(home_token)
+
+        assert observed == {
+            "home": profile_home,
+            "secret": "profile-secret",
+        }
+
     def test_run_secret_cli_fails_closed_without_fetch_context_in_multiplex(
         self, monkeypatch
     ):

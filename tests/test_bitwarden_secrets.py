@@ -218,6 +218,7 @@ def test_registry_fetch_uses_profile_auth_environment(monkeypatch, tmp_path):
     fake_binary.write_text("")
     monkeypatch.setenv("BWS_ACCESS_TOKEN", "primary-bws-token")
     monkeypatch.setenv("OPENAI_API_KEY", "primary-openai-key")
+    monkeypatch.setenv("HTTPS_PROXY", "https://primary-proxy.invalid")
     monkeypatch.setattr(bw, "find_bws", lambda **kwargs: fake_binary)
     captured_env = {}
 
@@ -235,7 +236,11 @@ def test_registry_fetch_uses_profile_auth_environment(monkeypatch, tmp_path):
     reg._reset_registry_for_tests()
     monkeypatch.setattr(reg, "_ensure_builtin_sources", lambda: None)
     reg.register_source(bw.BitwardenSource())
-    env = {"BWS_ACCESS_TOKEN": "personal-bws-token"}
+    env = {
+        "BWS_ACCESS_TOKEN": "personal-bws-token",
+        "HTTPS_PROXY": "https://personal-proxy.invalid",
+        "NO_PROXY": "vault.internal",
+    }
     try:
         reg.apply_all(
             {
@@ -253,6 +258,8 @@ def test_registry_fetch_uses_profile_auth_environment(monkeypatch, tmp_path):
 
     assert env["TARGET_SECRET"] == "resolved-value"
     assert captured_env["BWS_ACCESS_TOKEN"] == "personal-bws-token"
+    assert captured_env["HTTPS_PROXY"] == "https://personal-proxy.invalid"
+    assert captured_env["NO_PROXY"] == "vault.internal"
     assert "OPENAI_API_KEY" not in captured_env
 
 

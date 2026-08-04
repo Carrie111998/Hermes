@@ -166,6 +166,12 @@ class SecretSource(ABC):
         ``cfg`` is the source's raw config section (``secrets.<name>``)
         from config.yaml — treat every field defensively, the section
         may be malformed.  ``home_path`` is the resolved HERMES_HOME.
+
+        The registry runs ``fetch`` inside the target profile's copied context.
+        Implementations that need bootstrap credentials or subprocess settings
+        MUST read ``secret_source_environ()`` (or the scoped secret helpers),
+        never raw ``os.environ``; the latter is process-global and can cross a
+        multiplex profile boundary.
         """
 
     # -- optional hooks (defaults are correct for most sources) ------------
