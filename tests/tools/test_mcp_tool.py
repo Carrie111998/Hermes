@@ -326,6 +326,101 @@ class TestSchemaConversion:
         assert "$defs" not in schema["parameters"]
         assert "definitions" not in schema["parameters"]
 
+    def test_multitype_array_is_collapsed_to_anyof(self):
+        """A multi-type ``type`` array must become an ``anyOf`` of single-type schemas.
+
+        Anthropic's tool ``input_schema`` validator rejects an array-valued ``type``
+        with "JSON schema is invalid. It must match JSON Schema draft 2020-12", 400ing
+        every Claude-backed provider. This is not hypothetical: GitHub's hosted MCP ships
+        ``issue_write`` with ``issue_fields[].value`` typed exactly this way. Before this
+        fix the array survived ingestion untouched (``_strip_nullable_union`` only handles
+        the ``[X, "null"]`` two-element case), and the tool 400d on first use.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "value": {"type": ["string", "number", "boolean"]},
+            },
+        })
+
+        value = schema["properties"]["value"]
+        assert "type" not in value or not isinstance(value["type"], list)
+        assert value["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+            {"type": "boolean"},
+        ]
+
+    def test_nested_multitype_array_under_array_items_is_collapsed(self):
+        """The real GitHub ``issue_write`` shape: the array type is nested two levels deep
+        under ``properties.<field>.items.properties.<sub>``. The sanitizer must recurse."""
+        from tools.mcp_tool import _normalize_mcp_input_schema
+
+        schema = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": ["string", "number", "boolean"]},
+                        },
+                    },
+                },
+            },
+        })
+
+        value = schema["properties"]["issue_fields"]["items"]["properties"]["value"]
+        assert value["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+            {"type": "boolean"},
+        ]
+
+    def test_wire_property_keys_survive_ingestion_for_dispatch_round_trip(self):
+        """Ingestion must collapse the ``type`` array WITHOUT renaming property keys.
+
+        The registry holds the schema this function returns, and dispatch depends
+        on it keeping the server's wire names: ``sanitize_tool_schemas`` renames
+        provider-hostile keys only on the copy sent to the model, and
+        ``unrename_tool_args`` maps the model's arguments back by recomputing
+        those renames from the registry's original schema. Renaming during
+        ingestion would make that reverse map an identity, and a tool from a
+        server with keys such as Cloudflare's ``issue_class~neq`` would be
+        dispatched under the sanitized key instead of the wire key.
+        """
+        from tools.mcp_tool import _normalize_mcp_input_schema
+        from tools.schema_sanitizer import sanitize_tool_schemas, unrename_tool_args
+
+        registry_params = _normalize_mcp_input_schema({
+            "type": "object",
+            "properties": {
+                "issue_class~neq": {"type": ["string", "number"]},
+            },
+        })
+
+        # The type array is collapsed; the wire key is untouched.
+        assert list(registry_params["properties"]) == ["issue_class~neq"]
+        assert registry_params["properties"]["issue_class~neq"]["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+        ]
+
+        # The model sees the sanitized copy, with the key renamed...
+        outgoing = sanitize_tool_schemas([{
+            "type": "function",
+            "function": {"name": "query", "parameters": registry_params},
+        }])
+        model_key, = outgoing[0]["function"]["parameters"]["properties"]
+        assert model_key == "issue_class_neq"
+
+        # ...and its arguments map back to the wire key before dispatch.
+        assert unrename_tool_args(registry_params, {model_key: "bug"}) == {
+            "issue_class~neq": "bug",
+        }
 
     def test_optional_nullable_field_is_collapsed_to_non_null_schema(self):
         """Anthropic rejects MCP/Pydantic anyOf-null optional parameter schemas."""
@@ -1828,6 +1923,50 @@ class TestSamplingCallbackText:
                 "parameters": {"type": "object", "properties": {}},
             },
         }]
+
+    def test_server_tools_with_multitype_array_are_collapsed(self):
+        """Sampling hands server tools to the LLM without the global sanitizer.
+
+        A normal agent request goes through ``get_tool_definitions``, which
+        applies ``sanitize_tool_schemas`` to the outgoing copy. This path builds
+        the tool list here and passes it straight to ``call_llm``, so an
+        array-valued ``type`` reaches the provider verbatim unless MCP ingestion
+        collapses it — and Anthropic 400s the whole request when it does.
+        """
+        server_tool = SimpleNamespace(
+            name="issue_write",
+            description="Write an issue",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "issue_fields": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "value": {"type": ["string", "number", "boolean"]},
+                            },
+                        },
+                    },
+                },
+            },
+        )
+
+        with patch(
+            "agent.auxiliary_client.call_llm",
+            return_value=_make_llm_response(),
+        ) as mock_call:
+            params = _make_sampling_params(tools=[server_tool])
+            asyncio.run(self.handler(None, params))
+
+        parameters = mock_call.call_args.kwargs["tools"][0]["function"]["parameters"]
+        value = parameters["properties"]["issue_fields"]["items"]["properties"]["value"]
+        assert "type" not in value or not isinstance(value["type"], list)
+        assert value["anyOf"] == [
+            {"type": "string"},
+            {"type": "number"},
+            {"type": "boolean"},
+        ]
 
 # ---------------------------------------------------------------------------
 # 7. Tool use sampling callback

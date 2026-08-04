@@ -302,6 +302,109 @@ def strip_nullable_unions(
     return stripped
 
 
+def collapse_type_array(value: list) -> dict:
+    """Return the keys that replace a JSON Schema ``type`` array on one node.
+
+    JSON Schema ``type`` arrays (e.g. ``["number", "string"]``, common in MCP
+    tool schemas) are rejected by several tool-call backends:
+
+      * llama.cpp's grammar generator only accepts a singular string type.
+      * Gemini (including OpenAI-compatible transports such as GitHub Copilot
+        proxying to Gemini) rejects the array form outright — plain
+        @ai-sdk/google rewrites it, but the OpenAI-compatible path forwards it
+        verbatim and the backend 400s.
+      * Anthropic's tool ``input_schema`` validator rejects it with "JSON
+        schema is invalid. It must match JSON Schema draft 2020-12".
+
+    Normalize per the SDK's behavior:
+
+      * single non-null type → ``type: X`` (+ ``nullable: true`` if the array
+        also contained "null"). No data lost.
+      * multiple non-null types → ``anyOf`` of single-type schemas, so EVERY
+        branch survives instead of silently dropping all but the first.
+        ``null`` is lifted into ``nullable: true``.
+      * all-null / empty → ``type: "null"`` (or object fallback).
+
+    Ported from anomalyco/opencode#31877. Callers merge the returned keys into
+    the node they are building; ``nullable`` is a hint and should be merged
+    with ``setdefault`` so an explicit sibling ``nullable`` wins.
+    """
+    has_null = "null" in value
+    non_null = [t for t in value if isinstance(t, str) and t != "null"]
+    if len(non_null) == 1:
+        out: dict = {"type": non_null[0]}
+    elif len(non_null) >= 2:
+        # Preserve all branches as a union instead of dropping them.
+        out = {"anyOf": [{"type": t} for t in non_null]}
+    else:
+        # No usable non-null type: all-null array → type: "null";
+        # otherwise an empty/garbage array → object fallback.
+        return {"type": "null" if has_null else "object"}
+    if has_null:
+        out["nullable"] = True
+    return out
+
+
+def normalize_type_arrays(node: Any) -> Any:
+    """Recursively collapse ``type`` arrays, leaving every other key untouched.
+
+    This is the ``type``-array rule of :func:`_sanitize_node` and nothing else
+    — in particular it does NOT rename property keys.
+
+    MCP ingestion needs exactly this narrow pass. ``_normalize_mcp_input_schema``
+    populates the tool *registry*, and the registry must keep the server's wire
+    property names: ``sanitize_tool_schemas`` renames keys only on the copy sent
+    to the model, and ``unrename_tool_args`` maps the model's arguments back by
+    recomputing the renames from the registry's original schema. A rename
+    applied during ingestion would make that reverse map an identity, and tools
+    from servers with keys such as ``issue_class~neq`` would be dispatched with
+    the sanitized key instead of the wire key.
+
+    Structural walk mirrors :func:`_sanitize_node`: ``properties`` /
+    ``patternProperties`` / ``$defs`` / ``definitions`` values are schemas
+    (keys are names and are preserved verbatim), ``items`` /
+    ``additionalProperties`` / ``anyOf`` / ``oneOf`` / ``allOf`` are recursed
+    into, and the non-schema sibling keywords pass through unchanged.
+    """
+    if isinstance(node, list):
+        return [normalize_type_arrays(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: dict = {}
+    for key, value in node.items():
+        if key == "type" and isinstance(value, list):
+            for repl_key, repl_value in collapse_type_array(value).items():
+                if repl_key == "nullable":
+                    out.setdefault(repl_key, repl_value)
+                else:
+                    out[repl_key] = repl_value
+        elif (
+            key in {"properties", "patternProperties", "$defs", "definitions"}
+            and isinstance(value, dict)
+        ):
+            out[key] = {
+                sub_key: normalize_type_arrays(sub_value)
+                for sub_key, sub_value in value.items()
+            }
+        elif key in {"items", "additionalProperties"}:
+            # Bool ``additionalProperties`` (and non-standard ``items: true``)
+            # is a valid form — preserve rather than walk into it.
+            out[key] = value if isinstance(value, bool) else normalize_type_arrays(value)
+        elif key in {"anyOf", "oneOf", "allOf"} and isinstance(value, list):
+            out[key] = [normalize_type_arrays(item) for item in value]
+        elif key in {"required", "enum", "examples", "dependentRequired"}:
+            # Values here are literals / property-name lists, not schemas.
+            out[key] = value
+        else:
+            out[key] = (
+                normalize_type_arrays(value)
+                if isinstance(value, (dict, list))
+                else value
+            )
+    return out
+
+
 def _sanitize_node(node: Any, path: str) -> Any:
     """Recursively sanitize a JSON-Schema fragment.
 
@@ -351,39 +454,16 @@ def _sanitize_node(node: Any, path: str) -> Any:
 
     out: dict = {}
     for key, value in node.items():
-        # JSON Schema ``type`` arrays (e.g. ``["number", "string"]``, common
-        # in MCP tool schemas) are rejected by several tool-call backends:
-        #   * llama.cpp's grammar generator only accepts a singular string type.
-        #   * Gemini (including OpenAI-compatible transports such as GitHub
-        #     Copilot proxying to Gemini) rejects the array form outright —
-        #     plain @ai-sdk/google rewrites it, but the OpenAI-compatible path
-        #     forwards it verbatim and the backend 400s.
-        #
-        # Normalize per the SDK's behavior:
-        #   * single non-null type → ``type: X`` (+ ``nullable: true`` if the
-        #     array also contained "null"). No data lost.
-        #   * multiple non-null types → ``anyOf`` of single-type schemas, so
-        #     EVERY branch survives instead of silently dropping all but the
-        #     first. ``null`` is lifted into ``nullable: true``.
-        #   * all-null / empty → ``type: "null"`` (or object fallback).
-        # Ported from anomalyco/opencode#31877.
+        # ``type`` arrays are rejected by several tool-call backends; see
+        # ``collapse_type_array`` for the per-backend rationale and the mapping.
+        # ``nullable`` is merged with ``setdefault`` so an explicit sibling
+        # ``nullable`` later in this dict still wins.
         if key == "type" and isinstance(value, list):
-            has_null = "null" in value
-            non_null = [t for t in value if isinstance(t, str) and t != "null"]
-            if len(non_null) == 1:
-                out["type"] = non_null[0]
-                if has_null:
-                    out.setdefault("nullable", True)
-                continue
-            if len(non_null) >= 2:
-                # Preserve all branches as a union instead of dropping them.
-                out["anyOf"] = [{"type": t} for t in non_null]
-                if has_null:
-                    out.setdefault("nullable", True)
-                continue
-            # No usable non-null type: all-null array → type: "null";
-            # otherwise an empty/garbage array → object fallback.
-            out["type"] = "null" if has_null else "object"
+            for repl_key, repl_value in collapse_type_array(value).items():
+                if repl_key == "nullable":
+                    out.setdefault(repl_key, repl_value)
+                else:
+                    out[repl_key] = repl_value
             continue
 
         if key in {"properties", "$defs", "definitions"} and isinstance(value, dict):

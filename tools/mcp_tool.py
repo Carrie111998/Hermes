@@ -5484,6 +5484,28 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
     normalized = _rewrite_local_refs(schema)
     normalized = _strip_nullable_union(normalized)
     normalized = _repair_object_shape(normalized)
+    # Collapse multi-type ``type`` arrays (e.g. ``["string", "number", "boolean"]``)
+    # into an ``anyOf`` of single-type schemas. ``_strip_nullable_union`` above only
+    # handles the two-element ``[X, "null"]`` case; a genuine multi-type array survives
+    # it untouched, and Anthropic's tool ``input_schema`` validator rejects any array
+    # ``type`` with "JSON schema is invalid. It must match JSON Schema draft 2020-12"
+    # (observed via GitHub's hosted MCP: the ``issue_write`` tool declares
+    # ``issue_fields[].value`` as ``type: ["string", "number", "boolean"]``, which 400s
+    # on every Claude-backed provider).
+    #
+    # Deliberately ``normalize_type_arrays`` and NOT the full ``_sanitize_node``:
+    # this function feeds the tool *registry*, which must keep the server's wire
+    # property names. The global sanitizer renames non-conforming keys only on the
+    # copy sent to the model (``model_tools.get_tool_definitions``), and
+    # ``unrename_tool_args`` maps the model's arguments back by recomputing those
+    # renames from the registry's original schema. Renaming here would make that
+    # reverse map an identity and dispatch tools from servers with keys such as
+    # ``issue_class~neq`` under the sanitized key. Both routines share one
+    # implementation of the ``type``-array rule (``collapse_type_array``), the same
+    # way ``_strip_nullable_union`` above shares ``strip_nullable_unions``.
+    from tools.schema_sanitizer import normalize_type_arrays
+
+    normalized = normalize_type_arrays(normalized)
 
     # Ensure top-level is a well-formed object schema
     if not isinstance(normalized, dict):
