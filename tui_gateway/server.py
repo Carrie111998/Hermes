@@ -176,22 +176,26 @@ def _get_tui_hook_registry(hermes_home: Optional[str] = None) -> HookRegistry:
     """
     from pathlib import Path as _Path
     resolved = str(_Path(hermes_home).resolve()) if hermes_home else str(get_hermes_home().resolve())
-    if resolved not in _tui_hook_registries:
-        with _tui_hooks_lock:
-            if resolved not in _tui_hook_registries:
-                hooks_dir = _Path(resolved) / "hooks"
-                registry = HookRegistry(hooks_dir=hooks_dir)
-                try:
-                    registry.discover_and_load()
-                    # Only cache on success — a failed load leaves the registry in a
-                    # broken state.  Not caching allows a retry on the next message
-                    # (e.g. after the user corrects a bad hook file) rather than
-                    # silently serving an empty/half-loaded registry forever.
-                    _tui_hook_registries[resolved] = registry
-                except Exception as e:
-                    logger.error("Failed to load hooks for %s: %s", resolved, e)
-                    # do not cache — allow retry on next message
-    return _tui_hook_registries[resolved]
+    registry = _tui_hook_registries.get(resolved)
+    if registry is not None:
+        return registry
+    with _tui_hooks_lock:
+        registry = _tui_hook_registries.get(resolved)
+        if registry is not None:
+            return registry
+        hooks_dir = _Path(resolved) / "hooks"
+        registry = HookRegistry(hooks_dir=hooks_dir)
+        try:
+            registry.discover_and_load()
+            # Only cache on success — a failed load leaves the registry in a
+            # broken state.  Not caching allows a retry on the next message
+            # (e.g. after the user corrects a bad hook file) rather than
+            # silently serving an empty/half-loaded registry forever.
+            _tui_hook_registries[resolved] = registry
+        except Exception as e:
+            logger.error("Failed to load hooks for %s: %s", resolved, e)
+            # do not cache — allow retry on next message
+        return registry
 _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
