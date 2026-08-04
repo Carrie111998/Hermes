@@ -733,18 +733,28 @@ def interruptible_api_call(agent, api_kwargs: dict):
             # builds it via this callback (openai- or anthropic-kind) so the
             # interrupt / stale-call detectors can force-close the worker's
             # connection without touching the shared client (#67142).
-            result["response"] = _dispatch_nonstreaming_api_request(
-                agent,
-                api_kwargs,
-                make_client=lambda reason, kind="openai": _set_request_client(
-                    agent._create_request_anthropic_client(reason=reason)
-                    if kind == "anthropic_messages"
-                    else agent._create_request_openai_client(
-                        reason=reason, api_kwargs=api_kwargs
+            def _dispatch() -> Any:
+                return _dispatch_nonstreaming_api_request(
+                    agent,
+                    api_kwargs,
+                    make_client=lambda reason, kind="openai": _set_request_client(
+                        agent._create_request_anthropic_client(reason=reason)
+                        if kind == "anthropic_messages"
+                        else agent._create_request_openai_client(
+                            reason=reason, api_kwargs=api_kwargs
+                        ),
+                        kind=kind,
                     ),
-                    kind=kind,
-                ),
-            )
+                )
+            if agent.api_mode == "codex_responses":
+                from agent.codex_runtime import codex_request_cancel_scope
+
+                with codex_request_cancel_scope(
+                    lambda: _request_cancelled["value"]
+                ):
+                    result["response"] = _dispatch()
+            else:
+                result["response"] = _dispatch()
         except Exception as e:
             # If the request was cancelled by the main thread's interrupt
             # handler, the transport error is the expected consequence of our
@@ -967,6 +977,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Reconnecting."
                 )
+            _request_cancelled["value"] = True
             try:
                 _close_request_client_once("codex_ttfb_kill")
             except Exception:
@@ -1017,6 +1028,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"after first byte (model: {api_kwargs.get('model', 'unknown')}). "
                 f"Reconnecting."
             )
+            _request_cancelled["value"] = True
             try:
                 _close_request_client_once("codex_stream_idle_kill")
             except Exception:
@@ -1061,6 +1073,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
+            _request_cancelled["value"] = True
             try:
                 # #67142: routes by client kind — anthropic now aborts the
                 # request-local client's sockets from this poll (stranger)

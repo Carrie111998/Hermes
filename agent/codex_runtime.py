@@ -13,9 +13,10 @@ compatibility.
 * ``run_codex_create_stream_fallback`` — recovery path when the
   Responses ``stream=True`` initial create fails.
 """
-
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
 import json
 import logging
 import time
@@ -25,6 +26,48 @@ from typing import Any, Callable, Dict, List
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 
 logger = logging.getLogger(__name__)
+_CODEX_REQUEST_CANCEL_STATE = threading.local()
+
+
+@contextmanager
+def codex_request_cancel_scope(cancelled_check):
+    """Install a worker-thread request-cancellation predicate for Codex.
+
+    ``interruptible_api_call`` may abandon a logical request while its worker
+    thread still unwinds a physical Codex stream attempt. The abandoned worker
+    must not perform ``run_codex_stream``'s inner retry, reclaim stream-writer
+    ownership, or return a stale response into the replacement request. A
+    request-local predicate, stored thread-locally for the lifetime of that
+    worker dispatch, lets ``run_codex_stream`` observe the abandonment without
+    changing ordinary direct-call sites.
+    """
+
+    previous = getattr(_CODEX_REQUEST_CANCEL_STATE, "cancelled_check", None)
+    _CODEX_REQUEST_CANCEL_STATE.cancelled_check = cancelled_check
+    try:
+        yield
+    finally:
+        if previous is None:
+            try:
+                delattr(_CODEX_REQUEST_CANCEL_STATE, "cancelled_check")
+            except AttributeError:
+                pass
+        else:
+            _CODEX_REQUEST_CANCEL_STATE.cancelled_check = previous
+
+
+def _codex_request_cancelled() -> bool:
+    check = getattr(_CODEX_REQUEST_CANCEL_STATE, "cancelled_check", None)
+    if check is None:
+        return False
+    try:
+        return bool(check())
+    except Exception:
+        logger.debug(
+            "Codex request-cancellation predicate raised; treating request as live",
+            exc_info=True,
+        )
+        return False
 
 
 def _coerce_usage_int(value: Any) -> int:
@@ -1246,6 +1289,12 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     # Accumulate streamed text so callers / compat shims can read it.
     agent._codex_streamed_text_parts: list = []
 
+    def _raise_if_request_cancelled(where: str) -> None:
+        if _codex_request_cancelled():
+            raise InterruptedError(
+                f"Codex stream request cancelled after watchdog abandonment ({where})"
+            )
+
     def _on_text_delta(text: str) -> None:
         agent._codex_streamed_text_parts.append(text)
         agent._fire_stream_delta(text)
@@ -1257,6 +1306,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_streamed_codex_commentary(text)
 
     def _on_event(event: Any) -> None:
+        _raise_if_request_cancelled("on_event")
         # TTFB watchdog and activity touch — runs once per SSE event.
         agent._codex_stream_last_event_ts = time.time()
         agent._touch_activity("receiving stream response")
@@ -1264,6 +1314,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     for attempt in range(max_stream_retries + 1):
         if agent._interrupt_requested:
             raise InterruptedError("Agent interrupted before Codex stream retry")
+        _raise_if_request_cancelled("before_retry")
 
         intercepted_events = []
         writer_token = {"value": None}
@@ -1274,11 +1325,13 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             return active_client.responses.create(**stream_kwargs)
 
         def _codex_stream_created(_raw_stream: Any) -> None:
+            _raise_if_request_cancelled("stream_created")
             # Claim the delta sink for THIS physical attempt. A newer attempt
             # supersedes this token and fences late deltas out of the turn.
             writer_token["value"] = claim_stream_writer(agent)
 
         def _accept_codex_chunk(_chunk: Any) -> bool:
+            _raise_if_request_cancelled("accept_chunk")
             token = writer_token["value"]
             if token is None or stream_writer_is_current(agent, token):
                 return True
@@ -1331,6 +1384,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             _httpx.ConnectError,
             ConnectionError,
         ) as exc:
+            _raise_if_request_cancelled("open_stream_retry")
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); "
@@ -1366,6 +1420,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_or_superseded,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                _raise_if_request_cancelled("consume_retry")
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "
@@ -1377,6 +1432,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 raise
             except RuntimeError:
                 if event_stream.final_response is not None:
+                    _raise_if_request_cancelled("final_response_fallback")
                     return event_stream.final_response
                 raise
 
@@ -1386,7 +1442,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
             # finalizer — must NOT discard it or trigger a new physical
             # request. Record it as a non-fatal finalization warning and
             # still return the already-completed, already-billed response.
-            if not agent._interrupt_requested:
+            if not agent._interrupt_requested and not _codex_request_cancelled():
                 try:
                     for _ignored in event_stream:
                         pass
@@ -1399,6 +1455,7 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                         agent._client_log_context(), exc,
                     )
 
+            _raise_if_request_cancelled("before_return")
             if final.status in {"incomplete", "failed"}:
                 logger.warning(
                     "Codex Responses stream terminal status=%s "
