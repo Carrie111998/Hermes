@@ -344,6 +344,7 @@ test('managed.updater-handoff-preservation', async () => {
   const scheduled = []
   const service = createEvaAppUpdater({
     app: { getVersion: () => '1.0.0', isPackaged: true },
+    arch: 'arm64',
     autoUpdater: updater,
     emitProgress: () => undefined,
     isPackaged: true,
@@ -356,6 +357,13 @@ test('managed.updater-handoff-preservation', async () => {
 
   const first = service.apply()
   const second = service.apply()
+  for (let attempt = 0; attempt < 20 && scheduled.length === 0; attempt += 1) {
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  assert.equal(scheduled.length, 1)
+  assert.deepEqual(updater.installCalls, [])
+
+  scheduled[0]()
   const [firstResult, secondResult] = await Promise.all([first, second])
   assert.deepEqual(firstResult, {
     ok: true,
@@ -365,8 +373,5 @@ test('managed.updater-handoff-preservation', async () => {
   assert.deepEqual(secondResult, firstResult)
   assert.equal(updater.downloadCalls, 1)
   assert.equal(scheduled.length, 1)
-  assert.deepEqual(updater.installCalls, [])
-
-  scheduled[0]()
   assert.deepEqual(updater.installCalls, [[false, true]])
 })

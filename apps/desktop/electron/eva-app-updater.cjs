@@ -269,24 +269,21 @@ function createEvaAppUpdater(options) {
           throw new Error('The update downloaded without a verified release identity.')
         }
 
-        schedule(() => {
-          let rollbackHandoff
-          try {
-            rollbackHandoff = prepareInstallHandoff()
-            autoUpdater.quitAndInstall(false, true)
-          } catch (error) {
-            if (typeof rollbackHandoff === 'function') {
-              rollbackHandoff()
+        await new Promise((resolve, reject) => {
+          schedule(() => {
+            let rollbackHandoff
+            try {
+              rollbackHandoff = prepareInstallHandoff()
+              autoUpdater.quitAndInstall(false, true)
+              resolve()
+            } catch (error) {
+              if (typeof rollbackHandoff === 'function') {
+                rollbackHandoff()
+              }
+              reject(error)
             }
-            reportError('install-handoff', error)
-            emitProgress({
-              stage: 'error',
-              message: SAFE_APPLY_FAILURE_MESSAGE,
-              error: 'app-update-failed',
-              percent: null
-            })
-          }
-        }, 500)
+          }, 500)
+        })
         return { ok: true, handedOff: true, message: `Installing evaOS Agent ${downloadedVersion}.` }
       } catch (error) {
         reportError('apply', error)

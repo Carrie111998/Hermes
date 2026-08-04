@@ -86,6 +86,16 @@ function fixture(overrides = {}) {
   return { errors, handoffCalls, progress, scheduled, service, updater }
 }
 
+async function waitForScheduled(scheduled, count) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (scheduled.length >= count) {
+      return
+    }
+    await new Promise(resolve => setImmediate(resolve))
+  }
+  throw new Error(`Expected ${count} scheduled updater handoff(s); received ${scheduled.length}.`)
+}
+
 test('managed app updater always restores the fixed Electric Sheep feed and forward-only policy', async () => {
   const { progress, service, updater } = fixture()
 
@@ -166,7 +176,10 @@ test('release notes cannot restore upstream product branding', () => {
 test('apply downloads, reports progress, and prepares handoff before the signed restart', async () => {
   const { handoffCalls, progress, scheduled, service, updater } = fixture()
 
-  const result = await service.apply()
+  const resultPromise = service.apply()
+  await waitForScheduled(scheduled, 1)
+  scheduled[0]()
+  const result = await resultPromise
   assert.deepEqual(result, {
     ok: true,
     handedOff: true,
@@ -175,7 +188,7 @@ test('apply downloads, reports progress, and prepares handoff before the signed 
   assert.equal(updater.checkCalls, 1)
   assert.equal(updater.downloadCalls, 1)
   assert.equal(scheduled.length, 1)
-  assert.deepEqual(updater.installCalls, [])
+  assert.deepEqual(updater.installCalls, [[false, true]])
   assert.equal(
     progress.some(item => item.stage === 'fetch' && item.percent === 42.4),
     true
@@ -184,10 +197,23 @@ test('apply downloads, reports progress, and prepares handoff before the signed 
     progress.some(item => item.stage === 'restart' && item.percent === 100),
     true
   )
+  assert.deepEqual(handoffCalls, ['prepare'])
+})
+
+test('apply remains coalesced until the scheduled install handoff completes', async () => {
+  const { scheduled, service, updater } = fixture()
+
+  const first = service.apply()
+  await waitForScheduled(scheduled, 1)
+  const second = service.apply()
+  await new Promise(resolve => setImmediate(resolve))
+
+  assert.equal(updater.downloadCalls, 1)
+  assert.equal(scheduled.length, 1)
 
   scheduled[0]()
-  assert.deepEqual(handoffCalls, ['prepare'])
-  assert.deepEqual(updater.installCalls, [[false, true]])
+  const [firstResult, secondResult] = await Promise.all([first, second])
+  assert.deepEqual(secondResult, firstResult)
 })
 
 test('a failed install handoff restores the active-work quit guard and reports a safe error', async () => {
@@ -196,12 +222,14 @@ test('a failed install handoff restores the active-work quit guard and reports a
     throw new Error('helper failed at /private/tmp/secret')
   }
 
-  const result = await service.apply()
-  assert.equal(result.ok, true)
+  const resultPromise = service.apply()
+  await waitForScheduled(scheduled, 1)
   scheduled[0]()
+  const result = await resultPromise
 
+  assert.deepEqual(result, safeApplyFailure())
   assert.deepEqual(handoffCalls, ['prepare', 'rollback'])
-  assert.equal(errors.at(-1).stage, 'install-handoff')
+  assert.equal(errors.at(-1).stage, 'apply')
   assert.equal(errors.at(-1).error.message, 'helper failed at /private/tmp/secret')
   assert.equal(progress.at(-1).message, 'evaOS Agent could not install the update. Try again.')
   assert.equal(progress.at(-1).message.includes('/private/tmp'), false)
@@ -248,7 +276,10 @@ test('a no-update apply clears state so a later update installs in the same proc
   const { scheduled, service } = fixture({ autoUpdater: updater })
 
   const first = await service.apply()
-  const second = await service.apply()
+  const secondPromise = service.apply()
+  await waitForScheduled(scheduled, 1)
+  scheduled[0]()
+  const second = await secondPromise
 
   assert.deepEqual(first, {
     ok: false,
@@ -276,7 +307,10 @@ test('check failures remain renderer-safe and a later apply retries in the same 
   const { errors, scheduled, service } = fixture({ autoUpdater: updater })
 
   const first = await service.apply()
-  const second = await service.apply()
+  const secondPromise = service.apply()
+  await waitForScheduled(scheduled, 1)
+  scheduled[0]()
+  const second = await secondPromise
 
   assert.deepEqual(first, {
     ok: false,
