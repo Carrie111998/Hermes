@@ -16,6 +16,7 @@ from hermes_cli.tools_config import (
     _configure_provider,
     _reconfigure_provider,
     _get_platform_tools,
+    _resolve_channel_toolsets,
     _platform_toolset_summary,
     _reconfigure_tool,
     _run_post_setup,
@@ -742,3 +743,221 @@ def test_platforms_whose_composite_excludes_it_are_left_narrow():
             include_default_mcp_servers=False,
         )
         assert not (_RECENTLY_SHIPPED_TOOLSETS & enabled), platform
+
+
+# channel_toolsets: resolver + strict _get_platform_tools(chat_id=/parent_id=)
+
+_FAKE_ON = "fake_default_on_plugin"
+_FAKE_EX = "fake_explicit_plugin"
+_MCP_A, _MCP_B = "mcp_alpha", "mcp_beta"
+
+
+def _patch_plugins(monkeypatch, keys):
+    monkeypatch.setattr(
+        "hermes_cli.tools_config._get_plugin_toolset_keys", lambda: set(keys)
+    )
+
+
+def _ch(toolsets, cid="100"):
+    return {"channel_toolsets": [{"id": cid, "toolsets": toolsets}]}
+
+
+def test_channel_prompt_platforms_offer_channel_toolsets():
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    prompt_platforms = [
+        settings
+        for settings in DEFAULT_CONFIG.values()
+        if isinstance(settings, dict) and "channel_prompts" in settings
+    ]
+    assert prompt_platforms
+    assert all(settings.get("channel_toolsets") == [] for settings in prompt_platforms)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_resolve_channel_toolsets_exact_beats_parent(reverse):
+    bindings = [
+        {"id": "200", "toolsets": ["memory"]},
+        {"id": "100", "toolsets": ["terminal"]},
+    ]
+    if reverse:
+        bindings.reverse()
+    block = {"channel_toolsets": bindings}
+    assert _resolve_channel_toolsets(block, "100", parent_id="200") == ["terminal"]
+
+
+def test_resolve_channel_toolsets_parent_fallback_and_no_match():
+    block = {"channel_toolsets": [{"id": "200", "toolsets": ["terminal"]}]}
+    assert _resolve_channel_toolsets(block, "999", parent_id="200") == ["terminal"]
+    assert _resolve_channel_toolsets(block, "999", parent_id="888") is None
+
+
+def test_resolve_channel_toolsets_empty_list_and_numeric_id():
+    assert _resolve_channel_toolsets(_ch([]), "100") == []
+    assert _resolve_channel_toolsets(
+        {"channel_toolsets": [{"id": 100, "toolsets": ["terminal"]}]}, "100"
+    ) == ["terminal"]
+
+
+def test_resolve_channel_toolsets_invalid_matched_fail_closed():
+    """Matched id with missing/non-list toolsets or non-string members → [].
+    Invalid exact must not fall back to a permissive parent."""
+    assert _resolve_channel_toolsets(
+        {"channel_toolsets": {"100": ["web"]}}, "100"
+    ) == []
+    assert _resolve_channel_toolsets({"channel_toolsets": [{"id": "100"}]}, "100") == []
+    assert _resolve_channel_toolsets(
+        {"channel_toolsets": [{"id": "100", "toolsets": "web"}]}, "100"
+    ) == []
+    assert _resolve_channel_toolsets(
+        {"channel_toolsets": [{"id": "100", "toolsets": [1, "web"]}]}, "100"
+    ) == []
+    assert _resolve_channel_toolsets(
+        {
+            "channel_toolsets": [
+                {"id": "100", "toolsets": None},
+                {"id": "200", "toolsets": ["terminal"]},
+            ],
+        },
+        "100",
+        parent_id="200",
+    ) == []
+
+
+def test_resolve_channel_toolsets_malformed_and_missing():
+    assert _resolve_channel_toolsets(
+        {"channel_toolsets": ["garbage", None, {"id": "100", "toolsets": ["x"]}]},
+        "100",
+    ) == ["x"]
+    assert _resolve_channel_toolsets({}, "100") is None
+    assert _resolve_channel_toolsets({"channel_toolsets": None}, "100") is None
+    assert _resolve_channel_toolsets({"channel_toolsets": []}, "100") is None
+
+
+def test_channel_match_shadows_platform_and_empty_is_hard(monkeypatch):
+    _patch_plugins(monkeypatch, {_FAKE_ON})
+    cfg = {
+        "platform_toolsets": {"discord": ["memory", "terminal"]},
+        "discord": _ch(["web"]),
+    }
+    enabled = _get_platform_tools(
+        cfg, "discord", chat_id="100", include_default_mcp_servers=False
+    )
+    assert "web" in enabled and "memory" not in enabled and "terminal" not in enabled
+    hard = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory", "terminal"]},
+            "discord": _ch([]),
+            "mcp_servers": {_MCP_A: {"url": "https://example.com/a"}},
+            "context": {"engine": "openviking"},
+        },
+        "discord",
+        chat_id="100",
+    )
+    assert hard == set()
+    assert not (_RECENTLY_SHIPPED_TOOLSETS & hard)
+    assert "context_engine" not in hard and _FAKE_ON not in hard
+
+
+def test_channel_match_narrow_web_no_default_injections(monkeypatch):
+    _patch_plugins(monkeypatch, {_FAKE_ON})
+    enabled = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory", "terminal"]},
+            "discord": _ch(["web"]),
+            "mcp_servers": {
+                _MCP_A: {"url": "https://example.com/a"},
+                _MCP_B: {"url": "https://example.com/b"},
+            },
+            "context": {"engine": "openviking"},
+        },
+        "discord",
+        chat_id="100",
+    )
+    assert "web" in enabled
+    assert _MCP_A not in enabled and _MCP_B not in enabled
+    assert _FAKE_ON not in enabled and "context_engine" not in enabled
+    assert not (_RECENTLY_SHIPPED_TOOLSETS & enabled)
+    assert "kanban" not in enabled and "x_search" not in enabled
+
+
+def test_channel_match_explicit_mcp_and_plugin(monkeypatch):
+    _patch_plugins(monkeypatch, {_FAKE_ON, _FAKE_EX})
+    enabled = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory"]},
+            "discord": _ch(["web", _MCP_A, _FAKE_EX]),
+            "mcp_servers": {
+                _MCP_A: {"url": "https://example.com/a"},
+                _MCP_B: {"url": "https://example.com/b"},
+            },
+        },
+        "discord",
+        chat_id="100",
+    )
+    assert "web" in enabled and _MCP_A in enabled and _FAKE_EX in enabled
+    assert _MCP_B not in enabled and _FAKE_ON not in enabled
+
+
+def test_channel_match_composite_and_disabled_last(monkeypatch):
+    _patch_plugins(monkeypatch, set())
+    platform_config = {"platform_toolsets": {"discord": ["hermes-discord"]}}
+    enabled = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory"]},
+            "discord": _ch(["hermes-discord"]),
+        },
+        "discord",
+        chat_id="100",
+        include_default_mcp_servers=False,
+    )
+    assert enabled == _get_platform_tools(
+        platform_config, "discord", include_default_mcp_servers=False
+    )
+    m = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory"]},
+            "discord": _ch(["hermes-discord", "spotify", _MCP_A]),
+            "mcp_servers": {
+                _MCP_A: {"url": "https://example.com/a"},
+                _MCP_B: {"url": "https://example.com/b"},
+            },
+        },
+        "discord",
+        chat_id="100",
+    )
+    assert "spotify" in m and _MCP_A in m and _MCP_B not in m
+    d = _get_platform_tools(
+        {
+            "platform_toolsets": {"discord": ["memory"]},
+            "discord": _ch(["web", "terminal"]),
+            "agent": {"disabled_toolsets": ["terminal"]},
+        },
+        "discord",
+        chat_id="100",
+        include_default_mcp_servers=False,
+    )
+    assert "web" in d and "terminal" not in d
+
+
+def test_channel_no_match_and_no_ids_parity():
+    config = {
+        "platform_toolsets": {"discord": ["memory", "web"]},
+        "discord": _ch(["terminal"]),
+        "mcp_servers": {_MCP_A: {"url": "https://example.com/a"}},
+    }
+    assert _get_platform_tools(config, "discord", chat_id="999") == _get_platform_tools(
+        config, "discord"
+    )
+    without_bindings = {**config, "discord": {}}
+    assert _get_platform_tools(config, "discord") == _get_platform_tools(
+        without_bindings, "discord"
+    )
+    parent_only = _get_platform_tools(
+        config,
+        "discord",
+        chat_id="999",
+        parent_id="100",
+        include_default_mcp_servers=False,
+    )
+    assert "terminal" in parent_only and "memory" not in parent_only

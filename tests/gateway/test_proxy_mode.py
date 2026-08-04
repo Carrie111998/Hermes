@@ -295,3 +295,198 @@ class TestEnvVarRegistration:
         assert info["category"] == "messaging"
         assert info["password"] is False
 
+
+# channel_toolsets: local FG resolution + proxy fail-closed on match
+
+_SSE_OK = b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n'
+
+
+def _make_discord_source(chat_id="100", parent_chat_id=None):
+    return SessionSource(
+        platform=Platform.DISCORD,
+        chat_id=chat_id,
+        chat_name="test-channel",
+        chat_type="channel",
+        user_id="user-1",
+        user_name="tester",
+        parent_chat_id=parent_chat_id,
+    )
+
+
+class TestLocalForegroundSourceIds:
+    @pytest.mark.asyncio
+    async def test_run_agent_passes_source_ids_to_platform_tools(self, monkeypatch):
+        import sys
+        import threading
+        import types
+        from types import SimpleNamespace
+        import gateway.run as gateway_run
+
+        captured = {}
+        runtime = {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "test-key",
+        }
+
+        class _CapturingAgent:
+            def __init__(self, *a, **kw):
+                captured["enabled_toolsets"] = kw.get("enabled_toolsets")
+                self.tools = []
+                self.model = kw.get("model", "test-model")
+                self.provider = kw.get("provider", "test")
+                self.session_id = kw.get("session_id", "s1")
+                self.context_compressor = None
+                self.is_interrupted = False
+
+            def run_conversation(self, *a, **k):
+                return {
+                    "final_response": "ok",
+                    "messages": [],
+                    "api_calls": 1,
+                    "completed": True,
+                }
+
+            def shutdown_memory_provider(self, *a, **k):
+                pass
+
+            def close(self):
+                pass
+
+        fake = types.ModuleType("run_agent")
+        fake.AIAgent = _CapturingAgent
+        monkeypatch.setitem(sys.modules, "run_agent", fake)
+
+        def fake_gpt(config, platform, **kwargs):
+            captured.update(
+                platform=platform,
+                chat_id=kwargs.get("chat_id"),
+                parent_id=kwargs.get("parent_id"),
+            )
+            return {"web", "memory"}
+
+        runner = _make_runner()
+        for attr, val in {
+            "_ephemeral_system_prompt": "",
+            "_prefill_messages": [],
+            "_reasoning_config": None,
+            "_service_tier": None,
+            "_provider_routing": {},
+            "_fallback_model": None,
+            "_pending_model_notes": {},
+            "_session_db": None,
+            "_agent_cache_lock": threading.Lock(),
+            "hooks": SimpleNamespace(loaded_hooks=False),
+            "session_store": SimpleNamespace(
+                get_or_create_session=lambda source: SimpleNamespace(
+                    session_id="session-1"
+                ),
+                load_transcript=lambda session_id: [],
+            ),
+            "_get_or_create_gateway_honcho": lambda session_key: (None, None),
+            "_gateway_loop": None,
+        }.items():
+            setattr(runner, attr, val)
+
+        monkeypatch.delenv("GATEWAY_PROXY_URL", raising=False)
+        monkeypatch.setattr(gateway_run.GatewayRunner, "_get_proxy_url", lambda s: None)
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+        monkeypatch.setattr("hermes_cli.tools_config._get_platform_tools", fake_gpt)
+        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: runtime)
+        monkeypatch.setattr(
+            gateway_run, "_resolve_gateway_model", lambda config=None: "test-model"
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner, "_adapter_for_source", lambda s, src: None
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_resolve_session_agent_runtime",
+            lambda s, **kw: ("test-model", runtime),
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_resolve_session_reasoning_config",
+            lambda s, **kw: None,
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_resolve_session_service_tier",
+            lambda s, **kw: None,
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner,
+            "_resolve_turn_agent_config",
+            lambda s, msg, model, runtime: {
+                "model": model,
+                "runtime": runtime,
+                "request_overrides": None,
+            },
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner, "_refresh_fallback_model", lambda s: None
+        )
+        monkeypatch.setattr(
+            gateway_run.GatewayRunner, "_cleanup_agent_resources", lambda s, a: None
+        )
+
+        source = _make_discord_source(chat_id="100", parent_chat_id="parent-1")
+        result = await runner._run_agent(
+            message="hi",
+            context_prompt="",
+            history=[],
+            source=source,
+            session_id="session-1",
+            session_key="agent:main:discord:channel:100",
+        )
+        assert result["final_response"] == "ok"
+        assert captured == {
+            "platform": "discord",
+            "chat_id": "100",
+            "parent_id": "parent-1",
+            "enabled_toolsets": ["memory", "web"],
+        }
+
+
+class TestProxyChannelToolsets:
+    @pytest.mark.asyncio
+    async def test_unmatched_proxy_body_unchanged(self, monkeypatch):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        session = _FakeSession(_FakeSSEResponse(status=200, sse_chunks=[_SSE_OK]))
+        with patch("gateway.run._load_gateway_config", return_value={}), _patch_aiohttp(
+            session
+        ), patch("aiohttp.ClientTimeout"):
+            await _make_runner()._run_agent_via_proxy(
+                message="hello",
+                context_prompt="",
+                history=[],
+                source=_make_discord_source(chat_id="999"),
+                session_id="test",
+            )
+        assert "enabled_toolsets" not in session.captured_json
+        assert session.captured_json["model"] == "hermes-agent"
+        assert session.captured_json["stream"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("toolsets", [[], ["web"]])
+    async def test_matched_proxy_fails_closed_before_network(
+        self, monkeypatch, toolsets
+    ):
+        monkeypatch.setenv("GATEWAY_PROXY_URL", "http://host:8642")
+        monkeypatch.delenv("GATEWAY_PROXY_KEY", raising=False)
+        session = _FakeSession(_FakeSSEResponse(status=200, sse_chunks=[_SSE_OK]))
+        cfg = {"discord": {"channel_toolsets": [{"id": "100", "toolsets": toolsets}]}}
+        with patch("gateway.run._load_gateway_config", return_value=cfg), _patch_aiohttp(
+            session
+        ), patch("aiohttp.ClientTimeout"):
+            with pytest.raises(RuntimeError, match="channel_toolsets"):
+                await _make_runner()._run_agent_via_proxy(
+                    message="hello",
+                    context_prompt="",
+                    history=[],
+                    source=_make_discord_source(chat_id="100"),
+                    session_id="test",
+                )
+        assert session.captured_json is None

@@ -2220,13 +2220,63 @@ def _enable_recently_shipped_toolsets(
         enabled_toolsets.add(ts_key)
 
 
+def _resolve_channel_toolsets(
+    platform_block: dict,
+    chat_id: str | None,
+    parent_id: str | None = None,
+) -> Optional[List[str]]:
+    """Resolve ``channel_toolsets``: exact *chat_id*, else *parent_id*.
+
+    Returns the matched toolsets list (including ``[]``), or None if no match.
+    A matched id with missing/non-list toolsets or any non-string member fails
+    closed to ``[]`` and does not fall through to a parent binding. Numeric
+    binding ids still match string runtime ids.
+    """
+    bindings = (platform_block or {}).get("channel_toolsets")
+    if bindings is None:
+        return None
+    if not isinstance(bindings, list):
+        return []
+    if not bindings:
+        return None
+
+    # Exact fully before parent so order in the config list cannot invert
+    # precedence, and an invalid exact match cannot fall through to parent.
+    for target_id in (chat_id, parent_id):
+        if target_id is None or target_id == "":
+            continue
+        target = str(target_id)
+        for entry in bindings:
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("id", "")) != target:
+                continue
+            toolsets = entry.get("toolsets")
+            if not isinstance(toolsets, list) or not all(
+                isinstance(ts, str) for ts in toolsets
+            ):
+                return []
+            return list(toolsets)
+    return None
+
+
 def _get_platform_tools(
     config: dict,
     platform: str,
     *,
     include_default_mcp_servers: bool = True,
+    chat_id: str | None = None,
+    parent_id: str | None = None,
 ) -> Set[str]:
-    """Resolve which individual toolset names are enabled for a platform."""
+    """Resolve enabled toolset names for a platform.
+
+    Optional *chat_id* / *parent_id* select a ``channel_toolsets`` binding via
+    :func:`_resolve_channel_toolsets`. A match is a strict allowlist
+    (``[]`` = hard empty): no recently-shipped / x_search / default plugin /
+    context_engine / default MCP injection, and only selected composites
+    recover non-configurable members. No match leaves platform behavior
+    unchanged.
+    """
     from toolsets import resolve_toolset, TOOLSETS
 
     platform_toolsets = config.get("platform_toolsets") or {}
@@ -2236,6 +2286,20 @@ def _get_platform_tools(
     # ``hermes-discord``) is an opt-in to the platform's native default-off
     # toolsets — see _exempt_explicit_platform_native (#35527).
     explicitly_configured = isinstance(toolset_names, list)
+    # Strict channel match: list fully replaces platform_toolsets and
+    # suppresses auto-injection. Empty match still takes the common tail.
+    strict_channel = False
+
+    if chat_id is not None or parent_id is not None:
+        platform_block = config.get(platform) or {}
+        if isinstance(platform_block, dict):
+            channel_override = _resolve_channel_toolsets(
+                platform_block, chat_id, parent_id
+            )
+            if channel_override is not None:
+                toolset_names = channel_override
+                explicitly_configured = True
+                strict_channel = True
 
     if toolset_names is None or not isinstance(toolset_names, list):
         plat_info = PLATFORMS.get(platform)
@@ -2306,7 +2370,9 @@ def _get_platform_tools(
 
             enabled_toolsets |= expanded
 
-        _enable_recently_shipped_toolsets(enabled_toolsets, config, platform)
+        # Strict channel: no recently-shipped back-fill beyond composite expansion.
+        if not strict_channel:
+            _enable_recently_shipped_toolsets(enabled_toolsets, config, platform)
     else:
         # No explicit config — fall back to resolving composite toolset names
         # (e.g. "hermes-cli") to individual tool names and reverse-mapping.
@@ -2336,9 +2402,11 @@ def _get_platform_tools(
         # below: once you have working creds, you don't have to also click
         # through ``hermes tools`` to flip the toolset on. Only fires when
         # the user has not yet saved an explicit toolset list — once they
-        # do, the saved list is authoritative.
+        # do, the saved list is authoritative. Strict channel match never
+        # auto-injects: the channel list is an allowlist.
         x_search_auto_enabled = (
-            _toolset_allowed_for_platform("x_search", platform)
+            not strict_channel
+            and _toolset_allowed_for_platform("x_search", platform)
             and _xai_credentials_present()
         )
         if x_search_auto_enabled:
@@ -2377,9 +2445,19 @@ def _get_platform_tools(
     # checklist or in a user-saved config.  Must run in BOTH branches —
     # otherwise saving via `hermes tools` (which flips has_explicit_config
     # to True) silently drops them.
+    #
+    # Strict channel: recover only non-configurable members of *selected*
+    # composites (not the full platform default universe), so a narrow
+    # ``[web]`` channel list cannot leak ``kanban`` via platform recovery.
     _plat_info = PLATFORMS.get(platform)
     _default_ts = _plat_info["default_toolset"] if _plat_info else f"hermes-{platform}"
-    platform_tool_universe = set(resolve_toolset(_default_ts))
+    if strict_channel:
+        platform_tool_universe: Set[str] = set()
+        for ts_name in toolset_names:
+            if ts_name in TOOLSETS:
+                platform_tool_universe.update(resolve_toolset(ts_name))
+    else:
+        platform_tool_universe = set(resolve_toolset(_default_ts))
     configurable_tool_universe = set()
     for ck in configurable_keys:
         configurable_tool_universe.update(resolve_toolset(ck))
@@ -2417,6 +2495,7 @@ def _get_platform_tools(
     # A plugin toolset is "known" for a platform once `hermes tools`
     # has been saved for that platform (tracked via known_plugin_toolsets).
     # Unknown plugins default to enabled; known-but-absent = disabled.
+    # Strict channel: only plugins explicitly listed in the channel list.
     if plugin_ts_keys:
         known_map = config.get("known_plugin_toolsets", {}) or {}
         known_for_platform = set(known_map.get(platform, []) or [])
@@ -2424,6 +2503,8 @@ def _get_platform_tools(
             if pts in toolset_names:
                 # Explicitly listed in config — enabled
                 enabled_toolsets.add(pts)
+            elif strict_channel:
+                continue
             elif pts in _DEFAULT_OFF_TOOLSETS:
                 # Opt-in plugin toolset — stay off until user picks it
                 continue
@@ -2438,6 +2519,7 @@ def _get_platform_tools(
     # saves an explicit platform toolset list. Preserve the explicit empty-list
     # contract: selecting no configurable tools means no context-engine tools
     # either unless the user adds ``context_engine`` manually later.
+    # Strict channel: no automatic context_engine — list it explicitly if needed.
     context_cfg = config.get("context") or {}
     if not isinstance(context_cfg, dict):
         context_cfg = {}
@@ -2447,7 +2529,12 @@ def _get_platform_tools(
         and isinstance(platform_toolsets.get(platform), list)
         and not toolset_names
     )
-    if context_engine_name and context_engine_name != "compressor" and not explicit_empty_selection:
+    if (
+        not strict_channel
+        and context_engine_name
+        and context_engine_name != "compressor"
+        and not explicit_empty_selection
+    ):
         enabled_toolsets.add("context_engine")
 
     # Preserve any explicit non-configurable toolset entries (for example,
@@ -2464,6 +2551,7 @@ def _get_platform_tools(
     # If the platform explicitly lists one or more MCP server names, treat that
     # as an allowlist. Otherwise include every globally enabled MCP server.
     # Special sentinel: "no_mcp" in the toolset list disables all MCP servers.
+    # Strict channel: never auto-include default MCP servers — only explicit.
     enabled_mcp_servers = enabled_mcp_server_names(config)
     # Allow "no_mcp" sentinel to opt out of all MCP servers for this platform
     if "no_mcp" in toolset_names:
@@ -2472,7 +2560,7 @@ def _get_platform_tools(
     else:
         explicit_mcp_servers = explicit_passthrough & enabled_mcp_servers
         enabled_toolsets.update(explicit_passthrough - enabled_mcp_servers)
-    if include_default_mcp_servers:
+    if include_default_mcp_servers and not strict_channel:
         if explicit_mcp_servers or "no_mcp" in toolset_names:
             enabled_toolsets.update(explicit_mcp_servers)
         else:

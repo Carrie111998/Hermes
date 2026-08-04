@@ -19262,7 +19262,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = sorted(
+                _get_platform_tools(
+                    user_config,
+                    platform_key,
+                    chat_id=source.chat_id,
+                    parent_id=source.parent_chat_id,
+                )
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -23674,6 +23681,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         platform_key = _platform_config_key(source.platform)
         user_config = _load_gateway_config()
+        # Fail closed before any proxy/network I/O when a local channel
+        # binding matches: older/unknown remotes cannot enforce it safely.
+        from hermes_cli.tools_config import _resolve_channel_toolsets
+        platform_block = (
+            user_config.get(platform_key) if isinstance(user_config, dict) else None
+        )
+        if not isinstance(platform_block, dict):
+            platform_block = {}
+        if _resolve_channel_toolsets(
+            platform_block,
+            source.chat_id,
+            source.parent_chat_id,
+        ) is not None:
+            raise RuntimeError(
+                "channel_toolsets cannot safely be enforced through an "
+                "older/unknown gateway proxy"
+            )
+
         from gateway.display_config import resolve_display_setting
         _plat_streaming = resolve_display_setting(
             user_config, platform_key, "streaming"
@@ -24060,7 +24085,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = sorted(
+            _get_platform_tools(
+                user_config,
+                platform_key,
+                chat_id=source.chat_id,
+                parent_id=source.parent_chat_id,
+            )
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

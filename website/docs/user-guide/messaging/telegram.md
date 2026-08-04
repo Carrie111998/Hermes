@@ -1246,6 +1246,21 @@ Keys are chat IDs (groups/supergroups) or forum topic IDs. For forum groups, top
 
 Numeric YAML keys are automatically normalized to strings.
 
+## Per-Chat Toolsets
+
+Assign a strict tool and MCP-server allowlist to a Telegram chat:
+
+```yaml
+telegram:
+  channel_toolsets:
+    - id: "-1001234567890"
+      toolsets: [hermes-telegram, research-mcp]
+    - id: "-1009876543210"
+      toolsets: []  # hard no-tools gate
+```
+
+Unmapped chats retain `platform_toolsets.telegram`. A matched list does not inherit unlisted MCP servers, plugins, context-engine tools, or newly shipped toolsets; include `hermes-telegram` when normal Telegram tools should remain available. Numeric IDs are normalized to strings. The value must be a list; malformed values and matched rules in gateway proxy mode fail closed.
+
 ## Troubleshooting
 
 | Problem | Solution |

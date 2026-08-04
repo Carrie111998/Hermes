@@ -1902,6 +1902,7 @@ DEFAULT_CONFIG = {
         # If True, require @mention in Slack thread replies too.
         "thread_require_mention": False,
         "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "channel_toolsets": [],        # Strict per-channel toolset/MCP allowlists
     },
 
     # Discord platform settings (gateway mode)
@@ -1931,6 +1932,7 @@ DEFAULT_CONFIG = {
         "websocket_heartbeat_ack_max_age_seconds": 60,
         "websocket_max_latency_seconds": 30,
         "channel_prompts": {},         # Per-channel ephemeral system prompts (forum parents apply to child threads)
+        "channel_toolsets": [],        # Strict per-channel toolset/MCP allowlists (forum parents apply to child threads)
         # Opt-in DM role-based auth (#12136). By default, DISCORD_ALLOWED_ROLES
         # authorizes only guild messages in the role's own guild — DMs require
         # DISCORD_ALLOWED_USERS. Set dm_role_auth_guild to a guild ID to also
@@ -2004,6 +2006,7 @@ DEFAULT_CONFIG = {
     "telegram": {
         "reactions": False,            # Add 👀/✅/❌ reactions to messages during processing
         "channel_prompts": {},         # Per-chat/topic ephemeral system prompts (topics inherit from parent group)
+        "channel_toolsets": [],        # Strict per-chat toolset/MCP allowlists
         "allowed_chats": "",           # If set, bot ONLY responds in these group/supergroup chat IDs (whitelist)
         "extra": {
             "rich_messages": False,     # Bot API 10.1 rich messages (tables/task lists/details/math) render natively; set True to opt in. Default stays legacy MarkdownV2 because rich messages can be hard to copy as plain text in Telegram clients.
@@ -2017,6 +2020,7 @@ DEFAULT_CONFIG = {
         "free_response_channels": "",  # Comma-separated channel IDs where bot responds without mention
         "allowed_channels": "",        # If set, bot ONLY responds in these channel IDs (whitelist)
         "channel_prompts": {},         # Per-channel ephemeral system prompts
+        "channel_toolsets": [],        # Strict per-channel toolset/MCP allowlists
     },
 
     # Matrix platform settings (gateway mode)

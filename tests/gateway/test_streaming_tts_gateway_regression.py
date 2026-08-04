@@ -117,7 +117,11 @@ def _setup_monkeypatches(monkeypatch, tmp_path):
     )
 
     import hermes_cli.tools_config as tools_config
-    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+    monkeypatch.setattr(
+        tools_config,
+        "_get_platform_tools",
+        lambda user_config, platform_key, **kwargs: {"core"},
+    )
 
 
 def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
@@ -153,5 +157,4 @@ def test_run_agent_voice_turn_no_name_error(monkeypatch, tmp_path):
 
     result = asyncio.new_event_loop().run_until_complete(_run())
     assert result["final_response"] == "Hello from the agent."
-
 
