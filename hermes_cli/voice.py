@@ -918,10 +918,12 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
     """Synthesize ``text`` with the configured TTS provider and play it.
 
     Mirrors cli.py:_voice_speak_response exactly — same markdown strip
-    pipeline, same 4000-char cap, same explicit mp3 output path, same
+    pipeline, same explicit mp3 output path, same
     MP3-over-OGG playback choice (afplay misbehaves on OGG), same cleanup
     of both extensions. Keeping these in sync means a voice-mode TTS
     session in the TUI sounds identical to one in the classic CLI.
+    Long replies are not pre-capped: the provider layer splits over-cap
+    text into chunks and concatenates the audio (#53587 / #17973).
 
     While playback is in flight the module-level _tts_playing Event is
     cleared so the continuous-recording loop knows to wait before
@@ -958,30 +960,17 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
     try:
         from tools.tts_tool import text_to_speech_tool
 
-        # One dispatcher, zero parallel streaming implementations (#58930):
-        # when the configured provider has a chunked streamer registered in
-        # tools.tts_streaming, route the whole reply through the same
-        # stream_tts_to_speaker pipeline the CLI voice mode uses — audio
-        # starts on sentence one instead of after full synthesis. Falls
-        # through to the legacy whole-file path when no streamer resolves.
-        try:
-            from tools.tts_streaming import resolve_streaming_provider
-            from tools.tts_tool import _load_tts_config
-
-            if resolve_streaming_provider(_load_tts_config()) is not None:
-                if _speak_text_streaming(text, stop_event):
-                    return
-        except Exception as e:
-            _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
-
         # Shared cleaner (tools/tts_text_normalize): markdown, emoji,
         # <think> blocks, verifier footer, units, newline flattening.
+        # Length is NOT pre-capped here: the provider layer splits long
+        # text into chunks and concatenates the audio, so the whole reply
+        # is always spoken (#53587 / #17973).
         try:
             from tools.tts_text_normalize import prepare_spoken_text
-            tts_text = prepare_spoken_text(text, max_chars=4000)
+            tts_text = prepare_spoken_text(text, max_chars=None)
         except Exception:
             # Legacy fallback pipeline — keep speak_text best-effort.
-            tts_text = text[:4000] if len(text) > 4000 else text
+            tts_text = text
             tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)             # fenced code blocks
             tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)    # [text](url) → text
             tts_text = re.sub(r'https?://\S+', '', tts_text)                # bare URLs
@@ -995,6 +984,22 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
             tts_text = tts_text.strip()
         if not tts_text:
             return
+
+        # One dispatcher, zero parallel streaming implementations (#58930):
+        # when the configured provider has a chunked streamer registered in
+        # tools.tts_streaming, route the whole reply through the same
+        # stream_tts_to_speaker pipeline the CLI voice mode uses — audio
+        # starts on sentence one instead of after full synthesis. Falls
+        # through to the legacy whole-file path when no streamer resolves.
+        try:
+            from tools.tts_streaming import resolve_streaming_provider
+            from tools.tts_tool import _load_tts_config
+
+            if resolve_streaming_provider(_load_tts_config()) is not None:
+                if _speak_text_streaming(tts_text, stop_event):
+                    return
+        except Exception as e:
+            _debug(f"speak_text: streaming dispatch unavailable ({e}); using sync path")
 
         # MP3 output path, pre-chosen so we can play the MP3 directly even
         # when text_to_speech_tool auto-converts to OGG for messaging

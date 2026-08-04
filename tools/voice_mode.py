@@ -1490,6 +1490,36 @@ _active_playback: Optional[subprocess.Popen] = None
 _playback_lock = threading.Lock()
 
 
+def _audio_file_duration_seconds(file_path: str) -> Optional[float]:
+    """Return media duration via ffprobe, or None when unavailable.
+
+    Used to scale the ffplay wait to the actual content: a fixed 300s cap
+    killed playback of long TTS files mid-stream (#53587).
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            return None
+        return float(result.stdout.strip())
+    except (ValueError, OSError, subprocess.TimeoutExpired):
+        return None
+
+
 def stop_playback() -> None:
     """Interrupt the currently playing audio (if any)."""
     global _active_playback
@@ -1705,7 +1735,12 @@ def _play_audio_file_impl(file_path: str) -> bool:
                 )
                 with _playback_lock:
                     _active_playback = proc
-                proc.wait(timeout=300)
+                # Scale the wait to the actual content: a flat 300s cap killed
+                # ffplay mid-file for long TTS. Probe the duration and add
+                # slack; fall back to 1h when probing fails (#53587).
+                duration = _audio_file_duration_seconds(file_path)
+                wait_timeout = (duration + 30.0) if duration else 3600.0
+                proc.wait(timeout=wait_timeout)
                 rc = proc.returncode
                 with _playback_lock:
                     _active_playback = None

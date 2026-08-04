@@ -12473,12 +12473,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             # Strip markdown and non-speech content for cleaner TTS via the
             # shared cleaner (tools/tts_text_normalize): markdown, emoji,
             # <think> blocks, verifier footer, units, newline flattening.
+            # Length is NOT pre-capped here: the provider layer splits long
+            # text into chunks and concatenates the audio, so the whole
+            # reply is always spoken (#53587 / #17973).
             try:
                 from tools.tts_text_normalize import prepare_spoken_text
-                tts_text = prepare_spoken_text(text, max_chars=4000)
+                tts_text = prepare_spoken_text(text, max_chars=None)
             except Exception:
                 # Legacy fallback pipeline — keep voice replies best-effort.
-                tts_text = text[:4000] if len(text) > 4000 else text
+                tts_text = text
                 tts_text = re.sub(r'```[\s\S]*?```', ' ', tts_text)   # fenced code blocks
                 tts_text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', tts_text)  # [text](url) -> text
                 tts_text = re.sub(r'https?://\S+', '', tts_text)      # URLs

@@ -53,7 +53,7 @@ import uuid
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Dict, Any, Iterator, Optional
+from typing import Callable, Dict, Any, Iterator, List, Optional
 from urllib.parse import urljoin, urlparse
 
 from hermes_cli._subprocess_compat import windows_hide_flags
@@ -461,6 +461,75 @@ def _resolve_max_text_length(
             return DEFAULT_COMMAND_TTS_MAX_TEXT_LENGTH
 
     return FALLBACK_MAX_TEXT_LENGTH
+
+
+def _split_oversized_sentence(sentence: str, max_chars: int) -> List[str]:
+    """Split one over-limit sentence on word boundaries, then hard boundaries.
+
+    A single word longer than *max_chars* is hard-sliced so no content is
+    ever dropped (a 20000-char run-on token must still be spoken in full).
+    """
+    words = sentence.split()
+    chunks: List[str] = []
+    current = ""
+    for word in words:
+        if len(word) > max_chars:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.extend(word[i:i + max_chars] for i in range(0, len(word), max_chars))
+            continue
+        candidate = f"{current} {word}".strip()
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = word
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def _split_text_for_tts(text: str, max_chars: int) -> List[str]:
+    """Split *text* into provider-safe chunks without dropping content.
+
+    Sentence-boundary aware (``.``/``!``/``?``/``;``/``:`` + whitespace), so
+    each chunk is a natural prosodic unit; oversized single sentences are
+    further split on word boundaries; oversized single words are hard-sliced.
+    Joining the chunks with spaces reproduces the normalized input exactly.
+    """
+    if max_chars <= 0:
+        max_chars = FALLBACK_MAX_TEXT_LENGTH
+    normalized = " ".join((text or "").split())
+    if not normalized:
+        return []
+    if len(normalized) <= max_chars:
+        return [normalized]
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?;:,])\s+", normalized)
+        if sentence.strip()
+    ]
+    expanded: List[str] = []
+    for sentence in sentences:
+        if len(sentence) <= max_chars:
+            expanded.append(sentence)
+        else:
+            expanded.extend(_split_oversized_sentence(sentence, max_chars))
+
+    chunks: List[str] = []
+    current = ""
+    for sentence in expanded:
+        candidate = f"{current} {sentence}".strip()
+        if current and len(candidate) > max_chars:
+            chunks.append(current)
+            current = sentence
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
 
 
 # ===========================================================================
@@ -2777,6 +2846,185 @@ def _generate_kittentts(text: str, output_path: str, tts_config: Dict[str, Any])
 
 
 # ===========================================================================
+# Long-form audio concatenation (salvaged from PR #17973, authored by @TKCen)
+# ===========================================================================
+def _concat_audio_files(
+    audio_paths: List[str],
+    output_path: str,
+    *,
+    voice_compatible: bool = False,
+) -> Optional[str]:
+    """Combine independently encoded chunks with ffmpeg.
+
+    OGG/Opus is always decoded and re-encoded, even when a custom provider did
+    not opt in to voice-message presentation. Matching MP3 chunks preserve their
+    encoded frames. A failed or unavailable combine returns ``None`` so callers
+    can preserve the original, individually valid files. Structured audio
+    containers are never byte-joined.
+    """
+    if not audio_paths:
+        raise ValueError("No audio chunks to combine")
+    if len(audio_paths) == 1:
+        source = audio_paths[0]
+        if os.path.abspath(source) != os.path.abspath(output_path):
+            shutil.copyfile(source, output_path)
+        return output_path
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        return None
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    concat_path = destination.with_name(f".{destination.name}.{uuid.uuid4().hex}.concat.txt")
+    temp_output = destination.with_name(
+        f".{destination.stem}.{uuid.uuid4().hex}.combining{destination.suffix}"
+    )
+    try:
+        with concat_path.open("w", encoding="utf-8") as concat_file:
+            for path in audio_paths:
+                concat_file.write(f"file {shlex.quote(os.path.abspath(path))}\n")
+
+        command = [
+            ffmpeg,
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            str(concat_path),
+            "-vn",
+        ]
+        suffix = destination.suffix.lower()
+        if voice_compatible or suffix in {".ogg", ".opus"}:
+            command.extend([
+                "-c:a", "libopus", "-ac", "1", "-b:a", "64k", "-vbr", "off",
+            ])
+        elif suffix == ".mp3" and all(
+            Path(path).suffix.lower() == ".mp3" for path in audio_paths
+        ):
+            # Matching MP3 provider chunks already share one output codec/config.
+            # Preserve those encoded frames instead of imposing a second lossy pass.
+            command.extend(["-c:a", "copy"])
+        command.append(str(temp_output))
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            timeout=120,
+            stdin=subprocess.DEVNULL,
+            creationflags=windows_hide_flags(),
+        )
+        if (
+            result.returncode == 0
+            and temp_output.exists()
+            and temp_output.stat().st_size > 0
+        ):
+            os.replace(temp_output, destination)
+            return str(destination)
+        logger.warning(
+            "ffmpeg audio combine failed: %s",
+            result.stderr.decode("utf-8", errors="ignore")[:500],
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        logger.warning("ffmpeg audio combine failed: %s", exc)
+    finally:
+        for path in (concat_path, temp_output):
+            try:
+                path.unlink()
+            except OSError:
+                pass
+    return None
+
+
+def _text_to_speech_chunked(
+    chunks: List[str],
+    output_path: Optional[str],
+    speed: Optional[float],
+    instructions: Optional[str],
+    provider: Optional[str],
+) -> str:
+    """Synthesize each provider-safe chunk and concatenate into one file.
+
+    Chunk 0 targets the real destination (or the default path), so the
+    returned ``file_path`` is the path callers already expect; later chunks
+    go to sibling temp files that are cleaned up after concatenation. A
+    failed combine (no ffmpeg, or a transient ffmpeg error) degrades to the
+    first chunk only, with a warning — never worse than the legacy
+    truncation behavior, and never silently dropping the tail when ffmpeg
+    is available.
+    """
+    import json as _json
+
+    first_raw = text_to_speech_tool(
+        chunks[0], output_path, speed=speed, instructions=instructions, provider=provider,
+    )
+    try:
+        first = _json.loads(first_raw)
+    except (TypeError, _json.JSONDecodeError):
+        return first_raw
+    if not first.get("success"):
+        return first_raw
+    final_path = str(first.get("file_path") or "")
+    if not final_path or not os.path.isfile(final_path) or os.path.getsize(final_path) == 0:
+        return first_raw
+
+    base = Path(final_path)
+    chunk_files: List[str] = [final_path]
+    temp_paths: List[str] = []
+    try:
+        for index, chunk in enumerate(chunks[1:], start=2):
+            tmp = str(base.with_name(f".{base.stem}.chunk{index}{base.suffix}"))
+            temp_paths.append(tmp)
+            raw = text_to_speech_tool(
+                chunk, tmp, speed=speed, instructions=instructions, provider=provider,
+            )
+            try:
+                result = _json.loads(raw)
+            except (TypeError, _json.JSONDecodeError):
+                result = {}
+            if not result.get("success"):
+                return raw
+            actual = str(result.get("file_path") or tmp)
+            if os.path.isfile(actual) and os.path.getsize(actual) > 0:
+                chunk_files.append(actual)
+            else:
+                temp_paths.append(actual)
+
+        combined = _concat_audio_files(
+            chunk_files, final_path,
+            voice_compatible=bool(first.get("voice_compatible")),
+        )
+        if combined is None:
+            logger.warning(
+                "TTS chunk combine failed; returning first chunk only "
+                "(%d of %d chunks) — install ffmpeg for long-form speech",
+                len(chunks[0]), sum(len(c) for c in chunks),
+            )
+            return first_raw
+        first["file_path"] = combined
+        first["media_tag"] = f"MEDIA:{combined}"
+        if first.get("voice_compatible"):
+            first["media_tag"] = f"[[audio_as_voice]]\n{first['media_tag']}"
+        first["chunk_count"] = len(chunks)
+        logger.info(
+            "TTS long-form audio saved: %s (%d chunks, provider: %s)",
+            combined, len(chunks), first.get("provider"),
+        )
+        return _json.dumps(first, ensure_ascii=False)
+    finally:
+        for tmp in temp_paths:
+            try:
+                if os.path.abspath(tmp) != os.path.abspath(final_path) and os.path.isfile(tmp):
+                    os.unlink(tmp)
+            except OSError:
+                pass
+
+
+# ===========================================================================
 # Main tool function
 # ===========================================================================
 def text_to_speech_tool(
@@ -2848,12 +3096,23 @@ def text_to_speech_tool(
     # OpenAI handler.
     command_provider_config = _resolve_command_provider_config(provider, tts_config)
 
-    # Truncate very long text with a warning. The cap is per-provider
-    # (OpenAI 4096, xAI 15k, MiniMax 10k, ElevenLabs model-aware, etc.).
+    # Split very long text into provider-safe chunks instead of truncating it.
+    # The per-request cap is per-provider (OpenAI 4096, xAI 15k, MiniMax 10k,
+    # ElevenLabs model-aware, etc.); every chunk is synthesized and the audio
+    # concatenated, so the full reply is always spoken (#17973, #53587).
     max_len = _resolve_max_text_length(provider, tts_config)
     if len(text) > max_len:
+        chunks = _split_text_for_tts(text, max_len)
+        if len(chunks) > 1:
+            logger.info(
+                "TTS text for provider %s split into %d chunks (input=%d chars, cap=%d)",
+                provider, len(chunks), len(text), max_len,
+            )
+            return _text_to_speech_chunked(
+                chunks, output_path, speed, instructions, provider,
+            )
         logger.warning(
-            "TTS text too long for provider %s (%d chars), truncating to %d",
+            "TTS text too long for provider %s (%d chars) and not splittable, truncating to %d",
             provider, len(text), max_len,
         )
         text = text[:max_len]
@@ -3745,9 +4004,14 @@ def stream_tts_to_speaker(
             if sync_pipeline is not None:
                 sync_pipeline.speak(cleaned)
                 return
-            # Truncate very long sentences to the provider's per-request cap.
+            # Split very long sentences at the provider's per-request cap
+            # instead of truncating them — the full sentence must be spoken
+            # (#17973). Each part gets its own prefetch slot, so playback
+            # stays gapless without ever dropping the tail.
             if stream_max_len and len(cleaned) > stream_max_len:
-                cleaned = cleaned[:stream_max_len]
+                for part in _split_text_for_tts(cleaned, stream_max_len):
+                    _enqueue_audio(part)
+                return
             # Every sentence gets its own prefetch thread — the HTTP request
             # fires the moment the sentence boundary is detected, so audio for
             # sentence N+1 is already buffering while sentence N plays.
@@ -3915,7 +4179,7 @@ TTS_SCHEMA = {
         "properties": {
             "text": {
                 "type": "string",
-                "description": "The text to convert to speech. Provider-specific character caps apply and are enforced automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); over-long input is truncated."
+                "description": "The text to convert to speech. Provider-specific per-request character caps apply and are enforced automatically (OpenAI 4096, xAI 15000, MiniMax 10000, ElevenLabs 5k-40k depending on model); longer input is split into ordered chunks and the audio concatenated, so the full reply is always spoken."
             },
             "output_path": {
                 "type": "string",

@@ -11,6 +11,7 @@ import queue
 import tempfile
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -638,6 +639,45 @@ def test_hybrid_single_sentence_still_works(monkeypatch):
     assert done.is_set()
 
 
+def test_hybrid_oversized_sentence_split_not_truncated(monkeypatch):
+    """A sentence over the provider cap must be split, not truncated (#17973)."""
+    from tools import tts_tool
+
+    stream_calls: list[str] = []
+
+    class _Tracking(ts.StreamingTTSProvider):
+        sample_rate = 24000
+
+        @staticmethod
+        def available():
+            return True
+
+        def stream(self, text):
+            stream_calls.append(text)
+            yield b"\x00\x00" * 10
+
+    monkeypatch.setattr(tts_tool, "_resolve_max_text_length", lambda *a, **k: 40)
+
+    sd, out = _sd_mock()
+    # One long run-on sentence (no sentence boundaries inside).
+    q = _drain_queue(["X" * 200])
+    stop, done = threading.Event(), threading.Event()
+
+    with patch("tools.tts_streaming.resolve_streaming_provider",
+               return_value=_Tracking({}, {})), \
+         patch.object(tts_tool, "_import_sounddevice", return_value=sd), \
+         patch("platform.system", return_value="Linux"):
+        tts_tool.stream_tts_to_speaker(q, stop, done)
+
+    assert done.is_set()
+    assert len(stream_calls) >= 2, (
+        f"oversized sentence should be split into multiple stream() calls, got {stream_calls}"
+    )
+    # Every part must fit the provider cap and the whole text must be spoken.
+    assert all(len(part) <= 40 for part in stream_calls), stream_calls
+    assert "".join(stream_calls) == "X" * 200
+
+
 def test_hybrid_playback_serialized_no_overlap(monkeypatch):
     """Multiple batch flushes must not overlap on the output stream.
 
@@ -915,3 +955,197 @@ def test_sync_pipeline_cleans_temp_files(monkeypatch):
     assert created, "expected temp files to be created via mkstemp"
     leftovers = [p for p in created if os.path.exists(p)]
     assert not leftovers, f"temp files not cleaned: {leftovers}"
+
+
+# ── Long-form splitting & truncation class (#53587 / #17973) ─────────────
+
+
+def test_split_text_for_tts_preserves_normalized_text_under_request_cap():
+    """Splitting must never drop content: chunks rejoin to the input."""
+    from tools.tts_tool import _split_text_for_tts
+
+    text = (
+        "First sentence has useful shape. Second sentence stays intact. "
+        "A third one rounds out the paragraph nicely for testing purposes."
+    )
+    chunks = _split_text_for_tts(text, max_chars=48)
+
+    assert len(chunks) > 1
+    assert all(len(c) <= 48 for c in chunks)
+    assert " ".join(chunks) == " ".join(text.split())
+
+
+def test_split_text_for_tts_short_text_is_single_chunk():
+    from tools.tts_tool import _split_text_for_tts
+
+    assert _split_text_for_tts("Short.", max_chars=4000) == ["Short."]
+    assert _split_text_for_tts("", max_chars=4000) == []
+
+
+def test_split_text_for_tts_hard_slices_runaway_word():
+    """A 20000-char run-on token must still be spoken in full, not dropped."""
+    from tools.tts_tool import _split_text_for_tts
+
+    text = "X" * 20000
+    chunks = _split_text_for_tts(text, max_chars=5000)
+    assert len(chunks) == 4
+    assert all(len(c) <= 5000 for c in chunks)
+    assert "".join(chunks) == text
+
+
+def test_text_to_speech_tool_splits_long_text_and_concatenates(
+    tmp_path, monkeypatch,
+):
+    """text_to_speech_tool must split over-cap text and combine the audio."""
+    import json as _json
+    from tools import tts_tool
+
+    captured_text = []
+    chunk_files = []
+
+    def fake_openai(t, out, cfg, **_kw):
+        captured_text.append(t)
+        Path(out).write_bytes(b"\x00" * 10)
+        chunk_files.append(str(out))
+        return out
+
+    def fake_concat(paths, output_path, *, voice_compatible=False):
+        Path(output_path).write_bytes(b"".join(Path(p).read_bytes() for p in paths))
+        return output_path
+
+    monkeypatch.setattr(tts_tool, "_generate_openai_tts", fake_openai)
+    monkeypatch.setattr(tts_tool, "_concat_audio_files", fake_concat)
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "openai"})
+
+    text = "A" * 5000  # over OpenAI's 4096 cap
+    out = str(tmp_path / "out.mp3")
+    result = _json.loads(tts_tool.text_to_speech_tool(text=text, output_path=out))
+
+    assert result["success"] is True
+    assert len(captured_text) == 2
+    assert [len(c) for c in captured_text] == [4096, 904]
+    assert "".join(captured_text) == text
+    assert result.get("chunk_count") == 2
+    assert Path(result["file_path"]).exists()
+    # Temp chunk files must be cleaned up; only the final file remains.
+    assert [p for p in chunk_files if os.path.exists(p) and p != result["file_path"]] == []
+
+
+def test_text_to_speech_tool_short_text_single_chunk(tmp_path, monkeypatch):
+    import json as _json
+    from tools import tts_tool
+
+    captured_text = []
+
+    def fake_openai(t, out, cfg, **_kw):
+        captured_text.append(t)
+        Path(out).write_bytes(b"\x00")
+        return out
+
+    monkeypatch.setattr(tts_tool, "_generate_openai_tts", fake_openai)
+    monkeypatch.setattr(tts_tool, "_load_tts_config", lambda: {"provider": "openai"})
+
+    out = str(tmp_path / "out.mp3")
+    result = _json.loads(tts_tool.text_to_speech_tool(text="Hi there.", output_path=out))
+    assert result["success"] is True
+    assert captured_text == ["Hi there."]
+    assert "chunk_count" not in result
+
+
+@pytest.mark.real_audio_playback
+def test_speak_text_no_longer_precaps_at_4000(monkeypatch):
+    """speak_text must pass the full reply to the provider layer (#53587)."""
+    from hermes_cli import voice as voice_mod
+
+    sent = {}
+
+    def fake_tts(text, output_path=None, **kw):
+        sent["text"] = text
+        Path(output_path).write_bytes(b"\x00")
+        return '{"success": true, "file_path": "' + str(output_path) + '"}'
+
+    monkeypatch.setattr("tools.tts_tool.text_to_speech_tool", fake_tts)
+    # No streaming provider configured → the sync path is exercised.
+    monkeypatch.setattr(
+        "tools.tts_streaming.resolve_streaming_provider", lambda _cfg: None,
+    )
+    monkeypatch.setattr("tools.voice_mode.play_audio_file", lambda _p: True)
+    monkeypatch.setattr(voice_mod.os.path, "isfile", lambda _p: True)
+    monkeypatch.setattr(voice_mod.os.path, "getsize", lambda _p: 1024)
+    monkeypatch.setattr(voice_mod.os, "makedirs", lambda *a, **k: None)
+
+    voice_mod.speak_text("B" * 5000)
+    assert len(sent.get("text", "")) == 5000
+
+
+def test_ffplay_wait_scales_to_file_duration(monkeypatch):
+    """play_audio_file must scale the ffplay wait to the actual content."""
+    from tools import voice_mode
+
+    waits = []
+
+    class _FakeProc:
+        returncode = 0
+
+        def wait(self, timeout=None):
+            waits.append(timeout)
+            return 0
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(voice_mode, "_audio_file_duration_seconds", lambda _p: 120.0)
+    monkeypatch.setattr(voice_mode.shutil, "which", lambda name: "/usr/bin/ffplay")
+    monkeypatch.setattr(voice_mode.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(voice_mode.subprocess, "Popen", lambda *a, **k: _FakeProc())
+    monkeypatch.setattr(voice_mode.os.path, "isfile", lambda _p: True)
+    monkeypatch.setattr(voice_mode, "_is_wsl2_env", lambda: False)
+    monkeypatch.setattr(
+        "tools.environments.local.hermes_subprocess_env",
+        lambda **k: {"PATH": "/usr/bin"},
+    )
+
+    assert voice_mode.play_audio_file("/tmp/audio.mp3") is True
+    assert waits and waits[0] == 150.0  # duration + 30s slack
+
+
+def test_xai_websocket_uses_additional_headers(monkeypatch):
+    """websockets v15 renamed extra_headers → additional_headers (#75201)."""
+    import sys
+    import types
+
+    captured = {}
+
+    class _FakeWs:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def send(self, _msg):
+            pass
+
+        async def recv(self):
+            return "done"
+
+    def fake_connect(url, **kwargs):
+        captured["kwargs"] = kwargs
+        return _FakeWs()
+
+    fake_ws_mod = types.ModuleType("websockets")
+    fake_ws_mod.connect = fake_connect
+    monkeypatch.setitem(sys.modules, "websockets", fake_ws_mod)
+
+    fake_http = types.ModuleType("tools.xai_http")
+    fake_http.resolve_xai_http_credentials = lambda: {"api_key": "xai-key"}
+    monkeypatch.setitem(sys.modules, "tools.xai_http", fake_http)
+
+    streamer = ts.XAIStreamer({}, {})
+    frames = list(streamer.stream("Hello world"))
+    assert frames == []
+    assert "additional_headers" in captured["kwargs"]
+    assert captured["kwargs"]["additional_headers"] == {
+        "Authorization": "Bearer xai-key",
+    }
+    assert "extra_headers" not in captured["kwargs"]
