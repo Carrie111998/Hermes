@@ -250,8 +250,11 @@ When you use `--with-josh-setup` (or the individual flags), the installer wires 
 |---------------|-----|
 | `context.engine: ri-context-governor` | Rust prompt compaction replaces Python summarizer |
 | `agent.disabled_toolsets: [memory]` | Built-in memory disabled — semantic-memory replaces it |
-| `mcp_servers.semantic_memory` registered | Knowledge base available on next restart |
-| `mcp_servers.agent_graph` registered (with socket args) | Graph orchestration available on next restart |
+| `mcp_servers.semantic_memory` registered + args | Knowledge base with `--memory-dir` for persistent storage |
+| `mcp_servers.agent_graph` registered + socket args | Graph orchestration, socket matches systemd unit |
+| `~/.config/systemd/user/semantic-memory.service` | Auto-starts on boot, restarts on failure, candle embedder (zero deps) |
+| `~/.config/systemd/user/agent-graph-mcpd.service` | Auto-starts on boot, `MemoryMax=4G`, reads API key from `~/.hermes/agent-graph.env` |
+| `~/.hermes/agent-graph.env` (placeholder) | API key file — edit with your `OPENAI_API_KEY` |
 | Hooks auto-discovered from `~/.hermes/agent-hooks/` | No config needed — any `.py` file is loaded |
 
 **How this affects the learning loop:** Hermes' built-in learning loop (skill creation, memory recall, knowledge capture, session search) is **enhanced**, not broken. The agent hooks intercept memory operations at the hook level and route them to semantic-memory's vector + graph backend — giving you semantic search, knowledge graph edges, and factor-graph belief propagation instead of basic FTS5 keyword search. Skill creation and cron nudges are unchanged.
@@ -280,22 +283,40 @@ All flags are additive and independent — you can combine them. Downloads are b
 
 ### After install — what you need to provide
 
-The installer doesn't ship secrets. After installation:
+The installer sets up everything except secrets. Two daemons are configured to auto-start on next login (semantic-memory + agent-graph). After installation:
 
 ```bash
-# 1. Set your LLM provider API key
+# 1. Add your API key for the agent-graph daemon
+echo 'OPENAI_API_KEY=sk-...' >> ~/.hermes/agent-graph.env
+
+# 2. Start the daemons now (or reboot — they'll auto-start)
+systemctl --user start semantic-memory
+systemctl --user start agent-graph-mcpd
+
+# 3. Set your LLM provider API key for Hermes itself
 export OPENAI_API_KEY=sk-...
 
-# 2. Start the daemons (semantic-memory auto-starts on next login)
-systemctl --user start semantic-memory   # if you want it now
-agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro &
-
-# 3. Run setup to configure providers
+# 4. Run setup to configure providers
 hermes setup
 
-# 4. Restart Hermes to pick up MCP servers
+# 5. Restart Hermes to pick up MCP servers
 hermes
 ```
+
+**Daemons that auto-start on boot:**
+
+| Daemon | Unit | Port/socket |
+|--------|------|------------|
+| semantic-memory | `semantic-memory.service` | stdio MCP (Hermes spawns) or `--http-port 1738` if you add the flag |
+| agent-graph | `agent-graph-mcpd.service` | `~/.local/share/agent-graph/run/mcp.sock` |
+
+**Daemons not in the installer** (source-only, build with `cargo install`):
+
+| Daemon | What it does |
+|--------|-------------|
+| `claim-ledger-mcp` | Evidence/claim verification ledger — stdio MCP, needs `--ledger-dir` arg |
+| `cea-graph` | Causal edit attribution — Python relay to cea-bridge |
+| `pilot-bridge` | Forge-pilot bridge — Python relay for OODA loops |
 
 ### Rust acceleration — active paths
 

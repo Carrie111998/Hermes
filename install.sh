@@ -338,14 +338,14 @@ install_mcp_servers() {
             step "Creating semantic-memory systemd unit (auto-start on boot)..."
             local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
             mkdir -p "$unit_dir"
-            cat > "$unit_dir/semantic-memory.service" << UNITEOF
+            cat > "$unit_dir/semantic-memory.service" << 'UNITEOF'
 [Unit]
 Description=Semantic Memory knowledge base daemon
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=$HOME/.local/bin/semantic-memory-mcp --memory-dir $HERMES_HOME/semantic-memory.db --embedder candle --tool-profile full
+ExecStart=%h/.local/bin/semantic-memory-mcp --memory-dir %h/.hermes/semantic-memory.db --embedder candle --tool-profile full
 Restart=on-failure
 RestartSec=5
 Environment=RUST_LOG=info
@@ -358,6 +358,46 @@ UNITEOF
                 ok "semantic-memory will auto-start on next login" || \
                 warn "Could not enable semantic-memory systemd unit — start manually: systemctl --user start semantic-memory"
             info "Start now: systemctl --user start semantic-memory"
+        fi
+
+        # Create systemd user unit for agent-graph daemon
+        if [ "$WITH_AGENT_GRAPH" = true ]; then
+            step "Creating agent-graph systemd unit (auto-start on boot)..."
+            local unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+            mkdir -p "$unit_dir"
+            cat > "$unit_dir/agent-graph-mcpd.service" << 'UNITEOF'
+[Unit]
+Description=Agent Graph MCP daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/agent-graph-mcpd --base-url https://api.deepseek.com/v1 --model deepseek-v4-pro --data-dir %h/.local/share/agent-graph --socket %h/.local/share/agent-graph/run/mcp.sock --max-graphs 256
+Restart=on-failure
+RestartSec=3s
+MemoryHigh=2G
+MemoryMax=4G
+Environment=RUST_LOG=info
+EnvironmentFile=-%h/.hermes/agent-graph.env
+
+[Install]
+WantedBy=default.target
+UNITEOF
+
+            # Create env file placeholder for API key
+            local env_file="$HERMES_HOME/agent-graph.env"
+            if [ ! -f "$env_file" ]; then
+                echo "# Set your API key for the agent-graph daemon" > "$env_file"
+                echo "# OPENAI_API_KEY=sk-..." >> "$env_file"
+                chmod 600 "$env_file"
+            fi
+
+            systemctl --user daemon-reload 2>/dev/null
+            systemctl --user enable agent-graph-mcpd.service 2>/dev/null && \
+                ok "agent-graph will auto-start on next login" || \
+                warn "Could not enable agent-graph systemd unit"
+            info "Edit $env_file with your API key, then: systemctl --user start agent-graph-mcpd"
         fi
     fi
 }
@@ -485,7 +525,7 @@ if '${WITH_SEMANTIC_MEMORY}' == 'true':
 if '${WITH_AGENT_GRAPH}' == 'true':
     cfg.setdefault('mcp_servers', {})
     ag = cfg['mcp_servers'].setdefault('agent_graph', {})
-    ag.setdefault('args', ['--socket', '/tmp/agent-graph/mcp.sock'])
+    ag.setdefault('args', ['--socket', os.path.expanduser('~/.local/share/agent-graph/run/mcp.sock')])
 
 with open(cfg_path, 'w') as f:
     yaml.safe_dump(cfg, f, default_flow_style=False)
