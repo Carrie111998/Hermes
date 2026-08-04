@@ -5429,6 +5429,12 @@ class TestAnthropicInterruptHandler:
         Replaces the former source-reading assertion (which asserted the old,
         now-removed rebuild-on-interrupt behavior) with a behavior test.
         """
+        from tests.run_agent.anthropic_test_gate import (
+            enforce_native_anthropic_test_gate,
+        )
+
+        enforce_native_anthropic_test_gate()
+
         import threading
         import time
         from unittest.mock import MagicMock
