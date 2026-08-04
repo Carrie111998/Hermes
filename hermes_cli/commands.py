@@ -931,7 +931,8 @@ def _collect_gateway_skill_entries(
         # silently excluded from gateway slash menus (#8110).
         _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
         _allowed_prefixes.extend(
-            str(d).rstrip("/") + "/" for d in get_external_skills_dirs()
+            os.path.realpath(str(d)).rstrip("/") + "/"
+            for d in get_external_skills_dirs()
         )
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
@@ -939,6 +940,12 @@ def _collect_gateway_skill_entries(
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
+            # The skill scanner builds paths from the un-resolved SKILLS_DIR,
+            # while the prefixes above are resolved.  When $HERMES_HOME sits
+            # behind a symlink (~/.hermes -> /Volumes/...), the two never
+            # match and every skill is dropped from gateway menus.  Normalize
+            # both sides to the real path (also covers macOS /var->/private/var).
+            skill_path = os.path.realpath(skill_path)
             if not any(skill_path.startswith(prefix) for prefix in _allowed_prefixes):
                 continue
             if skill_path.startswith(_hub_dir):
