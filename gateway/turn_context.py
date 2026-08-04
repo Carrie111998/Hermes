@@ -35,6 +35,7 @@ class TurnContext:
 
     # --- read-only turn identity / wiring -------------------------------
     source: Any = None
+    event: Any = None
     _run_still_current: Callable[[], bool] = None  # type: ignore[assignment]
     _live_status_adapter: Any = None
     _live_status_mode: str = "off"

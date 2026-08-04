@@ -3569,14 +3569,15 @@ class TurnRunner:
         # reaction swapping works even when tool progress messages are off.
         if event_type == "tool.started" and tool_name and ctx._run_still_current():
             try:
-                _adapter = self._runner._adapter_for_source(ctx.source)
-                if _adapter is not None:
+                _adapter = ctx._status_adapter or self._runner._adapter_for_source(ctx.source)
+                _loop = ctx._loop_for_step or getattr(self._runner, "_gateway_loop", None)
+                if _adapter is not None and _loop is not None:
                     import asyncio
                     asyncio.run_coroutine_threadsafe(
                         _adapter._run_processing_hook(
                             "on_tool_call_start", ctx.event, tool_name
                         ),
-                        self._runner._loop,
+                        _loop,
                     )
             except Exception:
                 pass
@@ -4713,23 +4714,12 @@ class TurnRunner:
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
-        # Gate on needs_progress_queue (tool_progress OR thinking_progress)
-        # rather than tool_progress alone: the progress_callback also relays
-        # _thinking assistant scratch text, which is gated on
-        # thinking_progress and is intentionally independent of tool
-        # progress. With the old `tool_progress_enabled`-only gate, a user
-        # who set thinking_progress:true but kept tool_progress:off got a
-        # None callback — so _thinking scratch bubbles never relayed even
-        # though the progress queue was created for them.
-        agent.tool_progress_callback = (
-            ctx.progress_callback
-            if (
-                ctx.needs_progress_queue
-                or ctx.log_mode_enabled
-                or ctx._live_status_adapter is not None
-            )
-            else None
-        )
+        # ALWAYS register the progress_callback so the on_tool_call_start
+        # reaction-swap hook fires even when tool progress messages are off
+        # (the hook runs before the progress_queue guard inside
+        # progress_callback). The callback self-guards on
+        # needs_progress_queue / log_mode / live_status for everything else.
+        agent.tool_progress_callback = ctx.progress_callback
         # Discord voice verbal-ack hook (fires once per turn on first tool
         # call; armed only when in a voice channel with the mixer running).
         agent.tool_start_callback = (
@@ -17276,6 +17266,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=event.message_type,
+                event=event,
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -23742,6 +23733,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        event: Any = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -23761,6 +23753,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                event=event,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -23773,6 +23766,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
                 message_type=message_type,
+                event=event,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -23895,6 +23889,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         message_type: Optional[str] = None,
+        event: Any = None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -24139,6 +24134,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         turn_ctx = TurnContext(
             source=source,
+            event=event,
             _run_still_current=_run_still_current,
             _live_status_adapter=_live_status_adapter,
             _live_status_mode=_live_status_mode,
