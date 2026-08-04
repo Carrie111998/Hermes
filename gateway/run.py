@@ -2129,6 +2129,7 @@ from gateway.delivery import (
 from gateway.turn_lease import SessionTurnLeaseRegistry
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
+from gateway.agent_mail_watchers import GatewayAgentMailWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -3265,7 +3266,7 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewayAgentMailWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -8580,6 +8581,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
         # so human-in-the-loop workflows hear back without polling.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
+        # Profile-scoped Agent Mail wakes. Disabled unless the profile explicitly
+        # supplies a mailbox identity and target platform channel.
+        self._spawn_supervised(self._agent_mail_watcher, "agent_mail_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready
         # tasks. Gated by `kanban.dispatch_in_gateway` (default True).
