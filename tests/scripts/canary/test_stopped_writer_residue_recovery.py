@@ -71,6 +71,44 @@ def _exact_host_identity_snapshot() -> dict[str, Any]:
     }
 
 
+def test_exact_host_validation_imports_without_activation_runtime() -> None:
+    repository = Path(__file__).resolve().parents[3]
+    script = f"""
+import builtins
+import sys
+
+sys.path.insert(0, {str(repository)!r})
+original_import = builtins.__import__
+
+def guarded_import(name, *args, **kwargs):
+    if name == "gateway.canonical_writer_activation" or name.startswith("cryptography"):
+        raise ModuleNotFoundError(name)
+    return original_import(name, *args, **kwargs)
+
+builtins.__import__ = guarded_import
+from scripts.canary import stopped_writer_residue_recovery as recovery
+
+assert recovery._host_identities_are_exact({repr(_exact_host_identity_snapshot())})
+assert "gateway.canonical_writer_activation" not in sys.modules
+"""
+    completed = subprocess.run(
+        [sys.executable, "-I", "-c", script],
+        cwd="/",
+        env={
+            "HOME": "/nonexistent",
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": os.environ.get("PATH", ""),
+            "PYTHONDONTWRITEBYTECODE": "1",
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def _collector_receipt() -> dict[str, Any]:
     digest = "d" * 64
     unsigned: dict[str, Any] = {
