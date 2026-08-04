@@ -19,22 +19,10 @@ import os
 import re
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, ContextManager, Mapping, NoReturn, Sequence
 
-from gateway.canonical_writer_activation import (
-    DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
-    DEFAULT_WRITER_CONFIG_SOURCE_PATH,
-    _host_activation_lock,
-    _read_trusted_file,
-)
-from gateway.canonical_writer_config_collector import (
-    EVIDENCE_ROOT as CONFIG_COLLECTOR_EVIDENCE_ROOT,
-    ConfigCollectorReceipt,
-    _ensure_exact_directory,
-    _validate_exact_directory,
-    load_config_collector_receipt,
-)
 from scripts.canary.writer_release import (
     _ACTIVATION_PATHS,
     _SERVICE_PROPERTIES,
@@ -42,6 +30,10 @@ from scripts.canary.writer_release import (
     _collect_service_states,
     _fsync_directory,
     _publish_bytes_no_replace,
+    _read_stable_root_file,
+    _validate_root_directory,
+    _validate_root_parent_chain,
+    host_release_lifecycle_lock as _host_activation_lock,
 )
 
 
@@ -49,8 +41,23 @@ PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v1"
 RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v1"
 FAILURE_SCHEMA = "muncho-stopped-writer-residue-recovery-failure.v1"
 
+DEFAULT_WRITER_CONFIG_SOURCE_PATH = Path(
+    "/etc/muncho/writer-activation/staged/writer.json"
+)
+DEFAULT_GATEWAY_CONFIG_SOURCE_PATH = Path(
+    "/etc/muncho/writer-activation/staged/gateway.yaml"
+)
+CONFIG_COLLECTOR_EVIDENCE_ROOT = Path(
+    "/var/lib/muncho-writer-canary-evidence/config-collector"
+)
 STAGING_ROOT = DEFAULT_WRITER_CONFIG_SOURCE_PATH.parent
 RECOVERY_ROOT = STAGING_ROOT.parent / "recovered-staging"
+
+if _ACTIVATION_PATHS[:2] != (
+    DEFAULT_WRITER_CONFIG_SOURCE_PATH,
+    DEFAULT_GATEWAY_CONFIG_SOURCE_PATH,
+):
+    raise RuntimeError("stopped writer residue path contract drifted")
 
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -58,10 +65,72 @@ _RECEIPT_NAME_RE = re.compile(r"^([0-9a-f]{64})\.json$")
 _MAX_CONFIG_BYTES = 2 * 1024 * 1024
 _MAX_PLAN_BYTES = 2 * 1024 * 1024
 _MAX_RECEIPT_BYTES = 2 * 1024 * 1024
+_COLLECTOR_RECEIPT_SCHEMA = "muncho-writer-config-collector-receipt.v1"
+_COLLECTOR_RECEIPT_KEYS = frozenset({
+    "schema",
+    "release_revision",
+    "release_artifact_sha256",
+    "release_manifest_path",
+    "release_manifest_file_sha256",
+    "writer_config_path",
+    "writer_config_sha256",
+    "gateway_config_path",
+    "gateway_config_sha256",
+    "database",
+    "credential_provenance",
+    "catalog_attestation_sha256",
+    "public_routine_count",
+    "helper_routine_count",
+    "private_schema_identity_sha256",
+    "managed_hba_receipt_sha256",
+    "server_certificate_sha256",
+    "hba_observed_at_unix",
+    "hba_expires_at_unix",
+    "discord_edge_enabled",
+    "credential_content_or_digest_recorded",
+    "collected_at_unix",
+    "receipt_sha256",
+})
+_COLLECTOR_CREDENTIAL_KEYS = frozenset({
+    "path",
+    "device",
+    "inode",
+    "owner_uid",
+    "group_gid",
+    "mode",
+    "link_count",
+    "modification_time_ns",
+    "change_time_ns",
+    "content_or_digest_recorded",
+})
+_COLLECTOR_DATABASE_KEYS = frozenset({
+    "host",
+    "tls_server_name",
+    "port",
+    "database",
+    "user",
+    "ca_path",
+    "ca_sha256",
+})
+_COLLECTOR_CREDENTIAL_PATH = "/etc/muncho/credentials/canonical-writer-db-password"
+_COLLECTOR_RELEASE_BASE = Path("/opt/muncho-canary-releases")
+_COLLECTOR_DATABASE_CA_PATH = Path("/etc/muncho/trust/cloudsql-server-ca.pem")
+_COLLECTOR_TLS_RE = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.europe-west3\.sql\.goog$"
+)
 _FIXED_STAGED_NAMES = frozenset({
     DEFAULT_WRITER_CONFIG_SOURCE_PATH.name,
     DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name,
 })
+
+
+@dataclass(frozen=True)
+class _CollectorReceipt:
+    value: Mapping[str, Any]
+
+    @property
+    def sha256(self) -> str:
+        return str(self.value["receipt_sha256"])
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -127,58 +196,188 @@ def _archive_path(
 
 
 def _trusted_config(path: Path) -> bytes:
-    return _read_trusted_file(
+    return _read_stable_root_file(
         path,
-        expected_uid=0,
-        expected_gid=0,
-        allowed_modes=frozenset({0o400}),
-        maximum=_MAX_CONFIG_BYTES,
+        maximum_bytes=_MAX_CONFIG_BYTES,
+        exact_mode=0o400,
     )
 
 
 def _trusted_publication(path: Path, *, maximum: int) -> bytes:
-    return _read_trusted_file(
+    return _read_stable_root_file(
         path,
-        expected_uid=0,
-        expected_gid=0,
-        allowed_modes=frozenset({0o400}),
-        maximum=maximum,
+        maximum_bytes=maximum,
+        exact_mode=0o400,
     )
 
 
+def _validate_exact_directory(path: Path, *, mode: int = 0o700) -> None:
+    _validate_root_directory(path, exact_mode=mode)
+    _validate_root_parent_chain(path.parent)
+
+
+def _ensure_exact_directory(path: Path, *, mode: int = 0o700) -> None:
+    if not path.is_absolute() or ".." in path.parts:
+        raise ValueError("residue recovery directory path is invalid")
+    missing: list[Path] = []
+    current = path
+    while not os.path.lexists(current):
+        missing.append(current)
+        current = current.parent
+    _validate_root_parent_chain(current)
+    for item in reversed(missing):
+        os.mkdir(item, mode)
+        os.chown(item, 0, 0)
+        os.chmod(item, mode)
+        _fsync_directory(item.parent)
+    _validate_exact_directory(path, mode=mode)
+    _validate_root_parent_chain(path.parent)
+
+
 def _validate_staging_directory(path: Path) -> None:
-    _validate_exact_directory(path, uid=0, gid=0, mode=0o700)
+    _validate_exact_directory(path)
     entries = frozenset(os.listdir(path))
     if entries != _FIXED_STAGED_NAMES:
         raise RuntimeError("stopped writer residue namespace is not exact")
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for name, item in pairs:
+        if name in value:
+            raise ValueError("collector receipt contains duplicate keys")
+        value[name] = item
+    return value
+
+
+def _reject_json_constant(value: str) -> NoReturn:
+    raise ValueError(f"collector receipt contains non-JSON constant:{value}")
+
+
+def _nonnegative_integer(value: Any, label: str) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{label} is invalid")
+    return value
+
+
+def _load_collector_receipt(
+    *,
+    revision: str,
+    receipt_sha256: str,
+) -> _CollectorReceipt:
+    revision = _revision(revision, "collector evidence revision")
+    receipt_sha256 = _digest(receipt_sha256, "collector receipt path digest")
+    path = CONFIG_COLLECTOR_EVIDENCE_ROOT / revision / f"{receipt_sha256}.json"
+    raw = _trusted_publication(path, maximum=_MAX_RECEIPT_BYTES)
+    try:
+        value = json.loads(
+            raw.decode("utf-8", errors="strict"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_json_constant,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ValueError("collector receipt is not strict JSON") from exc
+    if (
+        not isinstance(value, Mapping)
+        or set(value) != _COLLECTOR_RECEIPT_KEYS
+        or value.get("schema") != _COLLECTOR_RECEIPT_SCHEMA
+        or value.get("release_revision") != revision
+        or value.get("writer_config_path") != str(DEFAULT_WRITER_CONFIG_SOURCE_PATH)
+        or value.get("gateway_config_path") != str(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH)
+        or value.get("discord_edge_enabled") is not False
+        or value.get("credential_content_or_digest_recorded") is not False
+        or raw != _canonical_bytes(value)
+    ):
+        raise ValueError("collector receipt identity drifted")
+    if value.get("release_manifest_path") != str(
+        _COLLECTOR_RELEASE_BASE / revision / "release-manifest.json"
+    ):
+        raise ValueError("collector release manifest path drifted")
+    for name in (
+        "release_artifact_sha256",
+        "release_manifest_file_sha256",
+        "writer_config_sha256",
+        "gateway_config_sha256",
+        "catalog_attestation_sha256",
+        "private_schema_identity_sha256",
+        "managed_hba_receipt_sha256",
+        "server_certificate_sha256",
+        "receipt_sha256",
+    ):
+        _digest(value.get(name), f"collector {name}")
+    credential = value.get("credential_provenance")
+    if (
+        not isinstance(credential, Mapping)
+        or set(credential) != _COLLECTOR_CREDENTIAL_KEYS
+        or credential.get("path") != _COLLECTOR_CREDENTIAL_PATH
+        or credential.get("owner_uid") != 999
+        or credential.get("group_gid") != 994
+        or credential.get("mode") != "0400"
+        or credential.get("link_count") != 1
+        or credential.get("content_or_digest_recorded") is not False
+    ):
+        raise ValueError("collector credential provenance drifted")
+    for name in (
+        "device",
+        "inode",
+        "modification_time_ns",
+        "change_time_ns",
+    ):
+        _nonnegative_integer(credential.get(name), f"collector credential {name}")
+    database = value.get("database")
+    if (
+        not isinstance(database, Mapping)
+        or set(database) != _COLLECTOR_DATABASE_KEYS
+        or database.get("host") != "10.91.0.3"
+        or database.get("port") != 5432
+        or database.get("database") != "muncho_canary_brain"
+        or database.get("user") != "muncho_canary_writer_login"
+        or database.get("ca_path") != str(_COLLECTOR_DATABASE_CA_PATH)
+        or not isinstance(database.get("tls_server_name"), str)
+        or _COLLECTOR_TLS_RE.fullmatch(database["tls_server_name"]) is None
+    ):
+        raise ValueError("collector database identity drifted")
+    _digest(database.get("ca_sha256"), "collector database CA")
+    observed = _nonnegative_integer(
+        value.get("hba_observed_at_unix"),
+        "collector HBA observation time",
+    )
+    expires = _nonnegative_integer(
+        value.get("hba_expires_at_unix"),
+        "collector HBA expiry time",
+    )
+    collected = _nonnegative_integer(
+        value.get("collected_at_unix"),
+        "collector collection time",
+    )
+    if expires - observed != 300 or not observed <= collected <= expires:
+        raise ValueError("collector freshness window drifted")
+    unsigned = {name: item for name, item in value.items() if name != "receipt_sha256"}
+    if _sha256_json(unsigned) != receipt_sha256:
+        raise ValueError("collector receipt self-digest drifted")
+    return _CollectorReceipt(dict(value))
 
 
 def _matching_collector_receipt(
     *,
     writer_sha256: str,
     gateway_sha256: str,
-) -> tuple[ConfigCollectorReceipt, Path]:
-    _validate_exact_directory(
-        CONFIG_COLLECTOR_EVIDENCE_ROOT,
-        uid=0,
-        gid=0,
-        mode=0o700,
-    )
-    matches: list[tuple[ConfigCollectorReceipt, Path]] = []
+) -> tuple[_CollectorReceipt, Path]:
+    _validate_exact_directory(CONFIG_COLLECTOR_EVIDENCE_ROOT)
+    matches: list[tuple[_CollectorReceipt, Path]] = []
     for revision_name in sorted(os.listdir(CONFIG_COLLECTOR_EVIDENCE_ROOT)):
         revision = _revision(revision_name, "collector evidence revision")
         directory = CONFIG_COLLECTOR_EVIDENCE_ROOT / revision
-        _validate_exact_directory(directory, uid=0, gid=0, mode=0o700)
+        _validate_exact_directory(directory)
         for receipt_name in sorted(os.listdir(directory)):
             match = _RECEIPT_NAME_RE.fullmatch(receipt_name)
             if match is None:
                 raise RuntimeError(
                     "collector evidence namespace contains an extra entry"
                 )
-            receipt = load_config_collector_receipt(
+            receipt = _load_collector_receipt(
                 revision=revision,
                 receipt_sha256=match.group(1),
-                require_fresh=False,
             )
             value = receipt.value
             if (
@@ -578,7 +777,7 @@ def apply_stopped_writer_residue_recovery(
         plan = plan_stopped_writer_residue_recovery(target)
         if plan != prelock:
             raise RuntimeError("residue recovery plan drifted before apply")
-        _ensure_exact_directory(RECOVERY_ROOT, uid=0, gid=0, mode=0o700)
+        _ensure_exact_directory(RECOVERY_ROOT)
         _write_intent(plan)
         state = _validate_current_state(plan)
         if state == "source":

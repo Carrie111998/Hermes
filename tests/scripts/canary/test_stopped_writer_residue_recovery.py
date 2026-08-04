@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -19,6 +22,119 @@ COLLECTOR_SHA256 = "c" * 64
 
 def _sha256(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def _collector_receipt() -> dict[str, Any]:
+    digest = "d" * 64
+    unsigned: dict[str, Any] = {
+        "schema": "muncho-writer-config-collector-receipt.v1",
+        "release_revision": SOURCE_REVISION,
+        "release_artifact_sha256": digest,
+        "release_manifest_path": (
+            f"/opt/muncho-canary-releases/{SOURCE_REVISION}/release-manifest.json"
+        ),
+        "release_manifest_file_sha256": digest,
+        "writer_config_path": "/etc/muncho/writer-activation/staged/writer.json",
+        "writer_config_sha256": digest,
+        "gateway_config_path": "/etc/muncho/writer-activation/staged/gateway.yaml",
+        "gateway_config_sha256": digest,
+        "database": {
+            "host": "10.91.0.3",
+            "tls_server_name": (
+                "14-0d81ef63-2cac-4a64-84ad-c4f58c0cfd56.europe-west3.sql.goog"
+            ),
+            "port": 5432,
+            "database": "muncho_canary_brain",
+            "user": "muncho_canary_writer_login",
+            "ca_path": "/etc/muncho/trust/cloudsql-server-ca.pem",
+            "ca_sha256": digest,
+        },
+        "credential_provenance": {
+            "path": "/etc/muncho/credentials/canonical-writer-db-password",
+            "device": 1,
+            "inode": 2,
+            "owner_uid": 999,
+            "group_gid": 994,
+            "mode": "0400",
+            "link_count": 1,
+            "modification_time_ns": 3,
+            "change_time_ns": 4,
+            "content_or_digest_recorded": False,
+        },
+        "catalog_attestation_sha256": digest,
+        "public_routine_count": 1,
+        "helper_routine_count": 1,
+        "private_schema_identity_sha256": digest,
+        "managed_hba_receipt_sha256": digest,
+        "server_certificate_sha256": digest,
+        "hba_observed_at_unix": 100,
+        "hba_expires_at_unix": 400,
+        "discord_edge_enabled": False,
+        "credential_content_or_digest_recorded": False,
+        "collected_at_unix": 200,
+    }
+    return {**unsigned, "receipt_sha256": recovery._sha256_json(unsigned)}
+
+
+def test_cli_imports_under_remote_minimal_python() -> None:
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-S",
+            "-B",
+            "-m",
+            recovery.__name__,
+            "--help",
+        ],
+        cwd=Path(__file__).parents[3],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode("utf-8", errors="replace")
+    assert b"Quarantine one exact stopped writer staging residue" in completed.stdout
+
+
+def test_lightweight_collector_receipt_loader_preserves_exact_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    value = _collector_receipt()
+    raw = recovery._canonical_bytes(value)
+    monkeypatch.setattr(recovery, "CONFIG_COLLECTOR_EVIDENCE_ROOT", tmp_path)
+    monkeypatch.setattr(
+        recovery,
+        "_trusted_publication",
+        lambda _path, **_kwargs: raw,
+    )
+
+    receipt = recovery._load_collector_receipt(
+        revision=SOURCE_REVISION,
+        receipt_sha256=value["receipt_sha256"],
+    )
+
+    assert receipt.value == value
+    assert receipt.sha256 == value["receipt_sha256"]
+
+    drifted = json.loads(raw)
+    drifted["database"]["unexpected"] = "field"
+    drifted_unsigned = {
+        name: item for name, item in drifted.items() if name != "receipt_sha256"
+    }
+    drifted["receipt_sha256"] = recovery._sha256_json(drifted_unsigned)
+    monkeypatch.setattr(
+        recovery,
+        "_trusted_publication",
+        lambda _path, **_kwargs: recovery._canonical_bytes(drifted),
+    )
+    with pytest.raises(ValueError, match="database identity drifted"):
+        recovery._load_collector_receipt(
+            revision=SOURCE_REVISION,
+            receipt_sha256=drifted["receipt_sha256"],
+        )
 
 
 @pytest.fixture()
