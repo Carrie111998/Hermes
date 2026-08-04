@@ -62,6 +62,7 @@ const EVA_MANAGED_HIDDEN_NOUS_GATEWAY_METHODS = new Set([
 const EVA_MANAGED_BLOCKED_GATEWAY_PREFIXES = ['billing.', 'subscription.']
 const EVA_MANAGED_HIDDEN_NOUS_COMMANDS = new Set(['subscription', 'topup', 'upgrade'])
 const EVA_MANAGED_PROFILE_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/
+const EVA_MANAGED_PROFILE_SELECTORS = new Set(['all'])
 const EVA_ACCOUNT_SCOPED_RENDERER_STORAGE_KEYS = Object.freeze([
   'hermes.desktop.composerQueue.v1',
   'hermes.desktop.dismissedAutoProjects',
@@ -224,8 +225,16 @@ function assertEvaManagedApiRequestAllowed(request) {
     throw new EvaBrokerError('evaOS Agent blocked duplicate Hermes profiles.', 400, 'managed-policy')
   }
   if (endpointProfiles.length === 1) {
-    if (routingProfile === null || !EVA_MANAGED_PROFILE_RE.test(endpointProfiles[0])) {
+    const endpointProfile = endpointProfiles[0]
+    if (routingProfile === null || !EVA_MANAGED_PROFILE_RE.test(endpointProfile)) {
       throw new EvaBrokerError('evaOS Agent blocked an invalid Hermes profile.', 400, 'managed-policy')
+    }
+    if (endpointProfile !== routingProfile && !EVA_MANAGED_PROFILE_SELECTORS.has(endpointProfile)) {
+      throw new EvaBrokerError(
+        'evaOS Agent connection and assignment are managed by Electric Sheep.',
+        403,
+        'managed-escape'
+      )
     }
   } else if (routingProfile !== null) {
     parsed.searchParams.set('profile', routingProfile)

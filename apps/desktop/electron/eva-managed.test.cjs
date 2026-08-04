@@ -434,17 +434,38 @@ test('managed backend rejects absolute, non-API, and ambiguous request paths', (
   }
 })
 
-test('managed backend validates routing and endpoint profiles independently', () => {
+test('managed backend adds a trusted routing profile when the endpoint omits one', () => {
   assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills', profile: 'research' }), {
     method: 'GET',
     path: '/api/skills?profile=research',
     pathname: '/api/skills'
   })
+})
+
+test('managed backend accepts an endpoint profile matching the trusted routing profile', () => {
+  assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=research', profile: 'research' }), {
+    method: 'GET',
+    path: '/api/skills?profile=research',
+    pathname: '/api/skills'
+  })
+})
+
+test('managed backend preserves the approved all-profile endpoint selector', () => {
   assert.deepEqual(assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=all', profile: 'research' }), {
     method: 'GET',
     path: '/api/skills?profile=all',
     pathname: '/api/skills'
   })
+})
+
+test('managed backend rejects endpoint profiles that differ from the trusted routing profile', () => {
+  assert.throws(
+    () => assertEvaManagedApiRequestAllowed({ path: '/api/skills?profile=research', profile: 'main' }),
+    error => error instanceof EvaBrokerError && error.statusCode === 403 && error.code === 'managed-escape'
+  )
+})
+
+test('managed backend validates routing and endpoint profile syntax independently', () => {
   for (const request of [
     { path: '/api/skills?profile=research' },
     { path: '/api/skills?profile=research&profile=all', profile: 'research' },
