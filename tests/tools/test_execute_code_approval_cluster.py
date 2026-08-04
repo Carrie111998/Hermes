@@ -361,8 +361,7 @@ def test_terminal_smart_deny_pending_payload_is_one_operation(gw_session, monkey
     monkeypatch.setattr(A, "_get_approval_mode", lambda: "smart")
     monkeypatch.setattr(A, "_smart_approve", lambda _command, _description: "deny")
     monkeypatch.setattr(
-        A,
-        "detect_dangerous_command",
+        A, "detect_dangerous_command",
         lambda command: (True, "pending-smart-deny", f"risk:{command}"),
     )
     monkeypatch.setattr(
