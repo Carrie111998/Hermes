@@ -74,6 +74,19 @@ def test_create_candidate_persists_current_state_and_creation_event(tmp_path, mo
     assert (home / "learning" / "ledger.db").exists()
 
 
+def test_namespaced_candidate_id_round_trips_through_ledger(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
+    from agent import learning_ledger
+
+    candidate_id = "pastoral:edaca6a49a734f408dd9fbad1f5408af"
+    learning_ledger.create_candidate(_candidate(candidate_id))
+
+    candidate = learning_ledger.get_candidate(candidate_id)
+    assert candidate is not None
+    assert candidate["candidate_id"] == candidate_id
+    assert learning_ledger.list_events(candidate_id=candidate_id)[0]["candidate_id"] == candidate_id
+
+
 def test_transition_is_compare_and_swap_and_appends_event(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "profile"))
     from agent import learning_ledger

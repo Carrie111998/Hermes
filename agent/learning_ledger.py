@@ -27,7 +27,10 @@ _MAX_EVIDENCE_CHARS = 500
 _MAX_JSON_CHARS = 16_384
 _RISKS = {"low", "medium", "high", "unknown"}
 _CONFIDENCE = {"low", "medium", "high", "unknown"}
-_CANDIDATE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Candidate IDs may be namespaced (for example ``pastoral:<uuid>``).
+# Keep the namespace separator explicit rather than permitting arbitrary
+# punctuation in IDs used by paths and CLI surfaces.
+_CANDIDATE_ID_RE = re.compile(r"^(?:[A-Za-z0-9_-]+:)?[A-Za-z0-9_-]{1,64}$")
 _VALID_STATUSES = {"pending", "applying", "active", "validated", "rolling_back", "rolled_back", "rejected"}
 _VALID_TRANSITIONS = {
     "pending": {"applying", "active", "rejected"},
