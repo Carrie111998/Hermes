@@ -511,8 +511,13 @@ class ChatCompletionsTransport(ProviderTransport):
         base_url = params.get("base_url")
 
         provider_prefs = params.get("provider_preferences")
+        # OpenRouter-only routing knobs. Never emit on non-OR paths (Nous
+        # Portal hard-rejects caller-supplied ``provider`` with HTTP 400).
         if provider_prefs and is_openrouter:
             extra_body["provider"] = provider_prefs
+        elif provider_prefs and not is_openrouter:
+            # Explicit no-op branch documents the policy for readers/tests.
+            pass
 
         # Pareto Code router plugin — model-gated. Same shape as the
         # profile path in plugins/model-providers/openrouter/__init__.py;
@@ -725,6 +730,23 @@ class ChatCompletionsTransport(ProviderTransport):
                     k: v for k, v in extra_body.items()
                     if k in ("thinking_config", "thinkingConfig")
                 }
+            # OpenRouter-only: caller-supplied provider routing preferences.
+            # Nous Portal (and any non-OR endpoint) hard-rejects them with
+            # HTTP 400. Strip even if request_overrides / a buggy profile
+            # tried to inject them.
+            if extra_body and "provider" in extra_body:
+                _prof_name = (getattr(profile, "name", None) or "").strip().lower()
+                _aliases = {
+                    str(a).strip().lower()
+                    for a in (getattr(profile, "aliases", None) or ())
+                }
+                _base = str(params.get("base_url") or "").lower()
+                _is_openrouter_profile = (
+                    _prof_name == "openrouter" or "openrouter" in _aliases
+                )
+                _is_openrouter_url = "openrouter.ai" in _base
+                if not (_is_openrouter_profile or _is_openrouter_url):
+                    extra_body.pop("provider", None)
             if extra_body:
                 api_kwargs["extra_body"] = extra_body
 
