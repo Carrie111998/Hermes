@@ -54,6 +54,7 @@ RUN_SETUP=true
 SKIP_RUST=false
 WITH_SEMANTIC_MEMORY=false
 WITH_AGENT_GRAPH=false
+WITH_JOSH_SETUP=false
 
 # ── Logging ─────────────────────────────────────────────────────────
 log()   { echo -e "${GREEN}[RI]${NC} $1"; }
@@ -92,6 +93,7 @@ show_help() {
     echo "  --with-semantic-memory   Install semantic-memory MCP server (knowledge base)"
     echo "  --with-agent-graph       Install agent-graph MCP server (multi-agent graphs)"
     echo "  --with-all-mcp           Install both MCP servers above"
+    echo "  --with-josh-setup        Full Josh's setup: skills + hooks + MCP servers"
     echo "  --help                   Show this message"
     echo
     echo "Disable Rust acceleration after install:"
@@ -109,6 +111,7 @@ while [ $# -gt 0 ]; do
         --with-semantic-memory)  WITH_SEMANTIC_MEMORY=true; shift ;;
         --with-agent-graph)      WITH_AGENT_GRAPH=true; shift ;;
         --with-all-mcp) WITH_SEMANTIC_MEMORY=true; WITH_AGENT_GRAPH=true; shift ;;
+        --with-josh-setup) WITH_JOSH_SETUP=true; shift ;;
         --help)         show_help ;;
         *)              warn "Unknown option: $1"; show_help ;;
     esac
@@ -306,6 +309,82 @@ install_mcp_servers() {
     fi
 }
 
+# ── Install Josh's full setup ────────────────────────────────────────
+install_josh_setup() {
+    if [ "$WITH_JOSH_SETUP" != true ]; then
+        return
+    fi
+
+    echo
+    echo -e "${BOLD}${CYAN}  ═══════════════════════════════════════════════${NC}"
+    echo -e "${BOLD}${CYAN}  ▸ Josh's Hermes Setup${NC}"
+    echo -e "${BOLD}${CYAN}  ═══════════════════════════════════════════════${NC}"
+    echo
+
+    # Enable MCP servers if not already selected
+    if [ "$WITH_SEMANTIC_MEMORY" != true ] || [ "$WITH_AGENT_GRAPH" != true ]; then
+        info "Enabling MCP servers (required for full setup)..."
+        WITH_SEMANTIC_MEMORY=true
+        WITH_AGENT_GRAPH=true
+        install_mcp_servers
+    fi
+
+    local release_url="https://github.com/RecursiveIntell/hermes-agent/releases/latest/download"
+
+    # ── Skills (70+ skills) ──────────────────────────────────────
+    echo
+    step "Installing Josh's skills pack (70+ skills)..."
+    info "  README generation, code review, GPU benchmarking, council deliberation,"
+    info "  device maintenance, email automation, GPU kernel dev, and more."
+
+    local skills_tarball="/tmp/hermes-skills.tar.gz"
+    if curl -fsSL "${release_url}/hermes-skills-20260803.tar.gz" -o "$skills_tarball" 2>/dev/null; then
+        mkdir -p "$HERMES_HOME/skills"
+        tar -xzf "$skills_tarball" -C "$HERMES_HOME/skills" 2>/dev/null && \
+            ok "Skills installed → $HERMES_HOME/skills/" && \
+            rm -f "$skills_tarball" || {
+            fail "Failed to extract skills tarball"
+            rm -f "$skills_tarball"
+        }
+    else
+        fail "Skills download failed — skipping (Hermes will still work)"
+    fi
+
+    # ── Agent hooks (12 hooks) ───────────────────────────────────
+    echo
+    step "Installing Josh's agent hooks (12 hooks)..."
+    info "  context-governor compaction, semantic-memory recall/capture,"
+    info "  CEA edit telemetry, knowledge-router classification, council trimming."
+
+    local hooks_tarball="/tmp/hermes-hooks.tar.gz"
+    if curl -fsSL "${release_url}/hermes-hooks-20260803.tar.gz" -o "$hooks_tarball" 2>/dev/null; then
+        mkdir -p "$HERMES_HOME/agent-hooks"
+        tar -xzf "$hooks_tarball" -C "$HERMES_HOME/agent-hooks" 2>/dev/null && \
+            ok "Hooks installed → $HERMES_HOME/agent-hooks/" && \
+            rm -f "$hooks_tarball" || {
+            fail "Failed to extract hooks tarball"
+            rm -f "$hooks_tarball"
+        }
+    else
+        fail "Hooks download failed — skipping (Hermes will still work)"
+    fi
+
+    echo
+    echo -e "${BOLD}${GREEN}  ✓ Josh's setup complete${NC}"
+    echo
+    echo -e "  ${BOLD}What you get:${NC}"
+    echo    "    • 70+ skills — READMEs, code review, GPU benchmarking, email, etc."
+    echo    "    • 12 agent hooks — memory recall, context compaction, telemetry"
+    echo    "    • semantic-memory MCP server — knowledge base + search"
+    echo    "    • agent-graph MCP server — multi-agent graph orchestration"
+    echo
+    echo -e "  ${BOLD}What you still need to provide:${NC}"
+    echo    "    • LLM provider API key (set OPENAI_API_KEY)"
+    echo    "    • Start agent-graph daemon: agent-graph-mcpd --model <your-model>"
+    echo    "    • Run 'hermes setup' to configure your providers"
+    echo
+}
+
 # ── Configure RecursiveIntell defaults ───────────────────────────────
 configure_ri_defaults() {
     step "Configuring RecursiveIntell defaults..."
@@ -368,6 +447,14 @@ print_next_steps() {
         echo
     fi
 
+    if [ "$WITH_JOSH_SETUP" = true ]; then
+        echo -e "  ${BOLD}Josh's setup:${NC} skills + hooks installed"
+        echo    "    Skills: $HERMES_HOME/skills/"
+        echo    "    Hooks:  $HERMES_HOME/agent-hooks/"
+        echo    "    Start agent-graph daemon: agent-graph-mcpd --model <your-model> &"
+        echo
+    fi
+
     echo -e "  ${BOLD}Disable a path:${NC}"
     echo    "    HERMES_RI_PIPELINE=0 hermes"
     echo
@@ -397,6 +484,7 @@ main() {
     setup_python
     install_rust_wheels
     install_mcp_servers
+    install_josh_setup
     configure_ri_defaults
     run_setup
     print_next_steps
