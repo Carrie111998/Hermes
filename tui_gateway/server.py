@@ -1557,6 +1557,31 @@ def remove_session_observer(sid: str, transport) -> bool:
     return True
 
 
+def claim_session_transport(session: dict, transport) -> None:
+    """(Re)bind a session's primary transport, auto-promoting the displaced
+    owner to observer.
+
+    ``session[\"transport\"]`` keeps its last-resumer-wins semantics (orphan
+    reaping, close_on_disconnect), but a client that LOSES ownership must not
+    go dark: second-screen continuity relies on the previous owner receiving
+    the session's events after being displaced (e.g. the Hermes Desktop UI,
+    which never calls ``session.observe``). Idempotent — claiming with the
+    same transport adds nothing.
+
+    Caller MUST hold ``session[\"history_lock\"]`` (a non-reentrant Lock).
+    """
+    if transport is None:
+        return
+    previous = session.get("transport")
+    session["transport"] = transport
+    if previous is not None and previous is not transport:
+        # The orphan sentinel isn't a real client — never keep feeding it.
+        if previous is _detached_ws_transport:
+            return
+        with _session_observers_lock:
+            session.setdefault("observer_transports", set()).add(previous)
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -8005,7 +8030,7 @@ def _live_session_payload(
         if cols is not None:
             session["cols"] = cols
         if transport is not None:
-            session["transport"] = transport
+            claim_session_transport(session, transport)
         if touch:
             session["last_active"] = time.time()
         in_memory_history = list(session.get("display_history_prefix") or []) + list(

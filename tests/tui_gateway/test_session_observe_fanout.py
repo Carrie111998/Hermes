@@ -164,3 +164,63 @@ def test_delivery_result_true_when_observer_receives(server):
 
     assert server.write_json(_event_frame("s1")) is True
     assert len(observer.frames) == 1
+
+
+def _locked_session(server, sid: str, transport) -> dict:
+    import threading
+
+    session = {"session_key": f"k-{sid}", "transport": transport, "history_lock": threading.Lock()}
+    server._sessions[sid] = session
+    return session
+
+
+def test_claim_promotes_displaced_owner_to_observer(server):
+    """A client that loses ownership via a re-claim keeps receiving events."""
+    old_owner, new_owner = FakeTransport(), FakeTransport()
+    session = _locked_session(server, "s1", old_owner)
+
+    with session["history_lock"]:
+        server.claim_session_transport(session, new_owner)
+
+    assert server._sessions["s1"]["transport"] is new_owner
+    server.write_json(_event_frame("s1"))
+    assert len(new_owner.frames) == 1
+    assert len(old_owner.frames) == 1  # auto-promoted to observer, still fed
+
+
+def test_claim_same_transport_is_idempotent(server):
+    owner = FakeTransport()
+    session = _locked_session(server, "s1", owner)
+
+    with session["history_lock"]:
+        server.claim_session_transport(session, owner)
+
+    assert "observer_transports" not in session
+    server.write_json(_event_frame("s1"))
+    assert len(owner.frames) == 1
+
+
+def test_claim_none_and_first_claim_do_not_observe(server):
+    session = _locked_session(server, "s1", None)
+
+    server.claim_session_transport(session, None)  # no-op
+    assert session.get("transport") is None
+
+    owner = FakeTransport()
+    with session["history_lock"]:
+        server.claim_session_transport(session, owner)
+
+    assert "observer_transports" not in session
+    assert session["transport"] is owner
+
+
+def test_claim_skips_orphan_sentinel(server):
+    """The detached-WS sentinel is not a real client — never kept as observer."""
+    new_owner = FakeTransport()
+    session = _locked_session(server, "s1", server._detached_ws_transport)
+
+    with session["history_lock"]:
+        server.claim_session_transport(session, new_owner)
+
+    assert session["transport"] is new_owner
+    assert "observer_transports" not in session
