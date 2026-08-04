@@ -250,10 +250,13 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  #
                     if spec:
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
+                        _saved_path = list(sys.path)
                         try:
                             spec.loader.exec_module(parent_mod)
                         except Exception:
                             pass
+                        finally:
+                            sys.path[:] = _saved_path
 
         # User-installed plugins need their synthetic parent registered the
         # same way, or relative imports inside the plugin cannot resolve.
@@ -286,18 +289,24 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["CronScheduler"]:  #
                 if sub_spec:
                     sub_mod = importlib.util.module_from_spec(sub_spec)
                     sys.modules[full_sub_name] = sub_mod
+                    _saved_path = list(sys.path)
                     try:
                         sub_spec.loader.exec_module(sub_mod)
                         loaded_submodules.append((sub_name, sub_mod))
                     except Exception as e:
                         logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+                    finally:
+                        sys.path[:] = _saved_path
 
+        _saved_path = list(sys.path)
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
             logger.debug("Failed to exec_module %s: %s", module_name, e)
             sys.modules.pop(module_name, None)
             return None
+        finally:
+            sys.path[:] = _saved_path
 
         # Manual importlib loading bypasses the normal import machinery that
         # binds child modules onto their parent packages. Restore that shape so

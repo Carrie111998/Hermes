@@ -256,10 +256,13 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                     if spec:
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
+                        _saved_path = list(sys.path)
                         try:
                             spec.loader.exec_module(parent_mod)
                         except Exception:
                             pass
+                        finally:
+                            sys.path[:] = _saved_path
 
         # User-installed plugins need their synthetic parent registered the
         # same way, or relative imports inside the plugin cannot resolve.
@@ -291,17 +294,23 @@ def _load_provider_from_dir(provider_dir: Path) -> Optional["MemoryProvider"]:
                 if sub_spec:
                     sub_mod = importlib.util.module_from_spec(sub_spec)
                     sys.modules[full_sub_name] = sub_mod
+                    _saved_path = list(sys.path)
                     try:
                         sub_spec.loader.exec_module(sub_mod)
                     except Exception as e:
                         logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+                    finally:
+                        sys.path[:] = _saved_path
 
+        _saved_path = list(sys.path)
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
             logger.debug("Failed to exec_module %s: %s", module_name, e)
             sys.modules.pop(module_name, None)
             return None
+        finally:
+            sys.path[:] = _saved_path
 
     # Try register(ctx) pattern first (how our plugins are written)
     if hasattr(mod, "register"):
@@ -422,7 +431,11 @@ def discover_plugin_cli_commands() -> List[dict]:
                 return results
             cli_mod = importlib.util.module_from_spec(spec)
             sys.modules[module_name] = cli_mod
-            spec.loader.exec_module(cli_mod)
+            _saved_path = list(sys.path)
+            try:
+                spec.loader.exec_module(cli_mod)
+            finally:
+                sys.path[:] = _saved_path
 
         register_cli = getattr(cli_mod, "register_cli", None)
         if not callable(register_cli):

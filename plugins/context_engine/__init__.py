@@ -131,10 +131,13 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                     if spec:
                         parent_mod = importlib.util.module_from_spec(spec)
                         sys.modules[parent] = parent_mod
+                        _saved_path = list(sys.path)
                         try:
                             spec.loader.exec_module(parent_mod)
                         except Exception:
                             pass
+                        finally:
+                            sys.path[:] = _saved_path
 
         # Now load the engine module
         spec = importlib.util.spec_from_file_location(
@@ -160,17 +163,23 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                 if sub_spec:
                     sub_mod = importlib.util.module_from_spec(sub_spec)
                     sys.modules[full_sub_name] = sub_mod
+                    _saved_path = list(sys.path)
                     try:
                         sub_spec.loader.exec_module(sub_mod)
                     except Exception as e:
                         logger.debug("Failed to load submodule %s: %s", full_sub_name, e)
+                    finally:
+                        sys.path[:] = _saved_path
 
+        _saved_path = list(sys.path)
         try:
             spec.loader.exec_module(mod)
         except Exception as e:
             logger.debug("Failed to exec_module %s: %s", module_name, e)
             sys.modules.pop(module_name, None)
             return None
+        finally:
+            sys.path[:] = _saved_path
 
     # Try register(ctx) pattern first (how plugins are written)
     if hasattr(mod, "register"):

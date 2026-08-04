@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import sys
 from dataclasses import dataclass, field as dataclass_field
 
 _log = logging.getLogger(__name__)
@@ -132,7 +133,11 @@ def get_provider_config_schema(name: str) -> ProviderConfigSchema | None:
     try:
         spec = importlib.util.spec_from_file_location(f"_hermes_memory_config_schema.{name}", path)
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        _saved_path = list(sys.path)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = _saved_path
         schema = getattr(module, "CONFIG_SCHEMA", None)
     except Exception:
         # Never cache a failed load: it would pin an empty panel until restart.

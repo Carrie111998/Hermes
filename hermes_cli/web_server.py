@@ -17265,11 +17265,14 @@ def _mount_plugin_api_routes():
             # "is not fully defined" because the module namespace isn't
             # reachable by name for string-annotation resolution.
             sys.modules[module_name] = mod
+            _saved_path = list(sys.path)
             try:
                 spec.loader.exec_module(mod)
             except Exception:
                 sys.modules.pop(module_name, None)
                 raise
+            finally:
+                sys.path[:] = _saved_path
             router = getattr(mod, "router", None)
             if router is None:
                 _log.warning("Plugin %s api file has no 'router' attribute", plugin["name"])

@@ -1883,7 +1883,17 @@ class PluginManager:
         module.__package__ = module_name
         module.__path__ = [str(plugin_dir)]  # type: ignore[attr-defined]
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+
+        # Isolate plugin from sys.path: save, exec, restore.
+        # Plugins often insert() their directory at sys.path[0] so
+        # absolute imports (e.g. from qdrant_memory.xxx) resolve.
+        # Without this, a plugin can permanently shadow top-level
+        # modules like cli.py — see issue #image-paste-import-error.
+        _saved_path = list(sys.path)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = _saved_path
         return module
 
     def _load_entrypoint_module(self, manifest: PluginManifest) -> types.ModuleType:
@@ -1898,7 +1908,11 @@ class PluginManager:
 
         for ep in group_eps:
             if ep.name == manifest.name:
-                return ep.load()
+                _saved_path = list(sys.path)
+                try:
+                    return ep.load()
+                finally:
+                    sys.path[:] = _saved_path
 
         raise ImportError(
             f"Entry point '{manifest.name}' not found in group '{ENTRY_POINTS_GROUP}'"

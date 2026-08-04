@@ -2613,11 +2613,14 @@ def _load_openclaw_migration_module():
     # (Python 3.11+ requires this for dynamically loaded modules)
     import sys as _sys
     _sys.modules[spec.name] = mod
+    _saved_path = list(_sys.path)
     try:
         spec.loader.exec_module(mod)
     except Exception:
         _sys.modules.pop(spec.name, None)
         raise
+    finally:
+        sys.path[:] = _saved_path
     return mod
 
 

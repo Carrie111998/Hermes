@@ -125,14 +125,16 @@ def _load_nostr_auth():
         return nostr_auth
     except ImportError:
         import importlib.util
-
         path = Path(__file__).with_name("nostr_auth.py")
         spec = importlib.util.spec_from_file_location("plugin_adapter_buzz_nostr_auth", path)
         assert spec is not None and spec.loader is not None
         module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
+        _saved_path = list(sys.path)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = _saved_path
         return module
-
 
 # ---------------------------------------------------------------------------
 # bech32 (BIP-173) helpers — used to convert between npub and hex pubkeys so

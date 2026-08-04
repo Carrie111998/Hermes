@@ -136,7 +136,11 @@ def _import_plugin_dir(plugin_dir: Path, source: str) -> None:
             return
         module = importlib.util.module_from_spec(spec)
         sys.modules[module_name] = module
-        spec.loader.exec_module(module)
+        _saved_path = list(sys.path)
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            sys.path[:] = _saved_path
     except Exception as exc:
         logger.warning(
             "Failed to load %s provider plugin %s: %s", source, plugin_dir.name, exc

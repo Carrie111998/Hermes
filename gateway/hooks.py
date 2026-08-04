@@ -132,11 +132,14 @@ class HookRegistry:
 
                 module = importlib.util.module_from_spec(spec)
                 sys.modules[module_name] = module
+                _saved_path = list(sys.path)
                 try:
                     spec.loader.exec_module(module)
                 except Exception:
                     sys.modules.pop(module_name, None)
                     raise
+                finally:
+                    sys.path[:] = _saved_path
 
                 handle_fn = getattr(module, "handle", None)
                 if handle_fn is None:

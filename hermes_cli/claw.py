@@ -210,11 +210,14 @@ def _load_migration_module(script_path: Path):
     # Register in sys.modules so @dataclass can resolve the module
     # (Python 3.11+ requires this for dynamically loaded modules)
     sys.modules[spec.name] = mod
+    _saved_path = list(sys.path)
     try:
         spec.loader.exec_module(mod)
     except Exception:
         sys.modules.pop(spec.name, None)
         raise
+    finally:
+        sys.path[:] = _saved_path
     return mod
 
 

@@ -1111,3 +1111,169 @@ class TestDispatchToolWithoutCliRef:
             assert calls[0][1].get("parent_agent") is None
         finally:
             registry.deregister("_test_dispatch_probe")
+
+
+
+class TestSysPathIsolation:
+    """sys.path is restored after plugin exec_module, even on errors."""
+
+    # ── Directory plugin ────────────────────────────────────────────────
+    def test_sys_path_restored_after_successful_load(self, tmp_path, monkeypatch):
+        """sys.path is unchanged after a directory plugin loads successfully."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(plugins_dir, "clean_plugin")
+        # Inject module-level sys.path mutation into __init__.py
+        init_path = plugin_dir / "__init__.py"
+        init_path.write_text(
+            "import sys\nsys.path.insert(0, '/injected/by/plugin')\n"
+            + init_path.read_text()
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        saved = list(sys.path)
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "/injected/by/plugin" not in sys.path, (
+            "sys.path must be restored after plugin exec_module"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+    def test_sys_path_restored_after_load_error(self, tmp_path, monkeypatch):
+        """sys.path is restored even when a directory plugin raises during load."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        plugin_dir = _make_plugin_dir(plugins_dir, "crashy_plugin")
+        # Module-level mutation then raise
+        init_path = plugin_dir / "__init__.py"
+        init_path.write_text(
+            "import sys\nsys.path.insert(0, '/injected/before/crash')\n"
+            "raise RuntimeError('boom')\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+
+        saved = list(sys.path)
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "/injected/before/crash" not in sys.path, (
+            "sys.path must be restored even when plugin raises"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+    # ── Provider plugin ─────────────────────────────────────────────────
+
+    def test_provider_plugin_sys_path_restored(self, tmp_path, monkeypatch):
+        """sys.path is unchanged after _import_plugin_dir exec_module."""
+        from providers import _import_plugin_dir, _REGISTRY
+
+        provider_dir = tmp_path / "test_provider"
+        provider_dir.mkdir()
+        (provider_dir / "__init__.py").write_text(
+            "import sys\nsys.path.insert(0, '/injected/by/provider')\n"
+            "from providers import register_provider\n"
+            "from providers.base import ProviderProfile\n"
+            "register_provider(ProviderProfile(name='_test_syspath_provider', aliases=[]))\n"
+        )
+
+        saved = list(sys.path)
+
+        _import_plugin_dir(provider_dir, "user")
+
+        assert "/injected/by/provider" not in sys.path, (
+            "sys.path must be restored after provider exec_module"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+        # Clean up registered provider
+        _REGISTRY.pop("_test_syspath_provider", None)
+
+    # ── Cross-plugin isolation ──────────────────────────────────────────
+
+    def test_plugin_a_mutation_does_not_affect_plugin_b(self, tmp_path, monkeypatch):
+        """When Plugin A mutates sys.path, Plugin B loads with the original path."""
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+
+        # Plugin A: module-level sys.path pollution
+        plugin_a = _make_plugin_dir(plugins_dir, "polluter")
+        (plugin_a / "__init__.py").write_text(
+            "import sys\nsys.path.insert(0, '/polluted')\n"
+            "def register(ctx): pass\n"
+        )
+        # Plugin B: verifies sys.path is clean at module level
+        plugin_b = plugins_dir / "innocent"
+        plugin_b.mkdir(parents=True)
+        (plugin_b / "plugin.yaml").write_text(
+            "name: innocent\nversion: '0.1'\ndescription: test\n"
+        )
+        (plugin_b / "__init__.py").write_text(
+            "import sys\n"
+            "assert '/polluted' not in sys.path, 'leaked from polluter'\n"
+            "def register(ctx): pass\n"
+        )
+
+        # Enable both plugins
+        hermes_home = tmp_path / "hermes_test"
+        (hermes_home / "config.yaml").write_text(
+            "plugins:\n  enabled:\n  - polluter\n  - innocent\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        saved = list(sys.path)
+
+        mgr = PluginManager()
+        mgr.discover_and_load()
+
+        assert "/polluted" not in sys.path, (
+            "Plugin A's sys.path mutation must not survive into Plugin B or post-load"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+    # ── Entry-point plugin ──────────────────────────────────────────────
+
+    def test_entrypoint_plugin_sys_path_restored(self, tmp_path, monkeypatch):
+        """sys.path is restored after ep.load() in _load_entrypoint_module."""
+        import importlib.metadata
+        import importlib.util
+
+        # Create a fake plugin module that mutates sys.path
+        ep_module_path = tmp_path / "ep_plugin.py"
+        ep_module_path.write_text(
+            "import sys\nsys.path.insert(0, '/injected/by/ep')\n"
+        )
+
+        spec = importlib.util.spec_from_file_location("ep_plugin", ep_module_path)
+
+        class _FakeEntryPoint:
+            name = "test_ep_plugin"
+            group = ENTRY_POINTS_GROUP
+
+            def load(self):
+                mod = importlib.util.module_from_spec(spec)
+                sys.modules["ep_plugin"] = mod
+                spec.loader.exec_module(mod)
+                return mod
+
+        monkeypatch.setattr(
+            importlib.metadata, "entry_points",
+            lambda **kwargs: [_FakeEntryPoint()],
+        )
+
+        manifest = PluginManifest(
+            name="test_ep_plugin",
+            source="entrypoint",
+        )
+
+        saved = list(sys.path)
+
+        mgr = PluginManager()
+        mgr._load_entrypoint_module(manifest)
+
+        assert "/injected/by/ep" not in sys.path, (
+            "sys.path must be restored after ep.load()"
+        )
+        assert sys.path == saved, "sys.path must be identical to pre-load state"
+
+        # Cleanup
+        sys.modules.pop("ep_plugin", None)
