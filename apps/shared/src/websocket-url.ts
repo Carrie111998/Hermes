@@ -50,7 +50,7 @@ function targetGatewayWsEndpoint(wsUrl: string, endpointPath: string, profile: n
     throw new Error('The refreshed WebSocket URL did not target the requested endpoint.')
   }
 
-  resolved.pathname = resolved.pathname.replace(/\/api\/ws$/, endpoint.pathname)
+  resolved.pathname = resolved.pathname.replace(/\/api\/ws$/, () => endpoint.pathname)
 
   for (const [key, value] of endpoint.searchParams.entries()) {
     resolved.searchParams.append(key, value)

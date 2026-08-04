@@ -120,6 +120,12 @@ describe('resolveGatewayWsUrl', () => {
       expect(url.searchParams.get('mode')).toBe('live')
       expect(url.searchParams.get('profile')).toBe('research')
     })
+
+    it('treats dollar replacement sequences in plugin endpoint paths literally', async () => {
+      const resolved = await resolveGatewayWsUrl({}, tokenConn, '/api/plugins/kanban/$&events')
+
+      expect(new URL(resolved).pathname).toBe('/api/plugins/kanban/$&events')
+    })
   })
 })
 

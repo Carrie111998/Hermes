@@ -180,6 +180,37 @@ describe('resolveMediaPlaybackSrc', () => {
     expect(getMediaStreamUrl).toHaveBeenCalledWith('/root/outputs/demo clip.mp4', 'research')
   })
 
+  it('reports managed remote media unavailable when the bridge issues no grant', async () => {
+    const getMediaStreamUrl = vi.fn(async () => null)
+    vi.stubGlobal('window', { hermesDesktop: { api: vi.fn(), getMediaStreamUrl } })
+    $connection.set({
+      mode: 'remote',
+      baseUrl: 'eva-managed://customer-one',
+      profile: 'research',
+      token: ''
+    } as never)
+
+    await expect(resolveMediaPlaybackSrc('file:///root/outputs/demo.mp4')).rejects.toThrow(
+      /managed remote media playback is unavailable/i
+    )
+  })
+
+  it('preserves managed remote media bridge rejections without local fallback', async () => {
+    const rejection = new Error('managed media grant expired')
+    const getMediaStreamUrl = vi.fn(async () => {
+      throw rejection
+    })
+    vi.stubGlobal('window', { hermesDesktop: { api: vi.fn(), getMediaStreamUrl } })
+    $connection.set({
+      mode: 'remote',
+      baseUrl: 'eva-managed://customer-one',
+      profile: 'research',
+      token: ''
+    } as never)
+
+    await expect(resolveMediaPlaybackSrc('file:///root/outputs/demo.mp4')).rejects.toBe(rejection)
+  })
+
   it('uses the Electron streaming protocol for local desktop video', async () => {
     vi.stubGlobal('window', { hermesDesktop: { api: vi.fn() } })
     $connection.set({ mode: 'local' } as never)

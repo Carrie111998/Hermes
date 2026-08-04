@@ -104,6 +104,8 @@ export async function resolveMediaPlaybackSrc(path: string): Promise<string> {
         if (streamUrl) {
           return streamUrl
         }
+
+        throw new Error('Managed remote media playback is unavailable.')
       }
 
       return mediaExternalUrl(path)
