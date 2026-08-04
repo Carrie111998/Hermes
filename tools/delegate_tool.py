@@ -17,6 +17,7 @@ The parent's context only sees the delegation call and the summary result,
 never the child's intermediate tool calls or reasoning.
 """
 
+import copy
 import enum
 import contextvars
 import json
@@ -1071,6 +1072,7 @@ def _build_child_progress_callback(
     parent_id: Optional[str] = None,
     depth: Optional[int] = None,
     model: Optional[str] = None,
+    route: Optional[str] = None,
     toolsets: Optional[List[str]] = None,
     session_ref: Optional[Dict[str, Any]] = None,
 ) -> Optional[callable]:
@@ -1118,6 +1120,8 @@ def _build_child_progress_callback(
             kw["depth"] = depth
         if model is not None:
             kw["model"] = model
+        if route is not None:
+            kw["route"] = route
         if toolsets is not None:
             kw["toolsets"] = list(toolsets)
         # The child's own session id — filled into the shared ref once the
@@ -1317,6 +1321,7 @@ def _build_child_agent(
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[Dict[str, Any]] = None,
     override_max_tokens: Optional[int] = None,
+    override_reasoning_effort: Optional[Any] = None,
     # ACP transport overrides from trusted delegation config.
     override_acp_command: Optional[str] = None,
     override_acp_args: Optional[List[str]] = None,
@@ -1324,6 +1329,9 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Configured named route selected for this child, if any. Credentials are
+    # supplied through the overrides above; this is observability metadata.
+    route: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1455,6 +1463,7 @@ def _build_child_agent(
         parent_id=parent_subagent_id,
         depth=tui_depth,
         model=effective_model_for_cb,
+        route=route,
         toolsets=child_toolsets,
         session_ref=child_session_ref,
     )
@@ -1544,14 +1553,20 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: named-route override > delegation override >
+    # parent inherit. ``None`` means no route-specific value was supplied;
+    # an empty string deliberately falls through to the parent level.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        # Keep the raw value — ``str(x or "")`` would coerce a YAML boolean
-        # False (``reasoning_effort: false``) to "" and inherit the parent
-        # instead of disabling thinking for children.
-        delegation_effort = delegation_cfg.get("reasoning_effort")
+        configured_effort = (
+            override_reasoning_effort
+            if override_reasoning_effort is not None
+            else delegation_cfg.get("reasoning_effort")
+        )
+        # Keep the raw value — coercing through ``str(x or "")`` would turn a
+        # YAML boolean False into inheritance instead of disabling thinking.
+        delegation_effort = configured_effort
         if delegation_effort or delegation_effort is False:
             from hermes_constants import parse_reasoning_effort
 
@@ -1560,7 +1575,7 @@ def _build_child_agent(
                 child_reasoning = parsed
             else:
                 logger.warning(
-                    "Unknown delegation.reasoning_effort '%s', inheriting parent level",
+                    "Unknown delegation reasoning_effort '%s', inheriting parent level",
                     delegation_effort,
                 )
     except Exception as exc:
@@ -1668,6 +1683,7 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    setattr(child, "_delegate_route", route)
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -1714,6 +1730,7 @@ def _build_child_agent(
             child_subagent_id=subagent_id,
             child_role=effective_role,
             child_goal=goal,
+            child_route=route,
         )
     except Exception:
         logger.debug("subagent_start hook invocation failed", exc_info=True)
@@ -2088,6 +2105,9 @@ def _run_single_child(
     Returns a structured result dict.
     """
     child_start = time.monotonic()
+    child_route = getattr(child, "_delegate_route", None)
+    if not isinstance(child_route, str):
+        child_route = None
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, "tool_progress_callback", None)
@@ -2242,6 +2262,7 @@ def _run_single_child(
                     if isinstance(getattr(child, "model", None), str)
                     else None
                 ),
+                "route": getattr(child, "_delegate_route", None),
                 "started_at": time.time(),
                 "status": "running",
                 "tool_count": 0,
@@ -2443,6 +2464,7 @@ def _run_single_child(
                     else None
                 ),
                 "_child_role": getattr(child, "_delegate_role", None),
+                "route": child_route,
                 "diagnostic_path": diagnostic_path,
             }
             if _late_pending_steer:
@@ -2561,6 +2583,7 @@ def _run_single_child(
             "api_calls": api_calls,
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
+            "route": child_route,
             "exit_reason": exit_reason,
             "tokens": {
                 "input": (
@@ -2728,6 +2751,7 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "route": child_route,
         }
         if _late_pending_steer:
             _error_entry["missed_steer"] = _late_pending_steer
@@ -2900,6 +2924,7 @@ def _finalize_child_results(
                     parent_turn_id=getattr(parent_agent, "_current_turn_id", "") or "",
                     child_session_id=getattr(child, "session_id", None),
                     child_role=child_role,
+                    child_route=entry.get("route"),
                     child_summary=entry.get("summary"),
                     child_status=entry.get("status"),
                     tool_call_history=_subagent_stop_tool_call_history(
@@ -2980,6 +3005,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2987,13 +3013,16 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context and role)
-      - Batch:  provide tasks array [{goal, context, role}, ...]
+      - Single: provide goal (+ optional context, role, route)
+      - Batch:  provide tasks array [{goal, context, role, route}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
     toolset and can spawn its own workers, bounded by
-    delegation.max_spawn_depth.  Per-task role beats the top-level one.
+    delegation.max_spawn_depth. Per-task role beats the top-level one.
+
+    Named routes are allowlisted under delegation.routes. Per-task route beats
+    the top-level route, which beats delegation.default_route.
 
     Returns JSON with results array, one entry per task.
     """
@@ -3050,16 +3079,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3079,7 +3098,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [
+            {
+                "goal": goal,
+                "context": context,
+                "role": top_role,
+                "route": route,
+            }
+        ]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -3094,6 +3120,20 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Resolve each task independently: a mixed-route batch can use a separate
+    # provider/model credential bundle and reasoning effort for every child.
+    # Do this before constructing children so an invalid route or credential
+    # leaves no partially-built agents attached to the parent.
+    resolved_task_routes = []
+    try:
+        for t in task_list:
+            requested_route = t.get("route") or route
+            route_cfg, route_name = _resolve_delegation_route(cfg, requested_route)
+            creds = _resolve_delegation_credentials(route_cfg, parent_agent)
+            resolved_task_routes.append((route_cfg, route_name, creds))
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -3145,6 +3185,7 @@ def delegate_task(
     # subagent-lifecycle API).
     children = []
     for i, t in enumerate(task_list):
+        route_cfg, route_name, creds = resolved_task_routes[i]
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
@@ -3165,9 +3206,11 @@ def delegate_task(
             override_api_mode=creds["api_mode"],
             override_request_overrides=creds.get("request_overrides"),
             override_max_tokens=creds.get("max_output_tokens"),
+            override_reasoning_effort=route_cfg.get("reasoning_effort"),
             override_acp_command=creds.get("command"),
             override_acp_args=creds.get("args"),
             role=effective_role,
+            route=route_name,
         )
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
@@ -3335,6 +3378,19 @@ def delegate_task(
 
             # Sort by task_index so results match input order
             results.sort(key=lambda r: r["task_index"])
+
+        # Preserve the selected route even for synthetic error entries or test
+        # doubles that did not originate in _run_single_child.
+        for entry in results:
+            task_index = entry.get("task_index")
+            if isinstance(task_index, int) and 0 <= task_index < len(resolved_task_routes):
+                route_name = resolved_task_routes[task_index][1]
+                if route_name is None:
+                    # Keep legacy result payloads unchanged when named routes
+                    # are not configured or not selected.
+                    entry.pop("route", None)
+                else:
+                    entry.setdefault("route", route_name)
 
         # Cap subagent summaries against the parent's remaining context
         # headroom (split across the batch) before they enter the parent's
@@ -3536,6 +3592,9 @@ def delegate_task(
             return tuple(parts), in_tool
 
         _goals = [t["goal"] for t in task_list]
+        dispatch_model = (
+            resolved_task_routes[0][2].get("model") if n_tasks == 1 else None
+        )
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -3543,7 +3602,7 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=dispatch_model,
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3577,6 +3636,7 @@ def delegate_task(
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
+                "routes": [route_name for _, route_name, _ in resolved_task_routes],
                 "note": note,
             }
             if live_paths:
@@ -3695,6 +3755,71 @@ def _resolve_child_credential_pool(
             exc,
         )
     return None
+
+
+_ROUTE_EXECUTION_FIELDS = (
+    "model",
+    "provider",
+    "base_url",
+    "api_key",
+    "api_mode",
+    "reasoning_effort",
+)
+
+
+def _configured_route_names(cfg: dict) -> List[str]:
+    """Return configured route names suitable for the model-facing schema."""
+    routes = cfg.get("routes") if isinstance(cfg, dict) else None
+    if not isinstance(routes, dict):
+        return []
+    return [name for name in routes if isinstance(name, str) and name.strip()]
+
+
+def _resolve_delegation_route(
+    cfg: dict, requested_route: Optional[str]
+) -> tuple[dict, Optional[str]]:
+    """Resolve one allowlisted named route over legacy delegation defaults.
+
+    ``requested_route`` is the already-precedenced per-task or top-level value.
+    When absent, ``delegation.default_route`` is used. Named routes override
+    only execution settings, preserving top-level operational controls.
+    """
+    base_cfg = dict(cfg) if isinstance(cfg, dict) else {}
+    raw_routes = base_cfg.get("routes")
+    if raw_routes is None:
+        routes: dict = {}
+    elif isinstance(raw_routes, dict):
+        routes = raw_routes
+    else:
+        raise ValueError("delegation.routes must be an object mapping route names to settings.")
+
+    candidate = requested_route
+    if candidate is None or (isinstance(candidate, str) and not candidate.strip()):
+        candidate = base_cfg.get("default_route")
+    if candidate is None or (isinstance(candidate, str) and not candidate.strip()):
+        return base_cfg, None
+    if not isinstance(candidate, str):
+        raise ValueError("Delegation route must be a configured route name.")
+
+    route_name = candidate.strip()
+    available_names = _configured_route_names(base_cfg)
+    if route_name not in available_names:
+        available = ", ".join(available_names) if available_names else "(none)"
+        raise ValueError(
+            f"Unknown delegation route '{route_name}'. Available routes: {available}."
+        )
+
+    route_cfg = routes[route_name]
+    if not isinstance(route_cfg, dict):
+        raise ValueError(
+            f"Delegation route '{route_name}' must be an object of route settings."
+        )
+
+    effective_cfg = dict(base_cfg)
+    for field in _ROUTE_EXECUTION_FIELDS:
+        if field in route_cfg:
+            effective_cfg[field] = route_cfg[field]
+    return effective_cfg, route_name
 
 
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
@@ -3890,9 +4015,10 @@ def _build_top_level_description() -> str:
         "for a batch) re-enters the conversation on its own. Do NOT wait or "
         "poll; continue other work.\n\n"
         "USE FOR: reasoning-heavy subtasks, work that would flood your context "
-        "with intermediate data, or independent parallel workstreams.\n"
+        "with intermediate data, independent parallel workstreams, or iterative "
+        "mechanical execution routed through a configured low-cost route.\n"
         "DO NOT USE FOR (use these instead):\n"
-        "- Mechanical multi-step work with no reasoning needed -> execute_code\n"
+        "- One deterministic script -> execute_code\n"
         "- A single tool call -> call the tool directly\n"
         "- Tasks needing user interaction -> subagents cannot ask questions\n"
         "- Durable work that must survive this session -> cronjob or "
@@ -3912,7 +4038,8 @@ def _build_top_level_description() -> str:
         "memory, send_message, or cronjob; orchestrators regain only "
         "delegate_task.\n"
         "- Children inherit the parent model and fallback chain unless pinned "
-        "globally via delegation.provider / delegation.model in config.yaml. "
+        "globally via delegation.provider / delegation.model or selected through "
+        "an allowlisted delegation.routes entry in config.yaml. "
         "Results are returned as an array, one entry per task."
     )
 
@@ -3927,7 +4054,8 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context/role are ignored; top-level route "
+        "remains the batch default unless a task supplies its own route."
     )
 
 
@@ -3968,23 +4096,82 @@ def _build_role_param_description() -> str:
     )
 
 
+def _build_route_param_description(*, per_task: bool = False) -> str:
+    """Describe the current allowlisted routes for top-level or task schema."""
+    try:
+        cfg = _load_config()
+    except Exception:
+        cfg = {}
+    route_names = _configured_route_names(cfg)
+    if not route_names:
+        return (
+            "Optional named child route. No routes are configured, so omit this "
+            "field to use legacy delegation defaults."
+        )
+
+    default_route = cfg.get("default_route") if isinstance(cfg, dict) else None
+    default_name = (
+        default_route.strip()
+        if isinstance(default_route, str) and default_route.strip() in route_names
+        else None
+    )
+    routes = cfg.get("routes") or {}
+    descriptions = []
+    for name in route_names:
+        route_cfg = routes.get(name)
+        description = route_cfg.get("description") if isinstance(route_cfg, dict) else None
+        if isinstance(description, str) and description.strip():
+            descriptions.append(f"{name}: {description.strip()}")
+
+    scope = "This task overrides the top-level route." if per_task else (
+        "This route applies to the single task or acts as the batch default."
+    )
+    text = (
+        f"Optional configured child route. Allowed routes: {', '.join(route_names)}. "
+        f"{scope}"
+    )
+    if default_name:
+        text += f" default: {default_name}."
+    if descriptions:
+        text += " Route descriptions: " + "; ".join(descriptions) + "."
+    return text
+
+
 def _build_dynamic_schema_overrides() -> dict:
     """Return per-call schema overrides reflecting current config.
 
     Plugged into ToolEntry.dynamic_schema_overrides so every
     get_definitions() pass rewrites the description fields to the user's
-    actual limits.
+    actual limits and configured route allowlist.
     """
-    overrides_params = {
-        **DELEGATE_TASK_SCHEMA["parameters"],
-    }
-    # Deep-copy properties so we don't mutate the static schema dict.
-    overrides_params["properties"] = {
-        k: dict(v) for k, v in DELEGATE_TASK_SCHEMA["parameters"]["properties"].items()
-    }
+    # The route enum lives under tasks.items.properties too, so a shallow copy
+    # would mutate the import-time static schema and leak stale config across
+    # sessions. Use a real deep copy for every dynamic rebuild.
+    overrides_params = copy.deepcopy(DELEGATE_TASK_SCHEMA["parameters"])
     overrides_params["properties"]["tasks"]["description"] = _build_tasks_param_description()
     overrides_params["properties"]["role"]["description"] = _build_role_param_description()
 
+    cfg = _load_config()
+    route_names = _configured_route_names(cfg)
+    default_route = cfg.get("default_route") if isinstance(cfg, dict) else None
+    default_name = (
+        default_route.strip()
+        if isinstance(default_route, str) and default_route.strip() in route_names
+        else None
+    )
+    route_schemas = (
+        overrides_params["properties"]["route"],
+        overrides_params["properties"]["tasks"]["items"]["properties"]["route"],
+    )
+    for route_schema, per_task in zip(route_schemas, (False, True)):
+        route_schema["description"] = _build_route_param_description(per_task=per_task)
+        if route_names:
+            route_schema["enum"] = route_names
+            if default_name:
+                route_schema["default"] = default_name
+        else:
+            route_schema.pop("enum", None)
+            route_schema.pop("default", None)
     return {
         "description": _build_top_level_description(),
         "parameters": overrides_params,
@@ -4025,6 +4212,10 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "route": {
+                "type": "string",
+                "description": "(rebuilt at get_definitions() time)",
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -4034,6 +4225,10 @@ DELEGATE_TASK_SCHEMA = {
                         "context": {
                             "type": "string",
                             "description": "Task-specific context",
+                        },
+                        "route": {
+                            "type": "string",
+                            "description": "(rebuilt at get_definitions() time)",
                         },
                         "role": {
                             "type": "string",
@@ -4124,6 +4319,7 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        route=args.get("route"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),

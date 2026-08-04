@@ -1675,6 +1675,10 @@ DEFAULT_CONFIG = {
                            # "codex_responses", or "anthropic_messages". Empty = auto-detect
                            # from URL (e.g. /anthropic suffix → anthropic_messages). Set this
                            # explicitly for non-standard endpoints the heuristic can't detect.
+        # Allowlisted per-child model/provider routes. A route may override only
+        # execution fields; operational limits continue to come from this block.
+        "default_route": "",  # empty = legacy top-level delegation defaults
+        "routes": {},
         # When delegate_task narrows child toolsets explicitly, preserve any
         # MCP toolsets the parent already has enabled. On by default so
         # narrowing (e.g. toolsets=["web","browser"]) expresses "I want these
