@@ -490,6 +490,7 @@ def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
     # --- Phase 1: determine keeper and losers for every group without touching Qdrant ---
     plan: list[dict] = []           # {keeper_id, to_delete, group_idx, group}
     ids_to_delete: set[str] = set() # deduplicated across all groups
+    keepers: set[str] = set()       # IDs elected as keeper in a prior group
 
     for idx, group in enumerate(groups, 1):
         members = group["members"]
@@ -501,6 +502,13 @@ def consolidate_groups(groups: list, dry_run: bool = True) -> tuple[int, int]:
             continue
         keeper_id = pick_keeper(group)
         to_delete = [pid for pid in members if pid != keeper_id]
+        # Don't delete a point that was elected keeper in a prior group —
+        # otherwise a transitive chain (A,B) then (B,C) could demote B,
+        # causing A's information to be lost.
+        to_delete = [pid for pid in to_delete if pid not in keepers]
+        if not to_delete:
+            continue
+        keepers.add(keeper_id)
         ids_to_delete.update(to_delete)
         plan.append({
             "keeper_id": keeper_id,
@@ -646,6 +654,12 @@ def main():
         default=_DEFAULT_THRESHOLD,
         help=f"Cosine similarity threshold for duplicate detection (default: {_DEFAULT_THRESHOLD}).",
     )
+    parser.add_argument(
+        "--max-points",
+        type=int,
+        default=2000,
+        help="Safety limit on number of points to compare (default: 2000). Use --max-points 0 to disable.",
+    )
     args = parser.parse_args()
 
     # --yes without --consolidate is meaningless; warn and exit
@@ -681,7 +695,7 @@ def main():
     else:
         print(f"Qdrant mode: HTTP ({resolved_url})", file=sys.stderr)
     print(f"Collection:  {args.collection}", file=sys.stderr)
-    if args.user:
+    if args.user is not None:
         print(f"User filter: {args.user!r}", file=sys.stderr)
     else:
         print("User filter: (all users in collection)", file=sys.stderr)
@@ -701,8 +715,19 @@ def main():
     points = scroll_all_points()
     print(f"Fetched {len(points)} total points.", file=sys.stderr)
 
+    if args.max_points and len(points) > args.max_points:
+        print(
+            f"ERROR: Collection has {len(points)} points, exceeding --max-points limit of {args.max_points}.",
+            file=sys.stderr,
+        )
+        print(
+            "O(n²) comparison would be very slow. Use --max-points 0 to disable this check, or filter by --user.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     # Determine which user_ids to scan
-    if args.user:
+    if args.user is not None:
         user_ids = [args.user]
     else:
         user_ids = sorted({
