@@ -23,7 +23,7 @@ class TestCopilotCatalogApiKeyResolution:
             "hermes_cli.auth.resolve_api_key_provider_credentials",
             return_value={"api_key": ""},
         ), patch(
-            "hermes_cli.auth.read_credential_pool",
+            "hermes_cli.auth.read_runtime_credential_pool",
             return_value=[{"access_token": "gho_abc123"}],
         ), patch(
             "hermes_cli.copilot_auth.exchange_copilot_token",
@@ -49,7 +49,7 @@ class TestCopilotCatalogApiKeyResolution:
             "hermes_cli.auth.resolve_api_key_provider_credentials",
             return_value={"api_key": ""},
         ), patch(
-            "hermes_cli.auth.read_credential_pool",
+            "hermes_cli.auth.read_runtime_credential_pool",
             return_value=[
                 {"access_token": "gho_unsupported_account"},
                 {"access_token": "gho_valid_token"},

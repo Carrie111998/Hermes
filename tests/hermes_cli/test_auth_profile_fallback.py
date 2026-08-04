@@ -1,12 +1,9 @@
-"""Tests for cross-profile auth fallback.
+"""Tests for shared credential pools across profiles.
 
-When ``HERMES_HOME`` points to a named profile, ``read_credential_pool()``
-and ``get_provider_auth_state()`` fall back to the global-root
-``auth.json`` per-provider when the profile has no entries for that
-provider.  Writes still target the profile only.
-
-See the #18594 follow-up report: profile workers couldn't see providers
-authenticated only at the global root.
+Provider singleton state remains profile-aware with a global-root fallback,
+but ``credential_pool`` and its suppression metadata are machine-wide state.
+Every profile reads and writes the one pool in the global-root ``auth.json``.
+Legacy profile-local pool rows are migrated into that shared store on access.
 """
 
 from __future__ import annotations
@@ -53,8 +50,137 @@ def _write(path: Path, payload: dict) -> None:
 
 
 # ---------------------------------------------------------------------------
-# read_credential_pool — provider-slice reads
+# read_credential_pool — shared provider-slice reads and migration
 # ---------------------------------------------------------------------------
+
+
+def test_profile_entries_migrate_into_shared_pool(profile_env):
+    """Legacy profile rows join the root pool instead of shadowing it."""
+    from hermes_cli.auth import read_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-1",
+            "label": "global-key",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-or-global",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "prof-1",
+            "label": "profile-key",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-or-profile",
+        }],
+    }))
+
+    assert [entry["id"] for entry in read_credential_pool("openrouter")] == [
+        "glob-1",
+        "prof-1",
+    ]
+
+    shared = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert [entry["id"] for entry in shared["credential_pool"]["openrouter"]] == [
+        "glob-1",
+        "prof-1",
+    ]
+    local = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert "credential_pool" not in local
+
+
+def test_repeated_profile_migration_deduplicates_cloned_rows(profile_env):
+    """A clone-all copy of root auth state must not duplicate credentials."""
+    from hermes_cli.auth import read_credential_pool
+
+    entry = {
+        "id": "shared-1",
+        "label": "same-account",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "manual:device_code",
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+    }
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [entry],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [dict(entry)],
+    }))
+
+    assert [item["id"] for item in read_credential_pool("openai-codex")] == [
+        "shared-1",
+    ]
+    assert [item["id"] for item in read_credential_pool("openai-codex")] == [
+        "shared-1",
+    ]
+
+
+def test_profile_migration_remaps_same_id_when_secret_material_differs(profile_env):
+    """An ID collision alone cannot discard a distinct migrated account."""
+    from hermes_cli.auth import read_credential_pool
+
+    shared_entry = {
+        "id": "shared-1",
+        "source": "manual:device_code",
+        "access_token": "current-access",
+        "refresh_token": "current-refresh",
+    }
+    stale_entry = {
+        **shared_entry,
+        "access_token": "stale-access",
+        "refresh_token": "stale-refresh",
+    }
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(pool={"openai-codex": [shared_entry]}),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(pool={"openai-codex": [stale_entry]}),
+    )
+
+    entries = read_credential_pool("openai-codex")
+    assert len(entries) == 2
+    assert entries[0]["id"] == "shared-1"
+    assert entries[0]["refresh_token"] == "current-refresh"
+    assert entries[1]["id"] != "shared-1"
+    assert entries[1]["refresh_token"] == "stale-refresh"
+
+
+def test_profile_migration_deduplicates_legacy_singleton_alias(profile_env):
+    """The old device-code/manual alias pair represents one OAuth account."""
+    from hermes_cli.auth import read_credential_pool
+
+    shared_entry = {
+        "id": "shared-1",
+        "label": "same-account",
+        "auth_type": "oauth",
+        "priority": 0,
+        "source": "device_code",
+        "access_token": "access-token",
+        "refresh_token": "refresh-token",
+    }
+    profile_entry = {
+        **shared_entry,
+        "id": "legacy-alias",
+        "source": "manual:device_code",
+    }
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [shared_entry],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openai-codex": [profile_entry],
+    }))
+
+    assert [item["id"] for item in read_credential_pool("openai-codex")] == [
+        "shared-1",
+    ]
 
 
 
@@ -81,6 +207,48 @@ def test_missing_global_auth_file_is_safe(profile_env):
 
     assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
     assert read_credential_pool("anthropic") == []
+
+
+def test_shared_pool_pytest_seatbelt_uses_windows_auth_root(monkeypatch, tmp_path):
+    from hermes_cli import auth
+
+    local_appdata = tmp_path / "LocalAppData"
+    monkeypatch.setattr(auth.sys, "platform", "win32")
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "seatbelt")
+    monkeypatch.setenv("LOCALAPPDATA", str(local_appdata))
+
+    assert auth._is_real_user_auth_store_under_test(
+        local_appdata / "hermes" / "auth.json"
+    )
+
+
+@pytest.mark.parametrize(
+    ("platform", "missing_env", "relative_auth_path"),
+    [
+        ("linux", "HOME", Path(".hermes/auth.json")),
+        ("win32", "LOCALAPPDATA", Path("AppData/Local/hermes/auth.json")),
+    ],
+)
+def test_shared_pool_pytest_seatbelt_uses_platform_fallback_when_env_missing(
+    monkeypatch,
+    tmp_path,
+    platform,
+    missing_env,
+    relative_auth_path,
+):
+    """Missing HOME/LOCALAPPDATA must not make the real-store guard fail open."""
+    from hermes_cli import auth
+
+    monkeypatch.setattr(auth.sys, "platform", platform)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "seatbelt")
+    monkeypatch.delenv(missing_env, raising=False)
+    real_auth_path = tmp_path / relative_auth_path
+    monkeypatch.setattr(auth, "_global_auth_file_path", lambda: real_auth_path)
+
+    assert auth._is_real_user_auth_store_under_test(real_auth_path)
+    with pytest.raises(RuntimeError, match="real user credential pool"):
+        auth._credential_pool_auth_file_path()
 
 
 def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
@@ -136,6 +304,296 @@ def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
     assert get_provider_auth_state("nous") is None
 
 
+def test_profile_logout_removes_provider_from_shared_pool(profile_env):
+    from hermes_cli.auth import clear_provider_auth
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(pool={"openai-codex": [{
+            "id": "shared",
+            "source": "manual:device_code",
+            "access_token": "shared-access",
+            "refresh_token": "shared-refresh",
+        }]}),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        {
+            **_make_auth_store(providers={
+                "openai-codex": {"tokens": {"access_token": "profile-access"}},
+            }),
+            "active_provider": "openai-codex",
+        },
+    )
+
+    assert clear_provider_auth("openai-codex") is True
+
+    shared = json.loads(
+        (profile_env["global"] / "auth.json").read_text(encoding="utf-8")
+    )
+    local = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    assert "openai-codex" not in shared.get("credential_pool", {})
+    assert "openai-codex" not in local.get("providers", {})
+
+
+def test_profile_logout_keeps_provider_retryable_when_shared_delete_fails(
+    profile_env, monkeypatch
+):
+    """A failed shared-pool save must leave active/provider state for retry."""
+    from hermes_cli import auth
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        _make_auth_store(pool={"openai-codex": [{
+            "id": "shared",
+            "source": "manual:device_code",
+            "access_token": "shared-access",
+            "refresh_token": "shared-refresh",
+        }]}),
+    )
+    _write(
+        profile_path,
+        {
+            **_make_auth_store(providers={
+                "openai-codex": {"tokens": {"access_token": "profile-access"}},
+            }),
+            "active_provider": "openai-codex",
+        },
+    )
+
+    real_save = auth._save_auth_store
+    failed_once = False
+
+    def fail_first_shared_save(store, target_path=None):
+        nonlocal failed_once
+        if target_path == root_path and not failed_once:
+            failed_once = True
+            raise OSError("injected shared save failure")
+        return real_save(store, target_path=target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", fail_first_shared_save)
+
+    with pytest.raises(OSError, match="injected shared save failure"):
+        auth.clear_provider_auth()
+
+    local_after_failure = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert local_after_failure["active_provider"] == "openai-codex"
+    assert "openai-codex" in local_after_failure["providers"]
+
+    assert auth.clear_provider_auth() is True
+    local_after_retry = json.loads(profile_path.read_text(encoding="utf-8"))
+    shared_after_retry = json.loads(root_path.read_text(encoding="utf-8"))
+    assert local_after_retry.get("active_provider") is None
+    assert "openai-codex" not in local_after_retry.get("providers", {})
+    assert "openai-codex" not in shared_after_retry.get("credential_pool", {})
+
+
+def test_classic_logout_deletes_provider_and_pool_in_one_save(
+    classic_env, monkeypatch
+):
+    """Same-file provider/pool cleanup is one atomic auth.json transaction."""
+    from hermes_cli import auth
+
+    auth_path = classic_env / "auth.json"
+    _write(
+        auth_path,
+        {
+            **_make_auth_store(
+                pool={"openai-codex": [{"id": "shared"}]},
+                providers={"openai-codex": {"tokens": {"access_token": "active"}}},
+            ),
+            "active_provider": "openai-codex",
+        },
+    )
+    real_save = auth._save_auth_store
+    saves = 0
+
+    def count_save(store, target_path=None):
+        nonlocal saves
+        saves += 1
+        return real_save(store, target_path=target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", count_save)
+
+    assert auth.clear_provider_auth() is True
+    assert saves == 1
+    stored = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert stored.get("active_provider") is None
+    assert "openai-codex" not in stored.get("providers", {})
+    assert "openai-codex" not in stored.get("credential_pool", {})
+
+
+def test_profile_codex_reauth_updates_shared_pool_not_profile_pool(profile_env):
+    from hermes_cli.auth import _save_codex_tokens
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(pool={"openai-codex": [{
+            "id": "shared",
+            "source": "device_code",
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+        }]}),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(providers={
+            "openai-codex": {
+                "tokens": {
+                    "access_token": "old-access",
+                    "refresh_token": "old-refresh",
+                }
+            },
+        }),
+    )
+
+    _save_codex_tokens(
+        {"access_token": "new-access", "refresh_token": "new-refresh"},
+        last_refresh="2026-08-04T00:00:00Z",
+    )
+
+    shared = json.loads(
+        (profile_env["global"] / "auth.json").read_text(encoding="utf-8")
+    )
+    local = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    shared_entry = shared["credential_pool"]["openai-codex"][0]
+    assert shared_entry["access_token"] == "new-access"
+    assert shared_entry["refresh_token"] == "new-refresh"
+    assert "credential_pool" not in local
+    assert (
+        local["providers"]["openai-codex"]["tokens"]["access_token"]
+        == "new-access"
+    )
+
+
+@pytest.mark.parametrize("failed_save", ["shared", "profile"])
+def test_profile_codex_reauth_retry_repairs_legacy_alias_after_partial_save(
+    profile_env, monkeypatch, failed_save
+):
+    """Either named-profile save can fail once without stranding an alias."""
+    from hermes_cli import auth
+
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        _make_auth_store(
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "legacy-alias",
+                        "source": "manual:device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "last_status": "dead",
+                    },
+                    {
+                        "id": "singleton-seed",
+                        "source": "device_code",
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                        "last_status": "dead",
+                    },
+                    {
+                        "id": "independent-account",
+                        "source": "manual:device_code",
+                        "access_token": "independent-access",
+                        "refresh_token": "independent-refresh",
+                        "last_status": "exhausted",
+                        "last_error_code": 429,
+                    },
+                ]
+            }
+        ),
+    )
+    _write(
+        profile_path,
+        _make_auth_store(
+            providers={
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                }
+            }
+        ),
+    )
+    real_save = auth._save_auth_store
+    failed_once = False
+
+    def fail_selected_save(store, target_path=None):
+        nonlocal failed_once
+        is_selected = (
+            target_path == root_path
+            if failed_save == "shared"
+            else target_path is None
+        )
+        if is_selected and not failed_once:
+            failed_once = True
+            raise OSError(f"injected {failed_save} save failure")
+        return real_save(store, target_path=target_path)
+
+    monkeypatch.setattr(auth, "_save_auth_store", fail_selected_save)
+    new_tokens = {
+        "access_token": "new-access",
+        "refresh_token": "new-refresh",
+    }
+
+    with pytest.raises(OSError, match=f"injected {failed_save} save failure"):
+        auth._save_codex_tokens(new_tokens, last_refresh="2026-08-04T00:00:00Z")
+
+    root_after_failure = json.loads(root_path.read_text(encoding="utf-8"))
+    profile_after_failure = json.loads(profile_path.read_text(encoding="utf-8"))
+    rows_after_failure = {
+        row["id"]: row
+        for row in root_after_failure["credential_pool"]["openai-codex"]
+    }
+    if failed_save == "shared":
+        assert rows_after_failure["legacy-alias"]["access_token"] == "old-access"
+        assert (
+            profile_after_failure["providers"]["openai-codex"]["tokens"][
+                "access_token"
+            ]
+            == "old-access"
+        )
+    else:
+        assert rows_after_failure["legacy-alias"]["access_token"] == "new-access"
+        assert (
+            profile_after_failure["providers"]["openai-codex"]["tokens"][
+                "access_token"
+            ]
+            == "old-access"
+        )
+
+    auth._save_codex_tokens(new_tokens, last_refresh="2026-08-04T00:00:00Z")
+
+    root_after_retry = json.loads(root_path.read_text(encoding="utf-8"))
+    profile_after_retry = json.loads(profile_path.read_text(encoding="utf-8"))
+    rows = {
+        row["id"]: row
+        for row in root_after_retry["credential_pool"]["openai-codex"]
+    }
+    for alias_id in ("legacy-alias", "singleton-seed"):
+        assert rows[alias_id]["access_token"] == "new-access"
+        assert rows[alias_id]["refresh_token"] == "new-refresh"
+        assert rows[alias_id]["last_status"] is None
+    assert rows["independent-account"]["access_token"] == "independent-access"
+    assert rows["independent-account"]["refresh_token"] == "independent-refresh"
+    assert rows["independent-account"]["last_status"] == "exhausted"
+    assert rows["independent-account"]["last_error_code"] == 429
+    assert (
+        profile_after_retry["providers"]["openai-codex"]["tokens"]
+        == new_tokens
+    )
+
+
 # ---------------------------------------------------------------------------
 # _load_provider_state — internal global fallback (issue #18594 follow-up)
 #
@@ -161,11 +619,11 @@ def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
 
 
 # ---------------------------------------------------------------------------
-# Writes stay scoped to the profile
+# Writes and suppression metadata target the shared root
 # ---------------------------------------------------------------------------
 
 
-def test_write_credential_pool_targets_profile_not_global(profile_env):
+def test_write_credential_pool_targets_shared_root(profile_env):
     from hermes_cli.auth import read_credential_pool, write_credential_pool
 
     _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
@@ -188,16 +646,28 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
         "access_token": "sk-profile-new",
     }])
 
-    # Global auth.json unchanged.
+    # The shared root now owns both the existing and newly-added entries.
     global_data = json.loads((profile_env["global"] / "auth.json").read_text())
-    assert global_data["credential_pool"]["openrouter"][0]["id"] == "glob-1"
+    assert [entry["id"] for entry in global_data["credential_pool"]["openrouter"]] == [
+        "prof-new",
+        "glob-1",
+    ]
+    assert not (profile_env["profile"] / "auth.json").exists()
+    assert [e["id"] for e in read_credential_pool("openrouter")] == [
+        "prof-new",
+        "glob-1",
+    ]
 
-    # Profile auth.json holds the new entry.
-    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
-    assert profile_data["credential_pool"]["openrouter"][0]["id"] == "prof-new"
 
-    # Subsequent read returns profile (shadows global).
-    assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+def test_suppression_is_shared_across_profiles(profile_env):
+    from hermes_cli.auth import is_source_suppressed, suppress_credential_source
+
+    suppress_credential_source("openai-codex", "device_code")
+
+    shared = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert shared["suppressed_sources"]["openai-codex"] == ["device_code"]
+    assert not (profile_env["profile"] / "auth.json").exists()
+    assert is_source_suppressed("openai-codex", "device_code") is True
 
 
 
@@ -288,3 +758,272 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_named_profile_runtime_pool_excludes_retained_seed_rows(profile_env):
+    from hermes_cli.auth import read_runtime_credential_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "retained-seed",
+                        "source": "device_code",
+                        "access_token": "other-profile-access",
+                    },
+                    {
+                        "id": "shared-manual",
+                        "source": "manual:device_code",
+                        "access_token": "shared-access",
+                    },
+                ]
+            }
+        ),
+    )
+
+    assert [
+        entry["id"] for entry in read_runtime_credential_pool("openai-codex")
+    ] == ["shared-manual"]
+
+
+def test_classic_runtime_pool_keeps_legacy_seed_rows(classic_env):
+    from hermes_cli.auth import read_runtime_credential_pool
+
+    _write(
+        classic_env / "auth.json",
+        _make_auth_store(
+            pool={
+                "openai-codex": [
+                    {
+                        "id": "classic-seed",
+                        "source": "device_code",
+                        "access_token": "classic-access",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert [
+        entry["id"] for entry in read_runtime_credential_pool("openai-codex")
+    ] == ["classic-seed"]
+
+
+def test_profile_migration_preserves_distinct_photon_rows(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "photon_project": [
+                    {
+                        "id": "root-project",
+                        "project_id": "root",
+                        "project_secret": "root-secret",
+                    }
+                ],
+                "photon_user": [
+                    {
+                        "id": "root-user",
+                        "from_number": "+10000000001",
+                        "user_number": "+10000000002",
+                    }
+                ],
+            }
+        ),
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "photon_project": [
+                    {
+                        "id": "profile-project",
+                        "project_id": "profile",
+                        "project_secret": "profile-secret",
+                    }
+                ],
+                "photon_user": [
+                    {
+                        "id": "profile-user",
+                        "from_number": "+10000000003",
+                        "user_number": "+10000000004",
+                    }
+                ],
+            }
+        ),
+    )
+
+    assert {entry["id"] for entry in read_credential_pool("photon_project")} == {
+        "root-project",
+        "profile-project",
+    }
+    assert {entry["id"] for entry in read_credential_pool("photon_user")} == {
+        "root-user",
+        "profile-user",
+    }
+
+
+def test_profile_migration_keeps_source_when_any_legacy_row_is_unsupported(
+    profile_env,
+):
+    from hermes_cli.auth import read_credential_pool
+
+    valid = {
+        "id": "valid-row",
+        "source": "manual",
+        "access_token": "valid-token",
+    }
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(pool={"openrouter": [valid, "unsupported-row"]}),
+    )
+
+    assert [entry["id"] for entry in read_credential_pool("openrouter")] == [
+        "valid-row"
+    ]
+    profile_store = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    assert profile_store["credential_pool"]["openrouter"][1] == "unsupported-row"
+
+
+def test_profile_migration_preserves_top_level_unsupported_suppressions(profile_env):
+    from hermes_cli.auth import read_credential_pool
+
+    valid = {
+        "id": "valid-row",
+        "source": "manual",
+        "access_token": "valid-token",
+    }
+    profile_store = _make_auth_store(pool={"openrouter": [valid]})
+    profile_store["suppressed_sources"] = "unsupported-shape"
+    _write(profile_env["profile"] / "auth.json", profile_store)
+
+    assert [entry["id"] for entry in read_credential_pool("openrouter")] == [
+        "valid-row"
+    ]
+    preserved = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    assert preserved["suppressed_sources"] == "unsupported-shape"
+    assert preserved["credential_pool"]["openrouter"][0]["id"] == "valid-row"
+
+
+def test_profile_migration_preserves_nested_malformed_shared_suppression(profile_env):
+    """An unsupported destination slice must not be replaced or cleaned up."""
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"openai-codex": "unsupported-shape"},
+        },
+    )
+    _write(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {},
+            "suppressed_sources": {"openai-codex": ["device_code"]},
+        },
+    )
+
+    from hermes_cli.auth import read_credential_pool
+
+    assert read_credential_pool("openai-codex") == []
+    root_store = json.loads(root_path.read_text(encoding="utf-8"))
+    profile_store = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert root_store["suppressed_sources"]["openai-codex"] == "unsupported-shape"
+    assert profile_store["suppressed_sources"]["openai-codex"] == ["device_code"]
+
+
+def test_profile_migration_preserves_malformed_destination_elements(profile_env):
+    """Unsupported nested destination values keep the profile source intact."""
+    root_path = profile_env["global"] / "auth.json"
+    profile_path = profile_env["profile"] / "auth.json"
+    _write(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {"openrouter": ["unsupported-destination-row"]},
+            "suppressed_sources": {
+                "openrouter": ["env:EXISTING", {"unsupported": "source"}]
+            },
+        },
+    )
+    _write(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "profile-row",
+                        "source": "manual",
+                        "api_key": "profile-key",
+                    }
+                ]
+            },
+            "suppressed_sources": {"openrouter": ["env:PROFILE"]},
+        },
+    )
+
+    from hermes_cli.auth import read_credential_pool
+
+    rows = read_credential_pool("openrouter")
+    assert rows[0] == "unsupported-destination-row"
+    assert any(isinstance(row, dict) and row.get("id") == "profile-row" for row in rows)
+    root_store = json.loads(root_path.read_text(encoding="utf-8"))
+    profile_store = json.loads(profile_path.read_text(encoding="utf-8"))
+    assert root_store["suppressed_sources"]["openrouter"] == [
+        "env:EXISTING",
+        {"unsupported": "source"},
+        "env:PROFILE",
+    ]
+    assert profile_store["credential_pool"]["openrouter"][0]["id"] == "profile-row"
+    assert profile_store["suppressed_sources"]["openrouter"] == ["env:PROFILE"]
+
+
+@pytest.mark.parametrize(
+    "shared_pool",
+    ["unsupported-top-level", {"openrouter": {"unsupported": "provider-shape"}}],
+)
+def test_profile_migration_preserves_malformed_shared_pool(profile_env, shared_pool):
+    from hermes_cli.auth import read_credential_pool
+
+    _write(
+        profile_env["global"] / "auth.json",
+        {"version": 1, "credential_pool": shared_pool},
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        _make_auth_store(
+            pool={
+                "openrouter": [
+                    {
+                        "id": "profile-row",
+                        "source": "manual",
+                        "access_token": "profile-token",
+                    }
+                ]
+            }
+        ),
+    )
+
+    assert read_credential_pool("openrouter") == []
+    root_store = json.loads(
+        (profile_env["global"] / "auth.json").read_text(encoding="utf-8")
+    )
+    profile_store = json.loads(
+        (profile_env["profile"] / "auth.json").read_text(encoding="utf-8")
+    )
+    assert root_store["credential_pool"] == shared_pool
+    assert profile_store["credential_pool"]["openrouter"][0]["id"] == "profile-row"

@@ -179,13 +179,15 @@ def _save_auth(data: Dict[str, Any]) -> None:
 
 def load_photon_token() -> Optional[str]:
     """Return the device-flow bearer token stored by ``login()`` or ``None``."""
-    auth = _load_auth()
-    pool = auth.get("credential_pool", {}).get("photon") or []
+    from hermes_cli.auth import read_credential_pool
+
+    pool = read_credential_pool("photon")
     if isinstance(pool, list) and pool:
         token = pool[0].get("access_token") or pool[0].get("token")
         if token:
             return str(token)
     # Backwards-compat shape: providers.photon.access_token
+    auth = _load_auth()
     legacy = auth.get("providers", {}).get("photon", {})
     if legacy.get("access_token"):
         return str(legacy["access_token"])
@@ -194,14 +196,12 @@ def load_photon_token() -> Optional[str]:
 
 def store_photon_token(token: str) -> None:
     """Persist a dashboard bearer token under ``credential_pool.photon``."""
-    from hermes_cli.auth import _auth_store_lock
+    from hermes_cli.auth import replace_credential_pool
 
-    with _auth_store_lock():
-        auth = _load_auth()
-        auth.setdefault("credential_pool", {})["photon"] = [
-            {"access_token": token, "issued_at": int(time.time())}
-        ]
-        _save_auth(auth)
+    replace_credential_pool(
+        "photon",
+        [{"id": "photon", "access_token": token, "issued_at": int(time.time())}],
+    )
 
 
 def clear_photon_token() -> None:
@@ -209,13 +209,18 @@ def clear_photon_token() -> None:
 
     Used to discard a stale/expired token before re-authentication.
     """
-    auth = _load_auth()
-    pool = auth.get("credential_pool", {})
-    photon = pool.get("photon", [])
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    photon = read_credential_pool("photon")
     if isinstance(photon, list) and photon:
-        pool["photon"] = []
-        _save_auth(auth)
+        removed_ids = [
+            str(entry.get("id"))
+            for entry in photon
+            if isinstance(entry, dict) and entry.get("id")
+        ]
+        write_credential_pool("photon", [], removed_ids=removed_ids)
     # Also clear the legacy shape if present.
+    auth = _load_auth()
     providers = auth.get("providers", {})
     if "photon" in providers:
         providers["photon"] = {}
@@ -258,8 +263,9 @@ def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
     env_sec = _get_scoped_secret("PHOTON_PROJECT_SECRET")
     if env_id and env_sec:
         return env_id, env_sec
-    auth = _load_auth()
-    proj = auth.get("credential_pool", {}).get("photon_project") or []
+    from hermes_cli.auth import read_credential_pool
+
+    proj = read_credential_pool("photon_project")
     if isinstance(proj, list) and proj:
         entry = proj[0]
         # back-compat: old records used "project_id" for the spectrum id
@@ -280,8 +286,9 @@ def load_dashboard_project_id() -> Optional[str]:
     env_id = os.getenv("PHOTON_DASHBOARD_PROJECT_ID")
     if env_id:
         return env_id
-    auth = _load_auth()
-    proj = auth.get("credential_pool", {}).get("photon_project") or []
+    from hermes_cli.auth import read_credential_pool
+
+    proj = read_credential_pool("photon_project")
     if isinstance(proj, list) and proj:
         entry = proj[0]
         return (
@@ -308,21 +315,19 @@ def store_project_credentials(
     ``auth.json`` so management commands work even when ``.env`` hasn't been
     loaded into the current process.
     """
-    from hermes_cli.auth import _auth_store_lock
+    from hermes_cli.auth import replace_credential_pool
 
-    with _auth_store_lock():
-        auth = _load_auth()
-        record: Dict[str, Any] = {
-            "spectrum_project_id": spectrum_project_id,
-            "project_secret": project_secret,
-            "issued_at": int(time.time()),
-        }
-        if dashboard_project_id:
-            record["dashboard_project_id"] = dashboard_project_id
-        if name:
-            record["name"] = name
-        auth.setdefault("credential_pool", {})["photon_project"] = [record]
-        _save_auth(auth)
+    record: Dict[str, Any] = {
+        "spectrum_project_id": spectrum_project_id,
+        "project_secret": project_secret,
+        "issued_at": int(time.time()),
+    }
+    if dashboard_project_id:
+        record["dashboard_project_id"] = dashboard_project_id
+    if name:
+        record["name"] = name
+    record["id"] = "photon-project"
+    replace_credential_pool("photon_project", [record])
     _persist_runtime_env(spectrum_project_id, project_secret)
 
 
@@ -336,21 +341,19 @@ def store_user_numbers(
     """Persist non-secret Photon user numbers for offline ``status`` output."""
     if not phone_number and not assigned_phone_number:
         return
-    from hermes_cli.auth import _auth_store_lock
+    from hermes_cli.auth import replace_credential_pool
 
-    with _auth_store_lock():
-        auth = _load_auth()
-        record: Dict[str, Any] = {"issued_at": int(time.time())}
-        if phone_number:
-            record["phone_number"] = phone_number
-        if assigned_phone_number:
-            record["assigned_phone_number"] = assigned_phone_number
-        if user_id:
-            record["user_id"] = user_id
-        if dashboard_project_id:
-            record["dashboard_project_id"] = dashboard_project_id
-        auth.setdefault("credential_pool", {})["photon_user"] = [record]
-        _save_auth(auth)
+    record: Dict[str, Any] = {"issued_at": int(time.time())}
+    if phone_number:
+        record["phone_number"] = phone_number
+    if assigned_phone_number:
+        record["assigned_phone_number"] = assigned_phone_number
+    if user_id:
+        record["user_id"] = user_id
+    if dashboard_project_id:
+        record["dashboard_project_id"] = dashboard_project_id
+    record["id"] = "photon-user"
+    replace_credential_pool("photon_user", [record])
 
 
 def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
@@ -943,8 +946,9 @@ def user_assigned_line(user: Optional[Dict[str, Any]]) -> Optional[str]:
 
 def load_user_numbers() -> Tuple[Optional[str], Optional[str]]:
     """Return ``(operator_phone_number, assigned_phone_number)`` for status."""
-    auth = _load_auth()
-    user_entries = auth.get("credential_pool", {}).get("photon_user") or []
+    from hermes_cli.auth import read_credential_pool
+
+    user_entries = read_credential_pool("photon_user")
     if isinstance(user_entries, list) and user_entries:
         entry = user_entries[0] or {}
         if isinstance(entry, dict):

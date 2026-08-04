@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import datetime
-import json
 import os
 import uuid
 from typing import Any, Dict, Optional
@@ -45,12 +44,9 @@ def has_xai_credentials() -> bool:
         if (get_secret("XAI_API_KEY", "") or "").strip():
             return True
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_cli.auth import _load_auth_store, read_runtime_credential_pool
 
-        auth_path = get_hermes_home() / "auth.json"
-        if not auth_path.exists():
-            return False
-        store = json.loads(auth_path.read_text(encoding="utf-8"))
+        store = _load_auth_store()
         providers = store.get("providers") if isinstance(store, dict) else None
         xai_state = providers.get("xai-oauth") if isinstance(providers, dict) else None
         tokens = xai_state.get("tokens") if isinstance(xai_state, dict) else None
@@ -59,12 +55,7 @@ def has_xai_credentials() -> bool:
             return True
         # Pool-only grants (multi-account ``auth add``) never write the
         # providers singleton; still count as present credentials.
-        credential_pool = store.get("credential_pool") if isinstance(store, dict) else None
-        entries = (
-            credential_pool.get("xai-oauth")
-            if isinstance(credential_pool, dict)
-            else None
-        )
+        entries = read_runtime_credential_pool("xai-oauth")
         if isinstance(entries, list):
             for entry in entries:
                 if not isinstance(entry, dict):

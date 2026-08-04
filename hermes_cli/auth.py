@@ -981,10 +981,8 @@ def _global_auth_file_path() -> Optional[Path]:
 
     Returns ``None`` when the profile and global root resolve to the same
     directory (classic mode, or custom HERMES_HOME that is not a profile).
-    Used by read-only fallback paths so providers authed at the root are
-    visible to profile processes that haven't configured them locally.
-
-    See issue #18594 follow-up (credential_pool shadowing).
+    Used both by provider-state fallback reads and by the shared credential
+    pool, whose reads and writes always target the root store.
     """
     try:
         from hermes_constants import get_default_hermes_root
@@ -998,13 +996,29 @@ def _global_auth_file_path() -> Optional[Path]:
     except Exception:
         if profile_home == global_root:
             return None
-    # No pytest seat belt here: this is a pure read-only path, and
-    # ``_load_global_auth_store()`` wraps the read in a try/except so an
-    # unreadable global file can never break the profile process.  The
-    # write-side seat belt still lives on ``_auth_file_path()`` where it
-    # belongs (that's what protects the real user's auth store from being
-    # corrupted by a mis-configured test).
     return global_root / "auth.json"
+
+
+def _is_real_user_auth_store_under_test(path: Path) -> bool:
+    """Return whether *path* is the real OS-user auth store during pytest."""
+    if not os.environ.get("PYTEST_CURRENT_TEST"):
+        return False
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        real_base = (
+            Path(local_appdata)
+            if local_appdata
+            else Path.home() / "AppData" / "Local"
+        )
+        real_root = real_base / "hermes" / "auth.json"
+    else:
+        real_home_env = os.environ.get("HOME", "").strip()
+        real_home = Path(real_home_env) if real_home_env else Path.home()
+        real_root = real_home / ".hermes" / "auth.json"
+    try:
+        return path.resolve(strict=False) == real_root.resolve(strict=False)
+    except Exception:
+        return True
 
 
 def _load_global_auth_store() -> Dict[str, Any]:
@@ -1026,21 +1040,267 @@ def _load_global_auth_store() -> Dict[str, Any]:
     global_path = _global_auth_file_path()
     if global_path is None or not global_path.exists():
         return {}
-    if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_env = os.environ.get("HOME", "")
-        if real_home_env:
-            real_root = Path(real_home_env) / ".hermes" / "auth.json"
-            try:
-                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
-                    return {}
-            except Exception:
-                pass
+    if _is_real_user_auth_store_under_test(global_path):
+        return {}
     try:
         return _load_auth_store(global_path)
     except Exception:
         # A malformed global store must not break profile reads. The
         # profile's own auth store is still authoritative.
         return {}
+
+
+def _credential_pool_auth_file_path() -> Path:
+    """Return the one machine-wide auth store that owns pool state."""
+    path = _global_auth_file_path() or _auth_file_path()
+    if _is_real_user_auth_store_under_test(path):
+        raise RuntimeError(
+            f"Refusing to use real user credential pool during test run: {path}. "
+            "Set HERMES_HOME and HOME to a tmp_path in the test fixture."
+        )
+    return path
+
+
+def _credential_pool_entry_identities(
+    provider_id: str,
+    entry: Dict[str, Any],
+) -> set[tuple]:
+    """Return non-ID identities used to deduplicate legacy pool copies.
+
+    Stable IDs are only row identifiers, not credential material identities.
+    Migration handles an ID collision separately by remapping the incoming row;
+    only matching secret/reference material is a true duplicate.
+    """
+    identities = set()
+
+    borrowed_fingerprint = str(entry.get("secret_fingerprint") or "").strip()
+    if borrowed_fingerprint:
+        identities.add(
+            (
+                provider_id,
+                "borrowed",
+                str(entry.get("source") or ""),
+                str(entry.get("base_url") or ""),
+                borrowed_fingerprint,
+            )
+        )
+        return identities
+
+    secret = (
+        entry.get("refresh_token")
+        or entry.get("agent_key")
+        or entry.get("access_token")
+        or entry.get("project_secret")
+        or ""
+    )
+    fingerprint = ""
+    if secret:
+        fingerprint = hashlib.sha256(
+            str(secret).encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+    if fingerprint:
+        identities.add(
+            (
+                provider_id,
+                "owned",
+                str(entry.get("base_url") or ""),
+                fingerprint,
+            )
+        )
+        return identities
+    ignored_identity_fields = {
+        "id",
+        "priority",
+        "last_status",
+        "last_status_at",
+        "last_error_code",
+        "last_error_reason",
+        "last_error_message",
+        "last_error_reset_at",
+        "request_count",
+    }
+    material = {
+        key: value
+        for key, value in entry.items()
+        if key not in ignored_identity_fields and value is not None
+    }
+    material_fingerprint = hashlib.sha256(
+        json.dumps(material, sort_keys=True, separators=(",", ":"), default=str).encode(
+            "utf-8", errors="surrogatepass"
+        )
+    ).hexdigest()
+    identities.add(
+        (
+            provider_id,
+            "reference",
+            material_fingerprint,
+        )
+    )
+    return identities
+
+
+def _merge_legacy_pool_state(
+    shared_store: Dict[str, Any],
+    profile_store: Dict[str, Any],
+) -> bool:
+    """Merge one legacy profile-local pool; return whether every row was understood."""
+    complete = True
+    shared_pool = shared_store.get("credential_pool")
+    if not isinstance(shared_pool, dict):
+        if "credential_pool" in shared_store:
+            complete = False
+            shared_pool = None
+        else:
+            shared_pool = {}
+            shared_store["credential_pool"] = shared_pool
+
+    profile_pool = profile_store.get("credential_pool")
+    if "credential_pool" in profile_store and not isinstance(profile_pool, dict):
+        complete = False
+    if isinstance(profile_pool, dict) and isinstance(shared_pool, dict):
+        for provider_id, raw_entries in profile_pool.items():
+            if not isinstance(raw_entries, list):
+                complete = False
+                continue
+            existing = shared_pool.get(provider_id)
+            if existing is not None and not isinstance(existing, list):
+                complete = False
+                continue
+            existing_entries = existing if isinstance(existing, list) else []
+            shared_pool[provider_id] = existing_entries
+            if any(not isinstance(item, dict) for item in existing_entries):
+                complete = False
+            identities = set().union(
+                *(
+                    _credential_pool_entry_identities(provider_id, item)
+                    for item in existing_entries
+                    if isinstance(item, dict)
+                )
+            )
+            used_ids = {
+                str(item.get("id"))
+                for item in existing_entries
+                if isinstance(item, dict) and item.get("id")
+            }
+            next_priority = max(
+                (
+                    item.get("priority", -1)
+                    for item in existing_entries
+                    if isinstance(item, dict)
+                    and isinstance(item.get("priority", -1), int)
+                ),
+                default=-1,
+            ) + 1
+            for raw_entry in raw_entries:
+                if not isinstance(raw_entry, dict):
+                    complete = False
+                    continue
+                entry = sanitize_borrowed_credential_payload(raw_entry, provider_id)
+                entry_identities = _credential_pool_entry_identities(provider_id, entry)
+                if not entry_identities.isdisjoint(identities):
+                    continue
+                entry = dict(entry)
+                entry_id = str(entry.get("id") or "")
+                while not entry_id or entry_id in used_ids:
+                    entry_id = uuid.uuid4().hex[:6]
+                    entry["id"] = entry_id
+                entry["priority"] = next_priority
+                next_priority += 1
+                existing_entries.append(entry)
+                identities.update(entry_identities)
+                used_ids.add(entry_id)
+
+    shared_suppressed = shared_store.get("suppressed_sources")
+    if not isinstance(shared_suppressed, dict):
+        if "suppressed_sources" in shared_store:
+            complete = False
+            shared_suppressed = None
+        else:
+            shared_suppressed = {}
+    profile_suppressed = profile_store.get("suppressed_sources")
+    if "suppressed_sources" in profile_store and not isinstance(
+        profile_suppressed, dict
+    ):
+        complete = False
+    if isinstance(profile_suppressed, dict) and isinstance(shared_suppressed, dict):
+        for provider_id, raw_sources in profile_suppressed.items():
+            if not isinstance(raw_sources, list):
+                complete = False
+                continue
+            sources = shared_suppressed.setdefault(provider_id, [])
+            if not isinstance(sources, list):
+                complete = False
+                continue
+            if any(not isinstance(source, str) for source in sources):
+                complete = False
+            for source in raw_sources:
+                if not isinstance(source, str):
+                    complete = False
+                    continue
+                if source not in sources:
+                    sources.append(source)
+    if isinstance(shared_suppressed, dict) and shared_suppressed:
+        shared_store["suppressed_sources"] = shared_suppressed
+    return complete
+
+
+def _migrate_active_profile_credential_pool() -> None:
+    """Move legacy active-profile pool state into the shared root store once."""
+    profile_path = _auth_file_path()
+    shared_path = _credential_pool_auth_file_path()
+    if _same_path(profile_path, shared_path) or not profile_path.exists():
+        return
+
+    # Pool reads are hot. Avoid taking the profile lock after migration has
+    # removed the legacy keys; re-check under the lock only when there is
+    # actually profile-local state to move.
+    profile_snapshot = _load_auth_store(profile_path)
+    if not (
+        isinstance(profile_snapshot.get("credential_pool"), dict)
+        or isinstance(profile_snapshot.get("suppressed_sources"), dict)
+    ):
+        return
+
+    # Preserve the established profile -> global lock order used by provider
+    # refresh transactions. Distinct profiles can wait on the shared lock
+    # without deadlocking one another.
+    with _auth_store_lock():
+        profile_store = _load_auth_store()
+        has_pool = isinstance(profile_store.get("credential_pool"), dict)
+        has_suppressions = isinstance(profile_store.get("suppressed_sources"), dict)
+        if not has_pool and not has_suppressions:
+            return
+        with _auth_store_lock(target_path=shared_path):
+            shared_store = _load_auth_store(shared_path)
+            migration_complete = _merge_legacy_pool_state(shared_store, profile_store)
+            _save_auth_store(shared_store, target_path=shared_path)
+
+        # Cleanup happens only after the root save succeeds. If cleanup fails,
+        # the next attempt is idempotent because migration deduplicates rows.
+        if not migration_complete:
+            logger.warning(
+                "Shared credential pool migration preserved unsupported legacy "
+                "state in %s; understood rows were copied but cleanup was skipped",
+                profile_path,
+            )
+            return
+        profile_store.pop("credential_pool", None)
+        profile_store.pop("suppressed_sources", None)
+        try:
+            _save_auth_store(profile_store)
+        except Exception as exc:
+            logger.warning(
+                "Shared credential pool migration succeeded, but legacy profile "
+                "state could not be removed from %s: %s",
+                profile_path,
+                exc,
+            )
+
+
+def _load_credential_pool_auth_store() -> tuple[Dict[str, Any], Path]:
+    _migrate_active_profile_credential_pool()
+    path = _credential_pool_auth_file_path()
+    return _load_auth_store(path), path
 
 
 def _auth_lock_path() -> Path:
@@ -1217,11 +1477,16 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
             )
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
-    if isinstance(raw, dict) and (
-        isinstance(raw.get("providers"), dict)
-        or isinstance(raw.get("credential_pool"), dict)
-    ):
-        raw.setdefault("providers", {})
+    auth_store_keys = {
+        "version",
+        "providers",
+        "credential_pool",
+        "suppressed_sources",
+        "active_provider",
+    }
+    if isinstance(raw, dict) and auth_store_keys.intersection(raw):
+        if "providers" not in raw:
+            raw["providers"] = {}
         if isinstance(raw.get("providers"), dict):
             _migrate_stale_nous_portal_url(raw["providers"])
         return raw
@@ -1490,51 +1755,40 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
-    """Return the persisted credential pool, or one provider slice.
-
-    In profile mode, the profile's credential pool is authoritative. If a
-    provider has no entries in the profile, entries from the global-root
-    ``auth.json`` are used as a read-only fallback — so workers spawned in a
-    profile can see providers that were only authenticated at global scope.
-
-    Profile entries always win: the global fallback only applies per-provider
-    when the profile has zero entries for that provider. Once the user runs
-    ``hermes auth add <provider>`` inside the profile, profile entries
-    fully shadow global for that provider on the next read.
-
-    Writes always go to the profile (``write_credential_pool`` is unchanged).
-    See issue #18594 follow-up.
-    """
-    auth_store = _load_auth_store()
+def read_credential_pool(provider_id: Optional[str] = None) -> Any:
+    """Return the machine-wide credential pool, or one provider slice."""
+    auth_store, _path = _load_credential_pool_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
         pool = {}
-
-    global_pool: Dict[str, Any] = {}
-    global_store = _load_global_auth_store()
-    maybe_global_pool = global_store.get("credential_pool") if global_store else None
-    if isinstance(maybe_global_pool, dict):
-        global_pool = maybe_global_pool
-
     if provider_id is None:
-        merged = dict(pool)
-        for gp_key, gp_entries in global_pool.items():
-            if not isinstance(gp_entries, list) or not gp_entries:
-                continue
-            # Per-provider shadowing: profile wins whenever it has ANY entries.
-            existing = merged.get(gp_key)
-            if isinstance(existing, list) and existing:
-                continue
-            merged[gp_key] = list(gp_entries)
-        return merged
-
+        return dict(pool)
     provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries)
-    # Profile has no entries for this provider — fall back to global.
-    global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    return list(provider_entries) if isinstance(provider_entries, list) else []
+
+
+def read_runtime_credential_pool(provider_id: str) -> List[Dict[str, Any]]:
+    """Return pool rows safe to consume directly as runtime credentials.
+
+    Named profiles may retain historical non-manual rows in the shared file for
+    downgrade-safe migration. Their active singleton/env values are rehydrated
+    as profile-local overlays by ``agent.credential_pool.load_pool``; raw token
+    fallbacks must not consume another profile's retained seed row.
+    """
+    entries = read_credential_pool(provider_id)
+    if not isinstance(entries, list):
+        return []
+    if _global_auth_file_path() is None:
+        return [entry for entry in entries if isinstance(entry, dict)]
+    return [
+        entry
+        for entry in entries
+        if isinstance(entry, dict)
+        and (
+            str(entry.get("source") or "") == "manual"
+            or str(entry.get("source") or "").startswith("manual:")
+        )
+    ]
 
 
 _POOL_STATUS_FIELDS = (
@@ -1629,8 +1883,10 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    _migrate_active_profile_credential_pool()
+    target_path = _credential_pool_auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1668,24 +1924,55 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store)
+        return _save_auth_store(auth_store, target_path=target_path)
+
+
+def replace_credential_pool(
+    provider_id: str,
+    entries: List[Dict[str, Any]],
+) -> Path:
+    """Atomically replace one provider slice with last-writer-wins semantics.
+
+    Most credential-pool writers merge concurrent account rows. Singleton-like
+    providers instead need rotation to remove every obsolete secret-bearing
+    row, including IDs assigned during legacy profile migration. This helper
+    performs that replacement under the shared-store lock so a read/write gap
+    cannot preserve a concurrently migrated stale row.
+    """
+    _migrate_active_profile_credential_pool()
+    target_path = _credential_pool_auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
+        pool = auth_store.get("credential_pool")
+        if not isinstance(pool, dict):
+            pool = {}
+            auth_store["credential_pool"] = pool
+        pool[provider_id] = [
+            sanitize_borrowed_credential_payload(entry, provider_id)
+            if isinstance(entry, dict)
+            else entry
+            for entry in entries
+        ]
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
     """Mark a credential source as suppressed so it won't be re-seeded."""
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    _migrate_active_profile_credential_pool()
+    target_path = _credential_pool_auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         suppressed = auth_store.setdefault("suppressed_sources", {})
         provider_list = suppressed.setdefault(provider_id, [])
         if source not in provider_list:
             provider_list.append(source)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
 
 
 def is_source_suppressed(provider_id: str, source: str) -> bool:
     """Check if a credential source has been suppressed by the user."""
     try:
-        auth_store = _load_auth_store()
+        auth_store, _path = _load_credential_pool_auth_store()
         suppressed = auth_store.get("suppressed_sources", {})
         return source in suppressed.get(provider_id, [])
     except Exception:
@@ -1697,8 +1984,10 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
 
     Returns True if a marker was cleared, False if no marker existed.
     """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    _migrate_active_profile_credential_pool()
+    target_path = _credential_pool_auth_file_path()
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
         suppressed = auth_store.get("suppressed_sources")
         if not isinstance(suppressed, dict):
             return False
@@ -1710,8 +1999,19 @@ def unsuppress_credential_source(provider_id: str, source: str) -> bool:
             suppressed.pop(provider_id, None)
         if not suppressed:
             auth_store.pop("suppressed_sources", None)
-        _save_auth_store(auth_store)
+        _save_auth_store(auth_store, target_path=target_path)
         return True
+
+
+def get_suppressed_credential_sources(provider_id: str) -> List[str]:
+    """Return shared suppression markers for one credential-pool provider."""
+    try:
+        auth_store, _path = _load_credential_pool_auth_store()
+        suppressed = auth_store.get("suppressed_sources", {})
+        sources = suppressed.get(provider_id, []) if isinstance(suppressed, dict) else []
+        return list(sources) if isinstance(sources, list) else []
+    except Exception:
+        return []
 
 
 def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
@@ -1827,7 +2127,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     # env-backed pool entries. This intentionally excludes ambient borrowed
     # sources like gh_cli / claude_code / qwen-cli.
     try:
-        for entry in read_credential_pool(normalized):
+        for entry in read_runtime_credential_pool(normalized):
             if not isinstance(entry, dict):
                 continue
             source = str(entry.get("source") or "").strip().lower()
@@ -1857,39 +2157,61 @@ def clear_provider_auth(provider_id: Optional[str] = None) -> bool:
     Clear auth state for a provider. Used by `hermes logout`.
     If provider_id is None, clears the active provider.
     Returns True if something was cleared.
+
+    The shared pool is the retry anchor in named-profile mode: remove it before
+    clearing the profile's provider/active state. In classic mode both live in
+    one auth.json and are committed by one atomic replace.
     """
+    _migrate_active_profile_credential_pool()
+    active_path = _auth_file_path()
+    shared_path = _credential_pool_auth_file_path()
+
     with _auth_store_lock():
         auth_store = _load_auth_store()
         target = provider_id or auth_store.get("active_provider")
         if not target:
             return False
 
-        providers = auth_store.get("providers", {})
+        providers = auth_store.get("providers")
         if not isinstance(providers, dict):
             providers = {}
             auth_store["providers"] = providers
 
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            pool = {}
-            auth_store["credential_pool"] = pool
+        if _same_path(active_path, shared_path):
+            pool = auth_store.get("credential_pool")
+            cleared = target in providers
+            providers.pop(target, None)
+            if isinstance(pool, dict) and target in pool:
+                del pool[target]
+                cleared = True
+            if auth_store.get("active_provider") == target:
+                auth_store["active_provider"] = None
+                cleared = True
+            if cleared:
+                _save_auth_store(auth_store)
+            return cleared
 
-        cleared = False
-        if target in providers:
-            del providers[target]
-            cleared = True
-        if target in pool:
-            del pool[target]
-            cleared = True
+        # Keep the profile lock outermost (the repository-wide profile -> root
+        # ordering), but durably delete shared state before mutating the profile
+        # snapshot. If this save fails, active_provider still identifies the
+        # same target so `clear_provider_auth()` can be retried without an ID.
+        shared_cleared = False
+        with _auth_store_lock(target_path=shared_path):
+            shared_store = _load_auth_store(shared_path)
+            shared_pool = shared_store.get("credential_pool")
+            if isinstance(shared_pool, dict) and target in shared_pool:
+                del shared_pool[target]
+                _save_auth_store(shared_store, target_path=shared_path)
+                shared_cleared = True
 
+        profile_cleared = target in providers
+        providers.pop(target, None)
         if auth_store.get("active_provider") == target:
             auth_store["active_provider"] = None
-            cleared = True
-
-        if not cleared:
-            return False
-        _save_auth_store(auth_store)
-    return True
+            profile_cleared = True
+        if profile_cleared:
+            _save_auth_store(auth_store)
+        return shared_cleared or profile_cleared
 
 
 def deactivate_provider() -> None:
@@ -3675,6 +3997,9 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
     """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    _migrate_active_profile_credential_pool()
+    shared_path = _credential_pool_auth_file_path()
+    active_path = _auth_file_path()
     with _auth_store_lock():
         auth_store = _load_auth_store()
         state = _load_provider_state(auth_store, "openai-codex") or {}
@@ -3690,13 +4015,28 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: 
         if label and str(label).strip():
             state["label"] = str(label).strip()
         _save_provider_state(auth_store, "openai-codex", state)
-        _sync_codex_pool_entries(
-            auth_store,
-            tokens,
-            last_refresh,
-            previous_singleton_tokens=previous_singleton_tokens,
-        )
-        _save_auth_store(auth_store)
+        if _same_path(active_path, shared_path):
+            _sync_codex_pool_entries(
+                auth_store,
+                tokens,
+                last_refresh,
+                previous_singleton_tokens=previous_singleton_tokens,
+            )
+            _save_auth_store(auth_store)
+        else:
+            # Repair the shared alias first. If either file save fails, retrying
+            # sees an old singleton with an old alias or an already-repaired
+            # alias; it can never see a new singleton while the alias is stale.
+            with _auth_store_lock(target_path=shared_path):
+                shared_store = _load_auth_store(shared_path)
+                _sync_codex_pool_entries(
+                    shared_store,
+                    tokens,
+                    last_refresh,
+                    previous_singleton_tokens=previous_singleton_tokens,
+                )
+                _save_auth_store(shared_store, target_path=shared_path)
+            _save_auth_store(auth_store)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -4222,8 +4562,10 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
     """
     cleared = 0
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
+        _migrate_active_profile_credential_pool()
+        target_path = _credential_pool_auth_file_path()
+        with _auth_store_lock(target_path=target_path):
+            auth_store = _load_auth_store(target_path)
             pool = auth_store.get("credential_pool")
             entries = pool.get("openai-codex") if isinstance(pool, dict) else None
             if not isinstance(entries, list):
@@ -4249,7 +4591,7 @@ def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
                 entry["last_error_reset_at"] = None
                 cleared += 1
             if cleared:
-                _save_auth_store(auth_store)
+                _save_auth_store(auth_store, target_path=target_path)
     except Exception:
         logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
     return cleared
@@ -4282,12 +4624,7 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
         return None
 
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return None
-        entries = pool.get("openai-codex")
+        entries = read_runtime_credential_pool("openai-codex")
         if not isinstance(entries, list):
             return None
         now = time.time()
@@ -4341,12 +4678,7 @@ def _pool_codex_access_token() -> str:
     the original AuthError).
     """
     try:
-        with _auth_store_lock():
-            auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return ""
-        entries = pool.get("openai-codex")
+        entries = read_runtime_credential_pool("openai-codex")
         if not isinstance(entries, list):
             return ""
 
@@ -4384,12 +4716,7 @@ def _xai_oauth_state_from_store(auth_store: Dict[str, Any]) -> Optional[Dict[str
         if access_token and refresh_token:
             return state
 
-    credential_pool = auth_store.get("credential_pool")
-    entries = (
-        credential_pool.get("xai-oauth")
-        if isinstance(credential_pool, dict)
-        else None
-    )
+    entries = read_runtime_credential_pool("xai-oauth")
     if isinstance(entries, list):
         for entry in entries:
             if not isinstance(entry, dict):
@@ -5569,24 +5896,38 @@ def _quarantine_nous_pool_entries(
     reason: str,
 ) -> bool:
     """Remove singleton-seeded Nous pool entries that contain dead OAuth state."""
-    pool = auth_store.get("credential_pool")
-    if not isinstance(pool, dict):
-        return False
-    entries = pool.get("nous")
-    if not isinstance(entries, list):
-        return False
-
-    retained = []
-    removed = False
     singleton_sources = {NOUS_DEVICE_CODE_SOURCE, f"manual:{NOUS_DEVICE_CODE_SOURCE}"}
-    for entry in entries:
-        if isinstance(entry, dict) and entry.get("source") in singleton_sources:
-            removed = True
-            continue
-        retained.append(entry)
+
+    def _remove_from(store: Dict[str, Any]) -> bool:
+        pool = store.get("credential_pool")
+        if not isinstance(pool, dict):
+            return False
+        entries = pool.get("nous")
+        if not isinstance(entries, list):
+            return False
+        retained = [
+            entry
+            for entry in entries
+            if not (
+                isinstance(entry, dict)
+                and entry.get("source") in singleton_sources
+            )
+        ]
+        if len(retained) == len(entries):
+            return False
+        pool["nous"] = retained
+        return True
+
+    removed = _remove_from(auth_store)
+    shared_path = _credential_pool_auth_file_path()
+    if not _same_path(shared_path, _auth_file_path()):
+        with _auth_store_lock(target_path=shared_path):
+            shared_store = _load_auth_store(shared_path)
+            if _remove_from(shared_store):
+                _save_auth_store(shared_store, target_path=shared_path)
+                removed = True
 
     if removed:
-        pool["nous"] = retained
         _oauth_trace(
             "nous_pool_device_code_quarantined",
             reason=reason,

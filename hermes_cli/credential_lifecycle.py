@@ -75,35 +75,32 @@ def _prune_env_pool_entries(env_var: str) -> List[str]:
 
     Returns the list of provider ids that had entries pruned.
     """
-    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
 
     source = f"env:{env_var}"
     pruned: List[str] = []
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        pool = auth_store.get("credential_pool")
-        if not isinstance(pool, dict):
-            return pruned
-        changed = False
-        for provider in list(pool.keys()):
-            entries = pool[provider]
-            if not isinstance(entries, list):
-                continue
-            kept = [
-                entry
-                for entry in entries
-                if not (isinstance(entry, dict) and entry.get("source") == source)
-            ]
-            if len(kept) == len(entries):
-                continue
-            changed = True
-            pruned.append(provider)
-            if kept:
-                pool[provider] = kept
-            else:
-                del pool[provider]
-        if changed:
-            _save_auth_store(auth_store)
+    pool = read_credential_pool(None)
+    if not isinstance(pool, dict):
+        return pruned
+    for provider, entries in list(pool.items()):
+        if not isinstance(entries, list):
+            continue
+        removed_ids = {
+            str(entry.get("id"))
+            for entry in entries
+            if isinstance(entry, dict)
+            and entry.get("source") == source
+            and entry.get("id")
+        }
+        kept = [
+            entry
+            for entry in entries
+            if not (isinstance(entry, dict) and entry.get("source") == source)
+        ]
+        if len(kept) == len(entries):
+            continue
+        pruned.append(provider)
+        write_credential_pool(provider, kept, removed_ids=removed_ids)
     return pruned
 
 

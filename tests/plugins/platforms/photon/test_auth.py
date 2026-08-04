@@ -106,6 +106,63 @@ def test_store_project_credentials_round_trip(
     assert photon_auth.load_dashboard_project_id() == "sp-123"
 
 
+def test_singleton_stores_replace_migrated_id_bearing_rows(
+    tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Rotation must remove obsolete migrated Photon secrets and metadata."""
+    monkeypatch.setattr(photon_auth, "_persist_runtime_env", lambda *a, **k: None)
+    (tmp_hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "photon": [
+                        {"id": "migrated-token", "access_token": "obsolete-token"}
+                    ],
+                    "photon_project": [
+                        {
+                            "id": "migrated-project",
+                            "spectrum_project_id": "obsolete-project",
+                            "project_secret": "obsolete-secret",
+                        }
+                    ],
+                    "photon_user": [
+                        {
+                            "id": "migrated-user",
+                            "phone_number": "+155****0000",
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    photon_auth.store_photon_token("current-token")
+    photon_auth.store_project_credentials(
+        spectrum_project_id="current-project",
+        project_secret="current-secret",
+    )
+    photon_auth.store_user_numbers(phone_number="+155****1111")
+
+    store = json.loads((tmp_hermes_home / "auth.json").read_text(encoding="utf-8"))
+    pool = store["credential_pool"]
+    assert [entry["id"] for entry in pool["photon"]] == ["photon"]
+    assert [entry["id"] for entry in pool["photon_project"]] == [
+        "photon-project"
+    ]
+    assert [entry["id"] for entry in pool["photon_user"]] == ["photon-user"]
+    serialized = json.dumps(pool, sort_keys=True)
+    for obsolete in (
+        "obsolete-token",
+        "obsolete-project",
+        "obsolete-secret",
+        "+155****0000",
+    ):
+        assert obsolete not in serialized
+
+
 def test_load_user_numbers_falls_back_to_home_channel(
     tmp_hermes_home: Path,
 ) -> None:

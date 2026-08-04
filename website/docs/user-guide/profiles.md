@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Profiles: Running Multiple Agents
 
-Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
+Run multiple independent Hermes agents on the same machine — each with its own config, environment-backed API keys, memory, sessions, skills, and gateway state. Credential-pool entries, including OAuth accounts added through `hermes auth`, are shared across profiles.
 
 ## What are profiles?
 
@@ -270,6 +270,14 @@ Add the line to your `~/.bashrc` or `~/.zshrc` for persistent completion. Comple
 ## How it works
 
 Profiles use the `HERMES_HOME` environment variable. When you run `coder chat`, the wrapper script sets `HERMES_HOME=~/.hermes/profiles/coder` before launching hermes. Since 119+ files in the codebase resolve paths via `get_hermes_home()`, Hermes state automatically scopes to the profile's directory — config, sessions, memory, skills, state database, gateway PID, logs, and cron jobs.
+
+The credential pool is the exception. Hermes stores pooled credentials and
+source-suppression state once in the root `~/.hermes/auth.json`, so adding an
+OAuth account through `hermes auth`, rotating to another account, or removing a
+pool entry is visible from every profile. Existing `credential_pool` data in a
+named profile's `auth.json` is merged into the shared root pool on first access
+and then removed from the profile file. Provider singleton state and profile
+`.env` files remain profile-aware; only the multi-account pool is machine-wide.
 
 This is separate from terminal working directory. Tool execution starts from `terminal.cwd` (or the launch directory when `cwd: "."` on the local backend), not automatically from `HERMES_HOME`.
 

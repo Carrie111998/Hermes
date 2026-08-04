@@ -12621,11 +12621,10 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
         if not provider.startswith(CUSTOM_POOL_PREFIX):
             try:
                 from hermes_cli.auth import (
-                    _load_auth_store,
+                    get_suppressed_credential_sources,
                     unsuppress_credential_source,
                 )
-                suppressed = _load_auth_store().get("suppressed_sources", {})
-                for src in list(suppressed.get(provider, []) or []):
+                for src in get_suppressed_credential_sources(provider):
                     unsuppress_credential_source(provider, src)
             except Exception:
                 _log.exception("unsuppress after pool add failed (non-fatal)")

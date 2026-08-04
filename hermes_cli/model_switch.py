@@ -2219,11 +2219,9 @@ def list_authenticated_providers(
         has_creds = any(os.environ.get(ev) for ev in env_vars)
         if not has_creds:
             try:
-                from hermes_cli.auth import _load_auth_store
-                store = _load_auth_store()
-                raw_pool_present = bool(
-                    store and store.get("credential_pool", {}).get(hermes_id)
-                )
+                from hermes_cli.auth import read_runtime_credential_pool
+
+                raw_pool_present = bool(read_runtime_credential_pool(hermes_id))
                 if raw_pool_present:
                     has_creds = _credential_pool_is_usable(
                         hermes_id, raw_pool_present=True

@@ -2648,7 +2648,7 @@ def _resolve_copilot_catalog_api_key() -> str:
       1. ``resolve_api_key_provider_credentials("copilot")`` — env vars
          (``COPILOT_GITHUB_TOKEN`` / ``GH_TOKEN`` / ``GITHUB_TOKEN``) plus
          the ``gh auth token`` CLI fallback.
-      2. ``read_credential_pool("copilot")`` — a token (typically a
+      2. ``read_runtime_credential_pool("copilot")`` — a token (typically a
          ``gho_*`` from device-code login, or a fine-grained PAT) stored in
          ``auth.json`` under ``credential_pool.copilot[]``. The pool is
          populated by ``hermes auth add copilot`` and by ``_seed_from_env``
@@ -2672,13 +2672,13 @@ def _resolve_copilot_catalog_api_key() -> str:
         pass
 
     try:
-        from hermes_cli.auth import read_credential_pool
+        from hermes_cli.auth import read_runtime_credential_pool
         from hermes_cli.copilot_auth import (
             exchange_copilot_token,
             validate_copilot_token,
         )
 
-        for entry in read_credential_pool("copilot"):
+        for entry in read_runtime_credential_pool("copilot"):
             if not isinstance(entry, dict):
                 continue
             raw = str(entry.get("access_token") or "").strip()

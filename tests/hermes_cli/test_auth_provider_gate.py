@@ -1,6 +1,8 @@
 """Tests for is_provider_explicitly_configured()."""
 
 import json
+from pathlib import Path
+
 import pytest
 
 
@@ -50,6 +52,79 @@ def test_ambient_pool_source_does_not_count_as_explicit(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("copilot") is False
+
+
+def test_named_profile_retained_explicit_flow_row_does_not_unlock_provider(
+    tmp_path, monkeypatch
+):
+    """Another profile's retained singleton seed is not explicit here."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    for key in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    (root / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "copilot": [
+                        {
+                            "id": "other-profile-seed",
+                            "source": "device_code",
+                            "auth_type": "oauth",
+                            "access_token": "other-profile-token",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    assert is_provider_explicitly_configured("copilot") is False
+
+
+def test_classic_retained_explicit_flow_row_still_unlocks_provider(
+    tmp_path, monkeypatch
+):
+    """Classic single-store installs preserve historical pool semantics."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    hermes_home = tmp_path / "classic"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    for key in ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN"):
+        monkeypatch.delenv(key, raising=False)
+    (hermes_home / "auth.json").write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "copilot": [
+                        {
+                            "id": "classic-seed",
+                            "source": "device_code",
+                            "auth_type": "oauth",
+                            "access_token": "classic-token",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    assert is_provider_explicitly_configured("copilot") is True
 
 
 def test_returns_true_when_moa_reference_slot_uses_provider(tmp_path, monkeypatch):

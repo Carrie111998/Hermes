@@ -7,6 +7,9 @@ during no-provider ``/model`` resolution, wins the model name, and sticks as
 the session provider (the "sticky provider fallback pollution" bug).
 """
 
+import json
+from pathlib import Path
+
 import pytest
 
 
@@ -84,6 +87,75 @@ def test_opaque_legacy_pool_value_stays_visible(monkeypatch):
     )
 
     assert _credential_pool_is_usable("opencode-go", raw_pool_present=True)
+
+
+@pytest.mark.parametrize(
+    ("named_profile", "expected_visible"),
+    [(True, False), (False, True)],
+)
+def test_section_one_pool_presence_uses_runtime_filtered_rows(
+    tmp_path, monkeypatch, named_profile, expected_visible
+):
+    """Retained profile seeds cannot authenticate a models.dev provider."""
+    import agent.models_dev as models_dev
+    import hermes_cli.models as models
+
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    if named_profile:
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        root = tmp_path / ".hermes"
+        hermes_home = root / "profiles" / "coder"
+        hermes_home.mkdir(parents=True)
+        auth_path = root / "auth.json"
+    else:
+        monkeypatch.setattr(Path, "home", lambda: fake_home)
+        hermes_home = tmp_path / "classic"
+        hermes_home.mkdir()
+        auth_path = hermes_home / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
+    auth_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "providers": {},
+                "credential_pool": {
+                    "deepseek": [
+                        {
+                            "id": "retained-explicit-seed",
+                            "source": "hermes_pkce",
+                            "auth_type": "api_key",
+                            "access_token": "other-profile-token",
+                        }
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        models_dev, "PROVIDER_TO_MODELS_DEV", {"deepseek": "deepseek"}
+    )
+    monkeypatch.setattr(
+        models_dev,
+        "fetch_models_dev",
+        lambda: {"deepseek": {"env": ["DEEPSEEK_API_KEY"]}},
+    )
+    monkeypatch.setattr(models, "_PROVIDER_MODELS", {"deepseek": ["deepseek-chat"]})
+    monkeypatch.setattr(models, "cached_provider_model_ids", lambda _provider: [])
+
+    from hermes_cli.model_switch import list_authenticated_providers
+
+    slugs = {
+        row["slug"]
+        for row in list_authenticated_providers(
+            current_provider="openrouter",
+            user_providers={},
+            custom_providers=[],
+        )
+    }
+    assert ("deepseek" in slugs) is expected_visible
 
 
 def test_picker_shows_exhausted_pool_provider(monkeypatch):

@@ -18,6 +18,7 @@ mocking the save boundary, so they exercise the actual atomic write path.
 
 import json
 import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -185,6 +186,20 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
     monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "stale-access",
+                        "refresh_token": "stale-refresh",
+                    }
+                }
+            },
+        },
+    )
 
     lock_held: dict = {"during_post": None}
     real_lock = A._auth_store_lock
@@ -232,6 +247,362 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     assert refreshed.refresh_token == "rotated-refresh"
     # The invariant: the single-use token POST ran inside the auth-store lock.
     assert lock_held["during_post"] is True
+
+
+@pytest.mark.parametrize("provider", ["openai-codex", "xai-oauth"])
+def test_named_profile_single_use_refresh_holds_profile_then_shared_lock_across_post(
+    provider, monkeypatch, tmp_path
+):
+    """Cross-profile refresh serialization is rooted at the shared pool store."""
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "before-access",
+                        "refresh_token": "before-refresh",
+                    }
+                }
+            },
+        },
+    )
+    entry = _entry(
+        provider,
+        id="shared-oauth",
+        access_token="before-access",
+        refresh_token="before-refresh",
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {provider: [entry.to_dict()]},
+        },
+    )
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    real_lock = A._auth_store_lock
+    depths = {profile_path: 0, root_path: 0}
+    outer_acquisitions = []
+    all_acquisitions = []
+
+    @contextmanager
+    def tracking_lock(*args, **kwargs):
+        target = kwargs.get("target_path") or A._auth_file_path()
+        all_acquisitions.append(target)
+        if depths.get(target, 0) == 0:
+            outer_acquisitions.append(target)
+        depths[target] = depths.get(target, 0) + 1
+        try:
+            with real_lock(*args, **kwargs):
+                yield
+        finally:
+            depths[target] -= 1
+
+    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
+    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
+    observed = {}
+
+    def fake_refresh(_access_token, _refresh_token, **_kwargs):
+        observed["profile"] = depths[profile_path] > 0
+        observed["shared"] = depths[root_path] > 0
+        return {
+            "access_token": "after-access",
+            "refresh_token": "after-refresh",
+            "last_refresh": "2026-08-04T00:00:00Z",
+        }
+
+    refresh_name = (
+        "refresh_codex_oauth_pure"
+        if provider == "openai-codex"
+        else "refresh_xai_oauth_pure"
+    )
+    monkeypatch.setattr(A, refresh_name, fake_refresh)
+
+    refreshed = CredentialPool(provider, [entry])._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert observed == {"profile": True, "shared": True}
+    assert outer_acquisitions[:2] == [profile_path, root_path]
+    assert all_acquisitions.count(profile_path) >= 2
+    assert all_acquisitions.count(root_path) >= 2
+
+
+def test_single_use_refresh_and_remove_overlap_without_pool_auth_deadlock(
+    monkeypatch, tmp_path
+):
+    """Refresh and removal must acquire pool/auth locks in one order."""
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    refresh_entry = _entry(
+        "openai-codex",
+        id="singleton",
+        access_token="before-access",
+        refresh_token="before-refresh",
+    )
+    manual_entry = PooledCredential(
+        provider="openai-codex",
+        id="manual",
+        label="manual",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=1,
+        source="manual:device_code",
+        access_token="manual-access",
+        refresh_token="manual-refresh",
+    )
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "before-access",
+                        "refresh_token": "before-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {},
+            "credential_pool": {
+                "openai-codex": [refresh_entry.to_dict(), manual_entry.to_dict()]
+            },
+        },
+    )
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    remove_has_pool_lock = threading.Event()
+    allow_remove_to_wait_for_auth = threading.Event()
+    refresh_post_started = threading.Event()
+    allow_refresh_post_to_finish = threading.Event()
+    real_write_pool = CP.write_credential_pool
+
+    def paused_write_pool(*args, **kwargs):
+        if threading.current_thread().name == "pool-remove":
+            remove_has_pool_lock.set()
+            assert allow_remove_to_wait_for_auth.wait(timeout=5)
+        return real_write_pool(*args, **kwargs)
+
+    def fake_refresh(_access_token, _refresh_token, **_kwargs):
+        refresh_post_started.set()
+        assert allow_refresh_post_to_finish.wait(timeout=5)
+        return {
+            "access_token": "after-access",
+            "refresh_token": "after-refresh",
+            "last_refresh": "2026-08-04T00:00:00Z",
+        }
+
+    monkeypatch.setattr(CP, "write_credential_pool", paused_write_pool)
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    pool = CredentialPool("openai-codex", [refresh_entry, manual_entry])
+    outcomes = {}
+    errors = []
+
+    def remove_manual():
+        try:
+            outcomes["removed"] = pool.remove_index(2)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    def refresh_singleton():
+        try:
+            outcomes["refreshed"] = pool._refresh_entry(refresh_entry, force=True)
+        except BaseException as exc:  # pragma: no cover - diagnostic capture
+            errors.append(exc)
+
+    remover = threading.Thread(target=remove_manual, name="pool-remove", daemon=True)
+    refresher = threading.Thread(
+        target=refresh_singleton,
+        name="pool-refresh",
+        daemon=True,
+    )
+    remover.start()
+    assert remove_has_pool_lock.wait(timeout=5)
+    refresher.start()
+    # In the buggy ordering the refresher gets auth first and reaches the POST;
+    # in the fixed ordering it waits for the pool lock held by the remover.
+    assert not refresh_post_started.wait(timeout=0.5)
+    allow_remove_to_wait_for_auth.set()
+    allow_refresh_post_to_finish.set()
+    remover.join(timeout=5)
+    refresher.join(timeout=5)
+
+    assert not remover.is_alive()
+    assert not refresher.is_alive()
+    assert errors == []
+    assert outcomes["removed"].id == "manual"
+    assert outcomes["refreshed"].refresh_token == "after-refresh"
+
+
+@pytest.mark.parametrize(
+    ("provider", "refresh_name"),
+    [
+        ("openai-codex", "refresh_codex_oauth_pure"),
+        ("xai-oauth", "refresh_xai_oauth_pure"),
+    ],
+)
+def test_runtime_only_singleton_refresh_fails_when_provider_save_fails(
+    profile_and_root, monkeypatch, provider, refresh_name
+):
+    """A consumed singleton token cannot be reported as durably refreshed."""
+    profile_path, root_path = profile_and_root
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "before-access",
+                        "refresh_token": "before-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {}, "credential_pool": {provider: []}},
+    )
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    entry = PooledCredential(
+        provider=provider,
+        id="profile-overlay",
+        label="profile singleton",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="device_code",
+        access_token="before-access",
+        refresh_token="before-refresh",
+        runtime_only=True,
+    )
+    monkeypatch.setattr(
+        A,
+        refresh_name,
+        lambda *_args, **_kwargs: {
+            "access_token": "after-access",
+            "refresh_token": "after-refresh",
+            "last_refresh": "2026-08-04T00:00:00Z",
+        },
+    )
+    real_save = A._save_auth_store
+
+    def fail_profile_save(store, target_path=None):
+        if target_path is None:
+            raise OSError("injected provider-state save failure")
+        return real_save(store, target_path=target_path)
+
+    monkeypatch.setattr(A, "_save_auth_store", fail_profile_save)
+    monkeypatch.setattr(CP, "_save_auth_store", fail_profile_save)
+    pool = CredentialPool(provider, [entry])
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is None
+    # Keep the rotated pair alive in memory so this process does not replay the
+    # consumed refresh token, even though the caller must treat persistence as failed.
+    retained = pool.entries()[0]
+    assert retained.access_token == "after-access"
+    assert retained.refresh_token == "after-refresh"
+    profile_tokens = _read_store(profile_path)["providers"][provider]["tokens"]
+    assert profile_tokens["refresh_token"] == "before-refresh"
+    assert "after-refresh" not in root_path.read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize("provider", ["xai-oauth", "openai-codex", "nous"])
+def test_terminal_refresh_quarantines_root_fallback_singleton_at_source(
+    provider, monkeypatch, tmp_path
+):
+    """Dead root singleton material cannot survive and re-seed the next pool."""
+    profile_path = tmp_path / "profiles" / "work" / "auth.json"
+    root_path = tmp_path / "auth.json"
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    if provider == "nous":
+        provider_state = {
+            "access_token": "root-access",
+            "refresh_token": "root-refresh",
+            "agent_key": "root-agent",
+            "client_id": "client",
+        }
+        error = A.AuthError(
+            "terminal",
+            provider="nous",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+    else:
+        provider_state = {
+            "tokens": {
+                "access_token": "root-access",
+                "refresh_token": "root-refresh",
+            }
+        }
+        error = A.AuthError(
+            "terminal",
+            provider=provider,
+            code=(
+                "xai_refresh_failed"
+                if provider == "xai-oauth"
+                else "codex_refresh_failed"
+            ),
+            relogin_required=True,
+        )
+    _write_store(
+        root_path,
+        {"version": 1, "providers": {provider: provider_state}},
+    )
+    monkeypatch.setattr(A, "_auth_file_path", lambda: profile_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(CP, "_global_auth_file_path", lambda: root_path)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    monkeypatch.setattr(A, "_clear_shared_nous_state", lambda _reason: None)
+
+    def raise_terminal(*_args, **_kwargs):
+        raise error
+
+    if provider == "xai-oauth":
+        monkeypatch.setattr(A, "refresh_xai_oauth_pure", raise_terminal)
+    elif provider == "openai-codex":
+        monkeypatch.setattr(A, "refresh_codex_oauth_pure", raise_terminal)
+    else:
+        monkeypatch.setattr(A, "resolve_nous_runtime_credentials", raise_terminal)
+
+    entry = _entry(
+        provider,
+        id=f"{provider}-singleton",
+        access_token="root-access",
+        refresh_token="root-refresh",
+    )
+    pool = CredentialPool(provider, [entry])
+
+    assert pool._refresh_entry(entry, force=True) is None
+
+    root_state = _read_store(root_path)["providers"][provider]
+    if provider == "nous":
+        assert "access_token" not in root_state
+        assert "refresh_token" not in root_state
+        assert "agent_key" not in root_state
+    else:
+        assert "access_token" not in root_state["tokens"]
+        assert "refresh_token" not in root_state["tokens"]
+    profile_state = _read_store(profile_path)
+    assert provider not in profile_state.get("providers", {})
 
 
 def test_write_through_fires_on_every_refresh_not_just_first(

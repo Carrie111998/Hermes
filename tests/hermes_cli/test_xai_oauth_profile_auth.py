@@ -14,21 +14,18 @@ def test_read_xai_oauth_tokens_uses_credential_pool_when_provider_tokens_empty(m
     or stale. Treating that as missing auth makes cron keep failing after the
     user has successfully re-authenticated.
     """
-    store = {
-        "providers": {"xai-oauth": {"tokens": {}, "last_auth_error": {}}},
-        "credential_pool": {
-            "xai-oauth": [
-                {
-                    "access_token": "pool-access",
-                    "refresh_token": "pool-refresh",
-                    "token_type": "Bearer",
-                    "last_refresh": "2026-06-03T19:00:00Z",
-                }
-            ]
-        },
-    }
-    monkeypatch.setattr(auth, "_load_auth_store", lambda: store)
+    store = {"providers": {"xai-oauth": {"tokens": {}, "last_auth_error": {}}}}
+    pool_entries = [
+        {
+            "access_token": "pool-access",
+            "refresh_token": "pool-refresh",
+            "token_type": "Bearer",
+            "last_refresh": "2026-06-03T19:00:00Z",
+        }
+    ]
+    monkeypatch.setattr(auth, "_load_auth_store", lambda *_args, **_kwargs: store)
     monkeypatch.setattr(auth, "_load_global_auth_store", lambda: {})
+    monkeypatch.setattr(auth, "read_credential_pool", lambda provider_id: pool_entries)
 
     resolved = auth._read_xai_oauth_tokens(_lock=False)
 
