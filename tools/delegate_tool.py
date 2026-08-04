@@ -2782,6 +2782,7 @@ def delegate_task(
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    model: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2861,6 +2862,35 @@ def delegate_task(
         creds = _resolve_delegation_credentials(cfg, parent_agent)
     except ValueError as exc:
         return tool_error(str(exc))
+
+    # Per-call model override: lets a workspace/skill run its delegated work under
+    # a chosen model (the per-workspace model-role feature). Provider-prefixed ids
+    # (with '/') resolve via the runtime provider resolver; plain/:cloud ids keep
+    # the inherited endpoint and just swap the model. No-op when `model` is absent.
+    if isinstance(model, str) and model.strip():
+        _ov_model = model.strip()
+        if _ov_model != (creds.get("model") or ""):
+            if "/" in _ov_model:
+                try:
+                    from hermes_cli.runtime_provider import resolve_runtime_provider
+                    _ov_rt = resolve_runtime_provider(
+                        requested=creds.get("provider") or None,
+                        target_model=_ov_model,
+                    )
+                    creds = {
+                        "model": _ov_model,
+                        "provider": _ov_rt.get("provider"),
+                        "base_url": _ov_rt.get("base_url"),
+                        "api_key": _ov_rt.get("api_key"),
+                        "api_mode": _ov_rt.get("api_mode"),
+                    }
+                except Exception as _ov_exc:
+                    logger.warning(
+                        "delegate_task: could not resolve model override %r (%s); "
+                        "keeping default model %r", _ov_model, _ov_exc, creds.get("model"),
+                    )
+            else:
+                creds = {**creds, "model": _ov_model}
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -3788,6 +3818,15 @@ DELEGATE_TASK_SCHEMA = {
     "parameters": {
         "type": "object",
         "properties": {
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model id for the subagent. A provider-prefixed id "
+                    "(e.g. 'anthropic/claude-fable-5') resolves through the "
+                    "runtime provider resolver; a plain id keeps the inherited "
+                    "endpoint and swaps only the model. Omit to inherit."
+                ),
+            },
             "goal": {
                 "type": "string",
                 "description": (
