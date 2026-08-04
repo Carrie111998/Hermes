@@ -65,6 +65,7 @@ function fixture(overrides = {}) {
   const errors = []
   const service = createEvaAppUpdater({
     app: { getVersion: () => '2026.7.20-es.8', isPackaged: true },
+    arch: 'arm64',
     autoUpdater: updater,
     emitProgress: value => progress.push(value),
     isPackaged: true,
@@ -214,6 +215,22 @@ test('unpacked or non-mac builds never check, download, or install', async () =>
   assert.equal(check.supported, false)
   assert.equal(apply.ok, false)
   assert.equal(apply.error, 'unavailable')
+  assert.equal(updater.checkCalls, 0)
+  assert.equal(updater.downloadCalls, 0)
+  assert.deepEqual(updater.installCalls, [])
+})
+
+test('packaged Intel macOS builds cannot consume the arm64-only managed appcast', async () => {
+  const { service, updater } = fixture({ arch: 'x64' })
+
+  const check = await service.check()
+  const apply = await service.apply()
+
+  assert.equal(check.supported, false)
+  assert.equal(check.message, 'Signed in-app updates require the Apple Silicon evaOS Agent app.')
+  assert.equal(apply.ok, false)
+  assert.equal(apply.error, 'unavailable')
+  assert.equal(apply.message, check.message)
   assert.equal(updater.checkCalls, 0)
   assert.equal(updater.downloadCalls, 0)
   assert.deepEqual(updater.installCalls, [])

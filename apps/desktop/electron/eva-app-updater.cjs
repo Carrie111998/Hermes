@@ -97,6 +97,7 @@ function safeApplyFailure() {
 function createEvaAppUpdater(options) {
   const {
     app,
+    arch = process.arch,
     autoUpdater,
     emitProgress = () => undefined,
     isPackaged = app?.isPackaged,
@@ -122,7 +123,13 @@ function createEvaAppUpdater(options) {
   let applying = false
 
   function supported() {
-    return Boolean(isPackaged) && platform === 'darwin'
+    return Boolean(isPackaged) && platform === 'darwin' && arch === 'arm64'
+  }
+
+  function unavailableMessage() {
+    return Boolean(isPackaged) && platform === 'darwin' && arch !== 'arm64'
+      ? 'Signed in-app updates require the Apple Silicon evaOS Agent app.'
+      : 'Signed in-app updates are available in the installed macOS app.'
   }
 
   function configure() {
@@ -199,7 +206,7 @@ function createEvaAppUpdater(options) {
 
   async function check() {
     if (!supported()) {
-      return unsupportedStatus('Signed in-app updates are available in the installed macOS app.', now)
+      return unsupportedStatus(unavailableMessage(), now)
     }
 
     if (checkPromise) {
@@ -233,7 +240,7 @@ function createEvaAppUpdater(options) {
       return {
         ok: false,
         error: 'unavailable',
-        message: 'Signed in-app updates are available in the installed macOS app.'
+        message: unavailableMessage()
       }
     }
 
