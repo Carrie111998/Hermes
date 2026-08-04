@@ -24,7 +24,6 @@ import argparse
 import base64
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -482,9 +481,11 @@ def _normalize_event_time(dt_obj: dict, user_tz: str | None) -> str:
     if not user_tz:
         return raw
     try:
-        # Parse the ISO 8601 datetime (handles +HH:MM and Z offsets)
-        raw_clean = re.sub(r"Z$", "+00:00", raw)
-        dt = datetime.fromisoformat(raw_clean)
+        # Parse the ISO 8601 datetime (handles +HH:MM and Z offsets natively in 3.11+)
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            print(f"[calendar] Warning: no timezone offset in '{raw}', returning raw", file=sys.stderr)
+            return raw
         try:
             from zoneinfo import ZoneInfo
             dt_local = dt.astimezone(ZoneInfo(user_tz))
