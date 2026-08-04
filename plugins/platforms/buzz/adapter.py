@@ -1358,6 +1358,15 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
         os.environ["BUZZ_ALLOW_ALL_USERS"] = str(extra["allow_all_users"]).lower()
     if "require_mention" in extra and not os.getenv("BUZZ_REQUIRE_MENTION"):
         os.environ["BUZZ_REQUIRE_MENTION"] = str(extra["require_mention"]).lower()
+    for src_key, env_key in (
+        ("free_response_channels", "BUZZ_FREE_RESPONSE_CHANNELS"),
+        ("inline_reply_channels", "BUZZ_INLINE_REPLY_CHANNELS"),
+    ):
+        val = extra.get(src_key)
+        if val is not None and not os.getenv(env_key):
+            if isinstance(val, (list, tuple)):
+                val = ",".join(str(c) for c in val)
+            os.environ[env_key] = str(val)
     return None
 
 
