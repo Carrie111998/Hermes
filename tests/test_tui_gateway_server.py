@@ -11398,6 +11398,1097 @@ def test_teardown_ends_session_in_profile_db(monkeypatch, tmp_path):
     assert str(seen.get("db_path")).endswith("state.db")
 
 
+def test_teardown_closes_profile_session_db_owned_by_agent_build(monkeypatch, tmp_path):
+    """A profile DB handed to an agent build must be closed at teardown."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class ProfileDB:
+        def __init__(self, db_path=None):
+            self.db_path = db_path
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    class FakeAgent:
+        model = "test-model"
+
+        def __init__(self):
+            self.close_calls = 0
+
+        def close(self):
+            self.close_calls += 1
+
+    def fake_make_agent(_sid, _key, session_db=None, **_kwargs):
+        captured["db"] = session_db
+        captured["agent"] = FakeAgent()
+        return captured["agent"]
+
+    monkeypatch.setattr("hermes_state.SessionDB", ProfileDB)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    sid = "profile-build-sid"
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "profile-session",
+        "profile_home": str(profile_home),
+    }
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3), "agent build did not finish"
+        assert captured["db"].db_path == profile_home / "state.db"
+        assert captured["db"].close_calls == 0
+
+        server._teardown_session(session)
+
+        assert captured["agent"].close_calls == 1
+        assert captured["db"].close_calls == 1
+    finally:
+        server._sessions.pop(sid, None)
+
+
+class _CountingDB:
+    """Minimal SessionDB stand-in that counts close() calls per instance."""
+
+    instances: list = []
+
+    def __init__(self, db_path=None):
+        self.db_path = db_path
+        self.close_calls = 0
+        type(self).instances.append(self)
+
+    def get_session(self, _key):
+        return {"id": _key, "cwd": None}
+
+    def update_session_cwd(self, *_a, **_k):
+        return None
+
+    def end_session(self, *_a, **_k):
+        return None
+
+    def close(self):
+        self.close_calls += 1
+
+
+class _CountingAgent:
+    model = "test-model"
+
+    def __init__(self, db=None):
+        self.close_calls = 0
+        self.db_close_calls_when_agent_closed = None
+        self._db = db
+
+    def close(self):
+        self.close_calls += 1
+        if self._db is not None and self.db_close_calls_when_agent_closed is None:
+            self.db_close_calls_when_agent_closed = self._db.close_calls
+
+
+def _stub_build_machinery(monkeypatch):
+    """Silence the side machinery _start_agent_build touches around the build."""
+    monkeypatch.setattr(server, "_set_session_context", lambda _t: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _t: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_probe_config_health", lambda *_a: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+
+
+def _deferred_profile_session(profile_home=None):
+    session = {
+        "agent": None,
+        "agent_ready": threading.Event(),
+        "session_key": "owned-db-session",
+    }
+    if profile_home is not None:
+        session["profile_home"] = str(profile_home)
+    return session
+
+
+def test_teardown_does_not_close_shared_db_for_launch_sessions(monkeypatch):
+    """A launch-profile session borrows _get_db(); teardown must leave it open."""
+    _CountingDB.instances = []
+    shared = _CountingDB()
+    agent = _CountingAgent(db=shared)
+
+    def fake_make_agent(_sid, _key, session_db=None, **_kw):
+        # Mirror _make_agent's fallback: no dedicated handle -> shared _get_db().
+        assert session_db is None
+        return agent
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr(server, "_get_db", lambda: shared)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+
+    sid = "launch-shared-sid"
+    session = _deferred_profile_session()
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3)
+        assert "_owned_session_db" not in session
+
+        server._teardown_session(session)
+
+        assert agent.close_calls == 1
+        assert shared.close_calls == 0
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_profile_db_closed_when_agent_build_fails(monkeypatch, tmp_path):
+    """A profile DB built for a failed _make_agent must not outlive the build."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+
+    def failing_make_agent(*_a, **_k):
+        raise RuntimeError("boom")
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", _CountingDB)
+    monkeypatch.setattr(server, "_make_agent", failing_make_agent)
+
+    sid = "failed-build-sid"
+    session = _deferred_profile_session(profile_home)
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3)
+
+        assert session.get("agent_error")
+        assert "_owned_session_db" not in session
+        assert len(_CountingDB.instances) == 1
+        assert _CountingDB.instances[0].close_calls == 1
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_session_close_during_deferred_build_closes_agent_and_db(monkeypatch, tmp_path):
+    """If session.close wins before publication, the build disposes of both."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    entered = threading.Event()
+    release = threading.Event()
+    agent_box: dict = {}
+
+    def gated_make_agent(_sid, _key, session_db=None, **_kw):
+        entered.set()
+        assert release.wait(timeout=5), "test gate never released"
+        agent_box["agent"] = _CountingAgent(db=session_db)
+        return agent_box["agent"]
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", _CountingDB)
+    monkeypatch.setattr(server, "_make_agent", gated_make_agent)
+
+    sid = "close-mid-build-sid"
+    session = _deferred_profile_session(profile_home)
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert entered.wait(timeout=5)
+        # Concurrent close claims the registry entry while the build is inside
+        # _make_agent; the build must then dispose of what it constructed.
+        popped = server._sessions.pop(sid)
+        server._teardown_session(popped)
+        release.set()
+        assert session["agent_ready"].wait(timeout=5)
+
+        assert agent_box["agent"].close_calls == 1
+        assert _CountingDB.instances[0].close_calls == 1
+        assert "_owned_session_db" not in session
+        # The discarded build must release resources WITHOUT finalizing the
+        # durable row (a deferred resume's row belongs to the conversation).
+        assert getattr(agent_box["agent"], "_end_session_on_close", True) is False
+    finally:
+        release.set()
+        server._sessions.pop(sid, None)
+
+
+def test_session_close_after_publish_does_not_double_close(monkeypatch, tmp_path):
+    """A close landing between publication and build completion closes once."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    entered = threading.Event()
+    release = threading.Event()
+    agent_box: dict = {}
+
+    def fake_make_agent(_sid, _key, session_db=None, **_kw):
+        agent_box["agent"] = _CountingAgent(db=session_db)
+        return agent_box["agent"]
+
+    def gated_wire_callbacks(_sid):
+        # Runs after the atomic publish; hold the build here while the close
+        # side claims and closes the published resources.
+        entered.set()
+        assert release.wait(timeout=5), "test gate never released"
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", _CountingDB)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_wire_callbacks", gated_wire_callbacks)
+
+    sid = "close-post-publish-sid"
+    session = _deferred_profile_session(profile_home)
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert entered.wait(timeout=5)
+        popped = server._sessions.pop(sid)
+        server._teardown_session(popped)
+        release.set()
+        assert session["agent_ready"].wait(timeout=5)
+
+        assert agent_box["agent"].close_calls == 1
+        assert _CountingDB.instances[0].close_calls == 1
+    finally:
+        release.set()
+        server._sessions.pop(sid, None)
+
+
+def test_repeated_teardown_closes_resources_once(monkeypatch, tmp_path):
+    """Teardown is idempotent, and the agent closes while its DB is still open."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    agent_box: dict = {}
+
+    def fake_make_agent(_sid, _key, session_db=None, **_kw):
+        agent_box["agent"] = _CountingAgent(db=session_db)
+        return agent_box["agent"]
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr("hermes_state.SessionDB", _CountingDB)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+
+    sid = "repeat-teardown-sid"
+    session = _deferred_profile_session(profile_home)
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert session["agent_ready"].wait(timeout=3)
+
+        server._teardown_session(session)
+        server._teardown_session(session)
+
+        agent = agent_box["agent"]
+        assert agent.close_calls == 1
+        assert _CountingDB.instances[0].close_calls == 1
+        # AIAgent.close finalizes the session row through the db as its last
+        # step, so the owned handle must still be open when the agent closes.
+        assert agent.db_close_calls_when_agent_closed == 0
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_init_session_records_owned_profile_db(monkeypatch, tmp_path):
+    """_init_session must record a caller-owned profile DB for teardown."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    db = _CountingDB(db_path=profile_home / "state.db")
+    agent = _CountingAgent(db=db)
+
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    sid = "init-owned-sid"
+    try:
+        server._init_session(
+            sid,
+            "init-owned-key",
+            agent,
+            [],
+            session_db=db,
+            owned_session_db=db,
+            profile_home=str(profile_home),
+        )
+        assert server._sessions[sid]["_owned_session_db"] is db
+
+        server._teardown_session(server._sessions.pop(sid))
+
+        assert agent.close_calls == 1
+        assert db.close_calls == 1
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_init_session_failure_unregisters_and_returns_ownership(monkeypatch, tmp_path):
+    """A post-registration _init_session failure with no concurrent closer leaves the record unregistered and resources untouched."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    db = _CountingDB(db_path=profile_home / "state.db")
+    agent = _CountingAgent(db=db)
+
+    def raise_wire_callbacks(_sid):
+        raise RuntimeError("wire boom")
+
+    monkeypatch.setattr(server, "_wire_callbacks", raise_wire_callbacks)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+
+    sid = "init-fail-sid"
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            server._init_session(
+                sid,
+                "init-fail-key",
+                agent,
+                [],
+                session_db=db,
+                owned_session_db=db,
+                profile_home=str(profile_home),
+            )
+        assert sid not in server._sessions
+        assert not getattr(excinfo.value, "_resources_claimed_by_closer", False)
+        assert db.close_calls == 0
+        assert agent.close_calls == 0
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_init_session_failure_after_concurrent_close_marks_claimed(monkeypatch, tmp_path):
+    """A concurrent closer that claims the record before the raise marks the exception as claimed and closes resources exactly once."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    db = _CountingDB(db_path=profile_home / "state.db")
+    agent = _CountingAgent(db=db)
+
+    sid = "init-claimed-sid"
+
+    def wire_callbacks_with_concurrent_close(_sid):
+        popped = server._sessions.pop(sid)
+        server._teardown_session(popped)
+        raise RuntimeError("wire boom")
+
+    monkeypatch.setattr(server, "_wire_callbacks", wire_callbacks_with_concurrent_close)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_mcp_late_refresh", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            server._init_session(
+                sid,
+                "init-claimed-key",
+                agent,
+                [],
+                session_db=db,
+                owned_session_db=db,
+                profile_home=str(profile_home),
+            )
+        assert getattr(excinfo.value, "_resources_claimed_by_closer", False) is True
+        assert agent.close_calls == 1
+        assert db.close_calls == 1
+        assert sid not in server._sessions
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_init_session_refuses_to_displace_registered_sid(monkeypatch, tmp_path):
+    """Two initializers racing one sid: the loser fails fast, the winner survives."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    _CountingDB.instances = []
+    winner = {"session_key": "winner-key"}
+    loser_db = _CountingDB(db_path=profile_home / "state.db")
+    loser_agent = _CountingAgent(db=loser_db)
+
+    sid = "contested-sid"
+    server._sessions[sid] = winner
+    try:
+        with pytest.raises(RuntimeError) as excinfo:
+            server._init_session(
+                sid,
+                "loser-key",
+                loser_agent,
+                [],
+                session_db=loser_db,
+                owned_session_db=loser_db,
+                profile_home=str(profile_home),
+            )
+        assert not getattr(excinfo.value, "_resources_claimed_by_closer", False)
+        assert server._sessions[sid] is winner
+        # The loser's resources revert to its caller — nothing auto-closed.
+        assert loser_agent.close_calls == 0
+        assert loser_db.close_calls == 0
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_eager_resume_init_failure_closes_locals_no_ghost(monkeypatch, tmp_path):
+    """An unclaimed _init_session failure during eager resume closes the local agent+db and leaves no ghost session."""
+    target = "stored-profile-session-initfail"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class ResumeProfileDB(_CountingDB):
+        def get_session(self, _target):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_resume_conversations(self, _sid):
+            return ([{"role": "user", "content": "hello"}], [])
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(self, *_a, **_k):
+            return [{"role": "user", "content": "hello"}]
+
+        def resolve_resume_session_id(self, sid_):
+            return sid_
+
+    class LaunchDB:
+        def close(self):
+            raise AssertionError("shared launch db must never be closed")
+
+    ResumeProfileDB.instances = []
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None, **_kw):
+        captured["agent_db"] = session_db
+        captured["agent"] = _CountingAgent(db=session_db)
+        return captured["agent"]
+
+    class FakeWorker:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def close(self):
+            pass
+
+    def raise_wire_callbacks(_sid):
+        raise RuntimeError("wire boom")
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ResumeProfileDB)
+    monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
+    monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _t: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _t: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_wire_callbacks", raise_wire_callbacks)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    import tools.approval as approval
+
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker", "eager_build": True},
+            }
+        )
+        assert "error" in resp, resp
+        assert captured["agent_db"].close_calls == 1
+        assert captured["agent"].close_calls == 1
+        # The existing conversation stays resumable: the discarded agent must
+        # not end_session the durable target row.
+        assert getattr(captured["agent"], "_end_session_on_close", True) is False
+        assert all(s.get("session_key") != target for s in server._sessions.values())
+    finally:
+        server._sessions.clear()
+
+
+def test_branch_init_failure_closes_locals_no_ghost(monkeypatch, tmp_path):
+    """An unclaimed _init_session failure during branch closes the local agent+db and leaves no ghost session."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class BranchProfileDB(_CountingDB):
+        def get_session_title(self, _key):
+            return "parent"
+
+        def get_next_title_in_lineage(self, current):
+            return f"{current} (branch)"
+
+        def create_session(self, *_a, **_k):
+            return None
+
+        def append_messages_batch(self, _sid, messages, **_k):
+            return list(range(1, len(messages) + 1))
+
+        def set_session_title(self, *_a, **_k):
+            return True
+
+    BranchProfileDB.instances = []
+
+    def fake_make_agent(*_a, **kw):
+        captured["agent_db"] = kw.get("session_db")
+        captured["agent"] = _CountingAgent(db=kw.get("session_db"))
+        return captured["agent"]
+
+    def raise_wire_callbacks(_sid):
+        raise RuntimeError("wire boom")
+
+    parent = {
+        "session_key": "parent-key",
+        "history": [{"role": "user", "content": "hi"}],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "cols": 80,
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "agent": _CountingAgent(),
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "cwd": str(tmp_path),
+    }
+    server._sessions["parent"] = parent
+    monkeypatch.setattr("hermes_state.SessionDB", BranchProfileDB)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_wire_callbacks", raise_wire_callbacks)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.branch",
+                "params": {"session_id": "parent", "name": "forked"},
+            }
+        )
+        assert "error" in resp, resp
+        assert captured["agent_db"].close_calls == 1
+        assert captured["agent"].close_calls == 1
+        assert set(server._sessions.keys()) == {"parent"}
+    finally:
+        server._sessions.clear()
+
+
+def test_eager_resume_init_failure_claimed_skips_local_close(monkeypatch, tmp_path):
+    """A concurrent closer that reclaims the eager-resume session before the raise closes resources exactly once, not doubled by the RPC handler."""
+    target = "stored-profile-session-claimed"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class ResumeProfileDB(_CountingDB):
+        def get_session(self, _target):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_resume_conversations(self, _sid):
+            return ([{"role": "user", "content": "hello"}], [])
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(self, *_a, **_k):
+            return [{"role": "user", "content": "hello"}]
+
+        def resolve_resume_session_id(self, sid_):
+            return sid_
+
+    class LaunchDB:
+        def close(self):
+            raise AssertionError("shared launch db must never be closed")
+
+    ResumeProfileDB.instances = []
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None, **_kw):
+        captured["agent_db"] = session_db
+        captured["agent"] = _CountingAgent(db=session_db)
+        return captured["agent"]
+
+    class FakeWorker:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def close(self):
+            pass
+
+    def wire_callbacks_with_concurrent_close(_sid):
+        claimed_sid = next(
+            sid_ for sid_, sess in server._sessions.items() if sess.get("session_key") == target
+        )
+        popped = server._sessions.pop(claimed_sid)
+        server._teardown_session(popped)
+        raise RuntimeError("wire boom")
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ResumeProfileDB)
+    monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
+    monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _t: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _t: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_wire_callbacks", wire_callbacks_with_concurrent_close)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    import tools.approval as approval
+
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker", "eager_build": True},
+            }
+        )
+        assert "error" in resp, resp
+        assert captured["agent"].close_calls == 1
+        assert captured["agent_db"].close_calls == 1
+        assert all(s.get("session_key") != target for s in server._sessions.values())
+    finally:
+        server._sessions.clear()
+
+
+def test_eager_resume_records_and_closes_profile_db(monkeypatch, tmp_path):
+    """An eager profile resume hands its dedicated DB to teardown, exactly once."""
+    target = "stored-profile-session"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class ResumeProfileDB(_CountingDB):
+        def get_session(self, _target):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_resume_conversations(self, _sid):
+            return ([{"role": "user", "content": "hello"}], [])
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(self, *_a, **_k):
+            return [{"role": "user", "content": "hello"}]
+
+        def resolve_resume_session_id(self, sid_):
+            return sid_
+
+    class LaunchDB:
+        def close(self):
+            raise AssertionError("shared launch db must never be closed")
+
+    ResumeProfileDB.instances = []
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None, **_kw):
+        captured["agent_db"] = session_db
+        captured["agent"] = _CountingAgent(db=session_db)
+        return captured["agent"]
+
+    class FakeWorker:
+        def __init__(self, *_a, **_k):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ResumeProfileDB)
+    monkeypatch.setattr(server, "_get_db", lambda: LaunchDB())
+    monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _t: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _t: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+
+    import tools.approval as approval
+
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker", "eager_build": True},
+            }
+        )
+        assert "error" not in resp, resp
+        sid = resp["result"]["session_id"]
+        assert server._sessions[sid]["_owned_session_db"] is captured["agent_db"]
+        assert captured["agent_db"].close_calls == 0
+
+        assert server._close_session_by_id(sid)
+
+        assert captured["agent"].close_calls == 1
+        assert captured["agent_db"].close_calls == 1
+    finally:
+        server._sessions.clear()
+
+
+def test_eager_resume_race_loser_closes_profile_db(monkeypatch, tmp_path):
+    """The losing side of the resume race closes its agent AND its profile DB."""
+    target = "raced-profile-session"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+    winner = ("winner-sid", {"session_key": target})
+
+    class ResumeProfileDB(_CountingDB):
+        def get_session(self, _target):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_resume_conversations(self, _sid):
+            return ([{"role": "user", "content": "hello"}], [])
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(self, *_a, **_k):
+            return [{"role": "user", "content": "hello"}]
+
+        def resolve_resume_session_id(self, sid_):
+            return sid_
+
+    ResumeProfileDB.instances = []
+    find_calls = {"n": 0}
+
+    def fake_find_live(_key):
+        # First probe is the pre-build fast path (no live session yet); the
+        # post-build double-check then finds the concurrent winner.
+        find_calls["n"] += 1
+        return None if find_calls["n"] == 1 else winner
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None, **_kw):
+        captured["agent_db"] = session_db
+        captured["agent"] = _CountingAgent(db=session_db)
+        return captured["agent"]
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ResumeProfileDB)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _t: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _t: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_find_live_session_by_key", fake_find_live)
+    monkeypatch.setattr(server, "_live_session_payload", lambda *a, **k: {})
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker", "eager_build": True},
+            }
+        )
+        assert "error" not in resp, resp
+        assert resp["result"]["resumed"] == target
+        assert captured["agent"].close_calls == 1
+        assert captured["agent_db"].close_calls == 1
+        # The winner owns the durable session row: the discarded duplicate
+        # must be released without finalizing (end_session-ing) that row.
+        assert getattr(captured["agent"], "_end_session_on_close", True) is False
+    finally:
+        server._sessions.clear()
+
+
+def test_deferred_profile_resume_closes_transient_read_handle(monkeypatch, tmp_path):
+    """The default deferred resume must close its read-only profile handle."""
+    target = "stored-profile-session-deferred"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+
+    class ResumeProfileDB(_CountingDB):
+        def get_session(self, _target):
+            return {"id": target, "cwd": str(tmp_path)}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_resume_conversations(self, _sid):
+            return ([{"role": "user", "content": "hello"}], [])
+
+        def get_ancestor_display_prefix(self, _sid):
+            return []
+
+        def get_messages_as_conversation(self, *_a, **_k):
+            return [{"role": "user", "content": "hello"}]
+
+        def resolve_resume_session_id(self, sid_):
+            return sid_
+
+    ResumeProfileDB.instances = []
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ResumeProfileDB)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_maybe_schedule_auto_continue", lambda *a, **k: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.resume",
+                "params": {"session_id": target, "profile": "worker"},
+            }
+        )
+        assert "error" not in resp, resp
+        # Exactly one dedicated handle was opened for the reads, and the
+        # handler closed it (TrackedConnection only untracks on close(), so
+        # dropping it for GC would poison the byte-probe registry).
+        assert len(ResumeProfileDB.instances) == 1
+        assert ResumeProfileDB.instances[0].close_calls == 1
+    finally:
+        server._sessions.clear()
+
+
+def test_profile_resume_read_exception_closes_transient_handle(monkeypatch, tmp_path):
+    """A db read raising mid-resume must still close the transient profile handle."""
+    target = "stored-profile-session-raises"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+
+    class ExplodingProfileDB(_CountingDB):
+        def get_session(self, _target):
+            raise RuntimeError("read boom")
+
+    ExplodingProfileDB.instances = []
+
+    monkeypatch.setattr(server, "_profile_home", lambda _p: profile_home)
+    monkeypatch.setattr("hermes_state.SessionDB", ExplodingProfileDB)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+
+    try:
+        with pytest.raises(RuntimeError, match="read boom"):
+            server.handle_request(
+                {
+                    "id": "1",
+                    "method": "session.resume",
+                    "params": {"session_id": target, "profile": "worker"},
+                }
+            )
+        assert len(ExplodingProfileDB.instances) == 1
+        assert ExplodingProfileDB.instances[0].close_calls == 1
+    finally:
+        server._sessions.clear()
+
+
+def test_branch_records_and_closes_profile_db(monkeypatch, tmp_path):
+    """A branched agent's dedicated profile DB is owned and closed at teardown."""
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    captured: dict = {}
+
+    class BranchProfileDB(_CountingDB):
+        def get_session_title(self, _key):
+            return "parent"
+
+        def get_next_title_in_lineage(self, current):
+            return f"{current} (branch)"
+
+        def create_session(self, *_a, **_k):
+            return None
+
+        def append_messages_batch(self, _sid, messages, **_k):
+            return list(range(1, len(messages) + 1))
+
+        def set_session_title(self, *_a, **_k):
+            return True
+
+    BranchProfileDB.instances = []
+
+    def fake_make_agent(*_a, **kw):
+        captured["agent_db"] = kw.get("session_db")
+        captured["agent"] = _CountingAgent(db=kw.get("session_db"))
+        return captured["agent"]
+
+    parent = {
+        "session_key": "parent-key",
+        "history": [{"role": "user", "content": "hi"}],
+        "history_lock": threading.Lock(),
+        "running": False,
+        "cols": 80,
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "agent": _CountingAgent(),
+        "created_at": 1.0,
+        "last_active": 1.0,
+        "cwd": str(tmp_path),
+    }
+    server._sessions["parent"] = parent
+    monkeypatch.setattr("hermes_state.SessionDB", BranchProfileDB)
+    monkeypatch.setattr(server, "_claim_active_session_slot", lambda *a, **k: (None, None))
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
+    monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
+    monkeypatch.setattr(server, "_register_session_cwd", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_attach_worker", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_finalize_session", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_announce_session_reclaimed", lambda *a, **k: None)
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "session.branch",
+                "params": {"session_id": "parent", "name": "forked"},
+            }
+        )
+        assert "result" in resp, resp
+        child_sid = resp["result"]["session_id"]
+        assert captured["agent_db"] is not None
+        assert server._sessions[child_sid]["_owned_session_db"] is captured["agent_db"]
+        assert captured["agent_db"].close_calls == 0
+
+        assert server._close_session_by_id(child_sid)
+
+        assert captured["agent"].close_calls == 1
+        assert captured["agent_db"].close_calls == 1
+    finally:
+        server._sessions.clear()
+
+
+def test_profile_session_churn_keeps_fd_count_stable(monkeypatch, tmp_path):
+    """Create/close churn with REAL profile SessionDBs must not grow the FD table.
+
+    This is the incident regression: every profile chat leaked ~3 SQLite fds
+    (db + WAL + SHM) until the launchd 256 soft limit killed the dashboard.
+    """
+    import gc
+
+    try:
+        fd_dir = os.listdir("/dev/fd")
+    except OSError:
+        pytest.skip("/dev/fd unavailable on this platform")
+
+    profile_home = tmp_path / "profiles" / "mlperf"
+    profile_home.mkdir(parents=True)
+    agents: list = []
+
+    def fake_make_agent(_sid, _key, session_db=None, **_kw):
+        agents.append(_CountingAgent(db=session_db))
+        return agents[-1]
+
+    _stub_build_machinery(monkeypatch)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+
+    import tools.approval as approval
+
+    monkeypatch.setattr(approval, "register_gateway_notify", lambda key, cb: None)
+    monkeypatch.setattr(approval, "load_permanent_allowlist", lambda: None)
+
+    def churn_once(i: int) -> None:
+        sid = f"fd-churn-{i}"
+        session = _deferred_profile_session(profile_home)
+        session["session_key"] = f"fd-churn-key-{i}"
+        server._sessions[sid] = session
+        try:
+            server._start_agent_build(sid, session)
+            assert session["agent_ready"].wait(timeout=10), "build did not finish"
+            assert session.get("agent_error") is None, session.get("agent_error")
+            assert "_owned_session_db" in session
+        finally:
+            server._close_session_by_id(sid, end_reason="tui_close")
+
+    # Warm-up pass so one-time imports/caches don't count as growth.
+    churn_once(0)
+    gc.collect()
+    before = len(os.listdir("/dev/fd"))
+    for i in range(1, 13):
+        churn_once(i)
+    gc.collect()
+    after = len(os.listdir("/dev/fd"))
+
+    assert all(a.close_calls == 1 for a in agents)
+    assert after - before <= 3, f"fd count grew {before} -> {after}"
+
+
 def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
     """session.branch must copy history into the parent's profile state.db."""
     profile_home = tmp_path / "profiles" / "mlperf"

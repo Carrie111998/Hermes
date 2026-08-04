@@ -561,6 +561,15 @@ class ComputeHost:
                 platform_override=frame.get("source"),
                 session_db=session_db,
             )
+        except Exception:
+            # The dedicated profile handle never reached an agent/session that
+            # could own it — close it before the build error propagates.
+            if session_db is not None:
+                try:
+                    session_db.close()
+                except Exception:
+                    pass
+            raise
         finally:
             if home_token is not None:
                 try:
@@ -571,12 +580,13 @@ class ComputeHost:
                     reset_secret_scope(secret_token)
                 except Exception:
                     pass
+        record = None
         try:
             from tui_gateway.transport import bind_transport, reset_transport
 
             token = bind_transport(self._transport)
             try:
-                server._init_session(
+                record = server._init_session(
                     sid,
                     key,
                     agent,
@@ -585,14 +595,27 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    # Dedicated profile handle (never the shared launch db):
+                    # the session record owns it so teardown closes it.
+                    owned_session_db=session_db,
                 )
             finally:
                 reset_transport(token)
-        except Exception:
+        except Exception as exc:
+            if getattr(exc, "_resources_claimed_by_closer", False):
+                # A concurrent close claimed the just-registered session and
+                # closed the agent + profile handle. Installing the fallback
+                # would resurrect closed resources; fail the turn instead.
+                raise
             # If _init_session's side machinery (slash worker, approval notify) is
-            # unavailable, keep a minimal host-owned session rather than failing
-            # the turn after the expensive agent build succeeded.
-            server._sessions[sid] = {
+            # unavailable, it unregistered its record and returned the live agent
+            # + profile handle to us — keep a minimal host-owned session rather
+            # than failing the turn after the expensive agent build succeeded.
+            # Built completely (ownership included) BEFORE publication, and
+            # published under the lock only into an empty slot, so a closer
+            # can never observe a record missing its owned handle and a
+            # concurrent initializer's live session is never displaced.
+            fallback = {
                 "agent": agent,
                 "session_key": key,
                 "history": list(history),
@@ -615,7 +638,41 @@ class ComputeHost:
                 "source": server._sanitize_client_source(frame.get("source")),
                 "transport": self._transport,
             }
-        session = server._sessions[sid]
+            if session_db is not None:
+                fallback["_owned_session_db"] = session_db
+            with server._sessions_lock:
+                existing = server._sessions.get(sid)
+                if existing is None:
+                    server._sessions[sid] = fallback
+            if existing is not None:
+                # A concurrent initializer won the sid (registration refuses
+                # to displace a live record) — its session serves this turn;
+                # our just-built resources lose and must be disposed of.
+                try:
+                    # Resource release only: the winner owns the durable
+                    # session row, so this discarded duplicate must not
+                    # end_session it.
+                    agent._end_session_on_close = False
+                except Exception:
+                    pass
+                try:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                except Exception:
+                    pass
+                if session_db is not None:
+                    try:
+                        session_db.close()
+                    except Exception:
+                        pass
+                record = existing
+            else:
+                record = fallback
+        if record is None:
+            # Older _init_session seams (tests) return nothing; fall back to
+            # the registry so their stubs keep working.
+            record = server._sessions.get(sid) or {}
+        session = record
         session["transport"] = self._transport
         session["profile_home"] = profile_home or session.get("profile_home")
         if isinstance(frame.get("attached_images"), list):

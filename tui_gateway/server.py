@@ -852,16 +852,37 @@ def _teardown_session(session: dict | None, *, end_reason: str = "tui_close") ->
             unregister_gateway_notify(key)
     except Exception:
         pass
-    try:
-        agent = session.get("agent")
-        if agent is not None and hasattr(agent, "close"):
-            agent.close()
-    except Exception:
-        pass
+    _close_session_agent_and_owned_db(session)
     # NOTE: the slash-worker is closed inside _finalize_session (the single
     # _finalized-guarded chokepoint that main folded it into), exactly once.
     # We deliberately do NOT re-close it here — _teardown_session's job beyond
     # finalize is unregistering the notifier and closing the in-process agent.
+
+
+def _close_session_agent_and_owned_db(session: dict) -> None:
+    """Close resources created exclusively for one gateway session.
+
+    Popping each resource is the idempotent ownership claim, so repeated
+    teardown closes each resource exactly once; both pops happen under one
+    lock so a concurrent claimant takes both resources or neither — the db
+    can never be closed out from under ``agent.close()``'s final
+    ``end_session`` write.  Only dedicated profile handles are recorded under
+    ``_owned_session_db``; the process-wide ``_get_db()`` handle is never put
+    here and must remain open.
+    """
+    with _sessions_lock:
+        agent = session.pop("agent", None)
+        session_db = session.pop("_owned_session_db", None)
+    try:
+        if agent is not None and hasattr(agent, "close"):
+            agent.close()
+    except Exception:
+        pass
+    try:
+        if session_db is not None and hasattr(session_db, "close"):
+            session_db.close()
+    except Exception:
+        pass
 
 
 def _attach_worker(sid: str, session: dict, worker) -> None:
@@ -2108,13 +2129,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
         notify_registered = False
         home_token = None
         secret_token = None
+        session_db = None
         profile_home = current.get("profile_home")
         try:
             tokens = _set_session_context(key)
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
-            session_db = None
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
                 try:
@@ -2169,7 +2190,34 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
-            current["agent"] = agent
+            # Transfer both resources to the live session atomically. If a
+            # concurrent close already detached it, this build still owns them
+            # and must dispose of them instead of publishing into an orphaned
+            # dict. The profile DB is exclusive to this build; shared launch
+            # DBs arrive through _make_agent's fallback and are never stored.
+            with _sessions_lock:
+                published = _sessions.get(sid) is current
+                if published:
+                    current["agent"] = agent
+                    if session_db is not None:
+                        current["_owned_session_db"] = session_db
+                        session_db = None
+            if not published:
+                try:
+                    # Resource release only: this agent never became the
+                    # session's owner, and on a deferred RESUME its
+                    # session_id is the durable conversation row the user
+                    # may reopen — ending it as agent_close here would fight
+                    # the gateway's own finalize policy for reaped sessions.
+                    agent._end_session_on_close = False
+                except Exception:
+                    pass
+                try:
+                    if hasattr(agent, "close"):
+                        agent.close()
+                except Exception:
+                    pass
+                return
             # Baseline for the per-turn config sync; the profile home
             # override is still active here.
             current["config_model_seen"] = _config_model_target()
@@ -2241,6 +2289,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             current["agent_error"] = str(e)
             _emit("error", sid, {"message": f"agent init failed: {e}"})
         finally:
+            # A DB created before _make_agent failed (or before a concurrent
+            # close won the publish race) never transferred to the session.
+            if session_db is not None:
+                try:
+                    session_db.close()
+                except Exception:
+                    pass
             if home_token is not None:
                 reset_hermes_home_override(home_token)
             if secret_token is not None:
@@ -2255,6 +2310,14 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # leak (session.close unregistered before _build registered it).
             with _sessions_lock:
                 replaced = _sessions.get(sid) is not current
+            # No resource cleanup here even when replaced: publish and pop are
+            # totally ordered by _sessions_lock, so a session detached AFTER
+            # publication is always torn down by its closer (pop ->
+            # _teardown_session -> _close_session_agent_and_owned_db), which
+            # finalizes BEFORE closing. Closing from this thread too would
+            # race that finalize (persist/end_session through a just-closed
+            # agent/db). A build that never published disposed of its own
+            # locals above.
             if replaced and notify_registered:
                 try:
                     from tools.approval import unregister_gateway_notify
@@ -6476,114 +6539,163 @@ def _init_session(
     session_db=None,
     source: str | None = None,
     profile_home: str | None = None,
+    owned_session_db=None,
 ):
+    # ``owned_session_db``: a dedicated (non-launch-profile) SessionDB the
+    # caller built for this session's agent. Recording it here transfers
+    # ownership to the session record so _teardown_session closes it exactly
+    # once. Callers must NEVER pass the shared _get_db() handle.
     now = time.time()
+    record = {
+        "agent": agent,
+        "session_key": key,
+        "history": history,
+        "history_lock": threading.Lock(),
+        "history_version": 0,
+        "inflight_turn": None,
+        "created_at": now,
+        "last_active": now,
+        "running": False,
+        "attached_images": [],
+        "image_counter": 0,
+        "cwd": cwd or _completion_cwd(),
+        "cols": cols,
+        "slash_worker": None,
+        "show_reasoning": _load_show_reasoning(),
+        "source": _resolve_session_source(source),
+        "tool_progress_mode": _load_tool_progress_mode(),
+        "edit_snapshots": {},
+        "tool_started_at": {},
+        # Profile-scoped HERMES_HOME for app-global remote mode; None =
+        # launch profile. SessionBranch copies the parent's value so the
+        # child stays on the same state.db.
+        "profile_home": profile_home,
+        # Per-session model override set by an in-session /model switch.
+        # Honored on rebuild (/new, resume) so a switch in THIS session
+        # never leaks into siblings via process-global env vars.
+        "model_override": None,
+        # Pin async event emissions to whichever transport created the
+        # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
+        "transport": current_transport() or _stdio_transport,
+    }
+    if owned_session_db is not None:
+        # Recorded in the same dict that gets registered, so a concurrent
+        # close that pops this session always finds the handle it is
+        # expected to close.
+        record["_owned_session_db"] = owned_session_db
     with _sessions_lock:
-        _sessions[sid] = {
-            "agent": agent,
-            "session_key": key,
-            "history": history,
-            "history_lock": threading.Lock(),
-            "history_version": 0,
-            "inflight_turn": None,
-            "created_at": now,
-            "last_active": now,
-            "running": False,
-            "attached_images": [],
-            "image_counter": 0,
-            "cwd": cwd or _completion_cwd(),
-            "cols": cols,
-            "slash_worker": None,
-            "show_reasoning": _load_show_reasoning(),
-            "source": _resolve_session_source(source),
-            "tool_progress_mode": _load_tool_progress_mode(),
-            "edit_snapshots": {},
-            "tool_started_at": {},
-            # Profile-scoped HERMES_HOME for app-global remote mode; None =
-            # launch profile. SessionBranch copies the parent's value so the
-            # child stays on the same state.db.
-            "profile_home": profile_home,
-            # Per-session model override set by an in-session /model switch.
-            # Honored on rebuild (/new, resume) so a switch in THIS session
-            # never leaks into siblings via process-global env vars.
-            "model_override": None,
-            # Pin async event emissions to whichever transport created the
-            # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
-            "transport": current_transport() or _stdio_transport,
-        }
-    _init_owns_db = False
-    if session_db is not None:
-        db = session_db
-    elif profile_home:
-        try:
-            from hermes_state import SessionDB
-
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
-            _init_owns_db = True
-        except Exception:
-            db = _get_db()
-    else:
-        db = _get_db()
+        if _sessions.get(sid) is not None:
+            # Refusing to displace a live record keeps the failure-path pop
+            # below unambiguous: once OUR record is registered, the slot can
+            # only change by a closer's pop-claim, never by silent
+            # replacement (two compute-host turns racing the same sid would
+            # otherwise strand the loser's agent + profile db unowned).
+            raise RuntimeError(f"session {sid} is already registered")
+        _sessions[sid] = record
     try:
-        if db is not None:
-            row = db.get_session(key) if hasattr(db, "get_session") else None
-            if row and row.get("cwd"):
-                with _sessions_lock:
-                    if sid in _sessions:
-                        _sessions[sid]["cwd"] = row["cwd"]
-            else:
-                try:
-                    _cwd = _sessions[sid]["cwd"]
-                    if hasattr(db, "update_session_cwd"):
-                        db.update_session_cwd(key, _cwd)
-                    # git branch/root probes run off the hot path (see _set_session_cwd).
-                    _persist_session_git_meta(_sessions[sid], _cwd)
-                except Exception:
-                    logger.debug(
-                        "failed to persist resumed session cwd", exc_info=True
-                    )
-    finally:
-        if _init_owns_db and db is not None:
+        _init_owns_db = False
+        if session_db is not None:
+            db = session_db
+        elif profile_home:
             try:
-                db.close()
+                from hermes_state import SessionDB
+
+                db = SessionDB(db_path=Path(profile_home) / "state.db")
+                _init_owns_db = True
+            except Exception:
+                db = _get_db()
+        else:
+            db = _get_db()
+        try:
+            if db is not None:
+                row = db.get_session(key) if hasattr(db, "get_session") else None
+                if row and row.get("cwd"):
+                    record["cwd"] = row["cwd"]
+                else:
+                    try:
+                        _cwd = record["cwd"]
+                        if hasattr(db, "update_session_cwd"):
+                            db.update_session_cwd(key, _cwd)
+                        # git branch/root probes run off the hot path (see _set_session_cwd).
+                        _persist_session_git_meta(record, _cwd)
+                    except Exception:
+                        logger.debug(
+                            "failed to persist resumed session cwd", exc_info=True
+                        )
+        finally:
+            if _init_owns_db and db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        _register_session_cwd(record)
+        # No eager slash-worker pre-warm — the session dict already carries
+        # slash_worker=None and slash.exec builds one on demand. See the
+        # deferred-build path in _start_agent_build for the full rationale
+        # (per-worker MCP fleets accumulating across retained sessions).
+        try:
+            from tools.approval import register_gateway_notify, load_permanent_allowlist
+
+            register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
+            load_permanent_allowlist()
+        except Exception:
+            pass
+        # Surface the self-improvement background review's "💾 …" summary as a
+        # review.summary event so Ink can render it as a persistent system line
+        # in the transcript. In the CLI path this message is printed via
+        # prompt_toolkit; the TUI has no equivalent print surface, so without
+        # this callback the review would write the skill/memory change silently.
+        try:
+            agent.background_review_callback = lambda message, _sid=sid: _emit(
+                "review.summary", _sid, {"text": str(message)}
+            )
+            # Honor display.memory_notifications (off | on | verbose) like the
+            # messaging gateway and CLI do — otherwise the review always behaved as
+            # "on" on the TUI/desktop and a user who set "off" was ignored.
+            agent.memory_notifications = _load_memory_notifications()
+        except Exception:
+            # Bare AIAgents that don't expose the attribute (unlikely, but keep
+            # session startup resilient).
+            pass
+        _wire_callbacks(sid)
+        with _sessions_lock:
+            if sid in _sessions:
+                _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
+        _notify_session_boundary("on_session_reset", key, _session_source(record))
+        _emit("session.info", sid, _session_info(agent, record))
+        _schedule_mcp_late_refresh(sid, agent)
+    except Exception as e:
+        # A half-initialized session must not stay registered: nobody ever
+        # receives its sid, so no close/reap could reach its agent or owned
+        # profile db for hours. Reclaim the record with the same atomic pop
+        # teardown uses. Winning the pop proves no concurrent closer touched
+        # it — the agent and owned db revert to the caller's locals, and
+        # nothing here closes them. Losing the pop means a closer already
+        # claimed the record and closes both resources itself (registration
+        # refuses to displace a live record, so a closer's pop is the ONLY
+        # way our record can leave the slot); the marker tells the caller
+        # not to close (or resurrect) them again.
+        with _sessions_lock:
+            still_ours = _sessions.get(sid) is record
+            if still_ours:
+                _sessions.pop(sid, None)
+        if still_ours:
+            stop_event = record.get("_notif_stop")
+            if stop_event is not None:
+                stop_event.set()
+            try:
+                from tools.approval import unregister_gateway_notify
+
+                unregister_gateway_notify(key)
             except Exception:
                 pass
-    _register_session_cwd(_sessions[sid])
-    # No eager slash-worker pre-warm — the session dict already carries
-    # slash_worker=None and slash.exec builds one on demand. See the
-    # deferred-build path in _start_agent_build for the full rationale
-    # (per-worker MCP fleets accumulating across retained sessions).
-    try:
-        from tools.approval import register_gateway_notify, load_permanent_allowlist
-
-        register_gateway_notify(key, lambda data: _emit_approval_request(sid, data))
-        load_permanent_allowlist()
-    except Exception:
-        pass
-    # Surface the self-improvement background review's "💾 …" summary as a
-    # review.summary event so Ink can render it as a persistent system line
-    # in the transcript. In the CLI path this message is printed via
-    # prompt_toolkit; the TUI has no equivalent print surface, so without
-    # this callback the review would write the skill/memory change silently.
-    try:
-        agent.background_review_callback = lambda message, _sid=sid: _emit(
-            "review.summary", _sid, {"text": str(message)}
-        )
-        # Honor display.memory_notifications (off | on | verbose) like the
-        # messaging gateway and CLI do — otherwise the review always behaved as
-        # "on" on the TUI/desktop and a user who set "off" was ignored.
-        agent.memory_notifications = _load_memory_notifications()
-    except Exception:
-        # Bare AIAgents that don't expose the attribute (unlikely, but keep
-        # session startup resilient).
-        pass
-    _wire_callbacks(sid)
-    with _sessions_lock:
-        if sid in _sessions:
-            _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
-    _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
-    _schedule_mcp_late_refresh(sid, agent)
+        else:
+            try:
+                e._resources_claimed_by_closer = True
+            except Exception:
+                pass
+        raise
+    return record
 
 
 def _new_session_key() -> str:
