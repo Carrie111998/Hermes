@@ -291,6 +291,37 @@ _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withd
 # the success signal.
 _FEISHU_REACTION_IN_PROGRESS = "Typing"
 _FEISHU_REACTION_FAILURE = "CrossMark"
+# Simple ack/remove reactions are complete as platform badges. Routing them
+# into the agent just burns a turn and often produces noisy "收到" bubbles
+# (and can double-send when stream-card falls back to post/text).
+_FEISHU_SILENT_REACTION_EMOJIS = frozenset({
+    "THUMBSUP",
+    "Thumbsup",
+    "thumbsup",
+    "OK",
+    "DONE",
+    "HEART",
+    "Heart",
+    "CLAP",
+    "OnIt",
+    "Get",
+    "CheckMark",
+    "CHECK_MARK",
+    "SMILE",
+    "BLUSH",
+    "LAUGH",
+    "Joy",
+    "APPLAUSE",
+    "Fire",
+    "FIRE",
+    "Party",
+    "PARTY",
+    "MUSCLE",
+    "FISTBUMP",
+    "THANKS",
+    "Awesome",
+    "YES",
+})
 # Bound on the (message_id → reaction_id) handle cache. Happy-path entries
 # drain on completion; the cap is a safeguard against unbounded growth from
 # delete-failures, not a capacity plan.
@@ -3081,6 +3112,21 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message_id:
             return
 
+        reaction_type_obj = getattr(event, "reaction_type", None)
+        emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
+        action = "added" if "created" in event_type else "removed"
+        # Ack/remove reactions are complete as platform badges. Do not start
+        # an agent turn that replies "收到" (and can double-deliver when the
+        # stream-card path falls back to post/text).
+        if emoji_type in _FEISHU_SILENT_REACTION_EMOJIS:
+            logger.info(
+                "[Feishu] Ignoring silent reaction %s:%s on message %s",
+                action,
+                emoji_type,
+                message_id,
+            )
+            return
+
         # Fetch the target message to verify it was sent by us and to obtain chat context.
         try:
             request = self._build_get_message_request(message_id)
@@ -3105,20 +3151,25 @@ class FeishuAdapter(BasePlatformAdapter):
             return
 
         user_id_obj = getattr(event, "user_id", None)
-        reaction_type_obj = getattr(event, "reaction_type", None)
-        emoji_type = str(getattr(reaction_type_obj, "emoji_type", "") or "UNKNOWN")
-        action = "added" if "created" in event_type else "removed"
         synthetic_text = f"reaction:{action}:{emoji_type}"
 
         sender_profile = await self._resolve_sender_profile(user_id_obj)
         chat_info = await self.get_chat_info(chat_id)
+        # Keep reaction replies on the reacted message's thread when present
+        # so stream_card is disabled (topic path) and the answer stays with
+        # the original conversation instead of the main timeline.
+        native_root_id = getattr(msg, "root_id", None) or None
+        native_thread_id = getattr(msg, "thread_id", None) or None
+        thread_id = native_root_id or native_thread_id or message_id
+        if chat_type_raw == "p2p":
+            thread_id = None
         source = self.build_source(
             chat_id=chat_id,
             chat_name=chat_info.get("name") or chat_id or "Feishu Chat",
             chat_type=self._resolve_source_chat_type(chat_info=chat_info, event_chat_type=chat_type_raw),
             user_id=sender_profile["user_id"],
             user_name=sender_profile["user_name"],
-            thread_id=None,
+            thread_id=thread_id,
             user_id_alt=sender_profile["user_id_alt"],
         )
         synthetic_event = MessageEvent(
@@ -5052,9 +5103,28 @@ class FeishuAdapter(BasePlatformAdapter):
             # starts cleanly and typewriter can animate from empty→text.
             ok = await self._stream_card_content(card_id, content)
             if not ok:
-                return None
+                # Interactive message is already visible. Never fall back to
+                # post/text after this point — that creates a second bubble
+                # with the same body (seen on short reaction acks).
+                logger.warning(
+                    "[Feishu] stream card content update failed after interactive "
+                    "send; keeping card bubble to avoid duplicate post/text "
+                    "card_id=%s om_message_id=%s",
+                    card_id,
+                    om_message_id or "?",
+                )
+                result.message_id = stream_message_id
+                return result
             if finalize:
-                await self._set_stream_card_mode(card_id, streaming=False, summary=content)
+                closed = await self._set_stream_card_mode(
+                    card_id, streaming=False, summary=content
+                )
+                if not closed:
+                    logger.warning(
+                        "[Feishu] stream card content updated but failed to close "
+                        "streaming_mode card_id=%s",
+                        card_id,
+                    )
                 if om_message_id:
                     self._record_outbound_text(chat_id, om_message_id, content)
 

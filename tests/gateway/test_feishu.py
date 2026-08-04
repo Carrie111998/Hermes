@@ -546,6 +546,47 @@ class TestAdapterBehavior(unittest.TestCase):
         )
         adapter._handle_message_with_guards.assert_not_awaited()
 
+    @patch.dict(os.environ, {}, clear=True)
+    def test_silent_ack_reaction_is_not_routed(self):
+        # THUMBSUP/OK-style reactions are complete as platform badges.
+        # Routing them into the agent produced noisy "收到" replies and,
+        # with stream-card→post fallback, duplicate bubbles.
+        adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
+
+        event = SimpleNamespace(
+            message_id="om_self_msg",
+            user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="THUMBSUP"),
+        )
+        data = SimpleNamespace(event=event)
+        asyncio.run(
+            adapter._handle_reaction_event("im.message.reaction.created_v1", data)
+        )
+        adapter._handle_message_with_guards.assert_not_awaited()
+        adapter._client.im.v1.message.get.assert_not_called()
+
+    @patch.dict(os.environ, {}, clear=True)
+    def test_non_silent_reaction_on_self_message_is_routed_with_thread(self):
+        adapter = self._build_reaction_adapter(msg_sender_id="cli_self_app")
+        # Enrich GET payload with thread context from the reacted message.
+        msg = adapter._client.im.v1.message.get.return_value.data.items[0]
+        msg.root_id = "om_thread_root"
+        msg.thread_id = "omt_topic"
+
+        event = SimpleNamespace(
+            message_id="om_self_msg",
+            user_id=SimpleNamespace(open_id="ou_human", user_id=None, union_id=None),
+            reaction_type=SimpleNamespace(emoji_type="Thinking"),
+        )
+        data = SimpleNamespace(event=event)
+        asyncio.run(
+            adapter._handle_reaction_event("im.message.reaction.created_v1", data)
+        )
+        adapter._handle_message_with_guards.assert_awaited_once()
+        synth = adapter._handle_message_with_guards.await_args.args[0]
+        self.assertEqual(synth.text, "reaction:added:Thinking")
+        self.assertEqual(synth.source.thread_id, "om_thread_root")
+
 
     def test_per_group_allowlist_policy_gates_by_sender(self):
         from gateway.config import PlatformConfig
