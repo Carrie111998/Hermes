@@ -2503,6 +2503,7 @@ def terminal_tool(
         # but applies unconditionally (force=True cannot help here).
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
+                contains_gateway_lifecycle_command,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
             )
@@ -2557,11 +2558,29 @@ def terminal_tool(
                     pass
                 return None
 
-            if contains_gateway_lifecycle_command_or_referenced_script(
-                command,
-                cwd=guard_cwd,
-                read_remote_script=_read_script_in_env,
-            ):
+            try:
+                lifecycle_blocked = (
+                    contains_gateway_lifecycle_command_or_referenced_script(
+                        command,
+                        cwd=guard_cwd,
+                        read_remote_script=_read_script_in_env,
+                    )
+                )
+            except Exception as guard_error:  # noqa: BLE001
+                # A guard bug must not become a hard tool failure (#77151:
+                # ValueError on NUL-bearing path tokens killed whole terminal
+                # calls). Degrade to the cheap textual check and continue.
+                logger.warning(
+                    "lifecycle guard raised %s: %s; falling back to direct check",
+                    type(guard_error).__name__,
+                    guard_error,
+                )
+                try:
+                    lifecycle_blocked = contains_gateway_lifecycle_command(command)
+                except Exception:  # noqa: BLE001
+                    lifecycle_blocked = False
+
+            if lifecycle_blocked:
                 return json.dumps({
                     "output": "",
                     "exit_code": 1,

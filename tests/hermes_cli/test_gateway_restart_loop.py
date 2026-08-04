@@ -857,3 +857,57 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+class TestLifecycleGuardNulPathTokens:
+    """NUL-bearing *path tokens* must not crash the guard (#77151).
+
+    Upstream 037825c1f handles NUL bytes in referenced-script *content*, but a
+    NUL inside the path token itself still reached ``os.open`` /
+    ``Path.resolve``, which raise ``ValueError`` (not OSError) and killed the
+    whole terminal call. Observed live: any ``python3 -c`` one-liner whose
+    inline source tokenizes into a NUL-carrying path-shaped string.
+    """
+
+    LIFECYCLE = "hermes gateway " + "restart"
+
+    def test_read_referenced_script_nul_path_returns_not_a_script(self):
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(Path("/tmp/a\x00b"))
+        assert text is None
+        assert unsafe is False
+
+    def test_guard_survives_nul_bearing_command(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        command = 'python3 -c "\nimport os\nopen(\'/tmp/a\x00b\')\n"'
+        assert guard(command, cwd="/tmp") is False
+
+    def test_inline_python_import_oneliner_is_allowed(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        command = 'python3 -c "import sqlite3; print(sqlite3.sqlite_version)"'
+        assert guard(command, cwd="/tmp") is False
+
+    def test_lifecycle_command_still_blocks(self):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        assert guard(self.LIFECYCLE, cwd="/tmp") is True
+
+    def test_lifecycle_inside_script_still_blocks(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        script = tmp_path / "danger.sh"
+        script.write_text(f"#!/usr/bin/env bash\n{self.LIFECYCLE}\n")
+        assert guard(f"bash {script}", cwd=str(tmp_path)) is True

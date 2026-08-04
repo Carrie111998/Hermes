@@ -188,6 +188,11 @@ def _iter_referenced_shell_scripts(
         if index is None:
             continue
         executable = segment[index]
+        if "\x00" in executable:
+            # NUL-bearing tokens come from binary content or inline program
+            # text tokenized as paths. No shell can execute them, and every
+            # downstream filesystem call raises ValueError on them (#77151).
+            continue
         executable_name = Path(executable).name
 
         if executable_name in {".", "source"}:
@@ -258,7 +263,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte in a path-shaped token (tokenized from
+        # inline program text or binary content). No shell could execute such a
+        # path, and it must never crash the guard (#76762, #77151).
         return None, False
     try:
         metadata = os.fstat(descriptor)
