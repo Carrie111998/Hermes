@@ -114,6 +114,7 @@ import { titlebarControlsPosition } from '../shell/titlebar'
 import { TitlebarControls } from '../shell/titlebar-controls'
 import { UpdatesOverlay } from '../updates-overlay'
 
+import { publishPluginActions } from './actions-bridge'
 import { ContribWiringContext } from './context'
 import { useBackgroundSync } from './hooks/use-background-sync'
 import { useDesktopIntegrations } from './hooks/use-desktop-integrations'
@@ -910,6 +911,20 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   }
 
   const actions = actionsRef.current
+
+  // Publish the live model-switch action to the plugin SDK bridge so plugins
+  // can drive the same picker semantics (composer atom + session config.set).
+  // Effect-managed, not render-body: an uncommitted render must not leak a
+  // closure, and unmount clears the bridge so a torn-down controller can't be
+  // invoked. The wrapper dereferences actionsRef at call time so it always
+  // runs the latest closure.
+  useEffect(() => {
+    publishPluginActions({
+      selectModel: selection => actionsRef.current!.selectModel(selection)
+    })
+
+    return () => publishPluginActions(null)
+  }, [])
 
   // Each pane node is memoized on ONLY the reactive inputs it truly consumes;
   // everything else reaches its surface through `actions` (stable) or the

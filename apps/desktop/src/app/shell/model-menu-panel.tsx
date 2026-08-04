@@ -22,18 +22,13 @@ import {
 } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { ModelOptionsResponse } from '@/types/hermes'
+import type { ModelSelection } from '@/types/model-selection'
 
 import { ModelCatalogMenu, type ModelMenuController } from './model-catalog-menu'
 
 export { ModelMenuCloseContext } from './model-catalog-menu'
 
-export interface ModelSelection {
-  model: string
-  provider: string
-  /** Runtime id of the surface that opened the menu. When set, the switch
-   *  targets that session (a tile) instead of the primary `$activeSessionId`. */
-  sessionId?: null | string
-}
+export type { ModelSelection }
 
 interface ModelMenuPanelProps {
   gateway?: HermesGateway

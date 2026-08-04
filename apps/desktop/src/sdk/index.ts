@@ -20,6 +20,7 @@
 
 import { atom, type ReadableAtom } from 'nanostores'
 
+import { runPluginSelectModel } from '@/app/contrib/actions-bridge'
 import { $narrowViewport } from '@/components/pane-shell/tree/store'
 import { onGatewayEvent } from '@/contrib/events'
 import { getLogs, getStatus } from '@/hermes'
@@ -28,6 +29,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $activeSessionId, $currentCwd, $currentModel, $gatewayState } from '@/store/session'
 import { runGatewayRestart } from '@/store/system-actions'
+import type { ModelSelection } from '@/types/model-selection'
 
 // -- state: readonly views over the app's live atoms -------------------------
 
@@ -94,6 +96,14 @@ export const host = {
 
   /** Restart the backend gateway (progress surfaces in the core statusbar). */
   restartGateway: async () => runGatewayRestart(),
+
+  /** Switch the model exactly like the in-app picker: updates the composer
+   *  atoms for a fresh draft and applies a session-scoped `config.set` for a
+   *  live session (deferred mid-turn). Resolves `true` when the switch is
+   *  accepted; resolves `false` when the controller is unavailable or the
+   *  controller rejects/rolls back the switch; unexpected handler exceptions
+   *  reject the promise. */
+  selectModel: async (selection: ModelSelection) => runPluginSelectModel(selection),
 
   /** One-shot system status snapshot (platforms, versions, …). */
   status: async () => getStatus(),
@@ -266,6 +276,7 @@ export { coarseElapsed, fmtDateTime, fmtDayTime, relativeTime } from '@/lib/time
 export { cn } from '@/lib/utils'
 export { THEMES_AREA } from '@/themes/user-themes'
 export type { RpcEvent, StatusResponse } from '@/types/hermes'
+export type { ModelSelection } from '@/types/model-selection'
 /** Subscribe a component to a `host.state` atom. */
 export { useStore as useValue } from '@nanostores/react'
 /** The app's data-fetching layer. Plugins share the ONE QueryClient mounted at
