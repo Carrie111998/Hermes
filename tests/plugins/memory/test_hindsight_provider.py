@@ -1557,3 +1557,59 @@ class TestV084RecallParams:
             min_scores={"semantic": "high"},
         )
         assert p._min_scores is None
+
+    def test_min_scores_nan_rejected(
+        self, provider_with_config, monkeypatch,
+    ) -> None:
+        """NaN in min_scores is rejected — range checks alone can't catch it
+        (NaN comparisons are always False), and json.dumps would serialize it
+        into invalid JSON on the wire."""
+        monkeypatch.setattr(
+            "importlib.metadata.version",
+            lambda _: "0.8.4",
+        )
+        p = provider_with_config(
+            min_scores={"semantic": float("nan")},
+        )
+        assert p._min_scores is None
+
+    def test_min_scores_infinity_rejected(
+        self, provider_with_config, monkeypatch,
+    ) -> None:
+        """±Infinity in min_scores is rejected for every field."""
+        monkeypatch.setattr(
+            "importlib.metadata.version",
+            lambda _: "0.8.4",
+        )
+        for field in ("semantic", "keyword", "reranker", "final"):
+            for bad in (float("inf"), float("-inf")):
+                p = provider_with_config(
+                    min_scores={field: bad},
+                )
+                assert p._min_scores is None, (
+                    f"{field}={bad} should be rejected"
+                )
+
+    def test_version_guard_fail_closed_on_error(
+        self, provider_with_config, monkeypatch,
+    ) -> None:
+        """v0.8.4 params are disabled when the client version cannot be
+        verified (fail closed, never pass kwargs to an unknown client)."""
+        def _boom(_pkg: str):
+            raise RuntimeError("distribution not found")
+
+        monkeypatch.setattr(
+            "importlib.metadata.version",
+            _boom,
+        )
+        p = provider_with_config(
+            prefer_observations=True,
+            min_scores={"semantic": 0.7},
+        )
+        assert p._prefer_observations is False
+        assert p._min_scores is None
+
+        p.handle_tool_call("hindsight_recall", {"query": "test"})
+        kwargs = p._client.arecall.call_args.kwargs
+        assert "prefer_observations" not in kwargs
+        assert "min_scores" not in kwargs

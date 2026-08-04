@@ -35,6 +35,7 @@ import atexit
 import importlib
 import json
 import logging
+import math
 import os
 import queue
 import sys
@@ -1011,6 +1012,11 @@ class HindsightMemoryProvider(MemoryProvider):
         val = input(prompt).strip()
         if val:
             provider_config["min_scores"] = val
+        elif "min_scores" in provider_config:
+            # Blank input clears the existing value — consistent with the
+            # prefer_observations prompt above (blank resets to default).
+            del provider_config["min_scores"]
+            print("  min_scores cleared.")
 
         # Step 4: Save everything
         provider_config.setdefault("bank_id", "hermes")
@@ -1631,12 +1637,13 @@ class HindsightMemoryProvider(MemoryProvider):
         # >= 0.8.4 before passing the params.
 
         # Supported min_scores fields and their valid numeric ranges.
-        # semantic / reranker: [0, 1], keyword: >= 0, final: any numeric.
+        # Per the Hindsight recall API: semantic / reranker / final are
+        # normalized scores in [0, 1], keyword is a BM25 score >= 0.
         _MIN_SCORE_FIELDS = {
             "semantic": (0.0, 1.0),
             "keyword": (0.0, None),
             "reranker": (0.0, 1.0),
-            "final": (None, None),
+            "final": (0.0, 1.0),
         }
 
         self._prefer_observations = self._config.get("prefer_observations", False)
@@ -1687,6 +1694,17 @@ class HindsightMemoryProvider(MemoryProvider):
                             )
                             valid = False
                             break
+                        # NaN and ±Infinity must be rejected explicitly: NaN
+                        # comparisons are always False, so range checks alone
+                        # cannot catch it, and json.dumps would serialize NaN
+                        # into invalid JSON on the wire.
+                        if isinstance(val, float) and not math.isfinite(val):
+                            logger.warning(
+                                "min_scores: value for %r must be finite, got %r. Rejected.",
+                                key, val,
+                            )
+                            valid = False
+                            break
                         lo, hi = _MIN_SCORE_FIELDS[key]
                         if lo is not None and val < lo:
                             logger.warning(
@@ -1720,8 +1738,16 @@ class HindsightMemoryProvider(MemoryProvider):
                     )
                     self._prefer_observations = False
                     self._min_scores = None
-            except Exception:
-                pass
+            except Exception as exc:
+                # Fail closed: if the installed version cannot be determined
+                # (client missing, packaging unavailable), never pass the
+                # v0.8.4 kwargs to an unknown client.
+                logger.warning(
+                    "Could not verify hindsight-client version (%s); "
+                    "v0.8.4 recall params disabled.", exc,
+                )
+                self._prefer_observations = False
+                self._min_scores = None
         self._retain_async = self._config.get("retain_async", True)
         self._prefetch_waits_for_retain = self._config.get("prefetch_waits_for_retain", True)
         self._prefetch_retain_drain_timeout = float(
