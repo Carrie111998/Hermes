@@ -681,17 +681,28 @@ class Mem0MemoryProvider(MemoryProvider):
            compaction even when the raw tool content gets summarized away.
            Non-blocking — extraction runs in a background daemon thread.
         """
-        # ------------------------------------------------------------------
-        # Step 1: inline truncation of oversized tool results (synchronous).
-        # NOTE: mutates the caller's message dicts in-place — intentional so
-        # the compressor downstream sees the trimmed content without a copy.
-        # Step 2's thread starts after this completes; no concurrent mutation.
-        # ------------------------------------------------------------------
         _TOOL_TRUNCATE_THRESHOLD = 8_000   # ~2 000 tokens — truncate above this
         _TOOL_TRUNCATE_HEAD = 500          # chars to keep from the start
         _TOOL_TRUNCATE_TAIL = 200          # chars to keep from the end
         _SENTINEL = "... [truncated, key facts extracted to memory] ..."
 
+        # ------------------------------------------------------------------
+        # Step 1: snapshot ORIGINAL tool content for memory extraction BEFORE
+        # any in-place truncation.  This ensures the extraction step receives
+        # the full, untruncated content so no information is lost.
+        # ------------------------------------------------------------------
+        tool_content: list[str] = []
+        for msg in messages:
+            if isinstance(msg, dict) and msg.get("role") == "tool":
+                content = msg.get("content", "")
+                if isinstance(content, str) and len(content) > 500:
+                    tool_content.append(content[:2000])  # cap to avoid token explosion
+
+        # ------------------------------------------------------------------
+        # Step 2: inline truncation of oversized tool results (synchronous).
+        # NOTE: mutates the caller's message dicts in-place — intentional so
+        # the compressor downstream sees the trimmed content without a copy.
+        # ------------------------------------------------------------------
         truncated_count = 0
         for msg in messages:
             if not isinstance(msg, dict):
@@ -720,16 +731,6 @@ class Mem0MemoryProvider(MemoryProvider):
         user_id = self._user_id
         agent_id = self._agent_id
         metadata = {**self._write_metadata(), "source": "pre_compress", "sprint_automation": True}
-
-        # Snapshot tool content synchronously before spawning the background thread
-        # to avoid a race condition: the main thread may mutate or compress the
-        # messages list concurrently, causing RuntimeError or partial reads.
-        tool_content: list[str] = []
-        for msg in messages:
-            if isinstance(msg, dict) and msg.get("role") == "tool":
-                content = msg.get("content", "")
-                if isinstance(content, str) and len(content) > 500:
-                    tool_content.append(content[:2000])  # cap to avoid token explosion
 
         if not tool_content:
             return ""
