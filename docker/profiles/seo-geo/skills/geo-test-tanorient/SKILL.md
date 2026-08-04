@@ -27,7 +27,13 @@ user) — on simule un acheteur, pas notre agent.
 
 ## Les 4 moteurs (approximés par API, recherche web active)
 
-3 via OpenRouter (`$OPENROUTER_API_KEY`, `POST https://openrouter.ai/api/v1/chat/completions`) :
+⚠️ **Clés** : `OPENROUTER_API_KEY`/`ANTHROPIC_API_KEY` sont volontairement
+invisibles dans le shell (blocklist des subprocess terminal, sécurité Hermes).
+Ce skill utilise les **miroirs dédiés** `$GEO_TEST_OPENROUTER_KEY` et
+`$GEO_TEST_ANTHROPIC_KEY` (vars Railway, référencées sur les originales).
+S'ils sont absents : ne simule RIEN, rapporte « clés GEO manquantes » et stop.
+
+3 via OpenRouter (`$GEO_TEST_OPENROUTER_KEY`, `POST https://openrouter.ai/api/v1/chat/completions`) :
 
 | Moteur simulé | `model` |
 |---|---|
@@ -39,12 +45,12 @@ Demande dans chaque cas les **sources/citations** (OpenRouter renvoie les
 annotations de recherche web ; si un moteur répond sans citations, note-le :
 mode dégradé, résultat moins fiable).
 
-Claude via l'API Anthropic (`$ANTHROPIC_API_KEY`) avec l'outil serveur
+Claude via l'API Anthropic (`$GEO_TEST_ANTHROPIC_KEY`) avec l'outil serveur
 `web_search` :
 
 ```bash
 curl -s https://api.anthropic.com/v1/messages \
-  -H "x-api-key: $ANTHROPIC_API_KEY" -H "anthropic-version: 2023-06-01" \
+  -H "x-api-key: $GEO_TEST_ANTHROPIC_KEY" -H "anthropic-version: 2023-06-01" \
   -H "content-type: application/json" -d '{
   "model": "claude-opus-5", "max_tokens": 2048,
   "tools": [{"type": "web_search_20250305", "name": "web_search"}],
