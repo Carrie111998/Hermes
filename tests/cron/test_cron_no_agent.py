@@ -158,3 +158,46 @@ def test_run_job_script_gets_own_process_group(hermes_env):
     # caller's group.
     assert script_pgid == script_pid
     assert script_pgid != caller_pgid
+
+
+@pytest.mark.skipif(
+    not hasattr(__import__("os"), "getpgid"),
+    reason="process groups are POSIX-only",
+)
+def test_run_job_script_timeout_kills_whole_process_group(hermes_env, monkeypatch):
+    """A timed-out script must not leak grandchildren in its isolated group.
+
+    Isolating the script into its own process group (#78432) means a plain
+    ``proc.kill()`` on timeout only reaches the script's own PID — any
+    children it spawned survive as orphans in that now-unreachable group.
+    The timeout path must killpg() the whole group instead.
+    """
+    import os
+    import time
+
+    from cron.scheduler import _run_job_script
+
+    pid_file = hermes_env / "grandchild.pid"
+    script_path = hermes_env / "scripts" / "hang.py"
+    script_path.write_text(
+        "import subprocess, sys\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'])\n"
+        f"open({str(pid_file)!r}, 'w').write(str(child.pid))\n"
+        "import time; time.sleep(30)\n"
+    )
+    monkeypatch.setattr("cron.scheduler._get_script_timeout", lambda: 0.3)
+
+    success, output = _run_job_script(str(script_path))
+    assert success is False
+    assert "timed out" in output.lower()
+
+    for _ in range(30):
+        if pid_file.exists():
+            break
+        time.sleep(0.1)
+    assert pid_file.exists(), "grandchild never started — test setup is broken"
+    grandchild_pid = int(pid_file.read_text().strip())
+
+    time.sleep(0.3)  # let the killpg() SIGKILL land and get reaped
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
