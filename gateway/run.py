@@ -26759,6 +26759,19 @@ def main():
     except Exception:
         pass
 
+    # Sweep stale __pycache__ if the checkout changed since the last gateway
+    # boot (e.g. a git pull or hermes update while the gateway was running).
+    # Without this, a lazy import of a new code path can resolve a freshly-pulled
+    # consumer module against a stale cached dependency -> ImportError
+    # (e.g. cannot import name 'CHECK_FN_CACHE_BYPASS' from 'tools.registry').
+    # The CLI entry point (hermes_cli/main.py) has the same guard; this covers
+    # the gateway's independent main() which doesn't pass through that path.
+    try:
+        from hermes_cli.main import _sweep_stale_bytecode_if_checkout_changed
+        _sweep_stale_bytecode_if_checkout_changed()
+    except Exception:
+        pass
+
     import argparse
     
     parser = argparse.ArgumentParser(description="Hermes Gateway - Multi-platform messaging")
