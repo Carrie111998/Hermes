@@ -518,7 +518,11 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             msg_id = data.get("guid") or data.get("messageGuid") or "ok"
             return SendResult(success=True, message_id=str(msg_id), raw_response=res)
         except Exception as exc:
-            return SendResult(success=False, error=str(exc))
+            err = str(exc)
+            if not err:
+                # httpx timeout exceptions stringify to "".
+                err = f"httpx.{type(exc).__name__}"
+            return SendResult(success=False, error=err)
 
     # ------------------------------------------------------------------
     # Text sending
