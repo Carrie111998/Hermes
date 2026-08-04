@@ -1398,29 +1398,40 @@ def test_archive_clears_a_worker_fence(kanban_home, live_worker):
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
-def test_unverifiable_pid_is_never_signalled_where_identity_is_available(
+def test_unverifiable_pid_widens_to_nothing_beyond_itself(
     kanban_home, live_worker, no_sleep,
 ):
     """Legacy rows carry a PID and no identity. On a platform that CAN
-    identify processes, that number is not evidence of anything: signalling
-    it risks killing whatever inherited it. Fail closed and let the bounded
-    fence carry the task instead.
+    identify processes, that number is not evidence of *which* process is
+    there — so the blast radius stays exactly that one number. No process
+    group (the widest radius we have, and the one that needs proof), and no
+    unbounded fence.
 
-    The documented exception is a platform with no identity probe at all
-    (Windows), where the PID is the only thing we ever had.
+    Signalling the pid itself is still right: it is the only handle we ever
+    had on that worker, and declining leaves a live writer to be carried by
+    a fence that expires. A recorded identity that MISMATCHES is the case
+    where we signal nothing at all — see
+    ``test_group_signal_requires_verified_leader_identity``.
     """
     proc = live_worker()
     pgid = os.getpgid(proc.pid)
 
     sent = []
+    group_calls = []
     info = kb._terminate_reclaimed_worker(
         proc.pid, kb._claimer_id(),
         signal_fn=lambda *a: sent.append(a),
+        killpg_fn=lambda *a: group_calls.append(a),
         pgid=pgid,
         identity=None,
     )
-    assert sent == [], "signalled a pid we cannot prove is our worker"
-    assert info["still_alive"] is True, "must fence instead of killing blind"
+    assert group_calls == [], "blasted a group we cannot prove is ours"
+    assert info["group_signaled"] is False
+    assert {s[0] for s in sent} == {proc.pid}, "signalled beyond the pid"
+    assert info["still_alive"] is True
+    assert info["leader_alive"] is True, (
+        "a live worker we could not kill must hold, not fall to a bounded fence"
+    )
     assert proc.poll() is None
 
 
@@ -1645,3 +1656,135 @@ def test_unknown_process_group_is_never_invented(kanban_home, no_sleep, monkeypa
             identity=task.worker_identity,
         )
         assert group_calls == []
+
+
+# ===========================================================================
+# Review round 5 — an identity-less LIVE worker must be killed, not fenced
+#
+# Failing closed on the *group* (never blast a pgid we cannot prove is ours)
+# had been over-applied to the *pid*: a legacy or transiently-unidentified
+# row whose worker was still running got no signal at all, only a fence —
+# and a fence with no identity token is bounded by WORKER_FENCE_MAX_SECONDS.
+# The live worker therefore aged out of its own fence and a replacement
+# claim landed beside it: exactly the ``t_80a3542a`` duplicate-writer state.
+# ===========================================================================
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_identityless_live_worker_is_terminated_not_left_to_age_out(
+    kanban_home, live_worker, no_sleep,
+):
+    """No identity token is not a reason to leave a live worker running.
+
+    A bare PID we recorded ourselves is weak evidence of *which* process is
+    there, but the pre-existing behaviour — signal the pid — stays the right
+    call while the number is still alive: the alternative is a fence that
+    expires under a worker that never stopped writing. The blast radius stays
+    the single pid; the process GROUP still requires a proven identity.
+    """
+    proc = live_worker()
+    pgid = os.getpgid(proc.pid)
+
+    group_calls = []
+    info = kb._terminate_reclaimed_worker(
+        proc.pid, kb._claimer_id(),
+        killpg_fn=lambda *a: group_calls.append(a),
+        pgid=pgid,
+        identity=None,
+    )
+
+    assert info["may_signal"] is True, "declined to signal a live worker"
+    assert info["termination_attempted"] is True
+    assert group_calls == [], "blasted a group we cannot prove is ours"
+    assert info["group_signaled"] is False
+    assert info["terminated"] is True
+    assert info["still_alive"] is False
+    proc.wait(timeout=5)
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_identityless_survivor_holds_the_claim_instead_of_fencing(
+    kanban_home, live_worker, no_sleep,
+):
+    """A live identity-less leader that shrugs off the kill is a HOLD.
+
+    ``_worker_survived_termination`` is what keeps the claim (and so keeps
+    the dispatcher from spawning a second writer). Reporting an unsignalled,
+    unverifiable-but-live leader as "not alive" routed this state onto the
+    bounded fence path, which resolves itself after an hour regardless of
+    the process. Holding is correct and self-correcting: the next tick
+    retries the kill.
+    """
+    proc = live_worker()
+    sent = []
+    info = kb._terminate_reclaimed_worker(
+        proc.pid, kb._claimer_id(),
+        signal_fn=lambda *a: sent.append(a),
+        pgid=os.getpgid(proc.pid),
+        identity=None,
+    )
+
+    assert {s[0] for s in sent} == {proc.pid}, "signalled beyond the pid"
+    assert info["sigkill"] is True, "never escalated past SIGTERM"
+    assert info["leader_alive"] is True
+    assert info["still_alive"] is True
+    assert info["terminated"] is False
+    assert kb._worker_survived_termination(info) is True, (
+        "a live worker we could not kill must hold its claim, not age out"
+    )
+    assert proc.poll() is None
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process groups")
+def test_operator_reclaim_pins_a_live_identityless_leader(
+    kanban_home, live_worker, no_sleep,
+):
+    """The operator path fences rather than holds — so the fence must bind.
+
+    ``reclaim_task`` honours the operator's release even for a worker that
+    survived termination, and records a fence to stop the duplicate writer.
+    With no identity on the row that fence was weakly evidenced and expired
+    after ``WORKER_FENCE_MAX_SECONDS`` while the worker was still running.
+    Pinning the identity observed at termination time makes the hold provable
+    (so it cannot age out under a live worker) and still self-releasing (a
+    recycled pid reads as ``worker_identity_changed``).
+    """
+    proc = live_worker()
+    pgid = os.getpgid(proc.pid)
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="legacy live worker", assignee="a")
+        kb.claim_task(conn, tid)
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ?, worker_pgid = ?, "
+                "worker_identity = NULL WHERE id = ?",
+                (proc.pid, pgid, tid),
+            )
+
+        # Signals swallowed: the worker outlives the operator's reclaim.
+        assert kb.reclaim_task(
+            conn, tid, reason="operator", signal_fn=lambda *a: None,
+        ) is True
+
+        fence = kb.worker_fence(conn, tid)
+        assert fence is not None, "released a live worker with no fence"
+        assert fence["identity"] == kb._process_identity(proc.pid), (
+            "fenced a live leader on nothing but a recyclable number"
+        )
+
+        # Age it far past the weak-evidence bound: a PROVEN live leader is
+        # not on a clock.
+        fence["since"] = int(time.time()) - kb.WORKER_FENCE_MAX_SECONDS * 10
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_fence = ? WHERE id = ?",
+                (json.dumps(fence), tid),
+            )
+        assert kb._fence_release_reason(fence, int(time.time())) is None
+        assert kb.claim_task(conn, tid) is None, (
+            "a live worker aged out of its own fence: duplicate writers"
+        )
+
+        # And it still resolves on its own once the worker is really gone.
+        _kill_and_reap(proc.pid)
+        assert kb.claim_task(conn, tid) is not None

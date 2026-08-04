@@ -4965,7 +4965,14 @@ def reclaim_task(
             pgid=probe_pgid,
             run_id=probe_run_id,
             claim_lock=probe_lock,
-            identity=probe_identity,
+            # An unidentified row whose leader survived the kill is the one
+            # case that would otherwise be fenced on a bare number, and the
+            # bound on that weak evidence would expire under a worker that
+            # never stopped writing. The termination probe saw the live
+            # process; pin what it saw. The automatic reclaims never reach
+            # here with a live leader — they hold the claim instead — so
+            # this is the only site where the fallback can be non-None.
+            identity=probe_identity or termination.get("observed_identity"),
             reason="manual_reclaim_unconfirmed_termination",
         ) if keep_fence else None
 
@@ -7575,6 +7582,12 @@ def _worker_leader_alive(
     either where the platform could have produced one — an unverifiable pid
     is treated as "not our worker", which routes the task onto the bounded
     fence path instead of an unbounded hold on a number.
+
+    That is the right answer for a decision made ABOUT a process we are only
+    observing. It is not the right answer for the process we are actively
+    killing: :func:`_terminate_reclaimed_worker` signals an identity-less
+    pid and therefore judges its survival on the bare pid, because a live
+    worker that fell through to a bounded fence would age out of it.
     """
     if not _pid_alive(pid):
         return False
@@ -7615,16 +7628,31 @@ def _terminate_reclaimed_worker(
     ``start_new_session=True``, so the group is the worker plus every tool
     subprocess it forked — but ONLY while the leader's recorded ``identity``
     still matches the live process. PIDs and PGIDs are recycled numbers, and
-    a group signal is the widest blast radius we have: without that proof we
-    fall back to signalling the bare PID (the pre-existing behaviour), and
-    on a proven mismatch we signal nothing at all, because our worker is
-    already gone and the number now belongs to a stranger.
+    a group signal is the widest blast radius we have.
+
+    Without that proof the blast radius narrows to the bare PID, which is
+    the pre-existing behaviour and the only one that keeps the duplicate-
+    writer invariant. The two unproven cases are NOT the same:
+
+    * **No recorded identity** (legacy row, or a row written before the
+      token landed): the PID is all we have, so we signal it. Declining
+      would leave a live worker to be carried by a fence — and a fence with
+      no identity token is bounded by ``WORKER_FENCE_MAX_SECONDS``, so the
+      worker would age out of its own fence and a second writer would claim
+      beside it. ``observed_identity`` reports the token of whatever is
+      still alive afterwards, so a caller that must fence rather than hold
+      (operator reclaim) can pin it instead of resting on the number.
+    * **Recorded identity that no longer matches** a live PID: the OS
+      recycled the number. Our worker is already gone, so we signal nothing
+      — killing here would kill a stranger.
 
     ``terminated`` is only True once nothing we are allowed to attribute to
     this worker answers a liveness probe; ``still_alive`` is its complement
-    for callers deciding whether to fence. Both are host-local judgements:
-    for a claim held by another host we return without probing anything,
-    since a local PID number says nothing about a remote process.
+    for callers deciding whether to fence, and ``leader_alive`` narrows that
+    to the worker process itself (the signal to HOLD the claim rather than
+    fence). All are host-local judgements: for a claim held by another host
+    we return without probing anything, since a local PID number says
+    nothing about a remote process.
     """
     import signal
 
@@ -7641,6 +7669,7 @@ def _terminate_reclaimed_worker(
         "sigkill": False,
         "still_alive": False,
         "leader_alive": False,
+        "observed_identity": None,
     }
     if not pid or pid <= 0 or not claim_lock:
         return info
@@ -7656,10 +7685,16 @@ def _terminate_reclaimed_worker(
 
     identity_ok = _identity_matches(pid, identity)
     info["identity_verified"] = identity_ok
-    # Signalling at all requires either a verified identity or a platform
-    # that cannot produce one. Blind-signalling a bare PID is how a recycled
-    # number gets a stranger's process killed.
-    may_signal = identity_ok or not _identity_probe_supported()
+    # A recorded identity that does NOT match is proof the number was
+    # recycled, and the only case where signalling is forbidden outright:
+    # blind-signalling it is how a stranger's process gets killed. With no
+    # identity recorded at all there is nothing to contradict — the PID is
+    # the only handle we have ever had, and the pre-existing behaviour of
+    # signalling it is what keeps a live worker from aging out of a bounded
+    # fence into a duplicate-writer state.
+    may_signal = (
+        identity_ok or identity is None or not _identity_probe_supported()
+    )
     info["may_signal"] = may_signal
     if identity and _pid_alive(pid) and not identity_ok:
         # The number is live but it is NOT our worker any more — the OS
@@ -7695,7 +7730,17 @@ def _terminate_reclaimed_worker(
         return info
 
     def _leader_alive() -> bool:
-        """The worker process itself — not the group it left behind."""
+        """The worker process itself — not the group it left behind.
+
+        With no recorded identity the bare PID is the answer: we just
+        signalled that number, so reporting it dead while it is visibly
+        alive would send the caller down the bounded-fence path and let the
+        survivor age out. ``_worker_leader_alive`` deliberately answers
+        "not ours" for an unverifiable pid — right for a fence decision it
+        did not signal, wrong for the process we are killing right here.
+        """
+        if identity is None:
+            return _pid_alive(pid)
         return _worker_leader_alive(pid, identity)
 
     def _alive() -> bool:
@@ -7761,6 +7806,13 @@ def _terminate_reclaimed_worker(
     info["leader_alive"] = _leader_alive()
     info["still_alive"] = _alive()
     info["terminated"] = not info["still_alive"]
+    if identity is None and info["leader_alive"]:
+        # Nothing was recorded at spawn, but the leader is alive NOW, so a
+        # token can be derived now. A caller that must fence instead of
+        # holding the claim (operator reclaim) pins this, turning a hold on
+        # a recyclable number into a provable one: unbounded while it
+        # matches, self-releasing the moment the pid is recycled.
+        info["observed_identity"] = _process_identity(pid)
     return info
 
 
@@ -8186,8 +8238,9 @@ def enforce_max_runtime(
         killed = bool(termination.get("sigkill"))
         if termination.get("still_alive"):
             # We are requeuing a worker we could not confirm dead: its
-            # children still hold the process group, or we were not allowed
-            # to signal it (no verified identity, no signalling primitive).
+            # children still hold the process group, or we had no signalling
+            # primitive at all. Never the leader itself — a live leader is
+            # held by the branch above, not fenced.
             # ``still_alive`` is only ever set for host-local claims. Fence
             # the task so no replacement claim lands until the group is gone.
             record_worker_fence(
