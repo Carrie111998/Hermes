@@ -794,6 +794,19 @@ class TestLifecycleGuardModule:
             is False
         )
 
+    def test_embedded_null_tilde_path_does_not_crash_expanduser(self):
+        """Binary-derived path fragments can fail before the bounded reader."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        assert (
+            contains_gateway_lifecycle_command_or_referenced_script(
+                "~/bad\x00reference.sh"
+            )
+            is False
+        )
+
     def test_nested_remote_script_keeps_remote_directory_authority(self):
         """Host path canonicalization must not rewrite nested remote references."""
         from cron.lifecycle_guard import (

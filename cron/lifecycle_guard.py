@@ -171,7 +171,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    path = Path(candidate)
+    try:
+        path = path.expanduser()
+    except (OSError, RuntimeError, ValueError):
+        # Recursive tokenization can surface a path-shaped fragment from
+        # decoded binary data. A NUL-bearing fragment is not a runnable
+        # script reference; preserve it for the bounded reader, which will
+        # classify it as unreadable instead of crashing the guard.
+        return path
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
