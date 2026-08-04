@@ -1,0 +1,61 @@
+# Profil "seo-geo" — suivi SEO & GEO (premier site : tanorient.com / Tan Services).
+# Overlay copié par docker/entrypoint.sh au boot Railway (config.yaml TOUJOURS
+# rafraîchi depuis ce template ; toute modif passe par le repo + redeploy).
+# Les `${VAR}` sont interpolées depuis l'environnement du process (injecté par
+# Railway). ⚠️ Une VAR absente laisse le littéral `${VAR}` en place (401 silencieux).
+
+model:
+  # DeepSeek v4 Flash via OpenRouter (choix Gilles 2026-08-04) — routines de
+  # suivi à fort volume, coût faible. Fallback Opus 5 direct Anthropic.
+  # (id vérifié sur /api/v1/models : pas de variante "-latest")
+  default: "deepseek/deepseek-v4-flash"
+  provider: "openrouter"
+
+fallback_providers:
+  - provider: anthropic
+    model: "claude-opus-5"
+
+terminal:
+  backend: local
+
+# Worker Kanban : reçoit des cartes du profil orchestrateur (assignee: seo-geo).
+toolsets:
+  - kanban
+
+# Approbations shell arbitrées par un side-model (Gemini Flash via OpenRouter) —
+# indispensable pour les runs cron non supervisés.
+auxiliary:
+  approval:
+    provider: "auto"
+    model: ""
+
+skills:
+  external_dirs:
+    - /opt/data/skills
+
+mcp_servers:
+  # WordPress tanorient.com — plugin AI Engine (Streamable HTTP, accès admin).
+  # Même endpoint que le Desktop mais SANS mcp-remote : Hermes parle HTTP natif.
+  # Token : VAR Railway WP_TANSERVICES_TOKEN (sans le préfixe "Bearer ").
+  wp-tanservices:
+    url: "https://tanorient.com/wp-json/mcp/v1/http"
+    headers:
+      Authorization: "Bearer ${WP_TANSERVICES_TOKEN}"
+    enabled: true
+    tools:
+      # Garde-fou : le suivi SEO n'a jamais besoin de supprimer ni de gérer
+      # les utilisateurs WordPress.
+      exclude: ["wp_delete_*", "wp_create_user", "wp_update_user"]
+
+  # Google Search Console — service account (API Search Console activée,
+  # e-mail du SA ajouté comme utilisateur sur la propriété préfixe
+  # https://tanorient.com/). Clé JSON décodée par l'entrypoint depuis
+  # GSC_SERVICE_ACCOUNT_B64 vers /opt/data/gsc-service-account.json.
+  # ⚠️ stdio : le subprocess n'hérite PAS de os.environ — le bloc env: est
+  # obligatoire (tools/mcp_tool.py:_build_safe_env).
+  gsc:
+    command: "npx"
+    args: ["-y", "mcp-server-gsc"]
+    env:
+      GOOGLE_APPLICATION_CREDENTIALS: "/opt/data/gsc-service-account.json"
+    enabled: true

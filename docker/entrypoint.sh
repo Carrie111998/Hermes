@@ -168,7 +168,7 @@ fi
 # to keep connectors + the kanban toolset in sync; SOUL.md is only seeded when
 # absent so manual edits survive reboots. The shared kanban board at
 # $HERMES_HOME/kanban.db lets the profiles delegate work to each other.
-for _p in web-design web-dev wmh-offers; do
+for _p in web-design web-dev wmh-offers seo-geo; do
     _pdir="$HERMES_HOME/profiles/$_p"
     _tmpl="$INSTALL_DIR/docker/profiles/$_p"
     if [ ! -d "$_pdir" ]; then
@@ -176,6 +176,8 @@ for _p in web-design web-dev wmh-offers; do
             _desc="Design & intégration web (maquettes, UI, responsive)"
         elif [ "$_p" = "wmh-offers" ]; then
             _desc="Propositions digitales — pipeline offres, devis, PPTX WMH"
+        elif [ "$_p" = "seo-geo" ]; then
+            _desc="Suivi SEO & GEO — Search Console, WordPress, visibilité IA (tanorient.com)"
         else
             _desc="Dev full-stack web — GitHub, Supabase, Netlify"
         fi
@@ -372,6 +374,22 @@ if [ -f "$FIREBASE_SA" ]; then
     echo "[entrypoint] Firebase: GOOGLE_APPLICATION_CREDENTIALS → $FIREBASE_SA"
 else
     echo "[entrypoint] Firebase: no service account (set FIREBASE_SERVICE_ACCOUNT_B64 to enable)"
+fi
+
+# Google Search Console — service-account key for the gsc MCP server of the
+# seo-geo profile (docker/profiles/seo-geo/config.yaml points its
+# GOOGLE_APPLICATION_CREDENTIALS at this file; the stdio MCP subprocess gets
+# the path via its own env: block, so the firebase GOOGLE_APPLICATION_CREDENTIALS
+# export above is not clobbered). Seed from GSC_SERVICE_ACCOUNT_B64 (base64 of
+# the JSON key) in the Railway dashboard — generate with:
+#   cat gsc-service-account.json | base64 | tr -d '\n'
+GSC_SA="$HERMES_HOME/gsc-service-account.json"
+if [ -n "$GSC_SERVICE_ACCOUNT_B64" ]; then
+    echo "$GSC_SERVICE_ACCOUNT_B64" | base64 -d > "$GSC_SA"
+    chmod 600 "$GSC_SA"
+    echo "[entrypoint] GSC: decoded service account → $GSC_SA"
+elif [ ! -f "$GSC_SA" ]; then
+    echo "[entrypoint] GSC: no service account (set GSC_SERVICE_ACCOUNT_B64 to enable the gsc MCP)"
 fi
 
 # Claude Code CLI — headless coding delegate for the web-dev profile.

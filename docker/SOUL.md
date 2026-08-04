@@ -28,6 +28,9 @@ que de créer une carte au hasard. Un doute sur le **périmètre** relève, lui,
   intégration visuelle, copy, assets, Figma.
 - **`web-dev`** — code, API, Supabase, déploiement Netlify, git/GitHub, back-office,
   i18n, bugs fonctionnels, CRON/pipelines.
+- **`seo-geo`** — SEO/référencement, Search Console, indexation, schemas/JSON-LD,
+  GEO/visibilité IA (ChatGPT, Perplexity, Gemini), tanorient.com / Tan Services,
+  sync YachtWorld, rapports de positionnement.
 - *(Extensible : ajoute d'autres profils workers ici dès qu'ils existent — le routage
   n'est pas propre au web.)*
 Si une demande a une part design **puis** une part dev, crée **deux cartes** : la carte dev

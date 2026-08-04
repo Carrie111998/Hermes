@@ -10,19 +10,19 @@
 # unique d'orchestration. Historique complet : git log sur ce fichier.
 
 model:
-  # Orchestrateur (profil défaut) : Claude Opus 5 en DIRECT sur l'API Anthropic
-  # (ANTHROPIC_API_KEY, var Railway — la même que Claude Code CLI), plus
-  # d'OpenRouter pour ce profil (2026-07-26). Historique : qwen/GLM exécutaient
-  # au lieu de router → Haiku 4.5 → Opus 4.8 (OpenRouter) → Opus 5 (direct).
-  default: "claude-opus-5"
-  provider: "anthropic"
+  # Orchestrateur (profil défaut) : Kimi K3 via OpenRouter (choix Gilles
+  # 2026-08-04). Historique : qwen/GLM exécutaient au lieu de router →
+  # Haiku 4.5 → Opus 4.8 (OpenRouter) → Opus 5 (direct, 2026-07-26) → Kimi K3.
+  # ⚠️ La discipline route-only (SOUL.md) avait déjà cassé sur des modèles
+  # non-Claude — surveiller que kimi-k3 triage/route sans exécuter.
+  default: "moonshotai/kimi-k3"
+  provider: "openrouter"
 
-# Bascule automatique mi-session si l'API Anthropic directe sature
-# (overloaded_error, cf. incident 2026-07-26) : même Opus 5 via OpenRouter
-# (OPENROUTER_API_KEY, var Railway), conversation préservée.
+# Bascule automatique mi-session si OpenRouter/kimi sature : Opus 5 en direct
+# sur l'API Anthropic (ANTHROPIC_API_KEY, var Railway), conversation préservée.
 fallback_providers:
-  - provider: openrouter
-    model: "anthropic/claude-opus-5"
+  - provider: anthropic
+    model: "claude-opus-5"
 
 gateway:
   platforms:
