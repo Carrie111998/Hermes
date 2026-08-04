@@ -412,6 +412,28 @@ class FakeAgent:
         }
 
 
+class StatusAndProgressAgent(FakeAgent):
+    """Exercise both transient delivery paths used during a long turn."""
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        status_cb = getattr(self, "status_callback", None)
+        if status_cb is not None:
+            status_cb("context_notice", "context status stays threaded")
+        return super().run_conversation(
+            message,
+            conversation_history=conversation_history,
+            task_id=task_id,
+        )
+
+
+class StartupKwargCaptureAgent(FakeAgent):
+    created: list[dict] = []
+
+    def __init__(self, **kwargs):
+        type(self).created.append(dict(kwargs))
+        super().__init__(**kwargs)
+
+
 class ApprovalSourceCaptureAgent:
     """Invoke the real per-turn approval callback from the worker thread."""
 
@@ -1099,6 +1121,79 @@ async def test_run_agent_progress_uses_event_message_id_for_slack_dm(monkeypatch
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("isolated_runtime", "expected_load_soul"),
+    [(False, True), (True, False)],
+)
+async def test_platform_context_skip_reaches_agent_without_breaking_isolation(
+    monkeypatch,
+    tmp_path,
+    isolated_runtime,
+    expected_load_soul,
+):
+    """Exercise config -> TurnRunner -> real AIAgent constructor kwargs.
+
+    The platform optimization keeps SOUL.md, while a sealed clean-room runtime
+    retains the stronger boundary and must not re-enable profile identity.
+    """
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "gateway": {
+                    "platforms": {
+                        "discord": {"skip_context_files": True}
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    StartupKwargCaptureAgent.created.clear()
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StartupKwargCaptureAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.DISCORD)
+    runner = _make_runner(adapter, tmp_path)
+    runner._isolated_runtime = isolated_runtime
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="channel-context-skip",
+        chat_type="group",
+    )
+
+    result = await runner._run_agent(
+        message="hello",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-context-skip",
+        session_key="agent:main:discord:group:channel-context-skip",
+        event_message_id="msg-context-skip",
+    )
+
+    assert result["final_response"] == "done"
+    assert len(StartupKwargCaptureAgent.created) == 1
+    created = StartupKwargCaptureAgent.created[0]
+    assert created["skip_context_files"] is True
+    assert created["load_soul_identity"] is expected_load_soul
+    assert created["skip_memory"] is isolated_runtime
+
+
+@pytest.mark.asyncio
 async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypatch, tmp_path):
     """Feishu needs reply_to plus reply_in_thread metadata for topic-scoped progress."""
     monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
@@ -1140,6 +1235,201 @@ async def test_run_agent_feishu_progress_replies_inside_existing_thread(monkeypa
     assert adapter.sent[0]["metadata"] == {"thread_id": "topic_17585"}
     assert adapter.edits
     assert adapter.edits[0]["message_id"] == "progress-1"
+
+
+@pytest.mark.asyncio
+async def test_progress_carries_anchor_for_relay_discord_auto_thread(monkeypatch, tmp_path):
+    """Every tool-progress send for a new mirrored conversation stays in the
+    connector-created Discord thread, even before that thread exists locally."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = StatusAndProgressAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    # Channel-initiating message: no thread_id yet, but the connector stamped
+    # the exact future thread anchor. Deliberately use a different relay event
+    # id so the assertion proves routing follows the connector authority rather
+    # than an incidental envelope id.
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chan-parent",
+        chat_type="group",
+        thread_id=None,
+        prospective_thread_id="msg-anchor-1",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="find me a gift",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-relay-thread",
+        session_key="agent:main:discord:thread:chan-parent:msg-anchor-1",
+        event_message_id="relay-envelope-99",
+    )
+
+    assert result["final_response"] == "done"
+    assert adapter.sent, "expected at least one progress send"
+    assert any(
+        call["content"] == "context status stays threaded"
+        for call in adapter.sent
+    ), "expected the status callback path to be exercised"
+    # Every progress send must carry the anchor so the connector threads it.
+    for call in adapter.sent:
+        assert call["reply_to"] == "msg-anchor-1", call
+        assert (call["metadata"] or {}).get("reply_to_message_id") == "msg-anchor-1", call
+        # Discord lifecycle/status sends are marked non-conversational.
+        assert (call["metadata"] or {}).get("non_conversational") is True, call
+
+
+@pytest.mark.asyncio
+async def test_interim_commentary_uses_same_relay_discord_auto_thread_anchor(
+    monkeypatch,
+    tmp_path,
+):
+    """Non-streamed commentary must not escape into the parent channel."""
+    import yaml
+
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump(
+            {
+                "display": {
+                    "interim_assistant_messages": True,
+                    "platforms": {"discord": {"tool_progress": "off"}},
+                },
+                "streaming": {"enabled": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = DelayedInterimAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {"api_key": "***"},
+    )
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="chan-interim-parent",
+        chat_type="group",
+        prospective_thread_id="msg-interim-anchor",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="work for a while",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-relay-interim",
+        session_key=(
+            "agent:main:discord:thread:chan-interim-parent:msg-interim-anchor"
+        ),
+        event_message_id="relay-interim-envelope",
+    )
+
+    assert result["final_response"] == "done"
+    interim = [
+        call
+        for call in adapter.sent
+        if call["content"] in {"first interim", "second interim"}
+    ]
+    assert [call["content"] for call in interim] == [
+        "first interim",
+        "second interim",
+    ]
+    assert all(
+        call["reply_to"] == "msg-interim-anchor" for call in interim
+    ), interim
+    assert all(
+        (call["metadata"] or {}).get("reply_to_message_id")
+        == "msg-interim-anchor"
+        for call in interim
+    )
+
+
+@pytest.mark.asyncio
+async def test_progress_no_anchor_for_native_discord_thread_event(monkeypatch, tmp_path):
+    """A message ARRIVING in an existing Discord thread (not the relay
+    auto-thread lane) must NOT get the synthetic prospective anchor — it already
+    routes by its real thread. Guards against over-broadening the relay fix."""
+    monkeypatch.setenv("HERMES_TOOL_PROGRESS_MODE", "all")
+    import yaml
+    (tmp_path / "config.yaml").write_text(
+        yaml.dump({"display": {"platforms": {"discord": {"tool_progress": "all"}}}}),
+        encoding="utf-8",
+    )
+
+    fake_dotenv = types.ModuleType("dotenv")
+    fake_dotenv.load_dotenv = lambda *args, **kwargs: None
+    monkeypatch.setitem(sys.modules, "dotenv", fake_dotenv)
+
+    fake_run_agent = types.ModuleType("run_agent")
+    fake_run_agent.AIAgent = FakeAgent
+    monkeypatch.setitem(sys.modules, "run_agent", fake_run_agent)
+
+    adapter = ProgressCaptureAdapter(platform=Platform.RELAY)
+    runner = _make_runner(adapter, tmp_path)
+    gateway_run = importlib.import_module("gateway.run")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"})
+
+    # No prospective_thread_id (event is IN a real thread already).
+    source = SessionSource(
+        platform=Platform.DISCORD,
+        chat_id="real-thread-9",
+        chat_type="thread",
+        thread_id="real-thread-9",
+        delivered_via_upstream_relay=True,
+    )
+
+    result = await runner._run_agent(
+        message="continue",
+        context_prompt="",
+        history=[],
+        source=source,
+        session_id="sess-in-thread",
+        session_key="agent:main:discord:thread:real-thread-9:real-thread-9",
+        event_message_id="msg-2",
+    )
+
+    assert result["final_response"] == "done"
+    # The relay-prospective synthetic anchor path must NOT engage; progress
+    # routes by the real thread's own metadata, not a forced reply_to anchor.
+    for call in adapter.sent:
+        meta = call["metadata"] or {}
+        assert meta.get("thread_id") == "real-thread-9", call
+        assert call["reply_to"] is None, call
+        assert meta.get("reply_to_message_id") is None, call
 
 
 # ---------------------------------------------------------------------------

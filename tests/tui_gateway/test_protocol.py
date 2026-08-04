@@ -1335,8 +1335,8 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
             create_calls.append((new_key, kwargs))
             return new_key
 
-        def append_message(self, **_kwargs):
-            return None
+        def append_messages_batch(self, _key, messages, **_kwargs):
+            return len(messages)
 
         def set_session_title(self, _key, _title):
             return None
@@ -1380,7 +1380,7 @@ def test_session_branch_persists_branched_from_marker(server, monkeypatch):
 
 def test_session_branch_forwards_original_timestamps(server, monkeypatch):
     """TUI /branch must copy the parent's messages WITH their original
-    timestamps — append_message otherwise stamps time.time() at INSERT and
+    timestamps — persistence otherwise stamps time.time() at INSERT and
     the branch's whole history silently appears authored "now" (#28841).
     """
     append_calls = []
@@ -1395,9 +1395,9 @@ def test_session_branch_forwards_original_timestamps(server, monkeypatch):
         def create_session(self, new_key, **kwargs):
             return new_key
 
-        def append_message(self, **kwargs):
-            append_calls.append(kwargs)
-            return None
+        def append_messages_batch(self, _key, messages, **_kwargs):
+            append_calls.extend(messages)
+            return len(messages)
 
         def set_session_title(self, _key, _title):
             return None
@@ -1446,9 +1446,9 @@ def test_persist_branch_seed_forwards_original_timestamps(server, monkeypatch):
     append_calls = []
 
     class _DB:
-        def append_message(self, **kwargs):
-            append_calls.append(kwargs)
-            return None
+        def append_messages_batch(self, _key, messages, **_kwargs):
+            append_calls.extend(messages)
+            return len(messages)
 
     @contextlib.contextmanager
     def _fake_session_db(_session):
