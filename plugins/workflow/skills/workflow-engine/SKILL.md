@@ -74,20 +74,32 @@ Without this, notifications go to Sherlock (default profile).
 
 ### Review Nodes
 
-Reviewers always complete the card — never block. Pass/fail is in the result summary:
+Reviewers **always complete the card — never block**. Pass/fail is parsed from the completion summary by the engine, so the reviewer must lead with a verdict on the FIRST LINE:
 
 ```yaml
 qa-verify:
   agent: "{qa}"
   task: >
     Run the tests. Complete this card with a summary.
-    - If pass → include test results
-    - If fail → include failure details
+    - First line: PASS or FAIL (verdict must be the first word)
+    - If PASS → include test results
+    - If FAIL → include the specific blockers the author must fix
 
-    Do NOT block this card. Always complete it with pass/fail.
+    Do NOT block this card. Always complete it with a verdict.
 ```
 
+**Verdict contract (mandatory):** the completion summary's first line must start with `PASS` or `FAIL` (the engine also recognizes `CHANGES REQUIRED`, `BLOCKED`, `REJECTED`, ✅, ❌ in the first 300 chars). Without a verdict the engine treats the review as passed by default — a reviewer that finds problems but forgets the `FAIL` verdict lets broken work through.
+
 The engine auto-injects a context header telling the reviewer which node it's reviewing and the card ID. YAML doesn't need to explain how to find the work.
+
+### What happens on FAIL (automatic — no manual card resets)
+
+1. Engine comments the upstream card with the review results (`Review Failed (reviewer)`)
+2. Upstream resets to `ready` — the author re-does the work
+3. **All** reviewers of that upstream are re-dispatched automatically when the revised work completes
+4. Each reviewer has a retry budget (per-review `max_retries` > node > workflow > default 3). Once exhausted, the reviewer stays terminal and the FAIL is documented for operator escalation
+
+Do NOT manually reset reviewer cards with SQL after a FAIL — the engine handles re-dispatch. Manual resets are only needed if a supervisor crashed mid-loop (see `workflow_status` / resume).
 
 ### Review Workspace Inheritance
 
@@ -102,10 +114,9 @@ Use `true` for read-only reviews where the reviewer needs the actual files.
 
 ### Block Reason Convention
 
-- `"pending review"` — triggers the review pipeline
-- Any other block reason — treated as unrelated failure
+The **only** block reason that matters to the engine is `"pending review"` — used by the legacy auto-resume path when a completed run's card is re-requested for review. All other block reasons are treated as unrelated failures and do NOT trigger the review pipeline.
 
-Workers default to `kanban_block`. YAML must explicitly say "call kanban_complete with a summary" when the worker should complete.
+In current review flows, reviewers never block: they complete with a PASS/FAIL verdict (see Review Nodes above).
 
 ## Template Variables
 
@@ -125,7 +136,8 @@ Workers default to `kanban_block`. YAML must explicitly say "call kanban_complet
 | No notification arrives | Cron without `delivery_target` | Pass `delivery_target` with explicit `profile` |
 | Notification goes to Sherlock | `profile` is None | Pass `delivery_target` with `profile` |
 | Unknown input rejected | Input not declared in YAML | Add to YAML `inputs:` or use top-level param |
-| Review not triggered | Block reason ≠ "pending review" | Use exact phrase "pending review" |
+| Review not triggered | Reviewers block instead of completing | Reviewers must always complete (done) with PASS/FAIL verdict |
+| Broken work passes review | Reviewer summary lacks a verdict word | First line must be `PASS` or `FAIL` (see Verdict contract) |
 | Review loops hit triage | Reviewer blocked instead of completing | Reviewers must always complete (done) |
 | Cards default to scratch | Board has no `default_workdir` | Set `default_workdir` in `board.json` |
 | Body prefix not injected | Gateway running stale bytecode | Delete `.pyc` files, restart gateway |
@@ -139,4 +151,5 @@ Workers default to `kanban_block`. YAML must explicitly say "call kanban_complet
 - [ ] `workflow_start` returns `{"status": "dispatched"}`
 - [ ] Cron workflows have `delivery_target` with explicit `profile`
 - [ ] Review nodes say "call kanban_complete" (not kanban_block)
+- [ ] Reviewers lead with `PASS`/`FAIL` verdict on first line
 - [ ] Final node completion triggers notification in your session

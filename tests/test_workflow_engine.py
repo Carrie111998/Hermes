@@ -2719,3 +2719,43 @@ class TestBoardResolution:
                     engine.execute("test-pipeline", fire_and_forget=True)
 
         mock_connect.assert_called_with(board="wf_test-pipeline")
+
+
+# ── Tests: review verdict classification + per-reviewer guard ───────
+
+
+class TestReviewVerdict:
+    """Regression tests for the done-based review loop (ideation 2026-08-04)."""
+
+    def test_classify_fail_markers(self, engine):
+        """FAIL / CHANGES REQUIRED / BLOCKED / ❌ all classify as fail."""
+        assert engine._classify_review_verdict("FAIL: rewrite the spec") == "fail"
+        assert engine._classify_review_verdict("CHANGES REQUIRED:\n1. fix x") == "fail"
+        assert engine._classify_review_verdict("BLOCKED — security concern") == "fail"
+        assert engine._classify_review_verdict("❌ This does not pass") == "fail"
+        assert engine._classify_review_verdict("REJECTED") == "fail"
+
+    def test_classify_pass_markers(self, engine):
+        """PASS / APPROVED / ✅ classify as pass."""
+        assert engine._classify_review_verdict("PASS — looks good") == "pass"
+        assert engine._classify_review_verdict("APPROVED") == "pass"
+        assert engine._classify_review_verdict("✅ LGTM") == "pass"
+        assert engine._classify_review_verdict("OK to proceed") == "pass"
+
+    def test_classify_no_false_fail_on_failures_noun(self, engine):
+        """'no failures found' must NOT classify as fail."""
+        assert engine._classify_review_verdict(
+            "Reviewed the spec. No failures found. Looks good."
+        ) == "pass"
+
+    def test_classify_unknown(self, engine):
+        """No verdict marker → unknown."""
+        assert engine._classify_review_verdict(
+            "Here are some notes about the spec."
+        ) == "unknown"
+
+    def test_verdict_scans_beyond_first_line(self, engine):
+        """Verdict on line 2 still counts (within 300 chars)."""
+        assert engine._classify_review_verdict(
+            "Summary of findings:\nCHANGES REQUIRED\nmore detail"
+        ) == "fail"

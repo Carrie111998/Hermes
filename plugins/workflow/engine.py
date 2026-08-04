@@ -168,6 +168,11 @@ class Workflow:
                                     # webhook storms or repeated dispatch signals.
                                     # Default False preserves the existing "multiple
                                     # parallel runs allowed" behavior.
+    max_retries: Optional[int] = None
+    """Default max review rounds per reviewer for this workflow.
+    Precedence: per-review entry > node > workflow > env var > engine
+    default (3). Overridden at execute() time by
+    HERMES_WORKFLOW_MAX_RETRIES."""
 
 
 @dataclass
@@ -208,6 +213,10 @@ class NodeState:
     review_counts: dict = field(default_factory=dict)
     """Tracks how many times each reviewer has reviewed this node.
     Key: reviewer node ID, Value: count."""
+    workspace_kind: str = ""
+    """Workspace kind for this node ('' = scratch, 'worktree' = git worktree)."""
+    workspace_path: Optional[str] = None
+    """Absolute path to the node's workspace (worktree dir or None for scratch)."""
     validation_warnings: list[str] = field(default_factory=list)
 
 # ── Engine core ──────────────────────────────────────────────────
@@ -249,6 +258,11 @@ class WorkflowEngine:
                 )
         self.workflows_dir = Path(workflows_dir)
         self.kanban_board = ""  # Set by three-tier resolution in execute()
+        # When a reviewer FAILs, the layer loop rewinds to the upstream
+        # node's layer so the revised work gets re-reviewed. Stored on
+        # the engine (not in state) — it is only meaningful inside the
+        # current execute() loop.
+        self._rewind_to_layer: int | None = None
         WorkflowEngine.STATE_DIR = self.workflows_dir / ".engine-state"
         self.STATE_DIR.mkdir(parents=True, exist_ok=True)
         # Job log DB at ~/.hermes/workflows/executions.db
@@ -885,7 +899,16 @@ class WorkflowEngine:
         """Query a kanban card's current state.
 
         Uses the kanban DB Python API directly — no subprocess.
-        Returns a dict with status, body, latest_summary, etc.
+        Returns a dict with status, body, result, latest_summary, etc.
+
+        ``latest_summary`` is the completion output of the most recent
+        completed run (the agent's actual result text), read from
+        ``task_runs.summary`` — NOT from ``task_events.message`` (that
+        column does not exist; the old query silently threw and the
+        field was never populated, which made ``get_card_body`` fall
+        through to the input prompt — the verdict detector and
+        downstream template substitution were reading the task
+        instructions instead of the agent's output).
         """
         conn = kanban_db.connect(board=self.kanban_board)
         try:
@@ -895,19 +918,26 @@ class WorkflowEngine:
             result = {
                 "status": task.status,
                 "body": task.body or "",
+                "result": task.result or "",
                 "assignee": task.assignee or "",
                 "title": task.title or "",
             }
-            # Get the latest summary from task_events if available
+            # Latest completion output: the closed run's summary (set by
+            # kanban_complete(summary=...)). Fall back to the tasks.result
+            # column (set by kanban_complete(result=...)).
             try:
-                events = conn.execute(
-                    "SELECT message FROM task_events WHERE task_id = ? ORDER BY rowid DESC LIMIT 1",
-                    (card_id,)
+                run_row = conn.execute(
+                    "SELECT summary FROM task_runs "
+                    "WHERE task_id = ? AND outcome = 'completed' "
+                    "ORDER BY id DESC LIMIT 1",
+                    (card_id,),
                 ).fetchone()
-                if events and events[0]:
-                    result["latest_summary"] = events[0]
+                if run_row and run_row["summary"]:
+                    result["latest_summary"] = run_row["summary"]
+                elif task.result:
+                    result["latest_summary"] = task.result
             except Exception as _exc:
-                logger.debug("Failed to load card summary events: %s", _exc)
+                logger.debug("Failed to load card summary: %s", _exc)
             return result
         finally:
             conn.close()
@@ -932,25 +962,81 @@ class WorkflowEngine:
                                           card.get("reason",
                                                    card.get("description", "")))))
 
-    def _review_already_passed(self, card_id: str) -> bool:
+    def _classify_review_verdict(self, reviewer_body: str) -> str:
+        """Classify a reviewer's completion summary as pass / fail / unknown.
+
+        Failure markers cover the fleet's verdict vocabulary: literal
+        FAIL (review-loop-test), CHANGES REQUIRED / BLOCKED (ideation
+        QA), ❌ / 🚫 emoji, and explicit rejects. Word boundaries avoid
+        false FAILs from phrases like "no failures found". Scanned
+        across the first 300 chars so a verdict on line 2 still counts.
+
+        Returns "pass", "fail", or "unknown" (no verdict marker found).
+        """
+        import re as _re
+        head = reviewer_body[:300]
+        head_upper = head.upper()
+        # FAIL/FAILED/FAILS = verdict words. FAILURE/FAILURES excluded —
+        # "no failures found" is a PASS, not a FAIL.
+        failed = bool(
+            _re.search(r"\bFAIL(ED|S)?\b", head_upper)
+            or any(
+                marker in head_upper
+                for marker in (
+                    "❌", "CHANGES REQUIRED", "BLOCKED",
+                    "REJECTED", "NOT PASS", "DOES NOT PASS",
+                )
+            )
+        )
+        passed = bool(
+            _re.search(r"\bPASS(ED)?\b", head_upper)
+            or any(
+                marker in head_upper
+                for marker in ("✅", "APPROVED", "OK")
+            )
+        )
+        if failed:
+            return "fail"
+        if passed:
+            return "pass"
+        return "unknown"
+
+    def _review_already_passed(self, card_id: str, reviewer_id: str = None) -> bool:
         """Return True when the last workflow-engine comment is a PASS
-        and no newer 'pending review' re-request has happened.
+        for THIS reviewer (when reviewer_id given) and no newer
+        'pending review' re-request has happened.
 
         Round-aware guard: a manual re-trigger (auto-resume) resets a
         completed run's card and re-blocks with 'pending review',
         writing a NEWER ``blocked`` event than the stale PASS comment.
         In that case the review round is fresh — this returns False so
         the reviewer's verdict is applied instead of being skipped.
+
+        Per-reviewer: without reviewer_id this matches any 'Review
+        Passed' comment (back-compat); with it, only a pass comment
+        from that specific reviewer counts — a prior reviewer's pass
+        must NOT suppress a later reviewer's verdict (ideation bug
+        2026-08-04: qa-review's completion was misread as PASS and
+        security-security's verdict was skipped entirely).
         """
         try:
             with kanban_db.connect_closing(board=self.kanban_board) as _chk:
+                if reviewer_id:
+                    prefix = f"Review Passed ({reviewer_id})"
+                else:
+                    prefix = "Review Passed"
                 existing = _chk.execute(
                     "SELECT body, created_at FROM task_comments "
                     "WHERE task_id = ? AND author = 'workflow-engine' "
-                    "ORDER BY created_at DESC LIMIT 1",
+                    "ORDER BY created_at DESC LIMIT 8",
                     (card_id,),
-                ).fetchone()
-                if not existing or "Review Passed" not in (existing[0] or ""):
+                ).fetchall()
+                matched = None
+                for body, created_at in existing:
+                    if body and prefix in body:
+                        matched = (body, created_at)
+                        break
+                if not matched:
                     return False
                 block_row = _chk.execute(
                     "SELECT created_at FROM task_events "
@@ -960,7 +1046,7 @@ class WorkflowEngine:
                     (card_id,),
                 ).fetchone()
                 # No re-request since the pass comment → stale round.
-                if not block_row or block_row[0] <= existing[1]:
+                if not block_row or block_row[0] <= matched[1]:
                     return True
                 # A fresh pending-review block came AFTER the pass
                 # comment — the review was re-requested. Apply verdict.
@@ -1465,6 +1551,14 @@ class WorkflowEngine:
                 # bottleneck analysis.
                 "duration_seconds": s.duration_seconds,
                 "error_count": s.error_count,
+                # Review-loop durability: round counts + workspace
+                # inheritance must survive supervisor restarts, or the
+                # retry limit resets to 0 and the review loops forever.
+                "review_counts": s.review_counts,
+                "review_index": s.review_index,
+                "review_body": s.review_body,
+                "workspace_kind": s.workspace_kind,
+                "workspace_path": s.workspace_path,
             } for nid, s in states.items()},
             "results": results,
             "run_id": run_id or "",
@@ -2678,6 +2772,13 @@ class WorkflowEngine:
                         # the upstream nodes' bodies available for
                         # {phaseN.X} template substitution.
                         result=s.get("result"),
+                        # Restore review-loop round counts + workspace so
+                        # retry limits survive supervisor restarts.
+                        review_counts=s.get("review_counts", {}),
+                        review_index=s.get("review_index", 0),
+                        review_body=s.get("review_body"),
+                        workspace_kind=s.get("workspace_kind", ""),
+                        workspace_path=s.get("workspace_path"),
                     )
                     for nid, s in saved["states"].items()
                 }
@@ -2853,6 +2954,16 @@ class WorkflowEngine:
 
         # ── Main execution loop (layer-based with loop support) ──
         while layer_idx < len(layers):
+            # Review-loop rewind: a reviewer FAILed inside _monitor_layer,
+            # reset the upstream + all its reviewers, and asked to jump
+            # back to the upstream's layer. The upstream card is 'ready'
+            # again (dispatcher will re-run it); the reviewers have no
+            # cards (fresh ones get created as their layers come around).
+            if self._rewind_to_layer is not None and self._rewind_to_layer < layer_idx:
+                print(f"   ↩  Review-loop rewind: layer {layer_idx + 1} → {self._rewind_to_layer + 1}")
+                layer_idx = self._rewind_to_layer
+                self._rewind_to_layer = None
+                continue
             layer = layers[layer_idx]
             print(f"── Layer {layer_idx + 1}/{len(layers)} ──")
             print(f"   Nodes: {', '.join(layer)}")
@@ -3055,7 +3166,15 @@ class WorkflowEngine:
                 # After _monitor_layer returns, check if any node in the
                 # workflow has an active review. If so, enter the review
                 # waiting loop directly.
-                if self._has_active_review(workflow, states, require_ready_implement=True):
+                #
+                # SKIPPED when a review-loop rewind is pending: the FAIL
+                # branch already reset the upstream + reviewers and set
+                # self._rewind_to_layer; the legacy waiting loop polls
+                # for a 'pending review' block that done-based reviewers
+                # never produce, so it would just spin until timeout.
+                if self._rewind_to_layer is not None:
+                    pass
+                elif self._has_active_review(workflow, states, require_ready_implement=True):
                     implement_nid = None
                     for nid, state in states.items():
                         node = workflow.nodes.get(nid)
@@ -3147,7 +3266,13 @@ class WorkflowEngine:
                         print(f"   ✗ {nid} → failed: {e}")
 
             # Re-monitor if we dispatched new nodes
-            if len(running_nodes) > 0 and not revision_result:
+            # SKIPPED when a review-loop rewind is pending: the FAIL
+            # branch already reset the reviewers (pending, no card) —
+            # re-polling them here would spin to timeout (the monitor
+            # sees a non-terminal node with no card and waits). The
+            # rewind jump re-dispatches them on their proper layer.
+            if (len(running_nodes) > 0 and not revision_result
+                    and self._rewind_to_layer is None):
                 revision_result = self._monitor_layer(
                     workflow, running_nodes, states, results, context,
                     layers=layers,
@@ -3267,6 +3392,17 @@ class WorkflowEngine:
 
             print()
 
+            # ── Review-loop rewind at layer-loop exit ──
+            # A FAIL on the LAST layer set self._rewind_to_layer but the
+            # while-loop is about to exit (layer_idx >= len(layers)), so
+            # the top-of-loop rewind check never fires. Jump back now.
+            if (self._rewind_to_layer is not None
+                    and self._rewind_to_layer < len(layers)):
+                print(f"   ↩  Review-loop rewind: layer {layer_idx + 1} → {self._rewind_to_layer + 1}")
+                layer_idx = self._rewind_to_layer
+                self._rewind_to_layer = None
+                continue
+
         # ── Summary ──
         completed = sum(1 for s in states.values() if s.status == "done")
         failed = sum(1 for s in states.values()
@@ -3314,6 +3450,12 @@ class WorkflowEngine:
         polls = 0
 
         while pending and polls < max_polls:
+            # Review-loop rewind: a FAIL branch reset this layer's
+            # reviewers to pending with no cards — they are re-dispatched
+            # from the rewind jump, not by this monitor. Exit early so
+            # the loop doesn't spin to timeout on cardless nodes.
+            if self._rewind_to_layer is not None:
+                break
             time.sleep(self.POLL_INTERVAL)
             polls += 1
 
@@ -3471,34 +3613,192 @@ class WorkflowEngine:
                             # loop) — but only when this is the SAME round.
                             # Auto-resume re-requests review with a fresh
                             # 'pending review' block; that must NOT be
-                            # suppressed by a stale PASS comment.
+                            # suppressed by a stale PASS comment. The guard
+                            # is PER-REVIEWER: a pass from one reviewer must
+                            # not suppress another reviewer's verdict
+                            # (ideation 2026-08-04: qa-review's completion
+                            # was misread as PASS and security-security's
+                            # verdict was skipped).
                             upstream_state = states[reviewer_for]
                             if upstream_state.kanban_card_id:
-                                if self._review_already_passed(upstream_state.kanban_card_id):
+                                if self._review_already_passed(upstream_state.kanban_card_id, reviewer_id=nid):
                                     print(f"   ✓ {nid} completed — review already passed for {reviewer_for}, skipping")
                                     pending.discard(nid)
                                     reviewer_for = None
 
                         if reviewer_for:
-                            # Reviewer completed — check result for pass/fail
+                            # Reviewer completed — determine pass/fail from
+                            # the reviewer's completion summary. Convention
+                            # (from the review-loop contract): the reviewer
+                            # completes with a summary whose first line
+                            # begins with PASS or FAIL. FAIL → enrich the
+                            # upstream card and reset it to ready for
+                            # re-work (review loop). PASS → enrich with
+                            # pass results and advance.
+                            upstream_state = states[reviewer_for]
                             reviewer_body = state.result or ""
-                            print(f"   ✅ {nid} PASSED — enriching {reviewer_for} with review results")
-                            if upstream_state.kanban_card_id:
-                                try:
-                                    with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                        kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
-                                        conn.execute(
-                                            "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
-                                            (upstream_state.kanban_card_id,)
-                                        )
-                                        kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
-                                        conn.commit()
-                                    upstream_state.status = "ready"
-                                    upstream_state.completed_at = None
-                                    upstream_state.result = None
-                                    print(f"   ↩  {reviewer_for} enriched with pass results, reset to ready")
-                                except Exception as e:
-                                    print(f"   ⚠  Failed to enrich upstream card: {e}")
+                            verdict = self._classify_review_verdict(reviewer_body)
+                            failed = verdict == "fail"
+                            passed = verdict == "pass"
+                            if failed:
+                                print(f"   ❌ {nid} FAILED — enriching {reviewer_for} with review results")
+                                # ── Done-based review round: FAIL ──
+                                # The upstream work is rejected. Reset the
+                                # upstream to ready for re-work AND reset
+                                # ALL of its reviewers so the revised work
+                                # gets the full review chain again (not just
+                                # the failing reviewer). Stale "Review
+                                # Passed" comments are deleted so the
+                                # round-aware guard cannot suppress the new
+                                # round (done-based loops write no 'blocked'
+                                # event to invalidate them). Finally the
+                                # layer loop rewinds to the upstream's layer
+                                # (self._rewind_to_layer) so the upstream
+                                # re-dispatches and the reviewers get fresh
+                                # cards.
+                                upstream_node = workflow.nodes[reviewer_for]
+                                # 1) Delete stale PASS comments (superseded
+                                #    by this FAIL round).
+                                if upstream_state.kanban_card_id:
+                                    try:
+                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                            conn.execute(
+                                                "DELETE FROM task_comments "
+                                                "WHERE task_id = ? AND author = 'workflow-engine' "
+                                                "AND body LIKE 'Review Passed%'",
+                                                (upstream_state.kanban_card_id,)
+                                            )
+                                            conn.commit()
+                                    except Exception as _de:
+                                        print(f"   ⚠  Failed to purge stale pass comments: {_de}")
+                                # 2) Resolve retry limits per reviewer:
+                                #    per-review entry > reviewer node >
+                                #    workflow > engine default (3).
+                                def _review_limit(rev_nid):
+                                    _l = None
+                                    for _rentry in (upstream_node.reviews or []):
+                                        if isinstance(_rentry, dict) and _rentry.get("review") == rev_nid:
+                                            _l = _rentry.get("max_retries")
+                                            break
+                                    if _l is None:
+                                        _rev_node = workflow.nodes.get(rev_nid)
+                                        if _rev_node is not None:
+                                            _l = _rev_node.max_retries
+                                    if _l is None:
+                                        _l = workflow.max_retries
+                                    if _l is None:
+                                        _l = 3
+                                    return _l
+                                # 3) Enrich upstream + reset to ready for
+                                #    re-work (FAIL comment stays — it is the
+                                #    feedback the author must address).
+                                if upstream_state.kanban_card_id:
+                                    try:
+                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                            kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Failed ({nid}):\n{reviewer_body}")
+                                            conn.execute(
+                                                "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                (upstream_state.kanban_card_id,)
+                                            )
+                                            kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
+                                            conn.commit()
+                                        upstream_state.status = "ready"
+                                        upstream_state.completed_at = None
+                                        upstream_state.result = None
+                                        print(f"   ↩  {reviewer_for} enriched with FAIL results, reset to ready")
+                                    except Exception as e:
+                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
+                                # 4) Reset every reviewer of the upstream
+                                #    (respecting each one's retry limit).
+                                #    Reviewers that NEVER reviewed (count 0)
+                                #    always get their chance — the limit
+                                #    only applies to reviewers with prior
+                                #    rounds.
+                                _any_reset = False
+                                for _rentry in (upstream_node.reviews or []):
+                                    _rev = _rentry if isinstance(_rentry, str) else _rentry.get("review", "")
+                                    if not _rev or _rev not in states:
+                                        continue
+                                    _prior = upstream_state.review_counts.get(_rev, 0)
+                                    _lim = _review_limit(_rev)
+                                    if _prior > 0:
+                                        _rounds = _prior + 1
+                                        upstream_state.review_counts[_rev] = _rounds
+                                        if _rounds > _lim:
+                                            print(f"   ⛔ {_rev} review limit reached ({_rounds}/{_lim}) — leaving terminal")
+                                            continue
+                                    else:
+                                        # Never reviewed — first round now.
+                                        upstream_state.review_counts[_rev] = 1
+                                        _rounds = 1
+                                    states[_rev].status = "pending"
+                                    states[_rev].kanban_card_id = None
+                                    states[_rev].completed_at = None
+                                    states[_rev].result = None
+                                    _any_reset = True
+                                    print(f"   🔄 {_rev} reset for re-review (round {_rounds}/{_lim})")
+                                # 5) Rewind the layer loop to the upstream's
+                                #    layer so the revised work re-dispatches
+                                #    and the reviewers get fresh cards.
+                                if _any_reset:
+                                    for _li, _ln in enumerate(layers):
+                                        if reviewer_for in _ln:
+                                            self._rewind_to_layer = _li
+                                            print(f"   ↩  Rewinding to layer {_li + 1} ({reviewer_for}) for re-review")
+                                            break
+                            elif passed:
+                                print(f"   ✅ {nid} PASSED — enriching {reviewer_for} with review results")
+                                if upstream_state.kanban_card_id:
+                                    try:
+                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                            kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
+                                            if upstream_state.status != "done":
+                                                # Done-based review flow: the upstream
+                                                # already completed before reviewers
+                                                # dispatched — a PASS ACCEPTS it. Leave
+                                                # it done. Resetting to ready would
+                                                # re-trigger the author and leave the
+                                                # workflow non-terminal (ideation
+                                                # 2026-08-04: spec kept getting reset
+                                                # to ready after each reviewer passed,
+                                                # so cards re-ran under the kanban
+                                                # dispatcher and the run never cleanly
+                                                # completed).
+                                                conn.execute(
+                                                    "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                                                    (int(time.time()), upstream_state.kanban_card_id)
+                                                )
+                                                kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "ready", "new": "done"})
+                                            conn.commit()
+                                        if upstream_state.status != "done":
+                                            upstream_state.status = "done"
+                                            upstream_state.completed_at = datetime.now(timezone.utc).isoformat()
+                                            upstream_state.result = None
+                                        print(f"   ↩  {reviewer_for} accepted — review passed")
+                                    except Exception as e:
+                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
+                            else:
+                                # No verdict marker — default to pass but
+                                # log it so operators notice the ambiguity.
+                                print(f"   ⚠  {nid} completed with NO verdict marker — treating as PASS: {reviewer_body[:80]!r}")
+                                if upstream_state.kanban_card_id:
+                                    try:
+                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                            kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
+                                            if upstream_state.status != "done":
+                                                conn.execute(
+                                                    "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
+                                                    (int(time.time()), upstream_state.kanban_card_id)
+                                                )
+                                                kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "ready", "new": "done"})
+                                            conn.commit()
+                                        if upstream_state.status != "done":
+                                            upstream_state.status = "done"
+                                            upstream_state.completed_at = datetime.now(timezone.utc).isoformat()
+                                            upstream_state.result = None
+                                        print(f"   ↩  {reviewer_for} accepted — review passed (no marker)")
+                                    except Exception as e:
+                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
 
                     # ── Blocked states ──
                     elif card_status_lower in ("blocked",):
@@ -3528,7 +3828,6 @@ class WorkflowEngine:
 
                                     if rev_state and rev_state.kanban_card_id:
                                         # Reviewer card already exists.
-                                        # Only unblock if it's actually blocked.
                                         if rev_state.status == "blocked":
                                             try:
                                                 with kanban_db.connect_closing(board=self.kanban_board) as _conn:
@@ -3539,9 +3838,69 @@ class WorkflowEngine:
                                                 print(f"   🔄 {nid} pending review → unblocked {rev_id} (card {rev_state.kanban_card_id})")
                                             except Exception as e:
                                                 print(f"   ⚠  Failed to unblock reviewer card: {e}")
-                                        else:
-                                            # Already running or ready — keep polling
+                                        elif rev_state.status in ("running", "ready", "pending"):
+                                            # Already in-flight — keep polling
                                             print(f"   ⏳ {nid} — {rev_id} already in-flight (status: {rev_state.status})")
+                                        else:
+                                            # Terminal state (done/failed/timed_out/skipped):
+                                            # this is a RE-REVIEW round — the upstream node
+                                            # re-blocked pending review after a FAIL. Enforce
+                                            # the retry limit, then re-dispatch a FRESH
+                                            # reviewer card (the old one is spent).
+                                            # Limit precedence: per-review > node > workflow
+                                            # > env var > engine default (3).
+                                            _rounds = state.review_counts.get(rev_id, 0)
+                                            _limit = None
+                                            for _entry in (node.reviews or []):
+                                                if isinstance(_entry, dict) and _entry.get("review") == rev_id:
+                                                    _limit = _entry.get("max_retries")
+                                                    break
+                                            if _limit is None:
+                                                _limit = reviewer_node.max_retries
+                                            if _limit is None:
+                                                _limit = workflow.max_retries
+                                            if _limit is None:
+                                                _limit = 3
+                                            if _rounds >= _limit:
+                                                print(f"   ⛔ {nid} — {rev_id} review limit reached ({_rounds}/{_limit}), not re-dispatching")
+                                                state.status = "blocked"
+                                                state.error = f"Review limit reached ({_rounds}/{_limit}) for {rev_id}"
+                                                results[nid] = "blocked"
+                                                pending.discard(nid)
+                                                continue
+                                            # Re-dispatch a fresh reviewer card
+                                            _upstream_card = states[nid].kanban_card_id or "unknown"
+                                            _review_header = (
+                                                f"You are reviewing the output of node '{nid}' "
+                                                f"(task {_upstream_card}). Read the card body and "
+                                                f"completion summary of that task to find the work.\n\n"
+                                            )
+                                            _rev_ws_kind = ""
+                                            _rev_ws_path = ""
+                                            if getattr(reviewer_node, "inherit_workspace", False):
+                                                _rev_ws_kind = states[nid].workspace_kind or ""
+                                                _rev_ws_path = states[nid].workspace_path or ""
+                                            reviewer_card_id = self.dispatch_node(
+                                                states[rev_id], reviewer_node, context,
+                                                workflow=workflow, states=states, layers=layers,
+                                                body_prefix=_review_header,
+                                                workspace_kind=_rev_ws_kind,
+                                                workspace_path=_rev_ws_path,
+                                            )
+                                            if reviewer_card_id:
+                                                states[rev_id].kanban_card_id = reviewer_card_id
+                                                states[rev_id].status = "running"
+                                                states[rev_id].started_at = datetime.now(timezone.utc).isoformat()
+                                                state.review_counts[rev_id] = state.review_counts.get(rev_id, 0) + 1
+                                                pending.add(rev_id)
+                                                self._save_state(
+                                                    workflow.name, states, results,
+                                                    0, layers,
+                                                    run_id=workflow.run_id, context=context,
+                                                )
+                                                print(f"   🔄 {nid} pending review → re-dispatched {rev_id} (round {state.review_counts[rev_id]}, card {reviewer_card_id})")
+                                            else:
+                                                print(f"   ⚠  Failed to re-dispatch reviewer {rev_id}")
                                     else:
                                         # First time — create the reviewer card.
                                         # Prepend review context so the reviewer
