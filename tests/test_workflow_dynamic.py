@@ -1141,6 +1141,164 @@ class TestRecoverWorkflow:
 # ── pending extensions accumulation ────────────────────────────────────────
 
 
+class TestReviewLoopPattern:
+    """Dynamic review-loop pattern: bounded producer rework on FAIL."""
+
+    def _make_review_workflow(self, agent, wf_id="wf-review-1", budget=None):
+        r1 = _parse(
+            handle_workflow_dynamic(
+                {
+                    "action": "create",
+                    "objective": "Produce and review an artifact",
+                    "workflow_id": wf_id,
+                    "max_review_retries": budget,
+                    "nodes": [
+                        {"node_id": "producer", "goal": "Build the thing",
+                         "depends_on": []},
+                        {"node_id": "reviewer", "goal": "Review the thing",
+                         "depends_on": ["producer"],
+                         "pattern": "review-loop", "review_target": "producer"},
+                    ],
+                },
+                agent,
+            )
+        )
+        assert r1["ok"], r1
+        return _workflows.get(("session_id:test-session", wf_id))
+
+    def test_fail_sends_producer_back_for_rework(self):
+        agent = _make_agent()
+        wf = self._make_review_workflow(agent)
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"status": "dispatched", "delegation_id": "dlg-test"})):
+            # Producer completes with a real output
+            _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-1",
+                 "node_id": "producer", "status": "completed",
+                 "summary": "artifact v1"}, agent))
+            # Reviewer FAILs it
+            r = _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-1",
+                 "node_id": "reviewer", "status": "completed",
+                 "summary": "FAIL: missing tests"}, agent))
+        assert r["ok"], r
+        assert r["review_outcome"]["action"] == "rework"
+        assert r["review_outcome"]["round"] == 1
+        # Producer reset (and re-dispatched), goal enriched with feedback
+        producer = wf.nodes["producer"]
+        assert producer.status != "completed"
+        assert producer.rework_count == 1
+        assert "FAIL: missing tests" in producer.goal
+        # Reviewer reset for another round
+        assert wf.nodes["reviewer"].status != "completed"
+
+    def test_pass_keeps_producer_done(self):
+        agent = _make_agent()
+        wf = self._make_review_workflow(agent, "wf-review-pass")
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"status": "dispatched", "delegation_id": "dlg-pass"})):
+            _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-pass",
+                 "node_id": "producer", "status": "completed",
+                 "summary": "artifact v1"}, agent))
+            r = _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-pass",
+                 "node_id": "reviewer", "status": "completed",
+                 "summary": "PASS: looks good"}, agent))
+        assert r["ok"], r
+        assert r["review_outcome"]["action"] == "pass"
+        assert wf.nodes["producer"].status == "completed"
+        assert wf.nodes["producer"].rework_count == 0
+        assert wf.nodes["reviewer"].status == "completed"
+
+    def test_failure_word_excluded(self):
+        """'no failures found' must NOT classify as fail (word boundary)."""
+        from plugins.workflow.dynamic import _classify_review_verdict
+        assert _classify_review_verdict("no failures found, all good") == "unknown"
+        assert _classify_review_verdict("no failures found, PASS") == "pass"
+        assert _classify_review_verdict("FAIL: broken") == "fail"
+        assert _classify_review_verdict("CHANGES REQUIRED: fix it") == "fail"
+        assert _classify_review_verdict("unclear comment") == "unknown"
+
+    def test_budget_exhausted_advances(self):
+        agent = _make_agent()
+        wf = self._make_review_workflow(agent, "wf-review-budget", budget=1)
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"status": "dispatched", "delegation_id": "dlg-budget"})):
+            # Round 1: FAIL -> rework
+            _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-budget",
+                 "node_id": "producer", "status": "completed",
+                 "summary": "artifact v1"}, agent))
+            r1 = _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-budget",
+                 "node_id": "reviewer", "status": "completed",
+                 "summary": "FAIL: nope"}, agent))
+            assert r1["review_outcome"]["action"] == "rework"
+            # Round 2 (last allowed): producer re-completes, reviewer FAILs again
+            _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-budget",
+                 "node_id": "producer", "status": "completed",
+                 "summary": "artifact v2"}, agent))
+            r2 = _parse(handle_workflow_dynamic(
+                {"action": "record", "workflow_id": "wf-review-budget",
+                 "node_id": "reviewer", "status": "completed",
+                 "summary": "FAIL: still nope"}, agent))
+        assert r2["review_outcome"]["action"] == "budget_exhausted"
+        assert r2["review_outcome"]["budget"] == 1
+        # Producer stays done — graph advances past the review
+        assert wf.nodes["producer"].status == "completed"
+        assert wf.nodes["producer"].rework_count == 1
+
+    def test_auto_extension_skipped_on_rework(self):
+        agent = _make_agent()
+        self._make_review_workflow(agent, "wf-review-ext")
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"status": "dispatched", "delegation_id": "dlg-ext"})):
+            with patch("plugins.workflow.get_config", return_value={
+                "max_nodes_per_workflow": 256,
+                "max_extensions_per_workflow": 10,
+                "max_nodes_per_extension": 3,
+                "auto_approve_extensions": False,
+            }):
+                with patch("plugins.workflow.analyst.analyze_extension") as mock_ext:
+                    mock_ext.return_value = [{"node_id": "ext", "goal": "Extend",
+                                              "depends_on": []}]
+                    _parse(handle_workflow_dynamic(
+                        {"action": "record", "workflow_id": "wf-review-ext",
+                         "node_id": "producer", "status": "completed",
+                         "summary": "v1"}, agent))
+                    r = _parse(handle_workflow_dynamic(
+                        {"action": "record", "workflow_id": "wf-review-ext",
+                         "node_id": "reviewer", "status": "completed",
+                         "summary": "FAIL: rework needed"}, agent))
+        # The producer record legitimately consulted the analyst once; the
+        # reviewer FAIL (rework round) must NOT trigger another call.
+        assert mock_ext.call_count == 1
+        assert r["review_outcome"]["action"] == "rework"
+
+    def test_pattern_pass_through_create(self):
+        agent = _make_agent()
+        r = _parse(handle_workflow_dynamic(
+            {"action": "create", "objective": "T",
+             "workflow_id": "wf-pattern-1",
+             "nodes": [
+                 {"node_id": "a", "goal": "do", "depends_on": [],
+                  "pattern": "review-loop", "review_target": "b",
+                  "max_review_retries": 2},
+                 {"node_id": "b", "goal": "do2", "depends_on": ["a"]},
+             ]}, agent))
+        assert r["ok"], r
+        wf = _workflows.get(("session_id:test-session", "wf-pattern-1"))
+        node_a = wf.nodes["a"]
+        assert node_a.pattern == "review-loop"
+        assert node_a.review_target == "b"
+        assert node_a.max_review_retries == 2
+        pv = node_a.public_view()
+        assert pv["pattern"] == "review-loop"
+        assert pv["rework_count"] == 0
+
+
 class TestAutoExtensionEnrichedContext:
     """Auto-extension passes accumulated results + template catalog to the analyst."""
 
@@ -1224,7 +1382,8 @@ class TestAutoExtensionEnrichedContext:
         )
         assert r1["ok"], r1
 
-        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps({"error": "no-op"})):
+        with patch("tools.delegate_tool.delegate_task", return_value=json.dumps(
+            {"status": "dispatched", "delegation_id": "dlg-ext"})):
             with patch("plugins.workflow.get_config", return_value={
                 "max_nodes_per_workflow": 256,
                 "max_extensions_per_workflow": 10,

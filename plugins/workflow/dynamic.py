@@ -82,6 +82,22 @@ class DynamicNode:
     depends_on: list[str] = field(default_factory=list)
     toolsets: list[str] | None = None
     role: str = "leaf"
+    pattern: str | None = None
+    """Shape the node belongs to (review-loop, parallel-fanout, synthesize,
+    sequential, tournament, research, or custom). Set by the extension
+    analyst or by explicit tool input; consumed by the engine for
+    pattern-specific behavior (review-loop rework) and by template
+    synthesis for shape recording."""
+    rework_count: int = 0
+    """How many times a review-loop producer has been sent back for
+    rework. Bounded by the workflow's max_review_retries; when exceeded
+    the producer stays done and the graph advances past the review."""
+    review_target: str | None = None
+    """For review nodes: the producer node_id this reviewer gates. The
+    engine uses it to reset the producer on FAIL."""
+    max_review_retries: int | None = None
+    """Per-node override for review rework budget; falls back to
+    workflow.max_review_retries then engine default (3)."""
     status: str = PENDING
     delegation_id: str | None = None
     summary: str | None = None
@@ -101,6 +117,9 @@ class DynamicNode:
             "depends_on": list(self.depends_on),
             "toolsets": list(self.toolsets) if self.toolsets else None,
             "role": self.role,
+            "pattern": self.pattern,
+            "rework_count": self.rework_count,
+            "review_target": self.review_target,
             "status": self.status,
             "delegation_id": self.delegation_id,
             "summary": self.summary,
@@ -134,6 +153,9 @@ class DynamicWorkflow:
     cancelled_at: float | None = None
     scope_key: str = "global"
     extension_count: int = 0
+    max_review_retries: int | None = None
+    """Default rework budget for review-loop producers. Precedence:
+    review node's max_review_retries > this > engine default (3)."""
 
     def public_view(self) -> dict[str, Any]:
         """Snapshot for the result envelope."""
@@ -709,6 +731,9 @@ def _action_create(
             depends_on=depends_on,
             toolsets=toolsets,
             role=role,
+            pattern=str(raw.get("pattern") or "").strip() or None,
+            review_target=str(raw.get("review_target") or "").strip() or None,
+            max_review_retries=_coerce_retries(raw.get("max_review_retries")),
             created_at=now,
             updated_at=now,
         )
@@ -735,6 +760,7 @@ def _action_create(
         created_at=now,
         updated_at=now,
         scope_key=scope_key,
+        max_review_retries=_coerce_retries(args.get("max_review_retries")),
     )
 
     # Store under lock
@@ -843,6 +869,9 @@ def _action_extend(
                 depends_on=depends_on,
                 toolsets=toolsets,
                 role=role,
+                pattern=str(raw.get("pattern") or "").strip() or None,
+                review_target=str(raw.get("review_target") or "").strip() or None,
+                max_review_retries=_coerce_retries(raw.get("max_review_retries")),
                 created_at=now,
                 updated_at=now,
             )
@@ -879,6 +908,135 @@ def _action_extend(
             )
 
         return _ok({"workflow": workflow.public_view(), **dispatch_result})
+
+
+def _coerce_retries(value: Any) -> int | None:
+    """Coerce a retry budget to a non-negative int, or None when absent/invalid."""
+    if value is None:
+        return None
+    try:
+        iv = int(value)
+    except (TypeError, ValueError):
+        return None
+    return iv if iv >= 0 else None
+
+
+def _review_retry_budget(workflow: DynamicWorkflow, node: DynamicNode) -> int:
+    """Resolve the rework budget for a review-loop producer.
+
+    Precedence: review node's max_review_retries > workflow
+    max_review_retries > engine default (3).
+    """
+    if node.max_review_retries is not None:
+        return node.max_review_retries
+    if workflow.max_review_retries is not None:
+        return workflow.max_review_retries
+    return 3
+
+
+def _classify_review_verdict(reviewer_body: str) -> str:
+    """Classify a reviewer's summary as pass / fail / unknown.
+
+    Mirrors the static engine's verdict vocabulary: FAIL / FAILED / FAILS
+    (word-bounded, excluding FAILURE/FAILURES so "no failures found"
+    counts as pass), CHANGES REQUIRED / BLOCKED / REJECTED / NOT PASS /
+    DOES NOT PASS, and ❌. PASS via PASS / PASSED / APPROVED / ✅ / OK.
+    Scans the first 300 chars so a verdict on line 2 still counts.
+    """
+    import re as _re
+    head = (reviewer_body or "")[:300].upper()
+    failed = bool(
+        _re.search(r"\bFAIL(ED|S)?\b", head)
+        or any(m in head for m in (
+            "\u274c", "CHANGES REQUIRED", "BLOCKED",
+            "REJECTED", "NOT PASS", "DOES NOT PASS",
+        ))
+    )
+    passed = bool(
+        _re.search(r"\bPASS(ED)?\b", head)
+        or any(m in head for m in ("\u2705", "APPROVED", "OK"))
+    )
+    if failed:
+        return "fail"
+    if passed:
+        return "pass"
+    return "unknown"
+
+
+def _maybe_apply_review_loop(
+    workflow: DynamicWorkflow,
+    reviewer: DynamicNode,
+    node_id: str,
+) -> dict[str, Any]:
+    """Apply review-loop semantics when a completed node is a reviewer.
+
+    When the reviewer's verdict is FAIL (or unknown-but-not-pass, when the
+    reviewer node declares pattern='review-loop'), the producer is sent
+    back for rework: its status resets to pending, its goal is enriched
+    with the reviewer's feedback, its rework_count bumps, and the reviewer
+    is reset to pending so both re-dispatch. The rework is bounded by the
+    resolved retry budget — when exhausted, the graph advances past the
+    review (the producer stays done) and the FAIL is surfaced in the
+    extension payload as a warning.
+
+    Returns a dict describing what happened (rework / pass / budget_exhausted /
+    not_applicable) for the record payload and extension guard.
+    """
+    target_id = reviewer.review_target or (
+        reviewer.depends_on[0] if reviewer.depends_on else None
+    )
+    if not target_id or target_id not in workflow.nodes:
+        return {"action": "not_applicable"}
+    producer = workflow.nodes[target_id]
+    if producer.status != COMPLETED:
+        return {"action": "not_applicable"}
+
+    verdict = _classify_review_verdict(reviewer.summary or reviewer.result or "")
+    budget = _review_retry_budget(workflow, reviewer)
+    is_review = reviewer.pattern == "review-loop"
+
+    if verdict == "pass":
+        return {"action": "pass"}
+
+    if verdict == "fail" or (is_review and verdict == "unknown"):
+        if producer.rework_count >= budget:
+            return {
+                "action": "budget_exhausted",
+                "producer": target_id,
+                "rework_count": producer.rework_count,
+                "budget": budget,
+            }
+        # Send the producer back for rework, enriched with feedback.
+        feedback = (reviewer.summary or reviewer.result or "").strip()
+        if feedback:
+            producer.goal = (
+                f"{producer.goal}\n\n[Review feedback — rework "
+                f"round {producer.rework_count + 1}]:\n{feedback[:2000]}"
+            )
+        producer.status = PENDING
+        producer.rework_count += 1
+        producer.summary = None
+        producer.result = None
+        producer.error = None
+        producer.completed_at = None
+        producer.dispatched_at = None
+        producer.duration_seconds = None
+        # The reviewer re-runs too.
+        reviewer.status = PENDING
+        reviewer.summary = None
+        reviewer.result = None
+        reviewer.completed_at = None
+        reviewer.dispatched_at = None
+        reviewer.duration_seconds = None
+        workflow.updated_at = _now()
+        return {
+            "action": "rework",
+            "producer": target_id,
+            "round": producer.rework_count,
+            "budget": budget,
+        }
+
+    return {"action": "not_applicable"}
 
 
 def _action_record(
@@ -945,15 +1103,30 @@ def _action_record(
         _sync_delegation_state(workflow)
         _dispatch_ready_nodes(workflow, parent_agent)
 
-        # Move workflow to _completed_workflows if it reached terminal state
-        if _is_workflow_terminal(workflow):
+        # Review-loop semantics: a completed reviewer may send its producer
+        # back for rework (bounded). Must run BEFORE the terminal check so
+        # a rework round does not evict a workflow that still has work.
+        review_outcome: dict[str, Any] = {}
+        if status == COMPLETED and node.pattern == "review-loop":
+            review_outcome = _maybe_apply_review_loop(workflow, node, nid)
+            if review_outcome.get("action") == "rework":
+                # Producer and reviewer were reset — re-dispatch now so the
+                # next round starts without waiting for another record.
+                _sync_delegation_state(workflow)
+                _dispatch_ready_nodes(workflow, parent_agent)
+
+        # Move workflow to _completed_workflows only when it reached
+        # terminal state AND no rework round is starting.
+        if review_outcome.get("action") != "rework" and _is_workflow_terminal(workflow):
             key = (scope_key, wf_id)
             _workflows.pop(key, None)
             _completed_workflows[key] = (workflow, now)
 
-        # Auto-extension: suggest follow-up nodes on completion
+        # Auto-extension: suggest follow-up nodes on completion.
+        # Skipped when this completion started a review rework round — the
+        # producer must redo its work before the graph grows further.
         ext_payload: dict[str, Any] = {}
-        if status == COMPLETED and node.summary:
+        if status == COMPLETED and node.summary and review_outcome.get("action") != "rework":
             from plugins.workflow import get_config
             from plugins.workflow.analyst import analyze_extension
 
@@ -1045,7 +1218,10 @@ def _action_record(
                 else:
                     ext_payload["extension_note"] = "no follow-up nodes suggested"
 
-        return _ok({"workflow": workflow.public_view(), **ext_payload})
+        payload = {"workflow": workflow.public_view(), **ext_payload}
+        if review_outcome:
+            payload["review_outcome"] = review_outcome
+        return _ok(payload)
 
 
 def _action_dispatch(
