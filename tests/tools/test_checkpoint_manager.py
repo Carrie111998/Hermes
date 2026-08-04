@@ -6,6 +6,7 @@ import logging
 import os
 import shutil
 import subprocess
+import sys
 import time
 import pytest
 from pathlib import Path
@@ -13,6 +14,7 @@ from unittest.mock import patch
 
 from tools.checkpoint_manager import (
     CheckpointManager,
+    DEFAULT_EXCLUDES,
     _shadow_repo_path,
     _init_store,
     _run_git,
@@ -1044,3 +1046,169 @@ class TestSessionDiff:
         assert result["success"] is True
         assert "feature.py" in result["diff"]
         assert "+x = 1" in result["diff"]
+
+
+# =========================================================================
+# CheckpointManager — unreadable paths must not abort the whole snapshot
+# =========================================================================
+
+needs_posix_perms = pytest.mark.skipif(
+    sys.platform == "win32" or os.geteuid() == 0,
+    reason="chmod-based access denial needs POSIX + non-root",
+)
+
+
+def _tracked_names(store, work_dir):
+    ok, files, _ = _run_git(
+        ["ls-tree", "-r", "--name-only", _ref_name(_project_hash(str(work_dir)))],
+        store, str(work_dir),
+    )
+    assert ok
+    return set(files.splitlines())
+
+
+class TestUnreadablePaths:
+    def test_node_compile_cache_is_excluded(self, mgr, work_dir, checkpoint_base):
+        """Hermes' own Node compile cache never enters a snapshot."""
+        cache = work_dir / "node-compile-cache" / "v26.5.1-x64"
+        cache.mkdir(parents=True)
+        (cache / "00bf0630").write_bytes(b"compiled\n")
+
+        assert mgr.ensure_checkpoint(str(work_dir), "initial") is True
+
+        names = _tracked_names(_store_path(checkpoint_base), work_dir)
+        assert "main.py" in names
+        assert not any(n.startswith("node-compile-cache/") for n in names)
+
+    @needs_posix_perms
+    def test_unreadable_file_does_not_abort_the_checkpoint(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """One unreadable path must cost that path — not the whole checkpoint.
+
+        Regression for #78888: ``git add -A`` exits 128 and stages *nothing*
+        when it cannot open a file, so a single root-owned cache entry left the
+        directory with zero checkpoints.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "main.py").write_text("print('hello')\n")
+        blocked = wd / "secrets.bin"
+        blocked.write_bytes(b"unreadable\n")
+        blocked.chmod(0)
+
+        try:
+            m = CheckpointManager(enabled=True, max_snapshots=5)
+            assert m.ensure_checkpoint(str(wd), "initial") is True
+
+            names = _tracked_names(_store_path(checkpoint_base), wd)
+            assert "main.py" in names          # readable work is preserved
+            assert "secrets.bin" not in names  # the unreadable path is skipped
+        finally:
+            blocked.chmod(0o644)  # so pytest can clean up
+
+    @needs_posix_perms
+    def test_unreadable_path_outside_excludes_still_checkpoints(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """The fix is not specific to node-compile-cache.
+
+        Any root-owned/unreadable path — a socket, a foreign cache, a partially
+        written file — used to abort the snapshot. Excludes alone cannot cover
+        that class, so the resilience must live at the ``git add`` call.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "keep.py").write_text("kept = True\n")
+        foreign = wd / "some-other-cache"
+        foreign.mkdir()
+        blocked = foreign / "blob"
+        blocked.write_bytes(b"nope\n")
+        blocked.chmod(0)
+
+        try:
+            m = CheckpointManager(enabled=True, max_snapshots=5)
+            assert m.ensure_checkpoint(str(wd), "initial") is True
+            assert "keep.py" in _tracked_names(_store_path(checkpoint_base), wd)
+        finally:
+            blocked.chmod(0o644)
+
+    def test_default_excludes_lists_node_compile_cache(self):
+        assert "node-compile-cache/" in DEFAULT_EXCLUDES
+
+    @needs_posix_perms
+    def test_skipped_paths_are_logged_not_swallowed(
+        self, tmp_path, checkpoint_base, monkeypatch, caplog,
+    ):
+        """A shrunken snapshot is tolerated, but never silent."""
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "keep.py").write_text("kept = True\n")
+        blocked = wd / "blocked.bin"
+        blocked.write_bytes(b"nope\n")
+        blocked.chmod(0)
+
+        try:
+            m = CheckpointManager(enabled=True, max_snapshots=5)
+            with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
+                assert m.ensure_checkpoint(str(wd), "initial") is True
+            assert any(
+                "partially succeeded" in r.message and "blocked.bin" in r.message
+                for r in caplog.records
+            ), f"expected a warning naming the skipped path, got: {caplog.records}"
+        finally:
+            blocked.chmod(0o644)
+
+    def test_uncommitted_nested_repo_does_not_abort_the_checkpoint(
+        self, tmp_path, checkpoint_base, monkeypatch,
+    ):
+        """A freshly ``git init``-ed subdirectory is the same class of failure.
+
+        ``git add -A`` exits 128 with "does not have a commit checked out", so
+        before #78888 any project containing an uncommitted nested repo also got
+        zero checkpoints — no unusual file ownership required.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "keep.py").write_text("kept = True\n")
+        nested = wd / "vendored"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q", str(nested)], check=True)
+        (nested / "f.txt").write_text("x\n")
+
+        m = CheckpointManager(enabled=True, max_snapshots=5)
+        assert m.ensure_checkpoint(str(wd), "initial") is True
+        assert "keep.py" in _tracked_names(_store_path(checkpoint_base), wd)
+
+    def test_clean_checkpoint_logs_no_warning(self, tmp_path, checkpoint_base, monkeypatch, caplog):
+        """An ordinary snapshot stays quiet.
+
+        ``git add`` writes ``warning:``/``hint:`` chatter to stderr while still
+        exiting 0 (an embedded repo that *does* have a commit), so the skip
+        warning must key off the exit code, not off stderr being non-empty.
+        """
+        monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
+        wd = tmp_path / "proj"
+        wd.mkdir()
+        (wd / "keep.py").write_text("kept = True\n")
+        nested = wd / "vendored"
+        nested.mkdir()
+        subprocess.run(["git", "init", "-q", str(nested)], check=True)
+        (nested / "f.txt").write_text("x\n")
+        subprocess.run(["git", "-C", str(nested), "add", "-A"], check=True)
+        subprocess.run(
+            ["git", "-C", str(nested), "-c", "user.email=t@t", "-c", "user.name=t",
+             "commit", "-qm", "seed"],
+            check=True,
+        )
+
+        m = CheckpointManager(enabled=True, max_snapshots=5)
+        with caplog.at_level(logging.WARNING, logger="tools.checkpoint_manager"):
+            assert m.ensure_checkpoint(str(wd), "initial") is True
+        assert not [r for r in caplog.records if "partially succeeded" in r.message], (
+            f"clean add must not warn, got: {[r.message for r in caplog.records]}"
+        )
