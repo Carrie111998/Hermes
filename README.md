@@ -214,6 +214,36 @@ See `hermes claw migrate --help` for all options, or use the `openclaw-migration
 
 ---
 
+## RecursiveIntell Rust Acceleration (optional)
+
+Hermes can route through [RecursiveIntell](https://github.com/RecursiveIntell)'s Rust stack for faster, receipt-backed LLM calls, context compaction, and vector scoring. All paths are opt-in and fall back to pure Python when disabled.
+
+### Enable a path
+
+| Env var | What it accelerates | Rust crate |
+|---------|-------------------|------------|
+| `HERMES_RI_PIPELINE=1` | LLM transport (any OpenAI-compatible provider) | [`llm-pipeline`](https://crates.io/crates/llm-pipeline) |
+| `HERMES_RI_AGENT_GRAPH=1` | Agent-graph MCP reads (SQLite direct) | [`agent-graph-mcp`](https://crates.io/crates/agent-graph-mcp) |
+| `HERMES_RI_POLY_KV=1` | Semantic-memory vector scoring | [`poly-kv`](https://crates.io/crates/poly-kv) |
+
+### Rust context-governor
+
+Set `context.engine: ri-context-governor` in `config.yaml` to use the [`context-governor`](https://crates.io/crates/context-governor) crate for deterministic, receipt-backed context compaction. A Rust first pass trims the prompt; if savings are insufficient, a configurable LLM summarizer handles the rest. See `agent/transports/ri_context_compressor.py` for the two-stage pipeline.
+
+### Install
+
+```bash
+pip install llm-pipeline context-governor poly-kv
+```
+
+Binaries are published on crates.io. The Python wheels bundle precompiled `.so` extensions built with PyO3 + maturin.
+
+### Fallback
+
+Every accelerated path follows the same contract: check the env var → try the native import → on any error, return `None` and fall through to the existing Python path. Unset the env var to disable a path without code changes.
+
+---
+
 ## Contributing
 
 We welcome contributions! See the [Contributing Guide](https://hermes-agent.nousresearch.com/docs/developer-guide/contributing) for development setup, code style, and PR process.
