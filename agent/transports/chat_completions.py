@@ -380,6 +380,7 @@ class ChatCompletionsTransport(ProviderTransport):
         anthropic_max_out = params.get("anthropic_max_output")
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
+        is_alibaba_coding = params.get("is_alibaba_coding", False)
         reasoning_config = _reasoning_config_for_model(model, params.get("reasoning_config"))
 
         if ephemeral is not None and max_tokens_fn:
@@ -418,6 +419,21 @@ class ChatCompletionsTransport(ProviderTransport):
                     if _e in {"low", "medium", "high"}:
                         _tokenhub_effort = _e
                 api_kwargs["reasoning_effort"] = _tokenhub_effort
+
+        # Alibaba Coding Plan: top-level reasoning_effort (unless thinking disabled)
+        if is_alibaba_coding:
+            _ali_thinking_off = bool(
+                reasoning_config
+                and isinstance(reasoning_config, dict)
+                and reasoning_config.get("enabled") is False
+            )
+            if not _ali_thinking_off:
+                _ali_effort = "medium"
+                if reasoning_config and isinstance(reasoning_config, dict):
+                    _e = (reasoning_config.get("effort") or "").strip().lower()
+                    if _e in {"low", "medium", "high", "xhigh"}:
+                        _ali_effort = _e
+                api_kwargs["reasoning_effort"] = _ali_effort
 
         # LM Studio: top-level reasoning_effort. Only emit when the model
         # declares reasoning support via /api/v1/models capabilities (gated

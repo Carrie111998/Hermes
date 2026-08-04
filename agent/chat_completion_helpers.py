@@ -1252,6 +1252,10 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         or base_url_host_matches(agent.base_url, "moonshot.ai")
         or base_url_host_matches(agent.base_url, "moonshot.cn")
     )
+    _is_alibaba_coding = (
+        agent.provider == "alibaba-coding-plan"
+        or base_url_host_matches(agent._base_url_lower, "coding-intl.dashscope.aliyuncs.com")
+    )
     _is_tokenhub = base_url_host_matches(agent._base_url_lower, "tokenhub.tencentmaas.com")
     _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
 
@@ -1368,6 +1372,7 @@ def build_api_kwargs(agent, api_messages: list, tools_for_api: list | None = Non
         is_github_models=_is_gh,
         is_nvidia_nim=_is_nvidia,
         is_kimi=_is_kimi,
+        is_alibaba_coding=_is_alibaba_coding,
         is_tokenhub=_is_tokenhub,
         is_lmstudio=_is_lmstudio,
         is_custom_provider=agent.provider == "custom",
