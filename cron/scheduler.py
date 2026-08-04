@@ -3486,6 +3486,35 @@ def run_job(
                 job_id, _mcp_exc,
             )
 
+        # ---------------------------------------------------------------
+        # Clear kanban-dispatcher env vars before every cron session.
+        # The kanban dispatcher sets these in the gateway process
+        # environment, and they leak into cron sessions that run in the
+        # same process.  When HERMES_KANBAN_TASK is set, the kanban
+        # toolset is force-added to the agent (skill_utils.py:306) and
+        # the agent's system prompt includes kanban-worker instructions
+        # (prompt_builder.py:213).  A cron agent that sees these will
+        # call kanban_complete on whichever task id it finds, silently
+        # overwriting real kanban-task results (LESSONS_LEARNED.md
+        # 2026-08-04 entry).  Clear every HERMES_KANBAN_* var before
+        # constructing the agent so cron sessions never look like
+        # kanban workers.
+        # ---------------------------------------------------------------
+        _kanban_leak_vars = [
+            "HERMES_KANBAN_TASK",
+            "HERMES_KANBAN_WORKSPACE",
+            "HERMES_KANBAN_DB",
+            "HERMES_KANBAN_BOARD",
+            "HERMES_KANBAN_RUN_ID",
+            "HERMES_KANBAN_CLAIM_LOCK",
+        ]
+        for _kv in _kanban_leak_vars:
+            if os.environ.pop(_kv, None) is not None:
+                logger.debug(
+                    "Job '%s': cleared leaked %s from environment",
+                    job_id, _kv,
+                )
+
         agent = AIAgent(
             model=model,
             api_key=runtime.get("api_key"),
