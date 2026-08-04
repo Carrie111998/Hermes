@@ -1,9 +1,26 @@
 """Unit tests for the agent-sandbox environment backend."""
 
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
+
+# ---------------------------------------------------------------------------
+# Global Import Mocks
+# ---------------------------------------------------------------------------
+# Mucking with sys.modules must happen AT THE TOP LEVEL before test collection.
+# This ensures `_lazy_ensure` doesn't run, and prevents ImportErrors if
+# other tests have already triggered imports of AgentSandboxBackend.
+
+sys.modules["tools.lazy_deps"] = MagicMock()
+
+mock_k8s = MagicMock()
+mock_k8s_models = MagicMock()
+mock_k8s.models = mock_k8s_models
+
+sys.modules["k8s_agent_sandbox"] = mock_k8s
+sys.modules["k8s_agent_sandbox.models"] = mock_k8s_models
 
 
 # ---------------------------------------------------------------------------
@@ -21,35 +38,16 @@ def _make_sandbox(claim_name="sb-123"):
     return sb
 
 
-def _patch_k8s_imports(monkeypatch):
-    """Patch the SDK so K8sSandboxBackend can be imported without it."""
-    import types as _types
-
-    k8s_mod = _types.ModuleType("k8s_agent_sandbox")
-    k8s_mod.SandboxClient = MagicMock()
-
-    k8s_models_mod = _types.ModuleType("k8s_agent_sandbox.models")
-    k8s_models_mod.SandboxDirectConnectionConfig = MagicMock()
-    k8s_models_mod.SandboxGatewayConnectionConfig = MagicMock()
-    k8s_models_mod.SandboxLocalTunnelConnectionConfig = MagicMock()
-    k8s_models_mod.SandboxInClusterConnectionConfig = MagicMock()
-
-    k8s_mod.models = k8s_models_mod
-
-    import sys
-    monkeypatch.setitem(sys.modules, "k8s_agent_sandbox", k8s_mod)
-    monkeypatch.setitem(sys.modules, "k8s_agent_sandbox.models", k8s_models_mod)
-    return k8s_mod
-
-
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
 @pytest.fixture()
-def k8s_sdk(monkeypatch):
-    """Provide a mock k8s SDK module and return it for assertions."""
-    return _patch_k8s_imports(monkeypatch)
+def k8s_sdk():
+    """Provide the globally mocked k8s SDK module and reset it for each test."""
+    mock_k8s.reset_mock()
+    mock_k8s_models.reset_mock()
+    return mock_k8s
 
 
 @pytest.fixture()
@@ -86,7 +84,10 @@ def make_env(k8s_sdk, monkeypatch):
         else:
             mock_client.list_all_sandboxes.side_effect = IndexError("list index out of range")
 
-        k8s_sdk.SandboxClient = MagicMock(return_value=mock_client)
+        # Configure the return_value of the existing mocked class.
+        # Do NOT overwrite it with a new MagicMock(), otherwise 'from ... import SandboxClient'
+        # inside the backend will hold onto the old mock and ignore this.
+        k8s_sdk.SandboxClient.return_value = mock_client
 
         from tools.environments.agent_sandbox import AgentSandboxBackend
 
@@ -184,7 +185,6 @@ class TestCleanup:
 class TestExecute:
     def test_basic_command(self, make_env):
         sb = _make_sandbox()
-        # Calls: (1) init_session bootstrap, (2) actual command
         sb.commands.run.side_effect = [
             _make_exec_response(stdout="", exit_code=0),  # init_session
             _make_exec_response(stdout="hello", exit_code=0),  # actual cmd
