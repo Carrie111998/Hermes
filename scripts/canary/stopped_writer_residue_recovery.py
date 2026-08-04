@@ -1071,15 +1071,24 @@ def validate_plan_mapping(
     gateway_sha = _digest(value["gateway_config_sha256"], "gateway config digest")
     artifacts = _plan_staged_artifacts(value)
     artifact_names = frozenset(artifacts)
+    expected_artifact_sets = {
+        PLAN_SCHEMA: {_collector_pair_names(), _planner_bundle_names()},
+        INSTALLED_NATIVE_PLAN_SCHEMA: {_planner_bundle_names()},
+        FAILED_NATIVE_PLAN_SCHEMA: {_failed_native_bundle_names()},
+    }
+    if (
+        schema in expected_artifact_sets
+        and artifact_names not in expected_artifact_sets[schema]
+    ):
+        raise ValueError("residue recovery plan schema artifact set is invalid")
     installed_native: Mapping[str, Any] | None = None
     if schema in {INSTALLED_NATIVE_PLAN_SCHEMA, FAILED_NATIVE_PLAN_SCHEMA}:
         raw_installed = value["installed_native_observation_plan"]
-        if (
-            not isinstance(raw_installed, Mapping)
-            or set(raw_installed) != {"source_path", "sha256", "archive_path"}
-            or artifact_names
-            not in {_planner_bundle_names(), _failed_native_bundle_names()}
-        ):
+        if not isinstance(raw_installed, Mapping) or set(raw_installed) != {
+            "source_path",
+            "sha256",
+            "archive_path",
+        }:
             raise ValueError("installed native observation plan binding is invalid")
         installed_native = raw_installed
     _recoverable_activation_paths(

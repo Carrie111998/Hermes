@@ -874,6 +874,36 @@ def test_apply_archives_exact_read_only_preflight_failure_chain_last(
     assert repeated == receipt
 
 
+def test_failed_native_plan_cannot_be_downcast_to_installed_native_schema(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(recovery_tree)
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+    downcast = dict(plan)
+    downcast["schema"] = recovery.INSTALLED_NATIVE_PLAN_SCHEMA
+    del downcast["failed_native_observation"]
+    downcast["invariants"] = {
+        name: value
+        for name, value in downcast["invariants"].items()
+        if name
+        not in {
+            "failure_quarantine_archived",
+            "failure_quarantine_deleted",
+            "failure_receipt_preserved",
+        }
+    }
+    unsigned = {
+        name: value for name, value in downcast.items() if name != "plan_sha256"
+    }
+    downcast["plan_sha256"] = recovery._sha256_json(unsigned)
+
+    with pytest.raises(
+        ValueError,
+        match="plan schema artifact set is invalid",
+    ):
+        recovery.validate_plan_mapping(downcast)
+
+
 def test_failed_native_recovery_rejects_unbound_quarantine(
     recovery_tree: dict[str, Any],
 ) -> None:
