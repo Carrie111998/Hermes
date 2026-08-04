@@ -444,7 +444,12 @@ class _FakePreservedJson:
         return cls(value)
 
 
-class _FakePoolTemplate:
+class _FakeImagePullPolicy(enum.Enum):
+    ALWAYS = 0
+    IFNOTPRESENT = 1
+
+
+class _FakeVmTemplate:
     def __init__(
         self,
         *,
@@ -454,11 +459,13 @@ class _FakePoolTemplate:
         tolerations: list[object] | None,
         command: list[str] | None,
         container_disk_image: str,
+        image_pull_policy: _FakeImagePullPolicy | None,
         image_pull_secret: str | None,
         cpu_cores: int | None,
         memory: str | None,
         firmware: _FakeFirmware | None,
         probes: _FakePreservedJson | None,
+        services: list[_FakeSandboxService] | None,
         oidc: object | None,
     ):
         self.runtime = runtime
@@ -467,38 +474,50 @@ class _FakePoolTemplate:
         self.tolerations = tolerations
         self.command = command
         self.container_disk_image = container_disk_image
+        self.image_pull_policy = image_pull_policy
         self.image_pull_secret = image_pull_secret
         self.cpu_cores = cpu_cores
         self.memory = memory
         self.firmware = firmware
         self.probes = probes
-        self.oidc = oidc
-
-
-class _FakePoolSpec:
-    def __init__(
-        self,
-        *,
-        replicas: int,
-        template: _FakePoolTemplate,
-        autoscaling: object | None,
-        services: list[_FakeSandboxService] | None,
-    ):
-        self.replicas = replicas
-        self.template = template
-        self.autoscaling = autoscaling
         self.services = services
-
-
-class _FakeCreatePoolRequest:
-    def __init__(self, *, namespace: str, spec: _FakePoolSpec):
-        self.namespace = namespace
-        self.spec = spec
+        self.oidc = oidc
 
 
 class _FakeSandboxTemplateRef:
     def __init__(self, *, name: str):
         self.name = name
+
+
+class _FakeWarmPoolSpec:
+    def __init__(
+        self,
+        *,
+        replicas: int,
+        sandbox_template_ref: _FakeSandboxTemplateRef,
+        autoscaling: object | None,
+    ):
+        self.replicas = replicas
+        self.sandbox_template_ref = sandbox_template_ref
+        self.autoscaling = autoscaling
+
+
+class _FakeTemplateSpec:
+    def __init__(self, *, vm_template: _FakeVmTemplate):
+        self.vm_template = vm_template
+
+
+class _FakeCreatePoolRequest:
+    def __init__(self, *, namespace: str, spec: _FakeWarmPoolSpec):
+        self.namespace = namespace
+        self.spec = spec
+
+
+class _FakeCreateTemplateRequest:
+    def __init__(self, *, namespace: str, name: str, spec: _FakeTemplateSpec):
+        self.namespace = namespace
+        self.name = name
+        self.spec = spec
 
 
 class _FakeClaimSpec:
@@ -512,14 +531,18 @@ class _FakeClaimSpec:
 class _FakeSandboxApi:
     configure_calls: list[dict[str, str]] = []
     reconcile_requests: list[_FakeCreatePoolRequest] = []
+    template_requests: list[_FakeCreateTemplateRequest] = []
     pool = _FakePool()
     CreatePoolRequest = _FakeCreatePoolRequest
+    CreateTemplateRequest = _FakeCreateTemplateRequest
     ClaimSpec = _FakeClaimSpec
-    PoolSpec = _FakePoolSpec
-    PoolTemplate = _FakePoolTemplate
+    OsGymSandboxWarmPoolSpec = _FakeWarmPoolSpec
+    OsGymSandboxTemplateSpec = _FakeTemplateSpec
+    VmTemplate = _FakeVmTemplate
     SandboxTemplateRef = _FakeSandboxTemplateRef
     SandboxService = _FakeSandboxService
     ServiceProtocol = _FakeServiceProtocol
+    ImagePullPolicy = _FakeImagePullPolicy
     Firmware = _FakeFirmware
     RuntimeKind = _FakeRuntimeKind
 
@@ -527,6 +550,7 @@ class _FakeSandboxApi:
     def reset(cls) -> None:
         cls.configure_calls = []
         cls.reconcile_requests = []
+        cls.template_requests = []
         cls.pool = _FakePool()
 
     @staticmethod
@@ -540,37 +564,47 @@ class _FakeSandboxApi:
             _FakeSandboxApi.pool.name = request.namespace
             return _FakeSandboxApi.pool
 
+    class Template:
+        @classmethod
+        async def reconcile(cls, request):
+            _FakeSandboxApi.template_requests.append(request)
+            return SimpleNamespace(name=request.name)
 
-def _pool_spec(
+
+def _pool_spec(*, replicas: int = 2) -> dict[str, object]:
+    return {
+        "replicas": replicas,
+        "autoscaling": None,
+        "sandbox_template_ref": {"name": None},
+    }
+
+
+def _template_spec(
     *,
     image: str = "registry.example/desktop:latest",
-    replicas: int = 2,
-    template_updates: dict[str, object] | None = None,
+    vm_template_updates: dict[str, object] | None = None,
 ) -> dict[str, object]:
-    template = {
+    vm_template = {
         "runtime": "kubevirt",
         "runtime_class_name": None,
         "node_selector": None,
         "tolerations": None,
         "command": None,
         "container_disk_image": image,
+        "image_pull_policy": None,
         "image_pull_secret": "ecr-credentials",
         "cpu_cores": 4,
         "memory": "4Gi",
         "firmware": "bios",
         "probes": {"readinessProbe": {"tcpSocket": {"port": 8000}}},
-        "oidc": None,
-    }
-    template.update(template_updates or {})
-    return {
-        "replicas": replicas,
-        "autoscaling": None,
         "services": [
             {"name": "server", "target_port": 8000, "protocol": "tcp"},
             {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
         ],
-        "template": template,
+        "oidc": None,
     }
+    vm_template.update(vm_template_updates or {})
+    return {"vm_template": vm_template}
 
 
 def _fleet_provider(replicas: int = 2) -> CuaFleetDesktopProvider:
@@ -581,6 +615,7 @@ def _fleet_provider(replicas: int = 2) -> CuaFleetDesktopProvider:
             client_secret="secret",
             pool="hermes-desktop",
             spec=_pool_spec(replicas=replicas),
+            template_spec=_template_spec(),
         ),
         sandbox_module=_FakeSandboxApi,
     )
@@ -606,18 +641,26 @@ def test_cua_fleet_reconciles_named_pool_with_public_sandbox_api() -> None:
     assert isinstance(request, _FakeCreatePoolRequest)
     assert request.namespace == "hermes-desktop"
     assert request.spec.replicas == 2
-    assert (
-        request.spec.template.container_disk_image == "registry.example/desktop:latest"
-    )
-    assert request.spec.template.runtime is _FakeRuntimeKind.KUBEVIRT
-    assert request.spec.template.firmware is _FakeFirmware.BIOS
-    assert isinstance(request.spec.template.probes, _FakePreservedJson)
-    assert json.loads(request.spec.template.probes.value) == {
+    assert request.spec.autoscaling is None
+    assert request.spec.sandbox_template_ref.name == "hermes-desktop-template"
+
+    assert len(_FakeSandboxApi.template_requests) == 1
+    template_request = _FakeSandboxApi.template_requests[0]
+    assert isinstance(template_request, _FakeCreateTemplateRequest)
+    assert template_request.namespace == "hermes-desktop"
+    assert template_request.name == "hermes-desktop-template"
+    vm_template = template_request.spec.vm_template
+    assert vm_template.container_disk_image == "registry.example/desktop:latest"
+    assert vm_template.runtime is _FakeRuntimeKind.KUBEVIRT
+    assert vm_template.firmware is _FakeFirmware.BIOS
+    assert vm_template.image_pull_policy is None
+    assert isinstance(vm_template.probes, _FakePreservedJson)
+    assert json.loads(vm_template.probes.value) == {
         "readinessProbe": {"tcpSocket": {"port": 8000}}
     }
     assert [
         (service.name, service.target_port, service.protocol)
-        for service in request.spec.services
+        for service in vm_template.services
     ] == [
         ("server", 8000, _FakeServiceProtocol.TCP),
         ("mcp", 3000, _FakeServiceProtocol.TCP),
@@ -629,19 +672,21 @@ def test_cua_fleet_reconciles_named_pool_with_public_sandbox_api() -> None:
     assert _FakeSandboxApi.pool.claim_contexts[0].exited == 1
 
 
-def test_cua_fleet_passes_native_pool_request_fields_to_reconcile() -> None:
+def test_cua_fleet_passes_native_template_request_fields_to_reconcile() -> None:
     _FakeSandboxApi.reset()
     provider = CuaFleetDesktopProvider(
         CuaFleetConfig(
             client_id="ukey-test",
             client_secret="secret",
             pool="hermes-cua-pool",
-            spec=_pool_spec(
+            spec=_pool_spec(),
+            template_spec=_template_spec(
                 image="registry.example/windows:latest",
-                template_updates={
+                vm_template_updates={
                     "firmware": "efi",
                     "cpu_cores": 10,
                     "memory": "20Gi",
+                    "image_pull_policy": "always",
                 },
             ),
         ),
@@ -650,39 +695,41 @@ def test_cua_fleet_passes_native_pool_request_fields_to_reconcile() -> None:
 
     lease = provider.acquire("task-template")
 
-    request = _FakeSandboxApi.reconcile_requests[0]
+    request = _FakeSandboxApi.template_requests[0]
     assert request.namespace == "hermes-cua-pool"
-    assert (
-        request.spec.template.container_disk_image == "registry.example/windows:latest"
+    assert request.name == "hermes-cua-pool-template"
+    assert request.spec.vm_template.container_disk_image == (
+        "registry.example/windows:latest"
     )
-    assert request.spec.template.firmware is _FakeFirmware.EFI
-    assert request.spec.template.cpu_cores == 10
-    assert request.spec.template.memory == "20Gi"
+    assert request.spec.vm_template.firmware is _FakeFirmware.EFI
+    assert request.spec.vm_template.cpu_cores == 10
+    assert request.spec.vm_template.memory == "20Gi"
+    assert request.spec.vm_template.image_pull_policy is _FakeImagePullPolicy.ALWAYS
 
     provider.release(lease)
 
 
-def test_cua_fleet_passes_configured_bind_deadline_to_public_claim_spec() -> None:
-    _FakeSandboxApi.reset()
-    provider = CuaFleetDesktopProvider(
-        CuaFleetConfig(
-            client_id="ukey-test",
-            client_secret="secret",
-            pool="hermes-cua-pool",
-            spec=_pool_spec(),
-            bind_deadline=900,
-        ),
-        sandbox_module=_FakeSandboxApi,
-    )
+def test_cua_fleet_reconciles_the_pool_before_its_template() -> None:
+    provider = _fleet_provider()
 
-    lease = provider.acquire("task-bind-deadline")
+    lease = provider.acquire("task-order")
 
-    claim_spec = _FakeSandboxApi.pool.claim_specs[0]
-    assert isinstance(claim_spec, _FakeClaimSpec)
-    assert claim_spec.sandbox_template_ref.name == "hermes-cua-pool"
-    assert claim_spec.warmpool is None
-    assert claim_spec.bind_deadline == 900
-    assert claim_spec.lifecycle is None
+    # The pool owns the namespace, so it has to land first.
+    assert _FakeSandboxApi.pool.name == "hermes-desktop"
+    assert _FakeSandboxApi.template_requests[0].namespace == "hermes-desktop"
+    assert len(_FakeSandboxApi.reconcile_requests) == 1
+
+    provider.release(lease)
+
+
+def test_cua_fleet_lets_the_sdk_derive_the_claim_from_the_pool_spec() -> None:
+    provider = _fleet_provider()
+
+    lease = provider.acquire("task-claim-default")
+
+    # A hand-built ClaimSpec used to point at the pool name, which is not a
+    # template, and every claim timed out waiting to bind.
+    assert _FakeSandboxApi.pool.claim_specs == [None]
 
     provider.release(lease)
 
@@ -735,9 +782,10 @@ def test_compute_config_selects_cua_fleet_provider(monkeypatch) -> None:
             "cua_fleet": {
                 "base_url": "https://run.cua.ai",
                 "pool": "hermes-desktop",
-                "spec": _pool_spec(
+                "spec": _pool_spec(),
+                "template_spec": _template_spec(
                     image="registry.example/desktop:latest",
-                    template_updates={"firmware": "efi"},
+                    vm_template_updates={"firmware": "efi"},
                 ),
             },
         }
@@ -746,7 +794,8 @@ def test_compute_config_selects_cua_fleet_provider(monkeypatch) -> None:
     assert isinstance(provider, CuaFleetDesktopProvider)
     assert provider.config.image == "registry.example/desktop:latest"
     assert provider.config.replicas == 2
-    assert provider.config.spec["template"]["firmware"] == "efi"
+    assert provider.config.template_name == "hermes-desktop-template"
+    assert provider.config.vm_template["firmware"] == "efi"
 
 
 def test_cua_fleet_environment_cleanup_exits_claim_once() -> None:
@@ -789,7 +838,7 @@ def test_cua_fleet_terminal_parses_sse_command_response() -> None:
 def test_cua_fleet_sandbox_package_is_lazy_installable() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.24",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.25",)
 
 
 def test_cua_fleet_nix_extra_matches_lazy_dependency_pin() -> None:
@@ -833,7 +882,7 @@ def test_desktop_terminal_reuses_existing_task_lease_without_incrementing(monkey
 def test_cua_fleet_provider_uses_public_sandbox_facade() -> None:
     from tools.lazy_deps import LAZY_DEPS
 
-    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.24",)
+    assert LAZY_DEPS["terminal.cua_fleet"] == ("cua-sandbox==0.1.25",)
 
 
 def test_cua_fleet_nix_build_declares_evdev_build_system() -> None:

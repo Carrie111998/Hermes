@@ -33,25 +33,31 @@ DEFAULT_CONFIG = {
             "base_url": "https://run.cua.ai",
             "token_url": "https://auth.cua.ai/realms/cyclops-cs/protocol/openid-connect/token",
             "pool": "hermes-desktop",
+            # Native osgym.cua.ai CRDs: the pool only sizes replicas and points
+            # at a template, which carries the VM shape (services included).
             "spec": {
                 "replicas": 1,
                 "autoscaling": None,
-                "services": [
-                    {"name": "server", "target_port": 8000, "protocol": "tcp"},
-                    {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
-                ],
-                "template": {
+                "sandbox_template_ref": {"name": None},
+            },
+            "template_spec": {
+                "vm_template": {
                     "runtime": "kubevirt",
                     "runtime_class_name": None,
                     "node_selector": None,
                     "tolerations": None,
                     "command": None,
                     "container_disk_image": "trycua/cua:latest",
+                    "image_pull_policy": None,
                     "image_pull_secret": "ecr-credentials",
                     "cpu_cores": 2,
                     "memory": "8Gi",
                     "firmware": "bios",
                     "probes": None,
+                    "services": [
+                        {"name": "server", "target_port": 8000, "protocol": "tcp"},
+                        {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
+                    ],
                     "oidc": None,
                 },
             },

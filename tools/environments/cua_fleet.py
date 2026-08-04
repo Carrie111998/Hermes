@@ -13,7 +13,7 @@ import os
 import threading
 import types
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence, Union, get_args, get_origin, get_type_hints
 
 from tools.computer_use.transports.base import CuaToolTransport
@@ -29,25 +29,34 @@ _DEFAULT_TOKEN_URL = (
 
 
 def _default_pool_spec() -> dict[str, Any]:
+    """Native ``OSGymSandboxWarmPool`` spec; the ref name is filled per pool."""
     return {
         "replicas": 1,
         "autoscaling": None,
-        "services": [
-            {"name": "server", "target_port": 8000, "protocol": "tcp"},
-            {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
-        ],
-        "template": {
+        "sandbox_template_ref": {"name": None},
+    }
+
+
+def _default_template_spec() -> dict[str, Any]:
+    """Native ``OSGymSandboxTemplate`` spec; the VM shape lives here now."""
+    return {
+        "vm_template": {
             "runtime": "kubevirt",
             "runtime_class_name": None,
             "node_selector": None,
             "tolerations": None,
             "command": None,
             "container_disk_image": "trycua/cua:latest",
+            "image_pull_policy": None,
             "image_pull_secret": "ecr-credentials",
             "cpu_cores": 2,
             "memory": "8Gi",
             "firmware": "bios",
             "probes": None,
+            "services": [
+                {"name": "server", "target_port": 8000, "protocol": "tcp"},
+                {"name": "mcp", "target_port": 3000, "protocol": "tcp"},
+            ],
             "oidc": None,
         },
     }
@@ -61,36 +70,46 @@ class CuaFleetConfig:
     client_secret: str = ""
     pool: str = "hermes-desktop"
     spec: Mapping[str, Any] = field(default_factory=_default_pool_spec)
+    template_spec: Mapping[str, Any] = field(default_factory=_default_template_spec)
     cwd: str = "/root"
     timeout: int = 60
     ready_timeout: float = 600
     request_timeout: float = 30
-    bind_deadline: int | None = None
 
     def __post_init__(self) -> None:
         replicas = self.spec.get("replicas")
         if isinstance(replicas, bool) or not isinstance(replicas, int) or replicas < 1:
             raise ValueError("spec.replicas must be a positive integer")
-        if self.bind_deadline is not None and (
-            isinstance(self.bind_deadline, bool)
-            or not isinstance(self.bind_deadline, int)
-            or self.bind_deadline < 1
-        ):
-            raise ValueError("bind_deadline must be a positive integer or None")
+        if "template" in self.spec or "services" in self.spec:
+            raise ValueError(
+                "spec.template/spec.services are gone: the VM shape now lives in "
+                "template_spec.vm_template (services included)"
+            )
 
     @property
     def replicas(self) -> int:
         return int(self.spec["replicas"])
 
     @property
+    def template_name(self) -> str:
+        """Name of the template this pool's members are stamped from."""
+        ref = self.spec.get("sandbox_template_ref")
+        name = ref.get("name") if isinstance(ref, Mapping) else None
+        return str(name) if name else f"{self.pool}-template"
+
+    @property
+    def vm_template(self) -> Mapping[str, Any]:
+        vm_template = self.template_spec.get("vm_template")
+        if not isinstance(vm_template, Mapping):
+            raise ValueError("template_spec.vm_template must be a mapping")
+        return vm_template
+
+    @property
     def image(self) -> str:
-        template = self.spec.get("template")
-        if not isinstance(template, Mapping):
-            raise ValueError("spec.template must be a mapping")
-        image = template.get("container_disk_image")
+        image = self.vm_template.get("container_disk_image")
         if not isinstance(image, str) or not image:
             raise ValueError(
-                "spec.template.container_disk_image must be a non-empty string"
+                "template_spec.vm_template.container_disk_image must be a non-empty string"
             )
         return image
 
@@ -372,6 +391,11 @@ def _hydrate_fleet_schema(schema_type: Any, value: Any) -> Any:
             in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
         ]
         if fields:
+            missing = [name for name in fields if name not in value]
+            if missing:
+                raise ValueError(
+                    f"{schema_type.__name__} config is missing {sorted(missing)}"
+                )
             hints = get_type_hints(schema_type.__init__)
             return schema_type(
                 **{
@@ -383,18 +407,30 @@ def _hydrate_fleet_schema(schema_type: Any, value: Any) -> Any:
     return value
 
 
-def _create_pool_request(
-    sandbox_api: Any, config: CuaFleetConfig, image: str | None
-) -> Any:
+def _create_pool_request(sandbox_api: Any, config: CuaFleetConfig) -> Any:
     spec = copy.deepcopy(dict(config.spec))
-    if image is not None:
-        template = spec.get("template")
-        if not isinstance(template, Mapping):
-            raise ValueError("spec.template must be a mapping")
-        spec["template"] = {**template, "container_disk_image": image}
+    ref = spec.get("sandbox_template_ref")
+    spec["sandbox_template_ref"] = {
+        **(dict(ref) if isinstance(ref, Mapping) else {}),
+        "name": config.template_name,
+    }
     return sandbox_api.CreatePoolRequest(
         namespace=config.pool,
-        spec=_hydrate_fleet_schema(sandbox_api.PoolSpec, spec),
+        spec=_hydrate_fleet_schema(sandbox_api.OsGymSandboxWarmPoolSpec, spec),
+    )
+
+
+def _create_template_request(
+    sandbox_api: Any, config: CuaFleetConfig, image: str | None
+) -> Any:
+    vm_template = copy.deepcopy(dict(config.vm_template))
+    if image is not None:
+        vm_template["container_disk_image"] = image
+    spec = {**copy.deepcopy(dict(config.template_spec)), "vm_template": vm_template}
+    return sandbox_api.CreateTemplateRequest(
+        namespace=config.pool,
+        name=config.template_name,
+        spec=_hydrate_fleet_schema(sandbox_api.OsGymSandboxTemplateSpec, spec),
     )
 
 
@@ -447,19 +483,22 @@ class CuaFleetDesktopProvider:
         pool = claim_context = None
         entered_claim = False
         try:
-            request = _create_pool_request(sandbox_api, self.config, image)
+            pool_request = _create_pool_request(sandbox_api, self.config)
+            template_request = _create_template_request(sandbox_api, self.config, image)
             with self._reconcile_lock:
+                # The pool owns the namespace, so it has to land before the
+                # template that its members are stamped from.
                 pool = worker.run(
-                    sandbox_api.Pool.reconcile(request),
+                    sandbox_api.Pool.reconcile(pool_request),
                     self.config.request_timeout,
                 )
-            claim_spec = sandbox_api.ClaimSpec(
-                sandbox_template_ref=sandbox_api.SandboxTemplateRef(name=pool.name),
-                warmpool=None,
-                bind_deadline=self.config.bind_deadline,
-                lifecycle=None,
-            )
-            claim_context = pool.claim(spec=claim_spec)
+                worker.run(
+                    sandbox_api.Template.reconcile(template_request),
+                    self.config.request_timeout,
+                )
+            # spec=None lets the SDK derive the claim from the pool's own spec,
+            # which keeps the template ref correct by construction.
+            claim_context = pool.claim()
             sandbox = worker.run(claim_context.__aenter__(), self.config.ready_timeout)
             entered_claim = True
         except BaseException:
@@ -496,15 +535,15 @@ class CuaFleetDesktopProvider:
             raise RuntimeError(f"Unknown Cua Fleet lease {lease.lease_id}")
         config = self.config
         if lease.image != config.image:
-            config = CuaFleetConfig(
-                **{
-                    field_name: (
-                        lease.image
-                        if field_name == "image"
-                        else getattr(config, field_name)
-                    )
-                    for field_name in CuaFleetConfig.__dataclass_fields__
-                }
+            config = replace(
+                config,
+                template_spec={
+                    **config.template_spec,
+                    "vm_template": {
+                        **config.vm_template,
+                        "container_disk_image": lease.image,
+                    },
+                },
             )
         return CuaFleetEnvironment(
             compute_lease=lease,
