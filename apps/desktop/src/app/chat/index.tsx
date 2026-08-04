@@ -57,6 +57,7 @@ import { useComposerScope } from './composer/scope'
 import type { ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
+import { PreviewArtifactPublisher } from './preview-artifact-publisher'
 import { ProfileTag } from './profile-tag'
 import { useRuntimeMessageRepository } from './runtime-repository'
 import { ScrollToBottomButton } from './scroll-to-bottom-button'
@@ -237,7 +238,12 @@ function ChatRuntimeBoundary({
     onReload
   })
 
-  return <AssistantRuntimeProvider runtime={runtime}>{children}</AssistantRuntimeProvider>
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <PreviewArtifactPublisher disabled={suppressMessages} />
+      {children}
+    </AssistantRuntimeProvider>
+  )
 }
 
 // Memoized: the tile caller (session-tile.tsx) and the contrib surface re-render
