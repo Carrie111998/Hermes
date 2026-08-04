@@ -166,6 +166,56 @@ class TestRunBackgroundTask:
         mock_agent_instance.shutdown_memory_provider.assert_called_once()
         mock_agent_instance.close.assert_called_once()
 
+    @pytest.mark.asyncio
+    async def test_background_agent_passes_source_ids_to_platform_tools(self):
+        runner = _make_runner()
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(return_value=([], "done"))
+        mock_adapter.extract_images = MagicMock(return_value=([], "done"))
+        runner.adapters[Platform.DISCORD] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.DISCORD,
+            user_id="12345",
+            chat_id="100",
+            parent_chat_id="parent-7",
+            user_name="testuser",
+        )
+        captured = {}
+
+        def fake_get_platform_tools(config, platform, **kwargs):
+            captured["platform"] = platform
+            captured["chat_id"] = kwargs.get("chat_id")
+            captured["parent_id"] = kwargs.get("parent_id")
+            return {"web", "memory"}
+
+        with patch(
+            "gateway.run._resolve_runtime_agent_kwargs",
+            return_value={"api_key": "test-key"},
+        ), patch(
+            "gateway.run._load_gateway_config",
+            return_value={},
+        ), patch(
+            "hermes_cli.tools_config._get_platform_tools",
+            side_effect=fake_get_platform_tools,
+        ), patch("run_agent.AIAgent") as MockAgent:
+            mock_agent_instance = MagicMock()
+            mock_agent_instance.shutdown_memory_provider = MagicMock()
+            mock_agent_instance.close = MagicMock()
+            mock_agent_instance.run_conversation.return_value = {
+                "final_response": "done",
+                "messages": [],
+            }
+            MockAgent.return_value = mock_agent_instance
+
+            await runner._run_background_task("say hi", source, "bg_channel")
+
+            assert MockAgent.call_args.kwargs["enabled_toolsets"] == ["memory", "web"]
+            assert captured["platform"] == "discord"
+            assert captured["chat_id"] == "100"
+            assert captured["parent_id"] == "parent-7"
+
 
 # ---------------------------------------------------------------------------
 # /background in help and known_commands

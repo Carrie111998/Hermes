@@ -903,6 +903,21 @@ slack:
 
 Keys are Slack channel IDs (find them via channel details → "About" → scroll to bottom). All messages in the matching channel get the prompt injected as an ephemeral system instruction.
 
+## Per-Channel Toolsets
+
+Assign a strict tool and MCP-server allowlist to a Slack channel:
+
+```yaml
+slack:
+  channel_toolsets:
+    - id: "C01ENGINEERING"
+      toolsets: [hermes-slack, engineering-mcp]
+    - id: "C02PUBLIC"
+      toolsets: []  # hard no-tools gate
+```
+
+Unmapped channels retain `platform_toolsets.slack`, and threaded messages use their channel's binding. A matched list does not inherit unlisted MCP servers, plugins, context-engine tools, or newly shipped toolsets; include `hermes-slack` when the channel should keep Slack's normal tools. The value must be a list; malformed values and matched rules in gateway proxy mode fail closed.
+
 ## Per-Channel Skill Bindings
 
 Auto-load a skill whenever a new session starts in a specific channel or DM. Unlike per-channel prompts (which are injected on every turn), skill bindings inject the skill content as a user message at **session start** — it becomes part of the conversation history and does not need to be reloaded on subsequent turns.

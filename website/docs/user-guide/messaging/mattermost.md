@@ -325,6 +325,21 @@ mattermost:
 
 Keys are Mattermost channel IDs (find them in the channel URL or via the API). All messages in the matching channel get the prompt injected as an ephemeral system instruction.
 
+## Per-Channel Toolsets
+
+Assign a strict tool and MCP-server allowlist to a Mattermost channel:
+
+```yaml
+mattermost:
+  channel_toolsets:
+    - id: "channel_id_abc123"
+      toolsets: [hermes-mattermost, research-mcp]
+    - id: "channel_id_public"
+      toolsets: []  # hard no-tools gate
+```
+
+Unmapped channels retain `platform_toolsets.mattermost`. A matched list does not inherit unlisted MCP servers, plugins, context-engine tools, or newly shipped toolsets. Include `hermes-mattermost` to retain the normal platform tools. The value must be a list; malformed values and matched rules in gateway proxy mode fail closed.
+
 ## Security
 
 :::warning

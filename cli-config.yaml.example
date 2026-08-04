@@ -1037,6 +1037,23 @@ platform_toolsets:
 #   reactions: true                  # Show processing reactions (default: true)
 #   history_backfill: true           # Recover missed channel messages on mention (default: true)
 #   history_backfill_limit: 50       # Max messages to scan backwards (default: 50)
+#   # Strict per-channel allowlists. Exact thread/channel id wins, then parent.
+#   # Unmapped channels keep platform_toolsets.discord. Include hermes-discord
+#   # when normal Discord tools are wanted alongside a scoped MCP server.
+#   channel_toolsets:
+#     - id: "1502967669224243365"    # #ops and its forum threads
+#       toolsets: [hermes-discord, project-ops-mcp]
+#     - id: "1502987414816423986"    # hard no-tools channel
+#       toolsets: []
+#
+# telegram:                           # Slack and Mattermost use the same shape
+#   channel_toolsets:
+#     - id: "-1001234567890"
+#       toolsets: [hermes-telegram, research-mcp]
+#
+# Matched channel_toolsets do not inherit unlisted MCP servers, plugins,
+# context-engine tools, or newly shipped toolsets. They fail closed when
+# malformed or when gateway proxy mode uses an unknown remote.
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Available toolsets (use these names in platform_toolsets or the toolsets list)

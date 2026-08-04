@@ -477,6 +477,25 @@ Behavior:
 - If a message arrives inside a thread or forum post and that thread has no explicit entry, Hermes falls back to the parent channel/forum ID.
 - Prompts are applied ephemerally at runtime, so changing them affects future turns immediately without rewriting past session history.
 
+#### `discord.channel_toolsets`
+
+**Type:** list of channel bindings — **Default:** `[]`
+
+Use a strict tool allowlist for a channel or thread, including named MCP servers:
+
+```yaml
+discord:
+  channel_toolsets:
+    - id: "1234567890"
+      toolsets: [hermes-discord, project-ops-mcp]
+    - id: "9876543210"
+      toolsets: []  # hard no-tools gate
+```
+
+Exact thread/channel IDs win regardless of list order; an unmapped thread inherits its parent binding. Unmapped channels retain `platform_toolsets.discord`. A matched list is strict: unlisted MCP servers, plugins, context-engine tools, and newly shipped toolsets are not added. Include `hermes-discord` when you want the normal Discord tool surface alongside scoped MCP servers. `channel_toolsets` must be a list; malformed configured values fail closed to no tools.
+
+Channel-scoped turns also fail closed when gateway proxy mode is enabled, because an older or unknown remote cannot prove that it enforces the same scope.
+
 #### `discord.history_backfill`
 
 **Type:** boolean — **Default:** `true`
@@ -921,5 +940,3 @@ Leave `everyone` and `roles` at `false` unless you know exactly why you need the
 :::
 
 For more information on securing your Hermes Agent deployment, see the [Security Guide](../security.md).
-
-
