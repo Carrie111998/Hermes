@@ -314,6 +314,72 @@ class TestCheckVoiceRequirements:
         assert result["stt_available"] is True
         assert "STT provider: OK (plugin: my-plugin-stt)" in result["details"]
 
+
+    def test_explicit_local_installable_counts_as_ready(self, monkeypatch):
+        """Regression: classic ``/voice on`` gates activation on this probe.
+
+        An explicit ``local`` provider whose faster-whisper isn't installed
+        yet must NOT trigger a lazy pip install from the probe, but must
+        still count as ready when lazy installs are permitted — the install
+        happens at first real transcription. Without this, ``/voice on``
+        rejected an installable provider before the transcription path could
+        install it (#77040 follow-up).
+        """
+        monkeypatch.setattr("tools.voice_mode._audio_available", lambda: True)
+        monkeypatch.setattr("tools.voice_mode.detect_audio_environment",
+                            lambda: {"available": True, "warnings": []})
+        # Explicit local, faster-whisper absent -> resolver says "none" and
+        # the probe must be called with install=False (no pip from a probe).
+        seen_install_flags = []
+
+        def _fake_get_provider(cfg, *, install=True):
+            seen_install_flags.append(install)
+            return "none"
+
+        monkeypatch.setattr(
+            "tools.transcription_tools._get_provider", _fake_get_provider,
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools._load_stt_config",
+            lambda: {"enabled": True, "provider": "local", "local": None},
+        )
+        monkeypatch.setattr(
+            "tools.voice_mode._lazy_installs_allowed", lambda: True,
+        )
+
+        from tools.voice_mode import check_voice_requirements
+
+        result = check_voice_requirements()
+        assert seen_install_flags == [False], (
+            "a requirements probe must never request a lazy install"
+        )
+        assert result["stt_available"] is True
+        assert result["available"] is True
+        assert "installs at first use" in result["details"]
+
+    def test_explicit_local_uninstallable_not_ready(self, monkeypatch):
+        """Lazy installs disabled -> explicit uninstalled local is NOT ready."""
+        monkeypatch.setattr("tools.voice_mode._audio_available", lambda: True)
+        monkeypatch.setattr("tools.voice_mode.detect_audio_environment",
+                            lambda: {"available": True, "warnings": []})
+        monkeypatch.setattr(
+            "tools.transcription_tools._get_provider",
+            lambda cfg, *, install=True: "none",
+        )
+        monkeypatch.setattr(
+            "tools.transcription_tools._load_stt_config",
+            lambda: {"enabled": True, "provider": "local", "local": None},
+        )
+        monkeypatch.setattr(
+            "tools.voice_mode._lazy_installs_allowed", lambda: False,
+        )
+
+        from tools.voice_mode import check_voice_requirements
+
+        result = check_voice_requirements()
+        assert result["stt_available"] is False
+        assert result["available"] is False
+
 # ============================================================================
 # AudioRecorder
 # ============================================================================

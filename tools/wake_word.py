@@ -760,10 +760,14 @@ def _stt_ready() -> bool:
         if provider != "none":
             return True
 
-        # Explicit local / local_command that isn't installed yet: ready iff
-        # a lazy install is permitted — the pip fetch happens at first
-        # transcription, never from a status poll / startup handshake.
-        if "provider" in stt_config and stt_config.get("provider") in ("local", "local_command"):
+        # Explicit local that isn't installed yet: ready iff a lazy install
+        # is permitted — the pip fetch happens at first transcription,
+        # never from a status poll / startup handshake. local_command is
+        # deliberately NOT included: the resolver never lazy-installs
+        # faster-whisper for it (transcription_tools._get_provider returns
+        # "none" for a missing explicit command without installing), so
+        # arming the wake word on it would be unbacked.
+        if "provider" in stt_config and stt_config.get("provider") == "local":
             return lazy_deps._allow_lazy_installs()
         return False
     except Exception:

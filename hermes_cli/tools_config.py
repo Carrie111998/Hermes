@@ -1842,17 +1842,17 @@ def _run_post_setup(post_setup_key: str):
         except ImportError:
             _print_info("    Installing piper-tts (~14MB wheel, voices downloaded on first use)...")
             try:
-                result = _pip_install(["-U", "piper-tts", "--quiet"], timeout=300)
+                result = _pip_install(["-U", "piper-tts==1.4.2", "--quiet"], timeout=300)
                 if result.returncode == 0:
                     _print_success("    piper-tts installed")
                 else:
                     _print_warning("    piper-tts install failed:")
                     _print_info(f"      {(result.stderr or '').strip()[:300]}")
-                    _print_info("    Run manually: uv pip install -U piper-tts")
+                    _print_info("    Run manually: uv pip install -U piper-tts==1.4.2")
                     return
             except subprocess.TimeoutExpired:
                 _print_warning("    piper-tts install timed out (>5min)")
-                _print_info("    Run manually: uv pip install -U piper-tts")
+                _print_info("    Run manually: uv pip install -U piper-tts==1.4.2")
                 return
         _print_info("    Default voice: en_US-lessac-medium (downloaded on first TTS call)")
         _print_info("    Full voice list: https://github.com/OHF-Voice/piper1-gpl/blob/main/docs/VOICES.md")

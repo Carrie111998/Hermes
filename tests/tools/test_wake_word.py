@@ -191,6 +191,35 @@ def test_stt_ready_is_a_probe_never_an_installer(monkeypatch):
     assert ww._stt_ready() is False
 
 
+def test_stt_ready_does_not_arm_unbacked_local_command(monkeypatch):
+    """Explicit local_command with no command and no whisper is NOT ready.
+
+    The resolver never lazy-installs faster-whisper for local_command
+    (transcription_tools._get_provider returns "none" for a missing
+    explicit command without installing), so treating it as ready would
+    arm the wake word on an unusable STT backend — even when lazy
+    installs are allowed.
+    """
+    monkeypatch.setattr(
+        ww, "_stt_ready", ww.__dict__["_stt_ready"]
+    )  # use the real implementation
+
+    def _fake_get_provider(cfg, *, install=True):
+        # faster-whisper absent, no HERMES_LOCAL_STT_COMMAND, no command
+        # provider configured → resolver says "none" and installs nothing.
+        return "none"
+
+    fake_stt = types.SimpleNamespace(
+        _get_provider=_fake_get_provider,
+        _load_stt_config=lambda: {"enabled": True, "provider": "local_command"},
+        is_stt_enabled=lambda cfg: bool(cfg.get("enabled")),
+    )
+    monkeypatch.setitem(sys.modules, "tools.transcription_tools", fake_stt)
+
+    monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: True)
+    assert ww._stt_ready() is False
+
+
 def test_requirements_fresh_install_lazy_allowed(monkeypatch):
     """Deps missing + lazy installs allowed → available, so /wake on can
     reach the engine constructor's ``lazy_deps.ensure()`` call.

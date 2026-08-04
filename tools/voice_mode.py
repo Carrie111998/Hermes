@@ -120,6 +120,21 @@ def _default_input_samplerate(sd) -> int:
 from hermes_constants import is_termux as _is_termux_environment
 
 
+def _lazy_installs_allowed() -> bool:
+    """Return whether lazy pip installs are permitted in this environment.
+
+    Mirrors ``wake_word._stt_ready``'s gate: probes must never run pip
+    themselves, but an *installable* provider still counts as ready so
+    activation gates (``/voice on``) don't reject a backend that will be
+    installed at first real use.
+    """
+    try:
+        from tools.lazy_deps import _allow_lazy_installs
+        return _allow_lazy_installs()
+    except Exception:
+        return False
+
+
 def _voice_capture_install_hint() -> str:
     if _is_termux_environment():
         return "pkg install python-numpy portaudio && python -m pip install sounddevice"
@@ -2193,6 +2208,19 @@ def check_voice_requirements() -> Dict[str, Any]:
     # lazy faster-whisper install here would freeze /voice status (and the
     # TUI's voice.toggle status RPC) for the length of a pip install.
     stt_provider = _get_provider(stt_config, install=False)
+    # Explicit ``local`` whose faster-whisper isn't installed yet: the probe
+    # must NOT install, but classic ``/voice on`` gates activation on this
+    # result (cli.py), so a lazy-installable local still counts as ready —
+    # the pip fetch happens at first real transcription, exactly like
+    # ``wake_word._stt_ready``. Without this the gate would reject an
+    # installable provider before the transcription path could install it.
+    lazy_local_pending = (
+        stt_provider == "none"
+        and stt_enabled
+        and "provider" in stt_config
+        and stt_config.get("provider") == "local"
+        and _lazy_installs_allowed()
+    )
     native_stt_available = stt_provider in {
         "local",
         "local_command",
@@ -2212,6 +2240,7 @@ def check_voice_requirements() -> Dict[str, Any]:
             plugin_stt_available = _check_plugin_stt_provider(stt_provider)
     stt_available = stt_enabled and (
         native_stt_available
+        or lazy_local_pending
         or command_stt_config is not None
         or plugin_stt_available
     )
@@ -2252,6 +2281,10 @@ def check_voice_requirements() -> Dict[str, Any]:
         details_parts.append("STT provider: OK (xAI Grok STT)")
     elif stt_provider == "elevenlabs":
         details_parts.append("STT provider: OK (ElevenLabs Scribe)")
+    elif lazy_local_pending:
+        details_parts.append(
+            "STT provider: OK (local faster-whisper — installs at first use)"
+        )
     elif command_stt_config is not None:
         details_parts.append(f"STT provider: OK (command: {stt_provider})")
     elif plugin_stt_available:

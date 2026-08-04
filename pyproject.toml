@@ -168,6 +168,9 @@ fal = ["fal-client==0.13.1"]
 # Edge TTS — default TTS provider but still optional (users can pick
 # ElevenLabs / OpenAI / MiniMax instead).
 edge-tts = ["edge-tts==7.2.7"]
+# Piper TTS — fully-local neural TTS (OHF-Voice/piper1-gpl). Mirrors the
+# `tts.piper` lazy-install entry in tools/lazy_deps.py; keep pins in sync.
+piper = ["piper-tts==1.4.2"]
 modal = ["modal==1.3.4"]
 daytona = ["daytona==0.155.0"]
 vercel = ["vercel==0.7.2"]

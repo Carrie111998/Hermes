@@ -30,6 +30,34 @@ class TestPiperLazyDepsRegistration:
             f"Expected 'piper-tts' in tts.piper packages, got {pkgs}"
         )
 
+    def test_tts_piper_pin_matches_pyproject_extra(self):
+        """The lazy pin must agree with the ``piper`` extra in pyproject.toml.
+
+        LAZY_DEPS documents that specs mirror the corresponding extra;
+        a drift means the version a user gets depends on eager vs lazy
+        install. Parsed (not imported) so the test stays free of
+        packaging-runtime side effects.
+        """
+        import re
+        import tomllib
+        from pathlib import Path
+
+        from tools.lazy_deps import LAZY_DEPS
+
+        lazy_spec = LAZY_DEPS["tts.piper"][0]
+        lazy_pin = re.match(r"^piper-tts==([^;\s]+)", lazy_spec).group(1)
+        pyproject = tomllib.loads(
+            Path("pyproject.toml").read_text(encoding="utf-8")
+        )
+        extra_specs = pyproject["project"]["optional-dependencies"]["piper"]
+        assert extra_specs, "pyproject [piper] extra must exist"
+        extra_pin = re.match(r"^piper-tts==([^;\s]+)", extra_specs[0]).group(1)
+        assert lazy_pin == extra_pin, (
+            f"lazy pin piper-tts=={lazy_pin} != pyproject [piper] pin "
+            f"piper-tts=={extra_pin} — the eager and lazy install paths "
+            "would diverge."
+        )
+
 
 # ---------------------------------------------------------------------------
 # 2. _import_piper calls ensure()
@@ -85,9 +113,10 @@ class TestCheckPiperAvailable:
 
     def test_returns_false_when_piper_not_installed(self):
         from tools.tts_tool import _check_piper_available
-        # In the test environment piper-tts is not installed,
-        # so this should return False.
-        assert _check_piper_available() is False
+        # Environment-independent: mock find_spec so the probe reports
+        # "absent" regardless of whether the runner has piper-tts installed.
+        with patch("importlib.util.find_spec", return_value=None):
+            assert _check_piper_available() is False
 
     def test_returns_true_when_piper_mocked(self):
         mock_spec = MagicMock()
