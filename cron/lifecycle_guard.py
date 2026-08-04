@@ -35,6 +35,7 @@ informative rejection instead of scheduling a job that will only fail
 
 from __future__ import annotations
 
+import itertools
 import os
 import re
 import shlex
@@ -45,6 +46,13 @@ from typing import Callable, Iterator, Optional
 
 class GatewayLifecycleBlocked(ValueError):
     """Raised when a cron job spec contains a gateway-lifecycle command."""
+
+
+# Cap on tokens scanned per command line. A real shell command has a handful
+# of tokens; a line yielding more is pathological (e.g. a stray NUL from
+# binary content) and must not be able to hang the guard in a shlex spin
+# loop (#76762). Bounding it keeps the guard O(n) and terminating.
+_MAX_SHLEX_TOKENS = 100_000
 
 
 # Shell-level command shapes that target the gateway lifecycle. Each branch
@@ -114,7 +122,7 @@ _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
-    normalized = command.replace("\\\n", "")
+    normalized = command.replace("\\\\\n", "")
     for line in normalized.splitlines() or [normalized]:
         try:
             lexer = shlex.shlex(
@@ -124,7 +132,13 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
             )
             lexer.whitespace_split = True
             lexer.commenters = "#"
-            tokens = list(lexer)
+            # ponytail: bound tokenization so a pathological line (e.g. a
+            # stray NUL from binary content) can never hang the guard in a
+            # shlex spin loop; a command with >100k tokens is not a shell
+            # command we need to scan anyway.
+            tokens = list(
+                itertools.islice(lexer, _MAX_SHLEX_TOKENS)
+            )
         except ValueError:
             continue
 
@@ -258,7 +272,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte — a binary's decoded contents can be
+        # tokenized into a path with a NUL. A guarded path must never crash
+        # the guard (#76762). Same contract as the resolve() guard below.
         return None, False
     try:
         metadata = os.fstat(descriptor)

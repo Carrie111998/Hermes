@@ -705,6 +705,21 @@ class TestLifecycleGuardModule:
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
 
+    def test_embedded_null_byte_path_does_not_crash(self):
+        """#76762 sibling: a NUL byte from a binary's decoded contents can be
+        tokenized into a referenced-script path. os.open raises ValueError
+        (embedded null byte) for such a path — the guard must treat it as
+        \"nothing to scan\", never crash the terminal tool."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # Would previously raise ValueError: embedded null byte from
+        # _read_referenced_script -> os.open.
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /tmp/foo\x00bar"
+        )
+        assert result is False
+
 
 # ---------------------------------------------------------------------------
 # Defense 2 (chokepoint): cron.jobs.create_job blocks the AGENT model-tool path
