@@ -198,6 +198,53 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def get_active_profile_home() -> Path:
+    """Return the active profile's own home directory.
+
+    This is the single source of truth for "where does THIS profile's data
+    live". Unlike :func:`get_default_hermes_root` (which returns the parent of
+    ``profiles/`` for profile-listing operations), this always resolves to the
+    directory the current session actually reads and writes:
+
+    * default profile → ``~/.hermes`` (or the platform/HERMES_HOME default)
+    * named profile   → ``<root>/profiles/<name>``
+
+    It is exactly :func:`get_hermes_home`. It exists as a separately-named
+    function so call sites that compose profile paths stop re-deriving the
+    home ad hoc (and stop double-appending ``profiles/<name>`` — see the
+    system-prompt profile line and issue #18594's sibling defects). Prefer
+    this over open-coding ``get_hermes_home()`` when the intent is "the
+    current profile's own directory", so the two resolution concerns
+    (profile-home vs profiles-root) stay grep-able and distinct.
+    """
+    return get_hermes_home()
+
+
+def get_active_profile_name() -> str:
+    """Return the active profile name derived from the profile home.
+
+    ``~/.hermes``              -> ``"default"``
+    ``<root>/profiles/<name>`` -> ``<name>``
+    anything else              -> ``"custom"``
+
+    Falls back to ``"default"`` on any resolution failure so callers never
+    raise into a tool/prompt path.
+    """
+    try:
+        home_real = get_active_profile_home().resolve()
+        root_real = get_default_hermes_root().resolve()
+    except (OSError, RuntimeError):
+        return "default"
+    try:
+        rel = home_real.relative_to(root_real / "profiles")
+        parts = rel.parts
+        if len(parts) == 1 and parts[0]:
+            return parts[0]
+    except ValueError:
+        pass
+    return "default"
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 

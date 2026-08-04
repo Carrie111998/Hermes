@@ -402,10 +402,21 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # See file_safety._resolve_active_profile_name + classify_cross_profile_target
     # for the matching tool-side guard.
     try:
-        from agent.file_safety import _resolve_active_profile_name
-        active_profile = _resolve_active_profile_name()
+        from hermes_constants import (
+            get_active_profile_home,
+            get_active_profile_name,
+            get_default_hermes_root,
+        )
+        active_profile = get_active_profile_name()
+        # The profile's own home IS get_active_profile_home() — do not append
+        # profiles/<name> again. The default profile's data lives at the
+        # profiles-root, which is the parent of profiles/, not the profile home.
+        profile_home = get_active_profile_home()
+        default_home = get_default_hermes_root()
     except Exception:
         active_profile = "default"
+        profile_home = None
+        default_home = None
     if active_profile == "default":
         post_workspace_parts.append(
             "Active Hermes profile: default. Other profiles (if any) live "
@@ -418,9 +429,9 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     else:
         post_workspace_parts.append(
             f"Active Hermes profile: {active_profile}. This session reads "
-            f"and writes {get_hermes_home()}/profiles/{active_profile}/. The default "
-            f"profile's data lives at {get_hermes_home()}/skills/, {get_hermes_home()}/plugins/, "
-            f"{get_hermes_home()}/cron/, {get_hermes_home()}/memories/ — those belong to a "
+            f"and writes {profile_home}/. The default "
+            f"profile's data lives at {default_home}/skills/, {default_home}/plugins/, "
+            f"{default_home}/cron/, {default_home}/memories/ — those belong to a "
             f"different session run from a different shell. Do NOT modify "
             f"another profile's skills/plugins/cron/memories unless the user "
             f"explicitly directs you to. The cross-profile write guard will "

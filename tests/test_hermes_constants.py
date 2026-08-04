@@ -81,6 +81,52 @@ class TestGetHermesHome:
         assert get_hermes_home() == local_appdata / "hermes"
 
 
+class TestActiveProfileResolution:
+    """Tests for get_active_profile_home() / get_active_profile_name().
+
+    These are the canonical profile-home vs profiles-root resolvers. The
+    system prompt's profile line composes from them; a doubled
+    ``profiles/<name>/profiles/<name>/`` path is the regression they guard.
+    """
+
+    def test_named_profile_resolves_own_home_and_root(self, tmp_path, monkeypatch):
+        from hermes_constants import get_active_profile_home, get_active_profile_name
+
+        root = tmp_path / ".hermes"
+        profile_home = root / "profiles" / "data-sage"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        assert get_active_profile_name() == "data-sage"
+        assert get_active_profile_home() == profile_home
+        # The profiles-root is the parent of profiles/, NOT the profile home.
+        assert get_default_hermes_root() == root
+
+    def test_default_profile_resolves_native_home(self, tmp_path, monkeypatch):
+        from hermes_constants import get_active_profile_home, get_active_profile_name
+
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+
+        assert get_active_profile_name() == "default"
+        assert get_active_profile_home() == tmp_path / ".hermes"
+        assert get_default_hermes_root() == tmp_path / ".hermes"
+
+    def test_docker_named_profile(self, tmp_path, monkeypatch):
+        from hermes_constants import get_active_profile_home, get_active_profile_name
+
+        docker_root = tmp_path / "opt" / "data"
+        profile_home = docker_root / "profiles" / "coder"
+        profile_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+
+        assert get_active_profile_name() == "coder"
+        assert get_active_profile_home() == profile_home
+        assert get_default_hermes_root() == docker_root
+
+
 class TestGetProcessHermesHome:
     """Tests for get_process_hermes_home() — process launch scope.
 
