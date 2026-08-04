@@ -196,9 +196,29 @@ class TestRunJobScript:
         assert output == "ok"
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
+        assert captured["kwargs"]["start_new_session"] is True
         assert "creationflags" not in captured["kwargs"]
         assert "encoding" not in captured["kwargs"]
         assert "errors" not in captured["kwargs"]
+
+    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX session isolation")
+    def test_script_runs_in_own_session_and_process_group(self, cron_env):
+        """MCP teardown must not signal an unrelated cron collector (#78432)."""
+        from cron.scheduler import _run_job_script
+
+        script = cron_env / "scripts" / "process_group.py"
+        script.write_text(
+            "import json, os\n"
+            "print(json.dumps({'pid': os.getpid(), 'sid': os.getsid(0), "
+            "'pgid': os.getpgrp()}))\n"
+        )
+
+        success, output = _run_job_script("process_group.py")
+        process = json.loads(output)
+
+        assert success is True
+        assert process["sid"] == process["pid"]
+        assert process["pgid"] == process["pid"]
 
 
 class TestBuildJobPromptWithScript:

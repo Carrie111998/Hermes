@@ -2297,7 +2297,11 @@ def _run_job_script(
     try:
         from tools.environments.local import build_subprocess_env
 
-        popen_kwargs = {}
+        # Keep cron collectors out of the gateway/MCP process group. MCP
+        # lifecycle teardown uses process-group signals for stdio server trees;
+        # without a separate session, an unrelated long-running no-agent cron
+        # script can receive that SIGTERM as collateral damage (#78432).
+        popen_kwargs = {"start_new_session": True}
         if sys.platform == "win32":
             popen_kwargs = {
                 "creationflags": windows_hide_flags(),
