@@ -46,6 +46,39 @@ NTFY_HOME_CHANNEL=hermes-myname-2026
 | `NTFY_HOME_CHANNEL` | Optional | Default topic for cron / notification delivery |
 | `NTFY_HOME_CHANNEL_NAME` | Optional | Human label for the home channel |
 
+## Multiple independent conversations
+
+One ntfy topic maps to one Hermes chat and session. To run several independent
+conversations with the same Hermes profile, configure multiple topics in
+`config.yaml`:
+
+```yaml
+platforms:
+  ntfy:
+    enabled: true
+    extra:
+      topics:
+        - hermes-1
+        - hermes-2
+        - hermes-3
+        - hermes-4
+        - hermes-5
+```
+
+Hermes opens one ntfy subscription covering all configured topics. Each
+incoming event's topic becomes its chat ID, so conversation history, active
+runs, and session locks stay separate. Replies return to the topic that
+originated the message. The profile's configuration, skills, and persistent
+memory remain shared. Add every configured topic to `NTFY_ALLOWED_USERS` and
+grant the authenticated ntfy account read/write access to each topic; otherwise
+the stream may connect but Hermes will reject messages during authorization.
+
+`topic` and `NTFY_TOPIC` remain supported for a single conversation. Use either
+`topic` or `topics`, not both. A fixed `publish_topic` still controls legacy
+single-topic split-input/output setups; multi-topic replies always return to
+their originating topic unless a send operation explicitly overrides the
+destination.
+
 ## Identity model — read this before deploying
 
 ntfy has no native authenticated user identity. The `title` field on a published message is **publisher-controlled** and can be anything the sender wants. The Hermes adapter does NOT use `title` for authorization — it would let any publisher who knows the topic spoof an allowed user.
@@ -143,7 +176,7 @@ If you only want Hermes to *push* notifications to ntfy (cron summaries, alerts)
 
 - **Message size**: ntfy caps message bodies at 4096 chars. Hermes truncates with a warning when this is exceeded.
 - **No typing indicators**: the protocol doesn't expose one; `send_typing` is a no-op.
-- **No threads or attachments**: ntfy is plain push notifications. Long replies stay in the message body, no thread fanout.
+- **No native threads or attachments**: ntfy is plain push notifications. Configure multiple topics when you need independent Hermes conversations.
 - **No native user identity**: see the identity-model section above.
 
 ## Troubleshooting

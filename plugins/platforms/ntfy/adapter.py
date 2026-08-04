@@ -18,7 +18,10 @@ Configuration in config.yaml::
         enabled: true
         extra:
           server: "https://ntfy.sh"       # or self-hosted URL
-          topic: "hermes-in"              # subscribe topic (incoming)
+          topic: "hermes-in"              # one subscribe topic (incoming)
+          topics:                          # or several independent chats
+            - "hermes-1"
+            - "hermes-2"
           publish_topic: "hermes-out"     # optional — defaults to topic
           token: "..."                    # optional Bearer / Basic auth token
           markdown: true                  # optional — enable markdown (default: false)
@@ -146,31 +149,40 @@ def _truncate_body(message: str, *, context: str) -> bytes:
     return message[:MAX_MESSAGE_LENGTH].encode("utf-8")
 
 
-def check_requirements() -> bool:
-    """Check whether the ntfy adapter is installable and minimally configured.
+def _configured_topics(extra: Dict[str, Any]) -> List[str]:
+    """Return ordered, de-duplicated topics from config or the legacy env."""
+    configured = extra.get("topics")
+    if isinstance(configured, (list, tuple)):
+        return list(dict.fromkeys(
+            topic.strip()
+            for topic in configured
+            if isinstance(topic, str) and topic.strip()
+        ))
+    topic = extra.get("topic") or os.getenv("NTFY_TOPIC", "")
+    topic = topic.strip()
+    return [topic] if topic else []
 
-    Reads ``NTFY_TOPIC`` directly to avoid the cost of a full
-    ``load_gateway_config()`` (which also writes to ``os.environ``) on
-    every pre-flight check.
+
+def check_requirements() -> bool:
+    """Check whether the ntfy adapter's runtime dependency is available.
+
+    Topic configuration is validated separately from the supplied
+    ``PlatformConfig`` so config-only ``topics`` setups work without a legacy
+    ``NTFY_TOPIC`` environment variable.
     """
-    if not HTTPX_AVAILABLE:
-        return False
-    topic = os.getenv("NTFY_TOPIC", "").strip()
-    return bool(topic)
+    return HTTPX_AVAILABLE
 
 
 def validate_config(config) -> bool:
-    """Validate that the configured ntfy platform has a topic set."""
+    """Validate that the configured ntfy platform has at least one topic."""
     extra = getattr(config, "extra", {}) or {}
-    topic = extra.get("topic") or os.getenv("NTFY_TOPIC", "")
-    return bool(topic)
+    return bool(_configured_topics(extra))
 
 
 def is_connected(config) -> bool:
     """Check whether ntfy is configured (env or config.yaml)."""
     extra = getattr(config, "extra", {}) or {}
-    topic = os.getenv("NTFY_TOPIC") or extra.get("topic", "")
-    return bool(topic)
+    return bool(_configured_topics(extra))
 
 
 class NtfyAdapter(BasePlatformAdapter):
@@ -191,11 +203,13 @@ class NtfyAdapter(BasePlatformAdapter):
             extra.get("server")
             or os.getenv("NTFY_SERVER_URL", DEFAULT_SERVER)
         ).rstrip("/")
-        self._topic: str = extra.get("topic") or os.getenv("NTFY_TOPIC", "")
+        self._topics = _configured_topics(extra)
+        # Keep the original single-topic attribute for compatibility with
+        # callers and plugins that inspect it.
+        self._topic: str = self._topics[0] if self._topics else ""
         self._publish_topic: str = (
             extra.get("publish_topic")
             or os.getenv("NTFY_PUBLISH_TOPIC", "")
-            or self._topic
         )
         self._token: str = extra.get("token") or _get_scoped_secret("NTFY_TOKEN", "")
 
@@ -212,15 +226,20 @@ class NtfyAdapter(BasePlatformAdapter):
         if not HTTPX_AVAILABLE:
             logger.warning("[%s] httpx not installed. Run: pip install httpx", self.name)
             return False
-        if not self._topic:
-            logger.warning("[%s] NTFY_TOPIC not configured", self.name)
+        if not self._topics:
+            logger.warning("[%s] No ntfy topics configured", self.name)
             return False
 
         try:
             self._http_client = httpx.AsyncClient(timeout=None)
             self._stream_task = asyncio.create_task(self._run_stream())
             self._mark_connected()
-            logger.info("[%s] Connected — subscribing to %s/%s", self.name, self._server, self._topic)
+            logger.info(
+                "[%s] Connected — subscribing to %s/%s",
+                self.name,
+                self._server,
+                ",".join(self._topics),
+            )
             return True
         except Exception as e:
             logger.error("[%s] Failed to connect: %s", self.name, e)
@@ -230,7 +249,7 @@ class NtfyAdapter(BasePlatformAdapter):
         """Subscribe to the ntfy topic with automatic reconnection."""
         backoff_idx = 0
         stream_start: float = 0.0
-        url = f"{self._server}/{self._topic}/json"
+        url = f"{self._server}/{','.join(self._topics)}/json"
         headers = self._auth_headers()
 
         while self._running:
@@ -351,9 +370,9 @@ class NtfyAdapter(BasePlatformAdapter):
         # ntfy has no native authenticated user identity. The title field is
         # publisher-controlled and must NOT be used for authorization — any
         # publisher who knows the topic can set title to an allowed username.
-        # Treat ntfy as a single trusted channel; user_id is fixed to the
-        # topic name. NTFY_ALLOWED_USERS is only a real trust boundary when
-        # the topic itself is protected by a read token.
+        # Treat each ntfy topic as one logical user/channel; user_id is the
+        # event's topic name. NTFY_ALLOWED_USERS is only a real trust boundary
+        # when every subscribed topic is protected by authenticated ntfy ACLs.
         user_id = topic
         user_name = topic
 
@@ -411,7 +430,23 @@ class NtfyAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Publish a message to the configured publish topic."""
         metadata = metadata or {}
-        publish_topic = metadata.get("publish_topic") or self._publish_topic or chat_id
+        if len(self._topics) > 1:
+            # Every subscribed topic is a distinct Hermes chat. Replies must
+            # return to the originating topic instead of collapsing all
+            # conversations onto a legacy fixed publish topic.
+            publish_topic = (
+                metadata.get("publish_topic")
+                or chat_id
+                or self._publish_topic
+                or self._topic
+            )
+        else:
+            publish_topic = (
+                metadata.get("publish_topic")
+                or self._publish_topic
+                or chat_id
+                or self._topic
+            )
 
         if not self._http_client:
             return SendResult(success=False, error="HTTP client not initialized")
@@ -544,8 +579,7 @@ async def _standalone_send(
         chat_id
         or extra.get("publish_topic")
         or os.getenv("NTFY_PUBLISH_TOPIC", "").strip()
-        or extra.get("topic")
-        or os.getenv("NTFY_TOPIC", "").strip()
+        or next(iter(_configured_topics(extra)), "")
     )
     if not publish_topic:
         return {"error": "ntfy standalone send: NTFY_TOPIC not configured"}

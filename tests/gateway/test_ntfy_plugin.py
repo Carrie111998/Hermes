@@ -68,11 +68,25 @@ class TestNtfyRequirements:
         monkeypatch.setattr(_ntfy, "HTTPX_AVAILABLE", False)
         assert check_requirements() is False
 
+    def test_config_only_setup_requires_httpx_not_topic_env(self, monkeypatch):
+        monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        monkeypatch.setattr(_ntfy, "HTTPX_AVAILABLE", True)
+        assert check_requirements() is True
+
 
     def test_is_connected_from_extra(self, monkeypatch):
         monkeypatch.delenv("NTFY_TOPIC", raising=False)
         assert is_connected(PlatformConfig(enabled=True, extra={"topic": "t"})) is True
         assert is_connected(PlatformConfig(enabled=True, extra={})) is False
+
+    def test_topics_list_is_valid_connected_config(self, monkeypatch):
+        monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        config = PlatformConfig(
+            enabled=True,
+            extra={"topics": [f"hermes-{number}" for number in range(1, 6)]},
+        )
+        assert validate_config(config) is True
+        assert is_connected(config) is True
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +102,14 @@ class TestNtfyAdapterInit:
         config = PlatformConfig(enabled=True, extra={})
         adapter = NtfyAdapter(config)
         assert adapter._topic == "env-topic"
+
+    def test_topics_list_read_from_config(self, monkeypatch):
+        monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        topics = [f"hermes-{number}" for number in range(1, 6)]
+        adapter = NtfyAdapter(
+            PlatformConfig(enabled=True, extra={"topics": topics})
+        )
+        assert adapter._topics == topics
 
 
     def test_publish_topic_uses_extra_value(self):
@@ -173,6 +195,24 @@ class TestConnect:
         except (asyncio.CancelledError, Exception):
             pass
 
+    def test_stream_subscribes_to_all_configured_topics(self):
+        topics = [f"hermes-{number}" for number in range(1, 6)]
+        adapter = NtfyAdapter(
+            PlatformConfig(enabled=True, extra={"topics": topics})
+        )
+        adapter._running = True
+
+        async def consume_once(url, headers):
+            adapter._running = False
+
+        with patch.object(
+            adapter, "_consume_stream", side_effect=consume_once
+        ) as consume:
+            _run(adapter._run_stream())
+
+        subscribed_url = consume.call_args.args[0]
+        assert subscribed_url.endswith(f"/{','.join(topics)}/json")
+
 
     def test_disconnect_cancels_stream_task(self):
         adapter = NtfyAdapter(PlatformConfig(enabled=True, extra={"topic": "t"}))
@@ -238,6 +278,25 @@ class TestSend:
         assert result.success is True
         posted_url = mock_client.post.call_args[0][0]
         assert posted_url.endswith("/hermes-in")
+
+    def test_send_replies_to_originating_topic_in_multi_topic_mode(self):
+        topics = [f"hermes-{number}" for number in range(1, 6)]
+        adapter = NtfyAdapter(
+            PlatformConfig(enabled=True, extra={"topics": topics})
+        )
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {}
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        adapter._http_client = mock_client
+
+        result = _run(adapter.send("hermes-4", "Hello topic four"))
+
+        assert result.success is True
+        posted_url = mock_client.post.call_args.args[0]
+        assert posted_url.endswith("/hermes-4")
 
     def test_send_uses_metadata_publish_topic(self):
         adapter = self._make_adapter(topic="hermes-in")
@@ -314,6 +373,28 @@ class TestOnMessage:
         _run(adapter._on_message(event))
         assert len(calls) == 1
         assert calls[0].text == "Hello from ntfy"
+
+    def test_each_topic_has_a_distinct_chat_identity(self):
+        topics = [f"hermes-{number}" for number in range(1, 6)]
+        adapter = NtfyAdapter(
+            PlatformConfig(enabled=True, extra={"topics": topics})
+        )
+        calls = []
+
+        async def handler(event):
+            calls.append(event)
+
+        adapter.set_message_handler(handler)
+        for number, topic in enumerate(topics, start=1):
+            _run(adapter._on_message({
+                "id": f"evt-{number}",
+                "event": "message",
+                "topic": topic,
+                "message": f"message {number}",
+                "time": None,
+            }))
+
+        assert [event.source.chat_id for event in calls] == topics
 
     def test_empty_message_skipped(self):
         adapter = self._make_adapter()
@@ -406,6 +487,27 @@ class TestStandaloneSend:
         result = _run(_standalone_send(pconfig, "", "hello"))
         assert "error" in result
         assert "NTFY_TOPIC" in result["error"]
+
+    def test_uses_first_configured_topic_when_chat_id_is_empty(self, monkeypatch):
+        monkeypatch.delenv("NTFY_TOPIC", raising=False)
+        monkeypatch.delenv("NTFY_PUBLISH_TOPIC", raising=False)
+        pconfig = MagicMock()
+        pconfig.extra = {"topics": ["hermes-1", "hermes-2"]}
+
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = {"id": "id-1"}
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_resp)
+        mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+        mock_client.__aexit__ = AsyncMock(return_value=None)
+
+        with patch.object(_ntfy, "httpx") as mock_httpx:
+            mock_httpx.AsyncClient.return_value = mock_client
+            result = _run(_standalone_send(pconfig, "", "hi"))
+
+        assert result["success"] is True
+        assert mock_client.post.call_args.args[0].endswith("/hermes-1")
 
 
     def test_emits_echo_tag_header(self, monkeypatch):
