@@ -254,6 +254,22 @@ class TestCreateProfile:
             / "SKILL.md"
         ).read_text() == "---\nname: installed-skill\n---\n"
 
+    def test_clone_config_copies_source_plugins(self, profile_env):
+        tmp_path = profile_env
+        default_home = tmp_path / ".hermes"
+        plugin_dir = default_home / "plugins" / "example-plugin"
+        plugin_dir.mkdir(parents=True)
+        (plugin_dir / "plugin.yaml").write_text("name: example-plugin\n")
+
+        profile_dir = create_profile("coder", clone_config=True, no_alias=True)
+
+        assert (
+            profile_dir
+            / "plugins"
+            / "example-plugin"
+            / "plugin.yaml"
+        ).read_text() == "name: example-plugin\n"
+
     def test_clone_all_copies_entire_tree(self, profile_env):
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
