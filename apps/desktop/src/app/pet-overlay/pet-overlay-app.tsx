@@ -414,6 +414,9 @@ export function PetOverlayApp() {
     isInteracting,
     loopMs: info.loopMs ?? 1100,
     overlayOpen: false,
+    // The pop-out overlay is a focusable:false panel (main.ts) so it never
+    // receives window focus; roaming must not pause on blur or it never runs.
+    pauseWhenUnfocused: false,
     petH,
     petW
   })
