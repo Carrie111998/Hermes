@@ -21,6 +21,9 @@ import enum
 import contextvars
 import json
 import logging
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 import os
@@ -744,6 +747,64 @@ _HEARTBEAT_STALE_CYCLES_IN_TOOL = 40  # 40 * 30s = 1200s stuck on same tool → 
 DEFAULT_TOOLSETS = ["terminal", "file", "web"]
 
 
+def _effective_parent_toolsets(parent_agent) -> set[str]:
+    """Resolve the parent's actual capability set for inherited delegation.
+
+    ``enabled_toolsets=None`` means "all tools" rather than "no tools".  A
+    live ``AIAgent`` records the schemas that survived toolset and ``check_fn``
+    filtering in ``valid_tool_names``; reverse-map those names to toolsets so
+    an inherited ``required_toolsets`` pre-flight observes the same capability
+    set a child will inherit.  Test doubles or alternate agent surfaces that do
+    not expose that attribute fall back to their loaded schema list, then the
+    normal model-tool resolver as a last resort.
+    """
+    parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
+    raw_disabled = getattr(parent_agent, "disabled_toolsets", None) or []
+    disabled = {str(name) for name in raw_disabled}
+    if parent_enabled is not None:
+        if isinstance(parent_enabled, (list, tuple, set)):
+            return {str(name) for name in parent_enabled} - disabled
+        return set()
+
+    loaded_names = getattr(parent_agent, "valid_tool_names", None)
+    if loaded_names is None:
+        schemas = getattr(parent_agent, "tools", None)
+        if isinstance(schemas, list):
+            loaded_names = {
+                schema.get("function", {}).get("name")
+                for schema in schemas
+                if isinstance(schema, dict)
+                and isinstance(schema.get("function"), dict)
+                and schema["function"].get("name")
+            }
+    if loaded_names is None:
+        # The normal resolver is only a fallback for unusual caller surfaces
+        # without a loaded schema record. It remains local capability discovery
+        # and deliberately does not resolve credentials or invoke a provider.
+        from model_tools import get_tool_definitions
+
+        schemas = get_tool_definitions(
+            enabled_toolsets=None,
+            disabled_toolsets=list(disabled),
+            quiet_mode=True,
+        )
+        loaded_names = {
+            schema.get("function", {}).get("name")
+            for schema in schemas
+            if isinstance(schema, dict)
+            and isinstance(schema.get("function"), dict)
+            and schema["function"].get("name")
+        }
+
+    import model_tools
+
+    return {
+        toolset
+        for name in loaded_names
+        if (toolset := model_tools.get_toolset_for_tool(str(name))) is not None
+    } - disabled
+
+
 # ---------------------------------------------------------------------------
 # Delegation progress event types
 # ---------------------------------------------------------------------------
@@ -1214,6 +1275,13 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Explicit profile-target fields.  These are internal, trusted values
+    # produced by pre-flight; model-facing calls cannot supply them directly.
+    target_toolsets: Optional[List[str]] = None,
+    target_disabled_toolsets: Optional[List[str]] = None,
+    target_profile_name: Optional[str] = None,
+    target_profile_home: Optional[Path] = None,
+    target_platform: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1254,21 +1322,15 @@ def _build_child_agent(
     # Note: enabled_toolsets=None means "all tools enabled" (the default),
     # so we must derive effective toolsets from the parent's loaded tools.
     parent_enabled = getattr(parent_agent, "enabled_toolsets", None)
-    if parent_enabled is not None:
-        parent_toolsets = set(parent_enabled)
-    elif parent_agent and hasattr(parent_agent, "valid_tool_names"):
-        # enabled_toolsets is None (all tools) — derive from loaded tool names
-        import model_tools
+    parent_toolsets = _effective_parent_toolsets(parent_agent)
 
-        parent_toolsets = {
-            ts
-            for name in parent_agent.valid_tool_names
-            if (ts := model_tools.get_toolset_for_tool(name)) is not None
-        }
-    else:
-        parent_toolsets = set(DEFAULT_TOOLSETS)
-
-    if toolsets:
+    # A named durable profile owns its configured capability set. The values
+    # are resolved and checked before construction, so do NOT intersect them
+    # with the caller's tools: doing so would silently turn profile targeting
+    # back into clone delegation. Legacy children keep the inherited path.
+    if target_toolsets is not None:
+        child_toolsets = _strip_blocked_tools(target_toolsets)
+    elif toolsets:
         # Intersect with parent — subagent must not gain tools the parent lacks.
         # Expand composite toolsets (e.g. hermes-cli) so that individual
         # toolset names (e.g. web, terminal) are recognised during intersection.
@@ -1291,7 +1353,11 @@ def _build_child_agent(
     # carry useful tools too. Pass exact one-tool deny toolsets through to the
     # child so model_tools subtracts the blocked names AFTER composite
     # expansion, and the restriction survives later registry/MCP refreshes.
-    raw_parent_disabled = getattr(parent_agent, "disabled_toolsets", None)
+    raw_parent_disabled = (
+        target_disabled_toolsets
+        if target_disabled_toolsets is not None
+        else getattr(parent_agent, "disabled_toolsets", None)
+    )
     if isinstance(raw_parent_disabled, (list, tuple, set)):
         inherited_disabled = [str(name) for name in raw_parent_disabled]
     else:
@@ -1521,9 +1587,15 @@ def _build_child_agent(
             quiet_mode=True,
             ephemeral_system_prompt=child_prompt,
             log_prefix=f"[subagent-{task_index}]",
-            platform="subagent",
+            # Target profiles run under their originating surface so their
+            # platform-specific config remains authoritative.  Generic children
+            # retain the existing internal subagent surface.
+            platform=target_platform or "subagent",
             skip_context_files=True,
             skip_memory=True,
+            # A named durable profile supplies its own specialist identity;
+            # generic clone delegation continues to omit it for compatibility.
+            load_soul_identity=target_profile_name is not None,
             clarify_callback=None,
             thinking_callback=child_thinking_cb,
             session_db=getattr(parent_agent, "_session_db", None),
@@ -1559,6 +1631,12 @@ def _build_child_agent(
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+    # Preserve the durable profile's scoped home through worker threads.  The
+    # run wrapper restores this scope before tools/config/secrets are touched.
+    if target_profile_home is not None:
+        child._delegate_profile_home = str(target_profile_home)
+        child._delegate_profile_name = target_profile_name
+    child._delegate_origin_platform = target_platform or _delegation_source_platform(parent_agent)
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
     # → NULL). Mirrors /branch's ``_branched_from`` pattern — see
@@ -1963,6 +2041,69 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
 
 
 def _run_single_child(
+    task_index: int,
+    goal: str,
+    child=None,
+    parent_agent=None,
+    **kwargs,
+) -> Dict[str, Any]:
+    """Run one child, re-entering its durable profile scope when targeted."""
+    profile_home = getattr(child, "_delegate_profile_home", None)
+    profile_name = getattr(child, "_delegate_profile_name", None)
+    profile_path: Optional[Path] = None
+    if isinstance(profile_home, str):
+        profile_path = Path(profile_home)
+    elif isinstance(profile_home, os.PathLike):
+        try:
+            raw_path = os.fspath(profile_home)
+        except TypeError:
+            raw_path = None
+        if isinstance(raw_path, str):
+            profile_path = Path(raw_path)
+
+    # Only the trusted construction path sets both markers. ``MagicMock`` and
+    # other generic test doubles can implement ``__fspath__`` and stringify to
+    # relative pseudo-paths; an arbitrary child attribute must never switch
+    # its config/secret scope. Durable profiles are absolute directories from
+    # ``get_profile_dir`` paired with a validated durable-profile name.
+    if (
+        isinstance(profile_name, str)
+        and bool(profile_name.strip())
+        and profile_path is not None
+        and profile_path.is_absolute()
+    ):
+        try:
+            with _delegated_profile_runtime_scope(profile_path):
+                return _run_single_child_in_profile_scope(
+                    task_index,
+                    goal,
+                    child=child,
+                    parent_agent=parent_agent,
+                    **kwargs,
+                )
+        except Exception as exc:
+            # Construction succeeded only after target pre-flight. A subsequent
+            # profile-scope failure (for example a removed profile directory)
+            # must surface as a child error rather than leak the parent scope.
+            return {
+                "task_index": task_index,
+                "status": "error",
+                "summary": None,
+                "error": f"Target profile runtime scope failed: {exc}",
+                "api_calls": 0,
+                "duration_seconds": 0,
+                "_child_role": getattr(child, "_delegate_role", None),
+            }
+    return _run_single_child_in_profile_scope(
+        task_index,
+        goal,
+        child=child,
+        parent_agent=parent_agent,
+        **kwargs,
+    )
+
+
+def _run_single_child_in_profile_scope(
     task_index: int,
     goal: str,
     child=None,
@@ -2776,12 +2917,231 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+@dataclass(frozen=True)
+class _DelegationProfileTarget:
+    """Resolved, immutable runtime selection for one named durable profile."""
+
+    name: str
+    home: Path
+    platform: str
+    effective_toolsets: tuple[str, ...]
+    disabled_toolsets: tuple[str, ...]
+
+
+@contextmanager
+def _delegated_profile_config_scope(profile_home: Path):
+    """Resolve config reads against one durable profile without mutating env.
+
+    Delegation pre-flight must use the target profile's own ``HERMES_HOME`` so
+    its platform toolsets and disabled-toolset policy are authoritative.  The
+    override is context-local, which keeps concurrent delegations isolated and
+    makes this safe to use before any child/session/provider work begins.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    token = set_hermes_home_override(str(profile_home))
+    try:
+        yield
+    finally:
+        reset_hermes_home_override(token)
+
+
+@contextmanager
+def _delegated_profile_runtime_scope(profile_home: Path):
+    """Apply a target profile's config and secret scope for child runtime work.
+
+    Pre-flight deliberately uses only ``_delegated_profile_config_scope`` so a
+    rejected call never resolves credentials.  Once pre-flight succeeds, child
+    provider resolution, construction, and execution use this fuller scope to
+    behave like the named durable profile rather than a clone of the parent.
+    """
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+    from hermes_cli.env_loader import hydrate_profile_secret_sources
+
+    with _delegated_profile_config_scope(profile_home):
+        hydrate_profile_secret_sources(profile_home)
+        secret_token = set_secret_scope(build_profile_secret_scope(profile_home))
+        try:
+            yield
+        finally:
+            reset_secret_scope(secret_token)
+
+
+def _resolve_delegation_target_profile(profile: Any) -> tuple[str, Path]:
+    """Validate and resolve an explicit durable-profile target."""
+    if not isinstance(profile, str) or not profile.strip():
+        raise ValueError("profile must be a non-empty durable profile name.")
+
+    from hermes_cli.profiles import (
+        get_profile_dir,
+        normalize_profile_name,
+        profile_exists,
+        validate_profile_name,
+    )
+
+    name = normalize_profile_name(profile)
+    validate_profile_name(name)
+    if not profile_exists(name):
+        raise ValueError(f"Target profile '{name}' does not exist.")
+    profile_home = get_profile_dir(name)
+    if not profile_home.is_dir():
+        # Keep the message deterministic if the directory disappears between
+        # profile_exists() and construction.
+        raise ValueError(f"Target profile '{name}' does not exist.")
+    return name, profile_home
+
+
+def _normalize_required_toolsets(value: Any, *, task_index: int) -> List[str]:
+    """Validate a task's capability contract and return stable unique names."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(
+            f"Task {task_index} required_toolsets must be an array of toolset names."
+        )
+
+    normalized: List[str] = []
+    for toolset in value:
+        if not isinstance(toolset, str) or not toolset.strip():
+            raise ValueError(
+                f"Task {task_index} required_toolsets must contain only non-empty strings."
+            )
+        name = toolset.strip()
+        if name not in normalized:
+            normalized.append(name)
+    return normalized
+
+
+def _normalize_delegation_model(value: Any, *, task_index: int) -> Optional[str]:
+    """Validate an optional one-session model override without persisting it."""
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"Task {task_index} model must be a non-empty string.")
+    return value.strip()
+
+
+def _delegation_source_platform(parent_agent) -> str:
+    """Return the originating surface for platform-specific target config."""
+    raw_platform = getattr(parent_agent, "platform", "cli")
+    if raw_platform == "subagent":
+        raw_platform = getattr(parent_agent, "_delegate_origin_platform", None) or raw_platform
+    if isinstance(raw_platform, str) and raw_platform.strip():
+        return raw_platform.strip().lower()
+    return "cli"
+
+
+def _target_profile_capabilities(
+    profile_home: Path, platform: str
+) -> tuple[set[str], tuple[str, ...]]:
+    """Return target platform capabilities and its configured disabled toolsets.
+
+    ``_get_platform_tools`` is the canonical resolver: it applies the actual
+    platform-composite/default semantics and subtracts
+    ``agent.disabled_toolsets`` last.  Do not duplicate that logic here.
+    """
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.tools_config import _get_platform_tools
+
+    with _delegated_profile_config_scope(profile_home):
+        config = load_config_readonly()
+        effective = set(_get_platform_tools(config, platform))
+        agent_cfg = config.get("agent") if isinstance(config, dict) else None
+        raw_disabled = (
+            agent_cfg.get("disabled_toolsets", []) if isinstance(agent_cfg, dict) else []
+        )
+        disabled = (
+            tuple(str(name) for name in raw_disabled)
+            if isinstance(raw_disabled, (list, tuple, set))
+            else ()
+        )
+        return effective, disabled
+
+
+def _preflight_delegation_capabilities(
+    task_list: List[Dict[str, Any]],
+    *,
+    top_profile: Any,
+    top_model: Any,
+    top_required_toolsets: Any,
+    parent_agent,
+) -> tuple[Dict[int, _DelegationProfileTarget], Dict[int, Optional[str]]]:
+    """Fail before credentials or child construction when a target lacks tools.
+
+    Top-level target fields are defaults for batch items; a task key (including
+    an explicit ``null``) overrides its top-level value.  Calls that omit both
+    fields preserve the legacy inherited-child behavior without a new config
+    read.  Returned target metadata is reused by the construction path once a
+    target profile is requested.
+    """
+    platform = _delegation_source_platform(parent_agent)
+    targets: Dict[int, _DelegationProfileTarget] = {}
+    models: Dict[int, Optional[str]] = {}
+    failures: List[str] = []
+
+    for index, task in enumerate(task_list):
+        task_profile = task["profile"] if "profile" in task else top_profile
+        required_value = (
+            task["required_toolsets"]
+            if "required_toolsets" in task
+            else top_required_toolsets
+        )
+        required = _normalize_required_toolsets(required_value, task_index=index)
+        model_value = task["model"] if "model" in task else top_model
+        models[index] = _normalize_delegation_model(model_value, task_index=index)
+
+        # No explicit profile plus no requirement is exactly the historic path.
+        if task_profile is None and not required:
+            continue
+
+        if task_profile is None:
+            # The old child path inherits these exact toolsets from the parent.
+            # Keep required_toolsets useful without changing an omitted-profile
+            # call into a profile switch.
+            effective = _effective_parent_toolsets(parent_agent)
+            label = "the inherited parent capability set"
+        else:
+            name, profile_home = _resolve_delegation_target_profile(task_profile)
+            effective, disabled = _target_profile_capabilities(profile_home, platform)
+            targets[index] = _DelegationProfileTarget(
+                name=name,
+                home=profile_home,
+                platform=platform,
+                effective_toolsets=tuple(sorted(effective)),
+                disabled_toolsets=disabled,
+            )
+            label = f"target profile '{name}'"
+
+        missing = sorted(set(required) - effective)
+        if missing:
+            failures.append(
+                f"Task {index} {label} is missing required toolset(s): {', '.join(missing)}."
+            )
+
+    if failures:
+        raise ValueError(
+            "Delegation capability pre-flight refused before child creation: "
+            + " ".join(failures)
+        )
+    return targets, models
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
     tasks: Optional[List[Dict[str, Any]]] = None,
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
+    profile: Optional[str] = None,
+    model: Optional[str] = None,
+    required_toolsets: Optional[List[str]] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2852,16 +3212,6 @@ def delegate_task(
         )
     effective_max_iter = default_max_iter
 
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -2881,7 +3231,14 @@ def delegate_task(
             )
         task_list = tasks
     elif goal and isinstance(goal, str) and goal.strip():
-        task_list = [{"goal": goal, "context": context, "role": top_role}]
+        task_list = [{
+            "goal": goal,
+            "context": context,
+            "role": top_role,
+            "profile": profile,
+            "model": model,
+            "required_toolsets": required_toolsets,
+        }]
     else:
         return tool_error("Provide either 'goal' (single task) or 'tasks' (batch).")
 
@@ -2896,6 +3253,40 @@ def delegate_task(
             )
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
+
+    # Capability checks intentionally precede credential resolution, live-log
+    # creation, session creation, and child construction.  A mismatch must be
+    # a deterministic, zero-provider/zero-child refusal.
+    try:
+        target_profiles, task_models = _preflight_delegation_capabilities(
+            task_list,
+            top_profile=profile,
+            top_model=model,
+            top_required_toolsets=required_toolsets,
+            parent_agent=parent_agent,
+        )
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    # Resolve each child's runtime only after all capability contracts pass.
+    # Explicit profiles use their own config/credentials; omitted profiles
+    # preserve the legacy parent/``delegation`` resolver path. This must stay
+    # ahead of live-log/session/child work so a bad runtime cannot partially
+    # spawn a batch.
+    try:
+        task_credentials: Dict[int, dict] = {}
+        for index in range(len(task_list)):
+            target = target_profiles.get(index)
+            if target is not None:
+                task_credentials[index] = _resolve_target_profile_credentials(
+                    target, task_models[index]
+                )
+            else:
+                task_credentials[index] = _resolve_delegation_credentials(
+                    cfg, parent_agent, task_models[index]
+                )
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     overall_start = time.monotonic()
     results = []
@@ -2941,27 +3332,40 @@ def delegate_task(
         # Per-task role beats top-level; normalise again so unknown
         # per-task values warn and degrade to leaf uniformly.
         effective_role = _normalize_role(t.get("role") or top_role)
-        child = _build_child_preserving_parent_tools(
-            task_index=i,
-            goal=t["goal"],
-            context=t.get("context"),
-            # Subagents always inherit the parent's toolsets; the model
-            # cannot choose or narrow them (no model-facing toolsets arg).
-            toolsets=None,
-            model=creds["model"],
-            max_iterations=effective_max_iter,
-            task_count=n_tasks,
-            parent_agent=parent_agent,
-            override_provider=creds["provider"],
-            override_base_url=creds["base_url"],
-            override_api_key=creds["api_key"],
-            override_api_mode=creds["api_mode"],
-            override_request_overrides=creds.get("request_overrides"),
-            override_max_tokens=creds.get("max_output_tokens"),
-            override_acp_command=creds.get("command"),
-            override_acp_args=creds.get("args"),
-            role=effective_role,
-        )
+        target = target_profiles.get(i)
+        creds = task_credentials[i]
+        child_kwargs = {
+            "task_index": i,
+            "goal": t["goal"],
+            "context": t.get("context"),
+            # Omitted profile preserves the historic parent-tool inheritance.
+            "toolsets": None,
+            "model": creds["model"],
+            "max_iterations": effective_max_iter,
+            "task_count": n_tasks,
+            "parent_agent": parent_agent,
+            "override_provider": creds["provider"],
+            "override_base_url": creds["base_url"],
+            "override_api_key": creds["api_key"],
+            "override_api_mode": creds["api_mode"],
+            "override_request_overrides": creds.get("request_overrides"),
+            "override_max_tokens": creds.get("max_output_tokens"),
+            "override_acp_command": creds.get("command"),
+            "override_acp_args": creds.get("args"),
+            "role": effective_role,
+        }
+        if target is not None:
+            child_kwargs.update(
+                target_toolsets=list(target.effective_toolsets),
+                target_disabled_toolsets=list(target.disabled_toolsets),
+                target_profile_name=target.name,
+                target_profile_home=target.home,
+                target_platform=target.platform,
+            )
+            with _delegated_profile_runtime_scope(target.home):
+                child = _build_child_preserving_parent_tools(**child_kwargs)
+        else:
+            child = _build_child_preserving_parent_tools(**child_kwargs)
         # Tee the child's progress events into its live transcript log.
         # wrap_progress_callback preserves the inner callback contract
         # (including the _flush attribute) and never lets writer failures
@@ -3322,7 +3726,9 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=(
+                task_credentials[0]["model"] if n_tasks == 1 else None
+            ),
             session_key=_session_key,
             origin_ui_session_id=_origin_ui_session_id,
             origin_session_id=_wake_sid,
@@ -3476,7 +3882,9 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict, parent_agent, model_override: Optional[str] = None
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3497,7 +3905,7 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
+    configured_model = model_override or str(cfg.get("model") or "").strip() or None
     configured_provider = str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
@@ -3594,6 +4002,56 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     return {
         "model": configured_model or runtime.get("model") or None,
         "provider": configured_provider if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM else runtime.get("provider"),
+        "base_url": runtime.get("base_url"),
+        "api_key": api_key,
+        "api_mode": runtime.get("api_mode"),
+        "request_overrides": dict(runtime.get("request_overrides") or {}),
+        "max_output_tokens": runtime.get("max_output_tokens"),
+        "command": runtime.get("command"),
+        "args": list(runtime.get("args") or []),
+    }
+
+
+def _resolve_target_profile_credentials(
+    target: _DelegationProfileTarget, model_override: Optional[str]
+) -> dict:
+    """Resolve a named profile's normal model/provider for one child session.
+
+    This intentionally does not write config: ``model_override`` is passed only
+    to the runtime resolver and then into the child constructor.  The profile's
+    configured default remains untouched for subsequent durable sessions.
+    """
+    try:
+        from hermes_cli.runtime_provider import _get_model_config, resolve_runtime_provider
+
+        with _delegated_profile_runtime_scope(target.home):
+            model_cfg = _get_model_config()
+            configured_model = str(model_cfg.get("default") or "").strip() or None
+            configured_provider = str(model_cfg.get("provider") or "").strip() or None
+            effective_model = model_override or configured_model
+            runtime = resolve_runtime_provider(
+                requested=configured_provider,
+                target_model=effective_model,
+            )
+    except Exception as exc:
+        raise ValueError(
+            f"Cannot resolve target profile '{target.name}' runtime: {exc}. "
+            "Check that its configured provider and credentials are valid."
+        ) from exc
+
+    api_key = runtime.get("api_key", "")
+    if not api_key:
+        raise ValueError(
+            f"Target profile '{target.name}' resolved its provider but has no API key. "
+            "Configure that profile's credentials or run 'hermes auth' in the profile."
+        )
+    return {
+        "model": effective_model or runtime.get("model") or None,
+        "provider": (
+            configured_provider
+            if runtime.get("provider") == _RUNTIME_PROVIDER_CUSTOM
+            else runtime.get("provider")
+        ),
         "base_url": runtime.get("base_url"),
         "api_key": api_key,
         "api_mode": runtime.get("api_mode"),
@@ -3706,7 +4164,9 @@ def _build_tasks_param_description() -> str:
         f"Batch mode: tasks to run in parallel (up to {max_children} for this "
         f"user, set via delegation.max_concurrent_children). Each gets "
         "its own subagent with isolated context and terminal session. "
-        "When provided, top-level goal/context/role are ignored."
+        "When provided, top-level goal/context are ignored; top-level role, "
+        "profile, model, and required_toolsets are defaults that task fields "
+        "can override."
     )
 
 
@@ -3804,6 +4264,35 @@ DELEGATE_TASK_SCHEMA = {
                     "specific you are, the better the subagent performs."
                 ),
             },
+            "profile": {
+                "type": "string",
+                "description": (
+                    "Optional durable Hermes profile to run for this child. "
+                    "The child resolves that profile's HERMES_HOME, provider, "
+                    "identity, and platform capabilities instead of cloning "
+                    "the parent. In batch mode this is a default per task."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional one-session model override. It is resolved for "
+                    "this delegated child only and never rewrites the target "
+                    "profile's configured model default. In batch mode this is "
+                    "a default per task."
+                ),
+            },
+            "required_toolsets": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Capabilities this child must have (for example "
+                    "computer_use). Hermes pre-flights the selected profile's "
+                    "platform toolsets minus disabled_toolsets before any child "
+                    "session or provider call. In batch mode this is a default "
+                    "per task."
+                ),
+            },
             "tasks": {
                 "type": "array",
                 "items": {
@@ -3818,6 +4307,19 @@ DELEGATE_TASK_SCHEMA = {
                             "type": "string",
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
+                        },
+                        "profile": {
+                            "type": "string",
+                            "description": "Per-task durable profile override.",
+                        },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task one-session model override.",
+                        },
+                        "required_toolsets": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Capabilities that must pre-flight before this child can spawn.",
                         },
                     },
                     "required": ["goal"],
@@ -3903,6 +4405,9 @@ registry.register(
         tasks=_strip_model_hidden_task_fields(args.get("tasks")),
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
+        profile=args.get("profile"),
+        model=args.get("model"),
+        required_toolsets=args.get("required_toolsets"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
