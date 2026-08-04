@@ -27,13 +27,17 @@ from scripts.canary.network_boundary import (
     NetworkBoundarySpec,
     build_plan as build_network_plan,
 )
+from scripts.canary.host_storage_successor import (
+    TARGET_SIZE_GB as CANONICAL_BOOT_DISK_SIZE_GB,
+    canonical_sha256 as canonical_storage_successor_sha256,
+)
 
 
 VM_NAME = "muncho-canary-v2-01"
 IMAGE_PROJECT = "debian-cloud"
 IMAGE = "debian-12-bookworm-v20260609"
 MACHINE_TYPE = "e2-medium"
-BOOT_DISK_SIZE_GB = 40
+BOOT_DISK_SIZE_GB = CANONICAL_BOOT_DISK_SIZE_GB
 BOOT_DISK_TYPE = "pd-balanced"
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -132,6 +136,10 @@ def build_plan(spec: HostSpec) -> HostPlan:
             "requires_live_complete_network_attestation": True,
             "single_host_step": True,
             "requires_post_apply_attestation": True,
+            "canonical_storage_successor_sha256": (
+                canonical_storage_successor_sha256()
+            ),
+            "canonical_boot_disk_size_gb": BOOT_DISK_SIZE_GB,
         },
         steps=(
             PlanStep(
@@ -223,15 +231,13 @@ def execute_plan(
             receipts.append({"name": step.name, "result": "verified_existing"})
             continue
         completed = runner(step.argv)
-        receipts.append(
-            {
-                "name": step.name,
-                "result": "created" if completed.returncode == 0 else "failed",
-                "returncode": completed.returncode,
-                "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
-                "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
-            }
-        )
+        receipts.append({
+            "name": step.name,
+            "result": "created" if completed.returncode == 0 else "failed",
+            "returncode": completed.returncode,
+            "stdout_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+            "stderr_sha256": hashlib.sha256(completed.stderr.encode()).hexdigest(),
+        })
         if completed.returncode != 0:
             return {
                 "schema": "muncho-isolated-canary-host-receipt.v1",

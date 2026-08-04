@@ -47,6 +47,8 @@ LEGACY_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v1"
 LEGACY_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v1"
 PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v2"
 RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v2"
+INSTALLED_NATIVE_PLAN_SCHEMA = "muncho-stopped-writer-residue-recovery-plan.v3"
+INSTALLED_NATIVE_RECEIPT_SCHEMA = "muncho-stopped-writer-residue-recovery.v3"
 FAILURE_SCHEMA = "muncho-stopped-writer-residue-recovery-failure.v1"
 
 DEFAULT_WRITER_CONFIG_SOURCE_PATH = Path(
@@ -57,6 +59,9 @@ DEFAULT_GATEWAY_CONFIG_SOURCE_PATH = Path(
 )
 DEFAULT_STAGED_NATIVE_PLAN_PATH = Path(
     "/etc/muncho/writer-activation/staged/native-observation-plan.json"
+)
+DEFAULT_INSTALLED_NATIVE_PLAN_PATH = Path(
+    "/etc/muncho/writer-activation/native-observation-plan.json"
 )
 DEFAULT_STAGED_WRITER_UNIT_PATH = Path(
     "/etc/muncho/writer-activation/staged/muncho-canonical-writer.service"
@@ -81,6 +86,7 @@ if _ACTIVATION_PATHS[:2] != (
     raise RuntimeError("stopped writer residue path contract drifted")
 if not {
     DEFAULT_STAGED_NATIVE_PLAN_PATH,
+    DEFAULT_INSTALLED_NATIVE_PLAN_PATH,
     DEFAULT_STAGED_WRITER_UNIT_PATH,
     DEFAULT_STAGED_PHASE_B_READINESS_UNIT_PATH,
     DEFAULT_STAGED_GATEWAY_UNIT_PATH,
@@ -236,6 +242,19 @@ def _archive_path(
     )
 
 
+def _installed_native_archive_path(
+    target_revision: str,
+    source_revision: str,
+    collector_receipt_sha256: str,
+) -> Path:
+    archive = _archive_path(
+        target_revision,
+        source_revision,
+        collector_receipt_sha256,
+    )
+    return archive.with_name(f"{archive.name}.installed-native-observation-plan.json")
+
+
 def _trusted_config(path: Path) -> bytes:
     return _read_stable_root_file(
         path,
@@ -303,22 +322,27 @@ def _staged_artifact_digests(root: Path) -> dict[str, str]:
     }
 
 
-def _recoverable_activation_paths(names: Sequence[str]) -> frozenset[Path]:
+def _recoverable_activation_paths(
+    names: Sequence[str],
+    *,
+    installed_native_plan: bool = False,
+) -> frozenset[Path]:
     entries = frozenset(names)
     if entries not in {_collector_pair_names(), _planner_bundle_names()}:
         raise ValueError("residue recovery staged artifact names are invalid")
-    return frozenset(STAGING_ROOT / name for name in entries)
+    if installed_native_plan and entries != _planner_bundle_names():
+        raise ValueError("installed native plan lacks the complete planner bundle")
+    paths = {STAGING_ROOT / name for name in entries}
+    if installed_native_plan:
+        paths.add(DEFAULT_INSTALLED_NATIVE_PLAN_PATH)
+    return frozenset(paths)
 
 
 def _plan_staged_artifacts(plan: Mapping[str, Any]) -> dict[str, str]:
     if plan.get("schema") == LEGACY_PLAN_SCHEMA:
         return {
-            DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name: str(
-                plan["gateway_config_sha256"]
-            ),
-            DEFAULT_WRITER_CONFIG_SOURCE_PATH.name: str(
-                plan["writer_config_sha256"]
-            ),
+            DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name: str(plan["gateway_config_sha256"]),
+            DEFAULT_WRITER_CONFIG_SOURCE_PATH.name: str(plan["writer_config_sha256"]),
         }
     artifacts = plan.get("staged_artifacts")
     if not isinstance(artifacts, Mapping):
@@ -333,11 +357,11 @@ def _decode_native_plan(raw: bytes) -> NativeObservationPlan:
             object_pairs_hook=_reject_duplicate_keys,
             parse_constant=_reject_json_constant,
         )
+        if not isinstance(value, Mapping):
+            raise ValueError("native observation plan is not an object")
+        plan = NativeObservationPlan.from_mapping(value)
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
         raise ValueError("staged native observation plan is invalid") from exc
-    if not isinstance(value, Mapping):
-        raise ValueError("staged native observation plan is invalid")
-    plan = NativeObservationPlan.from_mapping(value)
     if raw != _canonical_bytes(plan.to_mapping()) or plan.sha256 != _sha256_bytes(raw):
         raise ValueError("staged native observation plan is not canonical")
     return plan
@@ -377,9 +401,7 @@ def _validate_planner_bundle_bindings(
         "revision": source_revision,
         "artifact_root": expected_root,
         "artifact_sha256": collector.value["release_artifact_sha256"],
-        "release_manifest_file_sha256": collector.value[
-            "release_manifest_file_sha256"
-        ],
+        "release_manifest_file_sha256": collector.value["release_manifest_file_sha256"],
         "config_collector_receipt_sha256": collector.sha256,
         "writer_config": {
             "path": "/etc/muncho-canonical-writer/writer.json",
@@ -421,6 +443,44 @@ def _validate_planner_bundle_bindings(
     ).encode("utf-8", errors="strict")
     if phase_b_raw != expected_phase_b:
         raise ValueError("staged Phase-B readiness unit binding drifted")
+
+
+def _installed_native_plan_binding(
+    *,
+    staged_artifacts: Mapping[str, str],
+    target_revision: str,
+    source_revision: str,
+    collector_receipt_sha256: str,
+) -> dict[str, str] | None:
+    if not os.path.lexists(DEFAULT_INSTALLED_NATIVE_PLAN_PATH):
+        return None
+    if frozenset(staged_artifacts) != _planner_bundle_names():
+        raise RuntimeError("installed native plan lacks the complete planner bundle")
+    installed_raw = _trusted_publication(
+        DEFAULT_INSTALLED_NATIVE_PLAN_PATH,
+        maximum=_MAX_PLAN_BYTES,
+    )
+    staged_raw = _trusted_staged_artifact(
+        STAGING_ROOT,
+        DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
+    )
+    _decode_native_plan(installed_raw)
+    if installed_raw != staged_raw:
+        raise ValueError("installed native observation plan drifted from staging")
+    digest = _sha256_bytes(installed_raw)
+    if digest != staged_artifacts[DEFAULT_STAGED_NATIVE_PLAN_PATH.name]:
+        raise ValueError("installed native observation plan digest drifted")
+    return {
+        "source_path": str(DEFAULT_INSTALLED_NATIVE_PLAN_PATH),
+        "sha256": digest,
+        "archive_path": str(
+            _installed_native_archive_path(
+                target_revision,
+                source_revision,
+                collector_receipt_sha256,
+            )
+        ),
+    }
 
 
 def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
@@ -579,8 +639,15 @@ def _matching_collector_receipt(
     return matches[0]
 
 
-def _activation_inventory(staged_names: Sequence[str]) -> list[dict[str, str]]:
-    recoverable = _recoverable_activation_paths(staged_names)
+def _activation_inventory(
+    staged_names: Sequence[str],
+    *,
+    installed_native_plan: bool = False,
+) -> list[dict[str, str]]:
+    recoverable = _recoverable_activation_paths(
+        staged_names,
+        installed_native_plan=installed_native_plan,
+    )
     inventory: list[dict[str, str]] = []
     for path in _ACTIVATION_PATHS:
         present = os.path.lexists(path)
@@ -640,7 +707,6 @@ def _validate_service_states(value: Any) -> list[dict[str, Any]]:
 
 def _plan_from_live(target_revision: str) -> dict[str, Any]:
     staged_artifacts = _staged_artifact_digests(STAGING_ROOT)
-    inventory = _activation_inventory(tuple(staged_artifacts))
     writer_sha256 = staged_artifacts[DEFAULT_WRITER_CONFIG_SOURCE_PATH.name]
     gateway_sha256 = staged_artifacts[DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name]
     collector, collector_path = _matching_collector_receipt(
@@ -659,8 +725,26 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
     archive = _archive_path(target_revision, source_revision, collector.sha256)
     if os.path.lexists(archive):
         raise RuntimeError("stopped writer residue archive collides")
+    installed_native = _installed_native_plan_binding(
+        staged_artifacts=staged_artifacts,
+        target_revision=target_revision,
+        source_revision=source_revision,
+        collector_receipt_sha256=collector.sha256,
+    )
+    if installed_native is not None and os.path.lexists(
+        installed_native["archive_path"]
+    ):
+        raise RuntimeError("installed native plan archive collides")
+    inventory = _activation_inventory(
+        tuple(staged_artifacts),
+        installed_native_plan=installed_native is not None,
+    )
     unsigned: dict[str, Any] = {
-        "schema": PLAN_SCHEMA,
+        "schema": (
+            INSTALLED_NATIVE_PLAN_SCHEMA
+            if installed_native is not None
+            else PLAN_SCHEMA
+        ),
         "target_release_revision": target_revision,
         "source_release_revision": source_revision,
         "collector_receipt_path": str(collector_path),
@@ -686,6 +770,13 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             "staged_artifacts_deleted": False,
         },
     }
+    if installed_native is not None:
+        unsigned["installed_native_observation_plan"] = installed_native
+        unsigned["invariants"] = {
+            **unsigned["invariants"],
+            "installed_native_observation_plan_archived": True,
+            "installed_native_observation_plan_deleted": False,
+        }
     return {**unsigned, "plan_sha256": _sha256_json(unsigned)}
 
 
@@ -697,7 +788,11 @@ def validate_plan_mapping(
     if not isinstance(value, Mapping):
         raise ValueError("residue recovery plan is not an object")
     schema = value.get("schema")
-    if schema not in {LEGACY_PLAN_SCHEMA, PLAN_SCHEMA}:
+    if schema not in {
+        LEGACY_PLAN_SCHEMA,
+        PLAN_SCHEMA,
+        INSTALLED_NATIVE_PLAN_SCHEMA,
+    }:
         raise ValueError("residue recovery plan fields are not exact")
     expected_fields = {
         "schema",
@@ -718,8 +813,10 @@ def validate_plan_mapping(
         "invariants",
         "plan_sha256",
     }
-    if schema == PLAN_SCHEMA:
+    if schema in {PLAN_SCHEMA, INSTALLED_NATIVE_PLAN_SCHEMA}:
         expected_fields.add("staged_artifacts")
+    if schema == INSTALLED_NATIVE_PLAN_SCHEMA:
+        expected_fields.add("installed_native_observation_plan")
     if set(value) != expected_fields:
         raise ValueError("residue recovery plan fields are not exact")
     target = _revision(value["target_release_revision"])
@@ -735,7 +832,20 @@ def validate_plan_mapping(
     gateway_sha = _digest(value["gateway_config_sha256"], "gateway config digest")
     artifacts = _plan_staged_artifacts(value)
     artifact_names = frozenset(artifacts)
-    _recoverable_activation_paths(tuple(artifact_names))
+    installed_native: Mapping[str, Any] | None = None
+    if schema == INSTALLED_NATIVE_PLAN_SCHEMA:
+        raw_installed = value["installed_native_observation_plan"]
+        if (
+            not isinstance(raw_installed, Mapping)
+            or set(raw_installed) != {"source_path", "sha256", "archive_path"}
+            or artifact_names != _planner_bundle_names()
+        ):
+            raise ValueError("installed native observation plan binding is invalid")
+        installed_native = raw_installed
+    _recoverable_activation_paths(
+        tuple(artifact_names),
+        installed_native_plan=installed_native is not None,
+    )
     if any(
         not isinstance(name, str) or _digest(digest, f"staged {name} digest") != digest
         for name, digest in artifacts.items()
@@ -746,6 +856,23 @@ def validate_plan_mapping(
         or artifacts.get(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH.name) != gateway_sha
     ):
         raise ValueError("residue recovery config artifact binding drifted")
+    if installed_native is not None:
+        expected_installed_archive = _installed_native_archive_path(
+            target,
+            source,
+            collector_sha,
+        )
+        installed_digest = _digest(
+            installed_native.get("sha256"),
+            "installed native observation plan digest",
+        )
+        if (
+            installed_native.get("source_path")
+            != str(DEFAULT_INSTALLED_NATIVE_PLAN_PATH)
+            or installed_native.get("archive_path") != str(expected_installed_archive)
+            or installed_digest != artifacts.get(DEFAULT_STAGED_NATIVE_PLAN_PATH.name)
+        ):
+            raise ValueError("installed native observation plan binding drifted")
     if (
         value["writer_config_path"] != str(DEFAULT_WRITER_CONFIG_SOURCE_PATH)
         or value["gateway_config_path"] != str(DEFAULT_GATEWAY_CONFIG_SOURCE_PATH)
@@ -760,7 +887,10 @@ def validate_plan_mapping(
     inventory = value["activation_inventory"]
     if not isinstance(inventory, list) or len(inventory) != len(_ACTIVATION_PATHS):
         raise ValueError("residue recovery inventory is invalid")
-    recoverable = _recoverable_activation_paths(tuple(artifact_names))
+    recoverable = _recoverable_activation_paths(
+        tuple(artifact_names),
+        installed_native_plan=installed_native is not None,
+    )
     for path, item in zip(_ACTIVATION_PATHS, inventory, strict=True):
         expected_state = (
             "present_receipt_bound_residue" if path in recoverable else "absent"
@@ -775,8 +905,13 @@ def validate_plan_mapping(
         "staging_directory_renamed_atomically": True,
         "staged_configs_deleted": False,
     }
-    if schema == PLAN_SCHEMA:
+    if schema in {PLAN_SCHEMA, INSTALLED_NATIVE_PLAN_SCHEMA}:
         expected_invariants["staged_artifacts_deleted"] = False
+    if schema == INSTALLED_NATIVE_PLAN_SCHEMA:
+        expected_invariants.update({
+            "installed_native_observation_plan_archived": True,
+            "installed_native_observation_plan_deleted": False,
+        })
     if value["invariants"] != expected_invariants:
         raise ValueError("residue recovery invariants drifted")
     _validate_service_states(value["service_states"])
@@ -816,16 +951,49 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
     current_artifacts = _staged_artifact_digests(current_root)
     if current_artifacts != _plan_staged_artifacts(plan):
         raise RuntimeError("residue recovery staged artifact digest drifted")
-    recoverable = _recoverable_activation_paths(tuple(current_artifacts))
+    installed = plan.get("installed_native_observation_plan")
+    has_installed = plan.get("schema") == INSTALLED_NATIVE_PLAN_SCHEMA
+    if has_installed != isinstance(installed, Mapping):
+        raise RuntimeError("installed native observation plan state is invalid")
+    installed_source_exists = False
+    installed_archive_exists = False
+    if has_installed:
+        installed_source = Path(str(installed["source_path"]))
+        installed_archive = Path(str(installed["archive_path"]))
+        installed_source_exists = os.path.lexists(installed_source)
+        installed_archive_exists = os.path.lexists(installed_archive)
+        if installed_source_exists == installed_archive_exists:
+            raise RuntimeError("installed native observation plan state is ambiguous")
+        current_installed = (
+            installed_source if installed_source_exists else installed_archive
+        )
+        installed_raw = _trusted_publication(
+            current_installed,
+            maximum=_MAX_PLAN_BYTES,
+        )
+        if _sha256_bytes(installed_raw) != installed["sha256"]:
+            raise RuntimeError("installed native observation plan digest drifted")
+        _decode_native_plan(installed_raw)
+    recoverable = _recoverable_activation_paths(
+        tuple(current_artifacts),
+        installed_native_plan=has_installed,
+    )
     for path in _ACTIVATION_PATHS:
         if path in recoverable:
-            if source_exists != os.path.lexists(path):
+            expected_present = (
+                installed_source_exists
+                if path == DEFAULT_INSTALLED_NATIVE_PLAN_PATH
+                else source_exists
+            )
+            if expected_present != os.path.lexists(path):
                 raise RuntimeError("residue recovery source presence drifted")
         elif os.path.lexists(path):
             raise RuntimeError("non-recoverable stopped activation path is present")
     if _collect_service_states() != plan["service_states"]:
         raise RuntimeError("residue recovery service state drifted")
-    return "source" if source_exists else "archive"
+    if source_exists:
+        return "source" if installed_source_exists else "installed_native_archived"
+    return "staging_archived" if installed_source_exists else "archive"
 
 
 def plan_stopped_writer_residue_recovery(target_revision: str) -> dict[str, Any]:
@@ -863,9 +1031,18 @@ def _receipt_unsigned(
 ) -> dict[str, Any]:
     if type(created_at_unix) is not int or created_at_unix < 0:
         raise ValueError("residue recovery receipt time is invalid")
-    legacy = plan.get("schema") == LEGACY_PLAN_SCHEMA
+    schema = plan.get("schema")
+    legacy = schema == LEGACY_PLAN_SCHEMA
     unsigned = {
-        "schema": LEGACY_RECEIPT_SCHEMA if legacy else RECEIPT_SCHEMA,
+        "schema": (
+            LEGACY_RECEIPT_SCHEMA
+            if legacy
+            else (
+                INSTALLED_NATIVE_RECEIPT_SCHEMA
+                if schema == INSTALLED_NATIVE_PLAN_SCHEMA
+                else RECEIPT_SCHEMA
+            )
+        ),
         "ok": True,
         "state": "staging_residue_quarantined_services_stopped",
         "target_release_revision": plan["target_release_revision"],
@@ -888,6 +1065,12 @@ def _receipt_unsigned(
     if not legacy:
         unsigned["staged_artifacts"] = _plan_staged_artifacts(plan)
         unsigned["staged_artifacts_deleted"] = False
+    if schema == INSTALLED_NATIVE_PLAN_SCHEMA:
+        unsigned["installed_native_observation_plan"] = plan[
+            "installed_native_observation_plan"
+        ]
+        unsigned["installed_native_observation_plan_archived"] = True
+        unsigned["installed_native_observation_plan_deleted"] = False
     return unsigned
 
 
@@ -960,7 +1143,24 @@ def apply_stopped_writer_residue_recovery(
         _ensure_exact_directory(RECOVERY_ROOT)
         _write_intent(plan)
         state = _validate_current_state(plan)
-        if state == "source":
+        if plan.get("schema") == INSTALLED_NATIVE_PLAN_SCHEMA and state in {
+            "source",
+            "staging_archived",
+        }:
+            installed = plan["installed_native_observation_plan"]
+            installed_source = Path(str(installed["source_path"]))
+            installed_archive = Path(str(installed["archive_path"]))
+            if os.path.lexists(installed_archive):
+                raise RuntimeError("installed native plan archive collides")
+            source_item = os.lstat(installed_source)
+            recovery_item = os.lstat(RECOVERY_ROOT)
+            if source_item.st_dev != recovery_item.st_dev:
+                raise RuntimeError("installed native plan rename is not atomic")
+            os.rename(installed_source, installed_archive)
+            _fsync_directory(installed_source.parent)
+            _fsync_directory(RECOVERY_ROOT)
+            state = _validate_current_state(plan)
+        if state in {"source", "installed_native_archived"}:
             source = Path(str(plan["source_staging_root"]))
             archive = Path(str(plan["archive_path"]))
             if os.path.lexists(archive):
@@ -1069,6 +1269,8 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 __all__ = [
     "FAILURE_SCHEMA",
+    "INSTALLED_NATIVE_PLAN_SCHEMA",
+    "INSTALLED_NATIVE_RECEIPT_SCHEMA",
     "PLAN_SCHEMA",
     "RECEIPT_SCHEMA",
     "apply_stopped_writer_residue_recovery",

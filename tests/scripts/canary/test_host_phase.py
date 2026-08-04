@@ -7,6 +7,7 @@ import pytest
 from scripts.canary.foundation import build_plan as build_foundation_plan
 from scripts.canary.host import HostSpec, build_plan, execute_plan
 from scripts.canary.host_preflight import evaluate
+from scripts.canary.host_storage_successor import canonical_sha256
 from scripts.canary.network_boundary import (
     NetworkBoundarySpec,
     build_plan as build_network_plan,
@@ -115,7 +116,7 @@ def _exact_vm():
 def _exact_disk():
     return {
         "name": "muncho-canary-v2-01",
-        "sizeGb": "40",
+        "sizeGb": "100",
         "type": "projects/p/zones/europe-west3-a/diskTypes/pd-balanced",
         "sourceImage": (
             "https://www.googleapis.com/compute/v1/projects/debian-cloud/"
@@ -158,7 +159,9 @@ def test_vm_create_exists_only_in_the_single_phase_three_step():
     assert "--subnet=muncho-canary-europe-west3" in rendered
     assert "--service-account=muncho-canary-v2-runtime@" in rendered
     assert "--scopes=cloud-platform" in rendered
-    assert "--boot-disk-size=40GB" in rendered
+    assert "--boot-disk-size=100GB" in rendered
+    assert host.architecture["canonical_boot_disk_size_gb"] == 100
+    assert host.architecture["canonical_storage_successor_sha256"] == canonical_sha256()
 
 
 def test_absent_vm_is_provisionable_only_after_complete_network_attestation():
@@ -232,6 +235,24 @@ def test_normal_host_preflight_rejects_legacy_20gb_disk():
     evidence["planned_vm"] = _exact_vm()
     evidence["planned_vm_disk"] = _exact_disk()
     evidence["planned_vm_disk"]["sizeGb"] = "20"
+
+    report = evaluate(evidence)
+
+    assert report["ok"] is False
+    assert report["satisfied_steps"] == []
+    failed = {check["name"] for check in report["checks"] if not check["passed"]}
+    assert failed == {"resource.vm_absent_or_exact_running"}
+
+
+@pytest.mark.parametrize("legacy_size", ("40", "80"))
+def test_normal_host_preflight_rejects_predecessor_disk_sizes(
+    legacy_size: str,
+):
+    evidence = _evidence()
+    evidence["instances"] = [{"name": "muncho-canary-v2-01"}]
+    evidence["planned_vm"] = _exact_vm()
+    evidence["planned_vm_disk"] = _exact_disk()
+    evidence["planned_vm_disk"]["sizeGb"] = legacy_size
 
     report = evaluate(evidence)
 
