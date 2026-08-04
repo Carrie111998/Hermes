@@ -25,6 +25,34 @@ from agent.i18n import t
 logger = logging.getLogger("gateway.run")
 
 
+def _kanban_notify_failure_is_transient(exc: Exception) -> bool:
+    """Return True when a transport outage must not drop a subscription."""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    transient_markers = (
+        "timeout",
+        "timed out",
+        "connection",
+        "connector",
+        "cannot connect",
+        "not connected",
+        "temporary failure",
+        "name resolution",
+        "dns",
+        "network is unreachable",
+        "connection reset",
+        "connection refused",
+        "broken pipe",
+        "server disconnected",
+        "service unavailable",
+        "bad gateway",
+        "gateway timeout",
+        "rate limit",
+        "too many requests",
+    )
+    return any(marker in name or marker in text for marker in transient_markers)
+
+
 def _resolve_auto_decompose_settings(
     load_config: Callable[[], Any],
 ) -> "tuple[bool, int]":
@@ -572,15 +600,22 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            transient = _kanban_notify_failure_is_transient(exc)
                             fails = sub_fail_counts.get(sub_key, 0) + 1
-                            sub_fail_counts[sub_key] = fails
+                            if transient:
+                                # Connectivity outages are not evidence that
+                                # the destination is permanently dead. Keep
+                                # the event pending until transport recovers.
+                                sub_fail_counts.pop(sub_key, None)
+                            else:
+                                sub_fail_counts[sub_key] = fails
                             logger.warning(
                                 "kanban notifier: send failed for %s on %s "
-                                "(attempt %d/%d): %s",
+                                "(attempt %d/%d, transient=%s): %s",
                                 sub["task_id"], platform_str, fails,
-                                MAX_SEND_FAILURES, exc,
+                                MAX_SEND_FAILURES, transient, exc,
                             )
-                            if fails >= MAX_SEND_FAILURES:
+                            if not transient and fails >= MAX_SEND_FAILURES:
                                 logger.warning(
                                     "kanban notifier: dropping subscription "
                                     "%s on %s after %d consecutive send failures",

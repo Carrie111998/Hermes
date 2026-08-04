@@ -6,6 +6,27 @@ from types import SimpleNamespace
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from gateway.kanban_watchers import _kanban_notify_failure_is_transient
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        TimeoutError("send timed out"),
+        OSError("Temporary failure in name resolution"),
+        ConnectionError("Cannot connect to host discord.com:443"),
+        RuntimeError("Server disconnected"),
+    ],
+)
+def test_notify_transport_failures_are_transient(exc):
+    assert _kanban_notify_failure_is_transient(exc) is True
+
+
+def test_notify_permanent_delivery_failure_is_not_transient():
+    assert _kanban_notify_failure_is_transient(
+        RuntimeError("403 Forbidden: bot was removed from channel")
+    ) is False
+
 
 # ---------------------------------------------------------------------------
 # Fixtures
