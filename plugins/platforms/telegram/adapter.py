@@ -640,6 +640,11 @@ class TelegramAdapter(BasePlatformAdapter):
     _SPLIT_THRESHOLD = 4000
     MEDIA_GROUP_WAIT_SECONDS = 0.8
     _GENERAL_TOPIC_THREAD_ID = "1"
+    # "Copy to clipboard" button state (see _register_clipboard_copy):
+    # short-lived, bounded so an unattended bot can't accumulate entries
+    # holding full response text indefinitely.
+    _CLIPBOARD_COPY_TTL_SECONDS = 600
+    _CLIPBOARD_COPY_MAX_PENDING = 50
 
     # Telegram's edit_message applies MarkdownV2 formatting only on the
     # finalize=True path.  Without this flag, stream_consumer._send_or_edit
@@ -865,6 +870,11 @@ class TelegramAdapter(BasePlatformAdapter):
         # Clarify button state: clarify_id → session_key (for the clarify tool's
         # multiple-choice prompts; see GatewayRunner clarify_callback wiring).
         self._clarify_state: Dict[str, str] = {}
+        # Clipboard-copy button state: token → {text, chat_id, thread_id,
+        # created}. Holds the complete unsplit response for the "copy to
+        # Hermes clipboard" button attached to the final message of a split
+        # reply. Never put into callback_data — see _register_clipboard_copy.
+        self._clipboard_copy_state: Dict[str, dict] = {}
         # Notification mode for message sends.
         # "important" — only final responses, approvals, and slash confirmations
         #               trigger notifications; tool progress, streaming, status
@@ -4498,7 +4508,20 @@ class TelegramAdapter(BasePlatformAdapter):
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
-            
+
+            # Split legacy replies get a "copy full response" button on the
+            # FINAL chunk only, and only for the final user-visible reply
+            # (metadata["notify"]) — not intermediate/progress sends. The
+            # button targets the pre-split, pre-escape `content`, never the
+            # formatted/chunked text (req: never leak full text via
+            # callback_data — see _register_clipboard_copy).
+            clipboard_copy_keyboard = None
+            if len(chunks) > 1 and (metadata or {}).get("notify"):
+                clipboard_copy_token = self._register_clipboard_copy(
+                    content, chat_id=str(chat_id), thread_id=thread_id,
+                )
+                clipboard_copy_keyboard = self._clipboard_copy_keyboard(clipboard_copy_token)
+
             try:
                 from telegram.error import NetworkError as _NetErr
             except ImportError:
@@ -4558,6 +4581,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 effective_thread_id = thread_kwargs.get("message_thread_id")
 
                 msg = None
+                # Attach the clipboard-copy keyboard as reply_markup (not
+                # message text) so it never counts against the 4096-char
+                # chunk budget — only the final chunk gets it.
+                chunk_reply_markup_kwargs = (
+                    {"reply_markup": clipboard_copy_keyboard}
+                    if clipboard_copy_keyboard is not None and i == len(chunks) - 1
+                    else {}
+                )
                 for _send_attempt in range(3):
                     try:
                         # Try Markdown first, fall back to plain text if it fails
@@ -4570,6 +4601,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **chunk_reply_markup_kwargs,
                             )
                         except Exception as md_error:
                             # Markdown parsing failed, try plain text
@@ -4584,6 +4616,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                     **thread_kwargs,
                                     **self._link_preview_kwargs(),
                                     **self._notification_kwargs(metadata),
+                                    **chunk_reply_markup_kwargs,
                                 )
                             else:
                                 raise
@@ -5050,6 +5083,17 @@ class TelegramAdapter(BasePlatformAdapter):
             # if truncate_message returned a single chunk just edit normally.
             chunks = [content]
 
+        # A real split (len(chunks) > 1) on the final edit gets a "copy full
+        # response" button on the last continuation message — same contract
+        # as send()'s legacy split path. The button targets the pre-split
+        # `content`, never a formatted/chunked continuation.
+        clipboard_copy_keyboard = None
+        if finalize and len(chunks) > 1:
+            clipboard_copy_token = self._register_clipboard_copy(
+                content, chat_id=str(chat_id), thread_id=self._metadata_thread_id(metadata),
+            )
+            clipboard_copy_keyboard = self._clipboard_copy_keyboard(clipboard_copy_token)
+
         # Step 1 — edit the existing message with the first chunk.
         first_chunk = chunks[0]
         try:
@@ -5107,7 +5151,8 @@ class TelegramAdapter(BasePlatformAdapter):
         delivered_chunks = [first_chunk]
         prev_id = message_id
         thread_id = self._metadata_thread_id(metadata)
-        for chunk in chunks[1:]:
+        last_chunk_index = len(chunks) - 1
+        for chunk_index, chunk in enumerate(chunks[1:], start=1):
             sent_msg = None
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(
@@ -5115,6 +5160,13 @@ class TelegramAdapter(BasePlatformAdapter):
                 thread_id,
                 metadata,
                 reply_to_message_id=reply_to_id,
+            )
+            # Only the final continuation carries the clipboard-copy button
+            # (reply_markup, not message text — never inflates the chunk).
+            chunk_reply_markup_kwargs = (
+                {"reply_markup": clipboard_copy_keyboard}
+                if clipboard_copy_keyboard is not None and chunk_index == last_chunk_index
+                else {}
             )
             for use_markdown in (True, False) if finalize else (False,):
                 try:
@@ -5136,6 +5188,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         **thread_kwargs,
                         **self._link_preview_kwargs(),
                         **self._notification_kwargs(metadata),
+                        **chunk_reply_markup_kwargs,
                     )
                     break
                 except Exception as send_err:
@@ -5157,6 +5210,7 @@ class TelegramAdapter(BasePlatformAdapter):
                                 **retry_thread_kwargs,
                                 **self._link_preview_kwargs(),
                                 **self._notification_kwargs(metadata),
+                                **chunk_reply_markup_kwargs,
                             )
                             break
                         except Exception as _retry_err:
@@ -5435,6 +5489,60 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("[%s] send_update_prompt failed: %s", self.name, _redact_telegram_error_text(e))
             return SendResult(success=False, error=_redact_telegram_error_text(e))
+
+    def _clipboard_copy_button_label(self) -> str:
+        """Platform-appropriate label for the clipboard-copy button."""
+        if sys.platform == "darwin":
+            return "🍎📋 Copy to Mac Clipboard"
+        return "📋 Copy to Hermes Clipboard"
+
+    def _prune_clipboard_copy_state(self) -> None:
+        """Drop expired entries, then trim to the max-pending bound (oldest first)."""
+        now = time.time()
+        expired = [
+            token for token, entry in self._clipboard_copy_state.items()
+            if now - entry["created"] > self._CLIPBOARD_COPY_TTL_SECONDS
+        ]
+        for token in expired:
+            self._clipboard_copy_state.pop(token, None)
+
+        overflow = len(self._clipboard_copy_state) - self._CLIPBOARD_COPY_MAX_PENDING
+        if overflow > 0:
+            # Dicts preserve insertion order — oldest entries come first.
+            for token in list(self._clipboard_copy_state.keys())[:overflow]:
+                self._clipboard_copy_state.pop(token, None)
+
+    def _register_clipboard_copy(
+        self, text: str, *, chat_id: str, thread_id: Optional[str],
+    ) -> str:
+        """Store the full unsplit response and return a short opaque token.
+
+        The token (never the response text) goes into callback_data. Bounded
+        + TTL'd per _CLIPBOARD_COPY_MAX_PENDING / _CLIPBOARD_COPY_TTL_SECONDS
+        so an unattended bot can't accumulate full response text indefinitely.
+        """
+        import secrets
+
+        token = secrets.token_urlsafe(9)
+        self._clipboard_copy_state[token] = {
+            "text": text,
+            "chat_id": str(chat_id),
+            "thread_id": str(thread_id) if thread_id is not None else None,
+            "created": time.time(),
+        }
+        # Prune AFTER inserting so the max-pending bound accounts for the
+        # entry we just added (pruning first would only trim to MAX-1 before
+        # the insert, letting the dict grow to MAX+1).
+        self._prune_clipboard_copy_state()
+        return token
+
+    def _clipboard_copy_keyboard(self, token: str) -> "InlineKeyboardMarkup":
+        return InlineKeyboardMarkup([[
+            InlineKeyboardButton(
+                self._clipboard_copy_button_label(),
+                callback_data=f"cc:{token}",
+            )
+        ]])
 
     # Template attrs for the shared _format_exec_approval core (HTML mode).
     _EA_HEADER = "⚠️ <b>Command Approval Required</b>\n\n"
@@ -6654,6 +6762,74 @@ class TelegramAdapter(BasePlatformAdapter):
                         "Telegram clarify button: resolve_gateway_clarify returned False (id=%s)",
                         clarify_id,
                     )
+            return
+
+        # --- Clipboard-copy callbacks (cc:token) ---
+        if data.startswith("cc:"):
+            token = data.split(":", 1)[1]
+            caller_id = str(getattr(query.from_user, "id", ""))
+            if not self._is_callback_user_authorized(
+                caller_id,
+                chat_id=query_chat_id,
+                chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                user_name=query_user_name,
+            ):
+                await query.answer(text="⛔ You are not authorized to copy this response.")
+                return
+
+            self._prune_clipboard_copy_state()
+            entry = self._clipboard_copy_state.get(token)
+            if entry is None:
+                await query.answer(text="⌛ This copy link has expired or was already used.")
+                return
+
+            query_thread_str = str(query_thread_id) if query_thread_id is not None else None
+            entry_thread = entry.get("thread_id")
+            thread_mismatch = (
+                entry_thread is not None
+                and query_thread_str is not None
+                and entry_thread != query_thread_str
+            )
+            if str(entry["chat_id"]) != str(query_chat_id) or thread_mismatch:
+                await query.answer(text="⛔ This button isn't valid in this chat.")
+                return
+
+            # Consume before writing — a slow/failed clipboard write must not
+            # leave the token clickable again (single-use, mirrors the
+            # approval/slash-confirm/clarify state dicts above).
+            self._clipboard_copy_state.pop(token, None)
+            text = entry["text"]
+
+            try:
+                from hermes_cli.clipboard import write_clipboard_text
+                wrote = write_clipboard_text(text)
+            except Exception as exc:
+                # Never fatal — the Telegram response was already delivered;
+                # only the clipboard convenience action failed.
+                logger.warning(
+                    "[%s] clipboard copy callback raised (token=%s, chat=%s, size=%d): %s",
+                    self.name, token, query_chat_id, len(text), exc,
+                )
+                wrote = False
+
+            # Log token/size/status only — never the copied text (#9).
+            if wrote:
+                logger.info(
+                    "[%s] clipboard copy callback succeeded (token=%s, chat=%s, size=%d)",
+                    self.name, token, query_chat_id, len(text),
+                )
+                success_text = (
+                    "🍎📋 Copied to Mac clipboard." if sys.platform == "darwin"
+                    else "📋 Copied to Hermes clipboard."
+                )
+                await query.answer(text=success_text)
+            else:
+                logger.warning(
+                    "[%s] clipboard copy callback: backend unavailable (token=%s, chat=%s, size=%d)",
+                    self.name, token, query_chat_id, len(text),
+                )
+                await query.answer(text="⚠️ Clipboard unavailable on the Hermes host.")
             return
 
         # --- Update prompt callbacks ---
