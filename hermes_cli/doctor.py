@@ -1278,9 +1278,12 @@ def run_doctor(args):
     if wal_path.exists():
         try:
             wal_size = wal_path.stat().st_size
+            # Format helper: MB when >=1 MiB, else KB (avoids "0 MB" for small WALs).
+            def _fmt_size(n: int) -> str:
+                return f"{n / (1024*1024):.1f} MB" if n >= 1024 * 1024 else f"{n // 1024} KB"
             if wal_size > 50 * 1024 * 1024:  # 50 MB
                 check_warn(
-                    f"WAL file is large ({wal_size // (1024*1024)} MB)",
+                    f"WAL file is large ({_fmt_size(wal_size)})",
                     "(may indicate missed checkpoints)"
                 )
                 if should_fix:
@@ -1289,12 +1292,12 @@ def run_doctor(args):
                     conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
                     conn.close()
                     new_size = wal_path.stat().st_size if wal_path.exists() else 0
-                    check_ok(f"WAL checkpoint performed ({wal_size // 1024}K → {new_size // 1024}K)")
+                    check_ok(f"WAL checkpoint performed ({_fmt_size(wal_size)} → {_fmt_size(new_size)})")
                     fixed_count += 1
                 else:
                     issues.append("Large WAL file — run 'hermes doctor --fix' to checkpoint")
             elif wal_size > 10 * 1024 * 1024:  # 10 MB
-                check_info(f"WAL file is {wal_size // (1024*1024)} MB (normal for active sessions)")
+                check_info(f"WAL file is {_fmt_size(wal_size)} (normal for active sessions)")
         except Exception:
             pass
 
