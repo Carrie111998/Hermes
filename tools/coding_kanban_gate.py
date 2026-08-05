@@ -38,16 +38,54 @@ _READ_ONLY_COMMANDS = frozenset({
     "sort", "stat", "tail", "test", "tree", "uniq", "wc", "which",
     "whoami", "python", "python3", "node", "ruby", "go", "cargo", "npm",
     "date", "ps", "curl", "sqlite3", "gh",
+    "echo", "printf", "true", "false", "env", "id", "hostname", "uname",
+    "realpath", "clear", "tput", "basename",
+    "hermes",
+    "[", "[[",
 })
 _GIT_READ_ONLY = frozenset({
     "branch", "diff", "log", "ls-files", "remote", "rev-parse", "show",
     "status", "tag",
+    "worktree", "fetch", "cherry", "merge-base", "rev-list", "cat-file",
+    "for-each-ref", "show-ref", "count-objects", "ls-remote", "describe",
+    "blame",
 })
 _WRITE_MARKERS = re.compile(
-    r"(?:^|[^<])(?:>>?|<<|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
+    r"(?:^|[^<])(?:>>?|\btee\b|(?:^|\s)(?:-delete|-exec)\b|\bsed\s+[^\n]*-i\b|\bperl\s+[^\n]*-i\b|"
     r"\brm\b|\bmv\b|\bcp\b|\bmkdir\b|\btouch\b|\bchmod\b|\bchown\b|"
     r"\binstall\b|\btruncate\b|\btruncate\b)",
     re.IGNORECASE,
+)
+# Redirections that only move bytes around scratch space or duplicate an fd
+# do not write repository files.  Stripped before the write-marker check so
+# `hermes kanban list --json > /tmp/out.json 2>/dev/null` stays read-only.
+_SCRATCH_REDIRECT_RE = re.compile(
+    r"(?:[0-9]?>>?|&>)\s*(?:/tmp|/var/tmp|/dev/null)\S*|"
+    r"[0-9]?>>?\s*&\d+",
+)
+# Content inside quotes is data, not shell syntax: `echo 'a > b'` writes
+# nothing even though it contains a `>` character.  Mask quoted regions
+# before the write-marker scan; heredoc bodies (`<<EOF ... EOF`) are stdin
+# input, not writes, and are handled separately by the marker's `>`/`tee`
+# alternatives when combined with an actual file target.
+_QUOTED_REGION_RE = re.compile(r"'[^']*'|\"[^\"]*\"")
+# Shell control keywords are structural, not actions: `for`, `do`, `done`,
+# `if`, `then`, `fi`, etc.  A fragment that is only control structure (from
+# quote-aware `_command_parts` splitting) must not fail read-only probes.
+_SHELL_CONTROL_RE = re.compile(
+    r"^(?:do|done|then|fi|else|elif|while|until|case|esac|in|if)\b\s*", re.I,
+)
+_SHELL_FOR_HEADER_RE = re.compile(r"^for\s+\S+\s+in\b", re.I)
+# Interpreter (python/node/ruby) probes fail closed only on actual write or
+# execute patterns, not on read-only words like `open`/`run`/`call`.
+_INTERPRETER_WRITE_RE = re.compile(
+    r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
+    r"\.write(?:File|FileSync|_text|_bytes)?\s*\(|"
+    r"\b(?:os|Path|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|"
+    r"rmtree|copytree|copy|move|system|popen)\s*\(|"
+    r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\(|"
+    r"\b(?:subprocess|check_call|check_output)\b)",
+    re.I,
 )
 _CODING_AGENT_RE = re.compile(r"\b(codex|cursor|claude)(?:\s+(?:code|cli|agent))?\b", re.I)
 _CODING_INTENT_RE = re.compile(
@@ -74,14 +112,81 @@ def _first_line(value: str, fallback: str) -> str:
 
 
 def _command_parts(command: str) -> list[str]:
-    """Split a shell command enough to classify each simple command."""
-    parts = re.split(r"\s*(?:&&|\|\||[|;])\s*", command)
-    return [part.strip() for part in parts if part.strip()]
+    """Split a shell command enough to classify each simple command.
+
+    Quote-aware: separators (&&, ||, |, ;) only split OUTSIDE single/double
+    quotes, so a semicolon inside a quoted argument (e.g. a multi-statement
+    sqlite3 query string) is not mistaken for a command separator. A bare
+    fragment from such a split would fail read-only classification and spawn
+    a junk DEV task.
+    """
+    parts: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+    n = len(command)
+    while i < n:
+        ch = command[i]
+        if quote:
+            buf.append(ch)
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+            buf.append(ch)
+            i += 1
+            continue
+        # Outside quotes: a separator ends the current simple command.
+        # A lone `&` stays a separator (background command), EXCEPT when it is
+        # part of an fd-dup redirect (`2>&1`, `>&2`, `<&3`): splitting there
+        # would produce `2>` + `1` fragments that trip the write-marker check.
+        if ch in "&|;":
+            if ch == "&" and i + 1 < n and command[i + 1] == "&":
+                i += 2
+            elif ch == "|" and i + 1 < n and command[i + 1] == "|":
+                i += 2
+            elif ch == "&" and (
+                (buf and buf[-1] in "><") or (i + 1 < n and command[i + 1] in "><")
+            ):
+                buf.append(ch)
+                i += 1
+                continue
+            else:
+                i += 1
+            part = "".join(buf).strip()
+            if part:
+                parts.append(part)
+            buf = []
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf).strip()
+    if tail:
+        parts.append(tail)
+    return parts
 
 
 def _simple_command_is_read_only(command: str) -> bool:
     command = command.strip()
-    if not command or _WRITE_MARKERS.search(command):
+    if not command:
+        return False
+    # Shell control fragments (`for id in ...`, `do`, `done`, `if`, `then`,
+    # `fi`) are structural, not actions.  A loop header binds variables only;
+    # the body (split out by _command_parts) is what gets classified.
+    if _SHELL_FOR_HEADER_RE.match(command):
+        return True
+    stripped_control = _SHELL_CONTROL_RE.sub("", command)
+    if not stripped_control:
+        return True
+    command = stripped_control
+    # Scratch-space and fd-dup redirections are not repository writes.  Quote
+    # contents are data (`echo 'a > b'` writes nothing) so mask them first;
+    # heredoc bodies (`<<EOF`) are stdin, and only a real file target (`>` or
+    # `tee`) after the marker check gates.
+    write_scan = _QUOTED_REGION_RE.sub(" ", _SCRATCH_REDIRECT_RE.sub("", command))
+    if not command or _WRITE_MARKERS.search(write_scan):
         return False
     if re.search(r"\b(?:codex|cursor|claude|aider|copilot|gh\s+pr\s+(?:checkout|create))\b", command, re.I):
         return False
@@ -91,10 +196,38 @@ def _simple_command_is_read_only(command: str) -> bool:
         return False
     if not words:
         return True
-    # Environment assignments and command wrappers are harmless only when
-    # the wrapped command itself is an explicitly read-only command.
-    while words and ("=" in words[0] and not words[0].startswith("=")):
-        words.pop(0)
+    # Environment assignments (`VAR=...`), `export VAR=...`, and `env`
+    # prefixes are wrappers; only the wrapped command matters. `env` is
+    # stripped along with its option tokens (`-i`, `-u NAME`, `--unset=...`,
+    # `VAR=...`) before classifying the wrapped command; a bare `env` with
+    # no wrapped command is read-only (it just prints the environment).
+    while words:
+        w0 = words[0]
+        if "=" in w0 and not w0.startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "export" and len(words) > 1 and "=" in words[1] and not words[1].startswith("="):
+            words.pop(0)
+            continue
+        if w0.lower() == "env":
+            i = 1
+            while i < len(words):
+                w = words[i]
+                if w in ("-i", "-0"):
+                    i += 1
+                elif w in ("-u", "--unset") and i + 1 < len(words):
+                    i += 2
+                elif w.startswith("--unset="):
+                    i += 1
+                elif "=" in w and not w.startswith("="):
+                    i += 1
+                else:
+                    break
+            rest = words[i:]
+            if not rest:
+                return True
+            return _simple_command_is_read_only(" ".join(rest))
+        break
     if not words:
         return True
     base = Path(words[0]).name.lower()
@@ -142,13 +275,21 @@ def _simple_command_is_read_only(command: str) -> bool:
                 return False
         if subcommand == "tag" and any(not word.startswith("-") for word in words[2:]):
             return False
+        if subcommand == "worktree":
+            # Only `git worktree list` is read-only; add/remove/move/repair
+            # mutate the repo and must fail closed.
+            wt_args = [word for word in words[2:] if not word.startswith("-")]
+            if wt_args != ["list"]:
+                return False
     if base in {"python", "python3", "node", "ruby", "go", "cargo", "npm"}:
         # Package/build commands mutate caches or the workspace.  Inline
         # calculations and version/help probes remain available.
         lowered = command.lower()
         if base in {"npm", "cargo", "go"} and not re.search(r"\b(?:--version|version|help)\b", lowered):
             return False
-        if re.search(r"\b(?:open|write_text|write_bytes|unlink|remove|rename|mkdir|rmdir|system|popen|run|call|check_call|check_output)\b", command, re.I):
+        # Read probes (`json.load(open('/tmp/x.json'))`, sqlite3 SELECTs) are
+        # read-only; fail closed only on actual write/execute calls.
+        if _INTERPRETER_WRITE_RE.search(command):
             return False
     if base == "gh":
         # Keep status/view/list probes available, but never permit a mutating
@@ -160,6 +301,48 @@ def _simple_command_is_read_only(command: str) -> bool:
         if gh_subcommand not in {"auth", "pr", "run", "repo", "issue"}:
             return False
         if any(word in {"create", "close", "merge", "edit", "delete", "checkout", "comment", "rerun"} for word in words[1:]):
+            return False
+    if base == "hermes":
+        # Read-only Hermes CLI probes must not create gate-junk DEV cards.
+        # Allow read subcommands; fail closed for everything mutating.
+        _HERMES_READ_ONLY = {
+            "webhook": {"list"},
+            "kanban": {"list", "ls", "show", "stats", "diagnostics", "diag",
+                       "context", "runs", "assignees", "notify-list",
+                       "attachments", "log", "tail", "boards"},
+            "gateway": {"status", "doctor", "version", "health", "info"},
+            "config": {"get", "list", "show"},
+            "cron": {"list"},
+            "session": {"list", "show", "search"},
+            "version": set(),
+            "doctor": set(),
+            "help": set(),
+            "skills": {"list"},
+        }
+        # `boards` is read-only ONLY for list/current inspection; create/rm/
+        # switch/rename/set-workdir mutate board configuration and must fail
+        # closed.  `repair` and `gc` are mutating and deliberately absent.
+        _HERMES_KANBAN_BOARDS_READ_ONLY = frozenset({"list", "current"})
+        try:
+            hermes_cmd = next(word for word in words[1:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        allowed = _HERMES_READ_ONLY.get(hermes_cmd)
+        if allowed is None:
+            return False
+        if not allowed:
+            return True
+        try:
+            hermes_sub = next(word for word in words[2:] if not word.startswith("-"))
+        except StopIteration:
+            return False
+        if hermes_cmd == "kanban" and hermes_sub == "boards":
+            try:
+                boards_sub = next(word for word in words[3:] if not word.startswith("-"))
+            except StopIteration:
+                return False
+            return boards_sub in _HERMES_KANBAN_BOARDS_READ_ONLY
+        if hermes_sub not in allowed:
             return False
     return True
 
@@ -219,8 +402,10 @@ def _execute_code_is_read_only(code: str) -> bool:
         return False
     if re.search(
         r"(?:open\s*\([^)]*(?:['\"](?:w|a|x|wb|ab)|mode\s*=\s*['\"](?:w|a|x))|"
-        r"\.write(?:_text|_bytes)?\s*\(|\b(?:unlink|remove|rename|replace|mkdir|rmdir)\s*\(|"
-        r"\b(?:subprocess|os\.system|os\.popen|shutil\.(?:copy|move|rmtree))\b|"
+        r"\.write(?:_text|_bytes)?\s*\(|"
+        r"\b(?:os|Path|pathlib|shutil)\.(?:unlink|remove|rename|replace|mkdir|rmdir|rmtree|copytree|copy|move)\s*\(|"
+        r"\b(?:unlink|mkdir|rmdir|rmtree)\s*\(|"
+        r"\b(?:subprocess|os\.system|os\.popen)\b|"
         r"\b(?:write_file|patch|terminal)\s*\()",
         code,
         re.I,
@@ -618,7 +803,13 @@ def coding_tool_gate_refusal(
     repository = _repository(workspace, args)
     scope = _text(args.get("scope") or args.get("goal") or args.get("context") or user_message)
     if not scope:
-        scope = "Implement the requested code change."
+        # Tool-only call with no user message: title from the actual tool
+        # invocation so gate-created cards describe the real request.
+        tool_summary = _text(args.get("command") or args.get("path") or args.get("url"))
+        if tool_summary:
+            scope = "Run: " + tool_summary[:200]
+        else:
+            scope = "Implement the requested code change."
     acceptance_value = args.get("acceptance_criteria")
     if isinstance(acceptance_value, str):
         acceptance = [acceptance_value.strip()] if acceptance_value.strip() else []
@@ -666,6 +857,7 @@ def coding_tool_gate_refusal(
                     and candidate_meta.get("origin") == metadata["origin"]
                     and candidate_meta.get("repository") == repository
                     and candidate_meta.get("workspace") == workspace
+                    and candidate.status in ACTIVE_TASK_STATUSES
                 ):
                     existing_id = candidate.id
                     break
