@@ -1480,6 +1480,15 @@ export default class Ink {
    * stays true. ENTER_ALT_SCREEN is a terminal-side no-op if already in alt.
    */
   private reenterAltScreen(): void {
+    // Re-entry erases the physical alt screen immediately, so it must
+    // supersede a pending resize heal. Otherwise the resize guard suppresses
+    // scheduleRender() below and leaves the terminal blank until the trailing
+    // settle timer fires.
+    if (this.resizeSettleTimer !== null) {
+      clearTimeout(this.resizeSettleTimer)
+      this.resizeSettleTimer = null
+    }
+
     // DISABLE_MOUSE_TRACKING before enableMouseTrackingFor — same as
     // setAltScreenMouseTracking / AlternateScreen mount / handleResize.
     // DEC private modes have no atomic "set this bitmask" sequence, only

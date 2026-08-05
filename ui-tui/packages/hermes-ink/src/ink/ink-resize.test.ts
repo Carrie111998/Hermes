@@ -104,6 +104,32 @@ describe('Ink resize healing', () => {
     ink.unmount()
   })
 
+  it('lets destructive alt-screen re-entry supersede a pending resize heal', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+
+    ink.setAltScreenActive(true)
+    ink.render(React.createElement(Text, null, 'hello'))
+    ink.onRender()
+    stdout.chunks = []
+
+    stdout.columns = 12
+    stdout.emit('resize')
+    await vi.advanceTimersByTimeAsync(0)
+
+    ink.reassertTerminalModes(true)
+    await vi.advanceTimersByTimeAsync(0)
+
+    expectCleanRepaint(stdout)
+
+    const writesAfterReentry = stdout.chunks.length
+
+    await vi.advanceTimersByTimeAsync(200)
+    expect(stdout.chunks).toHaveLength(writesAfterReentry)
+
+    ink.unmount()
+  })
+
   it('heals same-dimension alt-screen resize events with an erase before repaint', async () => {
     const stdout = new FakeTty()
     const ink = makeInk(stdout)
