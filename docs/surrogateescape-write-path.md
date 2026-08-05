@@ -80,14 +80,22 @@ flowing; encode with the same codec at both ends.
   byte-identical to strict UTF-8; for `surrogateescape`-decoded content it
   restores the original bytes. One line fixes local **and** every backend that
   pipes through `_pipe_stdin`/`_popen_bash` (ssh, docker, singularity).
-- Restructure `_write()`:
+- Restructure `_write()`. **Ordering is load-bearing:** the target must be
+  resolved *before* the encode, so a failed encode still reaches the `finally`
+  close. (A draft that assigned `target` inside the `try` left `target is None`
+  when the encode raised and silently preserved the hang — caught in codex
+  review.) Error recording also happens *before* stdin closure, which is what
+  lets `_wait_for_process` observe the failure: the child cannot exit `cat`
+  until stdin closes, so record → close → child exits → reader sees the error.
 
   ```python
   def _write():
-      target = None
+      if proc.stdin is None:
+          errors.append(RuntimeError("process stdin unavailable"))
+          return
+      target = getattr(proc.stdin, "buffer", proc.stdin)  # resolve BEFORE encode
       try:
           raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
-          target = getattr(proc.stdin, "buffer", proc.stdin)
           target.write(raw)
       except (BrokenPipeError, OSError):
           pass  # child closed stdin early — normal
@@ -98,11 +106,14 @@ flowing; encode with the same codec at both ends.
           errors.append(exc)
       finally:
           try:
-              if target is not None:
-                  target.close()
+              target.close()
           except Exception:
               pass
   ```
+
+  `BufferedWriter.write` either completes the buffered write or raises — no
+  partial-write loop is needed, but the implementation must not silently
+  swallow the write's return value without checking it.
 
 - The `errors` list is attached to the proc (`proc._hermes_stdin_errors = errors`)
   **before** the thread starts, so there is no race between the writer thread
@@ -114,40 +125,65 @@ flowing; encode with the same codec at both ends.
 
 ### 2. Propagation — `_wait_for_process` + `_exec`
 
-- In `_wait_for_process` (`tools/environments/base.py:1210`), after the poll
-  loop: if `proc._hermes_stdin_errors` is non-empty, append
+- In `_wait_for_process` (`tools/environments/base.py:1210`), after
+  `drain_thread.join()` and immediately before the `_finalize_wait_result`
+  call (whose signature only takes collector/rendered/returncode, so the
+  error is read from the proc and folded into the returned dict after):
+  if `proc._hermes_stdin_errors` is non-empty, append
   `[stdin write failed: <exc>]` to the rendered output and add a `"stdin_error"`
-  key to the result dict. The child's real `returncode` is preserved.
+  key to the result dict. The child's real `returncode` is preserved. The
+  message is appended to whatever output the child produced, so it stays
+  visible even when the child wrote nothing.
 - In `ShellFileOperations._exec` (`tools/file_operations.py:872`): a
   `stdin_error` on an otherwise-zero returncode maps to a failure
   (`exit_code = 1`), so `_atomic_write`'s existing `exit_code != 0` check
   surfaces a clear error instead of false persistence success. This is
-  defense-in-depth — the write path is already protected by the pre-validation
-  below — and it covers non-write stdin callers (`terminal_tool` background
-  input) which read the message directly from the result output.
+  defense-in-depth — the write path is already protected by the early
+  rejection in section 3 — and it covers non-write stdin callers
+  (`terminal_tool` background input) which read the message directly from the
+  result output.
 
 ### 3. Write path — `write_file` (`tools/file_operations.py:1412`)
 
-- Immediately before `_atomic_write` (after the BOM-prepend so a restored BOM
-  is included in the hash), encode once:
+Two checks, deliberately split:
+
+- **Early synchronous rejection** — immediately after the denied-path check
+  (line 1459), *before* the syntax gate, BOM probes, lint baseline, or any
+  other subprocess. A C-speed regex scan is enough — rejection does not need
+  to encode:
 
   ```python
-  try:
-      content_bytes = content.encode("utf-8", "surrogateescape")
-  except UnicodeEncodeError as exc:
+  m = re.search(r"[\ud800-\udfff]", content)
+  if m:
       return WriteResult(error=(
           f"Refusing to write '{path}': content contains a lone surrogate "
-          f"character ({exc}) that cannot be encoded as UTF-8. The file was "
-          "NOT created or modified."
+          f"character ({m.group(0)!r}) that cannot be encoded as UTF-8. The "
+          "file was NOT created or modified."
       ))
   ```
 
-  Synchronous, deterministic, no child spawned, no hang, no empty-file
-  truncation (a failed pipe write followed by EOF would otherwise let
-  `cat > tmp` create an *empty* file and `mv` it over the target).
+  This makes "rejected before any child process spawns" literally true — the
+  syntax gate and BOM/line-ending probes run after it, so a surrogate-bearing
+  structured file is refused with a predictable error before any parser (or
+  `head`/`cat` child) sees it. Synchronous, deterministic, no hang, no
+  empty-file truncation (a failed pipe write followed by EOF would otherwise
+  let `cat > tmp` create an *empty* file and `mv` it over the target).
+
+- **Post-BOM encode for hash/byte-count** — after the BOM-prepend (line 1551)
+  so a restored BOM is included, encode once for `bytes_written` and the
+  SHA-256:
+
+  ```python
+  content_bytes = content.encode("utf-8", "surrogateescape")
+  ```
+
+  The early regex check makes this unreachable for surrogates, but it stays
+  inside a try/except returning the same `WriteResult` shape as defense for
+  any future caller that bypasses the early check.
+
 - Delete the `surrogatepass` encode at line 1598; use the pre-computed
   `content_bytes` for both `bytes_written` and the SHA-256. One encode serves
-  validation + hash. Rewrite the now-incorrect comment block (1590–1597) to
+  hash + byte count. Rewrite the now-incorrect comment block (1590–1597) to
   state the contract above.
 - `patch_replace` funnels through `write_file` (line 1745), so every write
   route shares the same validation.
@@ -161,49 +197,80 @@ the change is a no-op for normal content. The exception there is already caught
 and returned as `{"status": "error", ...}` — no hang possible — so no other
 change is needed.
 
+The adjacent Popen branch (`process_registry.py:1755`) was examined and is
+**not** in scope: non-PTY background processes are spawned with
+`stdin=subprocess.DEVNULL` (`process_registry.py:790`), so `write_stdin()`
+rejects that route before ever calling `.write()`. `tool_result_storage.py`
+also sends content via `env.execute(..., stdin_data=...)`; it is covered by the
+shared `_pipe_stdin` change in section 1.
+
 ---
 
 ## Edge cases
 
 - **Windows:** the `proc.stdin.buffer` newline-translation workaround is
   untouched; `surrogateescape` is a codec and platform-independent.
-- **Heredoc-mode remote backends** (modal, docker): untouched. Their stdin
-  rides argv, which POSIX encodes with `surrogateescape`, so round-trip already
-  works there; the hash fix in section 3 makes the verification agree with the
-  bytes they actually receive.
+- **Heredoc/payload-mode remote backends** (modal, daytona): untouched and
+  **not claimed as verified here** — their stdin rides SDK-specific transports
+  (JSON payloads, remote APIs), not plain POSIX argv. The round-trip guarantee
+  applies to the POSIX pipe backends (local, ssh, docker, singularity via
+  `_popen_bash`). The hash fix in section 3 still makes the verification agree
+  with whatever bytes those backends receive.
 - **Normal content:** `surrogateescape` is byte-identical to strict UTF-8 for
   any string without surrogates — zero behavior change for the common path,
-  including the fail-closed syntax gate (runs before validation, unchanged).
+  including the fail-closed syntax gate (which now runs *after* the surrogate
+  rejection, unchanged for normal content).
 - **Bytes input to `_pipe_stdin`:** the existing `isinstance(data, str)` branch
   is preserved; bytes pass through untouched.
-- **Empty content / BOM-only content:** `b""` encodes fine; BOM prepended
-  before validation is included in the hash exactly as it is written.
+- **Empty content / BOM-only content:** `b""` encodes fine; the early regex
+  rejection runs before BOM prepend (U+FEFF is not a surrogate, so the
+  ordering is safe), and the post-BOM encode includes the restored BOM in the
+  hash exactly as it is written.
 
 ## Testing
 
 New `tests/tools/test_file_write_surrogate_roundtrip.py`, using the real-env
 fixture pattern from `tests/tools/test_file_tools_live.py` (real
-`LocalEnvironment` + `ShellFileOperations`, temp cwd, no mocks):
+`LocalEnvironment` + `ShellFileOperations`, temp cwd, no mocks). Assert stable
+fields and substrings — never exact full error strings.
 
 1. **Round-trip:** `b"\xff\x00\xfe"` surrogateescape-decoded → `write_file` →
    on-disk bytes identical, `bytes_written == 3`, `verified is True` (the hash
    match that is broken today), no `.hermes-tmp*` leftovers, completes without
-   hanging.
+   hanging. Include a **mixed** string too (normal text + embedded surrogate
+   chars), not only raw surrogate bytes — proves the two codec paths agree on
+   the same byte stream.
 2. **Rejection:** `"\ud800"`, `"\udc7f"`, `"\udd00"` → `WriteResult.error`
-   mentions "surrogate", file absent, error does **not** contain "timed out"
-   (regression guard for the old hang).
+   mentions "surrogate", new target absent, error does **not** contain
+   "timed out" (regression guard for the old hang). Additionally: pre-write a
+   valid file to the same path, attempt a surrogate write over it, and assert
+   the existing target is **byte-for-byte unchanged** — the stronger safety
+   property (no truncation, no partial write).
 3. **Propagation:** `env.execute("cat > /dev/null", stdin_data="\ud800")` →
-   result carries `stdin_error`, `cat` exits 0 (proves stdin closed in
-   `finally`, no hang).
-4. **No-regression:** normal content round-trips byte-identical with
+   result carries `stdin_error` **and** the output contains the "stdin write
+   failed" message, `cat` exits 0 (proves stdin closed in `finally`), and the
+   call returns well under the environment timeout (bound elapsed time, e.g.
+   < 5s, so a broken implementation fails fast instead of slowly timing out).
+4. **Focused `_pipe_stdin` unit test:** a real `Popen` of
+   `bash -c 'cat > /dev/null'` with `stdin=PIPE`, `_pipe_stdin(proc,
+   "\ud800")`, `proc.wait(timeout=5)` → child exits 0 and
+   `proc._hermes_stdin_errors` is non-empty. This directly pins the
+   writer-thread ordering (target resolved before encode; error recorded
+   before close) that the high-level tests would only catch slowly.
+5. **`patch_replace` funnel:** `patch_replace` on an existing file with
+   `new_string` containing a surrogateescape char → clean error, file
+   byte-for-byte unchanged (validates the funnel path from the issue's
+   motivating scenario).
+6. **No-regression:** normal content round-trips byte-identical with
    `verified is True`.
 
 Run via `scripts/run_tests.sh tests/tools/test_file_write_surrogate_roundtrip.py -q`.
 
 ## Out of scope
 
-- Heredoc/payload transport fixes for remote backends (already correct via
-  argv; verified by existing suites).
+- Heredoc/payload transport fixes for remote backends — out of scope; the
+  round-trip guarantee in this spec covers the POSIX pipe backends (local,
+  ssh, docker, singularity) only.
 - The Windows decode branch of `process_registry.write_stdin` (bytes → str for
   pywinpty); unrelated to this failure.
 - `bytes_written` semantics in `process_registry` (character count vs byte
