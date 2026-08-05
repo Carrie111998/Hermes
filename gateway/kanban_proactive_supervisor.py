@@ -16,17 +16,6 @@ from typing import Any, Mapping, Optional
 from hermes_cli import kanban_db as kb
 
 _MATERIAL_EVENT_KINDS = ("blocked", "gave_up", "block_loop_detected")
-_PROTECTED_GATE_RE = re.compile(
-    r"\b(?:"
-    r"product (?:decision|judg(?:e)?ment)|business (?:decision|judg(?:e)?ment)|"
-    r"credential|credentials|secret|api key|token|password|permission|access grant|"
-    r"billing|payment|spend|spending|purchase|destructive|data[- ]loss|"
-    r"delete production|production data (?:deletion|migration)|migration risk|"
-    r"force[- ]push|history rewrite|irreversible infrastructure|"
-    r"infrastructure removal|live trad(?:e|ing)|risk decision|legal|compliance"
-    r")\b",
-    re.IGNORECASE,
-)
 _REPLY_MARKER_RE = re.compile(r"\[kanban-gate:([a-f0-9]{32})\]", re.IGNORECASE)
 
 
@@ -77,11 +66,6 @@ class SupervisorReplyResult:
     task_id: str
     resumed: bool
     status: str
-
-
-def is_protected_gate(reason: str) -> bool:
-    """Return whether a blocker belongs to an explicit human-only category."""
-    return bool(_PROTECTED_GATE_RE.search(reason or ""))
 
 
 def is_supervisor_gate_reply(
@@ -232,10 +216,7 @@ def reconcile_board(
         # Legacy/untyped blocks predate the explicit block-kind contract and
         # historically represent human blockers. Fail closed: only explicitly
         # typed non-human failure kinds are eligible for automatic recovery.
-        protected = not block_kind or (
-            block_kind in {"needs_input", "capability"}
-            and is_protected_gate(reason)
-        )
+        protected = not block_kind or block_kind in {"needs_input", "capability"}
         if protected:
             if _ensure_supervisor_subscription(
                 conn,
@@ -319,10 +300,7 @@ def render_supervisor_event(
 
     mode = str(metadata.get("_kanban_supervisor_mode") or "")
     if mode == "protected_gate":
-        if block_kind and (
-            block_kind not in {"needs_input", "capability"}
-            or not is_protected_gate(reason)
-        ):
+        if block_kind and block_kind not in {"needs_input", "capability"}:
             return ""
         token = str(metadata.get("_kanban_supervisor_gate_token") or "")
         if not re.fullmatch(r"[a-f0-9]{32}", token):

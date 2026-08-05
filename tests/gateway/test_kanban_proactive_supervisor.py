@@ -167,6 +167,69 @@ def test_untyped_legacy_protected_gate_is_not_auto_recovered(
         conn.close()
 
 
+@pytest.mark.parametrize("kind", ["needs_input", "capability"])
+def test_typed_human_gate_is_protected_regardless_of_wording(
+    tmp_path, monkeypatch, kind
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Typed human gate", assignee="forge")
+        assert kb.block_task(
+            conn,
+            task_id,
+            reason="Which option should I choose?",
+            kind=kind,
+        )
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        assert result.protected_gates == [task_id]
+        assert result.recovered == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("release_claim", [False, True])
+def test_dispatcher_gave_up_is_typed_transient_and_recovered(
+    tmp_path, monkeypatch, release_claim
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Dispatcher failure", assignee="forge")
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker executable unavailable",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=release_claim,
+            end_run=False,
+        )
+        gave_up = _latest_event(conn, task_id, "gave_up")
+
+        task = kb.get_task(conn, task_id)
+        assert task.block_kind == "transient"
+        assert json.loads(gave_up["payload"])["kind"] == "transient"
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        assert result.recovered == [task_id]
+        assert result.protected_gates == []
+        assert kb.get_task(conn, task_id).status == "ready"
+    finally:
+        conn.close()
+
+
 def test_authenticated_gate_reply_failure_does_not_fall_through_to_agent(monkeypatch):
     from gateway import kanban_proactive_supervisor as supervisor
 

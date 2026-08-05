@@ -42,10 +42,10 @@ class _StubAdapter(BasePlatformAdapter):
         return {}
 
 
-def _make_adapter():
+def _make_adapter(platform=Platform.TELEGRAM):
     """Create a minimal adapter for testing the active-session guard."""
     config = PlatformConfig(enabled=True, token="test-token")
-    adapter = _StubAdapter(config, Platform.TELEGRAM)
+    adapter = _StubAdapter(config, platform)
     adapter._busy_text_mode = ""
     adapter.sent_responses = []
 
@@ -62,16 +62,29 @@ def _make_adapter():
     return adapter
 
 
-def _make_event(text="/stop", chat_id="12345"):
+def _make_event(
+    text="/stop",
+    chat_id="12345",
+    *,
+    platform=Platform.TELEGRAM,
+    reply_to_text=None,
+    reply_to_is_own_message=False,
+):
     source = SessionSource(
-        platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
+        platform=platform, chat_id=chat_id, chat_type="dm"
     )
-    return MessageEvent(text=text, message_type=MessageType.TEXT, source=source)
+    return MessageEvent(
+        text=text,
+        message_type=MessageType.TEXT,
+        source=source,
+        reply_to_text=reply_to_text,
+        reply_to_is_own_message=reply_to_is_own_message,
+    )
 
 
-def _session_key(chat_id="12345"):
+def _session_key(chat_id="12345", *, platform=Platform.TELEGRAM):
     source = SessionSource(
-        platform=Platform.TELEGRAM, chat_id=chat_id, chat_type="dm"
+        platform=platform, chat_id=chat_id, chat_type="dm"
     )
     return build_session_key(source)
 
@@ -83,6 +96,29 @@ def _session_key(chat_id="12345"):
 
 class TestCommandBypassActiveSession:
     """Commands that must bypass the active-session guard."""
+
+    @pytest.mark.asyncio
+    async def test_authenticated_supervisor_reply_bypasses_discord_active_session(self):
+        adapter = _make_adapter(Platform.DISCORD)
+        sk = _session_key(platform=Platform.DISCORD)
+        adapter._active_sessions[sk] = asyncio.Event()
+        adapter._pending_messages[sk] = _make_event(
+            "ordinary queued", platform=Platform.DISCORD
+        )
+        event = _make_event(
+            "approve",
+            platform=Platform.DISCORD,
+            reply_to_text=(
+                "Decision needed\n"
+                "[kanban-gate:0123456789abcdef0123456789abcdef]"
+            ),
+            reply_to_is_own_message=True,
+        )
+
+        await adapter.handle_message(event)
+
+        assert adapter._pending_messages[sk].text == "ordinary queued"
+        assert any("handled:text:approve" in response for response in adapter.sent_responses)
 
     @pytest.mark.asyncio
     async def test_stop_bypasses_guard(self):
