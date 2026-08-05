@@ -62,6 +62,22 @@ def _find_deferred_guarded_reset_chain() -> ast.If:
     )
 
 
+def _return_dict_keysets_containing(required_key: str) -> list[set[str]]:
+    tree = ast.parse(inspect.getsource(gateway_run))
+    keysets: list[set[str]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Return) or not isinstance(node.value, ast.Dict):
+            continue
+        keys = {
+            key.value
+            for key in node.value.keys
+            if isinstance(key, ast.Constant) and isinstance(key.value, str)
+        }
+        if required_key in keys:
+            keysets.append(keys)
+    return keysets
+
+
 class TestCompressionDeferredIsSoft:
     def test_deferred_branch_guards_the_auto_reset(self):
         """The auto-reset (``reset_session``) must be unreachable when
@@ -84,5 +100,26 @@ class TestCompressionDeferredIsSoft:
             f"defer is transient — the session must stay intact so the next "
             f"message retries against the freshly compressed context "
             f"(#49874, #69870)."
+        )
+
+    def test_compression_terminal_flags_survive_gateway_result_returns(self):
+        """Every gateway result carrying defer must also carry exhaustion flags.
+
+        Fresh-tail exhaustion returns a non-empty user-facing response, so the
+        non-empty response path must preserve ``compression_exhausted`` for the
+        auto-reset consumer just like the empty-response path does.
+        """
+        keysets = _return_dict_keysets_containing("compression_deferred")
+        assert keysets, "No gateway return dict carries compression_deferred"
+
+        required = {
+            "compression_exhausted",
+            "context_handoff_required",
+            "fresh_tail_exhausted",
+        }
+        missing_by_return = [required - keys for keys in keysets if not required <= keys]
+        assert not missing_by_return, (
+            "Gateway return dicts that carry compression_deferred must also "
+            f"preserve {required}; missing={missing_by_return}"
         )
 

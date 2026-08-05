@@ -5478,6 +5478,8 @@ class TurnRunner:
                 "error": result.get("error"),
                 "compression_exhausted": result.get("compression_exhausted", False),
                 "compression_deferred": result.get("compression_deferred", False),
+                "context_handoff_required": result.get("context_handoff_required", False),
+                "fresh_tail_exhausted": result.get("fresh_tail_exhausted", False),
                 "tools": ctx.tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
@@ -5615,6 +5617,18 @@ class TurnRunner:
             # session that a concurrent compressor is about to shrink.
             "compression_deferred": (
                 ctx.result_holder[0].get("compression_deferred", False)
+                if ctx.result_holder[0] else False
+            ),
+            "compression_exhausted": (
+                ctx.result_holder[0].get("compression_exhausted", False)
+                if ctx.result_holder[0] else False
+            ),
+            "context_handoff_required": (
+                ctx.result_holder[0].get("context_handoff_required", False)
+                if ctx.result_holder[0] else False
+            ),
+            "fresh_tail_exhausted": (
+                ctx.result_holder[0].get("fresh_tail_exhausted", False)
                 if ctx.result_holder[0] else False
             ),
             "tools": ctx.tools_holder[0] or [],

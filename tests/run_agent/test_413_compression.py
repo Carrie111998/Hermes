@@ -634,7 +634,7 @@ class TestPreflightCompression:
 
         history = [
             {"role": "user", "content": "live task"},
-            {"role": "tool", "content": "fresh protected tool output"},
+            {"role": "assistant", "content": "fresh protected assistant output"},
         ]
         ok_resp = _mock_response(content="No proactive no-op compression", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [ok_resp]
@@ -658,6 +658,37 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         agent.context_compressor.should_compress.assert_not_called()
 
+    def test_pre_api_pressure_hook_skipped_when_cheap_guards_block(self, agent):
+        """Avoid side-effectful engine hooks when pre-API compression cannot run."""
+        agent.compression_enabled = False
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        pressure_hook = MagicMock(return_value=True)
+        agent.context_compressor.should_compress_request_pressure = pressure_hook
+
+        ok_resp = _mock_response(content="Compression disabled", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=140_000,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=[{"role": "user", "content": "live task"}],
+            )
+
+        assert result["completed"] is True
+        pressure_hook.assert_not_called()
+        mock_compress.assert_not_called()
+
     def test_context_overflow_stops_when_engine_reports_fresh_tail_exhausted(self, agent):
         """Do not retry provider overflow after LCM says the protected tail cannot fit."""
         err_400 = Exception(
@@ -667,7 +698,7 @@ class TestPreflightCompression:
         )
         err_400.status_code = 400  # type: ignore[attr-defined]
         agent.client.chat.completions.create.side_effect = [err_400]
-        agent.context_compressor._last_overflow_recovery_failed = False
+        agent.context_compressor.overflow_recovery_failed = MagicMock(return_value=False)
 
         history = [
             {"role": "user", "content": "live task"},
@@ -675,7 +706,7 @@ class TestPreflightCompression:
         ]
 
         def _compress_reports_tail_exhausted(msgs, *_args, **_kwargs):
-            agent.context_compressor._last_overflow_recovery_failed = True
+            agent.context_compressor.overflow_recovery_failed.return_value = True
             return msgs, "compressed prompt"
 
         with (

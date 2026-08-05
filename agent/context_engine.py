@@ -367,6 +367,16 @@ class ContextEngine(ABC):
         """
         return self.should_compress(prompt_tokens)
 
+    def overflow_recovery_failed(self) -> bool:
+        """Return True when the last forced overflow recovery still exceeded budget.
+
+        Most engines never run a distinct forced-overflow assembly path, so the
+        default is False.  Engines that can prove their protected/fresh tail
+        remains too large should override this so the host can stop retry loops
+        without depending on engine-private attributes.
+        """
+        return False
+
     def get_automatic_compaction_status_message(
         self,
         *,
