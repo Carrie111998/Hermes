@@ -81,6 +81,15 @@ def is_user_task_id(value: Any) -> bool:
     )
 
 
+def _is_slack_human_user_id(value: Any) -> bool:
+    user_id = str(value or "")
+    return (
+        len(user_id) > 1
+        and user_id == user_id.strip()
+        and user_id.startswith(("U", "W"))
+    )
+
+
 def is_interactive_user_task(task: Mapping[str, Any]) -> bool:
     return (
         is_user_task_id(task.get("id"))
@@ -206,6 +215,7 @@ def _control_blocks(
     base = dict(action_context or {})
     base.update({"revision": revision, "snapshot_hash": desired_hash})
     encoded = encode_action_value(base)
+    has_mutation_owner = _is_slack_human_user_id(base.get("route_user_id"))
     user_tasks = [task for task in todos if is_interactive_user_task(task)]
     over_capacity = len(user_tasks) > MAX_INTERACTIVE_TASKS
     completed = {
@@ -219,7 +229,7 @@ def _control_blocks(
         for task in user_tasks
     ]
     elements: list[dict[str, Any]] = []
-    if checkbox_options and not over_capacity:
+    if has_mutation_owner and checkbox_options and not over_capacity:
         checkbox: dict[str, Any] = {
             "type": "checkboxes",
             "action_id": "hermes_plan_complete",
@@ -240,7 +250,7 @@ def _control_blocks(
         for task in user_tasks
         if task["status"] == "in_progress"
     ]
-    if cancel_options and not over_capacity:
+    if has_mutation_owner and cancel_options and not over_capacity:
         elements.append({
             "type": "static_select",
             "action_id": "hermes_plan_cancel",
@@ -249,6 +259,7 @@ def _control_blocks(
         })
     if (
         signing_secret
+        and has_mutation_owner
         and not over_capacity
         and len(user_tasks) < MAX_INTERACTIVE_TASKS
         and len(todos) < MAX_TODO_ITEMS
@@ -946,7 +957,10 @@ class PlanCardStore:
             if not action_user_id:
                 return None
             route_user_id = str(state.get("route_user_id") or "")
-            if route_user_id and action_user_id != route_user_id:
+            if (
+                not _is_slack_human_user_id(route_user_id)
+                or action_user_id != route_user_id
+            ):
                 return None
             action_dedupe_id = str(metadata.get("action_dedupe_id") or "")
             if not action_dedupe_id or action_dedupe_id not in {

@@ -70,6 +70,7 @@ try:  # sibling module; support both package and flat plugin-dir import
         PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
+        _is_slack_human_user_id,
         build_plan_blocks,
         is_interactive_user_task,
         is_user_task_id,
@@ -86,6 +87,7 @@ except ImportError:  # pragma: no cover - plugin loaded outside package context
         PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
+        _is_slack_human_user_id,
         build_plan_blocks,
         is_interactive_user_task,
         is_user_task_id,
@@ -4771,7 +4773,10 @@ class SlackAdapter(BasePlatformAdapter):
     @staticmethod
     def _plan_interaction_owner_matches(state: Dict[str, Any], user_id: str) -> bool:
         route_user_id = str(state.get("route_user_id") or "")
-        return not route_user_id or route_user_id == str(user_id or "")
+        return (
+            _is_slack_human_user_id(route_user_id)
+            and route_user_id == str(user_id or "")
+        )
 
     @staticmethod
     def _plan_action_dedupe_id(body: Dict[str, Any], action: Dict[str, Any]) -> str:
@@ -4883,7 +4888,12 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=str(state.get("thread_ts") or "") or None,
         ):
             return
-        if not self._plan_interaction_owner_matches(state, str(user.get("id") or "")):
+        if (
+            action_id != "hermes_plan_refresh"
+            and not self._plan_interaction_owner_matches(
+                state, str(user.get("id") or "")
+            )
+        ):
             return
         dedupe_id = self._plan_action_dedupe_id(body, action)
         if not self._plan_store.consume_action_id(dedupe_id):

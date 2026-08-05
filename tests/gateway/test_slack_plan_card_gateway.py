@@ -298,6 +298,26 @@ async def test_claim_time_rechecks_current_actor_authorization(tmp_path) -> None
 
 
 @pytest.mark.asyncio
+async def test_claim_time_rejects_forged_metadata_from_unrelated_user(tmp_path) -> None:
+    adapter = _real_adapter(tmp_path)
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+    event = await _ingress_plan_event(adapter)
+    forged = {
+        **event.metadata["slack_plan_action"],
+        "action_user_id": "U-unrelated",
+    }
+
+    assert adapter._plan_store.validate_action(forged) is None
+    assert not adapter.validate_plan_action_metadata(forged)
+
+    event.metadata["slack_plan_action"] = forged
+    adapter.send = AsyncMock()
+    runner = _runner(adapter)
+    assert not await runner._validate_slack_plan_action_after_claim(event, "sk")
+    adapter.send.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_claim_time_rejects_current_ineligible_task_status(tmp_path) -> None:
     adapter = _real_adapter(tmp_path)
     adapter._is_interactive_user_authorized = MagicMock(return_value=True)

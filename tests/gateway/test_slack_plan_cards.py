@@ -24,6 +24,9 @@ from plugins.platforms.slack.plan_cards import (
 from tools.todo_tool import MAX_TODO_ITEMS, TodoStore
 
 
+_OWNER_CONTEXT = {"route_user_id": "U1"}
+
+
 def _snapshot(count: int = 4) -> list[dict[str, str]]:
     statuses = ["pending", "in_progress", "completed", "cancelled"]
     return [
@@ -56,10 +59,12 @@ def test_parse_todo_result_accepts_trailing_hint_and_rejects_errors() -> None:
 
 def test_native_renderer_preserves_status_and_rotates_block_ids() -> None:
     first = build_plan_blocks(
-        _snapshot(), revision=1, snapshot_hash="hash-1", signing_secret=b"secret"
+        _snapshot(), revision=1, snapshot_hash="hash-1", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     second = build_plan_blocks(
-        _snapshot(), revision=2, snapshot_hash="hash-1", signing_secret=b"secret"
+        _snapshot(), revision=2, snapshot_hash="hash-1", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
 
     plan = first.native_blocks[0]
@@ -124,7 +129,7 @@ def test_todo_store_canonical_ids_drive_plan_classification_and_controls(tmp_pat
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0",
+        "channel_id": "C1", "thread_ts": "10.0", "route_user_id": "U1",
     }
     state = store.record_desired_snapshot(route, canonical_snapshot)
     rendered = build_plan_blocks(
@@ -132,6 +137,7 @@ def test_todo_store_canonical_ids_drive_plan_classification_and_controls(tmp_pat
         revision=state["desired_revision"],
         snapshot_hash=state["desired_hash"],
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
 
     assert [
@@ -163,7 +169,8 @@ def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> N
         {"id": "սser:lookalike", "content": "Lookalike", "status": "pending"},
     ]
     rendered = build_plan_blocks(
-        todos, revision=3, snapshot_hash="hash", signing_secret=b"secret"
+        todos, revision=3, snapshot_hash="hash", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert [task["task_id"] for task in rendered.native_blocks[0]["tasks"]] == [
         task["id"] for task in todos
@@ -180,12 +187,37 @@ def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> N
     assert next(item for item in elements if item["action_id"] == "hermes_plan_add")["text"]["text"] == "Add user task"
 
 
+@pytest.mark.parametrize(
+    "action_context",
+    [None, {"route_user_id": ""}, {"route_user_id": "B-bot"}],
+)
+def test_renderer_without_mutation_owner_keeps_plan_and_refresh_only(
+    action_context,
+) -> None:
+    rendered = build_plan_blocks(
+        [{"id": "user:active", "content": "Active", "status": "in_progress"}],
+        revision=1,
+        snapshot_hash="read-only",
+        signing_secret=b"secret",
+        action_context=action_context,
+    )
+
+    assert rendered.native_blocks[0]["type"] == "plan"
+    assert [item["action_id"] for item in _action_elements(rendered)] == [
+        "hermes_plan_refresh"
+    ]
+    assert [
+        item["action_id"] for item in _action_elements(rendered, fallback=True)
+    ] == ["hermes_plan_refresh"]
+
+
 def test_pending_user_task_becomes_actionable_with_same_id_when_in_progress() -> None:
     pending = build_plan_blocks(
         [{"id": "user:stable", "content": "Stable", "status": "pending"}],
         revision=1,
         snapshot_hash="pending",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert [item["action_id"] for item in _action_elements(pending)] == [
         "hermes_plan_add", "hermes_plan_refresh",
@@ -196,6 +228,7 @@ def test_pending_user_task_becomes_actionable_with_same_id_when_in_progress() ->
         revision=2,
         snapshot_hash="active",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     checkbox = next(
         item for item in _action_elements(active)
@@ -219,7 +252,8 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         {"id": "user:two", "content": "Two", "status": "completed"},
     ]
     normal = build_plan_blocks(
-        large_agent_plan, revision=3, snapshot_hash="hash", signing_secret=b"secret"
+        large_agent_plan, revision=3, snapshot_hash="hash", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert len(normal.native_blocks[0]["tasks"]) == 42
     action_ids = [element["action_id"] for element in _action_elements(normal)]
@@ -235,6 +269,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         [{"id": f"user:{index}", "content": str(index), "status": "in_progress"}
          for index in range(MAX_INTERACTIVE_TASKS)],
         revision=4, snapshot_hash="capacity", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert "hermes_plan_add" not in [item["action_id"] for item in _action_elements(at_capacity)]
 
@@ -242,6 +277,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         [{"id": f"user:{index}", "content": str(index), "status": "in_progress"}
          for index in range(MAX_INTERACTIVE_TASKS + 1)],
         revision=5, snapshot_hash="oversized", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert [item["action_id"] for item in _action_elements(oversized)] == [
         "hermes_plan_refresh"
@@ -256,6 +292,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         revision=6,
         snapshot_hash="extreme",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     fallback_text = json.dumps(extreme.fallback_blocks).lower()
     assert len(extreme.native_blocks[0]["tasks"]) == 80
@@ -277,6 +314,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         revision=7,
         snapshot_hash="extreme-users",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     assert len(extreme_with_users.native_blocks[0]["tasks"]) == 82
     assert len(extreme_with_users.fallback_blocks) <= 50
@@ -307,6 +345,7 @@ def test_renderer_add_control_follows_authoritative_todo_capacity(
     ]
     rendered = build_plan_blocks(
         todos, revision=1, snapshot_hash="capacity", signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     action_ids = [item["action_id"] for item in _action_elements(rendered)]
     assert ("hermes_plan_add" in action_ids) is expect_add
@@ -344,6 +383,7 @@ def test_future_and_cancelled_user_tasks_do_not_consume_mutation_capacity() -> N
         revision=7,
         snapshot_hash="inactive-capacity",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
 
     assert len(rendered.native_blocks[0]["tasks"]) == MAX_INTERACTIVE_TASKS + 6
@@ -374,6 +414,7 @@ def test_fallback_splits_single_overlong_lines_without_undisclosed_loss() -> Non
         revision=8,
         snapshot_hash="long-lines",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     section_text = "".join(
         block["text"]["text"]
@@ -414,6 +455,7 @@ def test_native_task_titles_disclose_content_truncation_at_boundary(task_prefix)
         revision=9,
         snapshot_hash=f"title-{task_prefix}",
         signing_secret=b"secret",
+        action_context=_OWNER_CONTEXT,
     )
     exact_title, over_title = [
         task["title"] for task in rendered.native_blocks[0]["tasks"]
@@ -429,7 +471,8 @@ def test_native_task_titles_disclose_content_truncation_at_boundary(task_prefix)
 def test_add_task_is_disabled_without_signing_material() -> None:
     rendered = build_plan_blocks(
         [{"id": "user:a", "content": "A", "status": "pending"}],
-        revision=1, snapshot_hash="hash", signing_secret=None
+        revision=1, snapshot_hash="hash", signing_secret=None,
+        action_context=_OWNER_CONTEXT,
     )
     actions = rendered.native_blocks[-1]["elements"]
     assert "hermes_plan_add" not in [item["action_id"] for item in actions]
@@ -676,7 +719,7 @@ def test_validate_action_returns_exact_matching_snapshot(tmp_path) -> None:
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0",
+        "channel_id": "C1", "thread_ts": "10.0", "route_user_id": "U1",
     }
     original = store.record_desired_snapshot(route, _snapshot(1))
     assert store.mark_applied(
@@ -708,7 +751,7 @@ def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0",
+        "channel_id": "C1", "thread_ts": "10.0", "route_user_id": "U1",
     }
     state = store.record_desired_snapshot(route, [
         {"id": "agent:a", "content": "Agent", "status": "pending"},
@@ -749,11 +792,81 @@ def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_
     }) is None
 
 
+@pytest.mark.parametrize("route_user_id", ["U-owner", "", "B-bot"])
+@pytest.mark.parametrize(
+    ("action_kind", "changes"),
+    [
+        (
+            "complete_reopen",
+            {
+                "task_ids": ["user:active"],
+                "complete_task_ids": ["user:active"],
+                "complete_task_status": "completed",
+                "reopen_task_ids": [],
+                "reopen_task_status": "in_progress",
+            },
+        ),
+        (
+            "cancel",
+            {
+                "task_ids": ["user:active"],
+                "cancel_task_ids": ["user:active"],
+                "cancel_task_status": "cancelled",
+            },
+        ),
+        (
+            "add_user_task",
+            {
+                "task_ids": ["user:new"],
+                "add_task_ids": ["user:new"],
+                "add_task_content": "New",
+                "add_task_status": "in_progress",
+            },
+        ),
+    ],
+)
+def test_validate_action_requires_nonempty_exact_route_owner_for_every_mutation(
+    tmp_path, route_user_id, action_kind, changes,
+) -> None:
+    store = PlanCardStore(tmp_path)
+    route = {
+        "session_key": "sk",
+        "session_id": "sid",
+        "team_id": "T1",
+        "channel_id": "C1",
+        "thread_ts": "10.0",
+        "route_user_id": route_user_id,
+    }
+    state = store.record_desired_snapshot(route, [
+        {"id": "user:active", "content": "Active", "status": "in_progress"},
+    ])
+    assert store.mark_applied(
+        "sk",
+        revision=state["desired_revision"],
+        snapshot_hash=state["desired_hash"],
+        message_ts="20.0",
+    )
+    dedupe_id = f"{route_user_id or 'empty'}-{action_kind}"
+    assert store.consume_action_id(dedupe_id)
+    metadata = {
+        **route,
+        "message_ts": "20.0",
+        "revision": state["desired_revision"],
+        "snapshot_hash": state["desired_hash"],
+        "action_kind": action_kind,
+        "action_user_id": "U-other",
+        "action_dedupe_id": dedupe_id,
+        **changes,
+    }
+
+    assert store.validate_action(metadata) is None
+
+
 def test_validate_add_capacity_counts_only_in_progress_and_completed_user_tasks(tmp_path) -> None:
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0",
+        "channel_id": "C1", "thread_ts": "10.0", "route_user_id": "U1",
     }
     read_only = [
         {
@@ -813,7 +926,7 @@ def test_validate_add_rejects_authoritative_todo_capacity(
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0",
+        "channel_id": "C1", "thread_ts": "10.0", "route_user_id": "U1",
     }
     snapshot = [
         {"id": f"agent:{index}", "content": str(index), "status": "pending"}
