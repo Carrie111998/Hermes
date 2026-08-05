@@ -281,6 +281,7 @@ class TurnController {
       streamPendingTools: [],
       streamSegments: [],
       streaming: '',
+      streamingIsFull: false,
       subagents: [],
       tools: [],
       turnTrail: []
@@ -596,6 +597,7 @@ class TurnController {
     if (!this.interrupted && split.text) {
       patchTurnState({ streaming: split.text, streamingIsFull: true })
     }
+
     const existingReasoning = this.reasoningText.trim() || String(payload.reasoning ?? '').trim()
     const savedReasoning = [existingReasoning, existingReasoning ? '' : split.reasoning].filter(Boolean).join('\n\n')
     const savedToolTokens = this.toolTokenAcc

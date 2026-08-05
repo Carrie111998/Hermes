@@ -37,6 +37,7 @@ export const MessageLine = memo(function MessageLine({
   msg,
   prev,
   sections,
+  streamingIsFull = false,
   t,
   tools = []
 }: MessageLineProps) {
@@ -185,7 +186,12 @@ export const MessageLine = memo(function MessageLine({
         // Incremental markdown: split at the last stable block boundary so
         // only the in-flight tail re-tokenizes per delta. See
         // streamingMarkdown.tsx for the cost model.
-        <StreamingMd cols={bodyWidth} compact={compact} t={t} text={boundedLiveRenderText(msg.text)} />
+        <StreamingMd
+          cols={bodyWidth}
+          compact={compact}
+          t={t}
+          text={streamingIsFull ? msg.text : boundedLiveRenderText(msg.text)}
+        />
       ) : (
         <Md cols={bodyWidth} compact={compact} t={t} text={msg.text} />
       )
