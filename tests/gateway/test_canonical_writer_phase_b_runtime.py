@@ -453,6 +453,34 @@ def test_fixed_authority_loader_rejects_noncanonical_or_writable_files(
             runtime._read_fixed_root_json(plan_path)
 
 
+def test_phase_b_authority_storage_absence_is_exact_and_fails_closed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    absent = {
+        runtime.PHASE_B_AUTHORITY_ROOT,
+        runtime.PHASE_B_JOURNAL_ROOT.parent,
+    }
+
+    def lstat(path):
+        if path in absent:
+            raise FileNotFoundError(path)
+        raise AssertionError(path)
+
+    monkeypatch.setattr(runtime.os, "lstat", lstat)
+    assert runtime.phase_b_authority_storage_absent() is True
+
+    for error in (PermissionError("denied"), OSError("storage failure")):
+        monkeypatch.setattr(
+            runtime.os,
+            "lstat",
+            lambda _path, failure=error: (_ for _ in ()).throw(failure),
+        )
+        assert runtime.phase_b_authority_storage_absent() is False
+
+    monkeypatch.setattr(runtime.os, "lstat", lambda _path: object())
+    assert runtime.phase_b_authority_storage_absent() is False
+
+
 def test_production_dependencies_require_typed_plan_and_cloud_boundary() -> None:
     signature = inspect.signature(runtime.build_phase_b_dependencies)
     assert tuple(signature.parameters) == ("plan", "cloud")

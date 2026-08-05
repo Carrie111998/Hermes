@@ -90,6 +90,11 @@ from gateway.canonical_projection_export import (
     validate_projection_export,
 )
 from gateway.canonical_writer_release_contract import MAX_RELEASE_FILE_BYTES
+from gateway.canonical_writer_pre_phase_b_start import (
+    DEFAULT_PRE_PHASE_B_START_PERMIT_PATH,
+    build_pre_phase_b_start_permit,
+    canonical_pre_phase_b_start_permit_bytes,
+)
 from gateway.canonical_writer_lifecycle_lock import (
     HOST_LIFECYCLE_LOCK_PATH,
     host_release_lifecycle_lock,
@@ -2072,6 +2077,91 @@ def _unlink_exact(
     _fsync_directory(path.parent)
 
 
+def _pre_phase_b_native_plan(
+    plan: NativeObservationPlan | ActivationPlan,
+) -> NativeObservationPlan:
+    if isinstance(plan, NativeObservationPlan):
+        return NativeObservationPlan.from_mapping(plan.to_mapping())
+    if isinstance(plan, ActivationPlan):
+        native = NativeObservationPlan.from_mapping(
+            plan.native_observation_receipt["plan"]
+        )
+        if native.value["revision"] != plan.revision:
+            raise RuntimeError("pre-Phase-B permit release binding drifted")
+        return native
+    raise TypeError("pre-Phase-B permit requires an exact activation plan")
+
+
+def _install_pre_phase_b_start_permit(
+    plan: NativeObservationPlan | ActivationPlan,
+    *,
+    owner_approval_receipt: OwnerApprovalReceipt,
+    external_iam_receipt: ExternalIAMReceipt,
+) -> tuple[str, int]:
+    """Publish one exact short-lived writer-readable permit under the host lock."""
+
+    native = _pre_phase_b_native_plan(plan)
+    scope = "native_observation" if isinstance(plan, NativeObservationPlan) else "activation"
+    if owner_approval_receipt.value.get("scope") != scope:
+        raise PermissionError("pre-Phase-B permit owner scope is invalid")
+    identities = native.value["identities"]
+    writer_config = native.value["writer_config"]
+    permit = build_pre_phase_b_start_permit(
+        revision=str(native.value["revision"]),
+        artifact_root=str(native.value["artifact_root"]),
+        artifact_sha256=str(native.value["artifact_sha256"]),
+        release_manifest_file_sha256=str(
+            native.value["release_manifest_file_sha256"]
+        ),
+        writer_config_path=str(writer_config["path"]),
+        writer_config_sha256=str(writer_config["sha256"]),
+        writer_uid=int(identities["writer_uid"]),
+        writer_gid=int(identities["writer_gid"]),
+        boot_id_sha256=str(native.value["boot_id_sha256"]),
+        scope=scope,
+        plan_sha256=plan.sha256,
+        owner_approval_receipt_sha256=owner_approval_receipt.sha256,
+        owner_approval_expires_at_unix=int(
+            owner_approval_receipt.value["expires_at_unix"]
+        ),
+        external_iam_receipt_sha256=external_iam_receipt.sha256,
+    )
+    payload = canonical_pre_phase_b_start_permit_bytes(permit)
+    writer_gid = int(identities["writer_gid"])
+    # A process killed outside the sealed finally block may leave only this
+    # dedicated root-owned path.  The host activation lock excludes a live
+    # concurrent lifecycle, so a trusted prior file is safe to replace here.
+    _unlink_exact(
+        DEFAULT_PRE_PHASE_B_START_PERMIT_PATH,
+        uid=0,
+        gid=writer_gid,
+        mode=0o440,
+    )
+    _install_exact_bytes(
+        DEFAULT_PRE_PHASE_B_START_PERMIT_PATH,
+        payload,
+        uid=0,
+        gid=writer_gid,
+        mode=0o440,
+    )
+    return _sha256_bytes(payload), writer_gid
+
+
+def _remove_pre_phase_b_start_permit(
+    *,
+    file_sha256: str,
+    writer_gid: int,
+) -> None:
+    _digest(file_sha256, "pre-Phase-B permit file sha256")
+    _unlink_exact(
+        DEFAULT_PRE_PHASE_B_START_PERMIT_PATH,
+        uid=0,
+        gid=writer_gid,
+        mode=0o440,
+        sha256=file_sha256,
+    )
+
+
 def _external_iam_archive_path(receipt: ExternalIAMReceipt) -> Path:
     if not isinstance(receipt, ExternalIAMReceipt):
         raise TypeError("external IAM receipt is required")
@@ -4049,12 +4139,25 @@ class NativeObservationExecutor:
                 # owner-approved observation lifecycle.  The installed writer
                 # unit keeps its hard Requires= readiness dependency for every
                 # ordinary/full-canary start.
-                self._command(
-                    PRE_PHASE_B_WRITER_START_ARGV,
-                    "native start writer",
-                    timeout=90,
+                permit_file_sha256, permit_writer_gid = (
+                    _install_pre_phase_b_start_permit(
+                        self.plan,
+                        owner_approval_receipt=owner_approval_receipt,
+                        external_iam_receipt=iam_receipt,
+                    )
                 )
-                _require_active(WRITER_UNIT, runner=self.runner)
+                try:
+                    self._command(
+                        PRE_PHASE_B_WRITER_START_ARGV,
+                        "native start writer",
+                        timeout=90,
+                    )
+                    _require_active(WRITER_UNIT, runner=self.runner)
+                finally:
+                    _remove_pre_phase_b_start_permit(
+                        file_sha256=permit_file_sha256,
+                        writer_gid=permit_writer_gid,
+                    )
                 self.stage = "start_gateway"
                 _require_lifecycle_owner_approval(
                     owner_approval_receipt,
@@ -4798,12 +4901,25 @@ class ActivationExecutor:
             # This is the second and final pre-Phase-B observation.  Preserve
             # the permanent readiness dependency and ignore it only for this
             # exact owner-approved, stop-on-exit systemd job.
-            self._command(
-                PRE_PHASE_B_WRITER_START_ARGV,
-                "start writer",
-                timeout=90,
+            permit_file_sha256, permit_writer_gid = (
+                _install_pre_phase_b_start_permit(
+                    self.plan,
+                    owner_approval_receipt=owner_approval_receipt,
+                    external_iam_receipt=iam_receipt,
+                )
             )
-            writer_pid = _require_active(WRITER_UNIT, runner=self.runner)
+            try:
+                self._command(
+                    PRE_PHASE_B_WRITER_START_ARGV,
+                    "start writer",
+                    timeout=90,
+                )
+                writer_pid = _require_active(WRITER_UNIT, runner=self.runner)
+            finally:
+                _remove_pre_phase_b_start_permit(
+                    file_sha256=permit_file_sha256,
+                    writer_gid=permit_writer_gid,
+                )
             self.stage = "start_gateway"
             _require_lifecycle_owner_approval(
                 owner_approval_receipt,
