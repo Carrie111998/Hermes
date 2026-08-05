@@ -91,6 +91,8 @@ Contract essentials:
   paints over the transcript):
   - Docks (chrome rows): `dock-top` (under the top status bar),
     `dock-bottom` (default — above the bottom one).
+  - Transcript edge: `transcript-bottom` reserves rows below the scrolling
+    transcript and directly above the prompt/composer.
   - Rails (side columns beside the transcript; text reflows around them):
     `top-left`, `top-right`, `bottom-left`, `bottom-right` — corner names
     pick the rail side and its top/bottom anchor. Set `width` on the app

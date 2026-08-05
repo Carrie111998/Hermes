@@ -240,10 +240,10 @@ export function ActiveWidgetSlot(): ReactNode {
   return overlay.widget ? <WidgetAppMount active={overlay.widget} ctx={ctx} /> : null
 }
 
-/** An in-FLOW dock row: reserves real rows in the chrome (never covers
- *  content), right-aligned cards. `dock-top` renders under the top status
- *  bar, `dock-bottom` above the bottom one. */
-export function AmbientDock({ placement }: { placement: 'dock-bottom' | 'dock-top' }): ReactNode {
+/** An in-FLOW dock row: reserves real rows instead of covering content.
+ *  Chrome placements surround the composer; `transcript-bottom` renders at
+ *  the transcript's lower edge, directly above the prompt/composer. */
+export function AmbientDock({ placement }: { placement: 'dock-bottom' | 'dock-top' | 'transcript-bottom' }): ReactNode {
   const overlay = useStore($overlayState)
   const ctx = useRenderCtx()
   const docked = overlay.ambient.filter(active => zoneOf(active) === placement)

@@ -553,6 +553,8 @@ export const AppLayout = memo(function AppLayout({
 
         {!overlay.agents && !overlay.journey && (
           <>
+            <AmbientDock placement="transcript-bottom" />
+
             <PerfPane id="prompt">
               <PromptZone
                 cols={composer.cols}
