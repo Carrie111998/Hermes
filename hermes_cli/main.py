@@ -2531,6 +2531,22 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
+    # --query-file: read the single query from a file instead of -q/--query.
+    # Needed for very large prompts (e.g. harness-dispatch runs) that exceed
+    # the kernel's per-argv limit (MAX_ARG_STRLEN ~128KiB). Normalized here so
+    # both the TUI path and the classic CLI path see a plain `args.query`.
+    query_file = getattr(args, "query_file", None)
+    if query_file:
+        if getattr(args, "query", None):
+            print("Error: use either -q/--query or --query-file, not both.")
+            sys.exit(2)
+        try:
+            with open(query_file, "r", encoding="utf-8") as _qf:
+                args.query = _qf.read()
+        except OSError as exc:
+            print(f"Error: cannot read --query-file {query_file!r}: {exc}")
+            sys.exit(2)
+
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
     if continue_val and not getattr(args, "resume", None):

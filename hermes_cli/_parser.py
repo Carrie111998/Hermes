@@ -287,6 +287,14 @@ def build_top_level_parser():
         "-q", "--query", help="Single query (non-interactive mode)"
     )
     chat_parser.add_argument(
+        "--query-file",
+        help=(
+            "Path to a file whose contents are used as the single query "
+            "(alternative to -q/--query; avoids shell/argv size limits for "
+            "very large prompts). Mutually exclusive with -q/--query."
+        ),
+    )
+    chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"
     )
     # `default=argparse.SUPPRESS` on flags that are ALSO declared on the
