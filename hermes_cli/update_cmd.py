@@ -3879,6 +3879,28 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # versions). Probe the venv's core imports and repair if broken —
             # otherwise "Already up to date!" gaslights the user while their
             # install stays bricked.
+            # The same is true for Node dependencies. A failed npm refresh has
+            # already moved HEAD to the fetched commit, so the documented
+            # "fix npm and re-run hermes update" recovery lands in this
+            # commit_count == 0 branch. Re-check the manifest digest here and
+            # rebuild a stale web bundle after the dependency refresh succeeds.
+            # Successful recovery is defined by the persisted digest/stamp,
+            # not the helpers' return values: missing npm is a soft skip in
+            # _update_node_dependencies(), and _build_web_ui() may serve a
+            # stale dist after a failed build.
+            from hermes_constants import get_default_hermes_root
+
+            node_failures = _update_node_dependencies()
+            node_refresh_pending = _npm_lockfile_changed(
+                get_default_hermes_root()
+            )
+            web_refresh_pending = False
+            if not node_failures and not node_refresh_pending:
+                _m()._build_web_ui(_m().PROJECT_ROOT / "web")
+                web_refresh_pending = _m()._web_ui_build_needed(
+                    _m().PROJECT_ROOT / "web"
+                )
+
             healthy, detail = _venv_core_imports_healthy()
             if not healthy:
                 print("⚠ Checkout is current, but the venv is unhealthy:")
@@ -3919,7 +3941,12 @@ def _cmd_update_impl(args, gateway_mode: bool):
                 else:
                     print(f"⚠ Venv still unhealthy after repair: {detail_after}")
                     print("  Close all Hermes windows/gateways and re-run: hermes update")
-            else:
+            if node_failures or node_refresh_pending or web_refresh_pending:
+                print(
+                    "⚠ Checkout is current, but Node.js dependency recovery is still incomplete."
+                )
+                print("  Fix the npm error above and re-run `hermes update`.")
+            elif healthy:
                 print("✓ Already up to date!")
             if runtime_repaired is not None and not _m()._is_windows():
                 print()
