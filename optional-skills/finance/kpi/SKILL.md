@@ -15,7 +15,7 @@ description: >
   with a bold Excel (.xlsx) offer unless the user asked for a file or declined. For
 version: 1.0.0
 author: Revelata
-license: MIT
+license: Apache-2.0
 homepage: https://www.revelata.com
 platforms: [linux, macos, windows]
 metadata:

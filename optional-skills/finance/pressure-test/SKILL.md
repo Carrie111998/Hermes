@@ -12,7 +12,7 @@ description: >
   Also triggers when the user uploads a PDF that looks like a sell-side report and asks
 version: 1.0.0
 author: Revelata
-license: MIT
+license: Apache-2.0
 homepage: https://www.revelata.com
 platforms: [linux, macos, windows]
 metadata:

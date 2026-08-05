@@ -12,7 +12,7 @@ description: >
   Triggers: "full filing", "filing markdown", "quote the filing", "MD&A", "risk
 version: 1.0.0
 author: Revelata
-license: MIT
+license: Apache-2.0
 homepage: https://www.revelata.com
 platforms: [linux, macos, windows]
 metadata:
