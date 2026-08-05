@@ -84,6 +84,7 @@ const PROFILE_SCOPED_PREFIXES = [
   "/api/model/auxiliary",
   "/api/model/moa",
   "/api/model/options",
+  "/api/workspaces/interactive",
   // A named profile keeps its own pairing whitelist, and its gateway only
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
@@ -334,8 +335,69 @@ function appendSessionFilters(url: string, options: SessionQueryOptions): string
   return appendProfileParam(next, options.profile);
 }
 
+export interface InteractiveWorkspaceStartRequest {
+  project_id: string;
+  task_id: string;
+  workstream_id: string;
+  idempotency_key: string;
+  write_scope: string;
+}
+
+export interface InteractiveWorkspaceStartResponse {
+  ok: true;
+  project_id: string;
+  task_id: string;
+  workstream_id: string;
+  session_id: string;
+  repo_root: string;
+  workspace_path: string;
+  branch: string;
+  base_ref: string;
+  preflight_status: "passed" | "not_configured";
+  preflight_summary: string;
+  reused: boolean;
+}
+
+export interface InteractiveWorkspaceConnectedRequest
+  extends InteractiveWorkspaceStartRequest {
+  session_id: string;
+}
+
+export interface InteractiveWorkspaceConnectedResponse {
+  ok: true;
+  project_id: string;
+  task_id: string;
+  workstream_id: string;
+  session_id: string;
+  reused: boolean;
+}
+
 export const api = {
   buildWsUrl,
+  startInteractiveWorkspace: (
+    request: InteractiveWorkspaceStartRequest,
+    profile = getManagementProfile(),
+  ) =>
+    fetchJSON<InteractiveWorkspaceStartResponse>(
+      appendProfileParam("/api/workspaces/interactive/start", profile),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      },
+    ),
+  markInteractiveWorkspaceConnected: (
+    request: InteractiveWorkspaceConnectedRequest,
+    profile = getManagementProfile(),
+  ) =>
+    fetchJSON<InteractiveWorkspaceConnectedResponse>(
+      appendProfileParam("/api/workspaces/interactive/connected", profile),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(request),
+      },
+    ),
   getStatus: () => fetchJSON<StatusResponse>("/api/status"),
   /**
    * Identity probe for the dashboard auth gate (Phase 7).

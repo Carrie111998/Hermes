@@ -97,6 +97,14 @@ export const en: Translations = {
     currentProfileOption: "this dashboard ({name})",
     managingProfileBanner:
       "Managing profile \u201c{name}\u201d \u2014 config, keys, skills, MCPs, model, and new chats apply to that profile.",
+    workspaceStart: {
+      preparing: "Preparing task worktree, preflight, and session...",
+      failed: "The task workspace could not be prepared. No run was started.",
+      retry: "Retry workspace start",
+      failurePrefix: "Workspace start failed",
+      evidenceFailurePrefix:
+        "Chat connected, but workspace evidence could not be recorded",
+    },
   },
 
   status: {

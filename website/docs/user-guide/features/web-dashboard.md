@@ -119,6 +119,27 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 
 **Resume an existing session:** from the **Sessions** tab, click the play icon (▶) next to any session. That jumps to `/chat?resume=<id>` and launches the TUI with `--resume`, loading the full history.
 
+**Open a Project task in an isolated browser workspace:** a trusted same-dashboard link may provide `start_project`, `start_task`, `start_workstream`, `start_key`, and `write_scope` on `/chat` (plus `profile` for a non-default profile). After the dashboard's normal auth and request guards pass, the Chat page posts that bounded intent to Hermes. Hermes verifies the native Project/Task relationship, fetches the Project repository's origin, creates or reuses the Task's declared worktree and branch, runs the repository preflight, persists a Session whose CWD is that worktree, and resumes exactly that Session in the browser TUI. Retries with the same key and same intent reuse the receipt; changed intent under the same key fails closed. Starts are serialized across dashboard processes. This path does not assign the Task or create a Kanban Run.
+
+Repositories can declare the optional preflight at `.hermes/workspace-start.json`:
+
+```json
+{
+  "schema_version": 1,
+  "preflight": {
+    "command": ["bash", "scripts/worktree-preflight.sh"],
+    "required_inputs": ["write_scope"],
+    "timeout_seconds": 120,
+    "env": {
+      "PROJECT_ROOT": "workspace_path",
+      "PROJECT_WRITE_SCOPE": "write_scope"
+    }
+  }
+}
+```
+
+`command` is an argument array, never a shell string. `required_inputs` accepts only `write_scope`; every `env` key is a safe environment-variable name and every value is one of the supported aliases `workspace_path`, `write_scope`, `project_id`, `task_id`, or `workstream_id`. Hermes supplies a minimal scrubbed environment, bounds runtime/output, and removes a newly created worktree and branch if preparation fails. A prepared receipt is not connection proof: the native Task receives `interactive_session_connected` only after the exact browser Session emits a non-error PTY frame.
+
 **Session switcher (right rail):** the Chat tab carries its own ChatGPT-style conversation list in a thin right rail beside the terminal, so you can swap conversations without leaving the page. The rail stacks the model picker on top and the session list directly below it; the terminal takes up most of the screen. The list shows your most recent sessions for the active profile — title (falling back to a message preview), relative last-active time, message count, and the source channel for non-CLI sessions. Click any row to resume it in place (the terminal respawns with that conversation's history); the active session is highlighted. **New chat** starts a fresh session, and a refresh control re-pulls the list. The rail is read-only for switching — delete, rename, export, and bulk cleanup still live on the **Sessions** tab. On narrow screens it folds into a slide-over panel.
 
 **Prerequisites:**
@@ -127,7 +148,7 @@ The **Chat** tab embeds the full Hermes TUI (the same interface you get from `he
 - `ptyprocess` — installed by the `pty` extra (`cd ~/.hermes/hermes-agent && uv pip install -e ".[web,pty]"`, or `[all]` covers both)
 - POSIX kernel (Linux, macOS, or WSL2).  The `/chat` terminal pane specifically needs a POSIX PTY — native Windows Python has no equivalent, so on a native Windows install the rest of the dashboard (sessions, jobs, metrics, config editor) works but the `/chat` tab will show a banner telling you to use WSL2 for that feature.
 
-Close the browser tab and the PTY is reaped cleanly on the server. Re-opening spawns a fresh session.
+Legacy one-socket chats are reaped when the browser disconnects. Keep-alive chats use their attach token to retain the PTY for a bounded reattach window; an explicit process exit still ends the Session.
 
 To point [Hermes Desktop](#connecting-hermes-desktop-to-a-remote-backend) at a dashboard running on another machine instead of its own bundled backend, see the remote-backend section below.
 

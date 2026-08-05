@@ -592,6 +592,24 @@ def _unique_dir(base: str) -> str:
     return candidate
 
 
+def _worktree_directory_name(options: dict) -> str:
+    """Resolve an optional exact internal directory name, otherwise slugify UX text."""
+    exact = str(options.get("directoryName") or "").strip()
+    if exact:
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,119}", exact):
+            raise RuntimeError("Invalid worktree directory name.")
+        return exact
+    return _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
+
+
+def _worktree_for_branch(root: str, branch: str) -> Optional[dict]:
+    """Return the canonical worktree already owning ``branch``, if any."""
+    for worktree in worktree_list(root):
+        if worktree.get("branch") == branch:
+            return worktree
+    return None
+
+
 def worktree_add(cwd: str, options: dict) -> dict:
     _ensure_repo(cwd)
     root = _main_root(cwd)
@@ -601,6 +619,13 @@ def worktree_add(cwd: str, options: dict) -> dict:
     if options.get("existingBranch"):
         if not existing:
             raise RuntimeError("Branch name is required.")
+        checked_out = _worktree_for_branch(root, existing)
+        if checked_out:
+            return {
+                "path": checked_out["path"],
+                "branch": existing,
+                "repoRoot": root,
+            }
         if existing == _default_branch(root):
             _git_ok(root, ["switch", existing])
             return {"path": root, "branch": existing, "repoRoot": root}
@@ -608,8 +633,15 @@ def worktree_add(cwd: str, options: dict) -> dict:
         _git_ok(root, ["worktree", "add", target, existing])
         return {"path": target, "branch": existing, "repoRoot": root}
 
-    slug = _slugify(options.get("name") or f"work-{os.urandom(4).hex()}")
+    slug = _worktree_directory_name(options)
     branch = _sanitize_branch(options.get("branch") or "") or f"hermes/{slug}"
+    checked_out = _worktree_for_branch(root, branch)
+    if checked_out:
+        return {
+            "path": checked_out["path"],
+            "branch": branch,
+            "repoRoot": root,
+        }
     target = _unique_dir(os.path.join(root, ".worktrees", slug))
     args = ["worktree", "add", "-b", branch, target]
     if options.get("base"):
@@ -625,7 +657,19 @@ def worktree_add(cwd: str, options: dict) -> dict:
     code, _, err = _git(root, args)
     if code != 0:
         if "already exists" in (err or "").lower():
-            _git_ok(root, ["worktree", "add", target, branch])
+            code, _, retry_err = _git(root, ["worktree", "add", target, branch])
+            if code != 0:
+                # A concurrent identical request may have won after our first
+                # branch lookup. Recover that canonical worktree instead of
+                # creating a duplicate or surfacing a false failure.
+                checked_out = _worktree_for_branch(root, branch)
+                if checked_out:
+                    return {
+                        "path": checked_out["path"],
+                        "branch": branch,
+                        "repoRoot": root,
+                    }
+                raise RuntimeError(retry_err.strip() or "git worktree add failed")
         else:
             raise RuntimeError(err.strip() or "git worktree add failed")
     return {"path": target, "branch": branch, "repoRoot": root}

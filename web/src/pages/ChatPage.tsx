@@ -289,6 +289,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     title: string | null;
   }>({ scope: "", title: null });
   const { t } = useI18n();
+  const workspaceStartCopy = t.app.workspaceStart ?? {
+    preparing: "Preparing task worktree, preflight, and session...",
+    failed: "The task workspace could not be prepared. No run was started.",
+    retry: "Retry workspace start",
+    failurePrefix: "Workspace start failed",
+    evidenceFailurePrefix:
+      "Chat connected, but workspace evidence could not be recorded",
+  };
   const closeMobilePanel = useCallback(() => setMobilePanelOpenRaw(false), []);
   const modelToolsLabel = useMemo(
     () => `${t.app.modelToolsSheetTitle} ${t.app.modelToolsSheetSubtitle}`,
@@ -321,10 +329,34 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
-  const { profile: scopedProfile } = useProfileScope();
+  const { profile: managementProfile } = useProfileScope();
+  const explicitProfile = searchParams.get("profile")?.trim() ?? "";
+  const chatProfile = explicitProfile || managementProfile;
+  const startProject = searchParams.get("start_project")?.trim() ?? "";
+  const startTask = searchParams.get("start_task")?.trim() ?? "";
+  const startWorkstream = searchParams.get("start_workstream")?.trim() ?? "";
+  const startKey = searchParams.get("start_key")?.trim() ?? "";
+  const startScope = searchParams.get("write_scope")?.trim() ?? "";
+  const hasWorkspaceStartIntent = Boolean(
+    startProject || startTask || startWorkstream || startKey || startScope,
+  );
+  const workspaceStartBlocked = hasWorkspaceStartIntent && !resumeParam;
+  const [workspaceStartAttempt, setWorkspaceStartAttempt] = useState(0);
+  const [workspaceStartState, setWorkspaceStartState] = useState<
+    "idle" | "starting" | "failed"
+  >(() => (workspaceStartBlocked ? "starting" : "idle"));
+  const workspaceStartReceiptRef = useRef<{
+    project_id: string;
+    task_id: string;
+    workstream_id: string;
+    idempotency_key: string;
+    write_scope: string;
+    session_id: string;
+  } | null>(null);
+  const workspaceConnectedReportedRef = useRef<string | null>(null);
   const channel = useMemo(
-    () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
-    [resumeParam, scopedProfile],
+    () => generateChannelId(`${resumeParam ?? ""}\0${chatProfile}`),
+    [resumeParam, chatProfile],
   );
   const titleScope = `${channel}\0${reconnectNonce}`;
   const sessionTitle =
@@ -333,6 +365,90 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
     [titleScope],
   );
+
+  useEffect(() => {
+    if (!workspaceStartBlocked) return;
+
+    let cancelled = false;
+    const missing = [
+      ["project", startProject],
+      ["task", startTask],
+      ["workstream", startWorkstream],
+      ["idempotency key", startKey],
+    ]
+      .filter(([, value]) => !value)
+      .map(([name]) => name);
+
+    void Promise.resolve()
+      .then(() => {
+        if (missing.length) {
+          throw new Error(`Workspace start is missing: ${missing.join(", ")}`);
+        }
+        return api.startInteractiveWorkspace(
+          {
+            project_id: startProject,
+            task_id: startTask,
+            workstream_id: startWorkstream,
+            idempotency_key: startKey,
+            write_scope: startScope,
+          },
+          chatProfile,
+        );
+      })
+      .then((result) => {
+        if (cancelled) return;
+        workspaceStartReceiptRef.current = {
+          project_id: startProject,
+          task_id: startTask,
+          workstream_id: startWorkstream,
+          idempotency_key: startKey,
+          write_scope: startScope,
+          session_id: result.session_id,
+        };
+        workspaceConnectedReportedRef.current = null;
+        setBanner(null);
+        setWorkspaceStartState("idle");
+        setSearchParams(
+          (current) => {
+            const next = new URLSearchParams(current);
+            for (const name of [
+              "start_project",
+              "start_task",
+              "start_workstream",
+              "start_key",
+              "write_scope",
+            ]) {
+              next.delete(name);
+            }
+            next.set("resume", result.session_id);
+            if (chatProfile) next.set("profile", chatProfile);
+            return next;
+          },
+          { replace: true },
+        );
+      })
+      .catch((err: unknown) => {
+        if (cancelled) return;
+        const message = err instanceof Error ? err.message : String(err);
+        setWorkspaceStartState("failed");
+        setBanner(`${workspaceStartCopy.failurePrefix}: ${message}`);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    workspaceStartBlocked,
+    workspaceStartAttempt,
+    startProject,
+    startTask,
+    startWorkstream,
+    startKey,
+    startScope,
+    chatProfile,
+    workspaceStartCopy.failurePrefix,
+    setSearchParams,
+  ]);
 
   useEffect(() => {
     if (!isActive) {
@@ -350,7 +466,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let cancelled = false;
 
     api
-      .getSessionDetail(resumeParam, scopedProfile)
+      .getSessionDetail(resumeParam, chatProfile)
       .then((session) => {
         if (cancelled) return;
         handleSessionTitleChange(normalizeSessionTitle(session.title));
@@ -362,7 +478,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, handleSessionTitleChange]);
+  }, [resumeParam, chatProfile, handleSessionTitleChange]);
 
   useEffect(() => {
     if (!resumeParam) return;
@@ -370,7 +486,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     let cancelled = false;
 
     api
-      .getSessionLatestDescendant(resumeParam, scopedProfile)
+      .getSessionLatestDescendant(resumeParam, chatProfile)
       .then((res) => {
         if (cancelled || !res.session_id || res.session_id === resumeParam) {
           return;
@@ -387,7 +503,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, searchParams, setSearchParams]);
+  }, [resumeParam, chatProfile, searchParams, setSearchParams]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -476,6 +592,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     // mounted, hidden ChatPage from opening `/api/pty` on every dashboard
     // page. Sticky, so switching away from /chat keeps the PTY alive.
     if (!hasActivated) return;
+    if (workspaceStartBlocked) return;
 
     const host = hostRef.current;
     if (!host) return;
@@ -610,7 +727,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       void (async () => {
         const paths: string[] = [];
         for (const file of files) {
-          const uploaded = await uploadChatImage(file, scopedProfile);
+          const uploaded = await uploadChatImage(file, chatProfile);
           if (imageUploadDisposed) return;
           paths.push(uploaded.path);
         }
@@ -978,7 +1095,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
-      if (scopedProfile) params.profile = scopedProfile;
+      if (chatProfile) params.profile = chatProfile;
       const url = await api.buildWsUrl("/api/pty", params);
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
@@ -1059,6 +1176,31 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           : decoder.decode(new Uint8Array(ev.data as ArrayBuffer), {
               stream: true,
             });
+      // Mixed-clock compatibility: older dashboard servers sent startup
+      // failures as ordinary ANSI terminal frames before closing with 1011.
+      // Render those bytes, but never treat them as PTY-process evidence.
+      const isLegacyStartupFailure =
+        text.includes("Chat unavailable:") ||
+        text.includes("Chat failed to start:");
+      const receipt = workspaceStartReceiptRef.current;
+      if (
+        text &&
+        !isLegacyStartupFailure &&
+        receipt &&
+        receipt.session_id === resumeParam &&
+        workspaceConnectedReportedRef.current !== receipt.session_id
+      ) {
+        workspaceConnectedReportedRef.current = receipt.session_id;
+        void api
+          .markInteractiveWorkspaceConnected(receipt, chatProfile)
+          .catch((err: unknown) => {
+            workspaceConnectedReportedRef.current = null;
+            const message = err instanceof Error ? err.message : String(err);
+            setBanner(
+              `${workspaceStartCopy.evidenceFailurePrefix}: ${message}`,
+            );
+          });
+      }
       // Gate hydration on the payload actually written to xterm. The
       // sanitizer can turn a nonempty erase-only / all-newline / partial-CSI
       // resume frame into "" (pty-resume-sanitizer.ts); keying off raw `text`
@@ -1134,8 +1276,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
         return;
       }
       if (ev.code === 1011) {
-        // Server already wrote an ANSI error frame.
         setPtyState("closed");
+        if (ev.reason) {
+          setBanner(`Chat failed to start: ${ev.reason}`);
+        }
         return;
       }
       // Keep-alive close-code contract (web_server.pty_ws + pty_session):
@@ -1275,8 +1419,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     channel,
     clearReconnectTimer,
     resumeParam,
-    scopedProfile,
+    chatProfile,
+    workspaceStartBlocked,
     reconnectNonce,
+    workspaceStartCopy.evidenceFailurePrefix,
   ]);
 
   // When the user returns to the chat tab (isActive: false → true), the
@@ -1480,14 +1626,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <div className="border-b border-current/10 px-1 py-2">
               <ChatSidebar
                 channel={channel}
-                profile={scopedProfile}
+                profile={chatProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
             </div>
             <ChatSessionList
               activeSessionId={resumeParam}
-              profile={scopedProfile}
+              profile={chatProfile}
               onPicked={closeMobilePanel}
               onNewChat={startFreshDashboardChat}
             />
@@ -1523,6 +1669,32 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             ref={hostRef}
             className="hermes-chat-xterm-host min-h-0 min-w-0 flex-1"
           />
+
+          {workspaceStartBlocked && (
+            <div
+              className="absolute inset-0 z-30 flex flex-col items-center justify-center gap-3 bg-black/80 px-6 text-center"
+              role="status"
+              aria-live="polite"
+            >
+              <div className="text-sm tracking-wide text-white/90">
+                {workspaceStartState === "failed"
+                  ? workspaceStartCopy.failed
+                  : workspaceStartCopy.preparing}
+              </div>
+              {workspaceStartState === "failed" && (
+                <Button
+                  onClick={() => {
+                    setBanner(null);
+                    setWorkspaceStartState("starting");
+                    setWorkspaceStartAttempt((value) => value + 1);
+                  }}
+                  prefix={<RotateCcw className="h-4 w-4" />}
+                >
+                  {workspaceStartCopy.retry}
+                </Button>
+              )}
+            </div>
+          )}
 
           {showReconnectOverlay && (
             <div className="absolute inset-x-3 top-3 z-20 flex justify-center sm:inset-x-auto sm:right-3 sm:justify-end">
@@ -1613,7 +1785,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <div className="shrink-0">
               <ChatSidebar
                 channel={channel}
-                profile={scopedProfile}
+                profile={chatProfile}
                 onDashboardNewSessionRequest={startFreshDashboardChat}
                 onSessionTitleChange={handleSessionTitleChange}
               />
@@ -1623,7 +1795,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
             <div className="min-h-0 flex-1 overflow-hidden">
               <ChatSessionList
                 activeSessionId={resumeParam}
-                profile={scopedProfile}
+                profile={chatProfile}
                 onNewChat={startFreshDashboardChat}
               />
             </div>

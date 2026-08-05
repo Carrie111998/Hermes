@@ -3569,6 +3569,7 @@ class TestPtyWebSocket:
 
 
     def test_unavailable_platform_closes_with_message(self, monkeypatch):
+        from starlette.websockets import WebSocketDisconnect
         from hermes_cli.pty_bridge import PtyUnavailableError
 
         def _raise(argv, **kwargs):
@@ -3584,10 +3585,11 @@ class TestPtyWebSocket:
 
         monkeypatch.setattr(ws_mod.PtyBridge, "spawn", classmethod(lambda cls, *a, **k: _raise(*a, **k)))
 
-        with self.client.websocket_connect(self._url()) as conn:
-            # Expect a final text frame with the error message, then close.
-            msg = conn.receive_text()
-            assert "pty missing" in msg or "unavailable" in msg.lower() or "pty" in msg.lower()
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with self.client.websocket_connect(self._url()) as conn:
+                conn.receive_text()
+        assert exc_info.value.code == 1011
+        assert "pty missing" in exc_info.value.reason.lower()
 
 
 

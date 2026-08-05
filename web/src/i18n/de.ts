@@ -90,6 +90,15 @@ export const de: Translations = {
     statusOverview: "Statusübersicht",
     system: "System",
     webUi: "Web UI",
+    workspaceStart: {
+      preparing: "Hermes bereitet Worktree, Preflight und Session vor …",
+      failed:
+        "Der Task-Workspace konnte nicht vorbereitet werden. Es wurde kein Run gestartet.",
+      retry: "Workspace-Start erneut versuchen",
+      failurePrefix: "Workspace-Start fehlgeschlagen",
+      evidenceFailurePrefix:
+        "Chat verbunden, aber der Verbindungsnachweis konnte nicht gespeichert werden",
+    },
   },
 
   status: {

@@ -3975,6 +3975,52 @@ def _append_event(
     )
 
 
+def append_task_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> None:
+    """Append a durable non-run task lifecycle event.
+
+    Interactive surfaces sometimes need to record native task-adjacent state
+    without claiming the task or manufacturing a worker run.  Keep that write
+    on the same event ledger every Kanban consumer already reads, and retain the
+    delegated-child mutation guard used by the rest of the public write API.
+    """
+    _assert_not_delegated_child_mutation()
+    if get_task(conn, task_id) is None:
+        raise ValueError(f"task not found: {task_id}")
+    clean_kind = str(kind or "").strip()
+    if not clean_kind:
+        raise ValueError("event kind is required")
+    with write_txn(conn):
+        _append_event(conn, task_id, clean_kind, payload)
+
+
+def bind_workspace_and_append_task_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    workspace_path: Path | str,
+    branch_name: str,
+    kind: str,
+    payload: Optional[dict] = None,
+) -> None:
+    """Atomically bind a task workspace and append its non-run receipt."""
+    _assert_not_delegated_child_mutation()
+    if get_task(conn, task_id) is None:
+        raise ValueError(f"task not found: {task_id}")
+    clean_kind = str(kind or "").strip()
+    if not clean_kind:
+        raise ValueError("event kind is required")
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ?, branch_name = ? WHERE id = ?",
+            (str(workspace_path), str(branch_name), task_id),
+        )
+        _append_event(conn, task_id, clean_kind, payload)
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,

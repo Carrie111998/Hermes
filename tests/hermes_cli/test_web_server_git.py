@@ -75,6 +75,29 @@ def test_stage_commit_roundtrip_clears_changes(client, repo):
 
 
 
+def test_worktree_add_recovers_existing_branch_idempotently(client, repo):
+    payload = {
+        "path": str(repo),
+        "name": "browser-retry",
+        "branch": "feature/browser-retry",
+    }
+
+    first = client.post("/api/git/worktree/add", json=payload)
+    second = client.post("/api/git/worktree/add", json=payload)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert second.json() == first.json()
+    worktrees = subprocess.run(
+        ["git", "worktree", "list", "--porcelain"],
+        cwd=repo,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert worktrees.count("branch refs/heads/feature/browser-retry") == 1
+
+
 def test_worktree_add_initializes_plain_folder(client, tmp_path):
     folder = tmp_path / "plain-project"
     folder.mkdir()

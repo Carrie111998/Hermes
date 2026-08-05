@@ -13631,6 +13631,140 @@ def _config_profile_scope(profile: Optional[str]):
         reset_hermes_home_override(token)
 
 
+class InteractiveWorkspaceStartBody(BaseModel):
+    project_id: str
+    task_id: str
+    workstream_id: str
+    idempotency_key: str
+    write_scope: str = ""
+
+
+class InteractiveWorkspaceConnectedBody(InteractiveWorkspaceStartBody):
+    session_id: str
+
+
+@app.post("/api/workspaces/interactive/start")
+async def start_interactive_workspace(
+    body: InteractiveWorkspaceStartBody,
+    profile: Optional[str] = Query(default=None),
+):
+    """Prepare a native task worktree and a persisted resumable chat session.
+
+    This endpoint never claims the task and never creates a Kanban run.  The
+    blocking git/preflight/SQLite composition runs in the thread pool, with the
+    requested profile override installed inside that worker's context.
+    """
+    from dataclasses import asdict
+
+    from hermes_cli.interactive_workspace import (
+        InteractiveWorkspaceError,
+        InteractiveWorkspaceRequest,
+        start_interactive_task_workspace,
+    )
+
+    requested_profile = (profile or "").strip()
+
+    def _start():
+        with _config_profile_scope(requested_profile):
+            return start_interactive_task_workspace(
+                InteractiveWorkspaceRequest(
+                    project_id=body.project_id,
+                    task_id=body.task_id,
+                    workstream_id=body.workstream_id,
+                    idempotency_key=body.idempotency_key,
+                    write_scope=body.write_scope,
+                    profile_name=requested_profile,
+                )
+            )
+
+    try:
+        result = await run_in_threadpool(_start)
+    except InteractiveWorkspaceError as exc:
+        if exc.code in {"project_not_found", "task_not_found"}:
+            status = 404
+        elif exc.code in {
+            "project_task_mismatch",
+            "idempotency_mismatch",
+            "workspace_collision",
+            "branch_collision",
+            "stale_start_receipt",
+        }:
+            status = 409
+        elif exc.code in {
+            "fetch_failed",
+            "base_not_found",
+            "preflight_failed",
+            "preflight_config_invalid",
+            "write_scope_required",
+        }:
+            status = 422
+        else:
+            status = 400
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "details": exc.details,
+            },
+        ) from exc
+    return {"ok": True, **asdict(result)}
+
+
+@app.post("/api/workspaces/interactive/connected")
+async def mark_interactive_workspace_connected(
+    body: InteractiveWorkspaceConnectedBody,
+    profile: Optional[str] = Query(default=None),
+):
+    """Record the first PTY frame observed by the authenticated browser."""
+    from dataclasses import asdict
+
+    from hermes_cli.interactive_workspace import (
+        InteractiveWorkspaceError,
+        InteractiveWorkspaceRequest,
+        mark_interactive_task_session_connected,
+    )
+
+    requested_profile = (profile or "").strip()
+
+    def _mark_connected():
+        with _config_profile_scope(requested_profile):
+            return mark_interactive_task_session_connected(
+                InteractiveWorkspaceRequest(
+                    project_id=body.project_id,
+                    task_id=body.task_id,
+                    workstream_id=body.workstream_id,
+                    idempotency_key=body.idempotency_key,
+                    write_scope=body.write_scope,
+                    profile_name=requested_profile,
+                ),
+                body.session_id,
+            )
+
+    try:
+        result = await run_in_threadpool(_mark_connected)
+    except InteractiveWorkspaceError as exc:
+        status = 404 if exc.code in {
+            "project_not_found",
+            "task_not_found",
+            "workspace_not_prepared",
+        } else 409 if exc.code in {
+            "project_task_mismatch",
+            "idempotency_mismatch",
+            "session_intent_mismatch",
+            "stale_start_receipt",
+        } else 400
+        raise HTTPException(
+            status_code=status,
+            detail={
+                "code": exc.code,
+                "message": str(exc),
+                "details": exc.details,
+            },
+        ) from exc
+    return {"ok": True, **asdict(result)}
+
+
 app.include_router(_skills_routes.router)
 from hermes_cli.web_routers.skills import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     get_skills,
@@ -15664,13 +15798,12 @@ async def pty_ws(ws: WebSocket) -> None:
     # On native Windows, the POSIX PTY bridge can't be imported.  Tell the
     # client and close cleanly rather than pretending the feature works.
     if not _PTY_BRIDGE_AVAILABLE:
-        await ws.send_text(
-            "\r\n\x1b[31mChat unavailable: the embedded terminal requires a "
-            "POSIX PTY, which native Windows Python doesn't provide.\x1b[0m\r\n"
-            "\x1b[33mInstall Hermes inside WSL2 to use the dashboard's /chat "
-            "tab — the rest of the dashboard works here.\x1b[0m\r\n"
+        await ws.close(
+            code=1011,
+            reason=_ws_close_reason(
+                "embedded chat requires a POSIX PTY; use Hermes inside WSL2"
+            ),
         )
-        await ws.close(code=1011)
         return
 
     # --- spawn PTY ------------------------------------------------------
@@ -15707,13 +15840,11 @@ async def pty_ws(ws: WebSocket) -> None:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
     except HTTPException as exc:
         # Unknown/invalid profile from _resolve_profile_dir.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
-        await ws.close(code=1011)
+        await ws.close(code=1011, reason=_ws_close_reason(str(exc.detail)))
         return
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
+        await ws.close(code=1011, reason=_ws_close_reason(str(exc)))
         return
 
 
@@ -15733,12 +15864,10 @@ async def pty_ws(ws: WebSocket) -> None:
         try:
             bridge = _spawn()
         except PtyUnavailableError as exc:
-            await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-            await ws.close(code=1011)
+            await ws.close(code=1011, reason=_ws_close_reason(str(exc)))
             return
         except (FileNotFoundError, OSError) as exc:
-            await ws.send_text(f"\r\n\x1b[31mChat failed to start: {exc}\x1b[0m\r\n")
-            await ws.close(code=1011)
+            await ws.close(code=1011, reason=_ws_close_reason(str(exc)))
             return
         await _legacy_pump(ws, bridge)
         return
@@ -15749,12 +15878,10 @@ async def pty_ws(ws: WebSocket) -> None:
             attach_token, spawn=_spawn
         )
     except PtyUnavailableError as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
+        await ws.close(code=1011, reason=_ws_close_reason(str(exc)))
         return
     except (FileNotFoundError, OSError, RegistryFull) as exc:
-        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
-        await ws.close(code=1011)
+        await ws.close(code=1011, reason=_ws_close_reason(str(exc)))
         return
 
     await session.attach(ws)

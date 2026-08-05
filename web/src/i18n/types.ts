@@ -115,6 +115,14 @@ export interface Translations {
     managingProfile?: string;
     currentProfileOption?: string;
     managingProfileBanner?: string;
+    /** Optional — untranslated locales use the English workspace-start copy. */
+    workspaceStart?: {
+      preparing: string;
+      failed: string;
+      retry: string;
+      failurePrefix: string;
+      evidenceFailurePrefix: string;
+    };
   };
 
   // ── Status page ──
