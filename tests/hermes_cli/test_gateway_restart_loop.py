@@ -695,6 +695,22 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_referenced_path_with_embedded_nul_does_not_crash_guard(self):
+        """#76762 follow-up: a tokenized path containing an embedded NUL byte
+        can reach os.open() inside _read_referenced_script() directly, which
+        raises ValueError (not OSError) before Path.resolve() is ever called.
+        Real trigger: a terminal command whose arguments include plist paths
+        expanded from binary-adjacent content. The guard must skip it, not
+        crash the terminal tool.
+        """
+        from pathlib import Path
+
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(Path("/tmp/bad\x00path.sh"))
+        assert text is None
+        assert unsafe is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

@@ -260,6 +260,13 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         descriptor = os.open(path, flags)
     except OSError:
         return None, False
+    except ValueError:
+        # A tokenized "path" containing an embedded NUL byte (e.g. harvested
+        # from binary content) can reach os.open() before Path.resolve() ever
+        # runs — os.open raises ValueError for it, not OSError. Same rationale
+        # as the resolve() guard below: a guarded path must never crash the
+        # guard (#76762).
+        return None, False
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
