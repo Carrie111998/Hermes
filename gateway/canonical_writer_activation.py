@@ -102,7 +102,7 @@ ACTIVATION_FAILURE_SCHEMA = "muncho-writer-only-activation-failure.v1"
 OWNER_APPROVAL_SCHEMA = OWNER_APPROVAL_RECEIPT_SCHEMA
 SYSTEMD_BUNDLE_SCHEMA = "muncho-writer-only-systemd-bundle.v3"
 RELEASE_SCHEMA = "muncho-writer-only-release.v1"
-NATIVE_OBSERVATION_SCHEMA = "muncho-writer-native-observation.v1"
+NATIVE_OBSERVATION_SCHEMA = "muncho-writer-native-observation.v2"
 NATIVE_READ_ONLY_PREFLIGHT_SCHEMA = (
     "muncho-writer-native-read-only-preflight.v2"
 )
@@ -179,6 +179,12 @@ DEFAULT_EXTERNAL_IAM_RECEIPT_PATH = DEFAULT_EXTERNAL_IAM_LIVE_PATH
 
 SYSTEMCTL = "/usr/bin/systemctl"
 SYSTEMD_ANALYZE = "/usr/bin/systemd-analyze"
+PRE_PHASE_B_WRITER_START_ARGV = (
+    SYSTEMCTL,
+    "start",
+    "--job-mode=ignore-dependencies",
+    WRITER_UNIT,
+)
 SYSTEMD_TMPFILES = "/usr/bin/systemd-tmpfiles"
 JOURNALCTL = "/usr/bin/journalctl"
 
@@ -4037,8 +4043,16 @@ class NativeObservationExecutor:
                     plan_sha256=self.plan.sha256,
                 )
                 lifecycle_start_attempted = True
+                # Phase-B authority is derived from the completed activation
+                # receipt, so the durable readiness unit cannot run yet.  Use
+                # systemd's fixed single-job mode only inside this stopped,
+                # owner-approved observation lifecycle.  The installed writer
+                # unit keeps its hard Requires= readiness dependency for every
+                # ordinary/full-canary start.
                 self._command(
-                    (SYSTEMCTL, "start", WRITER_UNIT), "native start writer", timeout=90
+                    PRE_PHASE_B_WRITER_START_ARGV,
+                    "native start writer",
+                    timeout=90,
                 )
                 _require_active(WRITER_UNIT, runner=self.runner)
                 self.stage = "start_gateway"
@@ -4781,7 +4795,14 @@ class ActivationExecutor:
                 plan_sha256=self.plan.sha256,
             )
             service_start_attempted = True
-            self._command((SYSTEMCTL, "start", WRITER_UNIT), "start writer", timeout=90)
+            # This is the second and final pre-Phase-B observation.  Preserve
+            # the permanent readiness dependency and ignore it only for this
+            # exact owner-approved, stop-on-exit systemd job.
+            self._command(
+                PRE_PHASE_B_WRITER_START_ARGV,
+                "start writer",
+                timeout=90,
+            )
             writer_pid = _require_active(WRITER_UNIT, runner=self.runner)
             self.stage = "start_gateway"
             _require_lifecycle_owner_approval(

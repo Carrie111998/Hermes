@@ -18735,7 +18735,7 @@ class IapWriterActivationBridgeTransport(IapStoppedReleaseTransport):
             not isinstance(value, Mapping)
             or set(value) != expected_keys
             or value.get("ok") is not True
-            or value.get("schema") != "muncho-writer-native-observation.v1"
+            or value.get("schema") != "muncho-writer-native-observation.v2"
             or value.get("revision") != release_sha
             or value.get("native_observation_plan_sha256") != plan_sha256
             or type(value.get("idempotent")) is not bool

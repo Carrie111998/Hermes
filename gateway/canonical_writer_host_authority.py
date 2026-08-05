@@ -32,8 +32,8 @@ from typing import Any, Mapping, Sequence
 
 LEGACY_NATIVE_OBSERVATION_PLAN_SCHEMA = "muncho-writer-native-observation-plan.v2"
 NATIVE_OBSERVATION_PLAN_SCHEMA = "muncho-writer-native-observation-plan.v3"
-NATIVE_OBSERVATION_RECEIPT_SCHEMA = "muncho-writer-native-observation.v1"
-NATIVE_OBSERVATION_STAGE_SCHEMA = "muncho-writer-native-observation-stage.v1"
+NATIVE_OBSERVATION_RECEIPT_SCHEMA = "muncho-writer-native-observation.v2"
+NATIVE_OBSERVATION_STAGE_SCHEMA = "muncho-writer-native-observation-stage.v2"
 OWNER_APPROVAL_RECEIPT_SCHEMA = "muncho-writer-owner-approval.v1"
 EXTERNAL_IAM_RECEIPT_SCHEMA = "muncho-writer-external-iam-evidence.v1"
 # Observation remains live through two independently bounded 60-second service
@@ -866,6 +866,17 @@ _STOPPED_SERVICE_KEYS = frozenset(
         "main_pid",
     }
 )
+_PHASE_B_READINESS_SERVICE_KEYS = frozenset(
+    {
+        "unit_name",
+        "load_state",
+        "active_state",
+        "sub_state",
+        "unit_file_state",
+        "main_pid",
+        "fragment_path",
+    }
+)
 _DISCORD_ABSENCE_KEYS = frozenset(
     {
         "unit_name",
@@ -898,6 +909,7 @@ _LIVE_OBSERVATION_KEYS = frozenset(
         "expires_at_boottime_ns",
         "gateway_service",
         "writer_service",
+        "phase_b_readiness_service",
         "discord_absence",
         "legacy_helper_absence",
     }
@@ -910,6 +922,7 @@ _FINAL_STATE_KEYS = frozenset(
         "finalized_at_boottime_ns",
         "gateway_service",
         "writer_service",
+        "phase_b_readiness_service",
         "discord_absence",
     }
 )
@@ -1138,6 +1151,31 @@ def _validate_stopped_service(value: Any, *, unit: Mapping[str, Any]) -> None:
         raise ValueError("native receipt service was not finalized stopped/off")
 
 
+def _validate_pre_phase_b_readiness_service(
+    value: Any,
+    *,
+    unit: Mapping[str, Any],
+) -> None:
+    service = _exact_keys(
+        value,
+        _PHASE_B_READINESS_SERVICE_KEYS,
+        "pre-Phase-B readiness service",
+    )
+    if (
+        service.get("unit_name") != unit.get("name")
+        or service.get("load_state") != "loaded"
+        or service.get("active_state") != "inactive"
+        or service.get("sub_state") != "dead"
+        or service.get("unit_file_state") != "static"
+        or type(service.get("main_pid")) is not int
+        or service.get("main_pid") != 0
+        or service.get("fragment_path") != unit.get("path")
+    ):
+        raise ValueError(
+            "native pre-Phase-B readiness service was not exactly inactive/static"
+        )
+
+
 @dataclass(frozen=True)
 class NativeObservationReceipt:
     """Final two-phase receipt: an approved live observation, then stopped/off."""
@@ -1235,8 +1273,16 @@ class NativeObservationReceipt:
             discovery_policy=discovery_policy,
             artifact_root=artifact_root,
         )
+        _validate_pre_phase_b_readiness_service(
+            observation.get("phase_b_readiness_service"),
+            unit=plan.value["phase_b_readiness_unit"],
+        )
         _validate_stopped_service(final.get("gateway_service"), unit=plan.value["gateway_unit"])
         _validate_stopped_service(final.get("writer_service"), unit=plan.value["writer_unit"])
+        _validate_pre_phase_b_readiness_service(
+            final.get("phase_b_readiness_service"),
+            unit=plan.value["phase_b_readiness_unit"],
+        )
         _validate_discord_absence(observation.get("discord_absence"), plan.value["discord"])
         _validate_discord_absence(final.get("discord_absence"), plan.value["discord"])
         helper = _exact_keys(
@@ -3258,15 +3304,24 @@ def collect_native_observation(
         }
     readiness = plan.value["phase_b_readiness_unit"]
     readiness_state = _native_systemd_state(readiness["name"])
-    if (
-        readiness_state["LoadState"] != "loaded"
-        or readiness_state["ActiveState"] != "active"
-        or readiness_state["SubState"] != "exited"
-        or readiness_state["UnitFileState"] not in {"disabled", "static"}
-        or readiness_state["FragmentPath"] != readiness["path"]
-        or readiness_state["MainPID"] != 0
-    ):
-        raise RuntimeError("native Phase B readiness service is not exactly active")
+    readiness_service = {
+        "unit_name": readiness["name"],
+        "load_state": readiness_state["LoadState"],
+        "active_state": readiness_state["ActiveState"],
+        "sub_state": readiness_state["SubState"],
+        "unit_file_state": readiness_state["UnitFileState"],
+        "main_pid": readiness_state["MainPID"],
+        "fragment_path": readiness_state["FragmentPath"],
+    }
+    try:
+        _validate_pre_phase_b_readiness_service(
+            readiness_service,
+            unit=readiness,
+        )
+    except ValueError as exc:
+        raise RuntimeError(
+            "native Phase B readiness service is not exactly inactive/static"
+        ) from exc
     observed_boot = _boottime_ns()
     observation = {
         "boot_id_sha256": boot,
@@ -3278,6 +3333,7 @@ def collect_native_observation(
         ),
         "gateway_service": services["gateway"],
         "writer_service": services["writer"],
+        "phase_b_readiness_service": readiness_service,
         "discord_absence": _collect_discord_absence(plan),
         "legacy_helper_absence": collect_legacy_helper_absence(
             gateway_uid=plan.value["identities"]["gateway_uid"],
@@ -3297,6 +3353,10 @@ def collect_native_observation(
             discovery_policy=plan.value["native_discovery_policy"],
             artifact_root=plan.value["artifact_root"],
         )
+    _validate_pre_phase_b_readiness_service(
+        observation["phase_b_readiness_service"],
+        unit=plan.value["phase_b_readiness_unit"],
+    )
     return observation
 
 
@@ -3590,6 +3650,10 @@ def _validate_stage(
             discovery_policy=plan.value["native_discovery_policy"],
             artifact_root=plan.value["artifact_root"],
         )
+    _validate_pre_phase_b_readiness_service(
+        observation["phase_b_readiness_service"],
+        unit=plan.value["phase_b_readiness_unit"],
+    )
     _validate_discord_absence(observation["discord_absence"], plan.value["discord"])
     return plan, observation
 
@@ -3635,17 +3699,24 @@ def finalize_native_observation_stage(
         _validate_stopped_service(services[label], unit=unit)
     readiness = plan.value["phase_b_readiness_unit"]
     readiness_state = _native_systemd_state(readiness["name"])
-    if (
-        readiness_state["LoadState"] != "loaded"
-        or readiness_state["ActiveState"] != "inactive"
-        or readiness_state["SubState"] != "dead"
-        or readiness_state["UnitFileState"] != "static"
-        or readiness_state["FragmentPath"] != readiness["path"]
-        or readiness_state["MainPID"] != 0
-    ):
+    readiness_service = {
+        "unit_name": readiness["name"],
+        "load_state": readiness_state["LoadState"],
+        "active_state": readiness_state["ActiveState"],
+        "sub_state": readiness_state["SubState"],
+        "unit_file_state": readiness_state["UnitFileState"],
+        "main_pid": readiness_state["MainPID"],
+        "fragment_path": readiness_state["FragmentPath"],
+    }
+    try:
+        _validate_pre_phase_b_readiness_service(
+            readiness_service,
+            unit=readiness,
+        )
+    except ValueError as exc:
         raise RuntimeError(
             "native Phase B readiness service was not finalized stopped/off"
-        )
+        ) from exc
     owner_digest = validate_native_observation_approval(
         owner_approval_receipt,
         expected_plan_sha256=approved_plan_sha256,
@@ -3675,6 +3746,7 @@ def finalize_native_observation_stage(
         "finalized_at_boottime_ns": _boottime_ns(),
         "gateway_service": services["gateway"],
         "writer_service": services["writer"],
+        "phase_b_readiness_service": readiness_service,
         "discord_absence": _collect_discord_absence(plan),
     }
     receipt = NativeObservationReceipt.finalize(

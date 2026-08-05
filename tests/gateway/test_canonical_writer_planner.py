@@ -390,6 +390,16 @@ def _stopped_receipt(native_plan=None):
             "main_pid": 0,
         }
 
+    readiness = {
+        "unit_name": plan.value["phase_b_readiness_unit"]["name"],
+        "load_state": "loaded",
+        "active_state": "inactive",
+        "sub_state": "dead",
+        "unit_file_state": "static",
+        "main_pid": 0,
+        "fragment_path": plan.value["phase_b_readiness_unit"]["path"],
+    }
+
     return host_authority.NativeObservationReceipt.from_mapping({
         "schema": host_authority.NATIVE_OBSERVATION_RECEIPT_SCHEMA,
         "native_observation_plan_sha256": plan.sha256,
@@ -406,6 +416,7 @@ def _stopped_receipt(native_plan=None):
             + host_authority.NATIVE_OBSERVATION_TTL_SECONDS * 1_000_000_000,
             "gateway_service": live("gateway", 4242),
             "writer_service": live("writer", 4343),
+            "phase_b_readiness_service": readiness,
             "discord_absence": discord,
             "legacy_helper_absence": {
                 "path": str(host_authority.LEGACY_CLOUD_SQL_HELPER_PATH),
@@ -427,6 +438,7 @@ def _stopped_receipt(native_plan=None):
             "finalized_at_boottime_ns": observed + 1_000_000_000,
             "gateway_service": stopped("gateway"),
             "writer_service": stopped("writer"),
+            "phase_b_readiness_service": readiness,
             "discord_absence": discord,
         },
     })

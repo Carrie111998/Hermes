@@ -94,6 +94,18 @@ def test_command_has_fixed_clean_environment_and_rejects_shell():
         activation.Command(("/bin/sh", "-c", "true"))
 
 
+def test_pre_phase_b_writer_start_ignores_only_the_dependency_job_graph():
+    assert activation.PRE_PHASE_B_WRITER_START_ARGV == (
+        activation.SYSTEMCTL,
+        "start",
+        "--job-mode=ignore-dependencies",
+        activation.WRITER_UNIT,
+    )
+    assert activation.PHASE_B_READINESS_UNIT not in (
+        activation.PRE_PHASE_B_WRITER_START_ARGV
+    )
+
+
 def test_activation_lock_is_under_root_controlled_run_not_world_writable_run_lock():
     assert activation.ACTIVATION_LOCK_PATH == Path("/run/muncho-writer-activation.lock")
 
@@ -1217,11 +1229,18 @@ def test_final_activation_rechecks_owner_freshness_before_each_dangerous_step(
         )
 
     started = [
-        argv[2]
+        argv[-1]
         for argv in commands
         if argv[:2] == (activation.SYSTEMCTL, "start")
     ]
     assert started == expected_started
+    if expected_started:
+        writer_start = next(
+            argv
+            for argv in commands
+            if argv[:2] == (activation.SYSTEMCTL, "start")
+        )
+        assert writer_start == activation.PRE_PHASE_B_WRITER_START_ARGV
     assert activation.GATEWAY_UNIT not in started
     assert bool(seals) is expected_sealed
     if expire_on_require <= 3:
@@ -1451,6 +1470,113 @@ def test_native_expired_approval_after_host_mutation_is_forensic(
     ]
 
 
+def test_native_observation_uses_exact_pre_phase_b_writer_start(
+    tmp_path,
+    monkeypatch,
+):
+    plan = activation.NativeObservationPlan(value={
+        "revision": "b" * 40,
+        "external_iam_policy_sha256": "c" * 64,
+    })
+    owner = _owner_approval("native_observation", plan.sha256)
+    commands = []
+    writes = []
+
+    def runner(command):
+        commands.append(command.argv)
+        return subprocess.CompletedProcess(
+            command.argv,
+            1 if command.argv == activation.PRE_PHASE_B_WRITER_START_ARGV else 0,
+            b"",
+            b"",
+        )
+
+    executor = activation.NativeObservationExecutor(plan, runner=runner)
+    quarantine = tmp_path / "quarantine.json"
+    failure = tmp_path / "failure.json"
+    monkeypatch.setattr(activation, "_host_activation_lock", lambda: nullcontext())
+    monkeypatch.setattr(activation, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(activation, "DEFAULT_QUARANTINE_PATH", quarantine)
+    monkeypatch.setattr(activation.os.path, "lexists", lambda _path: False)
+    monkeypatch.setattr(
+        activation,
+        "_native_receipt_path",
+        lambda _plan: tmp_path / "native-receipt.json",
+    )
+    monkeypatch.setattr(
+        activation,
+        "_native_stage_path",
+        lambda _plan: tmp_path / "native-stage.json",
+    )
+    iam_receipt = SimpleNamespace(sha256="e" * 64)
+    monkeypatch.setattr(
+        activation,
+        "_load_lifecycle_external_iam",
+        lambda *_args, **_kwargs: iam_receipt,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_verify_native_preflight_inputs",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_archive_plan_external_iam",
+        lambda *_args, **_kwargs: {},
+    )
+    monkeypatch.setattr(activation, "_host_identity_snapshot", lambda: {})
+    monkeypatch.setattr(
+        activation,
+        "prepare_canary_host_identities",
+        lambda *_args, **_kwargs: {"changed": False},
+    )
+    monkeypatch.setattr(
+        activation,
+        "_record_host_preparation",
+        lambda *_args, **_kwargs: {
+            "receipt_path": str(tmp_path / "host.json"),
+            "receipt_sha256": "d" * 64,
+        },
+    )
+    monkeypatch.setattr(
+        activation,
+        "_install_native_observation_artifacts",
+        lambda _plan: (),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_prepare_native_runtime_directories",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_require_off_disabled",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_require_off_or_absent",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(activation, "_native_failure_path", lambda _plan: failure)
+    monkeypatch.setattr(activation, "_ensure_root_directory", lambda *_args: None)
+    monkeypatch.setattr(
+        activation,
+        "_write_root_receipt",
+        lambda path, value: writes.append((path, value)),
+    )
+
+    with pytest.raises(RuntimeError, match="failed closed"):
+        executor.observe(
+            approved_plan_sha256=plan.sha256,
+            owner_approval_receipt=owner,
+            external_iam_receipt_path=activation.DEFAULT_EXTERNAL_IAM_LIVE_PATH,
+        )
+
+    assert activation.PRE_PHASE_B_WRITER_START_ARGV in commands
+    assert [path for path, _value in writes] == [failure, quarantine]
+
+
 def test_host_identity_convergence_retries_only_until_exact(monkeypatch):
     snapshots = iter((
         {"state": "stale"},
@@ -1633,7 +1759,7 @@ def test_writer_start_failure_still_unconditionally_stops_gateway_then_writer(
         commands.append(command.argv)
         returncode = (
             1
-            if command.argv == (activation.SYSTEMCTL, "start", activation.WRITER_UNIT)
+            if command.argv == activation.PRE_PHASE_B_WRITER_START_ARGV
             else 0
         )
         return subprocess.CompletedProcess(command.argv, returncode, b"", b"")
