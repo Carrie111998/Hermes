@@ -5959,6 +5959,59 @@ def resolve_provider_client(
         return (_to_async_client(client, final_model, is_vision=is_vision) if async_mode
                 else (client, final_model))
 
+    # ── MiniMax OAuth (native Anthropic Messages API) ────────────────
+    # MoA resolves this provider's OAuth token via runtime_provider and passes
+    # it here explicitly. Without this branch it falls through to the generic
+    # API-key-provider path, which only handles auth_type="api_key" and
+    # returns (None, None) despite a valid OAuth credential.
+    if provider == "minimax-oauth":
+        minimax_key = str(explicit_api_key or "").strip()
+        minimax_base = str(explicit_base_url or "").strip().rstrip("/")
+        if not minimax_key or not minimax_base:
+            try:
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+
+                minimax_runtime = resolve_runtime_provider(
+                    requested="minimax-oauth", target_model=model or ""
+                )
+                minimax_key = minimax_key or str(
+                    minimax_runtime.get("api_key") or ""
+                ).strip()
+                minimax_base = minimax_base or str(
+                    minimax_runtime.get("base_url") or ""
+                ).strip().rstrip("/")
+            except Exception as exc:
+                logger.debug("MiniMax OAuth auxiliary runtime resolution failed: %s", exc)
+        if not minimax_key or not minimax_base:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth requested but no OAuth "
+                "credentials were available (run: hermes auth add minimax-oauth)"
+            )
+            return None, None
+        final_model = (
+            _normalize_resolved_model(
+                model or _get_aux_model_for_provider(provider), provider
+            )
+            or ""
+        )
+        try:
+            from agent.anthropic_adapter import build_anthropic_client
+
+            real_client = build_anthropic_client(minimax_key, minimax_base)
+        except ImportError:
+            logger.warning(
+                "resolve_provider_client: minimax-oauth requires the anthropic SDK"
+            )
+            return None, None
+        client = AnthropicAuxiliaryClient(
+            real_client, final_model, minimax_key, minimax_base, is_oauth=False
+        )
+        return (
+            _to_async_client(client, final_model, is_vision=is_vision)
+            if async_mode
+            else (client, final_model)
+        )
+
     # ── Custom endpoint (OPENAI_BASE_URL + OPENAI_API_KEY) ───────────
     if provider == "custom":
         custom_base = ""
