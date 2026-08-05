@@ -130,11 +130,15 @@ def test_reap_worker_zombies_noop_when_no_children():
 @pytest.mark.skipif(os.name == "nt", reason="fork-based reap test is POSIX-only")
 def test_reap_worker_zombies_reaps_and_records():
     """POSIX: spawn a child that exits; reap it and see it in the registry."""
-    child = subprocess.Popen([sys.executable, "-c", "pass"])
-    child.wait()  # now a zombie until reaped
+    # fork() so the child becomes a real zombie: subprocess.wait() would reap
+    # the child itself (waitpid consumes it), leaving nothing for
+    # reap_worker_zombies() to find.
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)  # child exits immediately; parent does not wait -> zombie
     reaped = reap_worker_zombies()
-    assert child.pid in reaped
-    kind, code = _classify_worker_exit(child.pid)
+    assert pid in reaped
+    kind, code = _classify_worker_exit(pid)
     assert kind == "clean_exit"
     assert code == 0
 
