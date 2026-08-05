@@ -104,6 +104,15 @@ class TestProviderMapping:
         assert PROVIDER_TO_MODELS_DEV["xai"] == "xai"
         assert PROVIDER_TO_MODELS_DEV["xai-oauth"] == "xai"
 
+    def test_siliconflow_mapped_to_models_dev_catalog(self):
+        # Regression test: both the bare "siliconflow" slug and the
+        # region-qualified "siliconflow-cn" slug must resolve to a real
+        # models.dev catalog id so list_provider_models()/
+        # get_model_capabilities() aren't silently empty for SiliconFlow
+        # users (see: model picker showing 0 models for SiliconFlow).
+        assert PROVIDER_TO_MODELS_DEV["siliconflow"] == "siliconflow-cn"
+        assert PROVIDER_TO_MODELS_DEV["siliconflow-cn"] == "siliconflow-cn"
+
     def test_unmapped_provider_not_in_dict(self):
         assert "nous" not in PROVIDER_TO_MODELS_DEV
 
