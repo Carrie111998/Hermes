@@ -2305,8 +2305,8 @@ def _decode_chat_image_upload(payload: ChatImageUpload) -> tuple[bytes, str, str
 
 # Stream-upload chunk size: shared value-const, also read by the
 # archive-import upload path below (NS-501). Defined here, before the router
-# mount, so the extracted files router can read it via web_deps.late_attr at
-# import time.
+# mount, so the extracted files router can read it via web_deps.LateState at
+# call time.
 _UPLOAD_CHUNK_BYTES = 1024 * 1024
 
 from hermes_cli.web_routers import files as _files_routes  # noqa: E402

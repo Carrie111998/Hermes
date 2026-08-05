@@ -8,7 +8,7 @@ helpers they call (``_resolve_managed_path``, ``_managed_file_entry``,
 reached via the late-binding seam in :mod:`hermes_cli.web_deps`, so
 ``monkeypatch.setattr(web_server, ...)`` keeps working. The shared numeric
 limits (``_MANAGED_FILE_MAX_BYTES``, ``_UPLOAD_CHUNK_BYTES``) also stay in
-web_server, read through ``LateState``/``late_attr``.
+web_server, read through ``LateState`` live proxies.
 """
 
 import base64
@@ -25,7 +25,7 @@ from typing import Optional
 from fastapi import APIRouter, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
-from hermes_cli.web_deps import late, late_attr, LateState
+from hermes_cli.web_deps import late, LateState
 from hermes_cli.web_models import (
     ChatImageUpload,
     ManagedDirectoryCreate,
@@ -48,9 +48,9 @@ _sanitize_chat_image_filename = late("_sanitize_chat_image_filename")
 get_hermes_home = late("get_hermes_home")
 
 # Live proxies for web_server-owned numeric limits (mutations/monkeypatches on
-# web_server remain authoritative; resolved at operation/import time).
+# web_server remain authoritative; resolved at operation/read time).
 _MANAGED_FILE_MAX_BYTES = LateState("_MANAGED_FILE_MAX_BYTES")
-_UPLOAD_CHUNK_BYTES = late_attr("_UPLOAD_CHUNK_BYTES")
+_UPLOAD_CHUNK_BYTES = LateState("_UPLOAD_CHUNK_BYTES")
 
 @router.post("/api/chat/image-upload")
 async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = None):
