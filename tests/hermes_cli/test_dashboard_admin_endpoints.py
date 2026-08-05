@@ -967,3 +967,63 @@ def test_spawn_hermes_action_scrubs_gateway_loop_guard_env(monkeypatch, tmp_path
 
     assert "_HERMES_GATEWAY" not in captured["env"]
     assert captured["env"]["HERMES_NONINTERACTIVE"] == "1"
+
+
+def test_spawn_hermes_action_scrubs_update_approval_bypass_env(monkeypatch, tmp_path):
+    """F8: a dashboard action spawned while an update-approval replay is
+    in-flight on another thread must NOT inherit BYPASS_ENV, even though
+    it's set in the real parent os.environ (the replay itself no longer
+    relies on this env var — see tools.update_approval.approval_bypass —
+    but the strip must hold regardless of how it got set)."""
+    import hermes_cli.web_server as ws
+    from tools import update_approval as ua
+
+    monkeypatch.setenv(ua.BYPASS_ENV, "1")
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 1234
+
+    def _fake_popen(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(ws.subprocess, "Popen", _fake_popen)
+
+    ws._spawn_hermes_action(["doctor"], "doctor")
+
+    assert ua.BYPASS_ENV not in captured["env"]
+
+
+def test_spawn_durable_action_scrubs_update_approval_bypass_env(monkeypatch, tmp_path):
+    """Same as above for _spawn_durable_action — the actual spawn path for
+    the "update" action itself (_DURABLE_ACTIONS = {"hermes-update"}), so
+    this is the site that matters most for an update replay's own child."""
+    import hermes_cli.web_server as ws
+    from tools import update_approval as ua
+
+    monkeypatch.setenv(ua.BYPASS_ENV, "1")
+    monkeypatch.setattr(ws, "_ACTION_LOG_DIR", tmp_path)
+
+    captured = {}
+
+    class _FakeProc:
+        pid = 5678
+
+    def _fake_spawn_with_exit_capture(cmd, **kwargs):
+        captured["env"] = kwargs.get("env")
+        return _FakeProc()
+
+    monkeypatch.setattr(
+        "hermes_cli.action_spawn.spawn_with_exit_capture",
+        _fake_spawn_with_exit_capture,
+    )
+    monkeypatch.setattr(ws, "_write_action_record", lambda *a, **kw: None)
+    monkeypatch.setattr(ws, "_emit_action_event", lambda *a, **kw: None)
+
+    ws._spawn_durable_action(["update"], "hermes-update")
+
+    assert ua.BYPASS_ENV not in captured["env"]
+    assert "_HERMES_GATEWAY" not in captured["env"]

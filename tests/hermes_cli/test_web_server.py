@@ -724,6 +724,120 @@ class TestWebServerEndpoints:
         assert status_data["pid"] is None
         assert any("docker pull nousresearch/hermes-agent:latest" in line for line in status_data["lines"])
 
+    def _write_durable_record(self, web_server, *, status="running", action_id="hermes-update-test"):
+        web_server._write_action_record("hermes-update", {
+            "name": "hermes-update", "action_id": action_id, "subcommand": ["update"],
+            "pid": 999999, "spawned_at": "2026-08-02T00:00:00-04:00",
+            "status": status, "exit_code": None, "finished_at": None,
+        })
+
+    def test_reconcile_reports_staged_not_failure(self, monkeypatch):
+        """A staged (exit 3) update must read back as status='staged', not
+        collapse into the generic exit_code!=0 -> 'failed' bucket."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server)
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text(str(UPDATE_EXIT_STAGED_FOR_APPROVAL))
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "staged"
+        assert record["exit_code"] == UPDATE_EXIT_STAGED_FOR_APPROVAL
+        assert ("update.restart_recovered", {
+            "subsystem": "updates", "outcome": "staged",
+            "action_id": "hermes-update-test", "detail": f"exit {UPDATE_EXIT_STAGED_FOR_APPROVAL}",
+        }) in events
+
+    def test_reconcile_survives_simulated_restart(self, monkeypatch):
+        """No live _ACTION_PROCS entry (as after a restart) + the wrapper's
+        independent exit-code file present -> correctly resolved, not stuck
+        reporting 'running' forever."""
+        import hermes_cli.web_server as web_server
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        # Simulate: this process never spawned it (fresh restart) — no
+        # _ACTION_PROCS entry at all — but a prior process's durable record
+        # and the wrapper's own completion signal are both on disk.
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-restart-test")
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text("0")
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "succeeded"
+        assert record["exit_code"] == 0
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert any(e == "update.restart_recovered" for e, _ in events)
+        assert not any(e == "update.reaped" for e, _ in events)
+
+    def test_reconcile_fast_path_uses_live_proc_not_file(self, monkeypatch):
+        """A live (mocked) Popen in _ACTION_PROCS is reaped directly — no
+        need to wait for or even have an exit-code file yet."""
+        import hermes_cli.web_server as web_server
+        from unittest.mock import MagicMock
+
+        events = []
+        monkeypatch.setattr("hermes_logging.emit_event", lambda event, **kw: events.append((event, kw)))
+
+        self._write_durable_record(web_server, action_id="hermes-update-fastpath-test")
+        # Deliberately do NOT write an exit-code file — the fast path must
+        # not need it.
+        web_server._action_exit_code_path("hermes-update").unlink(missing_ok=True)
+
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = 0
+        mock_proc.pid = 12345
+        web_server._ACTION_PROCS["hermes-update"] = mock_proc
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "succeeded"
+        assert "hermes-update" not in web_server._ACTION_PROCS
+        assert any(e == "update.reaped" for e, _ in events)
+        assert not any(e == "update.restart_recovered" for e, _ in events)
+
+    def test_reconcile_reports_running_when_genuinely_in_flight(self, monkeypatch):
+        """Neither a live proc nor a completed exit-code file -> still
+        reported as running, not guessed at."""
+        import hermes_cli.web_server as web_server
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-inflight-test")
+        web_server._action_exit_code_path("hermes-update").unlink(missing_ok=True)
+
+        record = web_server._reconcile_action_status("hermes-update")
+
+        assert record["status"] == "running"
+        assert record["exit_code"] is None
+
+    def test_get_action_status_endpoint_uses_reconcile_for_durable_action(self, monkeypatch):
+        """The HTTP status endpoint for hermes-update goes through the same
+        reconciliation path, not the plain _ACTION_PROCS/_ACTION_RESULTS
+        lookup used for other actions."""
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        self._write_durable_record(web_server, action_id="hermes-update-http-test")
+        web_server._action_exit_code_path("hermes-update").parent.mkdir(parents=True, exist_ok=True)
+        web_server._action_exit_code_path("hermes-update").write_text(str(UPDATE_EXIT_STAGED_FOR_APPROVAL))
+
+        resp = self.client.get("/api/actions/hermes-update/status")
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "staged"
+        assert data["running"] is False
+        assert data["exit_code"] == UPDATE_EXIT_STAGED_FOR_APPROVAL
 
 
 

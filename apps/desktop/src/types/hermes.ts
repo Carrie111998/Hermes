@@ -1118,10 +1118,17 @@ export interface StatusResponse {
   version: string
 }
 
+/** Only meaningful for durable actions (currently `hermes-update`) — other
+ *  actions' responses carry `status: null`/omit it. "staged" is the
+ *  approval-gate outcome: the process exited non-zero but nothing failed,
+ *  so it must never be rendered like a completed run. */
+export type ActionRunStatus = 'starting' | 'running' | 'succeeded' | 'failed' | 'staged' | 'unknown'
+
 export interface ActionResponse {
   name: string
   ok: boolean
   pid: number
+  status?: ActionRunStatus
 }
 
 export interface ActionStatusResponse {
@@ -1130,6 +1137,7 @@ export interface ActionStatusResponse {
   name: string
   pid: number | null
   running: boolean
+  status: ActionRunStatus | null
 }
 
 export interface BackendUpdateCommit {

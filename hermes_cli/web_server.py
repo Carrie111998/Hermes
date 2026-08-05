@@ -171,7 +171,7 @@ def _start_desktop_cron_ticker(stop_event: "threading.Event", interval: int = 60
 def _warm_gateway_module() -> None:
     try:
         import hermes_cli.gateway  # noqa: F401
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 
@@ -229,12 +229,28 @@ async def _lifespan(app: "FastAPI"):
     # sweeping stale sessions on schedule, independent of list requests.
     auto_archive_task = asyncio.create_task(_auto_archive_ticker_loop())
 
+    # Fast-path reaper for dashboard-spawned actions (see _spawn_durable_action
+    # / _reconcile_action_status) — status doesn't require a client to poll.
+    action_reaper_task = asyncio.create_task(_action_reaper_loop())
+
+    # Restart recovery: this process may be starting up right after a
+    # `hermes update` it spawned restarted it mid-run. Reconcile every known
+    # durable action's on-disk record proactively, before serving any
+    # request, rather than waiting for the dashboard's next status poll to
+    # discover a completion that already happened.
+    for _durable_name in _DURABLE_ACTIONS:
+        try:
+            _reconcile_action_status(_durable_name)
+        except Exception:
+            _log.debug("startup action reconcile failed for %s", _durable_name, exc_info=True)
+
     try:
         yield
     finally:
         pty_reaper_task.cancel()
         selftest_task.cancel()
         auto_archive_task.cancel()
+        action_reaper_task.cancel()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
@@ -1208,7 +1224,7 @@ def _custom_provider_options(
             from agent.transcription_registry import list_providers as _list_voice_providers
         for _p in _list_voice_providers():
             _add(getattr(_p, "name", None))
-    except Exception:  # pragma: no cover - registry import should not break schema
+    except Exception:  # pragma: no cover - registry import should not break schema  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     # Current-value preservation (``cfg_get`` takes *keys*, not dotted paths).
@@ -2118,7 +2134,7 @@ def _dashboard_local_update_managed_externally() -> bool:
         method = detect_install_method(PROJECT_ROOT)
         if method == "git":
             return False
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return True
 
@@ -3115,7 +3131,7 @@ async def get_status(profile: Optional[str] = None):
                 ]
                 if brokerable:
                     auth_flows.append("native_pkce")
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             # Module not importable yet (early startup) — leave as [].
             pass
 
@@ -3221,7 +3237,7 @@ async def get_status(profile: Optional[str] = None):
                     _sdb.close()
                 if _rebuild is not None:
                     status["fts_rebuild"] = _rebuild
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
 
         # Profile + gateway topology: which profiles exist, whether one
@@ -3356,19 +3372,19 @@ async def get_system_stats():
                 "free": du.free,
                 "percent": du.percent,
             }
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         try:
             info["cpu_percent"] = psutil.cpu_percent(interval=0.1)
             la = getattr(psutil, "getloadavg", None)
             if la:
                 info["load_avg"] = list(la())
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         try:
             boot = psutil.boot_time()
             info["uptime_seconds"] = int(time.time() - boot)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         try:
             proc = psutil.Process()
@@ -3378,7 +3394,7 @@ async def get_system_stats():
                 "create_time": int(proc.create_time()),
                 "num_threads": proc.num_threads(),
             }
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         info["psutil"] = True
     except Exception:
@@ -3666,8 +3682,149 @@ _ACTION_COMMANDS: Dict[str, Tuple[str, ...]] = {}
 _ACTION_RESULTS: Dict[str, Dict[str, Any]] = {}
 
 
+# ---------------------------------------------------------------------------
+# Durable action status — <HERMES_HOME>/actions/<name>.json
+#
+# _ACTION_PROCS/_ACTION_RESULTS above are process-lifetime-only: they're
+# wiped by the very restart a successful `hermes update` causes, since the
+# dashboard runs inside the gateway process the update restarts. For actions
+# whose own success can restart this process — currently just `update` —
+# status needs to survive that restart. Reuses gateway/slash_commands.py's
+# durable IPC pattern (hermes_cli.action_spawn.spawn_with_exit_capture):
+# the exit code is written to a file by the spawned command's own wrapper,
+# independent of whether this process is still alive to see it.
+#
+# Every other action (doctor, dump, backup, ...) keeps the simpler
+# _ACTION_PROCS-only mechanism unchanged — none of them restart the process
+# tracking them, so the extra durability isn't needed there.
+# ---------------------------------------------------------------------------
+
+_ACTIONS_DIR: Path = get_hermes_home() / "actions"
+_DURABLE_ACTIONS = {"hermes-update"}
+_TERMINAL_ACTION_STATUSES = {"succeeded", "failed", "staged"}
+
+
+def _action_record_path(name: str) -> Path:
+    return _ACTIONS_DIR / f"{name}.json"
+
+
+def _action_exit_code_path(name: str) -> Path:
+    return _ACTIONS_DIR / f"{name}.exit_code"
+
+
+def _write_action_record(name: str, record: Dict[str, Any]) -> None:
+    """Atomic write (tmp + os.replace) — a reader can never see a partial record."""
+    _ACTIONS_DIR.mkdir(parents=True, exist_ok=True)
+    path = _action_record_path(name)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def _read_action_record(name: str) -> Optional[Dict[str, Any]]:
+    path = _action_record_path(name)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as e:
+        _log.warning("Could not read action record %s: %s", path, e)
+        return None
+
+
+def _status_for_exit_code(name: str, exit_code: int) -> str:
+    if exit_code == 0:
+        return "succeeded"
+    if name == "hermes-update":
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+
+        if exit_code == UPDATE_EXIT_STAGED_FOR_APPROVAL:
+            return "staged"
+    return "failed"
+
+
+def _emit_action_event(event: str, *, outcome: str, action_id: Optional[str], detail: str) -> None:
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(event, subsystem="updates", outcome=outcome, action_id=action_id, detail=detail)
+    except Exception as e:
+        _log.warning(
+            "Could not emit action event %r (outcome=%s, action_id=%s): %s",
+            event, outcome, action_id, e,
+        )
+
+
+def _reconcile_action_status(name: str) -> Dict[str, Any]:
+    """Single source of truth for a durable action's current status.
+
+    A terminal record is trusted outright. Otherwise: try the fast path
+    first (a live ``Popen`` in *this* process — covers the common case
+    without waiting on the reaper's tick or the wrapper's file write).
+    Only if that has nothing new does it fall back to the wrapper's
+    independent exit-code file — the same read-time check gateway's
+    ``_send_update_notification`` does — so a completion that happened
+    while this process was restarting is still picked up correctly instead
+    of reporting "running" forever. Called from the same place regardless
+    of whether the caller is the reaper, the startup hook, or an HTTP
+    status request, so there's exactly one implementation of this check to
+    keep correct.
+    """
+    record = _read_action_record(name)
+    if record is None:
+        return {"name": name, "status": "unknown", "exit_code": None, "pid": None, "action_id": None}
+
+    if record.get("status") in _TERMINAL_ACTION_STATUSES:
+        return record
+
+    now_iso = datetime.now().astimezone().isoformat()
+
+    proc = _ACTION_PROCS.get(name)
+    if proc is not None:
+        code = proc.poll()
+        if code is not None:
+            try:
+                proc.wait(timeout=1)
+            except Exception as e:
+                _log.debug("Reap of finished action %r (pid=%s) failed: %s", name, proc.pid, e)
+            status = _status_for_exit_code(name, code)
+            record.update(status=status, exit_code=code, finished_at=now_iso)
+            _write_action_record(name, record)
+            _ACTION_PROCS.pop(name, None)
+            _ACTION_COMMANDS.pop(name, None)
+            _emit_action_event(
+                "update.reaped", outcome=status,
+                action_id=record.get("action_id"), detail=f"exit {code}",
+            )
+            return record
+        return record  # live and still running — nothing to reconcile
+
+    if name in _DURABLE_ACTIONS:
+        from hermes_cli.action_spawn import read_exit_code
+
+        code = read_exit_code(_action_exit_code_path(name))
+        if code is not None:
+            status = _status_for_exit_code(name, code)
+            record.update(status=status, exit_code=code, finished_at=now_iso)
+            _write_action_record(name, record)
+            _emit_action_event(
+                "update.restart_recovered", outcome=status,
+                action_id=record.get("action_id"), detail=f"exit {code}",
+            )
+            return record
+
+    return record  # genuinely still running, or the wrapper hasn't finished yet
+
+
 def _record_completed_action(name: str, message: str, exit_code: int = 1) -> None:
-    """Record a non-spawned action result and write it to the action log."""
+    """Record a non-spawned action result and write it to the action log.
+
+    Used for actions the server resolves synchronously without ever
+    spawning a subprocess (e.g. Docker/Nix's "unsupported here" guidance).
+    For actions in _DURABLE_ACTIONS this must also write the durable record
+    directly — get_action_status routes them through _reconcile_action_status,
+    which only reads _write_action_record's file, not _ACTION_RESULTS.
+    """
     log_file_name = _ACTION_LOG_FILES[name]
     _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
     log_path = _ACTION_LOG_DIR / log_file_name
@@ -3681,6 +3838,15 @@ def _record_completed_action(name: str, message: str, exit_code: int = 1) -> Non
     _ACTION_PROCS.pop(name, None)
     _ACTION_COMMANDS.pop(name, None)
     _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": None}
+
+    if name in _DURABLE_ACTIONS:
+        now_iso = datetime.now().astimezone().isoformat()
+        _write_action_record(name, {
+            "name": name, "action_id": f"{name}-{int(time.time() * 1000)}",
+            "subcommand": None, "pid": None, "spawned_at": now_iso,
+            "status": _status_for_exit_code(name, exit_code),
+            "exit_code": exit_code, "finished_at": now_iso, "detail": message,
+        })
 
 
 def _dashboard_spawn_executable() -> str:
@@ -3719,6 +3885,15 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     # drops it (gateway/run.py); mirror that here (#52470).
     action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
     action_env.pop("_HERMES_GATEWAY", None)
+    # If this dashboard action fires while an update-approval replay is
+    # in-flight on another thread, the replay's bypass must not leak into
+    # this spawned child — it's process-global only as a backward-compat
+    # fallback (tools/update_approval.py's BYPASS_ENV), never something a
+    # child should inherit. The in-process replay itself doesn't rely on
+    # this env var anymore (see approval_bypass()); this strip just closes
+    # the leak for anything that still sets it externally.
+    from tools import update_approval as _ua
+    action_env.pop(_ua.BYPASS_ENV, None)
 
     popen_kwargs: Dict[str, Any] = {
         "cwd": str(PROJECT_ROOT),
@@ -3743,13 +3918,89 @@ def _spawn_hermes_action(subcommand: List[str], name: str) -> subprocess.Popen:
     return proc
 
 
+def _spawn_durable_action(subcommand: List[str], name: str) -> subprocess.Popen:
+    """Spawn ``hermes <subcommand>`` with durable, restart-independent status
+    tracking (see ``_reconcile_action_status`` above and
+    ``hermes_cli.action_spawn``). Used for actions in ``_DURABLE_ACTIONS`` —
+    currently just ``update``, since it's the one action whose own success
+    can restart this very process.
+    """
+    from hermes_cli.action_spawn import spawn_with_exit_capture
+
+    log_file_name = _ACTION_LOG_FILES[name]
+    _ACTION_LOG_DIR.mkdir(parents=True, exist_ok=True)
+    log_path = _ACTION_LOG_DIR / log_file_name
+    with open(log_path, "ab", buffering=0) as log_file:
+        log_file.write(
+            f"\n=== {name} started {time.strftime('%Y-%m-%d %H:%M:%S')} ===\n".encode()
+        )
+
+    cmd = [_dashboard_spawn_executable(), "-m", "hermes_cli.main", *subcommand]
+
+    # Same _HERMES_GATEWAY drop as _spawn_hermes_action — see its comment
+    # (#52470): inheriting it would trip the in-process restart-loop guard.
+    action_env = {**os.environ, "HERMES_NONINTERACTIVE": "1"}
+    action_env.pop("_HERMES_GATEWAY", None)
+    # Same BYPASS_ENV drop as _spawn_hermes_action — see its comment. This
+    # is the more important of the two sites for it: _DURABLE_ACTIONS is
+    # currently just "update" itself, so this is the actual spawn path an
+    # update replay's child would take.
+    from tools import update_approval as _ua
+    action_env.pop(_ua.BYPASS_ENV, None)
+
+    now_iso = datetime.now().astimezone().isoformat()
+    action_id = f"{name}-{int(time.time() * 1000)}"
+    exit_code_path = _action_exit_code_path(name)
+
+    # Written BEFORE spawn (gateway's own pattern) so a Popen failure still
+    # leaves a record that an attempt was made, instead of silence.
+    _write_action_record(name, {
+        "name": name, "action_id": action_id, "subcommand": list(subcommand),
+        "pid": None, "spawned_at": now_iso, "status": "starting",
+        "exit_code": None, "finished_at": None,
+    })
+
+    try:
+        proc = spawn_with_exit_capture(
+            cmd,
+            output_path=log_path,
+            exit_code_path=exit_code_path,
+            cwd=str(PROJECT_ROOT),
+            env=action_env,
+        )
+    except Exception as exc:
+        _write_action_record(name, {
+            "name": name, "action_id": action_id, "subcommand": list(subcommand),
+            "pid": None, "spawned_at": now_iso, "status": "failed",
+            "exit_code": None, "finished_at": datetime.now().astimezone().isoformat(),
+            "detail": f"spawn failed: {exc}",
+        })
+        raise
+
+    _write_action_record(name, {
+        "name": name, "action_id": action_id, "subcommand": list(subcommand),
+        "pid": proc.pid, "spawned_at": now_iso, "status": "running",
+        "exit_code": None, "finished_at": None,
+    })
+    _emit_action_event(
+        "update.spawned", outcome="started",
+        action_id=action_id, detail=" ".join(subcommand),
+    )
+
+    _ACTION_RESULTS.pop(name, None)
+    _ACTION_COMMANDS[name] = tuple(subcommand)
+    _ACTION_PROCS[name] = proc
+    return proc
+
+
 def _tail_lines(path: Path, n: int) -> List[str]:
     """Return the last ``n`` lines of ``path`` without loading huge logs."""
     if n <= 0 or not path.exists():
         return []
     try:
         size = path.stat().st_size
-    except OSError:
+    except OSError as e:
+        _log.debug("Could not stat action log %s for tail: %s", path, e)
         return []
     if size <= 0:
         return []
@@ -3777,7 +4028,8 @@ def _tail_lines(path: Path, n: int) -> List[str]:
             if offset > 0:
                 handle.seek(offset - 1)
                 drop_partial_first_line = handle.read(1) != b"\n"
-    except OSError:
+    except OSError as e:
+        _log.debug("Could not read action log %s for tail: %s", path, e)
         return []
 
     lines = (
@@ -4032,7 +4284,7 @@ async def update_hermes():
         }
 
     try:
-        proc = _spawn_hermes_action(["update"], "hermes-update")
+        proc = _spawn_durable_action(["update"], "hermes-update")
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
@@ -4040,6 +4292,11 @@ async def update_hermes():
         "ok": True,
         "pid": proc.pid,
         "name": "hermes-update",
+        # "spawned", not "started" or "succeeded" — the process launched
+        # successfully, that's all this response can honestly claim. Poll
+        # /api/actions/hermes-update/status for the real outcome (running /
+        # succeeded / failed / staged).
+        "status": "spawned",
     }
 
 
@@ -4615,7 +4872,7 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
                     break
                 if frame.get("done"):
                     text_q.put(None)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         stop.set()
         text_q.put(None)  # unblock the producer
@@ -4649,6 +4906,21 @@ async def get_action_status(name: str, lines: int = 200):
     log_path = _ACTION_LOG_DIR / log_file_name
     tail = _tail_lines(log_path, min(max(lines, 1), 2000))
 
+    if name in _DURABLE_ACTIONS:
+        # Read-first, in-memory dict as cache only — so status survives a
+        # gateway restart. See _reconcile_action_status for the fallback
+        # chain (live Popen -> wrapper's independent exit-code file).
+        record = _reconcile_action_status(name)
+        status = record.get("status", "unknown")
+        return {
+            "name": name,
+            "running": status in {"starting", "running"},
+            "status": status,
+            "exit_code": record.get("exit_code"),
+            "pid": record.get("pid"),
+            "lines": tail,
+        }
+
     proc = _ACTION_PROCS.get(name)
     if proc is None:
         result = _ACTION_RESULTS.get(name)
@@ -4662,8 +4934,8 @@ async def get_action_status(name: str, lines: int = 200):
         if exit_code is not None:
             try:
                 proc.wait(timeout=1)
-            except Exception:
-                pass
+            except Exception as e:
+                _log.debug("Reap of finished action %r (pid=%s) failed: %s", name, pid, e)
             _ACTION_RESULTS[name] = {"exit_code": exit_code, "pid": pid}
             _ACTION_PROCS.pop(name, None)
             _ACTION_COMMANDS.pop(name, None)
@@ -4671,6 +4943,7 @@ async def get_action_status(name: str, lines: int = 200):
     return {
         "name": name,
         "running": running,
+        "status": None,
         "exit_code": exit_code,
         "pid": pid,
         "lines": tail,
@@ -6056,7 +6329,7 @@ def get_model_info(profile: Optional[str] = None):
                     "max_output_tokens": mc.max_output_tokens,
                     "model_family": mc.model_family,
                 }
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
 
         return {
@@ -6735,7 +7008,7 @@ def _denormalize_config_from_web(config: Dict[str, Any]) -> Dict[str, Any]:
                     "default": model_val,
                     "context_length": ctx_override,
                 }
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass  # can't read disk config — just use the string form
     return config
 
@@ -8461,7 +8734,7 @@ def _terminate_whatsapp_pairing(proc: subprocess.Popen | None) -> None:
     except Exception:
         try:
             proc.kill()
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
 
 
@@ -9755,7 +10028,7 @@ def _build_oauth_catalog() -> list[Dict[str, Any]]:
                 "docs_url": d.signup_url or "",
                 "status_fn": None,
             })
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     return rows
@@ -9849,13 +10122,13 @@ async def disconnect_oauth_provider(
                 if oauth_file.exists():
                     oauth_file.unlink()
                     cleared = True
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
             # Also clear the credential pool entry if present.
             try:
                 from hermes_cli.auth import clear_provider_auth
                 cleared = clear_provider_auth("anthropic") or cleared
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
             _log.info("oauth/disconnect: %s", provider_id)
             return {"ok": bool(cleared), "provider": provider_id}
@@ -10024,7 +10297,7 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
         for e in existing:
             try:
                 pool.remove_entry(getattr(e, "id", ""))
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
         entry = PooledCredential(
             provider="anthropic",
@@ -11101,6 +11374,41 @@ async def _auto_archive_ticker_loop(
         await asyncio.sleep(interval_s)
 
 
+async def _action_reaper_loop(poll_interval: float = 5.0) -> None:
+    """Reap spawned dashboard actions so status doesn't depend on a client
+    polling /api/actions/<name>/status.
+
+    Covers every action in _ACTION_PROCS (not just durable ones) — this is
+    the fast path for the common case where this process is still the one
+    that spawned it. It is NOT what makes status survive a restart the
+    action itself causes (that's _reconcile_action_status's fallback to the
+    wrapper's independent exit-code file, also exercised here for durable
+    actions so a stale "running" record left over from a previous process
+    is corrected on the very first tick rather than waiting for a request).
+    """
+    while True:
+        try:
+            for name in list(_ACTION_PROCS.keys()):
+                if name in _DURABLE_ACTIONS:
+                    _reconcile_action_status(name)
+                    continue
+                proc = _ACTION_PROCS.get(name)
+                if proc is None:
+                    continue
+                code = proc.poll()
+                if code is not None:
+                    try:
+                        proc.wait(timeout=1)
+                    except Exception as e:
+                        _log.debug("Reap of finished action %r (pid=%s) failed: %s", name, proc.pid, e)
+                    _ACTION_RESULTS[name] = {"exit_code": code, "pid": proc.pid}
+                    _ACTION_PROCS.pop(name, None)
+                    _ACTION_COMMANDS.pop(name, None)
+        except Exception:
+            _log.debug("action reaper tick failed", exc_info=True)
+        await asyncio.sleep(poll_interval)
+
+
 
 
 
@@ -12013,7 +12321,7 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
             )
             if humanized:
                 msg = humanized
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         flow.mark_error(msg)
     finally:
@@ -12792,12 +13100,12 @@ async def list_hooks():
         entry = None
         try:
             entry = shell_hooks.allowlist_entry_for(spec.event, spec.command)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         executable = False
         try:
             executable = shell_hooks.script_is_executable(spec.command)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         out.append({
             "event": spec.event,
@@ -12837,7 +13145,7 @@ async def create_hook(body: HookCreate):
             )
     except HTTPException:
         raise
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     cfg = load_config()
@@ -12898,7 +13206,7 @@ async def delete_hook(body: HookDelete):
     # Revoke consent regardless so a re-add re-prompts.
     try:
         shell_hooks.revoke(command)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
     if not removed:
@@ -13453,7 +13761,7 @@ def _clear_skills_prompt_cache() -> None:
     try:
         from agent.prompt_builder import clear_skills_system_prompt_cache
         clear_skills_system_prompt_cache(clear_snapshot=True)
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
 
 
@@ -13672,14 +13980,14 @@ def _probe_modal_backend() -> tuple:
 
         if has_direct_modal_credentials():
             return ("ready", "")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     try:
         from hermes_cli.config import get_env_value
 
         if get_env_value("MODAL_TOKEN_ID") and get_env_value("MODAL_TOKEN_SECRET"):
             return ("ready", "")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return (
         "needs_setup",
@@ -13693,7 +14001,7 @@ def _probe_daytona_backend() -> tuple:
 
         if get_env_value("DAYTONA_API_KEY"):
             return ("ready", "")
-    except Exception:
+    except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
         pass
     return ("needs_setup", "Set DAYTONA_API_KEY to use the Daytona backend.")
 
@@ -14107,7 +14415,7 @@ def _get_models_analytics(days: int = 30, profile: Optional[str] = None):
                         "max_output_tokens": mc.max_output_tokens,
                         "model_family": mc.model_family,
                     }
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
 
             models.append({
@@ -14255,11 +14563,11 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
             # the reap independent of that cancellation race (#54028).
             try:
                 await asyncio.to_thread(bridge.close)
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
             try:
                 await ws.close()
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
 
     reader_task = asyncio.create_task(pump_pty_to_ws())
@@ -14293,7 +14601,7 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
         reader_task.cancel()
         try:
             await reader_task
-        except (asyncio.CancelledError, Exception):
+        except (asyncio.CancelledError, Exception):  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
         await asyncio.to_thread(bridge.close)
 
@@ -15415,7 +15723,7 @@ async def console_ws(ws: WebSocket) -> None:
             active_task.cancel()
             try:
                 await active_task
-            except (asyncio.CancelledError, Exception):
+            except (asyncio.CancelledError, Exception):  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
 
 
@@ -16568,7 +16876,7 @@ def _merged_plugins_hub() -> Dict[str, Any]:
                         auth_required = True
                         auth_command = f"hermes auth {name}"
                         break
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
 
         rows.append({
@@ -17008,7 +17316,7 @@ def _write_dashboard_ready_file(actual_port: int) -> None:
         if tmp_name:
             try:
                 Path(tmp_name).unlink(missing_ok=True)
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
         _log.warning("Failed to write dashboard ready file %r: %s", target, exc)
 
@@ -17050,7 +17358,7 @@ def _maybe_open_browser(
         try:
             time.sleep(1.0)
             webbrowser.open(_open_url)
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
 
     threading.Thread(target=_open, daemon=True).start()
@@ -17131,7 +17439,7 @@ def start_server(
                     skip_reasons.append(
                         f"  • nous: {_nous_plugin.LAST_SKIP_REASON}"
                     )
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
 
             _fix_hint = (
@@ -17170,7 +17478,7 @@ def start_server(
                         "`hermes plugins enable basic`), then restart the "
                         "dashboard.\n\n"
                     ) + _fix_hint
-            except Exception:
+            except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
                 pass
             if skip_reasons:
                 raise SystemExit(
@@ -17359,7 +17667,7 @@ def start_server(
             asyncio.set_event_loop_policy(
                 asyncio.WindowsSelectorEventLoopPolicy()  # type: ignore[attr-defined]
             )
-        except Exception:
+        except Exception:  # noqa: S110 -- reviewed: deliberate best-effort swallow (silent-except audit)
             pass
 
     if _runner is not None:

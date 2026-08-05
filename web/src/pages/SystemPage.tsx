@@ -58,6 +58,7 @@ import type {
   CuratorStatus,
   PortalStatus,
   DebugShareResponse,
+  ActionRunStatus,
 } from "@/lib/api";
 
 function formatBytes(n: number): string {
@@ -107,6 +108,7 @@ function ActionLogViewer({
   const [lines, setLines] = useState<string[]>([]);
   const [running, setRunning] = useState(true);
   const [exitCode, setExitCode] = useState<number | null>(null);
+  const [runStatus, setRunStatus] = useState<ActionRunStatus | null>(null);
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const completeRef = useRef(false);
 
@@ -120,6 +122,7 @@ function ActionLogViewer({
         setLines(st.lines);
         setRunning(st.running);
         setExitCode(st.exit_code);
+        setRunStatus(st.status);
         if (!st.running && !completeRef.current) {
           completeRef.current = true;
           onComplete?.(action, st.exit_code);
@@ -136,6 +139,24 @@ function ActionLogViewer({
     };
   }, [action, onComplete]);
 
+  // `status` is only populated for durable actions (currently hermes-update)
+  // — a "staged" outcome exits with a distinct non-zero code that used to
+  // render identically to a real failure ("exit 3"), even though nothing
+  // failed: the update-approval gate just deferred it for review. Every
+  // other action still falls back to the plain exit-code check.
+  let badgeTone: "success" | "warning" | "destructive";
+  let badgeText: string;
+  if (runStatus === "staged") {
+    badgeTone = "warning";
+    badgeText = "awaiting approval";
+  } else if (runStatus === "succeeded" || (runStatus == null && exitCode === 0)) {
+    badgeTone = "success";
+    badgeText = "done";
+  } else {
+    badgeTone = "destructive";
+    badgeText = `exit ${exitCode}`;
+  }
+
   return (
     <Card>
       <CardContent className="py-4">
@@ -146,9 +167,7 @@ function ActionLogViewer({
             {running ? (
               <Badge tone="warning">running</Badge>
             ) : (
-              <Badge tone={exitCode === 0 ? "success" : "destructive"}>
-                {exitCode === 0 ? "done" : `exit ${exitCode}`}
-              </Badge>
+              <Badge tone={badgeTone}>{badgeText}</Badge>
             )}
           </div>
           <Button ghost size="icon" onClick={onClose} aria-label="Close log">

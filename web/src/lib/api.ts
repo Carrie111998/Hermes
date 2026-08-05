@@ -1356,6 +1356,10 @@ export interface ActionResponse {
   name: string;
   ok: boolean;
   pid: number | null;
+  /** Only set by durable actions (currently `hermes-update`) — "spawned"
+   *  means the process launched, nothing more. Poll getActionStatus for
+   *  the real outcome (running / succeeded / failed / staged). */
+  status?: ActionRunStatus;
   error?: string;
   message?: string;
   uploaded_bytes?: number;
@@ -1842,12 +1846,25 @@ interface FetchJSONOptions {
   allowUnauthorized?: boolean;
 }
 
+/** Only meaningful for durable actions (currently `hermes-update`) — other
+ *  actions' status responses carry `status: null`. "staged" is the
+ *  approval-gate outcome: the process exited 0-adjacent but nothing was
+ *  actually applied, so it must never be rendered like "succeeded". */
+export type ActionRunStatus =
+  | "starting"
+  | "running"
+  | "succeeded"
+  | "failed"
+  | "staged"
+  | "unknown";
+
 export interface ActionStatusResponse {
   exit_code: number | null;
   lines: string[];
   name: string;
   pid: number | null;
   running: boolean;
+  status: ActionRunStatus | null;
 }
 
 export interface PlatformStatus {

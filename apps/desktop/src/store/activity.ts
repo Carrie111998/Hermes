@@ -7,7 +7,7 @@ import type { ActionStatusResponse, SessionInfo } from '@/types/hermes'
 const HISTORY_LIMIT = 8
 const COMPLETED_TTL_MS = 5 * 60 * 1000
 
-export type RailTaskStatus = 'error' | 'running' | 'success'
+export type RailTaskStatus = 'error' | 'running' | 'success' | 'staged'
 
 export interface RailTask {
   id: string
@@ -77,12 +77,24 @@ function actionStatus(status: ActionStatusResponse): RailTaskStatus {
     return 'running'
   }
 
+  // `status.status` is only populated for durable actions (currently
+  // hermes-update). "staged" means the update-approval gate deferred it for
+  // review — the process exited non-zero-but-not-failed, so it must never
+  // collapse into the generic exit_code!==0 -> 'error' bucket below.
+  if (status.status === 'staged') {
+    return 'staged'
+  }
+
   return status.exit_code === 0 ? 'success' : 'error'
 }
 
 function actionDetail(status: ActionStatusResponse): string {
   if (status.running) {
     return 'Running'
+  }
+
+  if (status.status === 'staged') {
+    return 'Awaiting approval'
   }
 
   return status.exit_code === 0 ? 'Completed' : `Failed (${status.exit_code ?? 'unknown'})`
