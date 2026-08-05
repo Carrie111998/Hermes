@@ -163,10 +163,12 @@ fi
 #
 # Created once via the official `hermes profile create` path so the structure is
 # valid (profile.yaml, skills, wrapper), then SOUL.md/config.yaml are overlaid
-# from the committed templates under docker/profiles/<name>/. On Railway the
-# config.yaml is always refreshed (mirrors the default-profile behavior above)
-# to keep connectors + the kanban toolset in sync; SOUL.md is only seeded when
-# absent so manual edits survive reboots. The shared kanban board at
+# from the committed templates under docker/profiles/<name>/. On Railway BOTH
+# config.yaml and SOUL.md are always refreshed (mirrors the default-profile
+# behavior above): the repo templates are the source of truth — seed-only SOUL.md
+# left web-design/seo-geo running the stock Nous persona (513-byte stub predating
+# the templates) forever. Off Railway both stay seed-only so local edits survive.
+# The shared kanban board at
 # $HERMES_HOME/kanban.db lets the profiles delegate work to each other.
 for _p in web-design web-dev wmh-offers seo-geo; do
     _pdir="$HERMES_HOME/profiles/$_p"
@@ -188,7 +190,7 @@ for _p in web-design web-dev wmh-offers seo-geo; do
     # Overlay templates only if the profile dir exists (create may have failed);
     # guard so a missing dir never aborts boot under `set -e`.
     if [ -d "$_pdir" ]; then
-        if [ ! -f "$_pdir/SOUL.md" ] && [ -f "$_tmpl/SOUL.md" ]; then
+        if [ -f "$_tmpl/SOUL.md" ] && { [ -n "$RAILWAY_ENVIRONMENT" ] || [ ! -f "$_pdir/SOUL.md" ]; }; then
             cp "$_tmpl/SOUL.md" "$_pdir/SOUL.md" || true
         fi
         if [ -f "$_tmpl/config.yaml" ] && { [ -n "$RAILWAY_ENVIRONMENT" ] || [ ! -f "$_pdir/config.yaml" ]; }; then
