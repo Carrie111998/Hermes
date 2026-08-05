@@ -772,6 +772,31 @@ def check_command_security(command: str) -> dict:
             return {"action": "allow", "findings": [], "summary": "tirith path unavailable"}
         return {"action": "block", "findings": [], "summary": "tirith path unavailable (fail-closed)"}
 
+    # A command containing an embedded NUL byte can never be a valid POSIX
+    # command line: filenames and argv elements are NUL-terminated, and
+    # subprocess.run() raises `ValueError: embedded null byte` when handed
+    # such an argument. A guarded command must never crash the guard
+    # (#79279), so reject malformed NUL-bearing input with a clear,
+    # user-facing verdict up front rather than letting the exception escape
+    # (mirrors the lifecycle guard fix, #76762).
+    if "\x00" in command:
+        return {
+            "action": "block",
+            "findings": [
+                {
+                    "rule_id": "nul-byte",
+                    "severity": "HIGH",
+                    "title": "Command contains an embedded NUL byte",
+                    "description": (
+                        "The command contains an embedded NUL byte (\\x00), "
+                        "which POSIX cannot represent in a filename or argv "
+                        "element. Rejected to prevent undefined behavior."
+                    ),
+                }
+            ],
+            "summary": "command contains an embedded NUL byte",
+        }
+
     try:
         result = subprocess.run(
             [tirith_path, "check", "--json", "--non-interactive",
@@ -794,6 +819,28 @@ def check_command_security(command: str) -> dict:
         if fail_open:
             return {"action": "allow", "findings": [], "summary": f"tirith unavailable: {exc}"}
         return {"action": "block", "findings": [], "summary": f"tirith spawn failed (fail-closed): {exc}"}
+    except ValueError as exc:
+        # Defence-in-depth for #79279: a NUL-bearing argv should be caught by
+        # the up-front check above, but if one ever reaches subprocess.run the
+        # `ValueError: embedded null byte` must not escape the guard. Malformed
+        # input is never legitimately executable, so reject it outright.
+        _record_tirith_crash()
+        return {
+            "action": "block",
+            "findings": [
+                {
+                    "rule_id": "nul-byte",
+                    "severity": "HIGH",
+                    "title": "Command contains an embedded NUL byte",
+                    "description": (
+                        "The command contains an embedded NUL byte (\\x00), "
+                        "which POSIX cannot represent in a filename or argv "
+                        "element. Rejected to prevent undefined behavior."
+                    ),
+                }
+            ],
+            "summary": "command contains an embedded NUL byte",
+        }
     except subprocess.TimeoutExpired:
         _warn_once(
             f"tirith_timeout:{timeout}",
