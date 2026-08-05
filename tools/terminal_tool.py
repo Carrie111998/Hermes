@@ -2548,13 +2548,23 @@ def terminal_tool(
                         local_path = Path(guard_cwd) / local_path
                     if local_path.is_file():
                         metadata = local_path.stat()
+                        if stat.S_ISREG(metadata.st_mode):
+                            # Any file — regardless of size — whose first
+                            # chunk contains a NUL byte is a binary, not a
+                            # shell script. Check before the size guard so a
+                            # large binary (e.g. a 9MB ELF like sds) is never
+                            # streamed through `cat` and decoded into junk
+                            # text with NUL bytes (#76762).
+                            try:
+                                with open(local_path, "rb") as handle:
+                                    head = handle.read(4096)
+                            except OSError:
+                                head = b""
+                            if b"\x00" in head:
+                                return None
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
-                                # Skip binaries: NUL in the first chunk means the
-                                # file is not a text script (see lifecycle_guard).
-                                if b"\x00" in data[:4096]:
-                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass

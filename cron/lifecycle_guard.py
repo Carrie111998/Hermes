@@ -171,7 +171,12 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        path = Path(candidate).expanduser()
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte from a binary's decoded contents
+        # tokenized as a path — a guarded path must never crash the guard.
+        return Path(candidate)
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
