@@ -296,6 +296,28 @@ def register(ctx): ctx.register_context_engine(Engine())
         loader.load_context_engine(engine_dir.name)
 
 
+def test_agent_shutdown_closes_context_engine_after_session_end():
+    """Agent teardown closes the runtime, while repeated teardown is harmless."""
+    from run_agent import AIAgent
+
+    events = []
+    engine = _RuntimeEngine()
+    engine.on_session_end = lambda session_id, messages: events.append("session_end")
+    engine.close = lambda: events.append("close")
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = None
+    agent.context_compressor = engine
+    agent.session_id = "session-1"
+
+    agent.commit_memory_session([])
+    assert events == ["session_end"]
+
+    agent.close()
+    agent.close()
+
+    assert events == ["session_end", "session_end", "close"]
+
+
 def test_default_context_engine_behavior_remains_unchanged():
     engine = ContextCompressor(model="test", quiet_mode=True, config_context_length=200000)
     assert engine.name == "compressor"

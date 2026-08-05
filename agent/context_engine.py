@@ -86,6 +86,39 @@ def automatic_compaction_status_message(
     return message or None
 
 
+def create_context_engine_runtime(
+    engine: "ContextEngine",
+    *,
+    name: str = "context engine",
+) -> "ContextEngine":
+    """Create and validate an isolated runtime from a registered prototype.
+
+    Registered engines are process-owned prototypes.  This factory is the
+    supported boundary for producing an agent-owned runtime; implicit copying
+    and shared instances are unsafe for resource-owning engines.
+    """
+    if not isinstance(engine, ContextEngine):
+        raise TypeError(f"{name} must be a ContextEngine, got {type(engine).__name__}")
+    factory = getattr(engine, "create_runtime", None)
+    if not callable(factory) or type(engine).create_runtime is ContextEngine.create_runtime:
+        raise RuntimeError(
+            f"{name} must implement create_runtime() to create an isolated "
+            "per-agent runtime; shared prototypes and implicit copying are unsupported."
+        )
+    runtime = factory()
+    if runtime is engine:
+        raise RuntimeError(
+            f"{name} create_runtime() returned its shared prototype; return a distinct "
+            "runtime instance instead."
+        )
+    if not isinstance(runtime, ContextEngine):
+        raise TypeError(
+            f"{name} create_runtime() returned {type(runtime).__name__}, "
+            "not a ContextEngine runtime."
+        )
+    return runtime
+
+
 class ContextEngine(ABC):
     """Base class all context engines must implement."""
 

@@ -26,7 +26,7 @@ import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agent.context_engine import ContextEngine
+from agent.context_engine import ContextEngine, create_context_engine_runtime
 
 logger = logging.getLogger(__name__)
 
@@ -125,26 +125,10 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                 return None
             _ENGINE_PROTOTYPES[prototype_key] = prototype
 
-        factory = getattr(prototype, "create_runtime", None)
-        if not callable(factory) or type(prototype).create_runtime is ContextEngine.create_runtime:
-            raise ContextEngineLifecycleError(
-                f"Context engine '{name}' must implement create_runtime() to create "
-                "an isolated per-agent runtime; shared prototype instances and "
-                "implicit copying are unsupported."
-            )
-
-        runtime = factory()
-        if runtime is prototype:
-            raise ContextEngineLifecycleError(
-                f"Context engine '{name}' create_runtime() returned its shared "
-                "prototype. Return a distinct runtime instance instead."
-            )
-        if not isinstance(runtime, ContextEngine):
-            raise ContextEngineLifecycleError(
-                f"Context engine '{name}' create_runtime() returned "
-                f"{type(runtime).__name__}, not a ContextEngine runtime."
-            )
-        return runtime
+        try:
+            return create_context_engine_runtime(prototype, name=f"Context engine '{name}'")
+        except (RuntimeError, TypeError) as exc:
+            raise ContextEngineLifecycleError(str(exc)) from exc
 
 
 def _load_engine_prototype_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
