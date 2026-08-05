@@ -751,6 +751,43 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_raw_remote_binary_reference_is_skipped(self):
+        """The reusable guard may receive raw remote bytes directly, rather
+        than terminal_tool's pre-filtered reader. NUL-bearing fallback text
+        must still be treated as a binary, not a lifecycle command."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        elf_bytes = (
+            b"\x7fELF\x00\x00\x01\x00/usr/bin/evil\x00"
+            b"\x00hermes gateway restart\x00"
+        )
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/usr/bin/python3 -c 'print(1)'",
+            read_remote_script=lambda _path: elf_bytes.decode(
+                "utf-8", errors="replace"
+            ),
+        )
+        assert result is False
+
+    def test_raw_remote_fallback_still_blocks_real_scripts(self):
+        """Skipping binary fallback text must not allow actual lifecycle
+        commands inside a remotely-read shell script."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash /nonexistent/deploy.sh",
+            read_remote_script=lambda path: (
+                "#!/bin/bash\nhermes gateway restart\n"
+                if "deploy.sh" in path
+                else None
+            ),
+        )
+        assert result is True
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""

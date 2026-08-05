@@ -331,8 +331,17 @@ def _contains_unsafe_gateway_action(
             return True
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
+            # A NUL-containing path can only come from junk tokenized out of a
+            # binary's decoded contents — never remote-read it (#76762).
+            if "\x00" in os.fspath(script_path):
+                continue
             script_text = read_remote_script(str(script_path))
         if not script_text:
+            continue
+        # Fallback readers return decoded bytes; mirror the local binary check
+        # so machine code (NUL bytes) is "nothing to scan", exactly like a
+        # local binary read (#76762).
+        if "\x00" in script_text:
             continue
         # Relative references inside a script resolve against that script's
         # directory, not the original command's cwd.
