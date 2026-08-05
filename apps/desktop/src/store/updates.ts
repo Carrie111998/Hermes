@@ -236,8 +236,15 @@ export function maybeNotifyUpdateAvailable(status: DesktopUpdateStatus | null) {
   })
 }
 
-export function openUpdatesWindow(): void {
-  openUpdateOverlayFor(isRemoteMode() ? 'backend' : 'client')
+/**
+ * Open the updates overlay for the active target (auto-selected from the
+ * connection mode) and kick off its check. When `target` is passed explicitly
+ * it overrides the auto-select. Callers that know which component they want
+ * (e.g. the About panel, whose status is always the client's) should pass the
+ * target so the user action matches the displayed state.
+ */
+export function openUpdatesWindow(target?: UpdateTarget): void {
+  openUpdateOverlayFor(target ?? (isRemoteMode() ? 'backend' : 'client'))
 }
 
 /**
