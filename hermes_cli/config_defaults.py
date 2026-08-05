@@ -1466,6 +1466,7 @@ DEFAULT_CONFIG = {
         "mistral": {
             "model": "voxtral-mini-tts-2603",
             "voice_id": "c69964a6-ab8b-4f8a-9465-ec0925096ec8",  # Paul - Neutral
+            "ref_audio": "",  # Path to voice sample for on-the-fly cloning (overrides voice_id, recommended 2-3s, tested max ~50s) e.g. "/path/to/voice_sample.wav"
         },
         "minimax": {
             "model": "speech-02-hd",

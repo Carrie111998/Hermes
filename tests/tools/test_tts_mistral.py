@@ -102,6 +102,54 @@ class TestGenerateMistralTts:
         call_kwargs = mock_mistral_module.audio.speech.complete.call_args[1]
         assert call_kwargs["model"] == "voxtral-large-tts-9999"
 
+    def test_ref_audio_from_config_overrides_voice_id(
+        self, tmp_path, mock_mistral_module, monkeypatch
+    ):
+        """When tts.mistral.ref_audio points to a file, the file is base64-
+        encoded and passed as ref_audio; voice_id is NOT passed."""
+        from tools.tts_tool import _generate_mistral_tts
+
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        mock_mistral_module.audio.speech.complete.return_value = MagicMock(
+            audio_data=base64.b64encode(b"data").decode()
+        )
+
+        sample = tmp_path / "sample.mp3"
+        sample.write_bytes(b"\xff\xfbsample-audio-bytes")
+
+        config = {"mistral": {"ref_audio": str(sample)}}
+        _generate_mistral_tts("Hola", str(tmp_path / "test.mp3"), config)
+
+        call_kwargs = mock_mistral_module.audio.speech.complete.call_args[1]
+        assert "ref_audio" in call_kwargs
+        assert call_kwargs["ref_audio"] == base64.b64encode(
+            b"\xff\xfbsample-audio-bytes"
+        ).decode()
+        assert "voice_id" not in call_kwargs
+
+    def test_ref_audio_missing_path_falls_back_to_voice_id(
+        self, tmp_path, mock_mistral_module, monkeypatch
+    ):
+        """A missing ref_audio path must not crash — it falls back to voice_id."""
+        from tools.tts_tool import _generate_mistral_tts
+
+        monkeypatch.setenv("MISTRAL_API_KEY", "test-key")
+        mock_mistral_module.audio.speech.complete.return_value = MagicMock(
+            audio_data=base64.b64encode(b"data").decode()
+        )
+
+        config = {
+            "mistral": {
+                "ref_audio": str(tmp_path / "does-not-exist.mp3"),
+                "voice_id": "some-voice-id",
+            }
+        }
+        _generate_mistral_tts("Hola", str(tmp_path / "test.mp3"), config)
+
+        call_kwargs = mock_mistral_module.audio.speech.complete.call_args[1]
+        assert "ref_audio" not in call_kwargs
+        assert call_kwargs["voice_id"] == "some-voice-id"
+
 
 class TestTtsDispatcherMistral:
     def test_dispatcher_routes_to_mistral(

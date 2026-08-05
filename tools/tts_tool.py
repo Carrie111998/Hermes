@@ -2020,6 +2020,10 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     # Class-level base_url parity: every cloud TTS provider section supports
     # base_url. The Mistral SDK calls it server_url.
     base_url = mi_config.get("base_url")
+    # Optional ref_audio: path to a voice sample file for on-the-fly cloning.
+    # When set, voice_id is ignored in favor of the cloned voice.
+    # The file is read and base64-encoded.
+    ref_audio_path = mi_config.get("ref_audio", "")
 
     if output_path.endswith(".ogg"):
         response_format = "opus"
@@ -2034,14 +2038,30 @@ def _generate_mistral_tts(text: str, output_path: str, tts_config: Dict[str, Any
     client_kwargs: Dict[str, Any] = {"api_key": api_key}
     if base_url:
         client_kwargs["server_url"] = base_url
+
+    # Build speech kwargs — use ref_audio if configured, otherwise voice_id
+    speech_kwargs: Dict[str, Any] = {
+        "model": model,
+        "input": text,
+        "response_format": response_format,
+    }
+    if ref_audio_path:
+        ref_expanded = os.path.expanduser(ref_audio_path)
+        if os.path.isfile(ref_expanded):
+            with open(ref_expanded, "rb") as rf:
+                ref_b64 = base64.b64encode(rf.read()).decode("ascii")
+            speech_kwargs["ref_audio"] = ref_b64
+            # When ref_audio is provided, voice_id is ignored by the API.
+            # Don't pass both to avoid ambiguity.
+        else:
+            logger.warning("Mistral ref_audio path not found: %s — falling back to voice_id", ref_expanded)
+            speech_kwargs["voice_id"] = voice_id
+    else:
+        speech_kwargs["voice_id"] = voice_id
+
     try:
         with Mistral(**client_kwargs) as client:
-            response = client.audio.speech.complete(
-                model=model,
-                input=text,
-                voice_id=voice_id,
-                response_format=response_format,
-            )
+            response = client.audio.speech.complete(**speech_kwargs)
             audio_bytes = base64.b64decode(response.audio_data)
     except ValueError:
         raise
