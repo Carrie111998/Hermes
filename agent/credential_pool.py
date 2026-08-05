@@ -3020,10 +3020,20 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
         def _is_suppressed(_p, _s):  # type: ignore[misc]
             return False
 
-    # Seed from the custom_providers config entry's api_key field
+    # Seed from the custom_providers config entry's api_key / key_env field
     cp_config = _get_custom_provider_config(pool_key)
     if cp_config:
         api_key = str(cp_config.get("api_key") or "").strip()
+        if not api_key:
+            # Resolve key_env (the documented convention) when inline
+            # api_key is not set (#79130).
+            _key_env_name = str(
+                cp_config.get("key_env")
+                or cp_config.get("api_key_env")
+                or ""
+            ).strip()
+            if _key_env_name:
+                api_key = os.getenv(_key_env_name, "").strip()
         base_url = str(cp_config.get("base_url") or "").strip().rstrip("/")
         name = str(cp_config.get("name") or "").strip()
         if api_key:
