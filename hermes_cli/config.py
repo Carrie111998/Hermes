@@ -3129,6 +3129,15 @@ def load_config() -> Dict[str, Any]:
     return _load_config_impl(want_deepcopy=True)
 
 
+def load_config_strict() -> Dict[str, Any]:
+    """Load config without last-known-good/default parse-error fallback.
+
+    Use only at fail-closed authorization boundaries that must distinguish a
+    valid default configuration from an unreadable or malformed config file.
+    """
+    return _load_config_impl(want_deepcopy=True, fail_on_parse_error=True)
+
+
 def load_config_readonly() -> Dict[str, Any]:
     """Fast-path variant of ``load_config()`` for callers that ONLY READ.
 
@@ -3280,7 +3289,9 @@ def apply_terminal_config_to_env(
     return target
 
 
-def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
+def _load_config_impl(
+    *, want_deepcopy: bool, fail_on_parse_error: bool = False
+) -> Dict[str, Any]:
     with _CONFIG_LOCK:
         ensure_hermes_home()
         config_path = get_config_path()
@@ -3320,7 +3331,12 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             cache_sig = None
 
         cached = _LOAD_CONFIG_CACHE.get(path_key)
-        if cached is not None and cache_sig is not None and cached[:4] == cache_sig:
+        if (
+            not fail_on_parse_error
+            and cached is not None
+            and cache_sig is not None
+            and cached[:4] == cache_sig
+        ):
             # File signatures match, but the cached expansion is only valid if
             # every ${VAR} it was expanded against still has the same value.
             # Without this, a load_config() that ran before load_hermes_dotenv()
@@ -3346,6 +3362,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
 
                 config = _deep_merge(config, user_config)
             except Exception as e:
+                if fail_on_parse_error:
+                    raise
                 # Last-known-good fallback (port of openai/codex#31188's
                 # invariant: a parse failure in a policy/config file must not
                 # silently replace the effective policy with an empty/default
@@ -3393,7 +3411,11 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
         # against the process environment, never against user-config-defined refs.
         # This deliberately inverts the usual env-over-config precedence for the
         # keys the managed layer pins — see docs/design/managed-scope.md §4.1.
-        managed_config = managed_scope.load_managed_config()
+        managed_config = (
+            managed_scope.load_managed_config_strict()
+            if fail_on_parse_error
+            else managed_scope.load_managed_config()
+        )
         if managed_config:
             managed_expanded = _expand_env_vars(managed_config)
             expanded = _deep_merge(expanded, managed_expanded)

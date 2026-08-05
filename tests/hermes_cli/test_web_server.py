@@ -3401,6 +3401,138 @@ class TestDashboardPluginManifestExtensions:
         assert entry["tab"]["hidden"] is True
         assert entry["slots"] == ["sidebar", "header-left"]
 
+    def test_non_builtin_override_is_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        self._write_plugin(tmp_path, "bad-override", {
+            "name": "bad-override",
+            "tab": {"path": "/bad-override", "override": "/custom"},
+        })
+        from hermes_cli import web_server
+
+        plugins = web_server._discover_dashboard_plugins()
+
+        assert not any(plugin["name"] == "bad-override" for plugin in plugins)
+
+    def test_endpoint_uses_shared_denylist_and_route_collision_policy(
+        self, monkeypatch
+    ):
+        import asyncio
+
+        from hermes_cli import plugins_cmd, web_server
+
+        discovered = [
+            {"name": "project-board", "source": "project", "tab": {"path": "/board"}},
+            {"name": "bundled-board", "source": "bundled", "tab": {"path": "/board"}},
+            {"name": "disabled", "source": "bundled", "tab": {"path": "/disabled"}},
+        ]
+        monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda: discovered)
+        monkeypatch.setattr(web_server, "load_config", lambda: {})
+        monkeypatch.setattr(plugins_cmd, "_get_enabled_set", lambda: set())
+        monkeypatch.setattr(
+            plugins_cmd,
+            "_get_disabled_set",
+            lambda: {"project-board", "disabled"},
+        )
+
+        result = asyncio.run(web_server.get_dashboard_plugins())
+
+        assert [plugin["name"] for plugin in result] == ["bundled-board"]
+
+    def test_disabled_project_plugin_assets_are_not_served(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from hermes_cli import config, web_server
+
+        dashboard = tmp_path / "project-x" / "dashboard"
+        asset = dashboard / "dist" / "index.js"
+        asset.parent.mkdir(parents=True)
+        asset.write_text("export default {};", encoding="utf-8")
+        plugin = {
+            "name": "project-x",
+            "source": "project",
+            "_dir": str(dashboard),
+        }
+        monkeypatch.setattr(web_server, "_get_dashboard_plugins", lambda: [plugin])
+        monkeypatch.setattr(
+            config,
+            "load_config_strict",
+            lambda: {"plugins": {"disabled": ["project-x"]}},
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(web_server.serve_plugin_asset("project-x", "dist/index.js"))
+
+        assert exc_info.value.status_code == 404
+
+    def test_malformed_plugin_activation_config_denies_project_assets(
+        self, tmp_path, monkeypatch
+    ):
+        import asyncio
+
+        from fastapi import HTTPException
+
+        from hermes_cli import config, web_server
+
+        dashboard = tmp_path / "project-x" / "dashboard"
+        asset = dashboard / "dist" / "index.js"
+        asset.parent.mkdir(parents=True)
+        asset.write_text("export default {};", encoding="utf-8")
+        monkeypatch.setattr(
+            web_server,
+            "_get_dashboard_plugins",
+            lambda: [
+                {
+                    "name": "project-x",
+                    "source": "project",
+                    "_dir": str(dashboard),
+                }
+            ],
+        )
+        monkeypatch.setattr(
+            config,
+            "load_config_strict",
+            lambda: {"plugins": {"disabled": "project-x"}},
+        )
+
+        with pytest.raises(HTTPException) as exc_info:
+            asyncio.run(web_server.serve_plugin_asset("project-x", "dist/index.js"))
+
+        assert exc_info.value.status_code == 404
+
+    def test_active_project_plugin_assets_remain_available(self, tmp_path, monkeypatch):
+        import asyncio
+
+        from starlette.responses import FileResponse
+
+        from hermes_cli import config, web_server
+
+        dashboard = tmp_path / "project-x" / "dashboard"
+        asset = dashboard / "dist" / "index.js"
+        asset.parent.mkdir(parents=True)
+        asset.write_text("export default {};", encoding="utf-8")
+        monkeypatch.setattr(
+            web_server,
+            "_get_dashboard_plugins",
+            lambda: [
+                {
+                    "name": "project-x",
+                    "source": "project",
+                    "_dir": str(dashboard),
+                }
+            ],
+        )
+        monkeypatch.setattr(config, "load_config_strict", lambda: {})
+
+        response = asyncio.run(
+            web_server.serve_plugin_asset("project-x", "dist/index.js")
+        )
+
+        assert isinstance(response, FileResponse)
+
     def test_user_plugins_ignore_profile_home_override(self, tmp_path, monkeypatch):
         """Regression: user dashboard extensions are a dashboard-owned asset
         (like theme YAML), so they must stay visible after a context-local

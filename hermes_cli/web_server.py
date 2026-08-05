@@ -1824,19 +1824,30 @@ _SENSITIVE_HOME_CREDENTIAL_PATHS = frozenset({
 
 
 def _is_sensitive_home_credential_path(path: Path) -> bool:
+    """Classify both lexical and canonical paths relative to the user's home."""
+    lexical_home = Path.home().absolute()
+    path_candidates = [path.absolute()]
+    home_candidates = [lexical_home]
     try:
-        relative_parts = tuple(
-            part.lower()
-            for part in path.resolve(strict=False)
-            .relative_to(Path.home().resolve(strict=False))
-            .parts
-        )
-    except (OSError, RuntimeError, ValueError):
-        return False
-    return any(
-        relative_parts[: len(protected)] == protected
-        for protected in _SENSITIVE_HOME_CREDENTIAL_PATHS
-    )
+        path_candidates.append(path.resolve(strict=False))
+        home_candidates.append(lexical_home.resolve(strict=False))
+    except (OSError, RuntimeError):
+        pass
+
+    for candidate in path_candidates:
+        for home in home_candidates:
+            try:
+                relative_parts = tuple(
+                    part.lower() for part in candidate.relative_to(home).parts
+                )
+            except ValueError:
+                continue
+            if any(
+                relative_parts[: len(protected)] == protected
+                for protected in _SENSITIVE_HOME_CREDENTIAL_PATHS
+            ):
+                return True
+    return False
 
 
 def _is_sensitive_filename(name: str) -> bool:
@@ -2221,6 +2232,7 @@ def _resolve_managed_path(
     request: Request,
     *,
     for_write: bool = False,
+    reject_sensitive: bool = False,
 ) -> tuple[ManagedFilesPolicy, Path, str]:
     policy = _managed_files_policy(request)
     text = _path_text(raw_path)
@@ -2242,6 +2254,12 @@ def _resolve_managed_path(
     if ".." in candidate.parts:
         raise HTTPException(status_code=400, detail="Path cannot contain '..'")
 
+    # Check the caller's lexical path before canonicalization follows symlinks.
+    # Otherwise $HOME/.ssh -> /external/secrets would lose the protected .ssh
+    # component and the resolved-target checks in read/download would miss it.
+    if reject_sensitive and _is_sensitive_path(candidate):
+        raise HTTPException(status_code=403, detail="Access to sensitive files is not allowed")
+
     if for_write and not candidate.exists():
         parent = _canonical_path(candidate.parent)
         resolved = parent / candidate.name
@@ -2261,6 +2279,20 @@ def _managed_response_meta(policy: ManagedFilesPolicy) -> Dict[str, Any]:
         "locked_root": locked_root,
         "can_change_path": policy.can_change_path,
     }
+
+
+def _requested_managed_path_is_sensitive(
+    raw_path: str | None, request: Request
+) -> bool:
+    """Check the lexical request path before managed-path canonicalization."""
+    text = _path_text(raw_path)
+    if not text:
+        return False
+    policy = _managed_files_policy(request)
+    candidate = Path(text).expanduser()
+    if policy.locked_root is not None and not candidate.is_absolute():
+        candidate = policy.locked_root / candidate
+    return _is_sensitive_path(candidate)
 
 
 def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, Any]:
@@ -2392,6 +2424,7 @@ async def upload_chat_image(payload: ChatImageUpload, profile: Optional[str] = N
 
 @app.get("/api/files")
 async def list_managed_files(request: Request, path: Optional[str] = None):
+    lexical_sensitive = _requested_managed_path_is_sensitive(path, request)
     policy, target, display_path = _resolve_managed_path(path, request)
     if not target.exists():
         raise HTTPException(status_code=404, detail="Path not found")
@@ -2400,18 +2433,19 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
     try:
         entries = []
-        for child in target.iterdir():
-            if _is_sensitive_path(child):
-                continue
-            try:
-                entries.append(_managed_file_entry(policy, child))
-            except HTTPException:
-                # Directory entries can disappear between iteration and stat,
-                # and home folders commonly contain symlinks to removable
-                # volumes. Omit an entry that cannot be resolved safely rather
-                # than failing the entire listing. Direct file endpoints retain
-                # their explicit errors.
-                continue
+        if not lexical_sensitive:
+            for child in target.iterdir():
+                if _is_sensitive_path(child):
+                    continue
+                try:
+                    entries.append(_managed_file_entry(policy, child))
+                except HTTPException:
+                    # Directory entries can disappear between iteration and stat,
+                    # and home folders commonly contain symlinks to removable
+                    # volumes. Omit an entry that cannot be resolved safely rather
+                    # than failing the entire listing. Direct file endpoints retain
+                    # their explicit errors.
+                    continue
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
@@ -2432,7 +2466,9 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
 
 @app.get("/api/files/read")
 async def read_managed_file(request: Request, path: str):
-    policy, target, display_path = _resolve_managed_path(path, request)
+    policy, target, display_path = _resolve_managed_path(
+        path, request, reject_sensitive=True
+    )
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -2476,7 +2512,9 @@ async def download_managed_file(request: Request, path: str):
     (which can't set the session header) still authenticates. See ``/api/pty``
     for the same query-token precedent.
     """
-    policy, target, _display_path = _resolve_managed_path(path, request)
+    policy, target, _display_path = _resolve_managed_path(
+        path, request, reject_sensitive=True
+    )
     if not target.exists():
         raise HTTPException(status_code=404, detail="File not found")
     if not target.is_file():
@@ -16776,25 +16814,19 @@ async def get_dashboard_plugins():
         enabled_set = set()
         disabled_set = set()
 
-    def _is_active(p: dict) -> bool:
-        name = p.get("name", "")
-        if name in hidden:
-            return False
-        if p.get("source") == "user":
-            if name in disabled_set:
-                return False
-            if name not in enabled_set:
-                return False
-        elif p.get("source") == "bundled":
-            if name in disabled_set:
-                return False
-        return True
+    from hermes_cli.dashboard_plugin_pages import filter_active_dashboard_plugins
+
+    active_plugins = filter_active_dashboard_plugins(
+        plugins,
+        hidden=set(hidden),
+        enabled=enabled_set,
+        disabled=disabled_set,
+    )
 
     # Strip internal fields before sending to frontend.
     return [
         {k: v for k, v in p.items() if not k.startswith("_")}
-        for p in plugins
-        if _is_active(p)
+        for p in active_plugins
     ]
 
 
@@ -17180,21 +17212,29 @@ async def serve_plugin_asset(plugin_name: str, file_path: str):
     if not plugin:
         raise HTTPException(status_code=404, detail="Plugin not found")
 
-    # Gate: user plugins must be enabled to serve assets;
-    # bundled plugins must not be explicitly disabled.
+    # Apply the same source-aware activation policy used by dashboard discovery.
+    # This route is intentionally unauthenticated for browser script/style loads,
+    # so activation-config failures must fail closed rather than expose assets.
     try:
-        from hermes_cli.plugins_cmd import _get_enabled_set, _get_disabled_set
-        enabled_set = _get_enabled_set()
-        disabled_set = _get_disabled_set()
+        from hermes_cli.dashboard_plugin_pages import (
+            dashboard_plugin_is_active,
+            strict_dashboard_plugin_activation_sets,
+        )
+        from hermes_cli.config import load_config_strict
+
+        config = load_config_strict()
+        hidden_set, enabled_set, disabled_set = (
+            strict_dashboard_plugin_activation_sets(config)
+        )
     except Exception:
-        enabled_set = set()
-        disabled_set = set()
-    if plugin.get("source") == "user":
-        if plugin_name in disabled_set or plugin_name not in enabled_set:
-            raise HTTPException(status_code=404, detail="Plugin not found")
-    elif plugin.get("source") == "bundled":
-        if plugin_name in disabled_set:
-            raise HTTPException(status_code=404, detail="Plugin not found")
+        raise HTTPException(status_code=404, detail="Plugin not found")
+    if not dashboard_plugin_is_active(
+        plugin,
+        hidden=hidden_set,
+        enabled=enabled_set,
+        disabled=disabled_set,
+    ):
+        raise HTTPException(status_code=404, detail="Plugin not found")
 
     base = Path(plugin["_dir"])
     target = (base / file_path).resolve()

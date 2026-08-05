@@ -17,6 +17,7 @@ from hermes_cli.config import (
     _normalize_max_turns_config,
     is_provider_enabled,
     load_config,
+    load_config_strict,
     load_env,
     migrate_config,
     read_raw_config,
@@ -169,8 +170,42 @@ class TestLoadConfigParseFailure:
             err = capsys.readouterr().err
             assert "previously loaded config" in err
 
+    def test_strict_load_bypasses_cached_last_known_good(self, tmp_path):
+        import time
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            cfg = tmp_path / "config.yaml"
+            cfg.write_text("plugins:\n  disabled:\n    - project-x\n")
+            assert "project-x" in load_config()["plugins"]["disabled"]
+
+            time.sleep(0.05)
+            cfg.write_text("plugins:\n  disabled: [unclosed\n")
+
+            with pytest.raises(Exception):
+                load_config_strict()
 
 
+
+
+
+    def test_strict_load_rejects_malformed_managed_config(self, tmp_path):
+        user_home = tmp_path / "user"
+        managed_home = tmp_path / "managed"
+        user_home.mkdir()
+        managed_home.mkdir()
+        (managed_home / "config.yaml").write_text(
+            "plugins:\n  disabled: [unclosed\n"
+        )
+
+        with patch.dict(
+            os.environ,
+            {
+                "HERMES_HOME": str(user_home),
+                "HERMES_MANAGED_DIR": str(managed_home),
+            },
+        ):
+            with pytest.raises(Exception):
+                load_config_strict()
 
 
 class TestEmptyConfigSections:

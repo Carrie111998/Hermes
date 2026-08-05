@@ -62,9 +62,94 @@ def safe_dashboard_plugin_tab_path(
     lowered = value.casefold()
     if any(lowered == prefix or lowered.startswith(prefix + "/") for prefix in _RESERVED_PREFIXES):
         return None
-    if not allow_builtin and lowered in _BUILTIN_DASHBOARD_PATHS:
+    if allow_builtin:
+        return lowered if lowered in _BUILTIN_DASHBOARD_PATHS else None
+    if lowered in _BUILTIN_DASHBOARD_PATHS:
         return None
     return value
+
+
+def dashboard_plugin_route_key(path: str) -> str:
+    """Return the shared case-insensitive ownership key for a validated route."""
+    return path.casefold()
+
+
+def strict_dashboard_plugin_activation_sets(
+    config: dict[str, Any],
+) -> tuple[set[str], set[str], set[str]]:
+    """Parse activation policy strictly for unauthenticated asset access.
+
+    Missing sections/keys retain the normal empty-set defaults. Present values
+    must be lists of non-empty plugin names; indeterminate policy is rejected.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Plugin activation config must be a mapping")
+
+    def names(section_name: str, key: str) -> set[str]:
+        section = config.get(section_name, {})
+        if not isinstance(section, dict):
+            raise ValueError(f"{section_name} config must be a mapping")
+        value = section.get(key, [])
+        if not isinstance(value, list) or any(
+            not isinstance(item, str) or not item for item in value
+        ):
+            raise ValueError(f"{section_name}.{key} must be a list of names")
+        return set(value)
+
+    return (
+        names("dashboard", "hidden_plugins"),
+        names("plugins", "enabled"),
+        names("plugins", "disabled"),
+    )
+
+
+def dashboard_plugin_is_active(
+    plugin: dict[str, Any],
+    *,
+    hidden: set[str],
+    enabled: set[str],
+    disabled: set[str],
+) -> bool:
+    """Apply the dashboard's source-aware activation policy consistently."""
+    name = plugin.get("name", "")
+    if not isinstance(name, str) or not name or name in hidden or name in disabled:
+        return False
+    source = plugin.get("source")
+    if source == "user":
+        return name in enabled
+    if source == "bundled":
+        return True
+    # Project plugins are source-gated by HERMES_ENABLE_PROJECT_PLUGINS, but
+    # remain subject to the global plugins.disabled deny-list above.
+    return source == "project"
+
+
+def filter_active_dashboard_plugins(
+    plugins: list[dict[str, Any]],
+    *,
+    hidden: set[str],
+    enabled: set[str],
+    disabled: set[str],
+) -> list[dict[str, Any]]:
+    """Return active plugins with deterministic first-owner route semantics."""
+    active: list[dict[str, Any]] = []
+    seen_routes: set[str] = set()
+    for plugin in plugins:
+        if not dashboard_plugin_is_active(
+            plugin, hidden=hidden, enabled=enabled, disabled=disabled
+        ):
+            continue
+        tab = plugin.get("tab")
+        tab_info = tab if isinstance(tab, dict) else {}
+        if not tab_info.get("hidden"):
+            route = tab_info.get("override") or tab_info.get("path")
+            if isinstance(route, str):
+                route_key = dashboard_plugin_route_key(route)
+                if route_key in seen_routes:
+                    continue
+                seen_routes.add(route_key)
+        active.append(plugin)
+    return active
 
 
 def _safe_text(value: Any, fallback: str, *, maximum: int) -> str:
@@ -125,9 +210,12 @@ def list_dashboard_plugin_pages() -> list[dict[str, str]]:
             if not isinstance(raw_name, str) or not raw_name or raw_name in seen_names:
                 continue
             seen_names.add(raw_name)
-            if raw_name in hidden or raw_name in disabled:
-                continue
-            if source == "user" and raw_name not in enabled:
+            if not dashboard_plugin_is_active(
+                {"name": raw_name, "source": source},
+                hidden=hidden,
+                enabled=enabled,
+                disabled=disabled,
+            ):
                 continue
 
             tab_value = data.get("tab")
@@ -135,7 +223,10 @@ def list_dashboard_plugin_pages() -> list[dict[str, str]]:
             if tab.get("hidden") or tab.get("override"):
                 continue
             path = safe_dashboard_plugin_tab_path(tab.get("path", f"/{raw_name}"))
-            if path is None or path in seen_paths:
+            if path is None:
+                continue
+            path_key = dashboard_plugin_route_key(path)
+            if path_key in seen_paths:
                 continue
             page_id_suffix = _SAFE_PAGE_ID.sub("-", raw_name.casefold()).strip("-._")
             if not page_id_suffix:
@@ -161,6 +252,6 @@ def list_dashboard_plugin_pages() -> list[dict[str, str]]:
                 }
             )
             seen_ids.add(page_id)
-            seen_paths.add(path)
+            seen_paths.add(path_key)
 
     return pages
