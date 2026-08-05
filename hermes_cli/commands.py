@@ -849,6 +849,35 @@ _clamp_telegram_names = _clamp_command_names
 # Shared skill/plugin collection for gateway platforms
 # ---------------------------------------------------------------------------
 
+def _gateway_path_relative_to_root(path, root):
+    """Return *path* relative to *root* through lexical or resolved aliases.
+
+    Skill scanners normally preserve the configured path spelling.  Compare
+    that spelling first so a category symlink inside a local skills tree keeps
+    its category even when its target lives elsewhere.  The resolved fallback
+    handles a symlinked HERMES_HOME and macOS aliases such as /var -> /private/var.
+    ``Path.relative_to`` supplies component-aware containment on every platform.
+    """
+    from pathlib import Path
+
+    lexical_path = Path(path).expanduser().absolute()
+    lexical_root = Path(root).expanduser().absolute()
+    try:
+        return lexical_path.relative_to(lexical_root)
+    except ValueError:
+        pass
+
+    try:
+        resolved_path = lexical_path.resolve()
+        resolved_root = lexical_root.resolve()
+    except (OSError, RuntimeError):
+        return None
+    try:
+        return resolved_path.relative_to(resolved_root)
+    except ValueError:
+        return None
+
+
 def _collect_gateway_skill_entries(
     platform: str,
     max_slots: int,
@@ -921,34 +950,27 @@ def _collect_gateway_skill_entries(
         from agent.skill_commands import get_skill_commands
         from tools.skills_tool import SKILLS_DIR
         from agent.skill_utils import get_external_skills_dirs
-        _skills_dir = str(SKILLS_DIR.resolve())
-        _hub_dir = str((SKILLS_DIR / ".hub").resolve()).rstrip("/") + "/"
-        # Build set of allowed directory prefixes: local skills dir + any
-        # user-configured ``skills.external_dirs``. Ensure each prefix ends
-        # with ``/`` so ``/my-skills`` does not also match ``/my-skills-extra``.
+        _skills_dir = SKILLS_DIR
+        _hub_dir = SKILLS_DIR / ".hub"
+        # Build allowed roots: local skills dir + any user-configured
+        # ``skills.external_dirs``. Component-aware relative paths keep a
+        # sibling such as ``/my-skills-extra`` outside ``/my-skills``.
         # Without this widening, external skills are visible in
         # ``hermes skills list`` and the agent's ``/skill-name`` dispatch but
         # silently excluded from gateway slash menus (#8110).
-        _allowed_prefixes = [_skills_dir.rstrip("/") + "/"]
-        _allowed_prefixes.extend(
-            os.path.realpath(str(d)).rstrip("/") + "/"
-            for d in get_external_skills_dirs()
-        )
+        _allowed_roots = [_skills_dir, *get_external_skills_dirs()]
         skill_cmds = get_skill_commands()
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            # The skill scanner builds paths from the un-resolved SKILLS_DIR,
-            # while the prefixes above are resolved.  When $HERMES_HOME sits
-            # behind a symlink (~/.hermes -> /Volumes/...), the two never
-            # match and every skill is dropped from gateway menus.  Normalize
-            # both sides to the real path (also covers macOS /var->/private/var).
-            skill_path = os.path.realpath(skill_path)
-            if not any(skill_path.startswith(prefix) for prefix in _allowed_prefixes):
+            if not any(
+                _gateway_path_relative_to_root(skill_path, root) is not None
+                for root in _allowed_roots
+            ):
                 continue
-            if skill_path.startswith(_hub_dir):
+            if _gateway_path_relative_to_root(skill_path, _hub_dir) is not None:
                 continue
             skill_name = info.get("name", "")
             if skill_name in _platform_disabled:
@@ -1110,16 +1132,15 @@ def discord_skill_commands_by_category(
         from agent.skill_utils import get_external_skills_dirs
         from tools.skills_tool import SKILLS_DIR
 
-        _skills_dir = SKILLS_DIR.resolve()
-        _hub_dir = (SKILLS_DIR / ".hub").resolve()
-        # Build list of (resolved_root, is_local) tuples. Each external dir
-        # becomes its own scan root for category derivation — a skill at
+        _skills_dir = SKILLS_DIR
+        _hub_dir = SKILLS_DIR / ".hub"
+        # Each external dir becomes its own scan root for category derivation — a skill at
         # ``<external>/mlops/foo/SKILL.md`` is still categorized as "mlops".
-        _scan_roots: list[_P] = [_skills_dir]
+        _scan_roots = [_skills_dir]
         try:
             for ext in get_external_skills_dirs():
                 try:
-                    _scan_roots.append(_P(ext).resolve())
+                    _scan_roots.append(ext)
                 except Exception:
                     continue
         except Exception:
@@ -1131,22 +1152,19 @@ def discord_skill_commands_by_category(
             skill_path = info.get("skill_md_path", "")
             if not skill_path:
                 continue
-            sp = _P(skill_path).resolve()
+            sp = _P(skill_path)
             # Hub skills are loaded via the skill hub, not surfaced as
             # slash commands.
-            if str(sp).startswith(str(_hub_dir)):
+            if _gateway_path_relative_to_root(sp, _hub_dir) is not None:
                 continue
             # Accept skill if it lives under any scan root; record the
             # matching root so we can derive the category correctly.
-            matched_root: _P | None = None
+            matched_relative = None
             for root in _scan_roots:
-                try:
-                    sp.relative_to(root)
-                except ValueError:
-                    continue
-                matched_root = root
-                break
-            if matched_root is None:
+                matched_relative = _gateway_path_relative_to_root(sp.parent, root)
+                if matched_relative is not None:
+                    break
+            if matched_relative is None:
                 continue
 
             skill_name = info.get("name", "")
@@ -1197,8 +1215,7 @@ def discord_skill_commands_by_category(
 
             # Determine category from the relative path within the matched
             # scan root. e.g. creative/ascii-art/SKILL.md → ("creative", ...)
-            rel = sp.parent.relative_to(matched_root)
-            parts = rel.parts
+            parts = matched_relative.parts
             if len(parts) >= 2:
                 cat = parts[0]
                 categories.setdefault(cat, []).append((discord_name, desc, cmd_key))

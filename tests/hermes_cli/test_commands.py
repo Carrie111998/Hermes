@@ -1,5 +1,6 @@
 """Tests for the central command registry and autocomplete."""
 
+import pytest
 from prompt_toolkit.completion import CompleteEvent
 from prompt_toolkit.document import Document
 
@@ -748,6 +749,55 @@ class TestTelegramMenuCommands:
         menu_names = {n for n, _ in menu}
         assert "apple_notes" in menu_names
         assert "hub_skill" not in menu_names  # hub stays excluded under symlink
+
+    def test_symlinked_category_keeps_menu_category_and_hub_exclusion(self, tmp_path):
+        """A local category symlink is trusted, but one targeting .hub is not."""
+        import sys
+        from unittest.mock import patch
+        from hermes_cli.commands import discord_skill_commands_by_category
+
+        if sys.platform == "win32":
+            pytest.skip("symlinks need elevated privileges on Windows")
+
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        external_category = tmp_path / "external-creative"
+        (external_category / "diagram").mkdir(parents=True)
+        (skills_dir / "creative").symlink_to(external_category, target_is_directory=True)
+
+        hub_category = skills_dir / ".hub" / "hidden-category"
+        (hub_category / "hidden").mkdir(parents=True)
+        (skills_dir / "linked-hub").symlink_to(hub_category, target_is_directory=True)
+
+        fake_cmds = {
+            "/diagram": {
+                "name": "diagram",
+                "description": "Diagram skill",
+                "skill_md_path": str(skills_dir / "creative" / "diagram" / "SKILL.md"),
+            },
+            "/hidden": {
+                "name": "hidden",
+                "description": "Hub skill through a local symlink",
+                "skill_md_path": str(skills_dir / "linked-hub" / "hidden" / "SKILL.md"),
+            },
+        }
+
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("agent.skill_utils.get_external_skills_dirs", return_value=[]),
+            patch("agent.skill_utils.get_disabled_skill_names", return_value=set()),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+        ):
+            menu, _ = telegram_menu_commands(max_commands=100)
+            categories, uncategorized, hidden = discord_skill_commands_by_category(set())
+
+        assert "diagram" in {name for name, _ in menu}
+        assert [entry[0] for entry in categories["creative"]] == ["diagram"]
+        assert uncategorized == []
+        assert hidden == 0
+        assert "hidden" not in {
+            entry[0] for entries in categories.values() for entry in entries
+        }
 
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
