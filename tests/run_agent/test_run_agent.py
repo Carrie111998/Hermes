@@ -262,6 +262,21 @@ def test_flush_messages_to_session_db_batch_marks_only_after_success_and_clears_
     assert batch_msg.persistence_message_key
     assert batch_msg.persistence_ordinal == 0
     assert batch_msg.timestamp > 0
+    assert dict(batch_msg)["timestamp"] is None
+
+
+def test_batch_message_mapping_preserves_explicit_legacy_timestamp(agent):
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "timestamped", "timestamp": 123.5}
+
+    assert agent._flush_messages_to_session_db([message], []) is True
+
+    batch_msg = db.calls[0]["messages"][0]
+    assert batch_msg.timestamp == 123.5
+    assert batch_msg["timestamp"] == 123.5
+    assert batch_msg.get("timestamp") == 123.5
+    assert dict(batch_msg)["timestamp"] == 123.5
 
 
 def test_persist_session_canonical_returns_explicit_state_and_forbids_bool_coercion(agent):

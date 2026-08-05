@@ -29,7 +29,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -1710,6 +1710,7 @@ class SessionDBBatchMessage(Mapping[str, Any]):
     _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
         "role",
         "content",
+        "timestamp",
         "tool_name",
         "tool_calls",
         "tool_call_id",
@@ -1742,10 +1743,13 @@ class SessionDBBatchMessage(Mapping[str, Any]):
     api_content: Any = None
     display_kind: Optional[str] = None
     display_metadata: Optional[Dict[str, Any]] = None
+    _legacy_timestamp: Any = field(default=None, repr=False, compare=False)
 
     def __getitem__(self, key: str) -> Any:
         if key not in self._FIELD_NAMES:
             raise KeyError(key)
+        if key == "timestamp":
+            return self._legacy_timestamp
         return getattr(self, key)
 
     def __iter__(self) -> Iterator[str]:

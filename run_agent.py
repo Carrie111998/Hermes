@@ -2026,6 +2026,7 @@ class AIAgent:
             row_api_content = msg.get("api_content")
             if not isinstance(row_api_content, str):
                 row_api_content = None
+            legacy_row_timestamp = msg.get("timestamp")
             row_timestamp = _row_timestamp_for(msg)
             pending_cli_message = getattr(self, "_pending_cli_user_message", None)
             is_current_turn_user = (_ov_idx == msg_idx or msg is pending_cli_message)
@@ -2044,6 +2045,7 @@ class AIAgent:
                     content = _ov_content
                 if _ov_timestamp is not None:
                     row_timestamp = _ov_timestamp
+                    legacy_row_timestamp = _ov_timestamp
             if row_api_content == content:
                 row_api_content = None
             if (
@@ -2083,6 +2085,7 @@ class AIAgent:
                 role=role,
                 content=content,
                 timestamp=row_timestamp,
+                _legacy_timestamp=legacy_row_timestamp,
                 tool_name=msg.get("tool_name"),
                 tool_calls=tool_calls_data,
                 tool_call_id=msg.get("tool_call_id"),
