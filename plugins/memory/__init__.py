@@ -38,7 +38,7 @@ import importlib.util
 import logging
 import sys
 from pathlib import Path
-from typing import List, Optional, Tuple, TYPE_CHECKING
+from typing import Any, List, Optional, Tuple, TYPE_CHECKING
 from hermes_cli.config import cfg_get
 
 if TYPE_CHECKING:
@@ -323,6 +323,7 @@ def load_memory_provider(
     name: str,
     *,
     register_skills: Optional[bool] = None,
+    host_context: Any = None,
 ) -> Optional["MemoryProvider"]:
     """Load and return a MemoryProvider instance by name.
 
@@ -556,6 +557,22 @@ class _ProviderCollector:
         self.provider = None
         self._register_skills = register_skills
         self._context = None
+        self._llm = None
+
+    @property
+    def llm(self):
+        """Host-owned LLM facade for memory providers (e.g. Hindsight ``llm_provider=hermes``).
+
+        Built on the shared :class:`PluginLlm` facade so extraction/embedding
+        requests run against Hermes' active model/provider/auth without the
+        provider ever seeing raw credentials — any provider switch (API-key,
+        OAuth, MoA) is inherited automatically.
+        """
+        if self._llm is None:
+            from agent.plugin_llm import PluginLlm
+
+            self._llm = PluginLlm(plugin_id=f"memory.{self.name}")
+        return self._llm
 
     def register_memory_provider(self, provider):
         self.provider = provider
