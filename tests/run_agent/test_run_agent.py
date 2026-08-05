@@ -5063,6 +5063,43 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         agent._swap_credential.assert_called_once_with(next_entry)
 
+    def test_anthropic_monthly_spend_429_does_not_poison_pool(self, agent):
+        """Anthropic request-cost 429 is not a key-wide local cooldown.
+
+        A large Hermes request can exceed the monthly spend headroom while a
+        minimal request on the same API key still succeeds. The pool must not
+        mark ANTHROPIC_API_KEY exhausted for every future request.
+        """
+        class _Pool:
+            provider = "anthropic"
+
+            def current(self):
+                return SimpleNamespace(label="primary")
+
+            def entries(self):
+                return [SimpleNamespace(id="primary", runtime_api_key=agent.api_key)]
+
+            def mark_exhausted_and_rotate(self, **_kwargs):
+                raise AssertionError("monthly spend limit must not mark pool exhausted")
+
+        agent.provider = "anthropic"
+        agent._credential_pool = _Pool()
+        agent._swap_credential = MagicMock()
+
+        recovered, retry_same = agent._recover_with_credential_pool(
+            status_code=429,
+            has_retried_429=True,
+            classified_reason=FailoverReason.rate_limit,
+            error_context={
+                "reason": "rate_limit_error",
+                "message": "This request would exceed your account's monthly spend limit. Please try again later.",
+            },
+        )
+
+        assert recovered is False
+        assert retry_same is True
+        agent._swap_credential.assert_not_called()
+
 
 
 
@@ -5563,6 +5600,7 @@ class TestAnthropicCredentialRefresh:
         agent._anthropic_api_key = "sk-ant-oat01-stale-token"
         agent._anthropic_base_url = "https://api.anthropic.com"
         agent.provider = "anthropic"
+        agent._is_anthropic_oauth = True
 
         with (
             patch("agent.anthropic_adapter.resolve_anthropic_token", return_value="sk-ant-oat01-fresh-token"),

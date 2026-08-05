@@ -77,6 +77,54 @@ def test_explicit_reset_timestamp_overrides_default_429_ttl(tmp_path, monkeypatc
     assert pool.select() is None
 
 
+def test_reset_statuses_wins_over_disk_cooldown_merge(tmp_path, monkeypatch):
+    """`hermes auth reset` must not immediately resurrect disk cooldown.
+
+    write_credential_pool() normally merges a newer on-disk cooldown over a
+    stale in-memory snapshot to prevent lost updates between processes. An
+    explicit reset is different: the user is intentionally clearing that exact
+    cooldown. Without a reset-status exemption, pool.reset_statuses() printed
+    success but the readback still showed the entry as rate-limited.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "anthropic": [
+                    {
+                        "id": "anth-1",
+                        "label": "ANTHROPIC_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "sk-ant-test",
+                        "last_status": "exhausted",
+                        "last_status_at": time.time(),
+                        "last_error_code": 429,
+                        "last_error_reason": "rate_limit_error",
+                        "last_error_message": "This request would exceed your account's monthly spend limit.",
+                        "last_error_reset_at": time.time() + 3600,
+                    }
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("anthropic")
+    assert pool.reset_statuses() == 1
+
+    reloaded = load_pool("anthropic")
+    entry = reloaded.entries()[0]
+    assert entry.last_status is None
+    assert entry.last_status_at is None
+    assert entry.last_error_code is None
+    assert entry.last_error_message is None
+
+
 
 
 def test_billing_rotation_marks_all_entries_sharing_failed_key(tmp_path, monkeypatch):

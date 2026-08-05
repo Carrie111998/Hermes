@@ -52,6 +52,32 @@ logger = logging.getLogger(__name__)
 # spins forever and never reaches ``_try_activate_fallback``. See #26080.
 _MAX_AUTH_REFRESH_ATTEMPTS = 2
 
+_ANTHROPIC_REQUEST_SPEND_LIMIT_PHRASE = "would exceed your account's monthly spend limit"
+
+
+def _is_anthropic_request_spend_limit(
+    provider: str,
+    error_context: Optional[Dict[str, Any]],
+) -> bool:
+    """True for Anthropic's request-cost-specific monthly spend rejection.
+
+    Anthropic can return HTTP 429 with "This request would exceed your
+    account's monthly spend limit" for one large Hermes request while tiny
+    requests on the same key/model still return HTTP 200. Treating that as a
+    credential-wide cooldown strands otherwise-valid requests behind the local
+    pool. Keep the key selectable; the conversation loop can still retry or
+    fall back for this specific oversized request.
+    """
+    if (provider or "").strip().lower() != "anthropic":
+        return False
+    if not isinstance(error_context, dict):
+        return False
+    haystack = " ".join(
+        str(error_context.get(key) or "").lower()
+        for key in ("message", "reason", "code", "error")
+    )
+    return _ANTHROPIC_REQUEST_SPEND_LIMIT_PHRASE in haystack
+
 
 _REASONING_TAG_NAMES = ("think", "thinking", "reasoning", "REASONING_SCRATCHPAD", "thought")
 _TOOL_CALL_TAG_NAMES = ("tool_call", "tool_calls", "tool_result", "function_call", "function_calls")
@@ -1113,6 +1139,13 @@ def recover_with_credential_pool(
         return False, has_retried_429
 
     if effective_reason == FailoverReason.rate_limit:
+        if _is_anthropic_request_spend_limit(current_provider, error_context):
+            _ra().logger.info(
+                "Anthropic request would exceed monthly spend limit for this "
+                "request shape — leaving credential pool status unchanged."
+            )
+            return False, True
+
         # If current credential is already marked exhausted, skip retry and
         # rotate immediately. This prevents the "cancel-between-429s" trap
         # where has_retried_429 (a local var) gets reset on each new prompt,

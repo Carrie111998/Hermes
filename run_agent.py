@@ -6199,6 +6199,13 @@ class AIAgent:
         # Other anthropic_messages providers (MiniMax, Alibaba, etc.) use their own keys.
         if self.provider != "anthropic":
             return False
+        # This hook exists to rotate expiring OAuth credentials.  A selected
+        # regular API key is static and must never be replaced by an
+        # auto-discovered Claude Code subscription token at request time.
+        # API-key edits are handled separately by
+        # _try_refresh_env_client_credentials().
+        if not getattr(self, "_is_anthropic_oauth", False):
+            return False
         # Azure endpoints use static API keys — OAuth token rotation doesn't apply.
         # Refreshing would pick up ~/.claude/.credentials.json OAuth token and break auth.
         _base = getattr(self, "_anthropic_base_url", "") or ""
