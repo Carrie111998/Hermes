@@ -2384,6 +2384,7 @@ def init_agent(
     # 3. Check general plugin system (user-installed plugins)
     # 4. Fall back to built-in ContextCompressor
     _selected_engine = None
+    _engine_found = False
     _engine_name = "compressor"  # default
     try:
         _ctx_cfg = _agent_cfg.get("context", {}) if isinstance(_agent_cfg, dict) else {}
@@ -2408,6 +2409,7 @@ def init_agent(
             except Exception:
                 _candidate = None
             if _candidate is not None and _candidate.name == _engine_name:
+                _engine_found = True
                 try:
                     from agent.context_engine import create_context_engine_runtime
                     _selected_engine = create_context_engine_runtime(
@@ -2423,7 +2425,7 @@ def init_agent(
                     )
                     _selected_engine = None
 
-        if _selected_engine is None:
+        if _selected_engine is None and not _engine_found:
             _ra().logger.warning(
                 "Context engine '%s' not found — falling back to built-in compressor",
                 _engine_name,
