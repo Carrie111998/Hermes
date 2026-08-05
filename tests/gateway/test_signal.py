@@ -48,6 +48,11 @@ def _stub_rpc(return_value):
     return mock_rpc, captured
 
 
+async def _raise_oserror(params: dict) -> dict:
+    """Async stand-in for _inline_send_attachments that simulates a read failure."""
+    raise OSError("simulated unreadable attachment")
+
+
 # ---------------------------------------------------------------------------
 # Platform & Config
 # ---------------------------------------------------------------------------
@@ -122,7 +127,8 @@ class TestSignalHelpers:
         assert _parse_comma_list("") == []
         assert _parse_comma_list("  ,  ,  ") == []
 
-    def test_inline_send_attachments_converts_local_paths(self, tmp_path):
+    @pytest.mark.asyncio
+    async def test_inline_send_attachments_converts_local_paths(self, tmp_path):
         from gateway.platforms.signal import _inline_send_attachments
 
         attachment = tmp_path / "voice.ogg"
@@ -133,7 +139,7 @@ class TestSignalHelpers:
             "attachments": [str(attachment), "data:image/png;base64,AAAA", "/missing.jpg"],
         }
 
-        converted = _inline_send_attachments(params)
+        converted = await _inline_send_attachments(params)
 
         expected_data = base64.b64encode(b"OggS test audio").decode("ascii")
         assert converted is not params
@@ -141,12 +147,48 @@ class TestSignalHelpers:
         assert converted["attachments"][1:] == ["data:image/png;base64,AAAA", "/missing.jpg"]
         assert params["attachments"][0] == str(attachment)
 
-    def test_inline_send_attachments_leaves_no_local_files_unchanged(self):
+    @pytest.mark.asyncio
+    async def test_inline_send_attachments_leaves_no_local_files_unchanged(self):
         from gateway.platforms.signal import _inline_send_attachments
 
         params = {"recipient": ["+155****4567"], "attachments": ["data:text/plain;base64,SGk="]}
 
-        assert _inline_send_attachments(params) is params
+        assert await _inline_send_attachments(params) is params
+
+    @pytest.mark.asyncio
+    async def test_inline_send_attachments_unreadable_path_raises_oserror(self, tmp_path):
+        """An unreadable local attachment must raise OSError, not escape silently."""
+        from gateway.platforms.signal import _inline_send_attachments
+
+        unreadable = tmp_path / "locked.ogg"
+        unreadable.write_bytes(b"OggS test audio")
+        unreadable.chmod(0)
+
+        params = {
+            "recipient": ["+155****4567"],
+            "attachments": [str(unreadable)],
+        }
+
+        with pytest.raises(OSError):
+            await _inline_send_attachments(params)
+
+    @pytest.mark.asyncio
+    async def test_rpc_send_dropped_on_unreadable_attachment(self, monkeypatch):
+        """An unreadable send attachment must fail the RPC controlled, not escape."""
+        from gateway.platforms.signal import SignalAdapter
+
+        adapter = SignalAdapter.__new__(SignalAdapter)
+        adapter.client = MagicMock()
+        adapter.http_url = "http://localhost:8080"
+
+        monkeypatch.setattr(
+            "gateway.platforms.signal._inline_send_attachments",
+            _raise_oserror,
+        )
+
+        result = await adapter._rpc("send", {"recipient": ["+155****4567"], "attachments": ["/nope.ogg"]})
+        assert result is None
+        adapter.client.post.assert_not_called()
 
     def test_guess_extension_png(self):
         from gateway.platforms.signal import _guess_extension
