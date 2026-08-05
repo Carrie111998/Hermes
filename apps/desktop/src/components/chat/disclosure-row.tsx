@@ -14,11 +14,10 @@ import { cn } from '@/lib/utils'
 //     title text, NOT the full row — and reaches just past the chevron with
 //     `-mx-1.5 px-1.5` so it reads as a soft hit-target rather than a slab
 //     stretching to the message edge.
-//   - `trailing` overlays the right edge (absolute) and must stay
-//     non-interactive (e.g. a duration timer) — an opacity-0-but-clickable
-//     control there steals clicks from the caret. Interactive controls go in
-//     `action`, which lays out *in flow* at the far right so it never sits on
-//     top of the caret's hit-target, no matter how long the title is.
+//   - `trailing` is laid out in flow at the far right (ml-auto), matching the
+//     `action` slot's pattern, so it occupies real width and the title's
+//     FadeText correctly detects overflow. It is pointer-events-none so it
+//     cannot steal clicks from the caret. Interactive controls go in `action`.
 export function DisclosureRow({
   action,
   children,
@@ -68,7 +67,7 @@ export function DisclosureRow({
         </span>
       )}
       {trailing && (
-        <span className="absolute right-1 top-0 flex h-(--conversation-line-height) items-center">{trailing}</span>
+        <span className="pointer-events-none ml-auto flex h-(--conversation-line-height) shrink-0 items-center self-start pl-1.5 pr-1">{trailing}</span>
       )}
     </div>
   )
