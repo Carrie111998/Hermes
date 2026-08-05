@@ -83,7 +83,7 @@ def _(rid, params: dict) -> dict:
 
 @method("reload.mcp")
 def _(rid, params: dict) -> dict:
-    session = _sessions.get(params.get("session_id", ""))
+    session = _safe_session_get(params.get("session_id"))
     try:
         # Gate: /reload-mcp invalidates the prompt cache for this session.
         # Respect the ``approvals.mcp_reload_confirm`` config toggle — if
@@ -435,7 +435,7 @@ def _(rid, params: dict) -> dict:
     resolved = _resolve_name(name)
     if resolved != name:
         name = resolved
-    session = _sessions.get(params.get("session_id", ""))
+    session = _safe_session_get(params.get("session_id"))
 
     qcmds = _load_cfg().get("quick_commands", {})
     if name in qcmds:
@@ -1425,7 +1425,7 @@ def _(rid, params: dict) -> dict:
     try:
         from toolsets import get_all_toolsets, get_toolset_info
 
-        session = _sessions.get(params.get("session_id", ""))
+        session = _safe_session_get(params.get("session_id"))
         enabled = (
             set(getattr(session["agent"], "enabled_toolsets", []) or [])
             if session
@@ -1456,7 +1456,7 @@ def _(rid, params: dict) -> dict:
     try:
         from model_tools import get_toolset_for_tool, get_tool_definitions
 
-        session = _sessions.get(params.get("session_id", ""))
+        session = _safe_session_get(params.get("session_id"))
         enabled = (
             getattr(session["agent"], "enabled_toolsets", None)
             if session
@@ -1532,7 +1532,7 @@ def _(rid, params: dict) -> dict:
         )
         save_config(cfg)
 
-        session = _sessions.get(params.get("session_id", ""))
+        session = _safe_session_get(params.get("session_id"))
         info = (
             _reset_session_agent(params.get("session_id", ""), session)
             if session
@@ -1568,7 +1568,7 @@ def _(rid, params: dict) -> dict:
     try:
         from toolsets import get_all_toolsets, get_toolset_info
 
-        session = _sessions.get(params.get("session_id", ""))
+        session = _safe_session_get(params.get("session_id"))
         enabled = (
             set(getattr(session["agent"], "enabled_toolsets", []) or [])
             if session
