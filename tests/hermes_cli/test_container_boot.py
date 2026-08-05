@@ -230,7 +230,7 @@ def test_profiles_default_subdir_is_skipped_with_warning(
 
 
 # ---------------------------------------------------------------------------
-# Dashboard-container role detection (skip reconcile on the dashboard)
+# Web-server container role detection (skip reconcile on dashboard/serve)
 # ---------------------------------------------------------------------------
 
 
@@ -283,7 +283,43 @@ def test_main_skips_reconcile_in_dashboard_container_s6v3(
     assert rc == 0
     assert not (scandir / "gateway-worker").exists()
     assert not (scandir / "gateway-default").exists()
-    assert "skipping (dashboard container" in capsys.readouterr().out
+    assert "skipping (web server container" in capsys.readouterr().out
+
+
+def test_main_skips_reconcile_in_serve_container_s6v3(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """A headless desktop backend must not supervise profile gateways."""
+    from hermes_cli import container_boot
+
+    scandir = tmp_path / "run-service"
+    scandir.mkdir()
+    _make_profile(tmp_path, "worker", state="running")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("S6_PROFILE_GATEWAY_SCANDIR", str(scandir))
+    monkeypatch.setattr(
+        container_boot,
+        "_read_container_argv",
+        lambda: (
+            "/bin/sh",
+            "-e",
+            "/run/s6/basedir/scripts/rc.init",
+            "top",
+            "/opt/hermes/docker/main-wrapper.sh",
+            "serve",
+            "--host",
+            "0.0.0.0",
+        ),
+    )
+
+    rc = container_boot.main()
+
+    assert rc == 0
+    assert not (scandir / "gateway-worker").exists()
+    assert not (scandir / "gateway-default").exists()
+    assert "skipping (web server container" in capsys.readouterr().out
 
 
 
@@ -297,7 +333,5 @@ def _write_lifecycle_sentinel(profile_dir: Path, payload: dict) -> None:
     state_dir = profile_dir / "state"
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "gateway.lifecycle.json").write_text(json.dumps(payload))
-
-
 
 
