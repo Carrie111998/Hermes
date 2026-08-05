@@ -1298,6 +1298,46 @@ def run_doctor(args):
         except Exception:
             pass
 
+    # SQLite engine version guard (WAL-reset corruption bug, SQLite 3.7.0-3.51.2;
+    # safe builds are >= 3.51.3). Hermes resolves `import sqlite3` to `pysqlite3`
+    # when that package is present in the venv (it shadows the stdlib), so the
+    # version that actually matters is whatever is statically linked into
+    # pysqlite3's _sqlite3 extension -- NOT the managed Python's SQLite. A
+    # `hermes update` can silently revert pysqlite3 to a vulnerable build, and
+    # without this guard the user has no way to see it.
+    _section("SQLite Engine Version")
+    try:
+        import sqlite3
+
+        _sql_version = sqlite3.sqlite_version
+        _sql_backend = sqlite3.__file__ or "unknown"
+        _vparts = tuple(int(x) for x in _sql_version.split(".")[:3] if x.isdigit())
+        _vuln = _vparts < (3, 51, 3)
+        if _vuln:
+            check_warn(
+                f"SQLite engine is {_sql_version} (WAL-reset corruption bug, "
+                f"affects 3.7.0-3.51.2)",
+                f"(backend: {_sql_backend})",
+            )
+            if should_fix:
+                check_info(
+                    "Auto-fix not available: the active backend is pysqlite3, "
+                    "which statically links SQLite. Rebuild it against the "
+                    "official amalgamation >= 3.51.3, or run "
+                    "'hermes update' again after a safe build is published."
+                )
+            issues.append(
+                f"Vulnerable SQLite {_sql_version} (WAL-reset bug) — backend: "
+                f"{_sql_backend}"
+            )
+        else:
+            check_ok(
+                f"SQLite engine {_sql_version} (safe, >= 3.51.3)",
+                f"(backend: {_sql_backend})",
+            )
+    except Exception as e:
+        check_warn(f"Could not determine SQLite engine version: {e}")
+
     _check_gateway_service_linger(issues)
     _check_s6_supervision(issues)
 
