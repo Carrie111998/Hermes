@@ -820,7 +820,7 @@ def _model_sort_key(model_id: str, prefix: str) -> tuple:
 
     for ch in rest:
         if state == "start":
-            if ch in "vV":
+            if ch in "vVkK":
                 state = "in_version"
             elif ch.isdigit():
                 state = "in_version"
