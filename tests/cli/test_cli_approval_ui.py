@@ -23,8 +23,6 @@ def _make_cli_stub():
     cli._approval_state = None
     cli._approval_deadline = 0
     cli._approval_lock = threading.Lock()
-    cli._sudo_state = None
-    cli._sudo_deadline = 0
     cli._modal_input_snapshot = None
     cli._invalidate = MagicMock()
     cli._app = SimpleNamespace(invalidate=MagicMock(), current_buffer=_FakeBuffer())
@@ -92,36 +90,6 @@ class TestCliApprovalUi:
         cli._approval_state["response_queue"].put("deny")
         thread.join(timeout=2)
         assert result["value"] == "deny"
-
-
-    def test_sudo_prompt_restores_existing_draft_after_response(self):
-        cli = _make_cli_stub()
-        cli._app.current_buffer = _FakeBuffer("draft command", cursor_position=5)
-        result = {}
-
-        def _run_callback():
-            result["value"] = cli._sudo_password_callback()
-
-        with patch.object(cli_module, "_cprint"):
-            thread = threading.Thread(target=_run_callback, daemon=True)
-            thread.start()
-
-            deadline = time.time() + 2
-            while cli._sudo_state is None and time.time() < deadline:
-                time.sleep(0.01)
-
-            assert cli._sudo_state is not None
-            assert cli._app.current_buffer.text == ""
-
-            cli._app.current_buffer.text = "secret"
-            cli._app.current_buffer.cursor_position = len("secret")
-            cli._sudo_state["response_queue"].put("secret")
-
-            thread.join(timeout=2)
-
-        assert result["value"] == "secret"
-        assert cli._app.current_buffer.text == "draft command"
-        assert cli._app.current_buffer.cursor_position == 5
 
 
     def test_handle_approval_selection_view_expands_in_place(self):
@@ -199,13 +167,9 @@ class TestCliApprovalUi:
                 self.thinking_callback = None
 
             def run_conversation(self, **kwargs):
-                from tools.terminal_tool import (
-                    _get_approval_callback,
-                    _get_sudo_password_callback,
-                )
+                from tools.terminal_tool import _get_approval_callback
 
                 seen["approval"] = _get_approval_callback()
-                seen["sudo"] = _get_sudo_password_callback()
                 return {
                     "final_response": "done",
                     "messages": [],
@@ -227,8 +191,6 @@ class TestCliApprovalUi:
 
         assert seen["approval"].__self__ is cli
         assert seen["approval"].__func__ is HermesCLI._approval_callback
-        assert seen["sudo"].__self__ is cli
-        assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
         assert not cli._background_tasks
 
 
@@ -243,8 +205,6 @@ def _make_real_paint_cli_stub():
     cli._approval_state = None
     cli._approval_deadline = 0
     cli._approval_lock = threading.Lock()
-    cli._sudo_state = None
-    cli._sudo_deadline = 0
     cli._clarify_state = None
     cli._clarify_freetext = False
     cli._clarify_deadline = 0
@@ -261,7 +221,7 @@ def _make_real_paint_cli_stub():
 class TestModalPaintNow:
     """Regression for #41098 — modal prompts must paint immediately.
 
-    The dangerous-command approval, clarify, and sudo prompts run their wait
+    The dangerous-command approval and clarify prompts run their wait
     loop on a background thread, set modal state a ConditionalContainer reads,
     then must repaint so the panel becomes visible. They used the throttled
     _invalidate(), whose paint is silently dropped on a 250ms window collision
@@ -304,7 +264,7 @@ class TestModalPaintNow:
             )
             thread.join(timeout=2)
             # clarify returns immediately on a response (no teardown repaint);
-            # approval and sudo repaint to tear the panel down.
+            # approval repaints to tear the panel down.
             if state_attr != "_clarify_state":
                 assert cli._app.invalidate.called, (
                     f"{state_attr} panel was not repainted on teardown"
@@ -330,12 +290,12 @@ class TestModalPaintNow:
 class TestApprovalCallbackThreadLocalWiring:
     """Regression guard for the thread-local callback freeze (#13617 / #13618).
 
-    After 62348cff made _approval_callback / _sudo_password_callback thread-local
-    (ACP GHSA-qg5c-hvr5-hjgr), the CLI agent thread could no longer see callbacks
-    registered in the main thread — the dangerous-command prompt silently fell
-    back to stdin input() and deadlocked against prompt_toolkit. The fix is to
-    register the callbacks INSIDE the agent worker thread (matching the ACP
-    pattern). These tests lock in that invariant.
+    After 62348cff made _approval_callback thread-local (ACP GHSA-qg5c-hvr5-hjgr),
+    the CLI agent thread could no longer see callbacks registered in the main
+    thread — the dangerous-command prompt silently fell back to stdin input()
+    and deadlocked against prompt_toolkit. The fix is to register the callback
+    INSIDE the agent worker thread (matching the ACP pattern). These tests
+    lock in that invariant.
     """
 
     def test_main_thread_registration_is_invisible_to_child_thread(self):
@@ -374,42 +334,31 @@ class TestApprovalCallbackThreadLocalWiring:
         """
         from tools.terminal_tool import (
             set_approval_callback,
-            set_sudo_password_callback,
             _get_approval_callback,
-            _get_sudo_password_callback,
         )
 
         def approval_cb(_cmd, _desc):
             return "once"
-
-        def sudo_cb():
-            return "hunter2"
 
         seen = {}
 
         def _worker():
             # Mimic cli.py's run_agent() thread target.
             set_approval_callback(approval_cb)
-            set_sudo_password_callback(sudo_cb)
             try:
                 seen["approval"] = _get_approval_callback()
-                seen["sudo"] = _get_sudo_password_callback()
             finally:
                 set_approval_callback(None)
-                set_sudo_password_callback(None)
                 seen["approval_after"] = _get_approval_callback()
-                seen["sudo_after"] = _get_sudo_password_callback()
 
         t = threading.Thread(target=_worker, daemon=True)
         t.start()
         t.join(timeout=2)
 
         assert seen["approval"] is approval_cb
-        assert seen["sudo"] is sudo_cb
-        # Finally block must clear both slots — otherwise a reused thread
+        # Finally block must clear the slot — otherwise a reused thread
         # would hold a stale reference to a disposed CLI instance.
         assert seen["approval_after"] is None
-        assert seen["sudo_after"] is None
 
 
 class TestPersistPromptSummary:
@@ -480,7 +429,7 @@ class TestPersistPromptSummary:
 
 class TestClearOverlaysForInterrupt:
     """Regression tests for #14026 — interrupting a running agent must clear
-    every input-blocking overlay (approval/clarify/sudo/secret) so the CLI
+    every input-blocking overlay (approval/clarify/secret) so the CLI
     isn't left frozen with no thread servicing the prompt."""
 
     def _make_cli(self):
@@ -493,17 +442,14 @@ class TestClearOverlaysForInterrupt:
         cli._paint_now = MagicMock()
         return cli
 
-    def test_clears_all_four_overlays_and_unblocks_queues(self):
+    def test_clears_all_three_overlays_and_unblocks_queues(self):
         cli = self._make_cli()
         approval_q = queue.Queue()
         clarify_q = queue.Queue()
-        sudo_q = queue.Queue()
         secret_q = queue.Queue()
         cli._approval_state = {"response_queue": approval_q}
         cli._clarify_state = {"response_queue": clarify_q}
         cli._clarify_freetext = True
-        cli._sudo_state = {"response_queue": sudo_q, "timeout": 60}
-        cli._sudo_deadline = 99999.0
         cli._secret_state = {"response_queue": secret_q, "var_name": "X"}
 
         cli._clear_active_overlays_for_interrupt()
@@ -512,14 +458,11 @@ class TestClearOverlaysForInterrupt:
         assert cli._approval_state is None
         assert cli._clarify_state is None
         assert cli._clarify_freetext is False
-        assert cli._sudo_state is None
-        assert cli._sudo_deadline == 0
         assert cli._secret_state is None
 
         # Each blocked thread would have received a terminal value.
         assert approval_q.get_nowait() == "deny"
         assert clarify_q.get_nowait()  # cancellation sentinel string
-        assert sudo_q.get_nowait() == ""
         assert secret_q.get_nowait() == ""
 
 

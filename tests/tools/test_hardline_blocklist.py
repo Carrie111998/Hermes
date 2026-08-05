@@ -596,6 +596,32 @@ def test_sudo_stdin_guard_detects_without_password():
         assert "sudo" in desc.lower()
 
 
+def test_sudo_stdin_guard_fires_even_with_sudo_password_set(monkeypatch):
+    """Regression: the guard must NOT exempt sudo -S just because
+    SUDO_PASSWORD happens to be set in the environment.
+
+    This used to be a deliberate bypass — SUDO_PASSWORD configured meant
+    _transform_sudo_command legitimately injected -S itself, so the guard
+    stood down to avoid blocking Hermes's own transformed commands. That
+    injection mechanism was removed (SUDO_PASSWORD is a process-global
+    secret every spawned command could read); Hermes never writes
+    "sudo -S" anymore, so ANY occurrence — even with a stale SUDO_PASSWORD
+    still sitting in the environment — is the LLM's own doing and must be
+    blocked unconditionally, with no exemption.
+    """
+    import tools.approval as approval_mod
+
+    monkeypatch.setenv("SUDO_PASSWORD", "leftover-unused-value")
+
+    for cmd in _SUDO_STDIN_BLOCK:
+        is_blocked, desc = approval_mod._check_sudo_stdin_guard(cmd)
+        assert is_blocked, (
+            f"expected sudo stdin guard to block {cmd!r} even with "
+            "SUDO_PASSWORD set — the old exemption must be gone"
+        )
+        assert "sudo" in desc.lower()
+
+
 def test_sudo_stdin_guard_container_bypass(clean_session):
     """Containerized backends still bypass — they can't touch the host."""
     for env in ("docker", "singularity", "modal", "daytona", "vercel_sandbox"):

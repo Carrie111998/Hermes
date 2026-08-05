@@ -3,7 +3,7 @@
 This module deliberately stops at the Hermes boundary:
 - command preparation
 - cwd/timeout normalization
-- stdin/sudo shell wrapping
+- stdin shell wrapping
 - common result shape
 - interrupt/cancel polling
 
@@ -13,7 +13,6 @@ trust-boundary decisions in their own modules.
 
 from __future__ import annotations
 
-import shlex
 import time
 import uuid
 from abc import abstractmethod
@@ -48,11 +47,6 @@ def wrap_modal_stdin_heredoc(command: str, stdin_data: str) -> str:
     while marker in stdin_data:
         marker = f"HERMES_EOF_{uuid.uuid4().hex[:8]}"
     return f"{command} << '{marker}'\n{stdin_data}\n{marker}"
-
-
-def wrap_modal_sudo_pipe(command: str, sudo_stdin: str) -> str:
-    """Feed sudo via a shell pipe for transports without direct stdin piping."""
-    return f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {command}"
 
 
 class BaseModalExecutionEnvironment(BaseEnvironment):
@@ -174,9 +168,7 @@ class BaseModalExecutionEnvironment(BaseEnvironment):
         if stdin_data is not None and self._stdin_mode == "heredoc":
             exec_command = wrap_modal_stdin_heredoc(exec_command, stdin_data)
 
-        exec_command, sudo_stdin = self._prepare_command(exec_command)
-        if sudo_stdin is not None:
-            exec_command = wrap_modal_sudo_pipe(exec_command, sudo_stdin)
+        exec_command, _sudo_stdin = self._prepare_command(exec_command)
 
         return PreparedModalExec(
             command=exec_command,
