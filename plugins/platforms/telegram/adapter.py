@@ -312,7 +312,7 @@ from plugins.platforms.telegram.media_cache_mixin import MediaCacheMixin
 from plugins.platforms.telegram.inbound_handlers_mixin import InboundHandlersMixin
 from plugins.platforms.telegram.text_batching_mixin import TextBatchingMixin
 from plugins.platforms.telegram.media_batching_mixin import MediaBatchingMixin
-from plugins.platforms.telegram.dm_topics_mixin import DmTopicsMixin
+from plugins.platforms.telegram.dm_topics_cache_mixin import DmTopicsCacheMixin
 from plugins.platforms.telegram.rich_text_flatten_mixin import RichTextFlattenMixin
 from plugins.platforms.telegram.reactions_mixin import ReactionsMixin
 
@@ -615,7 +615,7 @@ class TelegramAdapter(
     InboundHandlersMixin,
     TextBatchingMixin,
     MediaBatchingMixin,
-    DmTopicsMixin,
+    DmTopicsCacheMixin,
     RichTextFlattenMixin,
     ReactionsMixin,
     BasePlatformAdapter,
