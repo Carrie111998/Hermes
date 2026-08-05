@@ -54,10 +54,11 @@ curator:
   stale_after_days: 30
   archive_after_days: 90
   consolidate: false           # LLM umbrella-building pass — opt-in (prune-only by default)
+  consolidate_archived: false  # also review recoverable packages in .archive/
   prune_builtins: true         # archive unused bundled built-in skills too (hub skills always exempt)
 ```
 
-To disable entirely, set `curator.enabled: false`. To keep the always-on pruning but opt into LLM consolidation, set `curator.consolidate: true`.
+To disable entirely, set `curator.enabled: false`. To keep the always-on pruning but opt into LLM consolidation, set `curator.consolidate: true`. Archived packages are included only when `curator.consolidate_archived: true`; absorbed packages retain a durable sidecar marker so they are not merged repeatedly.
 
 ### Running the review on a cheaper aux model
 
