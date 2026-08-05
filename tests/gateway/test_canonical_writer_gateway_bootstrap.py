@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import subprocess
 import sys
@@ -284,3 +285,21 @@ assert entry.__file__.endswith('/gateway/canonical_writer_gateway_bootstrap.py')
         },
     )
     assert completed.returncode == 0, completed.stderr
+
+
+def test_entrypoint_reports_only_failure_type_and_digest(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["canonical_writer_gateway_bootstrap"])
+
+    def fail_closed():
+        raise RuntimeError("fixed diagnostic failure")
+
+    monkeypatch.setattr(bootstrap, "run_writer_only_gateway", fail_closed)
+
+    assert bootstrap.main() == 1
+    digest = hashlib.sha256(
+        b"RuntimeError:fixed diagnostic failure"
+    ).hexdigest()
+    assert capsys.readouterr().err == (
+        "writer-only gateway failed closed "
+        f"error_type=RuntimeError error_sha256={digest}\n"
+    )

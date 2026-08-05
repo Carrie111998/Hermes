@@ -255,6 +255,13 @@ _HOST_IDENTITY_CONVERGENCE_ERROR_TYPE = "RuntimeError"
 _HOST_IDENTITY_CONVERGENCE_ERROR_SHA256 = hashlib.sha256(
     b"RuntimeError:canary host identity reconciliation did not converge"
 ).hexdigest()
+_RECOVERABLE_POST_INSTALL_NATIVE_FAILURE_STAGES = frozenset({
+    "refresh_external_iam",
+    "start_writer",
+    "start_gateway",
+    "collect_native",
+    "stop_services",
+})
 
 
 def _collector_pair_names() -> frozenset[str]:
@@ -978,16 +985,10 @@ def _validate_native_failure_value(
             iam=iam,
             require_current_host_state=require_current_host_state,
         )
-    elif value.get("stage") == "install":
-        _validate_native_install_failure(
-            value,
-            source_revision=source_revision,
-            native=native,
-            owner=owner,
-            iam=iam,
-            require_current_host_state=require_current_host_state,
-        )
-    elif value.get("stage") == "start_writer":
+    elif value.get("stage") in {
+        "install",
+        *_RECOVERABLE_POST_INSTALL_NATIVE_FAILURE_STAGES,
+    }:
         _validate_native_install_failure(
             value,
             source_revision=source_revision,
@@ -1575,7 +1576,8 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             base_archive=archive,
         )
         if (
-            failed_native_stage == "start_writer"
+            failed_native_stage
+            in _RECOVERABLE_POST_INSTALL_NATIVE_FAILURE_STAGES
             and not installed_native_artifacts
         ):
             raise RuntimeError(
