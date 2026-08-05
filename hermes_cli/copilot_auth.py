@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
-from utils import atomic_replace
 
 logger = logging.getLogger(__name__)
 
@@ -399,6 +398,14 @@ def _write_jwt_store_atomically(path: Path, store: dict) -> None:
     Raises on failure; both callers log at debug and continue, since the disk
     store is only a restart-survivability cache for the in-process one.
     """
+    # Imported lazily, matching this module's convention for its other
+    # cross-package dependencies (``get_hermes_home`` in ``_jwt_disk_path``,
+    # ``urllib.request`` in ``exchange_copilot_token``). ``utils`` pulls in
+    # PyYAML, which costs ~10ms of import time this module does not otherwise
+    # pay — and ``copilot_auth`` sits on the credential-resolution path that
+    # ``tests/tui_gateway/test_cold_start_gil_stall.py`` guards.
+    from utils import atomic_replace
+
     tmp_path = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
         fd = os.open(
