@@ -290,6 +290,26 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("GMI_API_KEY",),
         base_url_env_var="GMI_BASE_URL",
     ),
+    # AgentRouter exposes two wire protocols on one host and one API key.
+    # They are separate providers because the base URL and transport differ:
+    # /v1 is OpenAI-compatible (GPT, GLM), the bare host is Anthropic Messages
+    # (Claude Opus). See plugins/model-providers/agentrouter/.
+    "agentrouter": ProviderConfig(
+        id="agentrouter",
+        name="AgentRouter",
+        auth_type="api_key",
+        inference_base_url="https://agentrouter.org/v1",
+        api_key_env_vars=("AGENTROUTER_API_KEY",),
+        base_url_env_var="AGENTROUTER_BASE_URL",
+    ),
+    "agentrouter-anthropic": ProviderConfig(
+        id="agentrouter-anthropic",
+        name="AgentRouter (Claude)",
+        auth_type="api_key",
+        inference_base_url="https://agentrouter.org",
+        api_key_env_vars=("AGENTROUTER_API_KEY",),
+        base_url_env_var="AGENTROUTER_ANTHROPIC_BASE_URL",
+    ),
     "minimax": ProviderConfig(
         id="minimax",
         name="MiniMax",
@@ -1968,6 +1988,8 @@ def resolve_provider(
         "step": "stepfun", "stepfun-coding-plan": "stepfun",
         "arcee-ai": "arcee", "arceeai": "arcee",
         "gmi-cloud": "gmi", "gmicloud": "gmi",
+        "agent-router": "agentrouter", "agentrouter-openai": "agentrouter",
+        "agentrouter-claude": "agentrouter-anthropic",
         "minimax-china": "minimax-cn", "minimax_cn": "minimax-cn",
         "minimax-portal": "minimax-oauth", "minimax-global": "minimax-oauth", "minimax_oauth": "minimax-oauth",
         "alibaba_coding": "alibaba-coding-plan", "alibaba-coding": "alibaba-coding-plan",
