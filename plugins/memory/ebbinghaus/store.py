@@ -348,6 +348,9 @@ class EbbinghausMemoryStore:
         self._conn.executescript(_BASE_SCHEMA)
         self._migrate()
         self._conn.commit()
+        from .migrations import apply_experience_migrations
+
+        apply_experience_migrations(self._conn, self.db_path, now=self._now())
 
     def _migrate(self) -> None:
         self._conn.execute("BEGIN")
