@@ -213,10 +213,14 @@ def reconcile_board(
         event_kind = str(row["event_kind"])
         block_kind = str(payload.get("kind") or row.get("block_kind") or "")
 
-        # Legacy/untyped blocks predate the explicit block-kind contract and
-        # historically represent human blockers. Fail closed: only explicitly
-        # typed non-human failure kinds are eligible for automatic recovery.
-        protected = not block_kind or block_kind in {"needs_input", "capability"}
+        # Recovery is allowlisted, not inferred. Legacy, malformed, plugin, and
+        # future block kinds remain human gates until they opt into the typed
+        # transient contract. A block-loop event is always deliberate triage,
+        # even when the repeated underlying blocker was transient.
+        recoverable = (
+            block_kind == "transient" and event_kind in {"blocked", "gave_up"}
+        )
+        protected = not recoverable
         if protected:
             if _ensure_supervisor_subscription(
                 conn,
@@ -279,7 +283,6 @@ def render_supervisor_event(
     ).strip()
     task_id = str(getattr(task, "id", "") or "")
     title = str(getattr(task, "title", task_id) or task_id)
-    block_kind = str(payload.get("kind") or getattr(task, "block_kind", "") or "")
     metadata = delivery_metadata if isinstance(delivery_metadata, Mapping) else {}
     try:
         bound_event_id = int(metadata.get("_kanban_supervisor_event_id", -1))
@@ -300,8 +303,6 @@ def render_supervisor_event(
 
     mode = str(metadata.get("_kanban_supervisor_mode") or "")
     if mode == "protected_gate":
-        if block_kind and block_kind not in {"needs_input", "capability"}:
-            return ""
         token = str(metadata.get("_kanban_supervisor_gate_token") or "")
         if not re.fullmatch(r"[a-f0-9]{32}", token):
             return ""

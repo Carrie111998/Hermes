@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from types import SimpleNamespace
 
 import pytest
 
@@ -12,6 +13,7 @@ from gateway.kanban_proactive_supervisor import (
     ProactiveSupervisorConfig,
     consume_supervisor_reply,
     reconcile_board,
+    render_supervisor_event,
 )
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
@@ -230,6 +232,81 @@ def test_dispatcher_gave_up_is_typed_transient_and_recovered(
         conn.close()
 
 
+def test_unknown_typed_block_fails_closed_and_renders_gate(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Future blocker", assignee="forge")
+        assert kb.block_task(conn, task_id, reason="Requires operator approval")
+        blocked = _latest_event(conn, task_id, "blocked")
+        payload = json.loads(blocked["payload"])
+        payload["kind"] = "approval_required"
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET block_kind = 'approval_required' WHERE id = ?",
+                (task_id,),
+            )
+            conn.execute(
+                "UPDATE task_events SET payload = ? WHERE id = ?",
+                (json.dumps(payload), blocked["id"]),
+            )
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        metadata = kb.list_notify_subs(conn, task_id)[0]["delivery_metadata"]
+        rendered = render_supervisor_event(
+            board="default",
+            task=task,
+            event=SimpleNamespace(id=blocked["id"], payload=json.dumps(payload)),
+            delivery_metadata=metadata,
+            current_event_id=blocked["id"],
+        )
+        assert result.protected_gates == [task_id]
+        assert result.recovered == []
+        assert task.status == "blocked"
+        assert rendered and "Reply to this message" in rendered
+    finally:
+        conn.close()
+
+
+def test_current_block_loop_triage_is_never_auto_recovered(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Repeated transient", assignee="forge")
+        assert kb.block_task(
+            conn, task_id, reason="temporary backend failure", kind="transient"
+        )
+        assert kb.unblock_task(conn, task_id)
+        assert kb.block_task(
+            conn, task_id, reason="temporary backend failure", kind="transient"
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "triage"
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        assert result.protected_gates == [task_id]
+        assert result.recovered == []
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "triage"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = 'supervisor_recovery'",
+            (task_id,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_authenticated_gate_reply_failure_does_not_fall_through_to_agent(monkeypatch):
     from gateway import kanban_proactive_supervisor as supervisor
 
@@ -349,11 +426,21 @@ def test_recovery_budget_is_durable_and_exhaustion_is_status_only(tmp_path, monk
         first = reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
         assert first.recovered == [task_id]
 
-        assert kb.block_task(conn, task_id, reason="temporary backend failure", kind="transient")
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            "worker executable unavailable",
+            outcome="spawn_failed",
+            failure_limit=1,
+            force_trip=True,
+            release_claim=False,
+            end_run=False,
+        )
         exhausted = reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
 
         assert exhausted.recovery_exhausted == [task_id]
-        assert kb.get_task(conn, task_id).status == "triage"
+        task = kb.get_task(conn, task_id)
+        assert task is not None and task.status == "blocked"
         exhausted_event = conn.execute(
             "SELECT * FROM task_events WHERE task_id = ? "
             "AND kind IN ('blocked', 'gave_up', 'block_loop_detected') "
