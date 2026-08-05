@@ -4288,6 +4288,19 @@ class APIServerAdapter(BasePlatformAdapter):
         async def _run_and_close():
             try:
                 self._set_run_status(run_id, "running")
+                if session_id:
+                    try:
+                        db = self._ensure_session_db()
+                        if db is not None:
+                            row = db.get_session(session_id) or {}
+                            if row.get("ended_at") is not None:
+                                db.reopen_session(session_id)
+                    except Exception:
+                        logger.debug(
+                            "[api_server] failed to reopen run session %s",
+                            session_id,
+                            exc_info=True,
+                        )
                 agent = self._create_agent(
                     ephemeral_system_prompt=ephemeral_system_prompt,
                     session_id=session_id,
@@ -4457,6 +4470,22 @@ class APIServerAdapter(BasePlatformAdapter):
                 self._active_run_agents.pop(run_id, None)
                 self._active_run_tasks.pop(run_id, None)
                 self._run_approval_sessions.pop(run_id, None)
+                if session_id:
+                    try:
+                        still_active = any(
+                            (self._run_statuses.get(other_run_id) or {}).get("session_id") == session_id
+                            for other_run_id in self._active_run_tasks
+                        )
+                        if not still_active:
+                            db = self._ensure_session_db()
+                            if db is not None:
+                                db.end_session(session_id, "api_run_complete")
+                    except Exception:
+                        logger.debug(
+                            "[api_server] failed to end run session %s",
+                            session_id,
+                            exc_info=True,
+                        )
 
         task = asyncio.create_task(_run_and_close())
         self._active_run_tasks[run_id] = task

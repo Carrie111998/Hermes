@@ -84,6 +84,30 @@ def _make_slow_agent(**kwargs):
     return mock_agent, ready, interrupted
 
 
+class _FakeRunSessionDB:
+    def __init__(self, rows=None):
+        self.rows = rows or {}
+        self.get_calls = []
+        self.reopen_calls = []
+        self.end_calls = []
+
+    def get_session(self, session_id):
+        self.get_calls.append(session_id)
+        row = self.rows.get(session_id)
+        return dict(row) if row is not None else None
+
+    def reopen_session(self, session_id):
+        self.reopen_calls.append(session_id)
+        self.rows.setdefault(session_id, {})["ended_at"] = None
+        self.rows[session_id]["end_reason"] = None
+
+    def end_session(self, session_id, end_reason):
+        self.end_calls.append((session_id, end_reason))
+        row = self.rows.setdefault(session_id, {})
+        row["ended_at"] = time.time()
+        row["end_reason"] = end_reason
+
+
 @pytest.fixture
 def adapter():
     return _make_adapter()
@@ -145,6 +169,143 @@ class TestStartRun:
             data = await resp.json()
             assert "input" in data["error"]["message"]
 
+    @pytest.mark.asyncio
+    async def test_start_ends_persisted_session_after_completed_run(self, adapter):
+        """/v1/runs must close its SessionDB row when the run completes.
+
+        prune_sessions() only reaps rows with ended_at set, so an API run that
+        never calls end_session() becomes a permanent ghost session.
+        """
+        session_db = _FakeRunSessionDB({"runs-session": {"ended_at": None}})
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_ensure_session_db", return_value=session_db),
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "hello", "session_id": "runs-session"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert session_db.end_calls == [("runs-session", "api_run_complete")]
+
+    @pytest.mark.asyncio
+    async def test_start_reopens_reused_ended_session_before_run(self, adapter):
+        """Issue-strategy clients can intentionally reuse one session_id.
+
+        If the previous run ended that row, the next run must reopen it before
+        appending messages; otherwise an active reused session stays pruneable.
+        """
+        session_db = _FakeRunSessionDB({
+            "issue-session": {"ended_at": 123.0, "end_reason": "api_run_complete"}
+        })
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_ensure_session_db", return_value=session_db),
+                patch.object(adapter, "_create_agent") as mock_create,
+            ):
+                mock_agent = MagicMock()
+                mock_agent.run_conversation.return_value = {"final_response": "done"}
+                mock_agent.session_prompt_tokens = 0
+                mock_agent.session_completion_tokens = 0
+                mock_agent.session_total_tokens = 0
+                mock_create.return_value = mock_agent
+
+                resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "again", "session_id": "issue-session"},
+                )
+                assert resp.status == 202
+                run_id = (await resp.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{run_id}")
+                    status = await status_resp.json()
+                    if status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert status["status"] == "completed"
+        assert session_db.reopen_calls == ["issue-session"]
+        assert session_db.end_calls == [("issue-session", "api_run_complete")]
+
+    @pytest.mark.asyncio
+    async def test_start_does_not_close_shared_session_until_last_run_finishes(self, adapter):
+        """Concurrent /v1/runs may share a Paperclip issue session_id.
+
+        Finishing one run must not close the shared row while another run using
+        that session is still active; the last finisher closes it.
+        """
+        session_db = _FakeRunSessionDB({"shared-session": {"ended_at": None}})
+        slow_agent, slow_ready, _ = _make_slow_agent()
+        fast_agent = MagicMock()
+        fast_agent.run_conversation.return_value = {"final_response": "fast done"}
+        fast_agent.session_prompt_tokens = 0
+        fast_agent.session_completion_tokens = 0
+        fast_agent.session_total_tokens = 0
+        app = _create_runs_app(adapter)
+
+        async with TestClient(TestServer(app)) as cli:
+            with (
+                patch.object(adapter, "_ensure_session_db", return_value=session_db),
+                patch.object(adapter, "_create_agent", side_effect=[slow_agent, fast_agent]),
+            ):
+                slow_resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "slow", "session_id": "shared-session"},
+                )
+                slow_run_id = (await slow_resp.json())["run_id"]
+                assert slow_ready.wait(timeout=3.0)
+
+                fast_resp = await cli.post(
+                    "/v1/runs",
+                    json={"input": "fast", "session_id": "shared-session"},
+                )
+                fast_run_id = (await fast_resp.json())["run_id"]
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{fast_run_id}")
+                    fast_status = await status_resp.json()
+                    if fast_status["status"] == "completed":
+                        break
+                    await asyncio.sleep(0.05)
+
+                assert fast_status["status"] == "completed"
+                assert session_db.end_calls == []
+
+                stop_resp = await cli.post(f"/v1/runs/{slow_run_id}/stop")
+                assert stop_resp.status == 200
+
+                for _ in range(40):
+                    status_resp = await cli.get(f"/v1/runs/{slow_run_id}")
+                    slow_status = await status_resp.json()
+                    if slow_status["status"] in {"cancelled", "completed"}:
+                        break
+                    await asyncio.sleep(0.05)
+
+        assert slow_status["status"] in {"cancelled", "completed"}
+        assert session_db.end_calls == [("shared-session", "api_run_complete")]
     @pytest.mark.asyncio
     async def test_start_empty_input_returns_400(self, adapter):
         app = _create_runs_app(adapter)
