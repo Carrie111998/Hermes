@@ -138,6 +138,13 @@ def _ensure_supervisor_subscription(
         ),
         None,
     )
+    if existing:
+        existing_profile = str(existing.get("notifier_profile") or "").strip()
+        if existing_profile and existing_profile != notifier_profile:
+            # The route key is unique without profile in the DB schema. Never
+            # repurpose another profile's subscription: doing so would make its
+            # bot deliver a gate configured and consumed by this profile.
+            return False
     metadata = dict(existing.get("delivery_metadata") or {}) if existing else {}
     if (
         metadata.get("_kanban_supervisor_event_id") == int(event_id)
@@ -213,7 +220,9 @@ def reconcile_board(
         event_kind = str(row["event_kind"])
         block_kind = str(payload.get("kind") or row.get("block_kind") or "")
 
-        protected = block_kind in {"needs_input", "capability"} and is_protected_gate(reason)
+        protected = (
+            block_kind in {"needs_input", "capability"} or not block_kind
+        ) and is_protected_gate(reason)
         if protected:
             if _ensure_supervisor_subscription(
                 conn,

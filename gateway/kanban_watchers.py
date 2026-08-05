@@ -473,12 +473,33 @@ class GatewayKanbanWatchersMixin:
                             and render_supervisor_event is not None
                             and kind in {"blocked", "gave_up", "block_loop_detected"}
                         ):
+                            # Collection claims the cursor before platform I/O.
+                            # Re-read the subscription and task generation at
+                            # the final delivery boundary so a concurrent
+                            # dashboard transition, recovery, or replacement
+                            # gate cannot emit stale supervisor copy.
+                            _fresh_supervisor_state = await asyncio.to_thread(
+                                self._kanban_supervisor_delivery_state,
+                                sub,
+                                board_slug,
+                            )
+                            if _fresh_supervisor_state is None:
+                                _supervisor_suppressed_event_ids.add(int(ev.id))
+                                continue
+                            _fresh_sub, task, _fresh_state_event_id = _fresh_supervisor_state
+                            if (
+                                str(_fresh_sub.get("notifier_profile") or "")
+                                != str(sub.get("notifier_profile") or "")
+                            ):
+                                _supervisor_suppressed_event_ids.add(int(ev.id))
+                                continue
+                            delivery_metadata = _fresh_sub.get("delivery_metadata")
                             _supervisor_msg = render_supervisor_event(
                                 board=board_slug or _kb.DEFAULT_BOARD,
                                 task=task,
                                 event=ev,
                                 delivery_metadata=delivery_metadata,
-                                current_event_id=d.get("current_state_event_id"),
+                                current_event_id=_fresh_state_event_id,
                             )
                         if _supervisor_msg == "":
                             _supervisor_suppressed_event_ids.add(int(ev.id))
@@ -889,6 +910,41 @@ class GatewayKanbanWatchersMixin:
                 thread_id=sub.get("thread_id") or "",
                 new_cursor=cursor,
             )
+        finally:
+            conn.close()
+
+    def _kanban_supervisor_delivery_state(
+        self, sub: dict, board: Optional[str] = None,
+    ) -> Optional[tuple[dict, Any, Optional[int]]]:
+        """Re-read a supervisor subscription and its current task generation."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            current_sub = next(
+                (
+                    candidate
+                    for candidate in _kb.list_notify_subs(conn, sub["task_id"])
+                    if candidate.get("platform") == sub.get("platform")
+                    and candidate.get("chat_id") == sub.get("chat_id")
+                    and (candidate.get("thread_id") or "")
+                    == (sub.get("thread_id") or "")
+                ),
+                None,
+            )
+            if current_sub is None:
+                return None
+            task = _kb.get_task(conn, sub["task_id"])
+            if task is None:
+                return None
+            state_kinds = _kb.SUPERVISOR_STATE_EVENT_KINDS
+            placeholders = ",".join("?" for _ in state_kinds)
+            row = conn.execute(
+                f"SELECT id FROM task_events WHERE task_id = ? "
+                f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                (sub["task_id"], *state_kinds),
+            ).fetchone()
+            return current_sub, task, int(row["id"]) if row is not None else None
         finally:
             conn.close()
 

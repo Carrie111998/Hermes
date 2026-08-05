@@ -135,6 +135,57 @@ def test_preexisting_subscription_is_upgraded_and_rewound_to_current_gate(
         conn.close()
 
 
+def test_untyped_legacy_protected_gate_is_not_auto_recovered(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Legacy credential gate", assignee="forge")
+        assert kb.block_task(conn, task_id, reason="Need API key from Kevin")
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+
+        assert result.protected_gates == [task_id]
+        assert result.recovered == []
+        assert kb.get_task(conn, task_id).status == "blocked"
+    finally:
+        conn.close()
+
+
+def test_supervisor_does_not_take_over_subscription_owned_by_another_profile(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Profile-isolated gate", assignee="forge")
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="hermes-command-channel",
+            notifier_profile="other-profile",
+            delivery_metadata={"ordinary": True},
+        )
+        assert kb.block_task(
+            conn, task_id, reason="Need Kevin's product decision", kind="needs_input"
+        )
+
+        result = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+        sub = kb.list_notify_subs(conn, task_id)[0]
+
+        assert result.protected_gates == []
+        assert sub["notifier_profile"] == "other-profile"
+        assert sub["delivery_metadata"] == {"ordinary": True}
+    finally:
+        conn.close()
+
+
 def test_agent_owned_block_is_recovered_once_and_never_asks(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
@@ -641,6 +692,68 @@ def test_recovered_followup_on_persistent_supervisor_sub_is_silent(
 
     assert adapter.sent == []
     assert adapter.received == []
+
+
+def test_gate_resolved_after_collection_before_send_is_silent(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Racing approval", assignee="forge")
+        assert kb.block_task(
+            conn, task_id, reason="Need Kevin's product decision", kind="needs_input"
+        )
+        reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"proactive_supervisor": {
+            "enabled": True,
+            "platform": "discord",
+            "chat_id": "hermes-command-channel",
+            "chat_type": "channel",
+            "recovery_limit": 1,
+        }}},
+    )
+    adapter = _RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+
+    real_authorization_adapter = runner._authorization_adapter
+    resolved = False
+
+    def resolve_after_collection(platform, profile=None):
+        nonlocal resolved
+        if not resolved:
+            resolved = True
+            race_conn = kb.connect()
+            try:
+                assert kb.unblock_task(race_conn, task_id)
+            finally:
+                race_conn.close()
+        return real_authorization_adapter(platform, profile)
+
+    runner._authorization_adapter = resolve_after_collection
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert resolved is True
+    assert adapter.sent == []
 
 
 def test_gateway_tick_discovers_unsubscribed_gate_and_sends_replyable_prompt(
