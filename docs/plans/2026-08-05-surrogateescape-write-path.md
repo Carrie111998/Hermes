@@ -448,7 +448,10 @@ In `tools/file_operations.py::write_file`:
         # range cannot be encoded at all — and letting them reach the pipe
         # would spawn a child that then hangs, or truncates the target via
         # empty-stdin `cat`. Refuse synchronously before any subprocess.
-        m = re.search(r"[\ud800-\udfff]", content)
+        # NOTE: the range deliberately excludes U+DC80–U+DCFF (the
+        # surrogateescape round-trip range) — a naive [\ud800-\udfff] would
+        # reject round-trippable content.
+        m = re.search(r"[\ud800-\udc7f\udd00-\udfff]", content)
         if m:
             return WriteResult(
                 error=(

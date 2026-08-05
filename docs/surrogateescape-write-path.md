@@ -153,7 +153,7 @@ Two checks, deliberately split:
   to encode:
 
   ```python
-  m = re.search(r"[\ud800-\udfff]", content)
+  m = re.search(r"[\ud800-\udc7f\udd00-\udfff]", content)
   if m:
       return WriteResult(error=(
           f"Refusing to write '{path}': content contains a lone surrogate "
@@ -161,6 +161,11 @@ Two checks, deliberately split:
           "file was NOT created or modified."
       ))
   ```
+
+  The range deliberately EXCLUDES U+DC80–U+DCFF — the surrogateescape
+  round-trip range — which must flow through to the pipe. (A naive
+  `[\ud800-\udfff]` would reject round-trippable content and break the
+  round-trip contract; caught during implementation.)
 
   This makes "rejected before any child process spawns" literally true — the
   syntax gate and BOM/line-ending probes run after it, so a surrogate-bearing
