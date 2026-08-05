@@ -1165,7 +1165,9 @@ export default function ModelsPage() {
       .then(([models, auxData, provAvailable]) => {
         setData(models);
         setAux(auxData);
-        setHasProviders(provAvailable);
+        if (provAvailable !== undefined) {
+          setHasProviders(provAvailable);
+        }
       })
       .catch((err) => setError(String(err)))
       .finally(() => setLoading(false));
