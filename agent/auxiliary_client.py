@@ -5648,10 +5648,21 @@ def resolve_provider_client(
                 custom_base = _main_base
                 custom_key = _main_key
         if custom_base and custom_key:
-            final_model = _normalize_resolved_model(
-                model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
-                provider,
-            )
+            if explicit_base_url and not model:
+                # When an explicit custom endpoint is supplied without a model
+                # (e.g. a fallback entry with only base_url), using main_runtime's
+                # model would send the primary provider's model to a different
+                # backend — typically resulting in a 404.  Skip main_runtime
+                # and use the generic fallback instead.
+                final_model = _normalize_resolved_model(
+                    _read_main_model_for_aux() or "gpt-4o-mini",
+                    provider,
+                )
+            else:
+                final_model = _normalize_resolved_model(
+                    model or (main_runtime.get("model") if main_runtime else None) or "gpt-4o-mini",
+                    provider,
+                )
             extra = {}
             _clean_base, _dq = _extract_url_query_params(custom_base)
             if _dq:
