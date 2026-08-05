@@ -214,3 +214,48 @@ def test_openrouter_headers_no_cache_when_disabled(mock_openai):
     assert "X-OpenRouter-Cache-TTL" not in headers
 
 
+@patch("run_agent.OpenAI")
+def test_kimi_moonshot_explicit_creds_apply_gzip_accept_encoding(mock_openai):
+    """#59556: kimi-coding must send ``Accept-Encoding: gzip`` on the wire.
+
+    api.moonshot.ai matches no URL-specific header branch, so the
+    profile.default_headers fallback (run_agent.py
+    ``_apply_client_headers_for_base_url`` else-branch) must forward the
+    brotli-excluding header set when the client is built from explicit
+    credentials — the Windows Desktop path from #59556.
+    """
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        provider="kimi-coding",
+        api_key="test-key",
+        base_url="https://api.moonshot.ai/v1",
+        model="kimi-k2-turbo-preview",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["Accept-Encoding"] == "gzip"
+    assert headers["User-Agent"] == "hermes-agent/1.0"
+
+
+@patch("run_agent.OpenAI")
+def test_kimi_cn_moonshot_explicit_creds_apply_gzip_accept_encoding(mock_openai):
+    """#59556: kimi-coding-cn (api.moonshot.cn) mirrors the gzip header."""
+    mock_openai.return_value = MagicMock()
+    agent = AIAgent(
+        provider="kimi-coding-cn",
+        api_key="test-key",
+        base_url="https://api.moonshot.cn/v1",
+        model="kimi-k2-turbo-preview",
+        quiet_mode=True,
+        skip_context_files=True,
+        skip_memory=True,
+    )
+
+    headers = agent._client_kwargs["default_headers"]
+    assert headers["Accept-Encoding"] == "gzip"
+    assert headers["User-Agent"] == "hermes-agent/1.0"
+
+
