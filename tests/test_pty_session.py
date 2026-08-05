@@ -155,6 +155,28 @@ async def test_attach_first_attach_empty_buffer_sends_sentinel():
     await s.close()
 
 
+@pytest.mark.asyncio
+async def test_attach_rolled_out_offset_sends_sentinel_not_full_replay():
+    """A reconnecting client whose offset rolled out of the ring window must
+    NOT get a full 1MB replay: ChatPage stays mounted so xterm.js still holds
+    the painted history; a full replay re-sends megabytes the client already
+    has and stalls rendering (tab-return black screen on long sessions).
+    Emit the SGR-reset sentinel to clear the hydration gate instead."""
+    from hermes_cli.pty_session import PtySession
+    bridge = FakeBridge([b"a" * 2000, None])       # 2000 bytes > 1024 cap
+    s = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await s.start()
+    await asyncio.sleep(0.05)
+    # Offset 0 is long evicted (earliest byte now at 976).
+    ws = FakeWS()
+    await s.attach(ws, client_offset=0)
+    sent = [p for kind, p in ws.sent if kind == "bytes"]
+    assert sent == [b"\x1b[0m"], (
+        f"expected only sentinel (no full replay), got {len(sent)} frames"
+    )
+    await s.close()
+
+
 
 
 @pytest.mark.asyncio

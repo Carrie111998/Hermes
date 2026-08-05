@@ -213,6 +213,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // full 1 MB RingBuffer (the xterm.js terminal buffer already has the
   // history painted — ChatPage stays mounted across tab switches).
   const ptyByteOffsetRef = useRef(0);
+  // Pending PTY text coalesced by the per-frame write batching (see
+  // ws.onmessage). `pendingWriteRef` accumulates frames between animation
+  // frames; `writeRafRef` is the in-flight requestAnimationFrame handle so a
+  // burst of onmessage callbacks (backgrounded tab unfreezing) coalesces into
+  // one term.write per frame instead of flooding xterm's buffer.
+  const pendingWriteRef = useRef("");
+  const writeRafRef = useRef<number | null>(null);
   const mobileReplacementInputUntilRef = useRef(0);
   const [ptyState, setPtyState] =
     useState<PtyConnectionState>("connecting");
@@ -1111,8 +1118,25 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // resume frame into "" (pty-resume-sanitizer.ts); keying off raw `text`
       // would hide the wait notice while the terminal is still blank.
       const rendered = resumeParam ? sanitizer.next(text) : text;
-      term.write(rendered);
-      noteResumePtyChunk(rendered);
+      // Coalesce writes per animation frame. When the tab was backgrounded
+      // (Chrome freezes JS timers but the WS network stack keeps receiving),
+      // hundreds of onmessage callbacks pile up in the event queue and run
+      // back-to-back the instant the tab is visible again. Writing each one
+      // synchronously floods xterm's internal buffer and stalls the renderer
+      // ("tab-return freeze" on long-running sessions). Batching to one
+      // write per frame lets xterm's async renderer keep up instead.
+      pendingWriteRef.current += rendered;
+      if (writeRafRef.current == null) {
+        writeRafRef.current = requestAnimationFrame(() => {
+          writeRafRef.current = null;
+          const chunk = pendingWriteRef.current;
+          pendingWriteRef.current = "";
+          if (chunk) {
+            term.write(chunk);
+            noteResumePtyChunk(chunk);
+          }
+        });
+      }
     };
 
     ws.onclose = (ev) => {
@@ -1278,6 +1302,11 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       syncMetricsRef.current = null;
       clearEraseSuppressionTimer();
       clearResumeLoadingTimers();
+      if (writeRafRef.current != null) {
+        cancelAnimationFrame(writeRafRef.current);
+        writeRafRef.current = null;
+      }
+      pendingWriteRef.current = "";
       setResumeHydrating(false);
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();

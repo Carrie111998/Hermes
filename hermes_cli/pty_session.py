@@ -144,15 +144,23 @@ class PtySession:
                         pass  # detached mid-send; nothing buffered anyway
                 return
         # Full replay (first connect, or offset rolled out of the ring).
+        # NOTE: for a reconnecting client whose offset rolled out of the
+        # window, we deliberately do NOT fall back to a full 1MB replay: the
+        # dashboard keeps ChatPage mounted, so xterm.js still holds the full
+        # history the client painted before — a full replay would re-send
+        # megabytes of bytes the client already has and stall rendering
+        # ("tab-return black screen" on long-running sessions that exceed
+        # the ring window while backgrounded). Emit the no-op SGR-reset
+        # frame to clear the hydration gate and let live output resume.
         snap = self.buffer.snapshot()
-        if snap:
+        if client_offset is None and snap:
             await self._send_chunked(ws, snap)
-        elif client_offset is None:
-            # First attach to a PTY that has produced no output yet. The
-            # client's resume-hydration gate is edge-triggered on the first
-            # payload, so an empty buffer must still emit one no-op frame or
-            # the "loading…" overlay stays up (black screen) until the PTY
-            # happens to write something. SGR reset is invisible on xterm.
+        else:
+            # First attach to an empty buffer, or reconnect with a
+            # rolled-out offset: the client's resume-hydration gate is
+            # edge-triggered on the first payload, so emit one no-op frame
+            # or the "loading…" overlay stays up (black screen). SGR reset
+            # is invisible on xterm.
             try:
                 await ws.send_bytes(b"\x1b[0m")
             except Exception:
