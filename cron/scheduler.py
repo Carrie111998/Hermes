@@ -3541,6 +3541,39 @@ def run_job(
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
+
+        # ── Stale-timeout headroom (#78862) ──────────────────────────
+        # The non-stream stale detector (agent/reasoning_timeouts.py) uses
+        # a 600s floor for known reasoning models.  When the cron
+        # inactivity limit equals that floor, the scheduler's 5s poll
+        # interval means it kills the job at ~605s — *before* the stale
+        # detector fires at 600s and triggers retry / provider fallback.
+        # Auto-extend the inactivity limit so the stale detector plus at
+        # least one retry+fallback cycle fits inside the window.
+        if _cron_inactivity_limit is not None:
+            try:
+                _stale_base, _uses_implicit = (
+                    agent._resolved_api_call_stale_timeout_base()
+                )
+                # Only extend when the stale timeout is close to (or
+                # exceeds) the cron limit — i.e. the two timeouts would
+                # race.  30s margin accounts for the poll interval plus
+                # jitter in the stale detector's 0.3s poll.
+                if _stale_base > 0 and _stale_base >= _cron_inactivity_limit - 30:
+                    _STALE_HEADROOM = 180.0  # seconds for retry + fallback
+                    _extended = _stale_base + _STALE_HEADROOM
+                    if _extended > _cron_inactivity_limit:
+                        logger.info(
+                            "Job '%s': extending inactivity limit from "
+                            "%.0fs to %.0fs to accommodate reasoning-model "
+                            "stale timeout floor (%.0fs) + retry headroom",
+                            job_name, _cron_inactivity_limit, _extended,
+                            _stale_base,
+                        )
+                        _cron_inactivity_limit = _extended
+            except Exception:
+                pass  # best-effort — don't break cron on stale-query failure
+
         _POLL_INTERVAL = 5.0
         # Keep the one-shot run_claim fresh while the run is alive (#62002):
         # the claim TTL is a dead-owner detector, but without a heartbeat a
