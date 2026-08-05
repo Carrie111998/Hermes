@@ -227,6 +227,19 @@ def _live_service(plan, label, pid, start):
     }
 
 
+def _phase_b_readiness_service(plan):
+    unit = plan.value["phase_b_readiness_unit"]
+    return {
+        "unit_name": unit["name"],
+        "load_state": "loaded",
+        "active_state": "inactive",
+        "sub_state": "dead",
+        "unit_file_state": "static",
+        "main_pid": 0,
+        "fragment_path": unit["path"],
+    }
+
+
 def _receipt_mapping():
     plan = _plan()
     observed = 1_000_000_000
@@ -239,6 +252,7 @@ def _receipt_mapping():
         + authority.NATIVE_OBSERVATION_TTL_SECONDS * 1_000_000_000,
         "gateway_service": _live_service(plan, "gateway", 4242, 111),
         "writer_service": _live_service(plan, "writer", 4343, 222),
+        "phase_b_readiness_service": _phase_b_readiness_service(plan),
         "discord_absence": _discord_absent(),
         "legacy_helper_absence": {
             "path": str(authority.LEGACY_CLOUD_SQL_HELPER_PATH),
@@ -264,6 +278,7 @@ def _receipt_mapping():
         "finalized_at_boottime_ns": observed + 1_000_000_000,
         "gateway_service": stopped("gateway"),
         "writer_service": stopped("writer"),
+        "phase_b_readiness_service": _phase_b_readiness_service(plan),
         "discord_absence": _discord_absent(),
     }
     return {
@@ -409,6 +424,23 @@ def test_native_receipt_requires_stopped_state_and_exact_native_sets():
     with pytest.raises(ValueError, match="not finalized stopped"):
         authority.NativeObservationReceipt.from_mapping(running)
 
+    phase_b_started_early = copy.deepcopy(valid)
+    phase_b_started_early["observation"]["phase_b_readiness_service"].update(
+        {"active_state": "active", "sub_state": "exited"}
+    )
+    with pytest.raises(ValueError, match="not exactly inactive/static"):
+        authority.NativeObservationReceipt.from_mapping(phase_b_started_early)
+
+    for invalid_pid in (False, 0.0):
+        invalid_readiness_pid = copy.deepcopy(valid)
+        invalid_readiness_pid["observation"]["phase_b_readiness_service"][
+            "main_pid"
+        ] = invalid_pid
+        with pytest.raises(ValueError, match="not exactly inactive/static"):
+            authority.NativeObservationReceipt.from_mapping(
+                invalid_readiness_pid
+            )
+
     injected = copy.deepcopy(valid)
     injected["observation"]["writer_service"]["external_native_mappings"][0][
         "path"
@@ -431,6 +463,209 @@ def test_native_receipt_requires_stopped_state_and_exact_native_sets():
         current_boottime_ns=near_bound["observation"]["expires_at_boottime_ns"],
     )
     assert authority.NATIVE_OBSERVATION_TTL_SECONDS == 300
+
+
+def _patch_native_observation_runtime(
+    monkeypatch,
+    plan,
+    *,
+    readiness_active=False,
+):
+    identities = plan.value["identities"]
+    processes = {}
+    for label, pid, start in (("gateway", 4242, 111), ("writer", 4343, 222)):
+        processes[label] = authority.ProcessAuthorityEvidence(
+            pid=pid,
+            start_time_ticks=start,
+            effective_uid=identities[f"{label}_uid"],
+            effective_gid=identities[f"{label}_gid"],
+            supplementary_gids=tuple(
+                identities[f"{label}_supplementary_gids"]
+            ),
+            no_new_privileges=True,
+            effective_capabilities=(),
+            executable=plan.value[f"{label}_argv"][0],
+            argv=tuple(plan.value[f"{label}_argv"]),
+        )
+    digest_by_path = {
+        plan.value[name]["path"]: plan.value[name]["sha256"]
+        for name in (
+            "gateway_unit",
+            "writer_unit",
+            "phase_b_readiness_unit",
+            "gateway_config",
+            "writer_config",
+        )
+    }
+    release_manifest = Path(plan.value["artifact_root"]) / "release-manifest.json"
+    digest_by_path[str(release_manifest)] = plan.value[
+        "release_manifest_file_sha256"
+    ]
+    digest_by_path[plan.value["database"]["ca_path"]] = plan.value["database"][
+        "ca_sha256"
+    ]
+    monkeypatch.setattr(authority, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(authority, "_boot_id_sha256", lambda: BOOT)
+    monkeypatch.setattr(authority, "_host_identity_sha256", lambda: HOST)
+    monkeypatch.setattr(authority, "_boottime_ns", lambda: 1_000_000_000)
+    monkeypatch.setattr(authority.time, "time", lambda: NOW)
+    monkeypatch.setattr(
+        authority,
+        "_trusted_file_sha256",
+        lambda path, **_kwargs: digest_by_path[str(path)],
+    )
+
+    def systemd_state(unit_name):
+        if unit_name == plan.value["phase_b_readiness_unit"]["name"]:
+            return {
+                "LoadState": "loaded",
+                "ActiveState": "active" if readiness_active else "inactive",
+                "SubState": "exited" if readiness_active else "dead",
+                "UnitFileState": "static",
+                "FragmentPath": plan.value["phase_b_readiness_unit"]["path"],
+                "MainPID": 0,
+            }
+        label = (
+            "gateway"
+            if unit_name == plan.value["gateway_unit"]["name"]
+            else "writer"
+        )
+        return {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "running",
+            "UnitFileState": "disabled",
+            "FragmentPath": plan.value[f"{label}_unit"]["path"],
+            "MainPID": processes[label].pid,
+        }
+
+    monkeypatch.setattr(authority, "_native_systemd_state", systemd_state)
+    monkeypatch.setattr(
+        authority,
+        "_observe_process",
+        lambda pid: next(value for value in processes.values() if value.pid == pid),
+    )
+    monkeypatch.setattr(
+        authority,
+        "_discover_native_mappings",
+        lambda _process, _plan: (
+            [{"path": "/usr/lib/x86_64-linux-gnu/libc.so.6", "sha256": "c" * 64}],
+            ["[vdso]", "[vsyscall]"],
+        ),
+    )
+    monkeypatch.setattr(
+        authority,
+        "_collect_discord_absence",
+        lambda _plan: _discord_absent(),
+    )
+    monkeypatch.setattr(
+        authority,
+        "collect_legacy_helper_absence",
+        lambda **_kwargs: {
+            "path": str(authority.LEGACY_CLOUD_SQL_HELPER_PATH),
+            "file_exists": False,
+            "file_symlink": False,
+            "parent_exists": False,
+            "parent_symlink": False,
+            "gateway_access": {"read": False, "write": False, "execute": False},
+        },
+    )
+
+
+def test_collect_native_observation_attests_phase_b_readiness_inactive(
+    monkeypatch,
+):
+    plan = _plan()
+    _patch_native_observation_runtime(monkeypatch, plan)
+    observation = authority.collect_native_observation(
+        plan,
+        approved_plan_sha256=plan.sha256,
+    )
+    assert observation["phase_b_readiness_service"] == (
+        _phase_b_readiness_service(plan)
+    )
+
+
+def test_collect_native_observation_rejects_phase_b_readiness_started_early(
+    monkeypatch,
+):
+    plan = _plan()
+    _patch_native_observation_runtime(
+        monkeypatch,
+        plan,
+        readiness_active=True,
+    )
+
+    with pytest.raises(RuntimeError, match="not exactly inactive/static"):
+        authority.collect_native_observation(plan, approved_plan_sha256=plan.sha256)
+
+
+def test_finalize_native_observation_rejects_phase_b_readiness_started_early(
+    tmp_path,
+    monkeypatch,
+):
+    receipt_value = _receipt_mapping()
+    plan = authority.NativeObservationPlan.from_mapping(receipt_value["plan"])
+    stage = {
+        "schema": authority.NATIVE_OBSERVATION_STAGE_SCHEMA,
+        "native_observation_plan_sha256": plan.sha256,
+        "owner_approval_receipt_sha256": receipt_value[
+            "owner_approval_receipt_sha256"
+        ],
+        "host_preparation_receipt_sha256": receipt_value[
+            "host_preparation_receipt_sha256"
+        ],
+        "external_iam_receipt_sha256": receipt_value[
+            "external_iam_receipt_sha256"
+        ],
+        "plan": plan.to_mapping(),
+        "observation": receipt_value["observation"],
+    }
+    stage_path = tmp_path / "stage.json"
+    receipt_path = tmp_path / "receipt.json"
+    monkeypatch.setattr(authority, "_require_root_linux", lambda: None)
+    monkeypatch.setattr(authority, "_read_root_mapping", lambda _path: stage)
+    monkeypatch.setattr(authority, "_expected_stage_path", lambda _plan: stage_path)
+    monkeypatch.setattr(
+        authority,
+        "_expected_receipt_path",
+        lambda _plan: receipt_path,
+    )
+    monkeypatch.setattr(authority, "_boot_id_sha256", lambda: BOOT)
+    monkeypatch.setattr(authority, "_host_identity_sha256", lambda: HOST)
+
+    def systemd_state(unit_name):
+        if unit_name == plan.value["phase_b_readiness_unit"]["name"]:
+            return {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "exited",
+                "UnitFileState": "static",
+                "FragmentPath": plan.value["phase_b_readiness_unit"]["path"],
+                "MainPID": 0,
+            }
+        return {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "disabled",
+            "MainPID": 0,
+        }
+
+    monkeypatch.setattr(authority, "_native_systemd_state", systemd_state)
+    with pytest.raises(RuntimeError, match="not finalized stopped/off"):
+        authority.finalize_native_observation_stage(
+            stage_path,
+            receipt_path,
+            approved_plan_sha256=plan.sha256,
+            owner_approval_receipt=_approval(plan).to_mapping(),
+            host_preparation_receipt_sha256=receipt_value[
+                "host_preparation_receipt_sha256"
+            ],
+            external_iam_receipt_sha256=receipt_value[
+                "external_iam_receipt_sha256"
+            ],
+        )
 
 
 def test_authority_mapping_surfaces_sudo_polkit_caps_and_nnp():
