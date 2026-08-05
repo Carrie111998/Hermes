@@ -1350,6 +1350,10 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    # One transport rebuild at most for the entire user turn, including every
+    # tool-loop model iteration. A failed rebuild consumes the same one-shot
+    # budget; repeatedly rebuilding a broken client is not recovery.
+    primary_transport_recovery_attempted = False
     final_response = None
     interrupted = False
     failed = False
@@ -2165,7 +2169,6 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
                             continue
                         # No fallback available — surface buffered context
                         # so user sees the rate-limit message that led here.
@@ -2607,7 +2610,6 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
                         continue
 
                     # Check for error field in response (some providers include this)
@@ -2680,7 +2682,6 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
                             continue
                         # Terminal — flush buffered retry trace so user sees what happened.
                         agent._flush_status_buffer()
@@ -2857,7 +2858,6 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
                         continue
 
                     agent._flush_status_buffer()
@@ -3033,7 +3033,6 @@ def run_conversation(
                                 truncated_response_parts = []
                                 retry_count = 0
                                 compression_attempts = 0
-                                _retry.primary_recovery_attempted = False
                                 _retry.restart_with_rebuilt_messages = True
                                 break
                             # No fallback available — fall through to normal
@@ -4488,7 +4487,6 @@ def run_conversation(
                                 agent, api_messages, active_system_prompt)
                             retry_count = 0
                             compression_attempts = 0
-                            _retry.primary_recovery_attempted = False
                             continue
 
                 # ── Auth-failure provider failover ───────────────────────
@@ -4521,7 +4519,6 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
                         continue
 
                 # ── Nous Portal: record rate limit & skip retries ─────
@@ -5128,7 +5125,6 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
                         continue
                     if api_kwargs is not None:
                         agent._dump_api_request_debug(
@@ -5325,24 +5321,32 @@ def run_conversation(
                         "error": _nonretryable_summary,
                     }
 
-                if retry_count >= max_retries:
-                    # Before falling back, try rebuilding the primary
-                    # client once for transient transport errors (stale
-                    # connection pool, TCP reset).  Only attempted once
-                    # per API call block.
-                    if not _retry.primary_recovery_attempted and agent._try_recover_primary_transport(
+                # Rebuild the primary client before the next retry rather than
+                # repeating a stale pooled connection until the budget is
+                # exhausted. Recovery remains one-shot and starts the same
+                # bounded fresh attempt cycle that the previous terminal-budget
+                # path provided.
+                if not primary_transport_recovery_attempted:
+                    recovery_result = agent._try_recover_primary_transport(
                         api_error, retry_count=retry_count, max_retries=max_retries,
-                    ):
-                        _retry.primary_recovery_attempted = True
-                        retry_count = 0
-                        # Primary transport recovery starts a fresh attempt
-                        # cycle. Re-open fallback state so a follow-on 429 can
-                        # still activate fallback_providers after stale
-                        # pre-recovery fallback/credential-pool bookkeeping.
-                        _retry.has_retried_429 = False
-                        agent._fallback_index = 0
-                        agent._fallback_activated = False
-                        continue
+                    )
+                    # None means the error/provider was ineligible and did not
+                    # consume the turn-scoped recovery budget. True/False both
+                    # mean a rebuild was attempted; failure remains one-shot.
+                    if recovery_result is not None:
+                        primary_transport_recovery_attempted = True
+                        if recovery_result:
+                            retry_count = 0
+                            # Primary transport recovery starts a fresh attempt
+                            # cycle. Re-open fallback state so a follow-on 429 can
+                            # still activate fallback_providers after stale
+                            # pre-recovery fallback/credential-pool bookkeeping.
+                            _retry.has_retried_429 = False
+                            agent._fallback_index = 0
+                            agent._fallback_activated = False
+                            continue
+
+                if retry_count >= max_retries:
                     # Try fallback before giving up entirely
                     if agent._has_pending_fallback():
                         agent._buffer_status(f"⚠️ Max retries ({max_retries}) exhausted — trying fallback...")
@@ -5351,7 +5355,6 @@ def run_conversation(
                             agent, api_messages, active_system_prompt)
                         retry_count = 0
                         compression_attempts = 0
-                        _retry.primary_recovery_attempted = False
                         continue
                     # Terminal — flush buffered retry/fallback trace.
                     agent._flush_status_buffer()
