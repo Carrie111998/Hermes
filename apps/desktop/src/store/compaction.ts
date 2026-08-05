@@ -1,5 +1,8 @@
 import { atom, computed } from 'nanostores'
 
+import { debugTrace } from '@/lib/debug-trace'
+import { $activeSessionId } from '@/store/session'
+
 // Per-session flag while auto-compaction runs mid-turn. Without it the
 // transcript looks like it reset; per-session so a background chat can't
 // clobber the foreground view.
@@ -24,6 +27,8 @@ export function setSessionCompacting(sessionId: string | null | undefined, activ
 
     $compactingSessions.set({ ...sessions, [key]: true })
 
+    debugTrace('compaction', `started session=${key}`, { isActive: key === $activeSessionId.get() })
+
     return
   }
 
@@ -34,4 +39,6 @@ export function setSessionCompacting(sessionId: string | null | undefined, activ
   const next = { ...sessions }
   delete next[key]
   $compactingSessions.set(next)
+
+  debugTrace('compaction', `finished session=${key}`, { isActive: key === $activeSessionId.get() })
 }

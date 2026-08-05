@@ -53,6 +53,24 @@ Open on `127.0.0.1:9222` for any dev-server run. Closed in exactly two cases
 
 `HERMES_DESKTOP_CDP_PORT` moves the port (`=9333`) or disables it (`=off`).
 
+**A packaged app can never be instrumented, including a Nix-built one.**
+`nix run .#desktop` wraps a built `dist/` with `ELECTRON_IS_DEV 0` and no
+`HERMES_DESKTOP_DEV_SERVER`, so it trips both gates and no environment value
+opens the port. If the user runs the app that way there is no override to
+offer — they have to relaunch through the dev server. On NixOS that is:
+
+```bash
+nix develop
+cd apps/desktop && npm run dev
+```
+
+The devShell must export `LD_LIBRARY_PATH` with `libglvnd` + `mesa`. npm's
+prebuilt Electron dlopens `libEGL.so.1`, which is not on a NixOS library path;
+without it the GPU process dies and the app exits *after* printing the CDP line
+but before a window appears — so a port that opens and then vanishes is this,
+not a bad port. Nix-built Electron carries its own library path and is
+unaffected.
+
 Check before doing anything else:
 
 ```bash
@@ -115,6 +133,44 @@ If the node carries no class of its own, the value is **inherited** — sweeping
 call sites will not fix it, and you need the ancestor rule. A plugin stylesheet
 (e.g. `@tailwindcss/typography`'s `prose a { font-weight: 500 }`) routinely beats
 a utility class; override on the shared class, not at each usage.
+
+## Reading state over time, not just the DOM
+
+The DOM is a snapshot. For *sequence* bugs — a turn that stalls, history that
+vanishes, a session id that rotates under the user — read the trace log
+instead. Every renderer `console.*` call is mirrored into `desktop.log` (always
+on, 4KB cap per line), and the Settings → Advanced → **"Debug trace logging"**
+toggle adds structured `[trace:*]` lines for state transitions.
+
+The toggle is device-local, persisted in `localStorage` under
+`hermes.desktop.debugTrace.v1`, so it survives reloads. You can read *and set*
+it over CDP without touching the user's Settings UI:
+
+```bash
+node scripts/eval.mjs "localStorage.getItem('hermes.desktop.debugTrace.v1')"
+```
+
+Then read the output with the CLI rather than tailing the file by hand —
+`[trace:*]` lines are `console.debug`, so `--level debug` is required or they
+are filtered out:
+
+```bash
+hermes logs desktop --level debug | grep '\[trace:'
+```
+
+Categories are `session-state`, `gateway-event`, `persistence`, `message`,
+`busy`, `session-switch`, `connection`, `profile-switch`, `resume`, `prompt`,
+`sessions-list`, `compaction`, `error-boundary`. Grep the one that matches the
+bug class instead of reading all of them — a single reload emits hundreds of
+`persistence` lines, which will bury a `session-switch` you actually care about.
+
+The forwarder lives at **`window.hermesDesktop.forwardConsole`** (not
+`window.hermes`). To confirm forwarding is live, check that `console.log` is no
+longer native rather than looking for a flag that doesn't exist:
+
+```bash
+node scripts/eval.mjs "console.log.toString().includes('[native code]')"  # false ⇒ patched
+```
 
 ## Your own isolated instance
 

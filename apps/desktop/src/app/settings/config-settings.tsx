@@ -8,6 +8,7 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { getElevenLabsVoices, getHermesConfigSchema, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { $debugTraceEnabled, setDebugTraceEnabled } from '@/lib/debug-trace'
 import { triggerHaptic } from '@/lib/haptics'
 import {
   $dataUrlReadMaxMb,
@@ -69,6 +70,7 @@ export function ConfigSettings({
   const { t } = useI18n()
   const c = t.settings.config
   const keepAwake = useStore($keepAwake)
+  const debugTraceEnabled = useStore($debugTraceEnabled)
   // The editable draft is local (debounced autosave watches it), but it's seeded
   // from — and saved back through — the shared config cache, so edits are visible
   // in the MCP/model surfaces and reopening the page doesn't reload-flash.
@@ -315,6 +317,9 @@ export function ConfigSettings({
           />
           <QuickEntrySettings />
         </>
+      )}
+      {activeSectionId === 'advanced' && (
+        <ToggleRow checked={debugTraceEnabled} description={c.debugTraceDesc} label={c.debugTraceTitle} onChange={setDebugTraceEnabled} />
       )}
       {/* Device-local attach/preview byte cap (main-process IPC guard). Chat is
           where image-attachment behavior already lives, so this sits above the

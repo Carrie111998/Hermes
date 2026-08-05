@@ -466,10 +466,12 @@ export interface Translations {
       invalidJson: string
       keepAwakeTitle: string
       keepAwakeDesc: string
-      attachmentSizeTitle: string
-      attachmentSizeDesc: string
-      attachmentSizeUnit: string
-      attachmentSizeLabel: string
+      attachmentSizeTitle: string;
+      attachmentSizeDesc: string;
+      attachmentSizeUnit: string;
+      attachmentSizeLabel: string;
+      debugTraceTitle: string;
+      debugTraceDesc: string
     }
     quickEntry: {
       enabledTitle: string

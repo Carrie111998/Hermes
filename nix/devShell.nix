@@ -49,6 +49,14 @@
           # Force Node to use Nix's playwright-test binary instead of node_modules/.bin
           export PATH="${pkgs.playwright-test}/bin:$PATH"
 
+          # The desktop dev server (`npm run dev` in apps/desktop) runs npm's
+          # prebuilt Electron, which dlopens libEGL.so.1 at GPU-process startup.
+          # That is not a NixOS library path, so the GPU process dies and the
+          # app exits before a window appears. Nix-built Electron
+          # (`nix run .#desktop`) is wrapped with its own library path and is
+          # unaffected — this is only needed for source-tree dev runs.
+          export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath [ pkgs.libglvnd pkgs.mesa ]}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+
           # for the devshell to pick up the src
           export HERMES_PYTHON_SRC_ROOT=$(git rev-parse --show-toplevel)
 

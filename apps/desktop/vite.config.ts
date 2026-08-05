@@ -91,6 +91,11 @@ export default defineConfig(({ command }) => ({
     postcss: { plugins: [] }
   },
   build: {
+    // Ship sourcemaps so crash reports and devtools stack traces point at
+    // real TS/TSX source, not minified bundles. Separate .map files (not
+    // inline) keep the executable bundle lean; both electron-builder
+    // (files: ["dist/**"]) and nix (cp -rn dist) carry them through.
+    sourcemap: true,
     // The renderer intentionally ships FEW chunks (not one, not thousands):
     //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /
     //     dynamic import into the entry, so heavyweight lazy-only deps
