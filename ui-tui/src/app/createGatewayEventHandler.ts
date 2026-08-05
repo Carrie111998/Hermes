@@ -1044,7 +1044,7 @@ export function createGatewayEventHandler(ctx: GatewayEventHandlerContext): (ev:
         return
 
       case 'gateway.crash': {
-        // Windows STATUS_ACCESS_VIOLATION or similar gateway child crash.
+        // Windows STATUS_CONTROL_C_EXIT or similar gateway child exit.
         // The exit handler in useMainApp.ts will respawn + resume the
         // session; this case surfaces the diagnostic so the user knows
         // why the gateway died and that recovery is underway.
