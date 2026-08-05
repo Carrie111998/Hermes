@@ -302,6 +302,26 @@ hermes migrate xai --apply  # rewrite ~/.hermes/config.yaml in place
 
 **xAI Web Search backend.** When the [Web Search](../user-guide/features/web-search.md) toolset is enabled, `web.backend: xai` routes search through xAI's hosted search endpoint using the same `XAI_API_KEY` / OAuth credentials. No additional setup required if xAI is already configured as a provider.
 
+### DeepSeek — Responses API + Server-Side Web Search
+
+DeepSeek exposes an OpenAI-compatible **Responses API** at `https://api.deepseek.com` (no `/v1` suffix) for `deepseek-v4-flash`. The Responses surface ships a **server-executed `web_search` built-in**: when the [Web Search](../user-guide/features/web-search.md) toolset is enabled, Hermes replaces the client-side `web_search` function with DeepSeek's native `{"type": "web_search"}` tool, so the model decides when to search and DeepSeek executes the search server-side (multi-query, page-open, cited answers — verified live against `deepseek-v4-flash`).
+
+To use it, point the provider at the Responses surface:
+
+```yaml
+providers:
+  deepseek:
+    api: https://api.deepseek.com   # Responses API base — no /v1
+    transport: codex_responses      # enables Responses + native web_search
+```
+
+Requires `DEEPSEEK_API_KEY` in `~/.hermes/.env`. Notes:
+
+- The Responses API currently supports **only `deepseek-v4-flash`** (pro support was announced for August 2026). Chat-completions usage is unaffected.
+- Reasoning effort is honored (`low` / `high` / `max`); `max` is a valid dial for DeepSeek, unlike xAI where it clamps to `high`.
+- `prompt_cache_key` is skipped on this surface — DeepSeek's context hard-disk caching is automatic.
+- Unsupported Responses parameters are silently ignored by DeepSeek, so existing clients connect without changes.
+
 ### NovitaAI
 
 [NovitaAI](https://novita.ai) is the AI-native cloud for builders and agents. Its three product lines are Model API for 200+ models, Agent Sandbox for building and running AI agents, and GPU Cloud for scalable compute, all available from one platform.

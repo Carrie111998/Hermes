@@ -9,9 +9,20 @@ import hashlib
 import json
 import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall
+
+
+def _hostname_of(url: Any) -> str:
+    """Lowercased hostname of a base URL ('' on any parse failure)."""
+    if not url:
+        return ""
+    try:
+        return (urlparse(str(url)).hostname or "").lower()
+    except Exception:
+        return ""
 
 
 def _bounded_prompt_cache_key(value: Any) -> Optional[str]:
@@ -174,6 +185,11 @@ class ResponsesApiTransport(ProviderTransport):
             is_xai_responses=params.get("is_xai_responses") is True,
             is_github_responses=params.get("is_github_responses") is True,
             is_codex_backend=params.get("is_codex_backend") is True,
+            is_deepseek_responses=(
+                params.get("is_deepseek_responses") is True
+                or params.get("base_url_hostname") == "api.deepseek.com"
+                or _hostname_of(params.get("base_url")) == "api.deepseek.com"
+            ),
             base_url=params.get("base_url"),
         )
 
@@ -224,6 +240,7 @@ class ResponsesApiTransport(ProviderTransport):
             is_github_responses: bool — Copilot/GitHub models backend
             is_codex_backend: bool — chatgpt.com/backend-api/codex
             is_xai_responses: bool — xAI/Grok backend
+            is_deepseek_responses: bool — DeepSeek /responses backend
             github_reasoning_extra: dict | None — Copilot reasoning params
         """
         from agent.codex_responses_adapter import (
@@ -245,6 +262,10 @@ class ResponsesApiTransport(ProviderTransport):
         is_github_responses = params.get("is_github_responses") is True
         is_codex_backend = params.get("is_codex_backend") is True
         is_xai_responses = params.get("is_xai_responses") is True
+        is_deepseek_responses = params.get("is_deepseek_responses") is True or (
+            params.get("base_url_hostname") == "api.deepseek.com"
+            or _hostname_of(params.get("base_url")) == "api.deepseek.com"
+        )
         replay_encrypted_reasoning = bool(
             params.get("replay_encrypted_reasoning", True)
         )
@@ -274,6 +295,10 @@ class ResponsesApiTransport(ProviderTransport):
         if params.get("is_xai_responses", False):
             # xAI Responses tops out at high; keep generic stronger values usable.
             _effort_clamp.update({"xhigh": "high", "max": "high", "ultra": "high"})
+        elif is_deepseek_responses:
+            # DeepSeek Responses (deepseek-v4-flash) honors max; only the
+            # non-standard xhigh dial downgrades to high.
+            _effort_clamp.update({"xhigh": "high"})
         reasoning_effort = _effort_clamp.get(reasoning_effort, reasoning_effort)
 
         response_tools = _responses_tools(tools)
@@ -298,13 +323,26 @@ class ResponsesApiTransport(ProviderTransport):
         #    is honored, but rename the wire tool to
         #    ``hermes_web_search`` so Grok cannot hijack the name. The alias
         #    is mapped back to ``web_search`` in ``normalize_response``.
-        if is_xai_responses and response_tools:
+        if (is_xai_responses or is_deepseek_responses) and response_tools:
             has_client_web_search = any(
                 isinstance(t, dict) and t.get("name") == "web_search"
                 for t in response_tools
             )
             if has_client_web_search:
-                if _xai_prefers_native_web_search():
+                if is_deepseek_responses:
+                    # DeepSeek Responses (deepseek-v4-flash) ships a
+                    # server-executed ``web_search`` built-in on its /responses
+                    # surface (verified live 2026-08: the model streams
+                    # ``web_search_call`` items and returns a cited answer).
+                    # Swap the client function 1:1 so the search runs
+                    # server-side — same contract as the xAI native path.
+                    filtered = [
+                        t for t in response_tools
+                        if not (isinstance(t, dict) and t.get("name") == "web_search")
+                    ]
+                    filtered.append({"type": "web_search"})
+                    response_tools = filtered
+                elif _xai_prefers_native_web_search():
                     filtered = [
                         t for t in response_tools
                         if not (isinstance(t, dict) and t.get("name") == "web_search")
@@ -348,8 +386,16 @@ class ResponsesApiTransport(ProviderTransport):
         # there is no static content to hash.
         cache_key = _content_cache_key(instructions, response_tools) or session_id
         # xAI Responses takes prompt_cache_key in extra_body (set further
-        # down); GitHub Models opts out of cache-key routing entirely.
-        if not is_github_responses and not is_xai_responses and cache_key:
+        # down); GitHub Models opts out of cache-key routing entirely;
+        # DeepSeek's /responses surface has no prompt_cache_key parameter
+        # (unsupported params are silently ignored, but skip it anyway —
+        # DeepSeek's context-hard-disk caching is automatic).
+        if (
+            not is_github_responses
+            and not is_xai_responses
+            and not is_deepseek_responses
+            and cache_key
+        ):
             kwargs["prompt_cache_key"] = cache_key
 
         cache_retention = _default_prompt_cache_retention_for_request(
