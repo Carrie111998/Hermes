@@ -281,6 +281,29 @@ def test_persist_session_canonical_returns_explicit_state_and_forbids_bool_coerc
         bool(result)
 
 
+def test_persist_session_instance_override_requires_explicit_durability(agent):
+    seen = []
+    message = {"role": "user", "content": "override seam"}
+    agent._flush_messages_to_session_db = (
+        lambda messages, history: seen.append((messages, history))
+    )
+
+    result = agent._persist_session([message], [])
+
+    assert seen == [([message], [])]
+    assert result.state is run_agent.SessionPersistState.NOT_DURABLE
+    assert result.error_class == "PersistenceOverrideUnconfirmed"
+
+
+def test_persist_session_instance_override_accepts_explicit_success(agent):
+    message = {"role": "user", "content": "override seam"}
+    agent._flush_messages_to_session_db = lambda _messages, _history: True
+
+    result = agent._persist_session([message], [])
+
+    assert result.state is run_agent.SessionPersistState.CANONICAL
+
+
 def test_persist_session_spools_frozen_units_after_session_row_create_failure(agent, monkeypatch):
     db = MagicMock()
     db.create_session.side_effect = RuntimeError("session row locked")

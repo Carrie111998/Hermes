@@ -2382,12 +2382,18 @@ class AIAgent:
             )
             if callable(flush_override):
                 override_result = flush_override(messages, conversation_history)
-                if override_result is False:
-                    return SessionPersistResult(
-                        state=SessionPersistState.NOT_DURABLE,
-                        error_class="PersistenceOverrideFailed",
-                    )
-                return SessionPersistResult(state=SessionPersistState.CANONICAL)
+                if isinstance(override_result, SessionPersistResult):
+                    return override_result
+                if override_result is True:
+                    return SessionPersistResult(state=SessionPersistState.CANONICAL)
+                return SessionPersistResult(
+                    state=SessionPersistState.NOT_DURABLE,
+                    error_class="PersistenceOverrideUnconfirmed",
+                    error_message=(
+                        "instance-level persistence override did not explicitly "
+                        "confirm durable completion"
+                    ),
+                )
 
             replay_result = self._replay_pending_session_spool(trigger="pre_persist")
             blocked, replay_state_value = self._replay_result_blocks_canonical_persist(
