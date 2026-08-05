@@ -10,9 +10,8 @@ anyio==4.14.2
     #   openai
     #   starlette
     #   watchfiles
-certifi==2026.6.17
+certifi==2026.5.20
     # via
-    #   --override (workspace)
     #   hermes-agent (pyproject.toml)
     #   httpcore
     #   httpx
@@ -23,8 +22,6 @@ charset-normalizer==3.4.9
     # via requests
 click==8.4.2
     # via uvicorn
-cloakbrowser==0.4.12
-    # via hermes-agent (pyproject.toml)
 colorama==0.4.6
     # via
     #   click
@@ -33,10 +30,9 @@ concurrent-log-handler==0.9.29
     # via hermes-agent (pyproject.toml)
 croniter==6.0.0
     # via hermes-agent (pyproject.toml)
-cryptography==49.0.0
+cryptography==48.0.1
     # via
     #   hermes-agent (pyproject.toml)
-    #   cloakbrowser
     #   pyjwt
 distro==1.9.0
     # via openai
@@ -44,8 +40,6 @@ fastapi==0.139.2
     # via hermes-agent (pyproject.toml)
 fire==0.7.1
     # via hermes-agent (pyproject.toml)
-greenlet==3.5.3
-    # via playwright
 h11==0.16.0
     # via
     #   httpcore
@@ -57,7 +51,6 @@ httptools==0.8.0
 httpx==0.28.1
     # via
     #   hermes-agent (pyproject.toml)
-    #   cloakbrowser
     #   openai
 idna==3.18
     # via
@@ -76,20 +69,16 @@ markupsafe==3.0.3
     # via jinja2
 mdurl==0.1.2
     # via markdown-it-py
-openai==2.46.0
-    # via
-    #   --override (workspace)
-    #   hermes-agent (pyproject.toml)
+nemo-relay==0.6.0
+    # via hermes-agent (pyproject.toml)
+openai==2.24.0
+    # via hermes-agent (pyproject.toml)
 packaging==26.0
     # via hermes-agent (pyproject.toml)
 pathspec==1.1.1
     # via hermes-agent (pyproject.toml)
 pillow==12.3.0
-    # via
-    #   --override (workspace)
-    #   hermes-agent (pyproject.toml)
-playwright==1.61.0
-    # via cloakbrowser
+    # via hermes-agent (pyproject.toml)
 portalocker==3.2.0
     # via concurrent-log-handler
 prompt-toolkit==3.0.52
@@ -100,36 +89,29 @@ pycparser==3.0
     # via cffi
 pydantic==2.13.4
     # via
-    #   --override (workspace)
     #   hermes-agent (pyproject.toml)
     #   fastapi
     #   openai
-pydantic-core==2.47.0
-    # via
-    #   --override (workspace)
-    #   pydantic
-pyee==13.0.1
-    # via playwright
+pydantic-core==2.46.4
+    # via pydantic
 pygments==2.20.0
-    # via
-    #   --override (workspace)
-    #   hermes-agent (pyproject.toml)
-    #   rich
+    # via rich
 pyjwt==2.13.0
     # via hermes-agent (pyproject.toml)
 python-dateutil==2.9.0.post0
     # via croniter
 python-dotenv==1.2.2
     # via
-    #   --override (workspace)
     #   hermes-agent (pyproject.toml)
     #   uvicorn
 python-multipart==0.0.32
     # via hermes-agent (pyproject.toml)
 pytz==2026.2
     # via croniter
-pywin32==312
-    # via portalocker
+pywin32==311
+    # via
+    #   hermes-agent (pyproject.toml)
+    #   portalocker
 pywinpty==2.0.15
     # via hermes-agent (pyproject.toml)
 pyyaml==6.0.3
@@ -137,13 +119,9 @@ pyyaml==6.0.3
     #   hermes-agent (pyproject.toml)
     #   uvicorn
 requests==2.34.2
-    # via
-    #   --override (workspace)
-    #   hermes-agent (pyproject.toml)
-rich==14.3.4
-    # via
-    #   --override (workspace)
-    #   hermes-agent (pyproject.toml)
+    # via hermes-agent (pyproject.toml)
+rich==14.3.3
+    # via hermes-agent (pyproject.toml)
 ruamel-yaml==0.18.17
     # via hermes-agent (pyproject.toml)
 ruamel-yaml-clib==0.2.15
@@ -164,11 +142,12 @@ tqdm==4.69.0
     # via openai
 typing-extensions==4.16.0
     # via
+    #   anyio
     #   fastapi
     #   openai
     #   pydantic
     #   pydantic-core
-    #   pyee
+    #   starlette
     #   typing-inspection
 typing-inspection==0.4.2
     # via
@@ -178,7 +157,6 @@ tzdata==2025.3
     # via hermes-agent (pyproject.toml)
 urllib3==2.7.0
     # via
-    #   --override (workspace)
     #   hermes-agent (pyproject.toml)
     #   requests
 uvicorn==0.51.0
