@@ -876,7 +876,20 @@ def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
     assert agent._is_user_initiated_turn is False
 
 
-def test_prepared_non_copilot_aggregator_preserves_request_headers(monkeypatch):
+@pytest.mark.parametrize(
+    "provider",
+    [
+        "openrouter",
+        "custom:copilot",
+        "custom:github-copilot",
+        "copilot-acp",
+        "github-copilot-acp",
+        "copilot-acp-agent",
+    ],
+)
+def test_prepared_non_http_copilot_aggregator_preserves_request_headers(
+    monkeypatch, provider
+):
     from agent import moa_loop
 
     captured = {}
@@ -898,7 +911,7 @@ def test_prepared_non_copilot_aggregator_preserves_request_headers(monkeypatch):
     facade._call_prepared_aggregator(
         {
             "messages": [{"role": "user", "content": "question"}],
-            "aggregator": {"provider": "openrouter", "model": "aggregator"},
+            "aggregator": {"provider": provider, "model": "aggregator"},
             "aggregator_temperature": None,
         },
         {"extra_headers": request_headers},

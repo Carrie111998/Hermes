@@ -1722,12 +1722,15 @@ class MoAChatCompletions:
         _agent = getattr(self, "_agent", None)
         from agent.auxiliary_client import _normalize_aux_provider
 
+        raw_provider = str(agg_runtime.get("provider") or "").strip()
+        is_http_copilot = (
+            not raw_provider.lower().startswith("custom:")
+            and _normalize_aux_provider(raw_provider) == "copilot"
+        )
         if (
             _agent is not None
             and getattr(_agent, "_is_user_initiated_turn", False)
-            and _normalize_aux_provider(
-                str(agg_runtime.get("provider") or "")
-            ) == "copilot"
+            and is_http_copilot
         ):
             extra_headers = dict(extra_headers or {})
             extra_headers["x-initiator"] = "user"
