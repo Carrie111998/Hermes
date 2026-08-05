@@ -95,8 +95,16 @@ function isPreviewTab(value: unknown): value is PreviewTab {
 export const $previewTabs = persistentAtom<PreviewTab[]>(TABS_STORAGE_KEY, [], {
   decode: raw => {
     const parsed = JSON.parse(raw) as unknown
+    const tabs = Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []
 
-    return Array.isArray(parsed) ? parsed.filter(isPreviewTab) : []
+    // One Browser: rekey restored URL tabs onto the singleton id (rows written
+    // before the id existed carried one id per address) and keep only the
+    // LAST — the most recently opened page is the one the browser shows.
+    const lastUrl = tabs.findLast(tab => tab.target.kind === 'url')
+
+    return tabs
+      .filter(tab => tab.target.kind !== 'url' || tab === lastUrl)
+      .map(tab => (tab.target.kind === 'url' ? { ...tab, id: previewTabId(tab.target) } : tab))
   },
   // Inline bytes are not restorable. Strip them from images, and skip remote
   // HTML and artifact tabs that cannot render without their in-memory payload.
@@ -149,8 +157,15 @@ export const $previewReloadRequest = atom(0)
 export const $previewServerRestart = atom<PreviewServerRestart | null>(null)
 export const $previewServerRestartStatus = computed($previewServerRestart, restart => restart?.status ?? 'idle')
 
+/** The one Browser tab's id. URL targets all share it: the tab names the
+ *  SURFACE (Browser), not the page, so opening a second URL navigates the
+ *  browser it already has — re-front the tab, swap its target, and the pane
+ *  rebuilds its webview against the new url. Files and artifacts stay keyed
+ *  by identity; only the web surface is a singleton. */
+const BROWSER_TAB_ID: RightRailTabId = 'url:browser'
+
 export function previewTabId(target: PreviewTarget): RightRailTabId {
-  return `${target.kind}:${target.url}`
+  return target.kind === 'url' ? BROWSER_TAB_ID : `${target.kind}:${target.url}`
 }
 
 // Browsing files is "peek at the source"; a tool or an explicit link handing

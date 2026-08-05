@@ -68,6 +68,20 @@ describe('preview store', () => {
     expect($previewTabs.get().map(tab => tab.target.kind)).toEqual(['file', 'url', 'artifact'])
   })
 
+  // The Browser is a SINGLETON: the tab names the surface, not the page, so a
+  // second URL navigates the browser it already has instead of stacking a
+  // second Browser tab beside the first.
+  it('keeps one Browser tab — a second url swaps its target instead of adding a tab', () => {
+    openPreview(urlTarget('https://news.ycombinator.com'), 'tool-result')
+    openPreview(urlTarget('https://www.reddit.com'), 'tool-result')
+
+    const urlTabs = $previewTabs.get().filter(tab => tab.target.kind === 'url')
+
+    expect(urlTabs).toHaveLength(1)
+    expect(urlTabs[0].target.url).toBe('https://www.reddit.com')
+    expect($rightRailActiveTabId.get()).toBe(urlTabs[0].id)
+  })
+
   it('re-fronts an existing tab instead of duplicating it, refreshing its target', () => {
     openPreview({ ...fileTarget('/work/demo.html'), label: 'old' }, 'file-browser')
     openPreview({ ...fileTarget('/work/demo.html'), label: 'new' }, 'file-browser')
