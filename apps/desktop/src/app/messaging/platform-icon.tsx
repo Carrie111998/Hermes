@@ -69,6 +69,13 @@ const PLATFORM_ICONS: Record<string, PlatformIconSpec> = {
   api_server: { Icon: Globe, color: '#64748B', kind: 'generic' },
   weixin: { Icon: SiWechat, color: '#07C160', kind: 'brand' },
   qqbot: { Icon: SiQq, color: '#EB1923', kind: 'brand' },
+  raft: { color: '#141111', kind: 'brand', monogram: 'R' },
+  google_chat: { color: '#4285F4', kind: 'brand', monogram: 'G' },
+  line: { color: '#06C755', kind: 'brand', monogram: 'L' },
+  teams: { color: '#6264A7', kind: 'brand', monogram: 'T' },
+  irc: { color: '#6B7280', kind: 'generic', monogram: 'I' },
+  simplex: { color: '#2B4D7A', kind: 'generic', monogram: 'X' },
+  ntfy: { color: '#EA580C', kind: 'generic', monogram: 'n' },
   yuanbao: { Icon: SiBilibili, color: '#FB7299', kind: 'brand' }
 }
 
