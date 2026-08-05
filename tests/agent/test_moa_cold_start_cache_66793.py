@@ -177,7 +177,7 @@ def test_cached_slot_runtime_keeps_extra_body_across_aggregator_calls(
     monkeypatch.setattr(rt_mod, "resolve_runtime_provider", resolve_with_extra_body)
     import hermes_cli.config as cfg_mod
     cfg_file = tmp_path / "config.yaml"
-    cfg_file.write_text("moa: {}\n")
+    cfg_file.write_text("moa: {}\n", encoding="utf-8")
     monkeypatch.setattr(cfg_mod, "get_config_path", lambda: cfg_file)
     monkeypatch.setattr(cfg_mod, "load_config", lambda: _make_preset_config())
 
