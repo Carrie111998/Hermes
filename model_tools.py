@@ -275,6 +275,11 @@ _LEGACY_TOOLSET_MAP = {
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
 _tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
 
+# Set once when get_tool_definitions() first falls back to the process-wide
+# cache because the multiplex profile scope was unresolvable, so the warning
+# is emitted once per process, not once per request (#79047).
+_warned_tool_defs_scope_bypass: bool = False
+
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
 # (per-session toolset sets, config edits, kanban-task toggles); without a
@@ -297,10 +302,7 @@ def get_tool_definitions(
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
 ) -> List[Dict[str, Any]]:
-    """
-    Get tool definitions for model API calls with toolset-based filtering.
-
-    All tools must be part of a toolset to be accessible.
+    """Get tool definitions for model API calls with toolset-based filtering.
 
     Args:
         enabled_toolsets: Only include tools from these toolsets.
@@ -315,6 +317,7 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    global _warned_tool_defs_scope_bypass
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -333,17 +336,33 @@ def get_tool_definitions(
         except (FileNotFoundError, OSError, ImportError):
             cfg_fp = None
         profile_scope = check_fn_cache_scope()
-        if profile_scope != CHECK_FN_CACHE_BYPASS:
-            cache_key = (
-                frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
-                frozenset(disabled_toolsets) if disabled_toolsets else None,
-                registry._generation,
-                cfg_fp,
-                bool(os.environ.get("HERMES_KANBAN_TASK")),
-                bool(skip_tool_search_assembly),
-                _is_delegated_child_context(),
-                profile_scope,
-            )
+        if profile_scope == CHECK_FN_CACHE_BYPASS:
+            # Profile identity could not be resolved (multiplex gateway,
+            # no home override in this context — e.g. api_server worker
+            # threads that run outside _profile_runtime_scope). Failing
+            # closed here would disable the cache ENTIRELY: every request
+            # would recompute tool definitions and re-run live check_fn
+            # probes (~3.3s per api_server call, #79047). Degrade to the
+            # process-wide cache key instead — identical to single-profile
+            # behavior — and log the reason so operators can see this path.
+            if not _warned_tool_defs_scope_bypass:
+                logger.warning(
+                    "get_tool_definitions: profile cache scope unresolved "
+                    "(multiplex without home override); falling back to "
+                    "process-wide tool-definitions cache (#79047)"
+                )
+                _warned_tool_defs_scope_bypass = True
+            profile_scope = None
+        cache_key = (
+            frozenset(enabled_toolsets) if enabled_toolsets is not None else None,
+            frozenset(disabled_toolsets) if disabled_toolsets else None,
+            registry._generation,
+            cfg_fp,
+            bool(os.environ.get("HERMES_KANBAN_TASK")),
+            bool(skip_tool_search_assembly),
+            _is_delegated_child_context(),
+            profile_scope,
+        )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see

@@ -280,16 +280,13 @@ def _check_fn_cached(fn: Callable) -> bool:
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
-        try:
-            return bool(fn())
-        except Exception:
-            logger.warning(
-                "check_fn %s raised while profile cache scope was unresolved; "
-                "dependent tools will be unavailable this turn",
-                getattr(fn, "__qualname__", fn),
-                exc_info=True,
-            )
-            return False
+        # Profile identity could not be resolved (multiplex gateway, no
+        # home override in this context). Failing closed here would run the
+        # probe LIVE on every call — with 8+ tools that is seconds per
+        # request (api_server #79047). Degrade to the process-wide TTL
+        # cache (scope=None) instead, matching pre-multiplex behavior; the
+        # 30s TTL still bounds staleness and the lock still serializes.
+        scope = None
     cache_key = (fn, scope)
     with _check_fn_cache_lock:
         _prune_check_fn_caches(now)
@@ -357,9 +354,11 @@ def get_cached_check_fn_result(fn: Callable) -> Optional[bool]:
     now = time.monotonic()
     scope = check_fn_cache_scope()
     if scope == CHECK_FN_CACHE_BYPASS:
-        # Unresolved profile identity bypasses the cache entirely; there is no
-        # trustworthy cached verdict to report.
-        return None
+        # Unresolved profile identity: report the process-wide cached verdict
+        # (scope=None) when one is fresh. Matches _check_fn_cached's
+        # degradation — a full bypass here would starve read-only surfaces
+        # of every verdict in multiplex api_server paths (#79047).
+        scope = None
     with _check_fn_cache_lock:
         cached = _check_fn_cache.get((fn, scope))
         if cached is None:

@@ -205,8 +205,18 @@ class TestCheckFnTransientFailureSuppression:
             reg.invalidate_check_fn_cache()
             _clear_tool_defs_cache()
 
-    def test_unscoped_multiplex_request_bypasses_cache(self, monkeypatch):
-        """An unknown profile must never share another request's cache entry."""
+    def test_unscoped_multiplex_request_degrades_to_process_wide_cache(self, monkeypatch):
+        """An unresolved profile scope must degrade to the process-wide cache,
+        not disable caching entirely.
+
+        Failing closed (disabling both the check_fn TTL cache and the
+        tool-definitions memo) made every api_server request in a multiplex
+        gateway recompute tool definitions and re-run live probes — ~3.3s per
+        request (#79047). Unresolvable scopes now share the process-wide
+        (scope=None) cache key, which is safe: resolvable profiles still use
+        their own scope key, so cross-profile isolation is preserved (see
+        test_profile_scoped_availability_does_not_cross_multiplex_profiles).
+        """
         import model_tools
         import tools.registry as reg
         from agent.secret_scope import set_multiplex_active
@@ -224,14 +234,18 @@ class TestCheckFnTransientFailureSuppression:
         set_multiplex_active(True)
         monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute_definitions)
         try:
+            # First probe result is TTL-cached under the process-wide key...
             assert reg._check_fn_cached(probe) is True
-            assert reg._check_fn_cached(probe) is False
-            assert not reg._check_fn_cache
+            # ...so the second call hits the cache and never re-runs the probe.
+            assert reg._check_fn_cached(probe) is True
+            assert reg._check_fn_cache
 
+            # Tool-definitions memo degrades the same way: repeated unscoped
+            # calls reuse the process-wide entry instead of recomputing.
             model_tools.get_tool_definitions(quiet_mode=True)
             model_tools.get_tool_definitions(quiet_mode=True)
-            assert definition_calls["n"] == 2
-            assert not model_tools._tool_defs_cache
+            assert definition_calls["n"] == 1
+            assert model_tools._tool_defs_cache
         finally:
             set_multiplex_active(False)
             reg.invalidate_check_fn_cache()
