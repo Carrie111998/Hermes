@@ -1043,10 +1043,12 @@ def validate_intermediate_for_owner(
     before = _validate_observation(
         raw.get("before_observation"),
         phase="before_install",
+        allow_routeback_helper_present=True,
     )
     after = _validate_observation(
         raw.get("after_observation"),
         phase="after_install",
+        allow_routeback_helper_present=True,
     )
     if (
         raw.get("schema") != INTERMEDIATE_SCHEMA
