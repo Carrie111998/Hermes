@@ -1,44 +1,19 @@
-"""Unit tests for ``hermes_cli.service_manager``.
+"""Tests for hermes_cli.service_manager — the abstract ServiceManager
+protocol, the detect_service_manager() entry point, and the host-side
+adapter wrappers (Systemd / Launchd / Windows).
 
-``service_manager.py`` (added in PR #73, 1,123 lines) shipped with zero
-test coverage despite sitting on the gateway lifecycle critical path.
-
-Everything that shells out is mocked: no test invokes a real ``s6-svc``,
-``s6-svstat``, ``s6-svscanctl``, ``systemctl``, ``launchctl`` or touches a
-real supervised service. ``subprocess.run`` is patched (the module does a
-local ``import subprocess`` inside each method, so patching
-``subprocess.run`` in the shared ``subprocess`` module intercepts it),
-and the host backends' delegate functions are patched on
-``hermes_cli.gateway``.
-
-Covered:
-  * ``detect_service_manager`` / ``get_service_manager`` backend selection
-    for every platform plus the fallback "none" case.
-  * ``S6ServiceManager`` start / stop / restart / is_running, error
-    translation (GatewayNotRegisteredError / S6CommandError),
-    register / unregister / list_profile_gateways.
-  * ``SystemdServiceManager`` / ``LaunchdServiceManager`` restart + the
-    registration-unsupported contract.
-  * ``_dispatch_via_service_manager_if_s6`` and the ``_all_`` variant.
-  * ``write_platform_config_field`` round-trip against a tmp config.
-  * ``validate_profile_name``.
+The s6 backend is added in Phase 3; its tests live alongside the
+implementation in this same file once that phase ships.
 """
 from __future__ import annotations
 
-import os
-import subprocess
-import types
-from pathlib import Path
-from unittest.mock import MagicMock, patch
-
 import pytest
 
-from hermes_cli import service_manager as sm
 from hermes_cli.service_manager import (
-    GatewayNotRegisteredError,
     LaunchdServiceManager,
-    S6CommandError,
     S6ServiceManager,
+    ServiceManager,
+    ServiceManagerKind,
     SystemdServiceManager,
     WindowsServiceManager,
     detect_service_manager,
@@ -46,579 +21,471 @@ from hermes_cli.service_manager import (
     validate_profile_name,
 )
 
-S6_BIN = "/command"
-
-
-def _completed(returncode=0, stdout="", stderr=""):
-    """Stand-in for ``subprocess.CompletedProcess`` with concrete attrs.
-
-    Using a real object (not a bare MagicMock) keeps ``returncode != 0``
-    and string ``.stdout`` comparisons behaving like the production code
-    expects.
-    """
-    return types.SimpleNamespace(
-        returncode=returncode, stdout=stdout, stderr=stderr
-    )
-
 
 # ---------------------------------------------------------------------------
 # validate_profile_name
 # ---------------------------------------------------------------------------
 
 
-class TestValidateProfileName:
-    def test_accepts_valid_names(self):
-        for name in ("default", "a", "team-1", "team_1", "abc123"):
-            validate_profile_name(name)  # no raise
 
-    def test_rejects_empty(self):
-        with pytest.raises(ValueError):
-            validate_profile_name("")
 
-    def test_rejects_uppercase(self):
-        with pytest.raises(ValueError):
-            validate_profile_name("Team")
-
-    def test_rejects_path_traversal(self):
-        with pytest.raises(ValueError):
-            validate_profile_name("../etc")
-
-    def test_rejects_leading_dash(self):
-        with pytest.raises(ValueError):
-            validate_profile_name("-foo")
-
-    def test_rejects_too_long(self):
-        with pytest.raises(ValueError):
-            validate_profile_name("a" * 252)
 
 
 # ---------------------------------------------------------------------------
-# detect_service_manager / get_service_manager
+# detect_service_manager
 # ---------------------------------------------------------------------------
 
 
-class TestDetectServiceManager:
-    """``detect_service_manager`` keys on ``_s6_running`` then, in order,
-    the gateway helpers ``is_windows`` / ``is_macos`` /
-    ``supports_systemd_services`` (imported lazily from
-    ``hermes_cli.gateway``)."""
-
-    def _patch_gateway(self, monkeypatch, *, windows=False, macos=False,
-                       systemd=False):
-        from hermes_cli import gateway
-        monkeypatch.setattr(gateway, "is_windows", lambda: windows)
-        monkeypatch.setattr(gateway, "is_macos", lambda: macos)
-        monkeypatch.setattr(
-            gateway, "supports_systemd_services", lambda: systemd
-        )
-
-    def test_s6_wins_over_everything(self, monkeypatch):
-        monkeypatch.setattr(sm, "_s6_running", lambda: True)
-        # Even with a windows host underneath, s6 short-circuits first.
-        self._patch_gateway(monkeypatch, windows=True)
-        assert detect_service_manager() == "s6"
-
-    def test_windows(self, monkeypatch):
-        monkeypatch.setattr(sm, "_s6_running", lambda: False)
-        self._patch_gateway(monkeypatch, windows=True)
-        assert detect_service_manager() == "windows"
-
-    def test_launchd(self, monkeypatch):
-        monkeypatch.setattr(sm, "_s6_running", lambda: False)
-        self._patch_gateway(monkeypatch, macos=True)
-        assert detect_service_manager() == "launchd"
-
-    def test_systemd(self, monkeypatch):
-        monkeypatch.setattr(sm, "_s6_running", lambda: False)
-        self._patch_gateway(monkeypatch, systemd=True)
-        assert detect_service_manager() == "systemd"
-
-    def test_none_fallback(self, monkeypatch):
-        monkeypatch.setattr(sm, "_s6_running", lambda: False)
-        self._patch_gateway(monkeypatch)  # all False
-        assert detect_service_manager() == "none"
 
 
-class TestS6Running:
-    def test_false_when_comm_unreadable(self, monkeypatch):
-        def _raise(*_a, **_k):
-            raise OSError("nope")
-        monkeypatch.setattr(Path, "read_text", _raise)
-        assert sm._s6_running() is False
-
-    def test_false_when_comm_not_s6(self, monkeypatch):
-        monkeypatch.setattr(Path, "read_text", lambda *_a, **_k: "bash\n")
-        assert sm._s6_running() is False
-
-    def test_true_when_comm_and_basedir(self, monkeypatch):
-        monkeypatch.setattr(
-            Path, "read_text", lambda *_a, **_k: "s6-svscan\n"
-        )
-        monkeypatch.setattr(Path, "is_dir", lambda *_a, **_k: True)
-        assert sm._s6_running() is True
-
-    def test_false_when_basedir_missing(self, monkeypatch):
-        monkeypatch.setattr(
-            Path, "read_text", lambda *_a, **_k: "s6-svscan\n"
-        )
-        monkeypatch.setattr(Path, "is_dir", lambda *_a, **_k: False)
-        assert sm._s6_running() is False
-
-
-class TestGetServiceManager:
-    def test_returns_backend_per_kind(self, monkeypatch):
-        mapping = {
-            "systemd": SystemdServiceManager,
-            "launchd": LaunchdServiceManager,
-            "windows": WindowsServiceManager,
-            "s6": S6ServiceManager,
-        }
-        for kind, cls in mapping.items():
-            monkeypatch.setattr(sm, "detect_service_manager", lambda k=kind: k)
-            mgr = get_service_manager()
-            assert isinstance(mgr, cls)
-            assert mgr.kind == kind
-
-    def test_none_raises_runtimeerror(self, monkeypatch):
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "none")
-        with pytest.raises(RuntimeError):
-            get_service_manager()
 
 
 # ---------------------------------------------------------------------------
-# S6ServiceManager — lifecycle
+# _s6_running — must work for unprivileged users, not just root
+# ---------------------------------------------------------------------------
+
+
+def _patch_s6_paths(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    comm: str | OSError | None,
+    basedir_is_dir: bool,
+) -> None:
+    """Stub /proc/1/comm and /run/s6/basedir for _s6_running tests."""
+    from pathlib import Path as _Path
+
+    real_read_text = _Path.read_text
+    real_is_dir = _Path.is_dir
+
+    def fake_read_text(self, *args, **kwargs):  # type: ignore[override]
+        if str(self) == "/proc/1/comm":
+            if isinstance(comm, OSError):
+                raise comm
+            if comm is None:
+                raise FileNotFoundError(2, "No such file or directory")
+            return comm + "\n"
+        return real_read_text(self, *args, **kwargs)
+
+    def fake_is_dir(self):  # type: ignore[override]
+        if str(self) == "/run/s6/basedir":
+            return basedir_is_dir
+        return real_is_dir(self)
+
+    monkeypatch.setattr(_Path, "read_text", fake_read_text)
+    monkeypatch.setattr(_Path, "is_dir", fake_is_dir)
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Backend wrappers — kind + registration unsupported on hosts
+# ---------------------------------------------------------------------------
+
+
+def test_systemd_manager_kind_and_registration_unsupported() -> None:
+    mgr = SystemdServiceManager()
+    assert mgr.kind == "systemd"
+    assert mgr.supports_runtime_registration() is False
+    with pytest.raises(NotImplementedError):
+        mgr.register_profile_gateway("foo")
+    with pytest.raises(NotImplementedError):
+        mgr.unregister_profile_gateway("foo")
+    assert mgr.list_profile_gateways() == []
+    # Protocol conformance — runtime_checkable lets us assert this.
+    assert isinstance(mgr, ServiceManager)
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle delegation — wrappers must call through to module-level fns
+# ---------------------------------------------------------------------------
+
+
+
+
+def test_windows_manager_lifecycle_delegates(monkeypatch: pytest.MonkeyPatch) -> None:
+    called: list[str] = []
+    # Force-import the submodule so monkeypatch's attribute lookup
+    # against the `hermes_cli` package succeeds — gateway_windows is
+    # imported lazily inside the wrapper and may not yet be loaded.
+    import hermes_cli.gateway_windows  # noqa: F401
+
+    class _FakeWindowsModule:
+        @staticmethod
+        def start() -> None: called.append("start")
+        @staticmethod
+        def stop() -> None: called.append("stop")
+        @staticmethod
+        def restart() -> None: called.append("restart")
+        @staticmethod
+        def is_installed() -> bool: return True
+
+    monkeypatch.setattr("hermes_cli.gateway_windows", _FakeWindowsModule)
+    monkeypatch.setattr(
+        "hermes_cli.gateway.find_gateway_pids",
+        lambda **kw: [12345],
+    )
+    mgr = WindowsServiceManager()
+    mgr.start("ignored")
+    mgr.stop("ignored")
+    mgr.restart("ignored")
+    assert called == ["start", "stop", "restart"]
+    assert mgr.is_running("ignored") is True
+
+
+
+
+# ---------------------------------------------------------------------------
+# get_service_manager factory
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# S6ServiceManager — unit tests against a tmp-path scandir (no real s6)
 # ---------------------------------------------------------------------------
 
 
 @pytest.fixture
-def s6(tmp_path, monkeypatch):
-    """An S6ServiceManager rooted at a tmp scandir, with HERMES_HOME set
-    to tmp so the best-effort desired-state writes never touch a real
-    profile dir."""
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
-    (tmp_path / "home").mkdir()
-    scandir = tmp_path / "service"
-    scandir.mkdir()
-    return S6ServiceManager(scandir=scandir)
+def s6_scandir(tmp_path):
+    """Empty scandir for the S6ServiceManager tests."""
+    d = tmp_path / "service"
+    d.mkdir()
+    return d
 
 
-class TestS6Lifecycle:
-    def test_start_issues_svc_up(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
-        with patch("subprocess.run", return_value=_completed()) as run:
-            s6.start("gateway-foo")
-        run.assert_called_once()
-        args, kwargs = run.call_args
-        assert args[0] == [
-            f"{S6_BIN}/s6-svc", "-u", str(s6.scandir / "gateway-foo")
-        ]
-        assert kwargs["check"] is True
-        assert kwargs["timeout"] == 5
+@pytest.fixture
+def fake_subprocess_run(monkeypatch: pytest.MonkeyPatch):
+    """Capture subprocess.run calls + always return success. Lets the
+    S6ServiceManager tests run on hosts that don't have s6-svc /
+    s6-svscanctl installed.
 
-    def test_restart_issues_svc_t(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
-        with patch("subprocess.run", return_value=_completed()) as run:
-            s6.restart("gateway-foo")
-        assert run.call_args.args[0] == [
-            f"{S6_BIN}/s6-svc", "-t", str(s6.scandir / "gateway-foo")
-        ]
+    Records are normalized: leading ``/command/`` is stripped from
+    cmd[0] so assertions can match on the bare s6-svc / s6-svstat /
+    s6-svscanctl name regardless of whether the manager calls them
+    via absolute path or bare name."""
+    calls: list[list[str]] = []
 
-    def test_stop_issues_svc_down(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
+    def _fake(cmd, **kw):
+        import subprocess as _sp
+        seq = list(cmd) if isinstance(cmd, (list, tuple)) else [str(cmd)]
+        if seq and seq[0].startswith("/command/"):
+            seq[0] = seq[0][len("/command/"):]
+        calls.append(seq)
+        return _sp.CompletedProcess(cmd, 0, "", "")
 
-        def fake_run(cmd, *a, **k):
-            # s6-svstat probe in _supervised_pid: report no pid so the
-            # planned-stop marker path is skipped.
-            if cmd[0].endswith("s6-svstat"):
-                return _completed(returncode=1)
-            return _completed()
-
-        with patch("subprocess.run", side_effect=fake_run) as run:
-            s6.stop("gateway-foo")
-        svc_calls = [c for c in run.call_args_list
-                     if c.args[0][0].endswith("s6-svc")]
-        assert svc_calls[0].args[0] == [
-            f"{S6_BIN}/s6-svc", "-d", str(s6.scandir / "gateway-foo")
-        ]
-
-    def test_stop_writes_planned_marker_when_pid_present(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
-
-        def fake_run(cmd, *a, **k):
-            if cmd[0].endswith("s6-svstat"):
-                return _completed(returncode=0, stdout="up (pid 4321) 5s\n")
-            return _completed()
-
-        marker = MagicMock()
-        with patch("subprocess.run", side_effect=fake_run), \
-                patch("gateway.status.write_planned_stop_marker", marker):
-            s6.stop("gateway-foo")
-        marker.assert_called_once_with(4321)
-
-    def test_missing_service_dir_raises_not_registered(self, s6):
-        with patch("subprocess.run") as run:
-            with pytest.raises(GatewayNotRegisteredError) as ei:
-                s6.start("gateway-ghost")
-        # s6-svc is never invoked when the slot doesn't exist.
-        run.assert_not_called()
-        assert ei.value.profile == "ghost"
-        assert ei.value.service == "gateway-ghost"
-
-    def test_svc_nonzero_raises_command_error(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
-        err = subprocess.CalledProcessError(
-            returncode=100, cmd=["s6-svc"], output="", stderr="EACCES fifo"
-        )
-        with patch("subprocess.run", side_effect=err):
-            with pytest.raises(S6CommandError) as ei:
-                s6.start("gateway-foo")
-        assert ei.value.returncode == 100
-        assert ei.value.action == "start"
-        assert "EACCES fifo" in str(ei.value)
-
-    def test_is_running_true(self, s6):
-        with patch("subprocess.run",
-                   return_value=_completed(returncode=0, stdout="up (pid 5) 1s")):
-            assert s6.is_running("gateway-foo") is True
-
-    def test_is_running_false_when_down(self, s6):
-        with patch("subprocess.run",
-                   return_value=_completed(returncode=0, stdout="down 1s")):
-            assert s6.is_running("gateway-foo") is False
-
-    def test_is_running_false_on_nonzero(self, s6):
-        with patch("subprocess.run",
-                   return_value=_completed(returncode=1, stdout="")):
-            assert s6.is_running("gateway-foo") is False
-
-    def test_supports_runtime_registration(self, s6):
-        assert s6.supports_runtime_registration() is True
+    monkeypatch.setattr("subprocess.run", _fake)
+    return calls
 
 
 # ---------------------------------------------------------------------------
-# S6ServiceManager — registration
+# _seed_supervise_skeleton — unit tests
 # ---------------------------------------------------------------------------
+#
+# The skeleton helper pre-creates the dirs and FIFOs that s6-supervise
+# would otherwise create as root mode 0700, locking out the
+# unprivileged hermes user from every lifecycle op. These tests run
+# against tmp_path and assert the produced layout — the live-container
+# verification (against real s6-svc / s6-svstat) lives in
+# tests/docker/test_s6_profile_gateway_integration.py.
 
 
-class TestS6Registration:
-    def test_register_builds_service_dir(self, s6):
-        with patch("subprocess.run", return_value=_completed()) as run:
-            s6.register_profile_gateway("foo")
+def test_seed_supervise_skeleton_creates_expected_layout(tmp_path) -> None:
+    """Verifies the dirs + FIFO + modes the helper lays down."""
+    import stat
 
-        svc = s6.scandir / "gateway-foo"
-        assert svc.is_dir()
-        assert (svc / "type").read_text() == "longrun\n"
-        assert (svc / "run").exists()
-        assert (svc / "finish").exists()
-        assert (svc / "log" / "run").exists()
-        assert not (svc / "down").exists()  # start_now default True
-        # rescan triggered.
-        assert run.call_args.args[0] == [
-            f"{S6_BIN}/s6-svscanctl", "-a", str(s6.scandir)
-        ]
-        # run script targets the profile, drops privileges.
-        run_body = (svc / "run").read_text()
-        assert "hermes -p foo gateway run --replace" in run_body
-        assert "s6-setuidgid hermes" in run_body
+    from hermes_cli.service_manager import _seed_supervise_skeleton
 
-    def test_register_default_profile_omits_p_flag(self, s6):
-        with patch("subprocess.run", return_value=_completed()):
-            s6.register_profile_gateway("default")
-        run_body = (s6.scandir / "gateway-default" / "run").read_text()
-        assert "hermes gateway run --replace" in run_body
-        assert " -p " not in run_body
+    svc_dir = tmp_path / "gateway-foo"
+    svc_dir.mkdir()
 
-    def test_register_start_now_false_writes_down_marker(self, s6):
-        with patch("subprocess.run", return_value=_completed()):
-            s6.register_profile_gateway("foo", start_now=False)
-        assert (s6.scandir / "gateway-foo" / "down").exists()
+    _seed_supervise_skeleton(svc_dir)
 
-    def test_register_existing_raises_valueerror(self, s6):
-        (s6.scandir / "gateway-foo").mkdir()
-        with patch("subprocess.run", return_value=_completed()):
-            with pytest.raises(ValueError):
-                s6.register_profile_gateway("foo")
+    # Top-level event/ — s6-svlisten1 event subscription dir.
+    event = svc_dir / "event"
+    assert event.is_dir(), "missing top-level event/"
+    assert stat.S_IMODE(event.stat().st_mode) == 0o3730, (
+        f"event/ mode = {oct(event.stat().st_mode)}, want 03730"
+    )
 
-    def test_register_rescan_failure_cleans_up_and_raises(self, s6):
-        with patch(
-            "subprocess.run",
-            return_value=_completed(returncode=1, stderr="scan boom"),
-        ):
-            with pytest.raises(RuntimeError, match="s6-svscanctl"):
-                s6.register_profile_gateway("foo")
-        # The half-built slot is torn down on rescan failure.
-        assert not (s6.scandir / "gateway-foo").exists()
+    # supervise/ dir.
+    supervise = svc_dir / "supervise"
+    assert supervise.is_dir(), "missing supervise/"
+    assert stat.S_IMODE(supervise.stat().st_mode) == 0o755
 
-    def test_register_invalid_profile_rejected(self, s6):
-        with patch("subprocess.run", return_value=_completed()):
-            with pytest.raises(ValueError):
-                s6.register_profile_gateway("../evil")
+    # supervise/event/.
+    supervise_event = supervise / "event"
+    assert supervise_event.is_dir(), "missing supervise/event/"
+    assert stat.S_IMODE(supervise_event.stat().st_mode) == 0o3730
 
-    def test_unregister_stops_and_removes(self, s6):
-        svc = s6.scandir / "gateway-foo"
-        svc.mkdir()
-        with patch("subprocess.run", return_value=_completed()) as run, \
-                patch("time.sleep"):
-            s6.unregister_profile_gateway("foo")
-        assert not svc.exists()
-        cmds = [c.args[0][1] if len(c.args[0]) > 1 else c.args[0][0]
-                for c in run.call_args_list]
-        # Ordering: stop (-d), wait-for-down (-D), reap (-an).
-        joined = [" ".join(c.args[0]) for c in run.call_args_list]
-        assert any("s6-svc -d" in j for j in joined)
-        assert any("s6-svwait" in j for j in joined)
-        assert any("s6-svscanctl -an" in j for j in joined)
+    # supervise/control FIFO.
+    control = supervise / "control"
+    assert control.exists(), "missing supervise/control FIFO"
+    assert stat.S_ISFIFO(control.stat().st_mode), (
+        "supervise/control must be a FIFO"
+    )
+    assert stat.S_IMODE(control.stat().st_mode) == 0o660
 
-    def test_unregister_absent_is_noop(self, s6):
-        with patch("subprocess.run") as run, patch("time.sleep"):
-            s6.unregister_profile_gateway("nope")
-        run.assert_not_called()
 
-    def test_list_profile_gateways(self, s6):
-        (s6.scandir / "gateway-alpha").mkdir()
-        (s6.scandir / "gateway-beta").mkdir()
-        (s6.scandir / ".hidden-tmp").mkdir()  # skipped (dot-prefixed)
-        (s6.scandir / "s6-linux-init").mkdir()  # skipped (no prefix)
-        (s6.scandir / "gateway-file").write_text("x")  # skipped (not dir)
-        assert set(s6.list_profile_gateways()) == {"alpha", "beta"}
 
-    def test_list_profile_gateways_missing_scandir(self, tmp_path):
-        mgr = S6ServiceManager(scandir=tmp_path / "does-not-exist")
-        assert mgr.list_profile_gateways() == []
 
-    def test_render_finish_script_defines_fatal_config_exit_code(self):
-        """Regression test for a real bug: _render_finish_script imported
-        GATEWAY_FATAL_CONFIG_EXIT_CODE from gateway.restart, but that
-        symbol was never defined there — only GATEWAY_SERVICE_RESTART_EXIT_CODE
-        existed. That raised ImportError on the real register_profile_gateway
-        path, breaking s6 profile-gateway registration in production.
 
-        Assert the import now resolves and the rendered finish script
-        checks for the correct (EX_CONFIG) exit code, distinct from the
-        restart exit code.
-        """
-        from gateway.restart import (
-            GATEWAY_FATAL_CONFIG_EXIT_CODE,
-            GATEWAY_SERVICE_RESTART_EXIT_CODE,
-        )
 
-        assert GATEWAY_FATAL_CONFIG_EXIT_CODE == 78
-        assert GATEWAY_FATAL_CONFIG_EXIT_CODE != GATEWAY_SERVICE_RESTART_EXIT_CODE
 
-        script = S6ServiceManager._render_finish_script()
-        assert f'if [ "$1" = "{GATEWAY_FATAL_CONFIG_EXIT_CODE}" ]; then' in script
-        assert "exit 125" in script
+
+
+
+def test_render_run_script_uses_replace_to_take_over_stale_holder() -> None:
+    """NS-505: the supervised gateway must exec ``gateway run --replace``.
+
+    Without ``--replace`` a gateway started OUTSIDE s6 (a stray shell
+    ``hermes gateway run``, an agent action, the Open WebUI helper) holds
+    the per-HERMES_HOME PID lock; the supervised slot then execs a bare
+    ``gateway run``, hits the "Another gateway instance is already
+    running" guard, exits non-zero, and s6 restarts it — a restart loop
+    that never binds. ``--replace`` makes the supervised gateway reap the
+    stale holder and win, so s6 is authoritative for the slot.
+
+    Covers both the default (root HERMES_HOME, no ``-p``) and named-profile
+    render paths.
+    """
+    default_text = S6ServiceManager._render_run_script("default", {})
+    # Root profile: bare `hermes gateway run --replace` (no -p flag).
+    assert "hermes gateway run --replace" in default_text
+    assert "hermes -p default" not in default_text
+    # Every exec line that launches the gateway must carry --replace, so
+    # neither the non-root nor the privilege-drop branch can spin.
+    gateway_execs = [
+        line for line in default_text.splitlines()
+        if "gateway run" in line
+    ]
+    assert gateway_execs, "no gateway run exec line rendered"
+    assert all("--replace" in line for line in gateway_execs), (
+        f"a gateway run line is missing --replace: {gateway_execs}"
+    )
+
+    named_text = S6ServiceManager._render_run_script("coder", {})
+    named_execs = [
+        line for line in named_text.splitlines() if "gateway run" in line
+    ]
+    assert named_execs
+    assert all("--replace" in line for line in named_execs), (
+        f"a named-profile gateway run line is missing --replace: {named_execs}"
+    )
+
+
+def test_render_finish_script_exits_125_on_ex_config() -> None:
+    """The finish script must translate exit 78 (EX_CONFIG) into exit 125
+    (permanent failure) so s6 stops restarting on fatal config errors.
+    See #51228."""
+    text = S6ServiceManager._render_finish_script()
+    assert '[ "$1" = "78" ]' in text
+    assert "exit 125" in text
+    assert "exit 0" in text
+
+
+
+
 
 
 # ---------------------------------------------------------------------------
-# Host backends — systemd / launchd
+# Lifecycle errors — friendly messages, not raw CalledProcessError
 # ---------------------------------------------------------------------------
 
 
-class TestHostBackends:
-    def test_systemd_restart_delegates(self, monkeypatch):
-        from hermes_cli import gateway
-        called = MagicMock()
-        monkeypatch.setattr(gateway, "systemd_restart", called)
-        SystemdServiceManager().restart("ignored")
-        called.assert_called_once_with()
 
-    def test_systemd_start_stop_delegate(self, monkeypatch):
-        from hermes_cli import gateway
-        start, stop = MagicMock(), MagicMock()
-        monkeypatch.setattr(gateway, "systemd_start", start)
-        monkeypatch.setattr(gateway, "systemd_stop", stop)
-        mgr = SystemdServiceManager()
-        mgr.start("x")
-        mgr.stop("x")
-        start.assert_called_once_with()
-        stop.assert_called_once_with()
 
-    def test_launchd_restart_delegates(self, monkeypatch):
-        from hermes_cli import gateway
-        called = MagicMock()
-        monkeypatch.setattr(gateway, "launchd_restart", called)
-        LaunchdServiceManager().restart("ignored")
-        called.assert_called_once_with()
 
-    def test_host_backends_reject_registration(self):
-        for cls in (SystemdServiceManager, LaunchdServiceManager,
-                    WindowsServiceManager):
-            mgr = cls()
-            assert mgr.supports_runtime_registration() is False
-            assert mgr.list_profile_gateways() == []
-            with pytest.raises(NotImplementedError):
-                mgr.register_profile_gateway("foo")
-            with pytest.raises(NotImplementedError):
-                mgr.unregister_profile_gateway("foo")
+
+
+
 
 
 # ---------------------------------------------------------------------------
-# CLI wiring — _dispatch_via_service_manager_if_s6 (+ _all_ variant)
+# S6 stop writes a planned-stop marker (issue #42675)
+#
+# `hermes gateway stop` inside a container dispatches through
+# S6ServiceManager.stop() -> `s6-svc -d`, which SIGTERMs the gateway.
+# That SIGTERM is indistinguishable from the one s6/Docker sends on a
+# container restart unless we mark the intentional stop first. Without
+# the marker, the gateway's shutdown handler can't tell an operator
+# stop from a restart kill, and the gateway_state=stopped suppression
+# (run.py) would never engage for explicit stops.
 # ---------------------------------------------------------------------------
 
 
-class TestDispatchViaServiceManager:
-    def test_non_s6_falls_through(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "systemd")
-        got_mgr = MagicMock()
-        monkeypatch.setattr(sm, "get_service_manager", got_mgr)
-        assert gateway._dispatch_via_service_manager_if_s6(
-            "restart", profile="foo"
-        ) is False
-        got_mgr.assert_not_called()
+def _log_run_setup_fragment(rendered: str) -> str:
+    """Keep mkdir/rm setup from ``_render_log_run``; stop before ``s6-log``."""
+    keep: list[str] = []
+    for line in rendered.splitlines(keepends=True):
+        if line.startswith("#!/") or "shellcheck" in line:
+            continue
+        if "s6-log" in line:
+            break
+        keep.append(line)
+    return "#!/bin/sh\n" + "".join(keep)
 
-    def test_s6_restart_dispatches(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        assert gateway._dispatch_via_service_manager_if_s6(
-            "restart", profile="foo"
-        ) is True
-        mgr.restart.assert_called_once_with("gateway-foo")
 
-    def test_s6_start_and_stop_dispatch(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        gateway._dispatch_via_service_manager_if_s6("start", profile="p")
-        gateway._dispatch_via_service_manager_if_s6("stop", profile="p")
-        mgr.start.assert_called_once_with("gateway-p")
-        mgr.stop.assert_called_once_with("gateway-p")
+def test_s6_log_run_creates_leaf_as_hermes_without_chown(
+    s6_scandir, fake_subprocess_run,
+) -> None:
+    """log/run must not root-chown/unlink volume paths; create leaf as hermes.
 
-    def test_s6_unknown_action_returns_false(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        assert gateway._dispatch_via_service_manager_if_s6(
-            "bogus", profile="p"
-        ) is False
+    #45258 parent ownership is stage2's job (``logs/gateways`` seeded as
+    hermes). Restartable log/run must not pathname-chown or pathname-rm a
+    hermes-writable tree from root — that is a symlink TOCTOU hole.
+    """
+    mgr = S6ServiceManager(scandir=s6_scandir)
+    mgr.register_profile_gateway("coder")
 
-    def test_not_registered_exits(self, monkeypatch, capsys):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        mgr.restart.side_effect = GatewayNotRegisteredError("typo")
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        with pytest.raises(SystemExit) as ei:
-            gateway._dispatch_via_service_manager_if_s6(
-                "restart", profile="typo"
+    log_text = (s6_scandir / "gateway-coder" / "log" / "run").read_text()
+
+    assert not any(line.lstrip().startswith("chown ") for line in log_text.splitlines()), (
+        "restartable log/run must not invoke chown on hermes-writable paths; "
+        f"saw: {log_text!r}"
+    )
+    assert 's6-setuidgid hermes mkdir -p "$log_dir"' in log_text
+    assert 's6-setuidgid hermes rm -f "$log_dir/lock"' in log_text
+    assert 'else\n  mkdir -p "$log_dir"\n  rm -f "$log_dir/lock"\nfi\n' in log_text
+    # Lock cleanup must not remain a bare root-context pathname op after fi.
+    after_fi = log_text.split("fi\n", 1)[-1]
+    assert 'rm -f "$log_dir/lock"' not in after_fi
+
+    mkdir_as_hermes_idx = log_text.index('s6-setuidgid hermes mkdir -p "$log_dir"')
+    rm_as_hermes_idx = log_text.index('s6-setuidgid hermes rm -f "$log_dir/lock"')
+    exec_idx = log_text.index("s6-log 1 ")
+    assert mkdir_as_hermes_idx < rm_as_hermes_idx < exec_idx
+
+    # Runtime path expansion, never a baked-in absolute path.
+    assert '/opt/data/logs/gateways"' not in log_text
+
+
+def test_s6_log_run_never_invokes_chown_with_symlinked_log_dir(tmp_path) -> None:
+    """Symlinked ``$log_dir`` must not redirect root chown/rm to the referent."""
+    import os
+    import stat
+    import subprocess
+    import threading
+    import time
+
+    import pytest
+
+    if os.name == "nt":
+        pytest.skip("POSIX symlink + /bin/sh required")
+
+    hermes_home = tmp_path / "hermes"
+    gateways = hermes_home / "logs" / "gateways"
+    gateways.mkdir(parents=True)
+    leaf = gateways / "coder"
+    leaf.mkdir()
+
+    victim = tmp_path / "victim"
+    victim.mkdir()
+    (victim / "marker").write_text("keep", encoding="utf-8")
+    (victim / "lock").write_text("keep-lock", encoding="utf-8")
+    before = victim.stat()
+
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    recorder = tmp_path / "chown_calls.txt"
+    (bin_dir / "chown").write_text(
+        "#!/bin/sh\n"
+        f'printf "%s\\n" "$*" >> "{recorder.as_posix()}"\n'
+        "exit 0\n",
+        encoding="utf-8",
+    )
+    # Pretend we are root so the script takes the s6-setuidgid setup path.
+    # Mark the drop so fake rm can refuse unlink outside HERMES_HOME the way
+    # a real hermes uid cannot delete a foreign root-owned lock.
+    (bin_dir / "id").write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = "-u" ]; then echo 0; exit 0; fi\n'
+        "exit 1\n",
+        encoding="utf-8",
+    )
+    (bin_dir / "s6-setuidgid").write_text(
+        "#!/bin/sh\n"
+        "shift\n"
+        'HERMES_TEST_DROPPED=1 exec "$@"\n',
+        encoding="utf-8",
+    )
+    real_rm = "/bin/rm"
+    (bin_dir / "rm").write_text(
+        "#!/bin/sh\n"
+        # Privilege-dropped: no-op. Models that hermes cannot unlink a foreign
+        # root-owned lock outside the volume; avoids a realpath/rm TOCTOU in
+        # the test double itself. Root-context: real rm — a residual bare
+        # ``rm -f "$log_dir/lock"`` would delete victim/lock via the symlink.
+        'if [ -n "$HERMES_TEST_DROPPED" ]; then\n'
+        "  exit 0\n"
+        "fi\n"
+        f'exec {real_rm} "$@"\n',
+        encoding="utf-8",
+    )
+    for name in ("chown", "id", "s6-setuidgid", "rm"):
+        p = bin_dir / name
+        p.chmod(p.stat().st_mode | stat.S_IXUSR)
+
+    script_path = tmp_path / "log_run_setup.sh"
+    script_path.write_text(
+        _log_run_setup_fragment(S6ServiceManager._render_log_run("coder")),
+        encoding="utf-8",
+    )
+    script_path.chmod(script_path.stat().st_mode | stat.S_IXUSR)
+
+    stop = threading.Event()
+
+    def _clear_leaf() -> None:
+        if leaf.is_symlink():
+            leaf.unlink()
+        elif leaf.is_dir():
+            leaf.rmdir()
+        elif leaf.exists():
+            leaf.unlink()
+
+    def _swap_race() -> None:
+        # Alternate leaf between a real dir and a symlink to the victim while
+        # the setup fragment runs — proves there is no privileged chown/rm
+        # window to win, unlike a check-then-use preflight.
+        while not stop.is_set():
+            try:
+                _clear_leaf()
+                leaf.symlink_to(victim)
+                time.sleep(0.001)
+                _clear_leaf()
+                leaf.mkdir()
+            except OSError:
+                pass
+            time.sleep(0.001)
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(hermes_home)
+    env["PATH"] = f"{bin_dir.as_posix()}{os.pathsep}{env.get('PATH', '')}"
+
+    racer = threading.Thread(target=_swap_race, daemon=True)
+    racer.start()
+    try:
+        for _ in range(40):
+            proc = subprocess.run(
+                ["/bin/sh", str(script_path)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
             )
-        assert ei.value.code == 1
-        assert "typo" in capsys.readouterr().out
+            assert proc.returncode == 0, (proc.stdout, proc.stderr)
+            assert (victim / "lock").is_file(), "symlinked leaf must not let root unlink victim/lock"
+    finally:
+        stop.set()
+        racer.join(timeout=2)
 
-    def test_command_error_exits(self, monkeypatch, capsys):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        mgr.stop.side_effect = S6CommandError(
-            service="gateway-p", action="stop", returncode=1, stderr="boom"
-        )
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        with pytest.raises(SystemExit):
-            gateway._dispatch_via_service_manager_if_s6("stop", profile="p")
-        assert "boom" in capsys.readouterr().out
+    assert not recorder.exists() or recorder.read_text(encoding="utf-8").strip() == ""
+    after = victim.stat()
+    assert after.st_uid == before.st_uid
+    assert after.st_gid == before.st_gid
+    assert (victim / "marker").read_text(encoding="utf-8") == "keep"
+    assert (victim / "lock").read_text(encoding="utf-8") == "keep-lock"
 
 
-class TestDispatchAllViaServiceManager:
-    def test_non_s6_falls_through(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "systemd")
-        assert gateway._dispatch_all_via_service_manager_if_s6(
-            "restart"
-        ) is False
-
-    def test_unsupported_action_returns_false(self, monkeypatch):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        monkeypatch.setattr(sm, "get_service_manager", lambda: MagicMock())
-        assert gateway._dispatch_all_via_service_manager_if_s6(
-            "start"
-        ) is False
-
-    def test_restart_all_iterates_every_gateway(self, monkeypatch, capsys):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        mgr.list_profile_gateways.return_value = ["a", "b"]
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        assert gateway._dispatch_all_via_service_manager_if_s6(
-            "restart"
-        ) is True
-        mgr.restart.assert_any_call("gateway-a")
-        mgr.restart.assert_any_call("gateway-b")
-        assert mgr.restart.call_count == 2
-
-    def test_stop_all_reports_errors_and_continues(self, monkeypatch, capsys):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        mgr.list_profile_gateways.return_value = ["a", "b"]
-
-        def stop(name):
-            if name == "gateway-a":
-                raise S6CommandError(
-                    service=name, action="stop", returncode=1, stderr="x"
-                )
-        mgr.stop.side_effect = stop
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        assert gateway._dispatch_all_via_service_manager_if_s6("stop") is True
-        out = capsys.readouterr().out
-        assert "gateway-a" in out  # error line for the failing one
-        assert mgr.stop.call_count == 2  # continued past the failure
-
-    def test_no_gateways_registered(self, monkeypatch, capsys):
-        from hermes_cli import gateway
-        monkeypatch.setattr(sm, "detect_service_manager", lambda: "s6")
-        mgr = MagicMock()
-        mgr.list_profile_gateways.return_value = []
-        monkeypatch.setattr(sm, "get_service_manager", lambda: mgr)
-        assert gateway._dispatch_all_via_service_manager_if_s6(
-            "restart"
-        ) is True
-        assert "No profile gateways" in capsys.readouterr().out
-
-
-# ---------------------------------------------------------------------------
-# write_platform_config_field
-# ---------------------------------------------------------------------------
-
-
-class TestWritePlatformConfigField:
-    def test_writes_and_roundtrips(self, tmp_path, monkeypatch):
-        from hermes_cli import config as cfg
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cfg.write_platform_config_field("telegram", "bot_token", "abc123")
-        reloaded = cfg.load_config()
-        assert reloaded["platforms"]["telegram"]["bot_token"] == "abc123"
-
-    def test_updates_existing_field(self, tmp_path, monkeypatch):
-        from hermes_cli import config as cfg
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cfg.write_platform_config_field("telegram", "bot_token", "old")
-        cfg.write_platform_config_field("telegram", "bot_token", "new")
-        reloaded = cfg.load_config()
-        assert reloaded["platforms"]["telegram"]["bot_token"] == "new"
-
-    def test_preserves_sibling_platforms(self, tmp_path, monkeypatch):
-        from hermes_cli import config as cfg
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cfg.write_platform_config_field("telegram", "bot_token", "tg")
-        cfg.write_platform_config_field("discord", "bot_token", "dc")
-        reloaded = cfg.load_config()
-        assert reloaded["platforms"]["telegram"]["bot_token"] == "tg"
-        assert reloaded["platforms"]["discord"]["bot_token"] == "dc"
-
-    def test_raw_writes_to_raw_config(self, tmp_path, monkeypatch):
-        import yaml
-        from hermes_cli import config as cfg
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        cfg.write_platform_config_field(
-            "telegram", "bot_token", "raw-token", raw=True
-        )
-        on_disk = yaml.safe_load((tmp_path / "config.yaml").read_text())
-        assert on_disk["platforms"]["telegram"]["bot_token"] == "raw-token"

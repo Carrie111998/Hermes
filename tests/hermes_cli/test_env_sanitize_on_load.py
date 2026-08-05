@@ -5,12 +5,11 @@ from pathlib import Path
 from unittest.mock import patch
 
 
-def test_load_env_keeps_ambiguous_concatenated_assignment_opaque():
-    """load_env() must not reinterpret embedded KEY= text as a new assignment.
+def test_load_env_preserves_concatenated_text_as_value_data():
+    """Verify load_env() does not infer assignments within a physical line.
 
-    Re-splitting a value like ``TOKEN=abcANTHROPIC_API_KEY=...`` is ambiguous
-    and can become env injection. The safe behavior is to preserve the value as
-    opaque data after the first ``=``.
+    A missing newline is ambiguous: text resembling a second assignment may
+    instead be part of the first value, so it must remain opaque value data.
     """
     from hermes_cli.config import load_env
 
@@ -62,8 +61,8 @@ def test_load_env_normal_file_unchanged():
         env_path.unlink(missing_ok=True)
 
 
-def test_env_loader_keeps_ambiguous_concatenated_assignment_opaque():
-    """Env pre-sanitization must not split ambiguous embedded assignments."""
+def test_env_loader_does_not_split_concatenated_text():
+    """Verify sanitization preserves one assignment per physical line."""
     from hermes_cli.env_loader import _sanitize_env_file_if_needed
 
     token = "0123456789:test"
@@ -80,5 +79,7 @@ def test_env_loader_keeps_ambiguous_concatenated_assignment_opaque():
         with open(env_path, encoding="utf-8") as f:
             lines = f.readlines()
         assert lines == [corrupted]
+        parsed_token = lines[0].strip().split("=", 1)[1]
+        assert parsed_token == f"{token}ANTHROPIC_API_KEY=sk-ant-test"
     finally:
         env_path.unlink(missing_ok=True)
