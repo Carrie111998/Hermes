@@ -287,6 +287,7 @@ export function useMessageStream({
       // stays as the fallback.
       const writeCost = performance.now() - startedAt
       lastFlushCostRef.current = writeCost
+
       // At most one measurement rAF may be pending: only the newest flush's
       // measurement matters (the guard below discards stale frames), and a
       // hidden renderer parks rAF callbacks — without cancellation a long
@@ -295,8 +296,10 @@ export function useMessageStream({
       if (measureRafRef.current !== null) {
         window.cancelAnimationFrame(measureRafRef.current)
       }
+
       measureRafRef.current = window.requestAnimationFrame(frameStart => {
         measureRafRef.current = null
+
         // A newer flush already started; its own measurement wins.
         if (lastFlushAtRef.current !== startedAt) {
           return
@@ -356,6 +359,35 @@ export function useMessageStream({
     },
     [flushQueuedDeltas]
   )
+
+  // Page Visibility does not report every Windows/Linux focus transition.
+  // Flush queued deltas on both signals so returning to a chat cannot leave a
+  // completed chunk waiting for the next throttled timer.
+  // eslint-disable-next-line no-restricted-syntax -- timer-handle clear inside effect, not an atom mirror
+  useEffect(() => {
+    const flushPendingDeltas = () => {
+      if (flushHandleRef.current !== null) {
+        window.clearTimeout(flushHandleRef.current)
+        flushHandleRef.current = null
+      }
+
+      flushQueuedDeltas()
+    }
+
+    const flushWhenVisible = () => {
+      if (document.visibilityState === 'visible') {
+        flushPendingDeltas()
+      }
+    }
+
+    document.addEventListener('visibilitychange', flushWhenVisible)
+    window.addEventListener('focus', flushPendingDeltas)
+
+    return () => {
+      document.removeEventListener('visibilitychange', flushWhenVisible)
+      window.removeEventListener('focus', flushPendingDeltas)
+    }
+  }, [flushQueuedDeltas])
 
   const appendAssistantDelta = useCallback(
     (sessionId: string, delta: string) => {
