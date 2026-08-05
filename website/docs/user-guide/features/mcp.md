@@ -235,6 +235,28 @@ mcp_servers:
 
 On first connect, Hermes prints an authorize URL, opens your browser when possible, and waits for the OAuth callback on a local loopback port. Tokens are cached at `~/.hermes/mcp-tokens/<server>.json` with 0o600 perms; subsequent runs reuse them silently until refresh fails.
 
+#### Per-user OAuth identity (shared gateways)
+
+By default Hermes uses **shared** MCP OAuth: one token set per Hermes profile and MCP server. That is correct for single-operator CLI use, but on a multi-user gateway it means whoever completed `hermes mcp login` first authorizes every later caller.
+
+Set the identity boundary explicitly:
+
+```yaml
+mcp:
+  oauth:
+    identity_mode: per_user   # default: shared
+```
+
+In `per_user` mode:
+
+- Tokens are stored at `~/.hermes/mcp-tokens/by-user/<platform:user_id>/<server>.json`
+- The gateway session user (`HERMES_SESSION_USER_ID` + platform) selects which authorization is used
+- Missing identity fails closed — Hermes will not silently reuse another user's credentials
+- Operators can seed a user's tokens with `hermes mcp login <server> --user telegram:12345`
+
+Headless consent URL delivery in the originating messaging platform is tracked separately in [#78169](https://github.com/NousResearch/hermes-agent/issues/78169).
+
+
 **Remote / headless hosts.** When Hermes runs on a different machine than your browser, the loopback callback can't reach your laptop. Two ways to complete the flow:
 
 - **Paste-back (no setup):** on an interactive terminal Hermes prints "Or paste the redirect URL here…" alongside the authorize URL. Open the URL in your browser, approve, copy the full URL the browser ends up on (the redirect will show a connection error — that's expected), paste it at the prompt. Bare `?code=…&state=…` query strings work too.

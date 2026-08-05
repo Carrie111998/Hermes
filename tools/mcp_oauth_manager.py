@@ -134,11 +134,13 @@ def _make_hermes_provider_class() -> Optional[type]:
             *args: Any,
             server_name: str = "",
             preregistered: bool = False,
+            user_key: str = "",
             **kwargs: Any,
         ):
             super().__init__(*args, **kwargs)
             self._hermes_server_name = server_name
             self._hermes_home = ""
+            self._hermes_user_key = user_key or ""
             # When the client_id comes from config.yaml (pre-registered), an
             # invalid_client rejection means the *config* is wrong — deleting
             # client.json would just be re-seeded from config and re-running
@@ -395,6 +397,7 @@ def _make_hermes_provider_class() -> Optional[type]:
                 await get_manager().invalidate_if_disk_changed(
                     self._hermes_server_name,
                     hermes_home=self._hermes_home,
+                    user_key=getattr(self, "_hermes_user_key", "") or "",
                 )
             except Exception as exc:  # pragma: no cover — defensive
                 logger.debug(
@@ -466,16 +469,32 @@ class MCPOAuthManager:
         server_name: str,
         server_url: str,
         oauth_config: Optional[dict],
+        *,
+        user_key: str | None = None,
     ) -> Optional[Any]:
         """Return a cached OAuth provider for ``server_name`` or build one.
 
-        Idempotent: repeat calls with the same name return the same instance.
-        If ``server_url`` changes for a given name, the cached entry is
-        discarded and a fresh provider is built.
+        Idempotent: repeat calls with the same name (and user_key) return the
+        same instance. If ``server_url`` changes for a given name, the cached
+        entry is discarded and a fresh provider is built.
+
+        ``user_key`` scopes the provider + on-disk tokens when
+        ``mcp.oauth.identity_mode`` is ``per_user``. Empty/None keeps the
+        historical shared profile path.
 
         Returns None if the MCP SDK's OAuth support is unavailable.
         """
-        key = self._key(server_name)
+        if user_key is None:
+            try:
+                from tools.mcp_oauth_identity import current_oauth_user_key
+
+                resolved_user = current_oauth_user_key(require=False)
+            except Exception:
+                resolved_user = ""
+        else:
+            resolved_user = user_key
+
+        key = self._key(server_name, user_key=resolved_user)
         with self._entries_lock:
             entry = self._entries.get(key)
             if entry is not None and entry.server_url != server_url:
@@ -493,9 +512,12 @@ class MCPOAuthManager:
                 self._entries[key] = entry
 
             if entry.provider is None:
-                entry.provider = self._build_provider(server_name, entry)
+                entry.provider = self._build_provider(
+                    server_name, entry, user_key=resolved_user,
+                )
                 if entry.provider is not None:
                     entry.provider._hermes_home = key[0]
+                    entry.provider._hermes_user_key = resolved_user
 
             return entry.provider
 
@@ -503,16 +525,24 @@ class MCPOAuthManager:
     def _key(
         server_name: str,
         hermes_home: str | Path | None = None,
-    ) -> tuple[str, str]:
+        *,
+        user_key: str = "",
+    ) -> tuple[str, str, str]:
         from hermes_constants import get_hermes_home
 
         home = Path(hermes_home) if hermes_home is not None else get_hermes_home()
-        return (str(home.expanduser().resolve(strict=False)), server_name)
+        return (
+            str(home.expanduser().resolve(strict=False)),
+            server_name,
+            user_key or "",
+        )
 
     def _build_provider(
         self,
         server_name: str,
         entry: _ProviderEntry,
+        *,
+        user_key: str = "",
     ) -> Optional[Any]:
         """Build the underlying OAuth provider.
 
@@ -529,7 +559,6 @@ class MCPOAuthManager:
             )
             return None
 
-        # Local imports avoid circular deps at module import time.
         from tools.mcp_oauth import (
             HermesTokenStorage,
             OAuthNonInteractiveError,
@@ -551,7 +580,7 @@ class MCPOAuthManager:
         apply_oauth_provider_defaults(
             cfg, server_name=server_name, server_url=entry.server_url
         )
-        storage = HermesTokenStorage(server_name)
+        storage = HermesTokenStorage(server_name, user_key=user_key or None)
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
 
@@ -579,6 +608,7 @@ class MCPOAuthManager:
         return _HERMES_PROVIDER_CLS(
             server_name=server_name,
             preregistered=bool(cfg.get("client_id")),
+            user_key=user_key or "",
             server_url=entry.server_url,
             client_metadata=client_metadata,
             storage=storage,
@@ -592,6 +622,7 @@ class MCPOAuthManager:
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        user_key: str = "",
     ) -> _ProviderEntry | None:
         """Evict the provider from cache AND delete tokens from disk.
 
@@ -599,10 +630,14 @@ class MCPOAuthManager:
         ``hermes mcp login <name>`` during forced re-auth.
         """
         with self._entries_lock:
-            entry = self._entries.pop(self._key(server_name, hermes_home), None)
+            entry = self._entries.pop(
+                self._key(server_name, hermes_home, user_key=user_key), None,
+            )
 
         from tools.mcp_oauth import remove_oauth_tokens
-        remove_oauth_tokens(server_name, hermes_home=hermes_home)
+        remove_oauth_tokens(
+            server_name, hermes_home=hermes_home, user_key=user_key or None,
+        )
         logger.info(
             "MCP OAuth '%s': evicted from cache and removed from disk",
             server_name,
@@ -615,47 +650,54 @@ class MCPOAuthManager:
         entry: _ProviderEntry | None,
         *,
         hermes_home: str | Path | None = None,
+        user_key: str = "",
     ) -> None:
         """Restore a provider entry removed for a failed reauthorization."""
         if entry is None:
             return
         with self._entries_lock:
-            self._entries.setdefault(self._key(server_name, hermes_home), entry)
+            self._entries.setdefault(
+                self._key(server_name, hermes_home, user_key=user_key), entry,
+            )
 
     def evict(
         self,
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        user_key: str = "",
     ) -> None:
         """Drop only the in-process provider, preserving persisted OAuth state."""
         with self._entries_lock:
-            self._entries.pop(self._key(server_name, hermes_home), None)
-
-    # -- Disk watch ----------------------------------------------------------
+            self._entries.pop(
+                self._key(server_name, hermes_home, user_key=user_key), None,
+            )
 
     async def invalidate_if_disk_changed(
         self,
         server_name: str,
         *,
         hermes_home: str | Path | None = None,
+        user_key: str = "",
     ) -> bool:
         """If the tokens file on disk has a newer mtime than last-seen, force
         the MCP SDK provider to reload its in-memory state.
 
-        Returns True if the cache was invalidated (mtime differed). This is
-        the core fix for the external-refresh workflow: a cron job writes
-        fresh tokens to disk, and on the next tool call the running MCP
-        session picks them up without a restart.
+        Returns True if the cache was invalidated (mtime differed).
         """
-        from tools.mcp_oauth import _get_token_dir, _safe_filename
+        from tools.mcp_oauth import HermesTokenStorage
 
-        entry = self._entries.get(self._key(server_name, hermes_home))
+        entry = self._entries.get(
+            self._key(server_name, hermes_home, user_key=user_key)
+        )
         if entry is None or entry.provider is None:
             return False
 
         async with entry.lock:
-            tokens_path = _get_token_dir(hermes_home) / f"{_safe_filename(server_name)}.json"
+            storage = HermesTokenStorage(
+                server_name, hermes_home=hermes_home, user_key=user_key or None,
+            )
+            tokens_path = storage._tokens_path()
             try:
                 mtime_ns = tokens_path.stat().st_mtime_ns
             except (FileNotFoundError, OSError):
@@ -664,9 +706,6 @@ class MCPOAuthManager:
             if mtime_ns != entry.last_mtime_ns:
                 old = entry.last_mtime_ns
                 entry.last_mtime_ns = mtime_ns
-                # Force the SDK's OAuthClientProvider to reload from storage
-                # on its next auth flow. `_initialized` is private API but
-                # stable across the MCP SDK versions we pin (>=1.26.0).
                 if hasattr(entry.provider, "_initialized"):
                     entry.provider._initialized = False  # noqa: SLF001
                 logger.info(
@@ -677,27 +716,15 @@ class MCPOAuthManager:
                 return True
             return False
 
-    # -- 401 handler (dedup'd) -----------------------------------------------
-
     async def handle_401(
         self,
         server_name: str,
         failed_access_token: Optional[str] = None,
+        *,
+        user_key: str = "",
     ) -> bool:
-        """Handle a 401 from a tool call, deduplicated across concurrent callers.
-
-        Returns:
-            True  if a (possibly new) access token is now available — caller
-                  should trigger a reconnect and retry the operation.
-            False if no recovery path exists — caller should surface a
-                  ``needs_reauth`` error to the model so it stops hallucinating
-                  manual refresh attempts.
-
-        Thundering-herd protection: if N concurrent tool calls hit 401 with
-        the same ``failed_access_token``, only one recovery attempt fires.
-        Others await the same future.
-        """
-        entry = self._entries.get(self._key(server_name))
+        """Handle a 401 from a tool call, deduplicated across concurrent callers."""
+        entry = self._entries.get(self._key(server_name, user_key=user_key))
         if entry is None or entry.provider is None:
             return False
 
@@ -712,18 +739,14 @@ class MCPOAuthManager:
 
                 async def _do_handle() -> None:
                     try:
-                        # Step 1: Did disk change? Picks up external refresh.
                         disk_changed = await self.invalidate_if_disk_changed(
-                            server_name
+                            server_name, user_key=user_key,
                         )
                         if disk_changed:
                             if not pending.done():
                                 pending.set_result(True)
                             return
 
-                        # Step 2: No disk change — if the SDK can refresh
-                        # in-place, let the caller retry. The SDK's httpx.Auth
-                        # flow will issue the refresh on the next request.
                         provider = entry.provider
                         ctx = getattr(provider, "context", None)
                         can_refresh = False
@@ -736,7 +759,7 @@ class MCPOAuthManager:
                                     can_refresh = False
                         if not pending.done():
                             pending.set_result(can_refresh)
-                    except Exception as exc:  # pragma: no cover — defensive
+                    except Exception as exc:  # pragma: no cover
                         logger.warning(
                             "MCP OAuth '%s': 401 handler failed: %s",
                             server_name, exc,
@@ -752,12 +775,13 @@ class MCPOAuthManager:
 
         try:
             return await pending
-        except Exception as exc:  # pragma: no cover — defensive
+        except Exception as exc:  # pragma: no cover
             logger.warning(
                 "MCP OAuth '%s': awaiting 401 handler failed: %s",
                 server_name, exc,
             )
             return False
+
 
 
 # ---------------------------------------------------------------------------

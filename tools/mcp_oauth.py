@@ -429,25 +429,44 @@ def _write_json(path: Path, data: dict) -> None:
 class HermesTokenStorage:
     """Persist OAuth tokens and client registration to JSON files.
 
-    File layout::
+    File layout (shared / default)::
 
         HERMES_HOME/mcp-tokens/<server_name>.json         -- tokens
         HERMES_HOME/mcp-tokens/<server_name>.client.json   -- client info
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
+
+    File layout when ``user_key`` is set (``mcp.oauth.identity_mode: per_user``)::
+
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.json
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.client.json
+        HERMES_HOME/mcp-tokens/by-user/<user_key>/<server_name>.meta.json
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        user_key: str | None = None,
+    ):
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._user_key = _safe_filename(user_key) if user_key else ""
+
+    def _storage_dir(self) -> Path:
+        base = _get_token_dir(self._hermes_home)
+        if self._user_key:
+            return base / "by-user" / self._user_key
+        return base
 
     def _tokens_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
+        return self._storage_dir() / f"{self._server_name}.json"
 
     def _client_info_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.client.json"
+        return self._storage_dir() / f"{self._server_name}.client.json"
 
     def _meta_path(self) -> Path:
-        return _get_token_dir(self._hermes_home) / f"{self._server_name}.meta.json"
+        return self._storage_dir() / f"{self._server_name}.meta.json"
 
     # -- tokens ------------------------------------------------------------
 
@@ -1033,11 +1052,19 @@ def remove_oauth_tokens(
     server_name: str,
     *,
     hermes_home: str | Path | None = None,
+    user_key: str | None = None,
 ) -> None:
     """Delete stored OAuth tokens and client info for a server."""
-    storage = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    storage = HermesTokenStorage(
+        server_name, hermes_home=hermes_home, user_key=user_key,
+    )
     storage.remove()
-    logger.info("OAuth tokens removed for '%s'", server_name)
+    if user_key:
+        logger.info(
+            "OAuth tokens removed for '%s' (user=%s)", server_name, user_key,
+        )
+    else:
+        logger.info("OAuth tokens removed for '%s'", server_name)
 
 
 # ---------------------------------------------------------------------------

@@ -90,6 +90,14 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         help="Force re-authentication for an OAuth-based MCP server",
     )
     mcp_login_p.add_argument("name", help="Server name to re-authenticate")
+    mcp_login_p.add_argument(
+        "--user",
+        default="",
+        help=(
+            "Store tokens under mcp-tokens/by-user/<key>/ for per-user OAuth "
+            "(mcp.oauth.identity_mode: per_user). Example: telegram:12345"
+        ),
+    )
 
     mcp_reauth_p = mcp_sub.add_parser(
         "reauth",

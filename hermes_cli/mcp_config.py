@@ -378,7 +378,7 @@ def _probe_single_server(
     return tools_found
 
 
-def _oauth_tokens_present(name: str) -> bool:
+def _oauth_tokens_present(name: str, *, user_key: str = "") -> bool:
     """Return True if an OAuth token file exists on disk for ``name``.
 
     Used after ``hermes mcp login`` to distinguish a genuine authentication
@@ -387,7 +387,7 @@ def _oauth_tokens_present(name: str) -> bool:
     """
     try:
         from tools.mcp_oauth import HermesTokenStorage
-        return HermesTokenStorage(name).has_cached_tokens()
+        return HermesTokenStorage(name, user_key=user_key or None).has_cached_tokens()
     except Exception as exc:  # pragma: no cover — defensive
         logger.debug("Could not check OAuth tokens for '%s': %s", name, exc)
         # Be permissive on unexpected errors: don't block a real success.
@@ -784,13 +784,18 @@ def cmd_mcp_test(args):
 
 # ─── hermes mcp login ────────────────────────────────────────────────────────
 
-def _reauth_oauth_server(name: str, server_config: dict) -> bool:
+def _reauth_oauth_server(
+    name: str, server_config: dict, *, user_key: str = "",
+) -> bool:
     """Force a fresh OAuth flow for one server. Returns True on success.
 
     Wipes cached OAuth state (disk + in-process MCPOAuthManager cache),
     re-probes to trigger the browser flow, and verifies a token actually
     landed before reporting success. Shared by ``hermes mcp login`` and
     ``hermes mcp reauth`` so both behave identically for a single server.
+
+    When ``user_key`` is set, tokens land under
+    ``mcp-tokens/by-user/<user_key>/`` (#78174).
     """
     url = server_config.get("url")
     if not url:
@@ -805,12 +810,15 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
     # OAuth flow.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name)
+        get_manager().remove(name, user_key=user_key or "")
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
     print()
-    _info(f"Starting OAuth flow for '{name}'...")
+    if user_key:
+        _info(f"Starting OAuth flow for '{name}' (user={user_key})...")
+    else:
+        _info(f"Starting OAuth flow for '{name}'...")
 
     # Probe triggers the OAuth flow (browser redirect + callback capture).
     # Honor the server's configured connect_timeout so a human has enough
@@ -832,7 +840,14 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         except (TypeError, ValueError):
             _login_connect_timeout = 0.0
         _login_connect_timeout = max(_login_connect_timeout, 315.0)
-        with force_interactive_oauth():
+        from contextlib import ExitStack
+
+        with ExitStack() as stack:
+            stack.enter_context(force_interactive_oauth())
+            if user_key:
+                from tools.mcp_oauth_identity import force_oauth_user_key
+
+                stack.enter_context(force_oauth_user_key(user_key))
             tools = _probe_single_server(
                 name, server_config, connect_timeout=_login_connect_timeout
             )
@@ -844,7 +859,7 @@ def _reauth_oauth_server(name: str, server_config: dict) -> bool:
         # "Authenticated — N tools" in that case is a false success: every
         # real tool call later hangs until timeout because there's no token.
         # Verify a token actually landed on disk before claiming success.
-        if not _oauth_tokens_present(name):
+        if not _oauth_tokens_present(name, user_key=user_key):
             _warning(
                 "Server responded, but no OAuth token was obtained — "
                 "authentication did not complete."
@@ -906,7 +921,8 @@ def cmd_mcp_login(args):
             _info(f"Available servers: {', '.join(servers)}")
         return
 
-    _reauth_oauth_server(name, servers[name])
+    user_key = (getattr(args, "user", None) or "").strip()
+    _reauth_oauth_server(name, servers[name], user_key=user_key)
 
 
 def cmd_mcp_reauth(args):

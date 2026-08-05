@@ -1836,6 +1836,7 @@ class MCPServerTask:
         "_registered_tool_names", "_auth_type", "_refresh_lock",
         "_rpc_lock", "_pending_refresh_tasks",
         "_pending_call_context",
+        "_oauth_user_key",
         "_lifecycle_started_at", "_last_tool_call_at",
         "_idle_timeout_seconds", "_max_lifetime_seconds", "_recycled_reason",
         "initialize_result", "_ping_unsupported",
@@ -1894,6 +1895,7 @@ class MCPServerTask:
         # gateway-platform attribution and routes the approval prompt
         # to the right surface (Telegram, Slack, etc.).
         self._pending_call_context: Optional[contextvars.Context] = None
+        self._oauth_user_key: str = ""
         now = time.monotonic()
         self._lifecycle_started_at: float = now
         self._last_tool_call_at: float = now
@@ -2782,6 +2784,7 @@ class MCPServerTask:
                 from tools.mcp_oauth_manager import get_manager
                 _oauth_auth = get_manager().get_or_build_provider(
                     self.name, url, config.get("oauth"),
+                    user_key=getattr(self, "_oauth_user_key", "") or "",
                 )
             except Exception as exc:
                 logger.warning("MCP OAuth setup failed for '%s': %s", self.name, exc)
@@ -3037,7 +3040,7 @@ class MCPServerTask:
             return
         if not self._ready.is_set():
             with _lock:
-                if _servers.get(self.name) is not self:
+                if _servers.get(_server_registry_key_for_task(self)) is not self:
                     return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
@@ -3046,7 +3049,7 @@ class MCPServerTask:
         # recovered: drop its stale connect error so status surfaces stop
         # reporting it as failed.
         with _lock:
-            if _servers.get(self.name) is self:
+            if _servers.get(_server_registry_key_for_task(self)) is self:
                 _server_connect_errors.pop(self.name, None)
 
     async def run(self, config: dict):
@@ -3877,7 +3880,14 @@ def _handle_auth_error_and_retry(
     manager = get_manager()
 
     async def _recover():
-        return await manager.handle_401(server_name, None)
+        user_key = ""
+        try:
+            from tools.mcp_oauth_identity import current_oauth_user_key
+
+            user_key = current_oauth_user_key(require=False)
+        except Exception:
+            user_key = ""
+        return await manager.handle_401(server_name, None, user_key=user_key)
 
     try:
         recovered = _run_on_mcp_loop(_recover, timeout=10)
@@ -4692,6 +4702,12 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         Exception: on connection or initialization failure.
     """
     server = MCPServerTask(name)
+    try:
+        from tools.mcp_oauth_identity import current_oauth_user_key
+
+        server._oauth_user_key = current_oauth_user_key(require=False)
+    except Exception:
+        server._oauth_user_key = ""
     claim = _connect_server_claim.get()
     claim_token = None
     if claim is not None:
@@ -4764,14 +4780,73 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
         return False
 
 
+
+def _server_registry_key_for_task(server: "MCPServerTask") -> str:
+    """Registry key for an already-constructed MCPServerTask."""
+    from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+    return oauth_connection_registry_key(
+        server.name, getattr(server, "_oauth_user_key", "") or "",
+    )
+
+
+def _server_config_is_oauth(server_name: str, config: Optional[dict] = None) -> bool:
+    """True when the named MCP server is configured for OAuth auth."""
+    cfg = config
+    if cfg is None:
+        cfg = _lazy_server_configs.get(server_name)
+    if cfg is None:
+        try:
+            cfg = (_load_mcp_config() or {}).get(server_name)
+        except Exception:
+            cfg = None
+    if not isinstance(cfg, dict):
+        with _lock:
+            for _key, srv in _servers.items():
+                if srv is not None and srv.name == server_name:
+                    return (getattr(srv, "_auth_type", "") or "") == "oauth"
+        return False
+    return (cfg.get("auth") or "").lower().strip() == "oauth"
+
+
+def _resolve_oauth_registry_key(server_name: str, *, require_identity: bool = False) -> str:
+    """Return the ``_servers`` registry key for ``server_name``.
+
+    In shared mode this is ``server_name``. In per-user OAuth mode for OAuth
+    servers it becomes ``server@@user_key`` (#78174).
+    """
+    from tools.mcp_oauth_identity import (
+        current_oauth_user_key,
+        is_per_user_oauth_identity,
+        oauth_connection_registry_key,
+    )
+
+    if not is_per_user_oauth_identity() or not _server_config_is_oauth(server_name):
+        return server_name
+    user_key = current_oauth_user_key(require=require_identity)
+    return oauth_connection_registry_key(server_name, user_key)
+
+
 def _resolve_server_lazy(name: str, config: dict) -> bool:
     """True when this server defers spawn/connect until first tool use.
 
     Gated per-server by ``mcp_servers.<name>.lazy`` in config (default OFF),
     following the same per-server key pattern as ``idle_timeout_seconds``.
     Design from #56832 (Vansh5632).
+
+    Also forced ON for OAuth servers when ``mcp.oauth.identity_mode`` is
+    ``per_user`` (#78174).
     """
-    return _parse_boolish(config.get("lazy", False), default=False)
+    if _parse_boolish(config.get("lazy", False), default=False):
+        return True
+    try:
+        from tools.mcp_oauth_identity import is_per_user_oauth_identity
+
+        if is_per_user_oauth_identity() and _server_config_is_oauth(name, config):
+            return True
+    except Exception:
+        pass
+    return False
 
 
 def _ensure_lazy_server_connected(server_name: str) -> bool:
@@ -4783,8 +4858,19 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     cooldown bookkeeping stays in one place. Returns True when a live
     session is available afterwards.
     """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=True)
+    except Exception as exc:
+        logger.warning(
+            "MCP server '%s': refusing lazy connect without user identity: %s",
+            server_name, exc,
+        )
+        with _lock:
+            _server_connect_errors[server_name] = str(exc)
+        return False
+
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(registry_key)
         if server is not None and server.session is not None:
             return True
         config = _lazy_server_configs.get(server_name)
@@ -4792,12 +4878,16 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             return False
         if _connect_cooldown_active(server_name):
             return False
-        if server_name in _server_connecting:
+        if registry_key in _server_connecting or server_name in _server_connecting:
             return False
+        _server_connecting.add(registry_key)
         _server_connecting.add(server_name)
         _server_connect_errors.pop(server_name, None)
 
-    logger.info("MCP server '%s': lazy start on first use", server_name)
+    logger.info(
+        "MCP server '%s': lazy start on first use (key=%s)",
+        server_name, registry_key,
+    )
     _ensure_mcp_loop()
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
 
@@ -4810,6 +4900,7 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         message = _format_connect_error(exc)
         with _lock:
             _server_connecting.discard(server_name)
+            _server_connecting.discard(registry_key)
             _server_connect_errors[server_name] = message
             _record_connect_failure(server_name)
         logger.warning(
@@ -4819,11 +4910,16 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
 
     with _lock:
         _server_connecting.discard(server_name)
+        _server_connecting.discard(registry_key)
         _clear_connect_failure(server_name)
-        _lazy_server_configs.pop(server_name, None)
-        stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
-        cached_names = _lazy_server_tool_names.pop(server_name, None) or []
-        server = _servers.get(server_name)
+        if registry_key == server_name:
+            _lazy_server_configs.pop(server_name, None)
+            stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
+            cached_names = _lazy_server_tool_names.pop(server_name, None) or []
+        else:
+            stale_fingerprint = _lazy_server_fingerprints.get(server_name)
+            cached_names = list(_lazy_server_tool_names.get(server_name) or [])
+        server = _servers.get(registry_key)
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
         )
@@ -4852,19 +4948,33 @@ def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
     Also the single first-use connect point for lazy (schema-cache
     registered) servers, so raw tool calls AND the resource/prompt utility
     handlers all trigger the deferred spawn (#56832).
+
+    Under ``mcp.oauth.identity_mode: per_user``, OAuth servers are looked up
+    by ``server@@user_key`` so concurrent users never share a bearer (#78174).
     """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=True)
+    except Exception as exc:
+        logger.warning(
+            "MCP server '%s': no user identity for OAuth call: %s",
+            server_name, exc,
+        )
+        with _lock:
+            _server_connect_errors[server_name] = str(exc)
+        return None
+
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(registry_key)
         is_lazy = server_name in _lazy_server_configs
     if is_lazy and (server is None or server.session is None):
         _ensure_lazy_server_connected(server_name)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(registry_key)
         return server
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(registry_key)
     return server
 
 
@@ -4909,6 +5019,9 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         server = _get_connected_server_for_call(server_name)
         if not server:
+            identity_err = _server_connect_errors.get(server_name, "")
+            if "identity_mode is 'per_user'" in identity_err or "no authenticated user" in identity_err.lower():
+                return tool_error(identity_err)
             _bump_server_error(server_name)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -6189,18 +6302,38 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         ):
             # Recoverable park: the run task deliberately stays alive to
             # self-probe, so adopt it into the registry for shutdown/revival.
+            park_key = name
+            try:
+                from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+                park_key = oauth_connection_registry_key(
+                    name, getattr(server, "_oauth_user_key", "") or "",
+                )
+            except Exception:
+                park_key = name
             with _lock:
-                _servers[name] = server
+                _servers[park_key] = server
         elif server is not None:
             await server.shutdown()
         raise
     finally:
         _connect_server_claim.reset(claim_token)
 
+    registry_key = name
+    try:
+        from tools.mcp_oauth_identity import oauth_connection_registry_key
+
+        registry_key = oauth_connection_registry_key(
+            name, getattr(server, "_oauth_user_key", "") or "",
+        )
+    except Exception:
+        registry_key = name
+
     with _lock:
         _server_connecting.discard(name)
+        _server_connecting.discard(registry_key)
         _server_connect_errors.pop(name, None)
-        _servers[name] = server
+        _servers[registry_key] = server
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
