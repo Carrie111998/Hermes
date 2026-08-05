@@ -258,10 +258,16 @@ export function ChatSidebar({
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     let attempt = 0;
 
-    const surface = (msg: string) => !unmounting && setError(msg);
+    // The banner is shared with `info.credential_warning` and the JSON-RPC
+    // sidecar, and `error` is those messages' only home — the sidecar does
+    // not re-emit. So the events feed may only write over an empty banner
+    // or one of its own messages, and may only clear its own.
+    const surface = (msg: string) =>
+      !unmounting &&
+      setError((current) =>
+        isEventsFeedMessage(current) ? msg : (current ?? msg),
+      );
 
-    // Only clear a message the events feed wrote itself — the banner is
-    // shared with `info.credential_warning` and the JSON-RPC sidecar.
     const clearEventsBanner = () =>
       !unmounting &&
       setError((current) => (isEventsFeedMessage(current) ? null : current));

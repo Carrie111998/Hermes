@@ -276,13 +276,15 @@ describe("ChatSidebar event socket reconnect", () => {
     await act(async () => {
       FakeWebSocket.instances[0].emit("close", { code: 1006 });
     });
-    expect(container.textContent).toContain("events feed");
+    expect(container.textContent).toContain("events feed disconnected");
 
     await advance(1_000);
     await act(async () => {
       FakeWebSocket.instances[1].emit("open", {});
     });
 
+    // Banner gone entirely — including the "reconnect events feed" button,
+    // which only renders while `error` is set.
     expect(container.textContent).not.toContain("events feed");
   });
 
@@ -308,6 +310,49 @@ describe("ChatSidebar event socket reconnect", () => {
     });
 
     expect(container.textContent).toContain("ANTHROPIC_API_KEY is not set");
+  });
+
+  it("does not overwrite a sidecar error when the feed drops", async () => {
+    await renderSidebar();
+
+    // A sidecar error is already on the banner...
+    await act(async () => {
+      gatewayMocks.handlers.get("error")?.({
+        payload: { message: "ANTHROPIC_API_KEY is not set" },
+      });
+    });
+
+    // ...when the events feed drops. `error` is that message's only home,
+    // so overwriting it loses the warning permanently — the feed's own
+    // banner would later clear itself to null and the sidecar never
+    // re-emits.
+    await act(async () => {
+      FakeWebSocket.instances[0].emit("error", {});
+      FakeWebSocket.instances[0].emit("close", { code: 1006 });
+    });
+
+    expect(container.textContent).toContain("ANTHROPIC_API_KEY is not set");
+    // The disconnect message must not have replaced it. (Matching the
+    // banner text specifically — "reconnect events feed" is the button
+    // label, which is expected to be present whenever a banner shows.)
+    expect(container.textContent).not.toContain("events feed disconnected");
+  });
+
+  it("still reconnects while a foreign banner suppresses its message", async () => {
+    await renderSidebar();
+
+    await act(async () => {
+      gatewayMocks.handlers.get("error")?.({
+        payload: { message: "ANTHROPIC_API_KEY is not set" },
+      });
+    });
+    await act(async () => {
+      FakeWebSocket.instances[0].emit("close", { code: 1006 });
+    });
+
+    // Declining to write the banner must not disable the retry itself.
+    await advance(1_000);
+    expect(FakeWebSocket.instances).toHaveLength(2);
   });
 
   it("clears the reconnect timer and closes the socket on unmount", async () => {
