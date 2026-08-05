@@ -7,12 +7,14 @@ import re
 import pytest
 
 from gateway.config import Platform
+from gateway.platforms.base import MessageEvent, MessageType
 from gateway.kanban_proactive_supervisor import (
     ProactiveSupervisorConfig,
     consume_supervisor_reply,
     reconcile_board,
 )
 from gateway.run import GatewayRunner
+from gateway.session import SessionSource
 from hermes_cli import kanban_db as kb
 from hermes_cli import config as hermes_config
 from plugins.kanban.dashboard.plugin_api import _set_status_direct
@@ -135,13 +137,24 @@ def test_preexisting_subscription_is_upgraded_and_rewound_to_current_gate(
         conn.close()
 
 
-def test_untyped_legacy_protected_gate_is_not_auto_recovered(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "Need API key from Kevin",
+        "Need approval to delete all customer records",
+        "Need a decision on whether to ship this behavior",
+        "Need authorization to remove the production database",
+    ],
+)
+def test_untyped_legacy_protected_gate_is_not_auto_recovered(
+    tmp_path, monkeypatch, reason
+):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()
     conn = kb.connect()
     try:
         task_id = kb.create_task(conn, title="Legacy credential gate", assignee="forge")
-        assert kb.block_task(conn, task_id, reason="Need API key from Kevin")
+        assert kb.block_task(conn, task_id, reason=reason)
 
         result = reconcile_board(
             conn, board="default", config=_config(), notifier_profile="default"
@@ -152,6 +165,40 @@ def test_untyped_legacy_protected_gate_is_not_auto_recovered(tmp_path, monkeypat
         assert kb.get_task(conn, task_id).status == "blocked"
     finally:
         conn.close()
+
+
+def test_authenticated_gate_reply_failure_does_not_fall_through_to_agent(monkeypatch):
+    from gateway import kanban_proactive_supervisor as supervisor
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._active_profile_name = lambda: "default"
+    event = MessageEvent(
+        text="approve deletion",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="hermes-command-channel",
+            chat_type="channel",
+            user_id="kevin",
+            user_name="Kevin",
+            profile="default",
+        ),
+        reply_to_text="Decision needed\n[kanban-gate:0123456789abcdef0123456789abcdef]",
+        reply_to_is_own_message=True,
+    )
+
+    def fail_gate_lookup(**_kwargs):
+        raise OSError("temporary database failure")
+
+    monkeypatch.setattr(supervisor, "consume_supervisor_reply", fail_gate_lookup)
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert response is not None
+    assert "could not process" in response.lower()
+    assert "no action" in response.lower()
 
 
 def test_supervisor_does_not_take_over_subscription_owned_by_another_profile(

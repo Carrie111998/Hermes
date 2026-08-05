@@ -84,6 +84,15 @@ def is_protected_gate(reason: str) -> bool:
     return bool(_PROTECTED_GATE_RE.search(reason or ""))
 
 
+def is_supervisor_gate_reply(
+    reply_to_text: Optional[str], *, reply_to_is_own_message: bool
+) -> bool:
+    """Return whether an authenticated reply targets a supervisor gate prompt."""
+    return bool(
+        reply_to_is_own_message and _REPLY_MARKER_RE.search(reply_to_text or "")
+    )
+
+
 def _event_payload(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
@@ -220,9 +229,13 @@ def reconcile_board(
         event_kind = str(row["event_kind"])
         block_kind = str(payload.get("kind") or row.get("block_kind") or "")
 
-        protected = (
-            block_kind in {"needs_input", "capability"} or not block_kind
-        ) and is_protected_gate(reason)
+        # Legacy/untyped blocks predate the explicit block-kind contract and
+        # historically represent human blockers. Fail closed: only explicitly
+        # typed non-human failure kinds are eligible for automatic recovery.
+        protected = not block_kind or (
+            block_kind in {"needs_input", "capability"}
+            and is_protected_gate(reason)
+        )
         if protected:
             if _ensure_supervisor_subscription(
                 conn,
@@ -306,7 +319,10 @@ def render_supervisor_event(
 
     mode = str(metadata.get("_kanban_supervisor_mode") or "")
     if mode == "protected_gate":
-        if block_kind not in {"needs_input", "capability"} or not is_protected_gate(reason):
+        if block_kind and (
+            block_kind not in {"needs_input", "capability"}
+            or not is_protected_gate(reason)
+        ):
             return ""
         token = str(metadata.get("_kanban_supervisor_gate_token") or "")
         if not re.fullmatch(r"[a-f0-9]{32}", token):
