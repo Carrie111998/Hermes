@@ -68,6 +68,17 @@ def _assert_all_bounded(mock_run, *, expected_at_least: int) -> None:
         assert timeout > 0, f"non-positive timeout on: {_joined(call)}"
 
 
+def _drain(capsys) -> tuple:
+    """Return ``(stdout, stdout + stderr)`` from ``capsys``.
+
+    The diagnostics under test are printed to stdout, but a leaked traceback
+    or an unhandled exception surfaces on *stderr* — so "no traceback" has to
+    be asserted against both streams, or the assertion is false confidence.
+    """
+    captured = capsys.readouterr()
+    return captured.out, captured.out + captured.err
+
+
 def _check_side_effect(
     *,
     upstream_fetch_ok: bool = True,
@@ -148,8 +159,9 @@ class TestUpdateCheckTimeoutHandling:
 
         cmd_update(SimpleNamespace(check=True, branch=None))
 
-        out = capsys.readouterr().out
-        assert "Traceback" not in out
+        out, both = _drain(capsys)
+        assert "Traceback" not in both
+        assert "TimeoutExpired" not in both
         assert "timed out" in out
         assert "falling back to origin" in out
         assert any(
@@ -167,9 +179,9 @@ class TestUpdateCheckTimeoutHandling:
             cmd_update(SimpleNamespace(check=True, branch="bb/gui"))
         assert exc_info.value.code == 1
 
-        out = capsys.readouterr().out
-        assert "Traceback" not in out
-        assert "TimeoutExpired" not in out
+        out, both = _drain(capsys)
+        assert "Traceback" not in both
+        assert "TimeoutExpired" not in both
         assert "Timed out" in out
         assert str(_GIT_NETWORK_TIMEOUT_SECONDS) in out
 
@@ -213,9 +225,9 @@ class TestUpdateApplyFetch:
             cmd_update(SimpleNamespace(branch="main"))
         assert exc_info.value.code == 1
 
-        out = capsys.readouterr().out
-        assert "Traceback" not in out
-        assert "TimeoutExpired" not in out
+        out, both = _drain(capsys)
+        assert "Traceback" not in both
+        assert "TimeoutExpired" not in both
         assert "Timed out" in out
 
 
@@ -279,8 +291,9 @@ class TestUpstreamSyncDegradesOnTimeout:
         # Must return normally — no SystemExit, no TimeoutExpired escaping.
         _sync_with_upstream_if_needed(["git"], tmp_path)
 
-        out = capsys.readouterr().out
-        assert "Traceback" not in out
+        out, both = _drain(capsys)
+        assert "Traceback" not in both
+        assert "TimeoutExpired" not in both
         assert "timed out" in out
         assert "Skipping upstream sync" in out
         # The pull must not have been attempted after the fetch stalled.
@@ -292,8 +305,9 @@ class TestUpstreamSyncDegradesOnTimeout:
 
         _sync_with_upstream_if_needed(["git"], tmp_path)
 
-        out = capsys.readouterr().out
-        assert "Traceback" not in out
+        out, both = _drain(capsys)
+        assert "Traceback" not in both
+        assert "TimeoutExpired" not in both
         assert "timed out" in out
         assert "Skipping upstream sync" in out
         # Bailed before the fork push.
