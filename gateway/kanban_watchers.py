@@ -152,6 +152,27 @@ class GatewayKanbanWatchersMixin:
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
+        _reconcile_supervisor_board = None
+        render_supervisor_event = None
+        try:
+            from gateway.kanban_proactive_supervisor import (
+                ProactiveSupervisorConfig,
+                reconcile_board as _reconcile_supervisor_board,
+                render_supervisor_event,
+            )
+            from hermes_cli.config import load_config as _load_hermes_config
+
+            _full_config = _load_hermes_config()
+            _kanban_config = _full_config.get("kanban", {})
+            supervisor_config = ProactiveSupervisorConfig.from_mapping(
+                _kanban_config.get("proactive_supervisor", {})
+            )
+        except Exception as exc:
+            logger.warning(
+                "kanban notifier: proactive supervisor config unavailable; disabled: %s",
+                exc,
+            )
+            supervisor_config = None
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
@@ -260,7 +281,7 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(
+                            if (not supervisor_config or not supervisor_config.usable) and _kb.count_notify_subs(
                                 board=slug,
                                 notifier_profiles=notifier_profiles,
                                 include_unowned=include_unowned,
@@ -294,6 +315,24 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
+                            if (
+                                supervisor_config
+                                and supervisor_config.usable
+                                and _reconcile_supervisor_board is not None
+                            ):
+                                try:
+                                    _reconcile_supervisor_board(
+                                        conn,
+                                        board=slug,
+                                        config=supervisor_config,
+                                        notifier_profile=notifier_profile,
+                                    )
+                                except Exception as exc:
+                                    logger.warning(
+                                        "kanban proactive supervisor failed for board %s: %s",
+                                        slug,
+                                        exc,
+                                    )
                             subs = _kb.list_notify_subs(
                                 conn,
                                 notifier_profiles=notifier_profiles,
@@ -410,7 +449,25 @@ class GatewayKanbanWatchersMixin:
                         # chat subscribes to many tasks) legible at a glance.
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
-                        if kind == "completed":
+                        delivery_metadata = sub.get("delivery_metadata")
+                        _supervisor_delivery = bool(
+                            isinstance(delivery_metadata, dict)
+                            and delivery_metadata.get("_kanban_proactive_supervisor")
+                        )
+                        _supervisor_msg = None
+                        if (
+                            _supervisor_delivery
+                            and render_supervisor_event is not None
+                            and kind in {"blocked", "gave_up", "block_loop_detected"}
+                        ):
+                            _supervisor_msg = render_supervisor_event(
+                                board=board_slug or _kb.DEFAULT_BOARD,
+                                task=task,
+                                event=ev,
+                            )
+                        if _supervisor_msg:
+                            msg = _supervisor_msg
+                        elif kind == "completed":
                             # Prefer the run's summary (the worker's
                             # intentional human-facing handoff, carried
                             # in the event payload), then fall back to
@@ -491,12 +548,15 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
-                        delivery_metadata = sub.get("delivery_metadata")
                         metadata: dict[str, Any] = (
                             dict(delivery_metadata)
                             if isinstance(delivery_metadata, dict)
                             else {}
                         )
+                        # Supervisor markers are gateway-internal routing state,
+                        # not platform delivery options.
+                        metadata.pop("_kanban_proactive_supervisor", None)
+                        metadata.pop("_kanban_supervisor_board", None)
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         # Adapters with no push channel (the API server —

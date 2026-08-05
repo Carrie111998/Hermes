@@ -14452,6 +14452,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
         
+        # A reply to a native Kanban gate prompt belongs to that existing task
+        # graph. Attach the answer and resume the blocked card before creating
+        # or mutating a conversational session. Slash commands still follow
+        # the normal control path.
+        if not is_internal and not event.get_command():
+            try:
+                from gateway.kanban_proactive_supervisor import (
+                    consume_supervisor_reply,
+                )
+
+                _gate_reply = consume_supervisor_reply(
+                    reply_to_text=getattr(event, "reply_to_text", None),
+                    answer=event.text or "",
+                    author=source.user_name or source.user_id or "user",
+                )
+            except Exception as exc:
+                logger.warning("Kanban supervisor reply handling failed: %s", exc)
+                _gate_reply = None
+            if _gate_reply is not None:
+                if _gate_reply.resumed:
+                    return (
+                        f"Resumed Kanban {_gate_reply.task_id} on "
+                        f"{_gate_reply.board} with your decision attached."
+                    )
+                return (
+                    f"Kanban {_gate_reply.task_id} is no longer waiting for "
+                    "that decision."
+                )
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via

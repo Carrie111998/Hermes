@@ -242,6 +242,33 @@ the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
 
+### Proactive exception supervision
+
+The gateway can watch every board for blocking outcomes, including tasks
+created from the CLI, dashboard, plugins, or child workers that have no
+origin-session subscription. Agent-owned failures receive one durable,
+idempotent recovery attempt by default. Only blockers that name a protected
+human gate (for example a product decision, credentials, spending, destructive
+data action, or force-push) send a decision prompt. Reply directly to that
+prompt to attach the answer to the existing task and resume its graph.
+
+The feature is disabled until one profile explicitly owns the destination.
+This keeps ordinary installs silent and prevents a secondary profile's alert
+from falling back to another bot:
+
+```yaml
+kanban:
+  proactive_supervisor:
+    enabled: true
+    platform: discord
+    chat_id: "123456789012345678"
+    chat_type: channel
+    thread_id: ""        # optional
+    recovery_limit: 1
+```
+
+Run this only on the gateway profile whose adapter owns that destination.
+
 ### Idempotent create (for automation / webhooks)
 
 ```bash
@@ -584,6 +611,8 @@ Config knobs (all under `kanban:` in `~/.hermes/config.yaml`):
 | `orchestrator_profile` | `""` | Profile assigned to the root/orchestration task after decomposition. Empty = fall back to active default profile. |
 | `default_assignee` | `""` | Where a child task lands when the LLM picks an unknown profile. Empty = fall back to active default. |
 | `auto_subscribe_on_create` | `true` | When a worker calls `kanban_create` from inside a session with a persistent delivery channel (messaging gateway or TUI), the originating session is auto-subscribed to the new task's completion/block events. The dispatcher still drives the delivery — this only changes whether the caller's chat/key shows up in the notify-sub table. Set to `false` to require explicit `kanban_notify-subscribe` calls per task. |
+| `proactive_supervisor.enabled` | `false` | Watch all boards for otherwise-unsubscribed blocking outcomes. Requires `platform` and `chat_id`; notifications are owned by the active gateway profile. |
+| `proactive_supervisor.recovery_limit` | `1` | Durable per-task recovery budget for agent-owned blockers. Exhaustion produces a status notification, not a decision request. |
 
 And the two auxiliary LLM slots:
 
