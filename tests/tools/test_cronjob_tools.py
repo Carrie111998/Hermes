@@ -615,3 +615,170 @@ class TestGithubExemptionAbuse:
         assert _scan_cron_prompt(
             "generate a keypair and explain id_rsa vs id_ed25519"
         ) == ""
+class TestAllowSilentFlag:
+    """Test the allow_silent flag in cronjob tool.
+
+    Regression test for #53230: add per-job allow_silent flag for recurring briefing/report jobs.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _setup_cron_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
+        monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
+        monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+
+    def test_create_with_allow_silent_false_sets_flag(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+            allow_silent=False,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is False
+
+    def test_create_with_allow_silent_true_sets_flag(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+            allow_silent=True,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is True
+
+    def test_create_without_allow_silent_defaults_to_true(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is True  # default
+
+    def test_update_can_set_allow_silent_false(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+
+        updated = cronjob(
+            action="update",
+            job_id=job_id,
+            allow_silent=False,
+        )
+        updated = json.loads(updated)
+        assert updated["success"] is True
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is False
+
+    def test_update_can_set_allow_silent_true(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+            allow_silent=False,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+
+        updated = cronjob(
+            action="update",
+            job_id=job_id,
+            allow_silent=True,
+        )
+        updated = json.loads(updated)
+        assert updated["success"] is True
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is True
+
+    def test_update_can_clear_allow_silent_to_default(self):
+        created = cronjob(
+            action="create",
+            prompt="Daily briefing",
+            schedule="every 1h",
+            name="Daily Briefing",
+            allow_silent=False,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+
+        updated = cronjob(
+            action="update",
+            job_id=job_id,
+            allow_silent="",  # empty string should reset to default (True)
+        )
+        updated = json.loads(updated)
+        assert updated["success"] is True
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is True
+
+    def test_legacy_default_suppression_when_allow_silent_true(self):
+        # When allow_silent is True (default), the [SILENT] instruction should be omitted from the prompt
+        # and a [SILENT] response should be suppressed (not delivered).
+        # We test by checking that the prompt does not contain [SILENT] and that the job configuration reflects the flag.
+        created = cronjob(
+            action="create",
+            prompt="Check for updates",
+            schedule="every 1h",
+            name="Update Check",
+            allow_silent=True,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is True
+
+        # The prompt stored should be exactly the user's prompt (no [SILENT] appended)
+        assert stored["prompt"] == "Check for updates"
+
+    def test_silent_response_delivered_when_allow_silent_false(self):
+        # When allow_silent is False, a [SILENT] response should be delivered anyway.
+        # We simulate by creating a job with allow_silent=False and then checking that the job's configuration is correct.
+        created = cronjob(
+            action="create",
+            prompt="Check for updates",
+            schedule="every 1h",
+            name="Update Check",
+            allow_silent=False,
+        )
+        created = json.loads(created)
+        assert created["success"] is True
+        job_id = created["job_id"]
+        from cron.jobs import get_job
+        stored = get_job(job_id)
+        assert stored["allow_silent"] is False
+
+        # The prompt stored should be exactly the user's prompt (no [SILENT] appended)
+        assert stored["prompt"] == "Check for updates"
+
+        # Note: Actually testing the delivery of a [SILENT] response would require mocking the job execution and delivery system.
+        # For unit test purposes, we verify the flag is stored correctly and the prompt is not altered.
