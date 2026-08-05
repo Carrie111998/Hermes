@@ -13,6 +13,7 @@ import contextvars
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -968,6 +969,11 @@ class SlackAdapter(BasePlatformAdapter):
         # message events, and carry identity needed for stable session scoping.
         self._assistant_threads: Dict[Tuple[str, str, str], Dict[str, str]] = {}
         self._ASSISTANT_THREADS_MAX = 5000
+        # app_home_opened(messages) is Slack's Agent DM lifecycle equivalent
+        # to assistant_thread_started; keep its workspace/channel provenance
+        # separately named and bounded so classic DMs never inherit it.
+        self._agent_dm_lifecycle_channels: Dict[Tuple[str, str], None] = {}
+        self._AGENT_DM_LIFECYCLE_CHANNELS_MAX = 5000
         # Agent-view context is per workspace/user (not global): a context
         # change for one person's Slack split view must never appear in another
         # person's prompt. Slack also includes this in later DM events, but the
@@ -1009,7 +1015,11 @@ class SlackAdapter(BasePlatformAdapter):
         # Best-effort guard so automatic Slack AI thread titles are set once
         # per visible DM thread instead of on every reply.
         self._titled_assistant_threads: set = set()
+        # In-flight reservations are a subset of the bounded title cache and
+        # must not be evicted while Slack I/O is still unresolved.
+        self._assistant_thread_titles_inflight: set = set()
         self._TITLED_ASSISTANT_THREADS_MAX = 5000
+        self._assistant_thread_title_started_at = time.time()
         # Slash-command contexts: stash response_url + user_id so send()
         # can route the first reply ephemerally.  Keyed by
         # (team_id, channel_id, user_id) to avoid cross-workspace and
@@ -4558,51 +4568,100 @@ class SlackAdapter(BasePlatformAdapter):
         self,
         channel_id: str,
         thread_ts: str,
-        title_source: str,
+        title: str,
         *,
-        team_id: str = "",
+        client: Any,
     ) -> None:
         """Best-effort title for visible Slack AI DM threads."""
-        if (
-            not self._app
-            or not channel_id
-            or not thread_ts
-            or not title_source
-            or not self._assistant_thread_title_enabled()
-        ):
-            return
-
-        key = self._workspace_thread_key(team_id, channel_id, thread_ts)
-        if not key or key in self._titled_assistant_threads:
-            return
-
-        title = re.sub(r"\s+", " ", title_source).strip()
-        if not title or title.startswith("/"):
-            return
-        if len(title) > 80:
-            title = title[:77].rstrip() + "..."
-
         try:
-            await self._get_client(channel_id, team_id=team_id).assistant_threads_setTitle(
+            await client.assistant_threads_setTitle(
                 channel_id=channel_id,
                 thread_ts=thread_ts,
                 title=title,
             )
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setTitle failed: %s", e)
+
+    async def set_generated_assistant_thread_title(
+        self,
+        channel_id: str,
+        thread_ts: str,
+        title: str,
+        *,
+        team_id: str = "",
+        is_current_session: Optional[Callable[[], bool]] = None,
+    ) -> None:
+        """Best-effort title attempt from Hermes's generated session title."""
+        try:
+            if not self._assistant_thread_title_enabled() or not self._app:
+                return
+            if not team_id or not channel_id or not thread_ts or not title:
+                return
+            client = self._team_clients.get(team_id)
+            if client is None:
+                return
+            title = re.sub(r"\s+", " ", title).strip()
+            if not title or title.startswith("/"):
+                return
+            if len(title) > 80:
+                title = title[:77].rstrip() + "..."
+            try:
+                parsed_thread_ts = float(thread_ts)
+                if (
+                    not math.isfinite(parsed_thread_ts)
+                    or parsed_thread_ts < self._assistant_thread_title_started_at
+                ):
+                    return
+            except (TypeError, ValueError):
+                return
+            key = self._workspace_thread_key(team_id, channel_id, thread_ts)
+            if not key or key in self._titled_assistant_threads:
+                return
+            if is_current_session is None or is_current_session() is not True:
+                return
+            if self._TITLED_ASSISTANT_THREADS_MAX <= 0:
+                return
+            if len(self._titled_assistant_threads) >= self._TITLED_ASSISTANT_THREADS_MAX:
+                excess = (
+                    len(self._titled_assistant_threads)
+                    - self._TITLED_ASSISTANT_THREADS_MAX // 2
+                )
+                # Trim completed reservations only. Active attempts remain
+                # reserved until their Slack call settles, even when newer
+                # threads apply cache pressure while an older call is blocked.
+                evictable = self._titled_assistant_threads.difference(
+                    self._assistant_thread_titles_inflight
+                )
+                before_trim = set(evictable)
+                self._discard_oldest_by_thread_ts(
+                    evictable, excess, lambda e: e[2]
+                )
+                self._titled_assistant_threads.difference_update(
+                    before_trim.difference(evictable)
+                )
+                if (
+                    len(self._titled_assistant_threads)
+                    >= self._TITLED_ASSISTANT_THREADS_MAX
+                ):
+                    return
+            self._titled_assistant_threads.add(key)
+            self._assistant_thread_titles_inflight.add(key)
+        except Exception:
+            logger.debug(
+                "[Slack] failed to validate generated assistant thread title",
+                exc_info=True,
+            )
             return
 
-        self._titled_assistant_threads.add(key)
-        if len(self._titled_assistant_threads) > self._TITLED_ASSISTANT_THREADS_MAX:
-            excess = (
-                len(self._titled_assistant_threads)
-                - self._TITLED_ASSISTANT_THREADS_MAX // 2
+        try:
+            await self._set_assistant_thread_title(
+                channel_id,
+                thread_ts,
+                title,
+                client=client,
             )
-            # Keys are (team_id, channel_id, thread_ts) — evict the oldest
-            # threads first so recently titled threads keep their guard.
-            self._discard_oldest_by_thread_ts(
-                self._titled_assistant_threads, excess, lambda e: e[2]
-            )
+        finally:
+            self._assistant_thread_titles_inflight.discard(key)
 
     def _seed_assistant_thread_session(self, metadata: Dict[str, str]) -> None:
         """Prime the session store so assistant threads get stable user scoping."""
@@ -4724,6 +4783,11 @@ class SlackAdapter(BasePlatformAdapter):
 
         if team_id and channel_id:
             self._remember_channel_team(channel_id, team_id)
+            self._agent_dm_lifecycle_channels[(str(team_id), str(channel_id))] = None
+            self._trim_oldest_dict_entries(
+                self._agent_dm_lifecycle_channels,
+                self._AGENT_DM_LIFECYCLE_CHANNELS_MAX,
+            )
 
         metadata = {
             "channel_id": str(channel_id) if channel_id else "",
@@ -6189,17 +6253,6 @@ class SlackAdapter(BasePlatformAdapter):
         # and agent context show #channel / peer names instead of raw IDs.
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
 
-        # Slack's AI Agent Messages tab shows visible app threads; title the
-        # first DM thread turn from the user's prompt when Slack AI APIs are
-        # available. This is best-effort and configurable via config.yaml.
-        if is_dm and thread_ts and msg_type != MessageType.COMMAND:
-            await self._set_assistant_thread_title(
-                channel_id,
-                thread_ts,
-                original_text or text,
-                team_id=team_id,
-            )
-
         # Build source
         source = self.build_source(
             chat_id=channel_id,
@@ -6215,6 +6268,16 @@ class SlackAdapter(BasePlatformAdapter):
             # (they carry no user_id to match against the allowlist).
             is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
         )
+        assistant_thread_key = self._workspace_thread_key(
+            str(team_id), str(channel_id), str(thread_ts or "")
+        )
+        if is_one_to_one_dm and (
+            assistant_thread_key in self._assistant_threads
+            or (str(team_id), str(channel_id)) in self._agent_dm_lifecycle_channels
+        ):
+            # Internal, wire-invisible per-event provenance. The gateway copies
+            # this source before scheduling and never persists/serializes it.
+            setattr(source, "_slack_assistant_lifecycle_provenance", True)
 
         # Per-channel ephemeral prompt
         from gateway.platforms.base import (

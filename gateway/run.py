@@ -25,6 +25,7 @@ except ModuleNotFoundError:
     pass
 
 import asyncio
+import copy
 import concurrent.futures
 import dataclasses
 import faulthandler
@@ -5584,6 +5585,14 @@ class TurnRunner:
                         ctx.source,
                         effective_session_id,
                         title,
+                    )
+                elif self._runner._is_slack_assistant_thread_lane(ctx.source):
+                    maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_slack_generated_thread_title(
+                        copy.copy(ctx.source),
+                        effective_session_id,
+                        title,
+                        ctx.session_key,
+                        int(ctx.run_generation or 0),
                     )
                 maybe_auto_title(
                     getattr(self._runner._session_db, "_db", self._runner._session_db),
@@ -19533,6 +19542,99 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             cleaned = cleaned[:117].rstrip() + "..."
         return cleaned
 
+    def _is_slack_assistant_thread_lane(self, source: SessionSource) -> bool:
+        """Return True for Slack Agent/Assistant DM threads with visible titles."""
+        return (
+            source.platform == Platform.SLACK
+            and source.chat_type == "dm"
+            and bool(source.chat_id)
+            and bool(source.thread_id)
+            and bool(source.scope_id)
+            and getattr(source, "_slack_assistant_lifecycle_provenance", False) is True
+        )
+
+    async def _set_slack_generated_thread_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        session_key: str,
+        run_generation: int = 0,
+    ) -> None:
+        """Best-effort dispatch of a generated title to the Slack adapter."""
+        if not self._is_slack_assistant_thread_lane(source):
+            return
+        adapter = self._adapter_for_source(source) if getattr(self, "adapters", None) else None
+        set_title = getattr(adapter, "set_generated_assistant_thread_title", None)
+        if set_title is None:
+            return
+
+        def is_current_session() -> bool:
+            try:
+                state = self._peek_session_state(session_key)
+                if state is None:
+                    return False
+                return (
+                    self.session_store.peek_session_id(session_key) == session_id
+                    and int(state.persistent.last_invalidation_generation)
+                    <= int(run_generation)
+                )
+            except Exception:
+                return False
+
+        try:
+            await set_title(
+                str(source.chat_id),
+                str(source.thread_id),
+                title,
+                team_id=str(source.scope_id),
+                is_current_session=is_current_session,
+            )
+        except Exception:
+            logger.debug("Failed to set Slack assistant thread title", exc_info=True)
+
+    def _schedule_slack_generated_thread_title(
+        self,
+        source: SessionSource,
+        session_id: str,
+        title: str,
+        session_key: str,
+        run_generation: int,
+    ) -> None:
+        """Schedule a Slack title mutation from the auto-title background thread."""
+        if (
+            not session_id
+            or not session_key
+            or not title
+            or not self._is_slack_assistant_thread_lane(source)
+        ):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        copied_source = copy.copy(source)
+        future = safe_schedule_threadsafe(
+            self._set_slack_generated_thread_title(
+                copied_source, session_id, title, session_key, run_generation
+            ),
+            loop,
+            logger=logger,
+            log_message="Slack generated thread title failed to schedule",
+        )
+        if future is None:
+            return
+
+        def _log_title_failure(fut) -> None:
+            try:
+                fut.result()
+            except Exception:
+                logger.debug("Slack generated thread title failed", exc_info=True)
+
+        future.add_done_callback(_log_title_failure)
+
     def _is_discord_auto_thread_lane(self, source: SessionSource) -> bool:
         """Return True only for Discord threads Hermes just auto-created."""
         return (
@@ -22773,6 +22875,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _invalidate_session_run_generation(self, session_key: str, *, reason: str = "") -> int:
         """Invalidate any in-flight run token for ``session_key``."""
         generation = self._begin_session_run_generation(session_key)
+        if session_key:
+            self._session_state(
+                session_key
+            ).persistent.last_invalidation_generation = generation
         if reason:
             logger.info(
                 "Invalidated run generation for %s → %d (%s)",
