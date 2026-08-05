@@ -308,11 +308,12 @@ class TestReviewLoopE2E:
         assert any(b.startswith("Review Passed (security-review)") for b in bodies)
 
     def test_review_retry_limit_stops_loop(self, review_env):
-        """max_retries: 1 — after the second FAIL the reviewer stays
-        terminal; the workflow still advances and terminates (no
-        infinite loop, no re-dispatch of an exhausted reviewer)."""
+        """max_retries: 1 — after the second FAIL the reviewer is
+        EXHAUSTED: the review chain dies, the run ends BLOCKED (not
+        'completed'), and the exhausted reviewer is never re-dispatched.
+        No infinite loop, no fresh cards."""
         scripts = {
-            "[implement]": ["v1", "v2", "v3"],
+            "[implement]": ["v1", "v2"],
             "[qa-review]": ["FAIL: bad", "FAIL: bad"],
             "[security-review]": ["PASS: ok"],
         }
@@ -320,17 +321,25 @@ class TestReviewLoopE2E:
             review_env, qa_retries=1, sec_retries=3, scripts=scripts
         )
 
-        assert results["implement"] == "done"
-        # qa reviewed twice (rounds 1+2), then hit its limit and was
-        # left terminal — no third review.
+        # qa reviewed twice (rounds 1+2), then hit its limit and the
+        # chain stopped — no third review, no security review of a
+        # failed revision (security depends on qa's chain).
         assert len(driver.completions["[qa-review]"]) == 2
-        # security reviewed the final revision once.
-        assert len(driver.completions["[security-review]"]) == 1
+        assert len(driver.completions["[security-review]"]) == 0
+        # Implement did complete its WORK (twice) — but the workflow is
+        # NOT complete: the exhausted reviewer blocks the run.
 
+        # The exhausted reviewer's NODE state is terminal-blocked and the
+        # run's final state records it — the run must be BLOCKED, never
+        # 'completed' (live 2026-08-05: run ended '1 done, 0 blocked'
+        # with verify still 'running' in state).
         state = json.loads(_state_files(review_env["wf_dir"])[-1].read_text())
-        impl = state["states"]["implement"]
-        assert impl["status"] == "done"
-        assert impl["review_counts"] == {"qa-review": 2, "security-review": 2}
+        assert state["states"]["qa-review"]["status"] == "blocked", state["states"]["qa-review"]
+        assert state["final_status"] == "blocked", state.get("final_status")
+        # qa was assigned 2 rounds (round-1 FAIL reset bumps all reviewers,
+        # so security's counter also shows an assigned round — it never
+        # actually reviewed, which the completions assertion above proves).
+        assert state["states"]["implement"]["review_counts"]["qa-review"] == 2
 
 
 class TestGetCardStatus:

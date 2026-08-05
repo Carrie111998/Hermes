@@ -3239,6 +3239,16 @@ class WorkflowEngine:
                     print(f"   ⏭ {nid} — {state.status}")
                     continue
 
+                # Skip EXHAUSTED reviewers: a done-based reviewer that hit
+                # its retry budget is marked node-blocked with error
+                # "Review limit reached ..." — it must NEVER be re-dispatched
+                # (the review chain is dead; the run ends blocked). Without
+                # this guard the reuse branch below re-dispatches it and the
+                # card times out (seen live 2026-08-05 review-loop-exhaust).
+                if state.status == "blocked" and (state.error or "").startswith("Review limit reached"):
+                    print(f"   ⏭ {nid} — EXHAUSTED (terminal-blocked), skipping dispatch")
+                    continue
+
                 # Skip nodes with failed dependencies
                 # NOTE: "blocked" is excluded — it's transient (e.g.,
                 # heartbeat sweep, human gate). Downstream nodes wait
@@ -4009,6 +4019,7 @@ class WorkflowEngine:
                                 #    only applies to reviewers with prior
                                 #    rounds.
                                 _any_reset = False
+                                _exhausted = False
                                 for _rentry in (upstream_node.reviews or []):
                                     _rev = _rentry if isinstance(_rentry, str) else _rentry.get("review", "")
                                     if not _rev or _rev not in states:
@@ -4020,7 +4031,25 @@ class WorkflowEngine:
                                         upstream_state.review_counts[_rev] = _rounds
                                         if _rounds > _lim:
                                             print(f"   ⛔ {_rev} review limit reached ({_rounds}/{_lim}) — leaving terminal")
-                                            continue
+                                            # The reviewer is done-based exhausted: its card is
+                                            # DONE (with the FAIL verdict) but the workflow node
+                                            # is terminal. Mark the NODE state blocked so the run
+                                            # ends final_status='blocked' and the BLOCKED
+                                            # notification fires — otherwise the run is declared
+                                            # 'completed' with a live review loop (found live
+                                            # 2026-08-05 review-loop-exhaust-test: verify round 2
+                                            # exhausted, run ended '1 done, 0 blocked', state file
+                                            # showed verify 'running').
+                                            # Exhaustion STOPS the review chain: no other
+                                            # reviewer is reset and no rewind happens — the run
+                                            # terminates blocked (Randy's bounded-loop model).
+                                            states[_rev].status = "blocked"
+                                            states[_rev].error = (
+                                                f"Review limit reached ({_rounds}/{_lim}) — "
+                                                f"reviewer {_rev} exhausted; needs intervention"
+                                            )
+                                            _exhausted = True
+                                            break
                                     else:
                                         # Never reviewed — first round now.
                                         upstream_state.review_counts[_rev] = 1
@@ -4043,7 +4072,9 @@ class WorkflowEngine:
                                 # 5) Rewind the layer loop to the upstream's
                                 #    layer so the revised work re-dispatches;
                                 #    reviewers reuse their existing cards.
-                                if _any_reset:
+                                #    On exhaustion there is NO rewind — the
+                                #    chain is dead; the run ends blocked.
+                                if _any_reset and not _exhausted:
                                     for _li, _ln in enumerate(layers):
                                         if reviewer_for in _ln:
                                             self._rewind_to_layer = _li
