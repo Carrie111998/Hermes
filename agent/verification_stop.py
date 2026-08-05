@@ -294,6 +294,11 @@ _GROUNDING_TOOL_MARKERS = (
     "read", "search", "grep", "glob", "fetch", "web", "http", "curl", "ssh",
     "terminal", "shell", "bash", "find", "list_", "view", "browse", "open_file",
     "cat", "download", "scrape", "crawl", "lookup", "query",
+    # execute_code is terminal-class (see agent/display.py, which groups it with
+    # "terminal") and can read files exactly as a shell can, so excluding it while
+    # including "terminal" would nudge a genuinely grounded session. "vision"
+    # covers vision_analyze, the image-reading tool surfaced in every session.
+    "execute_code", "vision",
 )
 
 # Tool-name substrings that are writes/control, never grounding — checked first

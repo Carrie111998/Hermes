@@ -61,6 +61,24 @@ def test_bounded_by_attempts():
     assert r is None
 
 
+def test_grounded_execute_code_is_silent():
+    """execute_code is terminal-class and can read sources; it must count."""
+    r = build_grounding_nudge(
+        changed_paths=["/w/analysis.md"],
+        session_messages=[_tc("execute_code"), _tc("write_file")],
+    )
+    assert r is None
+
+
+def test_grounded_vision_analyze_is_silent():
+    """Inspecting an image IS inspecting source material."""
+    r = build_grounding_nudge(
+        changed_paths=["/w/findings.md"],
+        session_messages=[_tc("vision_analyze"), _tc("write_file")],
+    )
+    assert r is None
+
+
 def test_kanban_list_is_not_grounding():
     r = build_grounding_nudge(
         changed_paths=["/w/findings.md"],
