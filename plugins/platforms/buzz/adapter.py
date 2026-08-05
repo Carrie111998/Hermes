@@ -502,6 +502,7 @@ class BuzzAdapter(BasePlatformAdapter):
             self._set_fatal_error("connect_failed", "buzz users get returned no profile", retryable=True)
             return False
         self._self_pubkey = str(profiles[0]["pubkey"]).lower()
+        _save_buzz_identity(self._self_pubkey)
         self._display_name = str(profiles[0].get("display_name") or "").strip()
         self._self_npub = hex_to_npub(self._self_pubkey) or ""
 
@@ -1470,6 +1471,67 @@ def _env_enablement() -> Optional[dict]:
     return seed
 
 
+def _buzz_state_path(name: str) -> Optional[str]:
+    home = os.environ.get("HERMES_HOME")
+    return os.path.join(home, name) if home else None
+
+
+def _save_buzz_identity(pubkey: str) -> None:
+    """Record our pubkey so _standalone_send can pass --mention.
+
+    That sender runs without a live adapter instance, so it cannot read
+    self._self_pubkey -- but it needs the same mention-preflight escape hatch,
+    or an agent-initiated send containing any unresolved @token is dropped whole.
+    """
+    path = _buzz_state_path("buzz_identity.json")
+    if not path or not pubkey:
+        return
+    try:
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"pubkey": pubkey}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        logger.debug("Buzz: could not persist identity", exc_info=True)
+
+
+def _load_buzz_identity() -> Optional[str]:
+    path = _buzz_state_path("buzz_identity.json")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return (json.load(fh) or {}).get("pubkey") or None
+    except Exception:
+        return None
+
+
+def _load_turn_anchor_for(chat_id: str) -> Optional[str]:
+    """Current turn anchor for a channel, read from disk, TTL-checked.
+
+    The adapter keeps anchors in memory AND on disk; the standalone sender has
+    no instance, so it reads the same file. Without this, agent-initiated sends
+    (cross-agent dispatches, notifications) land at channel root while the
+    gateway's own turn replies thread correctly -- the exact split users report
+    as "the lead never uses threads".
+    """
+    path = _buzz_state_path("buzz_turn_anchors.json")
+    if not path or not os.path.exists(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as fh:
+            raw = json.load(fh) or {}
+        entry = raw.get(str(chat_id))
+        if not entry or len(entry) != 2:
+            return None
+        event_id, ts = str(entry[0]), float(entry[1])
+        if (time.time() - ts) > _TURN_ANCHOR_TTL:
+            return None
+        return event_id
+    except Exception:
+        return None
+
+
 async def _standalone_send(
     pconfig,
     chat_id: str,
@@ -1500,8 +1562,17 @@ async def _standalone_send(
         return {"error": "Buzz standalone send: no target channel (set BUZZ_HOME_CHANNEL)"}
 
     args = ["messages", "send", "--channel", target, "--content", "-"]
-    if thread_id:
-        args += ["--reply-to", str(thread_id)]
+    # Same mention preflight as BuzzAdapter.send: without an explicit --mention,
+    # any "@token" in the body that is not a current member of this channel
+    # fails the whole send (exit 1) and the message is silently lost.
+    _self = _load_buzz_identity()
+    if _self:
+        args += ["--mention", _self]
+    # Fall back to the turn anchor so agent-initiated sends thread under the
+    # message that prompted them instead of landing at the channel root.
+    _anchor = thread_id or _load_turn_anchor_for(target)
+    if _anchor:
+        args += ["--reply-to", str(_anchor)]
     for path in media_files or []:
         args += ["--file", str(path)]
     try:
