@@ -120,28 +120,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
 )
 
 
-def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
-    """Persist a session-hygiene compression-failure cooldown to the state DB.
-
-    Uses the same ``compression_failure_cooldown_until`` column and
-    ``record_compression_failure_cooldown`` method that the in-conversation
-    compression path (``agent/context_compressor.py``) already uses, so the
-    cooldown survives gateway restarts (#74136).
-    """
-    import time as _time
-    session_db = getattr(gateway, "_session_db", None)
-    if session_db is None:
-        return
-    session_db = getattr(session_db, "_db", session_db)
-    recorder = getattr(session_db, "record_compression_failure_cooldown", None)
-    if recorder is None:
-        return
-    try:
-        recorder(session_id, _time.time() + cooldown_seconds)
-    except Exception as exc:
-        logger.debug("session hygiene cooldown persist failed: %s", exc)
-
-
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -341,30 +319,6 @@ def _non_conversational_metadata(
     merged = dict(metadata or {})
     merged["non_conversational"] = True
     return merged
-
-
-def _seed_hygiene_system_prompt(
-    agent: Any,
-    session_row: Optional[Dict[str, Any]],
-) -> bool:
-    """Keep gateway hygiene from rebuilding a live session's system prompt.
-
-    The hygiene helper intentionally skips memory-provider initialization.
-    Compression is allowed to persist a system prompt, so letting that helper
-    rebuild one would strip external provider blocks from the live session.
-    Seed the exact persisted prompt instead.  When no usable prompt can be
-    restored, seed an empty cache entry.  Compression either preserves that
-    unusable value or rebuilds with the hygiene-only platform marker; the real
-    turn will rebuild either form with its fully initialized providers.
-    """
-    stored_prompt = ""
-    if isinstance(session_row, dict):
-        raw_prompt = session_row.get("system_prompt")
-        if isinstance(raw_prompt, str) and raw_prompt.strip():
-            stored_prompt = raw_prompt
-
-    agent._cached_system_prompt = stored_prompt
-    return bool(stored_prompt)
 
 
 def _is_transient_network_error(exc: BaseException) -> bool:
@@ -1670,24 +1624,6 @@ def _home_thread_env_var(platform_name: str) -> str:
     return f"{_home_target_env_var(platform_name)}_THREAD_ID"
 
 
-def _restart_notification_pending() -> bool:
-    """Return True when a /restart completion marker is waiting to be delivered."""
-    return (_hermes_home / ".restart_notify.json").exists()
-
-
-def _planned_restart_notification_path() -> Path:
-    return _hermes_home / ".restart_pending.json"
-
-
-def _planned_restart_notification_pending() -> bool:
-    """Return True when a non-chat planned restart should notify home channels."""
-    return _planned_restart_notification_path().exists()
-
-
-def _clear_planned_restart_notification() -> None:
-    _planned_restart_notification_path().unlink(missing_ok=True)
-
-
 # Mark this process as a gateway so cli.py's module-level load_cli_config()
 # knows not to clobber TERMINAL_CWD if lazily imported.
 os.environ["_HERMES_GATEWAY"] = "1"
@@ -2257,6 +2193,16 @@ from gateway.session_state import (
 from gateway.authz_mixin import GatewayAuthorizationMixin
 from gateway.kanban_watchers import GatewayKanbanWatchersMixin
 from gateway.slash_commands import GatewaySlashCommandsMixin
+from gateway.hygiene_mixin import (
+    _record_hygiene_cooldown,  # noqa: F401 — public contract; tests import it from gateway.run
+    _seed_hygiene_system_prompt,  # noqa: F401 — public contract; tests import it from gateway.run
+)
+from gateway.restart_mixin import (
+    _clear_planned_restart_notification,  # noqa: F401 — public contract; tests import it from gateway.run
+    _planned_restart_notification_path,  # noqa: F401 — public contract; tests import it from gateway.run
+    _planned_restart_notification_pending,  # noqa: F401 — public contract; tests import it from gateway.run
+    _restart_notification_pending,  # noqa: F401 — public contract; tests import it from gateway.run
+)
 from gateway.turn_context import TurnContext
 from gateway.platforms.base import (
     BasePlatformAdapter,
