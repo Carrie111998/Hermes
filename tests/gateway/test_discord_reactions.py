@@ -361,6 +361,50 @@ async def test_long_running_status_is_embed_edited_then_deleted(adapter, monkeyp
 
 
 @pytest.mark.asyncio
+async def test_cleanup_transient_statuses_deletes_all_active_turn_artifacts(adapter):
+    tool_status = SimpleNamespace(delete=AsyncMock())
+    heartbeat_status = SimpleNamespace(delete=AsyncMock())
+    adapter._tool_progress_status_messages["turn-a"] = tool_status
+    adapter._tool_progress_counts["turn-a"] = {"💻": 1}
+    adapter._tool_progress_channels["turn-a"] = SimpleNamespace()
+    adapter._long_running_status_messages["turn-b"] = heartbeat_status
+
+    await adapter._cleanup_transient_statuses()
+
+    tool_status.delete.assert_awaited_once()
+    heartbeat_status.delete.assert_awaited_once()
+    assert adapter._tool_progress_status_messages == {}
+    assert adapter._tool_progress_counts == {}
+    assert adapter._tool_progress_channels == {}
+    assert adapter._long_running_status_messages == {}
+
+
+@pytest.mark.asyncio
+async def test_resolve_clarify_text_response_marks_open_prompt_resolved(adapter, monkeypatch):
+    class FakeEmbed:
+        def __init__(self):
+            self.color = None
+            self.footer_text = None
+
+        def set_footer(self, *, text):
+            self.footer_text = text
+
+    monkeypatch.setattr(
+        discord_adapter_module,
+        "discord",
+        SimpleNamespace(Color=SimpleNamespace(green=lambda: "green")),
+    )
+    prompt = SimpleNamespace(embeds=[FakeEmbed()], edit=AsyncMock())
+    adapter._clarify_messages["clarify-1"] = prompt
+
+    assert await adapter.resolve_clarify_text_response("clarify-1", "Ship it") is True
+    assert prompt.embeds[0].color == "green"
+    assert prompt.embeds[0].footer_text == "Answered: Ship it"
+    prompt.edit.assert_awaited_once_with(embed=prompt.embeds[0], view=None)
+    assert adapter._clarify_messages == {}
+
+
+@pytest.mark.asyncio
 async def test_add_tool_progress_reaction_respects_disabled_reactions(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REACTIONS", "false")
     raw_message = SimpleNamespace(add_reaction=AsyncMock())

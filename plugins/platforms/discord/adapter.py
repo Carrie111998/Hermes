@@ -997,6 +997,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # Long-running heartbeats share the transient treatment of the tool
         # count embed: edit one embed during a turn, then delete it on exit.
         self._long_running_status_messages: Dict[str, Any] = {}
+        # Clarification prompts are state-aware controls, not conversational
+        # replies. Retain their Discord message until a typed answer can mark
+        # the original prompt resolved (button views edit themselves).
+        self._clarify_messages: Dict[str, Any] = {}
 
 
     def _config_value(
@@ -1630,6 +1634,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         task.cancel()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        await self._cleanup_transient_statuses()
         await super().cancel_background_tasks()
 
     def _text_batch_flush_deadline_seconds(self) -> float:
@@ -1671,6 +1676,10 @@ class DiscordAdapter(BasePlatformAdapter):
         # WebSocket handshake is in flight.  Explicitly cancelling the task here
         # ensures the zombie client cannot receive or dispatch any further events.
         await self._cancel_bot_task()
+        # Teardown can bypass the normal per-turn completion hook. Remove
+        # adapter-owned temporary embeds while the Discord client can still
+        # delete them, before closing its websocket.
+        await self._cleanup_transient_statuses()
         # Clean up all active voice connections before closing the client
         for guild_id in list(self._voice_clients.keys()):
             try:
@@ -3018,6 +3027,47 @@ class DiscordAdapter(BasePlatformAdapter):
                 await status.delete()
             except Exception:
                 logger.debug("[%s] long-running status delete failed", self.name, exc_info=True)
+
+    async def _cleanup_transient_statuses(self) -> None:
+        """Delete every active turn-status artifact during abnormal teardown.
+
+        Normal completion knows the originating inbound message and removes its
+        tool-count and heartbeat embeds through ``on_processing_complete``.
+        Cancellation, reconnect, and service shutdown do not always reach that
+        hook, so sweep the adapter-owned registries before the Discord client
+        closes.  Each delete helper is idempotent and consumes its own entry.
+        """
+        tool_keys = set(self._tool_progress_status_tasks)
+        tool_keys.update(self._tool_progress_status_messages)
+        tool_keys.update(self._tool_progress_counts)
+        tool_keys.update(self._tool_progress_channels)
+        heartbeat_keys = list(self._long_running_status_messages)
+        await asyncio.gather(
+            *(self._delete_tool_progress_status(key) for key in tool_keys),
+            *(self._delete_long_running_status(key) for key in heartbeat_keys),
+            return_exceptions=True,
+        )
+
+    async def resolve_clarify_text_response(self, clarify_id: str, response: str) -> bool:
+        """Edit an open-text clarification after the gateway captures its reply."""
+        prompt = self._clarify_messages.pop(str(clarify_id or ""), None)
+        if prompt is None or not hasattr(prompt, "edit"):
+            return False
+        try:
+            embed = next(iter(getattr(prompt, "embeds", []) or []), None)
+            answer = str(response or "").strip().replace("\n", " ")
+            if len(answer) > 900:
+                answer = answer[:897].rstrip() + "..."
+            if embed is not None and discord is not None:
+                embed.color = discord.Color.green()
+                embed.set_footer(text=f"Answered: {answer or '(empty response)'}")
+                await prompt.edit(embed=embed, view=None)
+            else:
+                await prompt.edit(view=None)
+            return True
+        except Exception:
+            logger.debug("[%s] clarify prompt resolution edit failed", self.name, exc_info=True)
+            return False
 
     async def send(
         self,
@@ -7015,6 +7065,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 tail=clarify_tail,
             )
             msg = await channel.send(content=content, embed=embed, view=view) if view else await channel.send(content=content, embed=embed)
+            self._clarify_messages[str(clarify_id)] = msg
+            self._nonconversational_messages.mark_many([str(msg.id)])
             if view:
                 view._message = msg  # store for on_timeout expiration editing
             return SendResult(success=True, message_id=str(msg.id))

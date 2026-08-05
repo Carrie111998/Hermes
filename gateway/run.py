@@ -11039,6 +11039,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Failed to resume typing after clarify response",
                                 exc_info=True,
                             )
+                        # Native Discord open-text prompts have no view callback
+                        # to edit their original message. Give adapters that own
+                        # such state a resolution hook after the gateway accepts
+                        # the typed response.
+                        _resolve_prompt = getattr(
+                            _clarify_adapter, "resolve_clarify_text_response", None,
+                        )
+                        if callable(_resolve_prompt):
+                            try:
+                                _prompt_resolution = _resolve_prompt(
+                                    _pending_clarify.clarify_id, _raw_clarify_reply,
+                                )
+                                if inspect.isawaitable(_prompt_resolution):
+                                    await _prompt_resolution
+                            except Exception:
+                                logger.debug(
+                                    "Failed to mark clarify prompt resolved",
+                                    exc_info=True,
+                                )
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
