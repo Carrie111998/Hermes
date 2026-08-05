@@ -1074,3 +1074,8 @@ def _looks_like_slash_command(text: str) -> bool:
     # A path like /Users/foo/bar.md always does.
     return "/" not in first_word[1:]
 
+
+# Install the light-mode skin hook at import time so that any consumer
+# importing cli_display (not just cli.py) gets the remap wrapper.
+_install_skin_light_mode_hook()
+

@@ -2551,9 +2551,6 @@ def _prune_orphaned_branches(repo_root: str) -> None:
     logger.debug("Pruned %d orphaned branches", len(orphaned))
 
 
-_install_skin_light_mode_hook()
-
-
 # Prime the light-mode detection cache early (at module load) when
 # we're running interactively so OSC 11 happens before pt grabs the
 # tty.  Skip for non-tty contexts (subagents, gateway, tests).
