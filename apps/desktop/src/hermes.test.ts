@@ -420,11 +420,13 @@ describe('Hermes REST helpers', () => {
         profile: 'default',
         title: `default-${i}`
       }))
+
       const coderSessions = Array.from({ length: 20 }, (_, i) => ({
         id: `c-${i}`,
         profile: 'coder',
         title: `coder-${i}`
       }))
+
       const sessions = [...defaultSessions, ...coderSessions]
 
       api.mockImplementation(({ path }: { path: string }) => {
@@ -501,6 +503,57 @@ describe('Hermes REST helpers', () => {
 
       // Global window filled: mark truncated via fallback heuristic.
       expect(result.recents.profiles_truncated).toEqual({ default: true })
+    })
+
+    it('marks a totals-only profile truncated when it has rows on disk but none in the window', async () => {
+      // archive has 10 sessions on disk, all older than the global window —
+      // its rows must stay reachable via the global "Load more".
+      const defaultSessions = Array.from({ length: 30 }, (_, i) => ({
+        id: `d-${i}`,
+        profile: 'default',
+        title: `default-${i}`
+      }))
+
+      const coderSessions = Array.from({ length: 20 }, (_, i) => ({
+        id: `c-${i}`,
+        profile: 'coder',
+        title: `coder-${i}`
+      }))
+
+      const sessions = [...defaultSessions, ...coderSessions]
+
+      api.mockImplementation(({ path }: { path: string }) => {
+        if (path.startsWith('/api/profiles/sessions/sidebar')) {
+          return Promise.reject(new Error('404: {"detail":"No such API endpoint: /api/profiles/sessions/sidebar"}'))
+        }
+
+        if (path.includes('source=cron')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        if (path.includes('exclude_sources=cron%2Cdesktop')) {
+          return Promise.resolve({ ...emptySessionsResponse, sessions: [], total: 0 })
+        }
+
+        return Promise.resolve({
+          ...emptySessionsResponse,
+          sessions,
+          total: 90,
+          profile_totals: { default: 60, coder: 20, archive: 10 }
+        })
+      })
+
+      const result = await listSidebarSessions({
+        recentsProfile: 'all',
+        recentsLimit: 50,
+        recentsExclude: ['cron', 'tool'],
+        cronLimit: 50,
+        messagingLimit: 100,
+        messagingExclude: ['cron', 'desktop']
+      })
+
+      // archive returned 0 of its 10 → truncated, so Load more stays visible.
+      expect(result.recents.profiles_truncated).toEqual({ default: true, coder: false, archive: true })
     })
   })
 })

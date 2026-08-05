@@ -443,15 +443,18 @@ export interface SidebarSessionSlice {
   profiles_truncated?: Record<string, boolean>
 }
 
-/** Which profiles filled their per-profile window in a returned page. The
+/** Which profiles still have rows on disk beyond the returned page. The
  *  legacy per-slice endpoint doesn't report `profiles_truncated`, so derive it
  *  from the rows. When the endpoint carries `profile_totals` (the exact
- *  conversation count per profile), compare each profile's returned count
- *  against its known total — the most precise signal, and already paid for by
- *  the request. When `profile_totals` is absent (even older backends), fall
- *  back to checking whether each profile's window filled the cap, or whether
- *  the global window was full (meaning every profile in the result likely has
- *  more rows on disk). */
+ *  conversation count per profile, computed before global windowing), compare
+ *  each profile's returned count against its known total — the most precise
+ *  signal, and already paid for by the request. Profiles with rows on disk but
+ *  none in this window (pushed out by the global merge) count as truncated
+ *  too, so their rows stay reachable via the global "Load more". When
+ *  `profile_totals` is absent (even older backends), fall back to checking
+ *  whether each profile's window filled the cap, or whether the global window
+ *  was full (meaning every profile in the result likely has more rows on
+ *  disk). */
 function profilesTruncatedFrom(
   sessions: SessionInfo[],
   cap: number,
@@ -466,8 +469,13 @@ function profilesTruncatedFrom(
     counts.set(key, (counts.get(key) ?? 0) + 1)
   }
 
+  // Include totals-only profiles (rows on disk, none returned in this window).
+  const names = new Set([...counts.keys(), ...Object.keys(profileTotals ?? {})])
+
   return Object.fromEntries(
-    [...counts].map(([name, count]) => {
+    [...names].map(name => {
+      const count = counts.get(name) ?? 0
+
       // Exact total known → truncated whenever the loaded window is smaller.
       if (profileTotals && typeof profileTotals[name] === 'number') {
         return [name, count < profileTotals[name]]
