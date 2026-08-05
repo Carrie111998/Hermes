@@ -294,6 +294,10 @@ from plugins.platforms.telegram.telegram_messaging import (
 )
 from plugins.platforms.telegram.telegram_rich import TelegramRichMixin
 from plugins.platforms.telegram.telegram_polling import TelegramPollingMixin
+from plugins.platforms.telegram.telegram_dm_topics import TelegramDmTopicMixin
+from plugins.platforms.telegram.telegram_lifecycle import TelegramLifecycleMixin
+from plugins.platforms.telegram.telegram_reactions import TelegramReactionsMixin
+from plugins.platforms.telegram.telegram_media import TelegramMediaMixin
 from plugins.platforms.telegram.telegram_interactive import TelegramInteractiveMixin
 from plugins.platforms.telegram.telegram_config_mention import TelegramConfigMentionMixin
 from utils import atomic_replace, env_float, env_int
