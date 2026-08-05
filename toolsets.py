@@ -83,6 +83,8 @@ _HERMES_CORE_TOOLS = [
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
+    # Email sending via AgentMail or SMTP
+    "email_send",
 ]
 
 # Webhook events may originate from untrusted third-party content (for example,
@@ -181,6 +183,12 @@ TOOLSETS = {
             "user's cursor or keyboard focus. Works with any tool-capable model."
         ),
         "tools": ["computer_use"],
+        "includes": []
+    },
+
+    "email": {
+        "description": "Send emails via AgentMail API or SMTP",
+        "tools": ["email_send"],
         "includes": []
     },
 
