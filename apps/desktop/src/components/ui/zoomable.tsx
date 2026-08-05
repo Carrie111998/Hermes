@@ -1,6 +1,6 @@
 'use client'
 
-import { type ReactNode, useEffect, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import { Dialog, DialogContent } from '@/components/ui/dialog'
 import { Tip } from '@/components/ui/tooltip'
@@ -69,13 +69,40 @@ function ZoomPanViewer({
   onOpenChange: (open: boolean) => void
   open: boolean
 }) {
-  const { panning, reset, stageProps, style, zoomIn, zoomOut } = useZoomPan()
+  const { fit, panning, reset, stageProps, style, zoomIn, zoomOut } = useZoomPan()
+  const stageRef = useRef<HTMLDivElement | null>(null)
+  const contentRef = useRef<HTMLDivElement | null>(null)
 
+  // Fit content to the stage on open. Content smaller than the stage (the
+  // common case for mermaid diagrams) would otherwise open at natural size in
+  // the middle of empty space — reads as "zoomed out". Measure the laid-out
+  // content at scale 1 (already CSS-capped to the viewport) and scale up to
+  // fill; oversized content is never scaled down below its fitted size.
   useEffect(() => {
-    if (open) {
-      reset()
+    if (!open) {
+      return
     }
-  }, [open, reset])
+
+    const raf = requestAnimationFrame(() => {
+      const stage = stageRef.current
+      const content = contentRef.current
+
+      if (!stage || !content) {
+        return
+      }
+
+      const stageRect = stage.getBoundingClientRect()
+      const contentRect = content.getBoundingClientRect()
+
+      if (stageRect.width <= 0 || stageRect.height <= 0 || contentRect.width <= 0 || contentRect.height <= 0) {
+        return
+      }
+
+      fit(Math.min(stageRect.width / contentRect.width, stageRect.height / contentRect.height))
+    })
+
+    return () => cancelAnimationFrame(raf)
+  }, [open, fit])
 
   return (
     <Dialog onOpenChange={onOpenChange} open={open}>
@@ -88,10 +115,11 @@ function ZoomPanViewer({
             'relative flex-1 touch-none select-none overflow-hidden',
             panning ? 'cursor-grabbing' : 'cursor-grab'
           )}
+          ref={stageRef}
           {...stageProps}
         >
           <div className="absolute inset-0 grid place-items-center">
-            <div className="origin-center" style={style}>
+            <div className="origin-center" ref={contentRef} style={style}>
               {children}
             </div>
           </div>

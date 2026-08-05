@@ -20,6 +20,11 @@ const MAX_SCALE = 8
 const WHEEL_STEP = 1.1
 const BUTTON_STEP = 1.25
 
+// Fit-to-screen floor: opening a viewer never zooms OUT below the content's
+// laid-out size (oversized diagrams are already CSS-capped to the stage);
+// small content is scaled UP to fill instead.
+const MIN_FIT_SCALE = 1
+
 const clamp = (scale: number) => Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale))
 
 /**
@@ -91,11 +96,19 @@ export function useZoomPan() {
   const zoomIn = useCallback(() => zoomAt(BUTTON_STEP), [zoomAt])
   const zoomOut = useCallback(() => zoomAt(1 / BUTTON_STEP), [zoomAt])
 
+  // Jump to an exact scale, centered. Used for fit-to-screen on open: content
+  // smaller than the stage scales up to fill; content already at or beyond the
+  // stage size stays at 1 (its CSS-capped layout size).
+  const fit = useCallback((scale: number) => {
+    setTransform({ scale: Math.min(MAX_SCALE, Math.max(MIN_FIT_SCALE, scale)), x: 0, y: 0 })
+  }, [])
+
   const style: CSSProperties = {
     transform: `translate(${transform.x}px, ${transform.y}px) scale(${transform.scale})`
   }
 
   return {
+    fit,
     panning,
     reset,
     scale: transform.scale,
