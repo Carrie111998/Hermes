@@ -221,6 +221,34 @@ class TestNoOpOnHealthyInput:
 
         assert messages[0]["content"] is content
 
+    def test_repair_is_idempotent(self):
+        """A repaired prefix must stay stable so the NEXT turn still caches."""
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "reminder"},
+            {"type": "tool_result", "tool_use_id": "t1", "content": "ok"},
+            {"type": "text", "text": "mid"},
+            {"type": "tool_result", "tool_use_id": "t2", "content": "ok2"},
+        ]}]
+        _hoist_tool_results_to_front(messages)
+        once = [dict(b) for b in messages[0]["content"]]
+
+        _hoist_tool_results_to_front(messages)
+
+        assert messages[0]["content"] == once
+
+    def test_reorder_never_drops_or_mutates_a_block(self):
+        """Every original block survives verbatim -- this reorders, never edits."""
+        messages = [{"role": "user", "content": [
+            {"type": "text", "text": "A"},
+            {"type": "tool_result", "tool_use_id": "t", "content": "R"},
+            {"type": "text", "text": "B"},
+        ]}]
+        original = sorted(map(repr, messages[0]["content"]))
+
+        _hoist_tool_results_to_front(messages)
+
+        assert sorted(map(repr, messages[0]["content"])) == original
+
 
 class TestPipelineOrdering:
     def test_hoist_survives_the_consecutive_role_merge(self):
