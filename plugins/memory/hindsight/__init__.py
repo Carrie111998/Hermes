@@ -135,18 +135,28 @@ def _check_local_runtime() -> tuple[bool, str | None]:
     so Hermes can degrade gracefully instead of repeatedly trying to start
     a broken local memory backend.
 
-    The embedded daemon computes embeddings via ``sentence_transformers``
-    (transformers + huggingface-hub). Importing ``hindsight`` /
-    ``hindsight_embed`` alone succeeds even when that stack is broken, so
-    without importing it here the probe would falsely report the backend
-    healthy and ``hermes memory status`` would stay green while the daemon
-    aborts at startup on every retain/recall. Import it too so the probe (and
-    status) reports the real ImportError.
+    The embedded daemon only needs ``sentence_transformers`` when a local ML
+    embeddings/reranker backend is selected. Remote embeddings (Gemini,
+    OpenAI, or TEI) plus a non-local reranker deliberately avoid that large
+    dependency stack, so do not reject those configurations merely because
+    ``sentence_transformers`` is absent.
     """
     try:
         importlib.import_module("hindsight")
         importlib.import_module("hindsight_embed.daemon_embed_manager")
-        importlib.import_module("sentence_transformers")
+        config = _load_config()
+        embeddings_provider = str(
+            config.get("embeddings_provider")
+            or os.environ.get("HINDSIGHT_API_EMBEDDINGS_PROVIDER", "")
+        ).strip().lower()
+        reranker_provider = str(
+            config.get("reranker_provider")
+            or os.environ.get("HINDSIGHT_API_RERANKER_PROVIDER", "")
+        ).strip().lower()
+        remote_embeddings = embeddings_provider in {"gemini", "google", "openai", "tei"}
+        non_local_reranker = reranker_provider in {"none", "rrf", "tei"}
+        if not (remote_embeddings and non_local_reranker):
+            importlib.import_module("sentence_transformers")
         return True, None
     except Exception as exc:
         return False, str(exc)
@@ -541,6 +551,30 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
         "HINDSIGHT_API_LLM_MODEL": str(current_model),
         "HINDSIGHT_API_LOG_LEVEL": "info",
     }
+
+    # Optional embedded-daemon knobs. These keep local Hindsight usable on small
+    # servers without installing the large local ML stack (torch + sentence-transformers).
+    # Values are intentionally copied into the profile env because hindsight-embed is
+    # launched as a standalone daemon and reads HINDSIGHT_API_* variables directly.
+    env_passthrough = {
+        "embeddings_provider": "HINDSIGHT_API_EMBEDDINGS_PROVIDER",
+        "embeddings_gemini_model": "HINDSIGHT_API_EMBEDDINGS_GEMINI_MODEL",
+        "embeddings_gemini_output_dimensionality": "HINDSIGHT_API_EMBEDDINGS_GEMINI_OUTPUT_DIMENSIONALITY",
+        "reranker_provider": "HINDSIGHT_API_RERANKER_PROVIDER",
+    }
+    for config_key, env_key in env_passthrough.items():
+        value = config.get(config_key)
+        if value not in (None, ""):
+            env_values[env_key] = str(value)
+
+    gemini_embeddings_key = (
+        config.get("embeddings_gemini_api_key")
+        or os.environ.get("HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY")
+        or os.environ.get("GEMINI_API_KEY")
+    )
+    if gemini_embeddings_key:
+        env_values["HINDSIGHT_API_EMBEDDINGS_GEMINI_API_KEY"] = str(gemini_embeddings_key)
+
     if current_base_url:
         env_values["HINDSIGHT_API_LLM_BASE_URL"] = str(current_base_url)
 
