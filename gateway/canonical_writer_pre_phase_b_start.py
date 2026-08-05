@@ -29,6 +29,8 @@ DEFAULT_PRE_PHASE_B_START_PERMIT_PATH = Path(
 DEFAULT_CANARY_RELEASES_ROOT = Path("/opt/muncho-canary-releases")
 PRE_PHASE_B_START_PERMIT_MAX_SECONDS = 180
 _MAX_PERMIT_BYTES = 64 * 1024
+# The signed release manifest enumerates the full built artifact tree.
+_MAX_RELEASE_MANIFEST_BYTES = 8 * 1024 * 1024
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _REVISION_RE = re.compile(r"^[0-9a-f]{40}$")
 _SCOPE_VALUES = frozenset({"native_observation", "activation"})
@@ -347,7 +349,7 @@ def build_pre_phase_b_start_permit(
         expected_uid=0,
         expected_gid=0,
         expected_mode=0o400,
-        maximum_bytes=2 * 1024 * 1024,
+        maximum_bytes=_MAX_RELEASE_MANIFEST_BYTES,
     )
     config_raw = _read_exact_file(
         config,
@@ -456,7 +458,7 @@ def validate_installed_pre_phase_b_start_permit(
         expected_uid=0,
         expected_gid=0,
         expected_mode=0o400,
-        maximum_bytes=2 * 1024 * 1024,
+        maximum_bytes=_MAX_RELEASE_MANIFEST_BYTES,
     )
     config = _absolute_path(config_path)
     config_raw = _read_exact_file(
