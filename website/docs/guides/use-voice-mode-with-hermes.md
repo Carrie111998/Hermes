@@ -360,7 +360,7 @@ In addition to the normal text-bot setup, make sure the bot has:
 
 Also enable privileged intents in the Developer Portal:
 - Presence Intent
-- Server Members Intent — only needed if `DISCORD_ALLOWED_USERS` uses usernames; with numeric user IDs the bot does not request this intent
+- Server Members Intent — only needed if `DISCORD_ALLOWED_USERS` uses usernames or `DISCORD_ALLOWED_ROLES` is set; with numeric user IDs and no roles the bot does not request this intent
 - Message Content Intent
 
 ## Join and leave
