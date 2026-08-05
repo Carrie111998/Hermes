@@ -81,6 +81,30 @@ def test_collect_carries_forward_last_known_on_fetch_failure(tmp_path):
     assert by["anthropic"]["windows"][0]["used_pct"] == 55.0  # last-known preserved
 
 
+def test_unconfigured_prev_does_not_carry_forward_as_stale(tmp_path):
+    # Prior run had this budget provider as unconfigured; the live fetch is
+    # still unavailable this run. It must stay "unconfigured", NOT flip to
+    # "stale" (which would imply stale DATA that never existed).
+    db = tmp_path / "state.db"
+    _seed_db(str(db))
+    prev = {
+        "generated_at": "2026-08-04T14:00:00Z",
+        "providers": [
+            {"key": "openai-codex", "label": "Codex", "mode": "budget",
+             "state": "unconfigured", "windows": [], "detail": "no data"},
+        ],
+    }
+
+    def fetch(provider):
+        # still unconfigured this run (unavailable with a reason)
+        return FakeSnap(False, (), unavailable_reason="no token")
+
+    data = collect(db_path=str(db), prev=prev, fetch_usage=fetch, now=NOW)
+    by = {p["key"]: p for p in data["providers"]}
+    assert by["openai-codex"]["state"] == "unconfigured"
+    assert by["openai-codex"]["state"] != "stale"
+
+
 def test_write_atomic_roundtrip(tmp_path):
     path = tmp_path / "sub" / "ai-tokens.json"
     write_atomic(path, {"generated_at": "x", "providers": []})

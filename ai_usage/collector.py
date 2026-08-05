@@ -19,6 +19,8 @@ def _carry_forward(prev: Optional[dict], key: str) -> Optional[dict]:
         return None
     for p in prev.get("providers", []):
         if p.get("key") == key:
+            if p.get("state") not in ("ok", "stale"):
+                return None
             carried = dict(p)
             carried["state"] = "stale"
             return carried
