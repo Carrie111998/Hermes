@@ -50,6 +50,58 @@ def test_broken_bitwarden_import_does_not_crash_cli_startup(monkeypatch, capsys)
     )
 
 
+def test_register_cli_builds_secrets_parser_with_broken_bitwarden(monkeypatch):
+    """#70697: ``secrets_cli.register_cli`` must wire the bitwarden
+    subcommand tree without importing the bitwarden module.
+
+    Reviewer follow-up (#74703): the unit-level check above only proves
+    ``_bw()`` defers the import. This test drives the real registration
+    path — the same ``register_cli`` call ``main()`` makes when it builds
+    the ``hermes secrets`` parser — with the bitwarden module poisoned, and
+    asserts the parser tree still constructs and parses normally.
+    """
+    import importlib
+
+    # Poison the bitwarden module so any eager import fails loudly.
+    monkeypatch.setitem(
+        sys.modules, "agent.secret_sources.bitwarden", None
+    )
+
+    # Fresh module state for the lazy cache, mirroring a cold process.
+    from hermes_cli import secrets_cli
+
+    secrets_cli._bw_module = None
+    importlib.reload(secrets_cli)
+
+    # Build a minimal parent parser exactly like main() does for the
+    # `hermes secrets` subcommand, then register the bitwarden tree on it.
+    import argparse
+
+    secrets_parser = argparse.ArgumentParser(prog="hermes secrets")
+    bw_sub = secrets_parser.add_subparsers(dest="secrets_command")
+    bitwarden_parser = bw_sub.add_parser(
+        "bitwarden",
+        aliases=["bw"],
+        help="Bitwarden Secrets Manager integration",
+    )
+    secrets_cli.register_cli(bitwarden_parser)
+
+    # The tree must parse a status invocation without touching bitwarden.
+    args = secrets_parser.parse_args(["bitwarden", "status"])
+    assert args.secrets_command == "bitwarden"
+    assert args.secrets_bw_command == "status"
+
+    # And calling _bw() afterwards must raise — import is still deferred.
+    raised = False
+    try:
+        secrets_cli._bw()
+    except ImportError:
+        raised = True
+    assert raised, "_bw() must still raise after parser registration"
+
+
+
+
 def _bitwarden_config(*, enabled: bool = True, server_url: str = "") -> dict:
     return {
         "secrets": {
