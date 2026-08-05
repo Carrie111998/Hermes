@@ -97,12 +97,10 @@ def _load_l0_registry_config() -> Dict[str, Any]:
         if not content.startswith("---"):
             return dict(_DEFAULTS)
         # Extract YAML between first two --- markers
-        end_marker = content.index("
----", 3)
+        end_marker = content.index("\n---", 3)
         yaml_str = content[3:end_marker].strip()
         result = dict(_DEFAULTS)
-        for line in yaml_str.split("
-"):
+        for line in yaml_str.split("\n"):
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
