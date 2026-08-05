@@ -29,6 +29,7 @@ import os
 import re
 import difflib
 import hashlib
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -1179,8 +1180,16 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        # Read a sample to check for binary content. Use python to decode the
+        # first 1000 BYTES without splitting a multi-byte UTF-8 char: a raw
+        # `head -c 1000` cut mid-character produced U+FFFD in the sample, which
+        # the binary detector (correctly, for real mojibake) treated as binary
+        # and blocked legitimate Cyrillic/UTF-8 text files from being read.
+        sample_cmd = (
+            f"{sys.executable} -c \"import sys;d=open(sys.argv[1],'rb').read(1000);"
+            f"sys.stdout.write(d.decode('utf-8','ignore'))\" "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
@@ -1298,7 +1307,11 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_result = self._exec(
+            f"{sys.executable} -c \"import sys;d=open(sys.argv[1],'rb').read(1000);"
+            f"sys.stdout.write(d.decode('utf-8','ignore'))\" "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
