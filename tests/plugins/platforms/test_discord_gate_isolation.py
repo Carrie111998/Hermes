@@ -36,6 +36,7 @@ GATE_VARS = [
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
     "DISCORD_ALLOW_BOTS",
+    "DISCORD_AUTO_THREAD_FAILURE_MODE",
 ]
 
 
@@ -113,6 +114,14 @@ class TestTwoAdapterChannelIsolation:
         _snapshot(b, {"DISCORD_IGNORED_CHANNELS": "322"})
         assert a._get_ignored_channels() == {"311"}
         assert b._get_ignored_channels() == {"322"}
+
+    def test_auto_thread_failure_mode_reads_direct_extra(self):
+        """An adapter can resolve its failure policy from per-profile config."""
+        inline = _adapter({"auto_thread_failure_mode": "inline"})
+        error = _adapter({"auto_thread_failure_mode": "error"})
+
+        assert inline._get_auto_thread_failure_mode() == "inline"
+        assert error._get_auto_thread_failure_mode() == "error"
 
 
 class TestTwoAdapterUserRoleIsolation:
@@ -372,6 +381,42 @@ class TestYamlBridgeSeeding:
 
         assert a._get_allowed_channels() == {"111"}
         assert b._get_allowed_channels() == {"222"}
+
+    def test_auto_thread_failure_mode_isolated_between_multiplex_profiles(
+        self, monkeypatch
+    ):
+        """Profile A's inline policy must not override profile B's error policy."""
+        from agent import secret_scope
+        from plugins.platforms.discord.adapter import _apply_yaml_config
+
+        # Profile A loads first through the legacy unscoped path and bridges its
+        # value into process env.
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+        seeded_a = _apply_yaml_config({}, {"auto_thread_failure_mode": "inline"})
+        assert os.environ["DISCORD_AUTO_THREAD_FAILURE_MODE"] == "inline"
+
+        # Profile B loads in an authoritative multiplex scope. Its policy must
+        # be carried by PlatformConfig.extra without mutating process env.
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+        token = secret_scope.set_secret_scope({})
+        try:
+            seeded_b = _apply_yaml_config(
+                {}, {"auto_thread_failure_mode": "error"}
+            )
+            b = _adapter(seeded_b)
+            b._snapshot_gate_env()
+        finally:
+            secret_scope.reset_secret_scope(token)
+
+        assert os.environ["DISCORD_AUTO_THREAD_FAILURE_MODE"] == "inline"
+        assert seeded_b["auto_thread_failure_mode"] == "error"
+        assert b._get_auto_thread_failure_mode() == "error"
+
+        # The first profile retains its own explicit inline behavior.
+        monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", False)
+        a = _adapter(seeded_a)
+        a._snapshot_gate_env()
+        assert a._get_auto_thread_failure_mode() == "inline"
 
 
 class TestTelegramGateIsolation:

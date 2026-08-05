@@ -386,6 +386,7 @@ _GATE_ENV_KEYS = (
     "DISCORD_IGNORED_CHANNELS",
     "DISCORD_NO_THREAD_CHANNELS",
     "DISCORD_FREE_RESPONSE_CHANNELS",
+    "DISCORD_AUTO_THREAD_FAILURE_MODE",
     "DISCORD_MISSED_MESSAGE_BACKFILL_CHANNELS",
     "DISCORD_ALLOW_ALL_USERS",
     "DISCORD_ALLOW_BOTS",
@@ -6229,6 +6230,14 @@ class DiscordAdapter(BasePlatformAdapter):
         """This adapter's DISCORD_NO_THREAD_CHANNELS list (per-profile)."""
         return self._gate_csv_set(self._gate_raw("no_thread_channels", "DISCORD_NO_THREAD_CHANNELS"))
 
+    def _get_auto_thread_failure_mode(self) -> str:
+        """Return this adapter's safe normalized auto-thread failure policy."""
+        configured = self._gate_raw(
+            "auto_thread_failure_mode", "DISCORD_AUTO_THREAD_FAILURE_MODE"
+        )
+        mode = str(configured or "error").strip().lower()
+        return "inline" if mode == "inline" else "error"
+
     def _get_allowed_users(self) -> set:
         """This adapter's DISCORD_ALLOWED_USERS entries (per-profile, cleaned)."""
         raw = self._gate_raw("allow_from", "DISCORD_ALLOWED_USERS")
@@ -7641,6 +7650,7 @@ class DiscordAdapter(BasePlatformAdapter):
         #   discord.allowed_channels: If set, bot ONLY responds in these channels (whitelist)
         #   discord.no_thread_channels: Channel IDs where bot responds directly without creating thread
         #   discord.auto_thread: Auto-create thread on @mention in channels (default: true)
+        #   discord.auto_thread_failure_mode: error (default) or isolated inline fallback
 
         thread_id = None
         parent_channel_id = None
@@ -7725,6 +7735,7 @@ class DiscordAdapter(BasePlatformAdapter):
         # Messages already inside threads or DMs are unaffected.
         # no_thread_channels: channels where bot responds directly without thread.
         auto_threaded_channel = None
+        auto_thread_failed = False
         if not is_thread and not isinstance(message.channel, discord.DMChannel):
             no_thread_channels = self._get_no_thread_channels()
             skip_thread = bool(channel_keys & no_thread_channels) or is_free_channel
@@ -7749,25 +7760,34 @@ class DiscordAdapter(BasePlatformAdapter):
                     # Fixes #51057.
                     self._dedup.is_duplicate(str(thread.id))
                 else:
-                    # Auto-threading is the configured routing target for this
-                    # message; if it fails we must NOT silently fall back to an
-                    # inline parent-channel reply (#20243). That breaks
-                    # thread-first Discord workflows by dumping a new task into
-                    # a shared channel. Surface a short visible error so the
-                    # user can retry once Discord recovers, and skip agent
-                    # invocation for this message.
-                    try:
-                        await message.channel.send(
-                            "⚠️ Hermes could not create a Discord thread for "
-                            "this message, so the request was not processed. Please retry."
-                        )
-                    except Exception as notify_error:
-                        logger.warning(
-                            "[%s] Failed to notify user of auto-thread failure: %s",
-                            self.name,
-                            notify_error,
-                        )
-                    return False
+                    if self._get_auto_thread_failure_mode() == "error":
+                        # Auto-threading is the configured routing target for
+                        # this message. Fail closed by default so thread-first
+                        # workflows never spill a request into a shared channel.
+                        try:
+                            await message.channel.send(
+                                "\u26a0\ufe0f Hermes could not create a Discord thread for "
+                                "this message, so the request was not processed. Please retry."
+                            )
+                        except Exception as notify_error:
+                            logger.warning(
+                                "[%s] Failed to notify user of auto-thread failure: %s",
+                                self.name,
+                                notify_error,
+                            )
+                        return False
+
+                    # Explicit inline mode preserves parent-channel delivery,
+                    # while prospective_thread_id gives this failed attempt a
+                    # fresh isolated session instead of reusing parent history.
+                    logger.warning(
+                        "[%s] Discord auto-thread creation failed for message %s "
+                        "in channel %s; continuing in the parent channel",
+                        self.name,
+                        getattr(message, "id", "unknown"),
+                        getattr(message.channel, "id", "unknown"),
+                    )
+                    auto_thread_failed = True
 
         referenced_attachments = []
         reference = getattr(message, "reference", None)
@@ -7847,6 +7867,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 getattr(auto_threaded_channel, "_hermes_auto_thread_initial_name", None)
                 or self._derive_auto_thread_name(message.content or "")
             ) if auto_threaded_channel is not None else None,
+            prospective_thread_id=str(message.id) if auto_thread_failed else None,
         )
 
         # Build media URLs -- download image attachments to local cache so the
@@ -9879,8 +9900,8 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
     The DiscordAdapter reads its runtime configuration via ``os.getenv()``
     throughout the connect / handle code paths (``DISCORD_ALLOWED_USERS``,
     ``DISCORD_REQUIRE_MENTION``, ``DISCORD_FREE_RESPONSE_CHANNELS``,
-    ``DISCORD_AUTO_THREAD``, ``DISCORD_REACTIONS``,
-    ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
+    ``DISCORD_AUTO_THREAD``, ``DISCORD_AUTO_THREAD_FAILURE_MODE``,
+    ``DISCORD_REACTIONS``, ``DISCORD_IGNORED_CHANNELS``, ``DISCORD_ALLOWED_CHANNELS``,
     ``DISCORD_NO_THREAD_CHANNELS``, ``DISCORD_HISTORY_BACKFILL``,
     ``DISCORD_HISTORY_BACKFILL_LIMIT``, ``DISCORD_ALLOW_MENTION_*``,
     ``DISCORD_REPLY_TO_MODE``, ``DISCORD_THREAD_REQUIRE_MENTION``,
@@ -9960,6 +9981,22 @@ def _apply_yaml_config(yaml_cfg: dict, discord_cfg: dict) -> dict | None:
             os.environ["DISCORD_FREE_RESPONSE_CHANNELS"] = str(frc)
     if "auto_thread" in discord_cfg and not os.getenv("DISCORD_AUTO_THREAD"):
         os.environ["DISCORD_AUTO_THREAD"] = str(discord_cfg["auto_thread"]).lower()
+    auto_thread_failure_mode_cfg = (
+        discord_cfg["auto_thread_failure_mode"]
+        if "auto_thread_failure_mode" in discord_cfg
+        else platform_extra_cfg.get("auto_thread_failure_mode")
+    )
+    if auto_thread_failure_mode_cfg is not None:
+        seeded_extra["auto_thread_failure_mode"] = str(
+            auto_thread_failure_mode_cfg
+        ).lower()
+        if (
+            not _skip_env_bridge
+            and not os.getenv("DISCORD_AUTO_THREAD_FAILURE_MODE")
+        ):
+            os.environ["DISCORD_AUTO_THREAD_FAILURE_MODE"] = seeded_extra[
+                "auto_thread_failure_mode"
+            ]
     if "reactions" in discord_cfg and not os.getenv("DISCORD_REACTIONS"):
         os.environ["DISCORD_REACTIONS"] = str(discord_cfg["reactions"]).lower()
     backfill_cfg = discord_cfg.get("missed_message_backfill")
@@ -10091,7 +10128,7 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of ``config.yaml``
         # ``discord:`` keys (require_mention, free_response_channels,
-        # auto_thread, reactions, ignored_channels, allowed_channels,
+        # auto_thread, auto_thread_failure_mode, reactions, ignored_channels, allowed_channels,
         # no_thread_channels, allow_mentions.*, reply_to_mode,
         # thread_require_mention) into ``DISCORD_*`` env vars that the
         # adapter reads via ``os.getenv()``.  Replaces the hardcoded block

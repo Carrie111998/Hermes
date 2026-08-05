@@ -1875,7 +1875,7 @@ class SessionStore:
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            allow_peer_fallback=legacy_key is None and not source.prospective_thread_id,
             raise_on_lookup_error=raise_on_lookup_error,
         )
         migrated_legacy = False
@@ -1937,7 +1937,7 @@ class SessionStore:
         recovered = self._find_gateway_session_row(
             session_key=session_key,
             source=source,
-            allow_peer_fallback=legacy_key is None,
+            allow_peer_fallback=legacy_key is None and not source.prospective_thread_id,
         )
         migrated_legacy = False
         if (

@@ -7,7 +7,8 @@ import sys
 
 import pytest
 
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
+from gateway.session import build_session_key
 
 
 def _ensure_discord_mock():
@@ -128,8 +129,7 @@ async def test_non_ignored_channel_processes_normally(adapter, monkeypatch):
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 
     # Stub auto-thread creation so this test focuses on ignored-channel
-    # routing only — auto-thread failures now correctly skip agent invocation
-    # (#20243), which would otherwise mask the assertion below.
+    # routing only.
     adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
 
     message = make_message(channel=FakeTextChannel(channel_id=700), content="hello")
@@ -146,8 +146,7 @@ async def test_ignored_channels_empty_string_ignores_nothing(adapter, monkeypatc
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
 
     # Stub auto-thread creation so this test focuses on ignored-channel
-    # routing only — auto-thread failures now correctly skip agent invocation
-    # (#20243), which would otherwise mask the assertion below.
+    # routing only.
     adapter._auto_create_thread = AsyncMock(return_value=FakeThread(channel_id=999))
 
     message = make_message(channel=FakeTextChannel(channel_id=500), content="hello")
@@ -177,23 +176,52 @@ async def test_no_thread_channel_skips_auto_thread(adapter, monkeypatch):
     adapter.handle_message.assert_awaited_once()
     event = adapter.handle_message.await_args.args[0]
     assert event.source.chat_type == "group"
+    assert event.source.prospective_thread_id is None
 
 
-# ── auto-thread failure must not silently fall back to inline (#20243) ──
+# ── auto-thread failure policy (#20243) ──────────────────────────────
 
 
 @pytest.mark.asyncio
-async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkeypatch):
-    """Auto-thread creation failure must not trigger an inline parent-channel reply.
-
-    Before #20243, ``effective_channel = auto_threaded_channel or message.channel``
-    silently routed the response back to the parent channel when thread creation
-    failed, breaking thread-first Discord workflows. The fix surfaces a short
-    visible error to the parent channel and skips agent invocation entirely so
-    the user can retry.
-    """
+@pytest.mark.parametrize("failure_mode", [None, "error", "unexpected"])
+async def test_auto_thread_failure_defaults_safely_to_error(
+    adapter, monkeypatch, failure_mode
+):
+    """Default, explicit error, and unknown modes all fail closed."""
     monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
     monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    if failure_mode is None:
+        monkeypatch.delenv("DISCORD_AUTO_THREAD_FAILURE_MODE", raising=False)
+    else:
+        monkeypatch.setenv("DISCORD_AUTO_THREAD_FAILURE_MODE", failure_mode)
+    monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
+    monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
+
+    adapter._auto_create_thread = AsyncMock(return_value=None)
+
+    channel = FakeTextChannel(channel_id=800)
+    channel.send = AsyncMock()
+    message = make_message(channel=channel, content="hello")
+
+    handled = await adapter._handle_message(message)
+
+    assert handled is False
+    adapter._auto_create_thread.assert_awaited_once()
+    adapter.handle_message.assert_not_awaited()
+    channel.send.assert_awaited_once()
+    assert "request was not processed" in channel.send.await_args.args[0]
+
+
+@pytest.mark.asyncio
+async def test_auto_thread_failure_inline_dispatches_parent_with_prospective_scope(
+    adapter, monkeypatch
+):
+    """Inline mode dispatches once in the parent channel,
+    with the triggering message id used only as a session discriminator."""
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "false")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_FAILURE_MODE", "inline")
     monkeypatch.delenv("DISCORD_NO_THREAD_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_IGNORED_CHANNELS", raising=False)
     monkeypatch.delenv("DISCORD_FREE_RESPONSE_CHANNELS", raising=False)
@@ -206,14 +234,21 @@ async def test_auto_thread_failure_skips_agent_and_notifies_user(adapter, monkey
     await adapter._handle_message(message)
 
     adapter._auto_create_thread.assert_awaited_once()
-    # Agent must NOT be invoked when the routing target failed.
-    adapter.handle_message.assert_not_awaited()
-    # User gets a visible explanation in the parent channel instead of a silent
-    # inline reply.
-    channel.send.assert_awaited_once()
-    sent_text = channel.send.await_args.args[0]
-    assert "could not create" in sent_text.lower()
-    assert "thread" in sent_text.lower()
+    adapter.handle_message.assert_awaited_once()
+    channel.send.assert_not_awaited()
+    event = adapter.handle_message.await_args.args[0]
+    assert event.source.chat_id == "800"
+    assert event.source.chat_type == "group"
+    assert event.source.thread_id is None
+    assert event.source.parent_chat_id is None
+    assert event.source.prospective_thread_id == "123"
+    ordinary_parent = SimpleNamespace(
+        **{
+            **event.source.__dict__,
+            "prospective_thread_id": None,
+        }
+    )
+    assert build_session_key(event.source) != build_session_key(ordinary_parent)
 
 
 # ── config.py bridging ───────────────────────────────────────────────
@@ -240,3 +275,25 @@ def test_config_bridges_ignored_channels(monkeypatch, tmp_path):
     assert os.getenv("DISCORD_IGNORED_CHANNELS") == "111,222"
 
 
+def test_config_bridges_auto_thread_failure_mode(monkeypatch, tmp_path):
+    """discord.auto_thread_failure_mode bridges to its environment variable."""
+    import yaml
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        yaml.dump({"discord": {"auto_thread_failure_mode": "inline"}})
+    )
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_AUTO_THREAD_FAILURE_MODE", "")
+
+    from gateway.config import load_gateway_config
+
+    config = load_gateway_config()
+
+    import os
+
+    assert os.getenv("DISCORD_AUTO_THREAD_FAILURE_MODE") == "inline"
+    assert (
+        config.platforms[Platform.DISCORD].extra["auto_thread_failure_mode"]
+        == "inline"
+    )

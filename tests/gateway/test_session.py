@@ -615,6 +615,60 @@ class TestSlackWorkspaceSessionIsolation:
         )
 
 
+class TestProspectiveThreadRecovery:
+    def test_prospective_thread_recovery_never_uses_parent_peer_fallback(
+        self, tmp_path, monkeypatch
+    ):
+        db = SessionDB(db_path=tmp_path / "state.db")
+        config = GatewayConfig()
+        parent_source = SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="channel-1",
+            chat_type="group",
+            user_id="user-1",
+        )
+        prospective_source = replace(
+            parent_source,
+            prospective_thread_id="msg-123",
+        )
+        parent_key = build_session_key(parent_source)
+        prospective_key = build_session_key(prospective_source)
+        assert prospective_key != parent_key
+
+        db.create_session(
+            "old-parent-session",
+            "discord",
+            user_id="user-1",
+            session_key=parent_key,
+            chat_id="channel-1",
+            chat_type="group",
+            thread_id=None,
+        )
+        db.append_message("old-parent-session", "user", "old parent turn")
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with patch("hermes_state.SessionDB", return_value=db):
+            first_store = SessionStore(
+                sessions_dir=tmp_path / "routing-a",
+                config=config,
+            )
+            first_entry = first_store.get_or_create_session(prospective_source)
+
+        assert first_entry.session_id != "old-parent-session"
+        assert first_entry.session_key == prospective_key
+        db.append_message(first_entry.session_id, "user", "prospective turn")
+
+        with patch("hermes_state.SessionDB", return_value=db):
+            restarted = SessionStore(
+                sessions_dir=tmp_path / "routing-b",
+                config=config,
+            )
+            recovered = restarted.get_or_create_session(prospective_source)
+
+        assert recovered.session_id == first_entry.session_id
+        assert recovered.session_key == prospective_key
+
+
 class TestWhatsAppSessionKeyConsistency:
     """Regression: WhatsApp session keys must collapse JID/LID aliases to a
     single stable identity for both DM chat_ids and group participant_ids."""

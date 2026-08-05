@@ -2131,11 +2131,13 @@ discord:
   require_mention: true          # Require @mention to respond in server channels
   free_response_channels: ""     # Comma-separated channel IDs where bot responds without @mention
   auto_thread: true              # Auto-create threads on @mention in channels
+  auto_thread_failure_mode: error # error (safe default) or isolated inline fallback
 ```
 
 - `require_mention` — when `true` (default), the bot only responds in server channels when mentioned with `@BotName`. DMs always work without mention.
 - `free_response_channels` — comma-separated list of channel IDs where the bot responds to every message without requiring a mention.
 - `auto_thread` — when `true` (default), mentions in channels automatically create a thread for the conversation, keeping channels clean (similar to Slack threading).
+- `auto_thread_failure_mode` — `error` (default) sends a retry warning and does not process the request if thread creation fails. `inline` continues in the parent channel with a fresh isolated session. Unknown values use `error`.
 
 ## Security
 

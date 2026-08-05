@@ -5,17 +5,21 @@ Covers the fix for slash commands not being recognized when sent via
 """
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.session import build_session_key
 from tests.e2e.conftest import (
     BOT_USER_ID,
+    CHANNEL_ID,
     E2E_MESSAGE_SETTLE_DELAY,
     get_response_text,
     make_discord_message,
     make_fake_dm_channel,
+    make_fake_text_channel,
     make_fake_thread,
 )
 
@@ -105,6 +109,112 @@ class TestAutoThreadingPreservesCommand:
         response = get_response_text(discord_adapter)
         assert response is not None
         assert "/new" in response
+
+    async def test_successful_auto_thread_routes_event_to_new_thread(
+        self, discord_adapter, bot_user, monkeypatch
+    ):
+        """Successful auto-threading should build the event as a thread turn."""
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
+        discord_adapter._text_batch_delay_seconds = 0
+        discord_adapter.handle_message = AsyncMock()
+
+        parent = make_fake_text_channel(channel_id=CHANNEL_ID, name="support")
+        fake_thread = make_fake_thread(thread_id=90002, name="help", parent=parent)
+        msg = make_discord_message(
+            content=f"<@{BOT_USER_ID}> help me",
+            channel=parent,
+            mentions=[bot_user],
+        )
+        msg.create_thread = AsyncMock(return_value=fake_thread)
+
+        handled = await discord_adapter._handle_message(msg)
+
+        assert handled is True
+        msg.create_thread.assert_awaited_once()
+        discord_adapter.handle_message.assert_awaited_once()
+        event = discord_adapter.handle_message.await_args.args[0]
+        assert event.source.chat_id == "90002"
+        assert event.source.chat_type == "thread"
+        assert event.source.thread_id == "90002"
+        assert event.source.prospective_thread_id is None
+        assert event.source.parent_chat_id == str(CHANNEL_ID)
+        assert event.source.auto_thread_created is True
+        assert event.source.auto_thread_initial_name == "help me"
+
+    async def test_failed_auto_thread_continues_in_parent_without_failure_notice(
+        self, discord_adapter, bot_user, monkeypatch
+    ):
+        """If auto-threading fails, the original request should still dispatch in the parent channel."""
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD_FAILURE_MODE", "inline")
+        monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
+        discord_adapter._text_batch_delay_seconds = 0
+        discord_adapter.handle_message = AsyncMock()
+
+        parent = make_fake_text_channel(channel_id=CHANNEL_ID, name="support")
+        parent.send = AsyncMock(side_effect=RuntimeError("seed message failed"))
+        msg = make_discord_message(
+            content=f"<@{BOT_USER_ID}> help me",
+            channel=parent,
+            mentions=[bot_user],
+        )
+        msg.create_thread = AsyncMock(side_effect=RuntimeError("thread create failed"))
+
+        handled = await discord_adapter._handle_message(msg)
+
+        assert handled is True
+        assert msg.create_thread.await_count == 2
+        assert parent.send.await_count == 2
+        assert all(
+            "Hermes could not create a Discord thread" not in call.args[0]
+            for call in parent.send.await_args_list
+        )
+        discord_adapter.handle_message.assert_awaited_once()
+        event = discord_adapter.handle_message.await_args.args[0]
+        assert event.text == "help me"
+        assert event.source.chat_id == str(CHANNEL_ID)
+        assert event.source.chat_type == "group"
+        assert event.source.thread_id is None
+        assert event.source.parent_chat_id is None
+        assert event.source.prospective_thread_id == str(msg.id)
+        assert build_session_key(event.source) != build_session_key(
+            replace(event.source, prospective_thread_id=None)
+        )
+
+    async def test_failed_auto_thread_source_metadata_has_no_auto_thread(
+        self, discord_adapter, bot_user, monkeypatch
+    ):
+        """Failure fallback metadata must reflect that no thread was auto-created."""
+        monkeypatch.setenv("DISCORD_AUTO_THREAD", "true")
+        monkeypatch.setenv("DISCORD_AUTO_THREAD_FAILURE_MODE", "inline")
+        monkeypatch.setenv("DISCORD_HISTORY_BACKFILL", "false")
+        discord_adapter._text_batch_delay_seconds = 0
+        discord_adapter.handle_message = AsyncMock()
+
+        parent = make_fake_text_channel(channel_id=CHANNEL_ID, name="support")
+        parent.send = AsyncMock(side_effect=RuntimeError("seed message failed"))
+        msg = make_discord_message(
+            content=f"<@{BOT_USER_ID}> summarize this",
+            channel=parent,
+            mentions=[bot_user],
+        )
+        msg.create_thread = AsyncMock(side_effect=RuntimeError("thread create failed"))
+
+        handled = await discord_adapter._handle_message(msg)
+
+        assert handled is True
+        discord_adapter.handle_message.assert_awaited_once()
+        source = discord_adapter.handle_message.await_args.args[0].source
+        assert source.auto_thread_created is False
+        assert source.auto_thread_initial_name is None
+        assert source.prospective_thread_id == str(msg.id)
+        metadata = source.to_dict()
+        assert "auto_thread_created" not in metadata
+        assert "auto_thread_initial_name" not in metadata
+        assert metadata["thread_id"] is None
+        assert "parent_chat_id" not in metadata
+        assert metadata["prospective_thread_id"] == str(msg.id)
 
 
 class TestRepliedToMediaDispatch:

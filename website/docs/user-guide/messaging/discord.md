@@ -301,6 +301,7 @@ Discord behavior is controlled through two files: **`~/.hermes/.env`** for crede
 | `DISCORD_FREE_RESPONSE_CHANNELS` | No | — | Comma-separated channel IDs where the bot responds without requiring an `@mention`, even when `DISCORD_REQUIRE_MENTION` is `true`. |
 | `DISCORD_IGNORE_NO_MENTION` | No | `true` | When `true`, the bot stays silent if a message `@mentions` other users but does **not** mention the bot. Prevents the bot from jumping into conversations directed at other people. Only applies in server channels, not DMs. |
 | `DISCORD_AUTO_THREAD` | No | `true` | When `true`, automatically creates a new thread for every `@mention` in a text channel, so each conversation is isolated (similar to Slack behavior). Messages already inside threads or DMs are unaffected. |
+| `DISCORD_AUTO_THREAD_FAILURE_MODE` | No | `"error"` | Behavior when Discord cannot create an auto-thread: `"error"` sends a retry warning and does not process the request; `"inline"` processes it in the parent channel with a fresh isolated session. Unknown values safely use `"error"`. |
 | `DISCORD_ALLOW_BOTS` | No | `"none"` | Controls how the bot handles messages from other Discord bots. `"none"` — ignore all other bots. `"mentions"` — only accept bot messages that `@mention` Hermes. `"all"` — accept all bot messages. |
 | `DISCORD_REACTIONS` | No | `true` | When `true`, the bot adds emoji reactions to messages during processing (👀 when starting, ✅ on success, ❌ on error). Set to `false` to disable reactions entirely. |
 | `DISCORD_IGNORED_CHANNELS` | No | — | Comma-separated channel IDs where the bot **never** responds, even when `@mentioned`. Takes priority over all other channel settings. |
@@ -336,6 +337,7 @@ discord:
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
+  auto_thread_failure_mode: error  # error (safe default) or isolated inline fallback
   reactions: true                 # Add emoji reactions during processing
   ignored_channels: []            # Channel IDs where bot never responds
   no_thread_channels: []          # Channel IDs where bot responds without threading
@@ -409,6 +411,19 @@ Free-response channels also **skip auto-threading** — the bot replies inline r
 When enabled, every `@mention` in a regular text channel automatically creates a new thread for the conversation. This keeps the main channel clean and gives each conversation its own isolated session history. Once a thread is created, subsequent messages in that thread don't require `@mention` — the bot knows it's already participating. Set [`thread_require_mention`](#discordthread_require_mention) to `true` to disable this in-thread shortcut for multi-bot setups.
 
 Messages sent in existing threads or DMs are unaffected by this setting. Channels listed in `discord.free_response_channels` or `discord.no_thread_channels` also bypass auto-threading and get inline replies instead.
+
+#### `discord.auto_thread_failure_mode`
+
+**Type:** string (`error` or `inline`) — **Default:** `error`
+
+Controls what happens when `auto_thread` is enabled but Discord thread creation fails. The safe default, `error`, sends the existing “request was not processed” warning and stops before invoking the agent, preserving thread-first workflows. Set it to `inline` to continue processing in the parent channel instead. Each inline fallback uses the triggering message ID as a prospective thread scope, so it starts a fresh isolated session rather than reusing stale parent-channel history. No thread-failure warning is sent in `inline` mode. Unknown values are normalized to `error`.
+
+```yaml
+discord:
+  auto_thread_failure_mode: inline
+```
+
+The setting has no effect on successful auto-thread creation, existing threads or DMs, or channels that bypass threading through `free_response_channels` or `no_thread_channels`.
 
 #### `discord.reactions`
 
