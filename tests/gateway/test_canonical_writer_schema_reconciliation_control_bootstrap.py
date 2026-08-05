@@ -1890,9 +1890,25 @@ def test_runtime_routeback_helper_replay_requires_exact_target_contract(
         attestation=object(),
         sha256=target_sha256,
     )
+    managed_hba_receipt = object()
+    hba_calls: list[tuple[Any, int, int]] = []
+
+    def collect_hba(
+        writer_config: Any,
+        *,
+        now_unix: int,
+        ttl_seconds: int,
+    ) -> Any:
+        hba_calls.append((writer_config, now_unix, ttl_seconds))
+        return managed_hba_receipt
+
     base = types.SimpleNamespace(
         target=target,
-        dependencies=types.SimpleNamespace(writer_config=lambda: config),
+        dependencies=types.SimpleNamespace(
+            writer_config=lambda: config,
+            collect_hba=collect_hba,
+            now=lambda: NOW,
+        ),
     )
     context = bootstrap._ControlRuntimeContext(
         base=base,
@@ -1927,7 +1943,10 @@ def test_runtime_routeback_helper_replay_requires_exact_target_contract(
         session,
         observation,
     )
-    assert calls == [(session, config, policy, None, config.user)]
+    assert hba_calls == [(config, NOW, 300)]
+    assert calls == [
+        (session, config, policy, managed_hba_receipt, config.user)
+    ]
 
     monkeypatch.setattr(
         bootstrap,
