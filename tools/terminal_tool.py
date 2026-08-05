@@ -2545,6 +2545,14 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # A NUL byte means a binary (ELF/Mach-O/PE/SQLite),
+                                # not a shell script — scanning decoded binary
+                                # contents tokenizes machine code and feeds NUL-
+                                # containing "paths" into the recursion, crashing
+                                # the guard with `embedded null byte` (#78811).
+                                # Mirror _read_referenced_script's skip semantics.
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
