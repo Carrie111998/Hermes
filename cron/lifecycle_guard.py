@@ -171,7 +171,15 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        path = Path(candidate).expanduser()
+    except RuntimeError:
+        # HOME unresolvable (unset/empty + no passwd entry): keep the
+        # literal path — a guarded path must never crash the guard
+        # (#76762). expanduser raises RuntimeError (not OSError/ValueError)
+        # in that case, so it must be caught here, not at the resolve()
+        # call site (#78974).
+        path = Path(candidate)
     if not path.is_absolute():
         path = Path(cwd or Path.cwd()) / path
     return path
@@ -310,7 +318,14 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    try:
+        script_paths = list(_iter_referenced_shell_scripts(command, cwd=cwd))
+    except (OSError, ValueError, RuntimeError):
+        # Any tokenizer/expansion surprise (unresolvable HOME, NUL bytes,
+        # unreadable paths) must degrade the scan, never crash the
+        # terminal tool (#78974, #76762).
+        script_paths = []
+    for script_path in script_paths:
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):

@@ -9,6 +9,7 @@ Covers:
 import json
 import os
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -704,6 +705,29 @@ class TestLifecycleGuardModule:
         (tmp_path / "deploy.sh").write_text("#!/bin/bash\nhermes gateway stop\n")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("daily ops", str(script))
+
+    def test_unresolvable_home_does_not_crash_guard(self, monkeypatch):
+        """#78974: expanduser raising RuntimeError (HOME unset + no passwd
+        entry) must degrade the scan, not crash the terminal tool.
+
+        Before the fix, _resolve_terminal_script_path called expanduser()
+        unguarded; the RuntimeError escaped the generator before the
+        resolve() try/except could catch it.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def _boom(self):
+            raise RuntimeError("Could not determine home directory.")
+
+        monkeypatch.setattr(Path, "expanduser", _boom)
+        # A ~-prefixed path forces the expanduser() call; the guard must
+        # degrade to the literal path and complete the scan.
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "bash ~/x.sh"
+        )
+        assert result is False
 
 
 # ---------------------------------------------------------------------------
