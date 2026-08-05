@@ -239,6 +239,104 @@ class TestMcpListJson:
         assert "ink" in out
         assert "enabled" in out
 
+    def test_list_json_non_dict_entry_does_not_kill_the_doc(self, tmp_path, capsys):
+        """One hand-edited non-dict server must not nuke the whole JSON doc."""
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "broken": "just a string",
+            "good": {"url": "https://example.com/mcp"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        servers = {s["name"]: s for s in doc["servers"]}
+        assert servers["broken"]["tools_known"] is False
+        assert servers["broken"]["tools"] == []
+        assert servers["good"]["url"] == "https://example.com/mcp"
+
+    def test_list_json_string_enabled_values(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "yes_server": {"url": "https://a.example/mcp", "enabled": "yes"},
+            "zero_server": {"url": "https://b.example/mcp", "enabled": "0"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        servers = {s["name"]: s for s in doc["servers"]}
+        assert servers["yes_server"]["enabled"] is True
+        assert servers["zero_server"]["enabled"] is False
+
+    def test_list_json_command_with_string_args_emits_empty_list(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "odd": {"command": "npx", "args": "npx -y @pkg"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        server = doc["servers"][0]
+        assert server["command"] == "npx"
+        assert server["args"] == []
+
+    def test_list_json_url_wins_over_command(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "both": {"url": "https://example.com/mcp", "command": "npx"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        server = doc["servers"][0]
+        assert server["url"] == "https://example.com/mcp"
+        assert "command" not in server
+
+    def test_list_json_corrupt_cache_without_names_is_unknown(self, tmp_path, capsys):
+        """Fingerprint-matching entry whose tools carry no names must read unknown."""
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "odd": {"url": "https://example.com/mcp"},
+        })
+        from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+
+        write_cache_entry(
+            "odd",
+            config_fingerprint({"url": "https://example.com/mcp"}),
+            tools=[{"description": "nameless", "inputSchema": {}}],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        server = doc["servers"][0]
+        assert server["tools_known"] is False
+        assert server["tools"] == []
+
+    def test_list_json_parser_exposes_the_flag(self):
+        """The argparse wiring itself is under test: --json must parse on `mcp list`."""
+        import argparse
+
+        from hermes_cli.subcommands.mcp import build_mcp_parser
+
+        parser = argparse.ArgumentParser()
+        subparsers = parser.add_subparsers(dest="command")
+        build_mcp_parser(subparsers, cmd_mcp=lambda args: None)
+        ns = parser.parse_args(["mcp", "list", "--json"])
+        assert ns.mcp_action == "list"
+        assert ns.json is True
+        # The alias carries the flag too.
+        ns_alias = parser.parse_args(["mcp", "ls", "--json"])
+        assert ns_alias.json is True
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_remove

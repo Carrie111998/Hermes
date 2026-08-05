@@ -79,7 +79,8 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
     mcp_list_p.add_argument(
         "--json",
         action="store_true",
-        help="Emit the server inventory as JSON (tool detail from the schema cache)",
+        help="Emit the server inventory as JSON (tool detail from the schema cache; "
+             "transport values are printed untruncated)",
     )
 
     mcp_test_p = mcp_sub.add_parser("test", help="Test MCP server connection")

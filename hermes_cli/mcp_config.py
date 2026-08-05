@@ -661,18 +661,25 @@ def _mcp_server_json_payload(name: str, cfg: dict) -> dict:
     — an honest "no tool detail", never a lying empty list.
     """
     payload: Dict[str, Any] = {"name": name}
+    if not isinstance(cfg, dict):
+        # A hand-edited non-dict entry must not nuke the whole document:
+        # report it honestly as a server with no known detail.
+        payload["enabled"] = True
+        payload["tools_known"] = False
+        payload["tools"] = []
+        return payload
     enabled = cfg.get("enabled", True)
     if isinstance(enabled, str):
         payload["enabled"] = enabled.lower() in {"true", "1", "yes"}
     else:
         payload["enabled"] = bool(enabled)
+    # Transport mirrors the text path's preference: url wins over command.
     if "url" in cfg:
         payload["url"] = cfg["url"]
-    if "command" in cfg:
+    elif "command" in cfg:
         payload["command"] = cfg["command"]
         args = cfg.get("args")
-        if isinstance(args, list):
-            payload["args"] = args
+        payload["args"] = args if isinstance(args, list) else []
     if cfg.get("auth"):
         payload["auth"] = cfg["auth"]
     tools = _cached_tool_list(name, cfg)
@@ -697,11 +704,16 @@ def _cached_tool_list(name: str, cfg: dict) -> Optional[List[dict]]:
     tools = entry.get("tools")
     if not isinstance(tools, list):
         return None
-    return [
+    known = [
         {"name": tool["name"], "description": tool.get("description", "")}
         for tool in tools
         if isinstance(tool, dict) and tool.get("name")
     ]
+    # A fingerprint-matching entry with tools but no usable names is a
+    # corrupted cache, not evidence of an empty server: report unknown.
+    if tools and not known:
+        return None
+    return known
 
 
 def _print_mcp_servers_json(servers: dict) -> None:
