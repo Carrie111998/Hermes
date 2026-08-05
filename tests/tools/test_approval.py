@@ -174,6 +174,32 @@ class TestWindowsShellDestructiveCommands:
         assert key is not None
         assert desc == "Windows cmd destructive delete"
 
+    def test_extended_absolute_cmd_path_requires_approval(self):
+        command = r"\\?\C:\Windows\System32\cmd.exe /c del /q C:\data"
+        normalized = approval_module._normalize_command_for_detection(command)
+        assert normalized == "//?/C:/Windows/System32/cmd.exe /c del /q C:/data"
+
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True
+        assert key is not None
+        assert desc == "Windows cmd destructive delete"
+
+    def test_quoted_device_absolute_pwsh_path_requires_approval(self):
+        command = (
+            r'"\\.\C:\Program Files\PowerShell\7\pwsh.exe" '
+            r"-Command Remove-Item -Recurse C:\data"
+        )
+        normalized = approval_module._normalize_command_for_detection(command)
+        assert normalized == (
+            '"//./C:/Program Files/PowerShell/7/pwsh.exe" '
+            "-Command Remove-Item -Recurse C:/data"
+        )
+
+        dangerous, key, desc = detect_dangerous_command(command)
+        assert dangerous is True
+        assert key is not None
+        assert desc == "Windows PowerShell destructive delete"
+
     def test_windows_destructive_requires_approval(self):
         cases = [
             (r"cmd /c del /f /q C:\tmp\hermes-victim\file.txt", "Windows cmd destructive delete"),
