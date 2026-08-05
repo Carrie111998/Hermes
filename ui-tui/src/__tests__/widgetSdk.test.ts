@@ -5,8 +5,8 @@ import { patchUiState, resetUiState } from '../app/uiStore.js'
 import { dialogTestApp, gridTestApp } from '../sdk/apps/index.js'
 import { closeWidget, dispatchWidgetInput, launchWidget, openWidget } from '../sdk/host.js'
 import { getWidgetApp, listWidgetApps } from '../sdk/registry.js'
-import { widgetSdk } from '../sdk/userWidgets.js'
 import type { WidgetInput } from '../sdk/types.js'
+import { widgetSdk } from '../sdk/userWidgets.js'
 
 const key = (overrides: Partial<WidgetInput['key']> = {}, ch = ''): WidgetInput =>
   ({
@@ -26,6 +26,7 @@ describe('widget SDK host', () => {
     const { renderToScreen } = await import('../../packages/hermes-ink/src/ink/render-to-screen.js')
     const { cellAtIndex } = await import('../../packages/hermes-ink/src/ink/screen.js')
     const { createElement } = await import('react')
+
     const textOf = () => {
       const { screen, height } = renderToScreen(createElement(AmbientDock, { placement: 'dock-bottom' }), 100)
 
@@ -99,6 +100,7 @@ describe('widget SDK host', () => {
 
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const element = createElement(AmbientDock, { placement: 'dock-bottom' })
+
     const instance = renderSync(element, {
       patchConsole: false,
       stderr: stderr as unknown as NodeJS.WriteStream,
@@ -131,18 +133,28 @@ describe('widget SDK host', () => {
     const { defineWidgetApp } = await import('../sdk/registry.js')
 
     const seenRefs: string[] = []
+
+    const ModalHookA = () => {
+      const ref = useRef('a')
+      seenRefs.push(`a:${ref.current}`)
+
+      return widgetSdk.h(widgetSdk.Text, null, 'modal-a')
+    }
+
+    const ModalHookB = () => {
+      const ref = useRef('b')
+      seenRefs.push(`b:${ref.current}`)
+
+      return widgetSdk.h(widgetSdk.Text, null, 'modal-b')
+    }
+
     defineWidgetApp({
       help: 'modal hook a',
       id: 'modal-hook-a',
       mode: 'modal',
       init: () => ({}),
       reduce: state => state,
-      render: () => {
-        const ref = useRef('a')
-        seenRefs.push(`a:${ref.current}`)
-
-        return widgetSdk.h(widgetSdk.Text, null, 'modal-a')
-      }
+      render: ModalHookA
     })
     defineWidgetApp({
       help: 'modal hook b',
@@ -150,12 +162,7 @@ describe('widget SDK host', () => {
       mode: 'modal',
       init: () => ({}),
       reduce: state => state,
-      render: () => {
-        const ref = useRef('b')
-        seenRefs.push(`b:${ref.current}`)
-
-        return widgetSdk.h(widgetSdk.Text, null, 'modal-b')
-      }
+      render: ModalHookB
     })
 
     const stdout = new PassThrough()
@@ -167,6 +174,7 @@ describe('widget SDK host', () => {
 
     const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
     const element = createElement(ActiveWidgetSlot)
+
     const instance = renderSync(element, {
       patchConsole: false,
       stderr: stderr as unknown as NodeJS.WriteStream,
@@ -185,18 +193,20 @@ describe('widget SDK host', () => {
       }).not.toThrow()
       expect(seenRefs.at(-1)).toBe('b:b')
 
+      const ModalHookBReloaded = () => {
+        const ref = useRef('reloaded')
+        seenRefs.push(`reload:${ref.current}`)
+
+        return widgetSdk.h(widgetSdk.Text, null, 'modal-b-reloaded')
+      }
+
       defineWidgetApp({
         help: 'modal hook b reloaded',
         id: 'modal-hook-b',
         mode: 'modal',
         init: () => ({}),
         reduce: state => state,
-        render: () => {
-          const ref = useRef('reloaded')
-          seenRefs.push(`reload:${ref.current}`)
-
-          return widgetSdk.h(widgetSdk.Text, null, 'modal-b-reloaded')
-        }
+        render: ModalHookBReloaded
       })
       expect(() => instance.rerender(element)).not.toThrow()
       expect(seenRefs.at(-1)).toBe('reload:reloaded')

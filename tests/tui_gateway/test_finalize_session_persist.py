@@ -13,7 +13,7 @@ Scenarios:
 
 import threading
 import time
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import ANY, MagicMock, PropertyMock, patch
 
 import pytest
 
@@ -269,5 +269,8 @@ class TestOnSessionEndHook:
             interrupted=True,
             model="claude-sonnet-4",
             platform="tui",
+            ui_session_id=ANY,
+            session_profile=ANY,
+            session_cwd=ANY,
         )
 
