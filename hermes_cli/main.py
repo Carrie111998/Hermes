@@ -2253,6 +2253,47 @@ def _safe_tui_cwd(env: Optional[dict] = None) -> str:
         return str(PROJECT_ROOT)
 
 
+# Queries larger than this travel to the TUI via a file path
+# (HERMES_TUI_QUERY_FILE) instead of an env value: Linux applies
+# MAX_ARG_STRLEN (~128KiB) to individual environment strings too.
+_TUI_QUERY_ENV_MAX_BYTES = 100_000
+# OOM guard for the --query-file slurp; real prompts are far smaller
+# (harness-dispatch caps prompts at 500KB).
+_MAX_QUERY_FILE_BYTES = 50 * 1024 * 1024
+
+
+def _apply_tui_query_env(
+    env: dict, query: Optional[str], query_file: Optional[str] = None
+) -> Optional[str]:
+    """Hand the initial query to the TUI without exceeding per-string env
+    size limits. Small queries ride HERMES_TUI_QUERY; large queries and
+    explicit query files ride HERMES_TUI_QUERY_FILE (the TUI reads the
+    file itself). Returns a temp file path the caller must unlink, or None.
+    """
+    if not query:
+        return None
+    if query_file and os.path.isfile(query_file):
+        env["HERMES_TUI_QUERY_FILE"] = os.path.abspath(query_file)
+        return None
+    if len(query.encode("utf-8", "replace")) <= _TUI_QUERY_ENV_MAX_BYTES:
+        env["HERMES_TUI_QUERY"] = query
+        return None
+    import tempfile
+
+    fd, path = tempfile.mkstemp(prefix="hermes-tui-query-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(query)
+    except Exception:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        raise
+    env["HERMES_TUI_QUERY_FILE"] = path
+    return path
+
+
 def _apply_tui_python_env(env: dict) -> None:
     """Seed/repair Python-related env vars shared by CLI and dashboard TUI launches."""
     src_root = str(env.get("HERMES_PYTHON_SRC_ROOT") or "").strip()
@@ -2285,6 +2326,7 @@ def _launch_tui(
     verbose: Optional[bool] = None,
     quiet: bool = False,
     query: Optional[str] = None,
+    query_file: Optional[str] = None,
     image: Optional[str] = None,
     worktree: bool = False,
     checkpoints: bool = False,
@@ -2294,6 +2336,7 @@ def _launch_tui(
 ):
     """Replace current process with the TUI."""
     tui_dir = PROJECT_ROOT / "ui-tui"
+    tui_query_tmp: Optional[str] = None
 
     import tempfile
 
@@ -2359,8 +2402,7 @@ def _launch_tui(
             value = str(skills).strip()
             if value:
                 env["HERMES_TUI_SKILLS"] = value
-    if query:
-        env["HERMES_TUI_QUERY"] = query
+    tui_query_tmp = _apply_tui_query_env(env, query, query_file)
     if image:
         env["HERMES_TUI_IMAGE"] = image
     if checkpoints:
@@ -2420,6 +2462,11 @@ def _launch_tui(
             os.unlink(active_session_file)
         except OSError:
             pass
+        if tui_query_tmp:
+            try:
+                os.unlink(tui_query_tmp)
+            except OSError:
+                pass
         if wt_info:
             try:
                 _cleanup_worktree(wt_info)
@@ -2531,20 +2578,28 @@ def cmd_chat(args):
 
     _apply_safe_mode(args)
 
-    # --query-file: read the single query from a file instead of -q/--query.
-    # Needed for very large prompts (e.g. harness-dispatch runs) that exceed
-    # the kernel's per-argv limit (MAX_ARG_STRLEN ~128KiB). Normalized here so
-    # both the TUI path and the classic CLI path see a plain `args.query`.
+    # --query-file: single query read from a file (large prompts would blow
+    # the kernel's per-argv limit when passed via -q). Normalized here so
+    # both the TUI path and the classic CLI path see a plain args.query.
     query_file = getattr(args, "query_file", None)
     if query_file:
-        if getattr(args, "query", None):
+        if getattr(args, "query", None) is not None:
             print("Error: use either -q/--query or --query-file, not both.")
             sys.exit(2)
         try:
             with open(query_file, "r", encoding="utf-8") as _qf:
-                args.query = _qf.read()
+                args.query = _qf.read(_MAX_QUERY_FILE_BYTES + 1)
+        except UnicodeDecodeError as exc:
+            print(f"Error: --query-file {query_file!r} is not valid UTF-8: {exc}")
+            sys.exit(2)
         except OSError as exc:
             print(f"Error: cannot read --query-file {query_file!r}: {exc}")
+            sys.exit(2)
+        if len(args.query) > _MAX_QUERY_FILE_BYTES:
+            print(f"Error: --query-file {query_file!r} exceeds {_MAX_QUERY_FILE_BYTES} bytes")
+            sys.exit(2)
+        if not args.query.strip():
+            print(f"Error: --query-file {query_file!r} is empty")
             sys.exit(2)
 
     # Resolve --continue into --resume with the latest session or by name
@@ -2713,6 +2768,7 @@ def cmd_chat(args):
             verbose=getattr(args, "verbose", None),
             quiet=getattr(args, "quiet", False),
             query=getattr(args, "query", None),
+            query_file=getattr(args, "query_file", None),
             image=getattr(args, "image", None),
             worktree=getattr(args, "worktree", False),
             checkpoints=getattr(args, "checkpoints", False),
@@ -10914,7 +10970,11 @@ def _try_termux_fast_cli_launch() -> bool:
 
     if args.command in {None, "chat"}:
         _set_chat_arg_defaults(args)
-        interactive_prompt = not getattr(args, "query", None) and not getattr(args, "image", None)
+        interactive_prompt = (
+            not getattr(args, "query", None)
+            and not getattr(args, "query_file", None)
+            and not getattr(args, "image", None)
+        )
         if interactive_prompt:
             # Bare Termux CLI should reach the prompt first and do agent-only
             # discovery on the first submitted turn instead of before input.

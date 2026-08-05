@@ -1,5 +1,7 @@
 import type { MouseTrackingMode } from '@hermes/ink'
 
+import { readFileSync } from 'node:fs'
+
 import { isTermuxTuiMode } from '../lib/termux.js'
 
 const truthy = (v?: string) => /^(?:1|true|yes|on)$/i.test((v ?? '').trim())
@@ -26,7 +28,19 @@ const parseToggle = (v?: string): boolean | null => {
 export const TERMUX_TUI_MODE = isTermuxTuiMode()
 
 export const STARTUP_RESUME_ID = (process.env.HERMES_TUI_RESUME ?? '').trim()
-export const STARTUP_QUERY = (process.env.HERMES_TUI_QUERY ?? '').trim()
+// Large initial queries are handed over via HERMES_TUI_QUERY_FILE (a path)
+// because environment values are subject to the same per-string size limits
+// as argv. Prefer the file when present; fall back to the env-carried query.
+const startupQueryFile = (process.env.HERMES_TUI_QUERY_FILE ?? '').trim()
+let startupQuery = (process.env.HERMES_TUI_QUERY ?? '').trim()
+if (startupQueryFile) {
+  try {
+    startupQuery = readFileSync(startupQueryFile, 'utf8').trim()
+  } catch {
+    // Unreadable file: fall back to the env-carried query.
+  }
+}
+export const STARTUP_QUERY = startupQuery
 export const STARTUP_IMAGE = (process.env.HERMES_TUI_IMAGE ?? '').trim()
 
 // Mouse tracking mode resolution at startup. Per-mode selection (off|wheel|
