@@ -207,13 +207,15 @@ git commit -m "fix(environments): surrogateescape-safe stdin piping, always clos
 ### Task 2: Surface stdin write failures — `_wait_for_process` + `_exec`
 
 **Files:**
-- Modify: `tools/environments/base.py` — `_wait_for_process` natural-exit path (currently line 1210)
+- Modify: `tools/environments/base.py` — `_pipe_stdin` (store the writer-thread handle: `proc._hermes_stdin_thread = thread` before `thread.start()`), `_wait_for_process` natural-exit path (currently line 1210)
 - Modify: `tools/file_operations.py` — `ShellFileOperations._exec` (lines 846-876, mapping at 872-876)
 - Test: extend `tests/tools/test_file_write_surrogate_roundtrip.py` (append classes below)
 
 **Interfaces:**
-- Consumes: `proc._hermes_stdin_errors` (Task 1).
+- Consumes: `proc._hermes_stdin_errors` (Task 1) and `proc._hermes_stdin_thread` (added here to `_pipe_stdin`).
 - Produces: `"stdin_error": str` key on `BaseEnvironment.execute()` result dicts (only when the writer thread failed and the child still exited); `ShellFileOperations._exec` maps a `stdin_error` on an otherwise-zero returncode to `exit_code=1`.
+
+**Review carry-forward (codex quality review of Task 1):** a child that exits WITHOUT reading stdin (e.g. `bash -c 'exit 0'`) can let the writer thread finish after `_wait_for_process` reads the error list — a legit encode failure could be silently missed. `_wait_for_process` MUST join the writer thread (bounded) before reading `_hermes_stdin_errors`. The writer thread cannot block long after child exit (write raises `BrokenPipeError` once the pipe closes), so `join(timeout=5)` is a pure safety net.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -252,18 +254,69 @@ class TestExecStdinErrorMapping:
         result = ops._exec("echo hi", cwd="/tmp", stdin_data="\ud800")
         assert result.exit_code == 1
         assert "boom" in result.stdout
+
+
+class TestPipeStdinRemainingBranches:
+    """Review-requested coverage: bytes passthrough + proc.stdin None."""
+
+    def test_bytes_input_passes_through_untouched(self, tmp_path):
+        out = tmp_path / "out.bin"
+        proc = subprocess.Popen(
+            ["bash", "-c", f"cat > {shlex.quote(str(out))}"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        try:
+            _pipe_stdin(proc, b"\x00\x01\xfe")
+            _wait_or_kill(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        assert proc.returncode == 0
+        assert out.read_bytes() == b"\x00\x01\xfe"
+        assert proc._hermes_stdin_errors == []
+
+    def test_stdin_none_records_runtime_error(self, tmp_path):
+        proc = subprocess.Popen(
+            ["bash", "-c", "exit 0"],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True,
+            encoding="utf-8", errors="replace",
+        )
+        _pipe_stdin(proc, "data")
+        _wait_or_kill(proc)
+        assert proc.returncode == 0
+        assert proc._hermes_stdin_errors
+        assert isinstance(proc._hermes_stdin_errors[0], RuntimeError)
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
 
-Run: `scripts/run_tests.sh tests/tools/test_file_write_surrogate_roundtrip.py -k "TestStdinErrorPropagation or TestExecStdinErrorMapping" -q`
-Expected: `test_execute_surfaces_stdin_error_without_hanging` FAILS (`result.get("stdin_error")` is None, message absent); `test_exec_maps_stdin_error_to_failure` FAILS (exit_code is 0).
+Run: `scripts/run_tests.sh tests/tools/test_file_write_surrogate_roundtrip.py -k "TestStdinErrorPropagation or TestExecStdinErrorMapping or TestPipeStdinRemainingBranches" -q`
+Expected: `test_execute_surfaces_stdin_error_without_hanging` FAILS (`result.get("stdin_error")` is None, message absent); `test_exec_maps_stdin_error_to_failure` FAILS (exit_code is 0); the two `TestPipeStdinRemainingBranches` tests PASS (they pin Task 1's already-landed behavior — soundness controls, not red tests).
 
 - [ ] **Step 3: Write the minimal implementation**
 
-In `tools/environments/base.py`, replace the natural-exit return of `_wait_for_process` (currently `return self._finalize_wait_result(output, output.render(), proc.returncode)` at line 1210) with:
+In `tools/environments/base.py::_pipe_stdin`, change the thread start (currently `threading.Thread(target=_write, daemon=True).start()`) to store the handle before starting:
 
 ```python
+    thread = threading.Thread(target=_write, daemon=True)
+    proc._hermes_stdin_thread = thread
+    thread.start()
+```
+
+In `tools/environments/base.py::_wait_for_process`, replace the natural-exit return (currently `return self._finalize_wait_result(output, output.render(), proc.returncode)` at line 1210) with:
+
+```python
+        # Join the stdin writer thread before reading its error list: a child
+        # that exits without reading stdin can otherwise race ahead of a
+        # recorded encode failure, silently dropping it. The thread cannot
+        # block long after child exit (write raises BrokenPipeError once the
+        # pipe closes); the timeout is a pure safety net.
+        stdin_thread = getattr(proc, "_hermes_stdin_thread", None)
+        if stdin_thread is not None:
+            stdin_thread.join(timeout=5)
         rendered = output.render()
         result = self._finalize_wait_result(output, rendered, proc.returncode)
         stdin_errors = getattr(proc, "_hermes_stdin_errors", None)
