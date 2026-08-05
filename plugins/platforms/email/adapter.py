@@ -1320,7 +1320,13 @@ class EmailAdapter(BasePlatformAdapter):
         so parts accumulate here and are flushed together.
         """
         key = self._ctx_key_for(to_addr, ctx)
-        entry = self._pending.get(key)
+        # Tolerate a partially-constructed adapter (tests and some proactive
+        # paths instantiate via object.__new__), so buffering never depends on
+        # __init__ having run.
+        pending = getattr(self, "_pending", None)
+        if pending is None:
+            pending = self._pending = {}
+        entry = pending.get(key)
         if entry is None:
             entry = {
                 "to_addr": to_addr,
@@ -1334,7 +1340,7 @@ class EmailAdapter(BasePlatformAdapter):
                 "task": None,
                 "first_seen": time.monotonic(),
             }
-            self._pending[key] = entry
+            pending[key] = entry
         if body and body.strip():
             entry["body_parts"].append(body.strip())
         for fp in file_paths or []:
@@ -1343,6 +1349,7 @@ class EmailAdapter(BasePlatformAdapter):
         if reply_to and not entry.get("reply_to"):
             entry["reply_to"] = reply_to
 
+        window = float(getattr(self, "_fold_window", 12.0))
         old = entry.get("task")
         if old is not None and not old.done():
             old.cancel()
@@ -1359,19 +1366,25 @@ class EmailAdapter(BasePlatformAdapter):
             key,
             len(entry["body_parts"]),
             len(entry["files"]),
-            self._fold_window,
+            window,
         )
         return f"pending-fold-{key}"
 
     async def _flush_after_idle(self, key: str) -> None:
         """Wait for the turn to go quiet, then emit exactly one mail."""
         try:
-            entry = self._pending.get(key)
+            entry = getattr(self, "_pending", {}).get(key)
             if not entry:
                 return
             elapsed = time.monotonic() - entry["first_seen"]
             await asyncio.sleep(
-                max(0.0, min(self._fold_window, self._fold_max_wait - elapsed))
+                max(
+                    0.0,
+                    min(
+                        float(getattr(self, "_fold_window", 12.0)),
+                        float(getattr(self, "_fold_max_wait", 90.0)) - elapsed,
+                    ),
+                )
             )
         except asyncio.CancelledError:
             # A newer part arrived and re-armed the timer.
@@ -1383,7 +1396,7 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _flush_now(self, key: str) -> Optional[str]:
         """Build and send the buffered turn as a single MIME message."""
-        entry = self._pending.pop(key, None)
+        entry = getattr(self, "_pending", {}).pop(key, None)
         if not entry:
             return None
         body = "\n\n".join(entry["body_parts"]).strip()
@@ -1403,7 +1416,7 @@ class EmailAdapter(BasePlatformAdapter):
         try:
             if files:
                 return self._send_email_with_attachments(
-                    to_addr, body, files, ctx, reply_to
+                    to_addr, body, files, ctx=ctx, reply_to=reply_to
                 )
             return self._send_email(to_addr, body, reply_to, ctx)
         except Exception as e:
@@ -1415,8 +1428,9 @@ class EmailAdapter(BasePlatformAdapter):
 
     def _flush_all_pending(self) -> None:
         """Emit every buffered turn — used on shutdown so nothing is dropped."""
-        for key in list(self._pending.keys()):
-            entry = self._pending.get(key) or {}
+        pending = getattr(self, "_pending", None) or {}
+        for key in list(pending.keys()):
+            entry = pending.get(key) or {}
             task = entry.get("task")
             if task is not None and not task.done():
                 task.cancel()
@@ -1640,6 +1654,7 @@ class EmailAdapter(BasePlatformAdapter):
         _dedupe_key = self._ctx_key_for(to_addr, ctx)
         _already = self._sent_attachments.setdefault(_dedupe_key, set())
         _fresh: List[str] = []
+        _fresh_hashes: List[str] = []
         _skipped: List[str] = []
         for _fp in file_paths:
             try:
@@ -1647,10 +1662,10 @@ class EmailAdapter(BasePlatformAdapter):
             except Exception:
                 _fresh.append(_fp)
                 continue
-            if _h in _already:
+            if _h in _already or _h in _fresh_hashes:
                 _skipped.append(Path(_fp).name)
             else:
-                _already.add(_h)
+                _fresh_hashes.append(_h)
                 _fresh.append(_fp)
         if _skipped:
             logger.info(
@@ -1685,6 +1700,9 @@ class EmailAdapter(BasePlatformAdapter):
                 smtp.close()
 
         logger.info("[Email] Sent multi-attachment email to %s (%d files)", to_addr, len(file_paths))
+        # Record hashes only AFTER a successful send: marking them earlier meant
+        # a failed flush permanently suppressed those files on this thread.
+        _already.update(_fresh_hashes)
         self._register_outbound_msgid(msg_id, to_addr, ctx)
         return msg_id
 

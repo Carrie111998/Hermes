@@ -1304,6 +1304,89 @@ class TestThreadContext(unittest.TestCase):
             self.assertEqual(ctx["subject"], "Creative")
             self.assertEqual(ctx["recipients"], ["cc@test.com"])
 
+    def test_queue_part_survives_partially_constructed_adapter(self):
+        """Buffering must not depend on __init__ having run.
+
+        Tests and some proactive paths build the adapter via object.__new__,
+        so _pending / _fold_window / _fold_max_wait may not exist yet. If
+        _queue_part touches them directly it raises AttributeError and the
+        reply is lost entirely.
+        """
+        import asyncio
+        from plugins.platforms.email.adapter import EmailAdapter
+        adapter = object.__new__(EmailAdapter)
+
+        async def _drive():
+            # Inside a running loop _queue_part arms the idle-flush task rather
+            # than sending immediately -- the real gateway path.
+            adapter._queue_part(
+                "user@test.com", {"subject": "Creative"}, body="hello", file_paths=[]
+            )
+            key = adapter._ctx_key_for("user@test.com", {"subject": "Creative"})
+            entry = adapter._pending[key]
+            entry["task"].cancel()
+            return key, entry
+
+        key, entry = asyncio.run(_drive())
+
+        self.assertIn("user@test.com", key)
+        self.assertEqual(entry["body_parts"], ["hello"])
+
+    def test_failed_send_does_not_poison_attachment_dedupe(self):
+        """A failed flush must not permanently suppress those files.
+
+        Hashes are recorded only after a successful send. Marking them up
+        front meant one SMTP failure made the attachments un-resendable on
+        that thread forever -- indistinguishable from the original bug.
+        """
+        import tempfile
+        adapter = self._make_adapter()
+
+        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
+            f.write(b"\x89PNG" + b"\x01" * 32)
+            path = f.name
+
+        ctx = {
+            "subject": "Creative",
+            "message_id": "<parent@test.com>",
+            "references": "",
+            "sender_addr": "user@test.com",
+            "recipients": ["cc@test.com"],
+        }
+        key = adapter._ctx_key_for("user@test.com", ctx)
+
+        try:
+            # First attempt: SMTP dies mid-send.
+            with patch.object(
+                adapter, "_connect_smtp", side_effect=OSError("smtp down")
+            ):
+                with self.assertRaises(OSError):
+                    adapter._send_email_with_attachments(
+                        "user@test.com", "body", [path], ctx=ctx
+                    )
+
+            # Nothing may have been recorded as delivered.
+            self.assertEqual(adapter._sent_attachments.get(key, set()), set())
+
+            # Retry succeeds -> the file must still be attached this time.
+            smtp = MagicMock()
+            with patch.object(adapter, "_connect_smtp", return_value=smtp):
+                adapter._send_email_with_attachments(
+                    "user@test.com", "body", [path], ctx=ctx
+                )
+
+            smtp.send_message.assert_called_once()
+            sent = smtp.send_message.call_args.args[0]
+            # The attachment path is where threading was lost: assert it here.
+            self.assertEqual(sent["Subject"], "Re: Creative")
+            self.assertEqual(sent["In-Reply-To"], "<parent@test.com>")
+            self.assertEqual(sent["Cc"], "cc@test.com")
+            names = [p.get_filename() for p in sent.walk() if p.get_filename()]
+            self.assertEqual(len(names), 1)
+            self.assertEqual(len(adapter._sent_attachments.get(key, set())), 1)
+        finally:
+            os.unlink(path)
+
 
 class TestSendMethods(unittest.TestCase):
     """Test email send methods."""
