@@ -116,6 +116,8 @@ def test_endpoint_bodies_match_api_contract(skill_md: str) -> None:
     assert re.search(r"/api/oa-check\S*\"[^`]*?\"id\"", skill_md, re.DOTALL)
     # /api/verify nests the citation under `claimed`.
     assert re.search(r"/api/verify\S*\"[^`]*?\"claimed\"", skill_md, re.DOTALL)
+    # /api/audit takes `claims` (bare, no wrapper).
+    assert re.search(r"/api/audit\S*\"[^`]*?\"claims\"", skill_md, re.DOTALL)
 
 
 def test_verify_verdicts_are_the_real_enum(skill_md: str) -> None:
@@ -132,3 +134,34 @@ def test_warns_against_fabricating_fallbacks(skill_md: str) -> None:
 def test_disclaims_paper_search(skill_md: str) -> None:
     """This skill cites papers you already have; `arxiv` finds new ones."""
     assert "`arxiv`" in skill_md
+
+
+def test_documents_all_seven_mcp_tools(skill_md: str) -> None:
+    """auditBibliography shipped after the original draft — don't undercount the surface."""
+    assert "seven operations" in skill_md
+    for tool in (
+        "resolveIdentifier",
+        "formatCitation",
+        "exportCitation",
+        "checkRetraction",
+        "checkOpenAccess",
+        "verifyCitation",
+        "auditBibliography",
+    ):
+        assert f"`{tool}`" in skill_md, f"missing MCP tool: {tool}"
+
+
+def test_audit_section_present(skill_md: str) -> None:
+    """Whole-bibliography audit is the highest-value operation for a research skill."""
+    assert "### 6. Audit a whole bibliography" in skill_md
+    audit_section = skill_md.split("### 6.", 1)[1].split("## Pitfalls", 1)[0]
+    assert "/api/audit" in audit_section
+    assert "max 25" in audit_section
+    assert "1-based" in audit_section
+
+
+def test_rate_limits_are_not_overstated(skill_md: str) -> None:
+    """Measured against prod: format and export are both 10/min, not ~40/10."""
+    prereqs = skill_md.split("## Prerequisites", 1)[1].split("## How to Run", 1)[0]
+    assert "~40" not in prereqs, "format rate limit was overstated 4x in the original draft"
+    assert "10/min" in prereqs

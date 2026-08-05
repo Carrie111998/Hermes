@@ -25,9 +25,9 @@ already have an identifier. For discovery, use the `arxiv` skill instead.
 ## Prerequisites
 None. The API is public and needs no install and no key — call it anonymously and it works.
 
-Anonymous callers get a rate-limited free tier (~40 format / 10 export requests per
-window), which is ample for human-driven agent use. Two optional upgrades, neither
-required by this skill:
+Anonymous callers get a rate-limited free tier per IP: 10/min each for `format` and
+`export`, 60/min for the retraction/open-access/verify checks, 8/min for `audit`. That's
+ample for human-driven agent use. Two optional upgrades, neither required by this skill:
 
 - **First-party key** — sign in at https://scholar-sidekick.com/account, issue an `ssk_`
   key, and send `Authorization: Bearer ssk_…` for a higher allowance.
@@ -35,11 +35,11 @@ required by this skill:
   https://rapidapi.com/scholar-sidekick-scholar-sidekick-api/api/scholar-sidekick and
   send `X-RapidAPI-Key` to the gateway host instead.
 
-The same six operations are also exposed as a hosted MCP server at
+The same seven operations are also exposed as a hosted MCP server at
 `https://scholar-sidekick.com/api/mcp` (`resolveIdentifier`, `formatCitation`,
-`exportCitation`, `checkRetraction`, `checkOpenAccess`, `verifyCitation`), which also
-accepts anonymous calls. Use it only if you want tool-native access; the REST calls below
-need no setup at all.
+`exportCitation`, `checkRetraction`, `checkOpenAccess`, `verifyCitation`,
+`auditBibliography`), which also accepts anonymous calls. Use it only if you want
+tool-native access; the REST calls below need no setup at all.
 
 ## How to Run
 Invoke every operation as a JSON POST through the `terminal` tool. Base URL
@@ -65,6 +65,7 @@ https://scholar-sidekick.com/openapi/openapi.yml (OpenAPI 3.1).
 | Retraction / correction / EoC check | `POST /api/retraction-check` | `{id}` |
 | Open-access status + best legal URL | `POST /api/oa-check` | `{id}` |
 | Verify a claimed citation (fabrication) | `POST /api/verify` | `{claimed: {title, doi}}` |
+| Audit a whole bibliography (fabrication + retraction, ≤25 entries) | `POST /api/audit` | `{claims: [{title}]}` |
 | Service health | `GET /api/health` | — |
 
 ## Procedure
@@ -123,10 +124,25 @@ AI-fabrication pattern (real DOI + invented title; Topaz et al., Lancet 2026). `
 (a wrong-identifier citation error). Use this for "is this citation real?", not a plain
 format or resolve — those never catch a real DOI carrying an invented title.
 
+### 6. Audit a whole bibliography
+```bash
+curl -sS -X POST "https://scholar-sidekick.com/api/audit" \
+  -H "Content-Type: application/json" \
+  -d '{"claims": [{"title": "Attention Is All You Need"}, {"title": "A fabricated title"}]}'
+```
+Runs `/api/verify` per entry plus a retraction check, in one call — use this instead of
+looping `/api/verify` over a reference list. Takes **exactly one** of:
+`claims[]` (max 25, each needs a `title`), `bibliography` (raw BibTeX/RIS/CSL-JSON string,
+max 128 KB, auto-detected), or `references[]` (max 25 raw prose reference strings).
+Returns `{ ok, entries: [{ index, status, verdict, confidence, matched, mismatches }],
+summary: { total, matched, mismatch, ambiguous, not_found, errored, retracted } }`.
+`entries[].index` is **1-based**. A single bad entry gets `status: "error"` without
+failing the batch.
+
 ## Pitfalls
 - Never scrape the web UI — the JSON API is faster and stable.
 - Pass identifiers verbatim; don't strip prefixes.
-- Body fields differ per endpoint: `format`/`export` use `text`; `retraction-check`/`oa-check` use `id` (one identifier per call); `verify` wraps fields in `claimed`. Don't mix them up.
+- Body fields differ per endpoint: `format`/`export` use `text`; `retraction-check`/`oa-check` use `id` (one identifier per call); `verify` wraps fields in `claimed`; `audit` takes `claims[]` (bare, no wrapper). Don't mix them up.
 - ISBNs have no DOI, so retraction and open-access checks return a "no DOI" result for books.
 - Don't fabricate a fallback: if a call fails or returns `ok:false`, report that — never invent a citation, retraction status, OA verdict, or a "matched" verdict.
 
