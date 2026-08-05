@@ -41,6 +41,7 @@ from agent.conversation_compression import (
 from agent.context_engine import automatic_compaction_status_message
 from agent.iteration_budget import IterationBudget
 from agent.memory_manager import build_memory_context_block
+from agent.memory_provider import is_trivial_prompt
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
@@ -438,7 +439,12 @@ def build_turn_context(
     # Generate unique task_id if not provided to isolate VMs between tasks.
     effective_task_id = task_id or str(uuid.uuid4())
     agent._current_task_id = effective_task_id
-    turn_id = f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+    turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "")
+    if not turn_id:
+        turn_id = (
+            f"{agent.session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
+        )
+    agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     # Tripwire: warn (with both turn ids) when this turn starts before the
@@ -1045,7 +1051,7 @@ def build_turn_context(
     # Plugin hook: pre_llm_call (context injected into user message, not system prompt).
     plugin_user_context = ""
     try:
-        from hermes_cli.plugins import invoke_hook as _invoke_hook
+        from hermes_cli.lifecycle import invoke_hook as _invoke_hook
         _pre_results = _invoke_hook(
             "pre_llm_call",
             session_id=agent.session_id,
@@ -1056,6 +1062,7 @@ def build_turn_context(
             is_first_turn=(not bool(conversation_history)),
             model=agent.model,
             platform=getattr(agent, "platform", None) or "",
+            parent_session_id=getattr(agent, "_parent_session_id", None) or "",
             sender_id=getattr(agent, "_user_id", None) or "",
         )
         _ctx_parts: list[str] = []
@@ -1146,11 +1153,15 @@ def build_turn_context(
             pass
 
     # External memory provider: prefetch once before the tool loop.
+    #
+    # Skip prefetch on trivial prompts (greetings, acknowledgements) to
+    # prevent memory-context injection on turns that carry no semantic signal.
     ext_prefetch_cache = ""
     if agent._memory_manager:
         try:
             _query = original_user_message if isinstance(original_user_message, str) else ""
-            ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
+            if not is_trivial_prompt(_query):
+                ext_prefetch_cache = agent._memory_manager.prefetch_all(_query) or ""
         except Exception:
             pass
 
