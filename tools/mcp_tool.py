@@ -3679,8 +3679,7 @@ def _signal_reconnect(server: Any) -> bool:
 
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
-    with _lock:
-        server = _servers.get(server_name)
+    server = _lookup_live_server(server_name)
     if server is None:
         return False
     return _signal_reconnect(server)
@@ -3899,8 +3898,7 @@ def _handle_auth_error_and_retry(
         recovered = False
 
     if recovered:
-        with _lock:
-            srv = _servers.get(server_name)
+        srv = _lookup_live_server(server_name)
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -4084,8 +4082,7 @@ def _handle_session_expired_and_retry(
     if not _is_session_expired_error(exc):
         return None
 
-    with _lock:
-        srv = _servers.get(server_name)
+    srv = _lookup_live_server(server_name)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -4781,6 +4778,32 @@ def _request_lazy_reconnect(server_name: str, server: MCPServerTask) -> bool:
 
 
 
+
+def _lookup_live_server(server_name: str) -> Optional["MCPServerTask"]:
+    """Find a live MCPServerTask by logical name (shared or per-user key).
+
+    Prefers the current OAuth registry key, then any connected entry whose
+    ``.name`` matches. Used by reconnect / check paths that only know the
+    logical server name.
+    """
+    try:
+        registry_key = _resolve_oauth_registry_key(server_name, require_identity=False)
+    except Exception:
+        registry_key = server_name
+    with _lock:
+        server = _servers.get(registry_key)
+        if server is not None:
+            return server
+        if registry_key != server_name:
+            server = _servers.get(server_name)
+            if server is not None:
+                return server
+        for key, srv in _servers.items():
+            if srv is not None and srv.name == server_name:
+                return srv
+    return None
+
+
 def _server_registry_key_for_task(server: "MCPServerTask") -> str:
     """Registry key for an already-constructed MCPServerTask."""
     from tools.mcp_oauth_identity import oauth_connection_registry_key
@@ -5450,12 +5473,12 @@ def _make_check_fn(server_name: str):
     """Return a check function that verifies the MCP connection is alive."""
 
     def _check() -> bool:
+        server = _lookup_live_server(server_name)
+        if server is not None and (
+            server.session is not None or server._is_recycled_stdio()
+        ):
+            return True
         with _lock:
-            server = _servers.get(server_name)
-            if server is not None and (
-                server.session is not None or server._is_recycled_stdio()
-            ):
-                return True
             # Lazy (schema-cache registered) servers are available: the
             # first real call spawns/connects them (#56832).
             return server_name in _lazy_server_configs
