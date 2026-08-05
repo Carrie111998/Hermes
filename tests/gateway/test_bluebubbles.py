@@ -93,40 +93,45 @@ class TestBlueBubblesHelpers:
         assert api_post_paths == ["/api/v1/message/text"]
 
     @pytest.mark.asyncio
-    async def test_send_reuses_live_gateway_adapter(self, monkeypatch):
-        from types import SimpleNamespace
-        from gateway.platforms.base import SendResult
+    async def test_standalone_send_does_not_write_gateway_status(self, monkeypatch):
         from gateway.platforms.bluebubbles import BlueBubblesAdapter
         from tools.send_message_tool import _send_bluebubbles
 
-        calls = []
+        async def fake_api_get(self, path):
+            if path == "/api/v1/server/info":
+                return {"data": {"private_api": True, "helper_connected": True}}
+            return {"status": 200}
 
-        class LiveAdapter:
-            async def send(self, chat_id, message):
-                calls.append((chat_id, message))
-                return SendResult(success=True, message_id="live-message")
+        async def fake_api_post(self, path, payload):
+            return {"status": 200, "data": {"guid": "standalone-message"}}
 
-        runner = SimpleNamespace(adapters={Platform.BLUEBUBBLES: LiveAdapter()})
-        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
-
-        async def fail_if_second_adapter_connects(self, *, start_webhook_listener=True):
-            raise AssertionError("standalone adapter must not start when a live adapter exists")
-
-        monkeypatch.setattr(BlueBubblesAdapter, "connect", fail_if_second_adapter_connects)
+        status_writes = []
+        monkeypatch.setattr(BlueBubblesAdapter, "_api_get", fake_api_get)
+        monkeypatch.setattr(BlueBubblesAdapter, "_api_post", fake_api_post)
+        monkeypatch.setattr(
+            BlueBubblesAdapter,
+            "_mark_connected",
+            lambda self: status_writes.append("connected"),
+        )
+        monkeypatch.setattr(
+            BlueBubblesAdapter,
+            "_mark_disconnected",
+            lambda self: status_writes.append("disconnected"),
+        )
 
         result = await _send_bluebubbles(
             {"server_url": "http://localhost:1234", "password": "secret"},
             "iMessage;-;user@example.com",
-            "hello live adapter",
+            "hello standalone adapter",
         )
 
         assert result == {
             "success": True,
             "platform": "bluebubbles",
             "chat_id": "iMessage;-;user@example.com",
-            "message_id": "live-message",
+            "message_id": "standalone-message",
         }
-        assert calls == [("iMessage;-;user@example.com", "hello live adapter")]
+        assert status_writes == []
 
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)

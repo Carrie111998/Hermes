@@ -299,7 +299,6 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             return False
 
         if not start_webhook_listener:
-            self._mark_connected()
             return True
 
         from aiohttp import web
@@ -334,7 +333,8 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     async def disconnect(self) -> None:
         # Outbound-only connections never own a webhook registration.
-        if self._runner:
+        owns_gateway_lifecycle = self._runner is not None
+        if owns_gateway_lifecycle:
             await self._unregister_webhook()
 
         if self.client:
@@ -343,7 +343,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
         if self._runner:
             await self._runner.cleanup()
             self._runner = None
-        self._mark_disconnected()
+        # A temporary standalone sender must not overwrite the running
+        # gateway's persisted PID/status record in the shared HERMES_HOME.
+        if owns_gateway_lifecycle:
+            self._mark_disconnected()
 
     @property
     def _webhook_url(self) -> str:
