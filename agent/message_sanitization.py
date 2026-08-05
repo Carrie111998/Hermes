@@ -221,6 +221,31 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 
+    # Repair pass 0b: the payload is well-formed JSON that arrived wrapped.
+    # Two shapes reach here intact and were being discarded as unrepairable:
+    # a markdown fence around the object (```json … ```), and a complete
+    # object followed by prose. Both are ordinary model behaviour, and both
+    # carry the arguments the model actually chose — falling through to "{}"
+    # runs the tool with no arguments instead.
+    _unfenced = re.sub(
+        r"^\s*```[A-Za-z0-9_+-]*\s*\n?|\n?\s*```\s*$", "", raw_stripped,
+    ).strip()
+    for _candidate in (_unfenced, raw_stripped):
+        if not _candidate:
+            continue
+        try:
+            _parsed, _end = json.JSONDecoder().raw_decode(_candidate)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        _reserialised = json.dumps(_parsed, separators=(",", ":"))
+        logger.warning(
+            "Recovered wrapped tool_call arguments for %s (dropped %d "
+            "surrounding character(s))",
+            tool_name,
+            len(raw_stripped) - _end,
+        )
+        return _reserialised
+
     # Attempt common JSON repairs
     fixed = raw_stripped
     # 1. Strip trailing commas before } or ]

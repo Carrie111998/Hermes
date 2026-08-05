@@ -61,3 +61,45 @@ class TestRepairToolCallArguments:
     # -- Stage 4: control-char escape fallback --
 
 
+
+
+class TestWrappedArgumentRecovery:
+    """A complete JSON payload that merely arrived wrapped must be recovered.
+
+    Both shapes below are ordinary model behaviour and carry the arguments the
+    model actually chose; falling through to "{}" runs the tool with no
+    arguments instead of the requested ones.
+    """
+
+    @staticmethod
+    def _repair(raw):
+        from agent.message_sanitization import _repair_tool_call_arguments
+
+        return _repair_tool_call_arguments(raw, "write_file")
+
+    def test_markdown_fenced_payload_is_recovered(self):
+        out = self._repair('```json\n{"path": "a.txt", "content": "hi"}\n```')
+        assert json.loads(out) == {"path": "a.txt", "content": "hi"}
+
+    def test_bare_fence_without_language_is_recovered(self):
+        out = self._repair('```\n{"path": "a.txt"}\n```')
+        assert json.loads(out) == {"path": "a.txt"}
+
+    def test_trailing_prose_after_the_object_is_dropped(self):
+        out = self._repair('{"path": "a.txt"} — writing that file now')
+        assert json.loads(out) == {"path": "a.txt"}
+
+    def test_leading_and_trailing_whitespace_only(self):
+        out = self._repair('  \n {"path": "a.txt"}  \n ')
+        assert json.loads(out) == {"path": "a.txt"}
+
+    def test_wellformed_payload_is_unchanged_semantically(self):
+        payload = {
+            "path": r"C:\Users\me\a.txt",
+            "content": "line1\nline2 🌍",
+        }
+        out = self._repair(json.dumps(payload))
+        assert json.loads(out) == payload
+
+    def test_still_empty_object_when_nothing_parses(self):
+        assert json.loads(self._repair("{path: 'a.txt'")) == {}
