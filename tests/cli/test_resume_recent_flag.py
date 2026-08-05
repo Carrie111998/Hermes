@@ -106,10 +106,16 @@ class TestRecentFlagInResumeCommand:
             "title": "Coding",
         }
         cli_obj._session_db.resolve_resume_session_id.return_value = "sess_002"
-        cli_obj._session_db.get_messages_as_conversation.return_value = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi"},
-        ]
+        cli_obj._session_db.get_resume_conversations.return_value = (
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        )
 
         with (
             patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_002"),
@@ -119,7 +125,7 @@ class TestRecentFlagInResumeCommand:
             cli_obj._handle_resume_command("/resume sess_002")
 
         # Verify limit was passed
-        call_args = cli_obj._session_db.get_messages_as_conversation.call_args
+        call_args = cli_obj._session_db.get_resume_conversations.call_args
         assert call_args.kwargs.get("limit") == 5
         assert cli_obj.session_id == "sess_002"
 
@@ -132,9 +138,10 @@ class TestRecentFlagInResumeCommand:
             "title": "Coding",
         }
         cli_obj._session_db.resolve_resume_session_id.return_value = "sess_002"
-        cli_obj._session_db.get_messages_as_conversation.return_value = [
-            {"role": "user", "content": "hello"},
-        ]
+        cli_obj._session_db.get_resume_conversations.return_value = (
+            [{"role": "user", "content": "hello"}],
+            [{"role": "user", "content": "hello"}],
+        )
 
         with (
             patch("hermes_cli.main._resolve_session_by_name_or_id", return_value="sess_002"),
@@ -143,7 +150,7 @@ class TestRecentFlagInResumeCommand:
         ):
             cli_obj._handle_resume_command("/resume sess_002")
 
-        call_args = cli_obj._session_db.get_messages_as_conversation.call_args
+        call_args = cli_obj._session_db.get_resume_conversations.call_args
         assert call_args.kwargs.get("limit") is None
 
 
