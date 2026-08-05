@@ -102,7 +102,9 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-def _sql_session_last_active(alias: str = "s") -> str:
+def _sql_session_last_active(
+    alias: str = "s", *, include_activity: bool = True
+) -> str:
     """SQL expression for session recency used by list/status surfaces.
 
     Freshest of ``last_activity_at`` (mid-turn agent activity heartbeat) and
@@ -116,6 +118,8 @@ def _sql_session_last_active(alias: str = "s") -> str:
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
         f"WHERE _act_m.session_id = {alias}.id)"
     )
+    if not include_activity:
+        return f"COALESCE({msg_max}, {alias}.started_at)"
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("
@@ -127,7 +131,9 @@ def _sql_session_last_active(alias: str = "s") -> str:
     )
 
 
-def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+def _sql_session_last_active_by_id(
+    session_id_expr: str, *, include_activity: bool = True
+) -> str:
     """Same freshest-of expression keyed by a session-id SQL expression."""
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
@@ -141,6 +147,8 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
         f"(SELECT started_at FROM sessions _act_s "
         f"WHERE _act_s.id = {session_id_expr})"
     )
+    if not include_activity:
+        return f"COALESCE({msg_max}, {started})"
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("

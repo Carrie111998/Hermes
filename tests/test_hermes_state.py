@@ -135,6 +135,78 @@ class TestConnectionLifecycle:
             "fts-read-only"
         ]
 
+    def test_read_only_list_tolerates_unmigrated_session_columns(self, tmp_path):
+        db_path = tmp_path / "state.db"
+        writable = SessionDB(db_path=db_path)
+        writable.create_session(
+            "legacy-profile-session",
+            source="telegram",
+            session_key="agent:main:telegram:dm:legacy-chat",
+            chat_id="legacy-chat",
+            chat_type="dm",
+            user_id="legacy-user",
+        )
+        writable.append_message(
+            "legacy-profile-session",
+            role="user",
+            content="history survives an upgrade",
+        )
+        writable.close()
+
+        conn = sqlite3.connect(db_path)
+        conn.execute("ALTER TABLE sessions DROP COLUMN last_activity_at")
+        conn.execute("ALTER TABLE sessions DROP COLUMN profile_name")
+        columns_before = {
+            row[1] for row in conn.execute("PRAGMA table_info(sessions)")
+        }
+        conn.close()
+
+        read_only = SessionDB(db_path=db_path, read_only=True)
+        try:
+            sessions = read_only.list_sessions_rich(
+                limit=20,
+                min_message_count=1,
+                order_by_last_active=True,
+                compact_rows=True,
+                include_pinned=True,
+            )
+            gateway_sessions = read_only.list_gateway_sessions()
+            searched_sessions = read_only.search_sessions()
+            telegram_sessions = (
+                read_only.list_unlinked_telegram_sessions_for_user(
+                    chat_id="legacy-chat",
+                    user_id="legacy-user",
+                )
+            )
+        finally:
+            read_only.close()
+
+        assert [session["id"] for session in sessions] == [
+            "legacy-profile-session"
+        ]
+        assert sessions[0]["preview"] == "history survives an upgrade"
+        assert [session["id"] for session in gateway_sessions] == [
+            "legacy-profile-session"
+        ]
+        assert [session["id"] for session in searched_sessions] == [
+            "legacy-profile-session"
+        ]
+        assert [session["id"] for session in telegram_sessions] == [
+            "legacy-profile-session"
+        ]
+
+        verify = sqlite3.connect(db_path)
+        try:
+            columns_after = {
+                row[1] for row in verify.execute("PRAGMA table_info(sessions)")
+            }
+        finally:
+            verify.close()
+
+        assert columns_after == columns_before
+        assert "last_activity_at" not in columns_after
+        assert "profile_name" not in columns_after
+
     def test_failed_read_only_open_does_not_leak_tracked_connection(
         self, tmp_path
     ):

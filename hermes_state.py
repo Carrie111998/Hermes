@@ -2026,6 +2026,11 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Read-only cross-profile attachments deliberately skip schema
+        # reconciliation. Cache their live sessions columns so list queries
+        # can tolerate a profile DB that has not yet been opened writable by
+        # the newly-installed version.
+        self._read_only_session_columns: Optional[frozenset[str]] = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -2065,6 +2070,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 try:
                     apply_database_pragmas(self._conn, db_label="state.db")
                     cursor = self._conn.cursor()
+                    self._read_only_session_columns = frozenset(
+                        row["name"]
+                        for row in cursor.execute(
+                            'PRAGMA table_info("sessions")'
+                        ).fetchall()
+                    )
                     self._fts_enabled = (
                         self._fts_table_probe(cursor, "messages_fts") is True
                     )
@@ -3282,7 +3293,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             SELECT sessions.*,
                    COALESCE(sp.prompt, sessions.system_prompt)
                        AS _system_prompt_resolved,
-                   {_sql_session_last_active("sessions")} AS last_active
+                   {self._session_last_active_sql("sessions")} AS last_active
             FROM sessions
             LEFT JOIN system_prompts sp
               ON sp.hash = sessions.system_prompt_hash
@@ -5683,7 +5694,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                         WHEN child.ended_at IS NULL THEN 1
                         ELSE 2
                       END,
-                      {_sql_session_last_active("child")} DESC,
+                      {self._session_last_active_sql("child")} DESC,
                       child.started_at DESC,
                       child.id DESC
                     LIMIT 1
@@ -5935,7 +5946,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 chain_max AS (
                     SELECT
                         root_id,
-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                        MAX({self._session_last_active_by_id_sql("cur_id")}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
                 )
@@ -5947,7 +5958,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active,
+                    {self._session_last_active_sql("s")} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -5970,7 +5981,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active
+                    {self._session_last_active_sql("s")} AS last_active
                 FROM sessions s
                 {prompt_join}
                 {where_sql}
@@ -7648,7 +7659,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         select_with_last_active = (
             "SELECT s.*, "
             "COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
-            f"{_sql_session_last_active('s')} AS last_active "
+            f"{self._session_last_active_sql('s')} AS last_active "
             "FROM sessions s "
             "LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash "
         )
@@ -9204,7 +9215,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
-                        {_sql_session_last_active("s")} AS last_active
+                        {self._session_last_active_sql("s")} AS last_active
                     FROM sessions s
                     LEFT JOIN system_prompts sp
                       ON sp.hash = s.system_prompt_hash
@@ -9234,7 +9245,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                              ORDER BY m.timestamp, m.id LIMIT 1),
                             ''
                         ) AS _preview_raw,
-                        {_sql_session_last_active("s")} AS last_active
+                        {self._session_last_active_sql("s")} AS last_active
                     FROM sessions s
                     LEFT JOIN system_prompts sp
                       ON sp.hash = s.system_prompt_hash

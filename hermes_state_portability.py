@@ -19,6 +19,7 @@ from hermes_state_common import (
     _PREVIEW_RAW_SELECT,
     _shape_preview,
     _sql_session_last_active,
+    _sql_session_last_active_by_id,
 )
 
 # Moved methods logged under the "hermes_state" logger before the split;
@@ -29,18 +30,40 @@ logger = logging.getLogger("hermes_state")
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
 
-    @classmethod
-    def _compact_session_cols(cls) -> str:
+    def _has_session_column(self, name: str) -> bool:
+        live_columns = self._read_only_session_columns
+        return live_columns is None or name in live_columns
+
+    def _session_last_active_sql(self, alias: str = "s") -> str:
+        return _sql_session_last_active(
+            alias,
+            include_activity=self._has_session_column("last_activity_at"),
+        )
+
+    def _session_last_active_by_id_sql(self, session_id_expr: str) -> str:
+        return _sql_session_last_active_by_id(
+            session_id_expr,
+            include_activity=self._has_session_column("last_activity_at"),
+        )
+
+    def _compact_session_cols(self) -> str:
         """SELECT list for compact_rows: every ``sessions`` column declared in
         SCHEMA_SQL except prompt storage internals, aliased with the ``s``
         prefix used by list_sessions_rich/_get_session_rich_row queries."""
+        cls = type(self)
         if cls._session_compact_cols_sql is None:
-            declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
+            declared = self._parse_schema_columns(SCHEMA_SQL)["sessions"]
             cls._session_compact_cols_sql = ", ".join(
                 f"s.{name}" for name in declared
-                if name not in cls._SESSION_COMPACT_EXCLUDED
+                if name not in self._SESSION_COMPACT_EXCLUDED
             )
-        return cls._session_compact_cols_sql
+        current_projection = cls._session_compact_cols_sql
+        if self._read_only_session_columns is None:
+            return current_projection
+        return ", ".join(
+            column for column in current_projection.split(", ")
+            if column.removeprefix("s.") in self._read_only_session_columns
+        )
 
     def distinct_session_cwds(self, include_archived: bool = False) -> List[Dict[str, Any]]:
         """Distinct non-empty session cwds with usage stats, for repo discovery.
@@ -110,7 +133,7 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                {_sql_session_last_active("s")} AS last_active
+                {self._session_last_active_sql("s")} AS last_active
             FROM sessions s
             LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
             WHERE s.source = 'cron' AND s.id >= ? AND s.id < ?
@@ -194,7 +217,7 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                {_sql_session_last_active("s")} AS last_active
+                {self._session_last_active_sql("s")} AS last_active
             FROM sessions s
             {prompt_join}
             WHERE s.id IN ({placeholders})
