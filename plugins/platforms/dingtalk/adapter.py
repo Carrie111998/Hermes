@@ -314,6 +314,37 @@ class DingTalkAdapter(BasePlatformAdapter):
                 self._client_id, self._client_secret
             )
             self._stream_client = dingtalk_stream.DingTalkStreamClient(credential)
+            # In DingTalkAdapter.connect(), after creating self._stream_client:
+
+            # Harden keepalive: ws.ping() can hang indefinitely on half-dead connections,
+            # stalling the keepalive loop and causing silent disconnects (~3 min after
+            # the last inbound message). Wrap it in a timeout so a stuck ping closes the
+            # WebSocket, which lets the SDK's start() reconnect loop kick in.
+            async def _hardened_keepalive(_self, ws, ping_interval=60):
+                import time as _time
+                while True:
+                    await asyncio.sleep(ping_interval)
+                    try:
+                        await asyncio.wait_for(ws.ping(), timeout=15.0)
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "[%s] keepalive: pong timeout (15s) — closing to trigger reconnect",
+                            self.name,
+                        )
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break  # exits keepalive; SDK start() catches ConnectionClosed and reconnects
+                    except Exception as e:
+                        logger.warning("[%s] keepalive: ping failed: %s — closing", self.name, e)
+                        try:
+                            await ws.close()
+                        except Exception:
+                            pass
+                        break
+            
+            type(self._stream_client).keepalive = _hardened_keepalive
 
             # Initialize card SDK if available and configured
             if CARD_SDK_AVAILABLE and self._card_template_id:
