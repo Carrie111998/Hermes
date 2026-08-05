@@ -192,6 +192,7 @@ class GatewayAgentCacheMixin:
         """
         if interrupt_depth == 0:
             from agent.session_activity import ActivityProvenance
+            from gateway.run import time  # keep patch("gateway.run.time") seam (precedent #77752)
 
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
