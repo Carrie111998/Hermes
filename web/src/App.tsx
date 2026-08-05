@@ -40,6 +40,7 @@ import {
   Package,
   PanelLeftClose,
   PanelLeftOpen,
+  PanelRight,
   Plug,
   Puzzle,
   Radio,
@@ -105,7 +106,11 @@ import { useTheme } from "@/themes";
 import { isDashboardEmbeddedChatEnabled } from "@/lib/dashboard-flags";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { api } from "@/lib/api";
-import type { StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import type { DashboardPage, StatusResponse, UpdateCheckResponse } from "@/lib/api";
+import {
+  resolveDashboardContext,
+  type DashboardContext,
+} from "@/lib/dashboard-pages";
 
 function RouteFallback({ label = "Loading…" }: { label?: string }) {
   return (
@@ -374,7 +379,22 @@ export default function App() {
   const { manifests, loading: pluginsLoading } = usePlugins();
   const { theme } = useTheme();
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [contextOpen, setContextOpen] = useState(false);
+  const contextOpenRef = useRef(false);
+  const contextTriggerRef = useRef<HTMLSpanElement>(null);
+  const [dashboardPages, setDashboardPages] = useState<DashboardPage[]>([]);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
+  const openContext = useCallback(() => {
+    contextOpenRef.current = true;
+    setContextOpen(true);
+  }, []);
+  const closeContext = useCallback(() => {
+    contextOpenRef.current = false;
+    setContextOpen(false);
+    window.requestAnimationFrame(() =>
+      contextTriggerRef.current?.querySelector("button")?.focus(),
+    );
+  }, []);
 
   const [collapsed, setCollapsed] = useState(() => {
     try {
@@ -399,6 +419,10 @@ export default function App() {
   const isDocsRoute = pathname === "/docs" || pathname === "/docs/";
   const normalizedPath = pathname.replace(/\/$/, "") || "/";
   const isChatRoute = normalizedPath === "/chat";
+  const dashboardContext = useMemo(
+    () => resolveDashboardContext(dashboardPages, normalizedPath),
+    [dashboardPages, normalizedPath],
+  );
   const embeddedChat = isDashboardEmbeddedChatEnabled();
   // Defer mounting the persistent chat host (and its xterm chunk) until the
   // user has actually opened /chat at least once. Sticky after that so the
@@ -486,9 +510,31 @@ export default function App() {
   const layoutVariant = theme.layoutVariant ?? "standard";
 
   useEffect(() => {
-    if (!mobileOpen) return;
+    let cancelled = false;
+    api
+      .getDashboardPages()
+      .then((response) => {
+        if (!cancelled) setDashboardPages(response.pages);
+      })
+      .catch(() => {
+        if (!cancelled) setDashboardPages([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (contextOpenRef.current) closeContext();
+  }, [normalizedPath, closeContext]);
+
+  useEffect(() => {
+    if (!mobileOpen && !contextOpen) return;
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setMobileOpen(false);
+      if (e.key === "Escape") {
+        setMobileOpen(false);
+        if (contextOpen) closeContext();
+      }
     };
     document.addEventListener("keydown", onKey);
     const prevOverflow = document.body.style.overflow;
@@ -497,12 +543,16 @@ export default function App() {
       document.removeEventListener("keydown", onKey);
       document.body.style.overflow = prevOverflow;
     };
-  }, [mobileOpen]);
+  }, [mobileOpen, contextOpen, closeContext]);
 
   useEffect(() => {
     const mql = window.matchMedia("(min-width: 1024px)");
     const onChange = (e: MediaQueryListEvent) => {
-      if (e.matches) setMobileOpen(false);
+      if (e.matches) {
+        setMobileOpen(false);
+        contextOpenRef.current = false;
+        setContextOpen(false);
+      }
     };
     mql.addEventListener("change", onChange);
     return () => mql.removeEventListener("change", onChange);
@@ -512,7 +562,7 @@ export default function App() {
     <ProfileProvider>
     <div
       data-layout-variant={layoutVariant}
-      className="flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
+      className="studio-shell flex h-dvh max-h-dvh min-h-0 flex-col overflow-hidden bg-background-base text-text-primary antialiased"
     >
       <SelectionSwitcher />
 
@@ -525,7 +575,7 @@ export default function App() {
 
       <header
         className={cn(
-          "lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
+          "studio-mobile-header lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
           "flex items-center gap-2 px-4 py-2",
           "border-b border-current/20",
           "bg-background-base",
@@ -543,21 +593,40 @@ export default function App() {
           aria-label={t.app.openNavigation}
           aria-expanded={mobileOpen}
           aria-controls="app-sidebar"
-          className="text-text-secondary hover:text-midground"
+          className="min-h-11 min-w-11 text-text-secondary hover:text-midground"
         >
           <Menu />
         </Button>
 
-        <Typography className="font-bold text-[0.95rem] leading-[0.95] tracking-[0.05em] text-midground">
-          {t.app.brand}
+        <Typography className="font-semibold text-[0.95rem] leading-none tracking-[-0.02em] text-midground">
+          Hermes Studio
         </Typography>
+
+        {dashboardContext && (
+          <span ref={contextTriggerRef} className="ml-auto inline-flex">
+            <Button
+              ghost
+              size="icon"
+              onClick={openContext}
+              aria-label="Open related pages"
+              aria-expanded={contextOpen}
+              aria-controls="dashboard-context-sidebar"
+              className="min-h-11 min-w-11 text-text-secondary hover:text-midground"
+            >
+              <PanelRight />
+            </Button>
+          </span>
+        )}
       </header>
 
-      {mobileOpen && (
+      {(mobileOpen || contextOpen) && (
         <Button
           ghost
-          aria-label={t.app.closeNavigation}
-          onClick={closeMobile}
+          aria-label="Close navigation panels"
+          onClick={() => {
+            closeMobile();
+            if (contextOpen) closeContext();
+          }}
           className={cn(
             "lg:hidden fixed inset-0 z-40 p-0 block",
             "bg-black/70",
@@ -574,7 +643,7 @@ export default function App() {
             id="app-sidebar"
             aria-label={t.app.navigation}
             className={cn(
-              "fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
+              "studio-primary-sidebar fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
               "border-r border-current/20",
               "bg-background-base",
               "transition-[transform] duration-200 ease-[cubic-bezier(0.23,1,0.32,1)]",
@@ -603,12 +672,20 @@ export default function App() {
                 )}
               >
                 <PluginSlot name="header-left" />
-
-                <Typography className="font-bold text-[1.125rem] leading-[0.95] tracking-[0.0525rem] text-midground uppercase">
-                  Hermes
-                  <br />
-                  Agent
-                </Typography>
+                <span
+                  aria-hidden
+                  className="studio-brand-mark grid h-8 w-8 shrink-0 place-items-center rounded-[0.6rem] bg-foreground text-xs font-bold text-background-base"
+                >
+                  H
+                </span>
+                <span className="min-w-0">
+                  <Typography className="block truncate text-[0.95rem] font-semibold leading-tight tracking-[-0.025em] text-midground">
+                    Hermes Studio
+                  </Typography>
+                  <Typography className="block truncate text-[0.7rem] leading-tight tracking-normal text-text-tertiary">
+                    Agent workspace
+                  </Typography>
+                </span>
               </div>
 
               <Button
@@ -747,7 +824,7 @@ export default function App() {
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
             <div
               className={cn(
-                "relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
+                "studio-main relative z-2 flex min-w-0 min-h-0 flex-1 flex-col",
                 "px-3 sm:px-6",
                 isChatRoute
                   ? "pb-0 pt-1 sm:pt-2 lg:pt-4"
@@ -758,7 +835,7 @@ export default function App() {
               <PluginSlot name="pre-main" />
               <div
                 className={cn(
-                  "w-full min-w-0",
+                  "studio-page-frame w-full min-w-0",
                   !isChatRoute &&
                     "pb-[calc(2rem+env(safe-area-inset-bottom,0px))] lg:pb-8",
                   (isDocsRoute || isChatRoute) &&
@@ -813,6 +890,14 @@ export default function App() {
               <PluginSlot name="post-main" />
             </div>
           </PageHeaderProvider>
+
+          {dashboardContext && (
+            <DashboardContextSidebar
+              context={dashboardContext}
+              mobileOpen={contextOpen}
+              onClose={closeContext}
+            />
+          )}
         </div>
       </div>
 
@@ -835,6 +920,149 @@ export default function App() {
 function ProfileKeyedRoutes({ children }: { children: ReactNode }) {
   const { profile } = useProfileScope();
   return <div key={profile || "__own__"} className="contents">{children}</div>;
+}
+
+const DASHBOARD_GROUP_LABELS: Record<DashboardPage["group"], string> = {
+  workspace: "Workspace",
+  automations: "Automations",
+  integrations: "Integrations",
+  manage: "Manage",
+};
+
+export function DashboardContextSidebar({
+  context,
+  mobileOpen,
+  onClose,
+}: {
+  context: DashboardContext;
+  mobileOpen: boolean;
+  onClose: () => void;
+}) {
+  const mobileDrawerRef = useRef<HTMLElement>(null);
+
+  useEffect(() => {
+    if (!mobileOpen) return;
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        mobileDrawerRef.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!mobileDrawerRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", trapFocus);
+    return () => document.removeEventListener("keydown", trapFocus);
+  }, [mobileOpen]);
+
+  return (
+    <>
+      <aside
+        id="dashboard-context-sidebar-desktop"
+        aria-label={`${DASHBOARD_GROUP_LABELS[context.group]} related pages`}
+        className="studio-context-sidebar sticky top-0 z-10 hidden h-dvh w-60 shrink-0 flex-col border-l border-border bg-card/95 shadow-none backdrop-blur-xl lg:flex"
+      >
+        <DashboardContextSidebarContent context={context} onClose={onClose} />
+      </aside>
+
+      {mobileOpen && (
+        <aside
+          ref={mobileDrawerRef}
+          id="dashboard-context-sidebar"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`${DASHBOARD_GROUP_LABELS[context.group]} related pages`}
+          className="studio-context-sidebar fixed inset-y-0 right-0 z-50 flex w-72 shrink-0 flex-col border-l border-border bg-card/95 shadow-2xl backdrop-blur-xl lg:hidden"
+        >
+          <DashboardContextSidebarContent
+            context={context}
+            onClose={onClose}
+            showClose
+          />
+        </aside>
+      )}
+    </>
+  );
+}
+
+function DashboardContextSidebarContent({
+  context,
+  onClose,
+  showClose = false,
+}: {
+  context: DashboardContext;
+  onClose: () => void;
+  showClose?: boolean;
+}) {
+  return (
+    <>
+      <div className="flex h-14 shrink-0 items-center justify-between border-b border-border px-4">
+        <div className="min-w-0">
+          <p className="text-[0.68rem] font-semibold uppercase tracking-[0.12em] text-muted-foreground">
+            Section
+          </p>
+          <p className="truncate text-sm font-semibold text-foreground">
+            {DASHBOARD_GROUP_LABELS[context.group]}
+          </p>
+        </div>
+        {showClose && (
+          <Button
+            autoFocus
+            ghost
+            size="icon"
+            onClick={onClose}
+            aria-label="Close related pages"
+            className="min-h-11 min-w-11"
+          >
+            <X className="h-4 w-4" />
+          </Button>
+        )}
+      </div>
+
+      <nav className="min-h-0 flex-1 overflow-y-auto p-3" aria-label="Related pages">
+        <ul className="space-y-1">
+          {context.pages.map((page) => (
+            <li key={page.id}>
+              <NavLink
+                to={page.path}
+                onClick={showClose ? onClose : undefined}
+                className={({ isActive }) =>
+                  cn(
+                    "group flex rounded-lg px-3 py-2.5 transition-colors",
+                    "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
+                    isActive
+                      ? "bg-accent text-accent-foreground"
+                      : "text-muted-foreground hover:bg-muted hover:text-foreground",
+                  )
+                }
+              >
+                <span className="min-w-0">
+                  <span className="block truncate text-sm font-medium">
+                    {page.label}
+                  </span>
+                  <span className="mt-0.5 line-clamp-2 block text-xs leading-4 opacity-75">
+                    {page.description}
+                  </span>
+                </span>
+              </NavLink>
+            </li>
+          ))}
+        </ul>
+      </nav>
+    </>
+  );
 }
 
 function SidebarNavLink({
@@ -874,7 +1102,7 @@ function SidebarNavLink({
         onBlur={collapsed ? hideTooltip : undefined}
         className={({ isActive }) =>
           cn(
-            "group/nav relative flex items-center gap-3",
+            "studio-nav-link group/nav relative flex items-center gap-3",
             "px-5 py-2.5",
             "font-sans text-display uppercase text-sm tracking-[0.12em]",
             "whitespace-nowrap transition-colors cursor-pointer",

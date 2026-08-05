@@ -184,6 +184,110 @@ export const roseTheme: DashboardTheme = {
   },
 };
 
+/** Premium Stripe × Apple-inspired light appearance approved for Hermes Studio. */
+export const studioLightTheme: DashboardTheme = {
+  name: "studio-light",
+  label: "Hermes Studio — Light",
+  description: "Restrained light appearance with crisp surfaces and violet accents",
+  palette: {
+    background: { hex: "#f5f7fa", alpha: 1 },
+    midground: { hex: "#162033", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(99, 91, 255, 0.12)",
+    noiseOpacity: 0,
+  },
+  typography: {
+    ...DEFAULT_TYPOGRAPHY,
+    fontSans:
+      '-apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif',
+    fontDisplay:
+      '-apple-system, BlinkMacSystemFont, "SF Pro Display", "Segoe UI", sans-serif',
+    letterSpacing: "-0.006em",
+  },
+  layout: { radius: "0.75rem", density: "comfortable" },
+  colorOverrides: {
+    card: "#ffffff",
+    cardForeground: "#162033",
+    popover: "#ffffff",
+    popoverForeground: "#162033",
+    primary: "#635bff",
+    primaryForeground: "#ffffff",
+    secondary: "#f7f8fb",
+    secondaryForeground: "#162033",
+    muted: "#f0f2f6",
+    mutedForeground: "#667085",
+    accent: "#f0efff",
+    accentForeground: "#5148e5",
+    destructive: "#d92d20",
+    destructiveForeground: "#ffffff",
+    success: "#0c9b61",
+    warning: "#b7791f",
+    border: "#e5e9f0",
+    input: "#d4dae4",
+    ring: "#635bff",
+  },
+  terminalBackground: "#ffffff",
+  terminalForeground: "#162033",
+  seriesColors: {
+    inputTokenAccent: "#635bff",
+    outputTokenAccent: "#0c9b61",
+  },
+  swatchColors: ["#f5f7fa", "#635bff", "#162033"],
+};
+
+/** Premium Stripe × Apple-inspired dark appearance approved for Hermes Studio. */
+export const studioDarkTheme: DashboardTheme = {
+  name: "studio-dark",
+  label: "Hermes Studio — Dark",
+  description: "Deep neutral canvas with layered surfaces and soft violet accents",
+  palette: {
+    background: { hex: "#090c12", alpha: 1 },
+    midground: { hex: "#f4f6fb", alpha: 1 },
+    foreground: { hex: "#ffffff", alpha: 0 },
+    warmGlow: "rgba(139, 131, 255, 0.14)",
+    noiseOpacity: 0,
+  },
+  typography: studioLightTheme.typography,
+  layout: studioLightTheme.layout,
+  colorOverrides: {
+    card: "#11151d",
+    cardForeground: "#f4f6fb",
+    popover: "#171c26",
+    popoverForeground: "#f4f6fb",
+    primary: "#8b83ff",
+    primaryForeground: "#090c12",
+    secondary: "#171c26",
+    secondaryForeground: "#f4f6fb",
+    muted: "#191f2a",
+    mutedForeground: "#9ba5b5",
+    accent: "#201f38",
+    accentForeground: "#a39dff",
+    destructive: "#ff6b62",
+    destructiveForeground: "#090c12",
+    success: "#40c991",
+    warning: "#f0b45f",
+    border: "rgba(255, 255, 255, 0.085)",
+    input: "rgba(255, 255, 255, 0.15)",
+    ring: "#8b83ff",
+  },
+  terminalBackground: "#090c12",
+  terminalForeground: "#f4f6fb",
+  seriesColors: {
+    inputTokenAccent: "#8b83ff",
+    outputTokenAccent: "#40c991",
+  },
+  swatchColors: ["#090c12", "#8b83ff", "#f4f6fb"],
+};
+
+/** Picker entry for OS-following Studio appearance; resolves in ThemeProvider. */
+export const studioSystemTheme: DashboardTheme = {
+  ...studioLightTheme,
+  name: "studio-system",
+  label: "Hermes Studio — System",
+  description: "Follow the operating system light or dark appearance",
+  swatchColors: ["#f5f7fa", "#635bff", "#090c12"],
+};
+
 /** Light mode — vivid Nous-blue accents on a cream canvas. */
 export const nousBlueTheme: DashboardTheme = {
   name: "nous-blue",
@@ -229,6 +333,9 @@ export const defaultLargeTheme: DashboardTheme = {
 };
 
 export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
+  "studio-system": studioSystemTheme,
+  "studio-light": studioLightTheme,
+  "studio-dark": studioDarkTheme,
   default: defaultTheme,
   "default-large": defaultLargeTheme,
   "nous-blue": nousBlueTheme,
@@ -238,3 +345,14 @@ export const BUILTIN_THEMES: Record<string, DashboardTheme> = {
   cyberpunk: cyberpunkTheme,
   rose: roseTheme,
 };
+
+/** Resolve a built-in theme, including the dynamic Studio system alias. */
+export function resolveBuiltinTheme(
+  name: string,
+  prefersDark = false,
+): DashboardTheme | undefined {
+  if (name === "studio-system") {
+    return prefersDark ? studioDarkTheme : studioLightTheme;
+  }
+  return BUILTIN_THEMES[name];
+}

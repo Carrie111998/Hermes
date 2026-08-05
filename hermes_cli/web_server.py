@@ -317,6 +317,11 @@ from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
 
 app.include_router(_memory_oauth_router)
 
+# Canonical read-only dashboard page discovery for the SPA and MCP tools.
+from hermes_cli.web_routers import dashboard as _dashboard_routes  # noqa: E402
+
+app.include_router(_dashboard_routes.router)
+
 # ---------------------------------------------------------------------------
 # Session token for protecting sensitive endpoints (reveal).
 # The desktop shell mints the token and injects it via
@@ -16184,6 +16189,9 @@ def mount_spa(application: FastAPI):
 # Built-in dashboard themes — label + description only.  The actual color
 # definitions live in the frontend (web/src/themes/presets.ts).
 _BUILTIN_DASHBOARD_THEMES = [
+    {"name": "studio-system", "label": "Hermes Studio — System", "description": "Follow the operating system light or dark appearance"},
+    {"name": "studio-light",  "label": "Hermes Studio — Light",  "description": "Restrained light appearance with crisp surfaces and violet accents"},
+    {"name": "studio-dark",   "label": "Hermes Studio — Dark",   "description": "Deep neutral canvas with layered surfaces and soft violet accents"},
     {"name": "default",       "label": "Hermes Teal",         "description": "Classic dark teal — the canonical Hermes look"},
     {"name": "default-large", "label": "Hermes Teal (Large)", "description": "Hermes Teal with bigger fonts and roomier spacing"},
     {"name": "nous-blue",     "label": "Nous Blue",           "description": "Light mode — vivid Nous-blue accents on cream canvas"},

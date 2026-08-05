@@ -10,7 +10,8 @@ Matches OpenClaw's 9-tool MCP channel bridge surface:
   events_poll, events_wait, messages_send, permissions_list_open,
   permissions_respond
 
-Plus: channels_list (Hermes-specific extra)
+Plus: channels_list and dashboard page discovery/deep links (Hermes-specific
+extras)
 
 Usage:
     hermes mcp serve
@@ -605,6 +606,47 @@ def create_mcp_server(event_bridge: Optional[EventBridge] = None) -> "FastMCP":
     )
 
     bridge = event_bridge or EventBridge()
+
+    # -- dashboard_pages_list ---------------------------------------------
+
+    @mcp.tool()
+    def dashboard_pages_list(query: Optional[str] = None) -> str:
+        """List canonical Hermes dashboard pages that can be opened from chat.
+
+        Returns safe public page metadata only: ID, label, route path, group,
+        and description. Use ``dashboard_link_get`` with a returned ID to
+        produce a clickable URL.
+
+        Args:
+            query: Optional text to filter by page name, description, or group
+        """
+        from hermes_cli.dashboard_pages import list_dashboard_pages
+
+        pages = list_dashboard_pages(query)
+        return json.dumps({"count": len(pages), "pages": pages}, indent=2)
+
+    # -- dashboard_link_get -----------------------------------------------
+
+    @mcp.tool()
+    def dashboard_link_get(page_id: str) -> str:
+        """Return a safe clickable link to one Hermes dashboard page.
+
+        The generated URL never contains a session token or credentials.
+        The origin is operator-controlled through ``HERMES_DASHBOARD_URL`` and
+        defaults to the local dashboard; MCP callers cannot override it.
+
+        Args:
+            page_id: Canonical page ID from ``dashboard_pages_list``
+        """
+        from hermes_cli.dashboard_pages import build_configured_dashboard_link
+
+        try:
+            result = build_configured_dashboard_link(page_id)
+        except KeyError:
+            return json.dumps({"error": f"Unknown dashboard page: {page_id}"})
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)})
+        return json.dumps(result, indent=2)
 
     # -- conversations_list ------------------------------------------------
 

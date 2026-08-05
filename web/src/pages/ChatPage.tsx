@@ -28,13 +28,13 @@ import { cn } from "@/lib/utils";
 import { Copy, PanelRight, RotateCcw, X } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { createPortal } from "react-dom";
-import { useSearchParams } from "react-router";
+import { useNavigate, useSearchParams } from "react-router";
 
 import { ChatSidebar } from "@/components/ChatSidebar";
 import { ChatSessionList } from "@/components/ChatSessionList";
 import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
-import { api } from "@/lib/api";
+import { api, HERMES_BASE_PATH } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
@@ -64,6 +64,7 @@ import {
   uploadChatImage,
 } from "@/lib/chatImagePaste";
 import { maybeReloadForLoopbackWsAuthFailure } from "@/lib/dashboard-auth-reload";
+import { classifyDashboardLink } from "@/lib/dashboard-navigation";
 import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
@@ -162,6 +163,7 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
 }
 
 export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+  const navigate = useNavigate();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
@@ -737,7 +739,21 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     term.loadAddon(unicode11);
     term.unicode.activeVersion = "11";
 
-    term.loadAddon(new WebLinksAddon());
+    term.loadAddon(
+      new WebLinksAddon((event, uri) => {
+        const resolution = classifyDashboardLink(
+          uri,
+          window.location.href,
+          HERMES_BASE_PATH,
+        );
+        event.preventDefault();
+        if (resolution.kind === "internal") {
+          navigate(resolution.route);
+        } else if (resolution.kind === "external") {
+          window.open(resolution.url, "_blank", "noopener,noreferrer");
+        }
+      }),
+    );
 
     let mobileInputCleanup: (() => void) | null = null;
     term.open(host);
@@ -1277,6 +1293,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     resumeParam,
     scopedProfile,
     reconnectNonce,
+    navigate,
   ]);
 
   // When the user returns to the chat tab (isActive: false → true), the

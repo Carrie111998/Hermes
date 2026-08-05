@@ -526,6 +526,47 @@ def _event_loop():
     loop.close()
 
 
+class TestE2EDashboardPages:
+    def test_dashboard_pages_list_filters_public_manifest(self, fake_mcp_server, _event_loop):
+        server, _ = fake_mcp_server
+
+        result = _run_tool(server, "dashboard_pages_list", {"query": "models"})
+
+        assert result["count"] == 1
+        assert result["pages"][0]["id"] == "models"
+        assert result["pages"][0]["path"] == "/models"
+
+    def test_dashboard_link_get_returns_clickable_credential_free_link(
+        self, fake_mcp_server, _event_loop
+    ):
+        server, _ = fake_mcp_server
+
+        result = _run_tool(
+            server,
+            "dashboard_link_get",
+            {"page_id": "sessions"},
+        )
+
+        assert result["url"] == "http://127.0.0.1:9119/sessions"
+        assert result["markdown"] == "[Open Sessions](http://127.0.0.1:9119/sessions)"
+        assert "token" not in result["url"].lower()
+
+    def test_dashboard_link_get_rejects_unknown_page_and_hides_origin_argument(
+        self, fake_mcp_server, _event_loop
+    ):
+        server, _ = fake_mcp_server
+
+        unknown = _run_tool(server, "dashboard_link_get", {"page_id": "not-real"})
+        tool = next(
+            tool
+            for tool in server._tool_manager.list_tools()
+            if tool.name == "dashboard_link_get"
+        )
+
+        assert unknown == {"error": "Unknown dashboard page: not-real"}
+        assert set(inspect.signature(tool.fn).parameters) == {"page_id"}
+
+
 class TestE2EConversationsList:
     def test_list_all(self, mcp_server_e2e, _event_loop):
         server, _ = mcp_server_e2e
@@ -930,6 +971,7 @@ class TestToolRegistration:
         tool_names = {t.name for t in tools}
 
         expected = {
+            "dashboard_pages_list", "dashboard_link_get",
             "conversations_list", "conversation_get", "messages_read",
             "attachments_fetch", "events_poll", "events_wait",
             "messages_send", "channels_list",

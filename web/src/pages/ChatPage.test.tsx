@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router";
+import { MemoryRouter, useLocation } from "react-router";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 class FakeFitAddon {
@@ -11,6 +11,15 @@ class FakeFitAddon {
 class FakeWebglAddon {
   onContextLoss() {
     return { dispose() {} };
+  }
+}
+
+type WebLinkHandler = (event: MouseEvent, uri: string) => void;
+let webLinkHandler: WebLinkHandler | null = null;
+
+class FakeWebLinksAddon {
+  constructor(handler?: WebLinkHandler) {
+    webLinkHandler = handler ?? null;
   }
 }
 
@@ -68,7 +77,7 @@ const maybeReloadForLoopbackWsAuthFailure = vi.fn(() => false);
 
 vi.mock("@xterm/addon-fit", () => ({ FitAddon: FakeFitAddon }));
 vi.mock("@xterm/addon-unicode11", () => ({ Unicode11Addon: class {} }));
-vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: class {} }));
+vi.mock("@xterm/addon-web-links", () => ({ WebLinksAddon: FakeWebLinksAddon }));
 vi.mock("@xterm/addon-webgl", () => ({ WebglAddon: FakeWebglAddon }));
 vi.mock("@xterm/xterm", () => ({ Terminal: FakeTerminal }));
 vi.mock("@/components/ChatSidebar", () => ({
@@ -144,8 +153,18 @@ async function render(ui: ReactNode) {
   await act(async () => root.render(ui));
 }
 
+function LocationProbe() {
+  const location = useLocation();
+  return (
+    <output data-testid="location">
+      {`${location.pathname}${location.search}`}
+    </output>
+  );
+}
+
 beforeEach(() => {
   FakeWebSocket.instances = [];
+  webLinkHandler = null;
   maybeReloadForLoopbackWsAuthFailure.mockClear();
   vi.stubGlobal("WebSocket", FakeWebSocket);
   vi.stubGlobal(
@@ -206,6 +225,80 @@ afterEach(async () => {
 });
 
 describe("ChatPage", () => {
+  it("routes same-origin dashboard links through React Router", async () => {
+    const { default: ChatPage } = await import("./ChatPage");
+
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+        <LocationProbe />
+      </MemoryRouter>,
+    );
+
+    await vi.waitFor(() => expect(webLinkHandler).not.toBeNull());
+    const preventDefault = vi.fn();
+    const dashboardUrl = new URL("/models", window.location.href).href;
+
+    await act(async () => {
+      webLinkHandler?.({ preventDefault } as unknown as MouseEvent, dashboardUrl);
+    });
+
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(container.querySelector('[data-testid="location"]')?.textContent).toBe(
+      "/models",
+    );
+  });
+
+  it("suppresses rejected same-origin links instead of opening them", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(webLinkHandler).not.toBeNull());
+    const preventDefault = vi.fn();
+
+    await act(async () => {
+      webLinkHandler?.(
+        { preventDefault } as unknown as MouseEvent,
+        new URL("/models?token=secret", window.location.href).href,
+      );
+    });
+
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(open).not.toHaveBeenCalled();
+    open.mockRestore();
+  });
+
+  it("opens explicitly safe external HTTP links", async () => {
+    const open = vi.spyOn(window, "open").mockImplementation(() => null);
+    const { default: ChatPage } = await import("./ChatPage");
+    await render(
+      <MemoryRouter initialEntries={["/chat"]}>
+        <ChatPage isActive />
+      </MemoryRouter>,
+    );
+    await vi.waitFor(() => expect(webLinkHandler).not.toBeNull());
+    const preventDefault = vi.fn();
+
+    await act(async () => {
+      webLinkHandler?.(
+        { preventDefault } as unknown as MouseEvent,
+        "https://example.com/docs",
+      );
+    });
+
+    expect(preventDefault).toHaveBeenCalledOnce();
+    expect(open).toHaveBeenCalledWith(
+      "https://example.com/docs",
+      "_blank",
+      "noopener,noreferrer",
+    );
+    open.mockRestore();
+  });
+
   it("treats loopback 4401 closes as stale-token reload candidates", async () => {
     const { default: ChatPage } = await import("./ChatPage");
 
