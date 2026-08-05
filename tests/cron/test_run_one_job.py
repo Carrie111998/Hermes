@@ -31,7 +31,7 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(jid, ok, err=None, delivery_error=None, execution_id=None):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -39,6 +39,65 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
     monkeypatch.setattr(s, "_deliver_result", fake_deliver)
     monkeypatch.setattr(s, "mark_job_run", fake_mark)
     return calls
+
+
+def test_run_one_job_persists_and_claims_delivery_before_send(monkeypatch):
+    """A completed agent result crosses a durable boundary before network I/O."""
+    calls = []
+    target = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+
+    monkeypatch.setattr(s, "claim_dispatch", lambda _job_id: True)
+    monkeypatch.setattr(s, "mark_execution_running", lambda _execution_id: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (True, "output", "response", None),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda *_args: "/tmp/output.md")
+    monkeypatch.setattr(s, "mark_job_run", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(s, "_resolve_delivery_targets", lambda _job: [target])
+    monkeypatch.setattr(
+        s,
+        "enqueue_delivery",
+        lambda execution_id, **kwargs: calls.append(("enqueue", execution_id, kwargs))
+        or {"execution_id": execution_id},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        s,
+        "claim_delivery",
+        lambda execution_id: calls.append(("claim", execution_id))
+        or {
+            "execution_id": execution_id,
+            "job": {"id": "durable", "name": "Durable"},
+            "content": "response",
+            "targets": [target],
+            "claim_token": "claim-1",
+        },
+        raising=False,
+    )
+    monkeypatch.setattr(
+        s,
+        "_deliver_result",
+        lambda *_args, **_kwargs: calls.append(("deliver", _kwargs["targets_override"]))
+        or s.DeliveryReport("offline", [], [target]),
+    )
+    monkeypatch.setattr(
+        s,
+        "finish_delivery_attempt",
+        lambda execution_id, **kwargs: calls.append(("finish_delivery", execution_id, kwargs)),
+        raising=False,
+    )
+
+    assert s.run_one_job(
+        {"id": "durable", "name": "Durable", "deliver": "telegram", "execution_id": "exec-1"}
+    ) is True
+    assert [call[0] for call in calls] == [
+        "enqueue", "claim", "deliver", "finish_delivery"
+    ]
+    assert calls[0][2]["content"] == "response"
+    assert calls[3][2]["failed_targets"] == [target]
 
 
 def test_tick_process_job_sequence(monkeypatch):
@@ -107,5 +166,3 @@ def test_run_one_job_installs_secret_scope_under_multiplex(monkeypatch, tmp_path
     assert scope_during_run["base_url"] == "https://openrouter.ai/api/v1"
     # And it was torn down after run_one_job returned (no leak).
     assert ss.current_secret_scope() is None
-
-

@@ -280,6 +280,30 @@ def test_failing_tick_records_liveness_but_not_success():
     assert all(b is False for b in beats), "a failing tick wrongly bumped the success marker"
 
 
+def test_builtin_reconciles_due_deliveries_before_each_tick():
+    from cron.scheduler_provider import InProcessCronScheduler
+
+    events = []
+    stop = threading.Event()
+
+    def retry(**_kwargs):
+        events.append("retry")
+
+    def tick(**_kwargs):
+        events.append("tick")
+        stop.set()
+
+    with patch("cron.executions.recover_interrupted_executions", return_value=0), \
+         patch("cron.executions.recover_interrupted_deliveries", return_value=0), \
+         patch("cron.scheduler.retry_due_deliveries", side_effect=retry), \
+         patch("cron.scheduler.tick", side_effect=tick), \
+         patch("cron.jobs.record_ticker_heartbeat"), \
+         patch("cron.jobs.clear_ticker_error"):
+        InProcessCronScheduler().start(stop, interval=0)
+
+    assert events == ["retry", "tick"]
+
+
 def test_heartbeat_roundtrip_and_age(tmp_path, monkeypatch):
     """record_ticker_heartbeat writes fresh timestamps atomically; the age
     getters read them back as small positive ages."""
@@ -412,5 +436,4 @@ def test_multiplex_ticker_ticks_each_profile_once(tmp_path, monkeypatch):
     # With 2 profiles and multiple iterations, we should have seen at least 2 calls.
     assert len(tick_count) >= len(profile_homes), \
         f"Expected >= {len(profile_homes)} tick calls, got {len(tick_count)}"
-
 

@@ -7,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -65,6 +66,34 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def test_retention_preserves_terminal_execution_with_pending_delivery(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
+    pending = executions.create_execution("pending-delivery", source="builtin")
+    executions.finish_execution(pending["id"], success=True)
+    executions.enqueue_delivery(
+        pending["id"],
+        job={"id": "pending-delivery"},
+        content="result",
+        targets=[{"platform": "telegram", "chat_id": "1"}],
+    )
+    for index in range(4):
+        row = executions.create_execution(f"newer-{index}", source="builtin")
+        executions.finish_execution(row["id"], success=True)
+
+    assert executions.latest_execution("pending-delivery")["id"] == pending["id"]
+    assert executions.get_delivery(pending["id"])["status"] == "pending"
+
+
+def test_execution_ledger_path_follows_active_profile(monkeypatch, tmp_path):
+    import cron.executions as executions
+
+    profile = tmp_path / "profiles" / "ops"
+    monkeypatch.setattr(executions, "get_hermes_home", lambda: profile)
+
+    assert executions._current_executions_file() == profile / "cron" / "executions.db"
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
@@ -73,6 +102,45 @@ def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     with __import__("pytest").raises(sqlite3.DatabaseError):
         executions.create_execution("new", source="builtin")
     assert executions.EXECUTIONS_FILE.read_bytes() == b"not a sqlite database"
+
+
+def test_delivery_schema_additively_migrates_pre_hardening_database(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    conn = sqlite3.connect(executions.EXECUTIONS_FILE)
+    conn.execute(
+        """CREATE TABLE deliveries (
+             execution_id TEXT PRIMARY KEY,
+             job_id TEXT NOT NULL,
+             job_json TEXT,
+             content TEXT,
+             targets_json TEXT NOT NULL,
+             status TEXT NOT NULL,
+             attempt_count INTEGER NOT NULL DEFAULT 0,
+             next_attempt_at TEXT,
+             last_error TEXT,
+             created_at TEXT NOT NULL,
+             updated_at TEXT NOT NULL
+           )"""
+    )
+    conn.execute(
+        """INSERT INTO deliveries
+           (execution_id, job_id, job_json, content, targets_json, status,
+            attempt_count, next_attempt_at, created_at, updated_at)
+           VALUES ('legacy', 'job', '{"id":"job"}', 'result', '[]',
+                   'retry_wait', 1, '2099-01-01T00:00:00+00:00', 'now', 'now')"""
+    )
+    conn.commit()
+    conn.close()
+
+    migrated = executions.get_delivery("legacy")
+
+    assert migrated["status"] == "retry_wait"
+    assert migrated["permanent_error"] is None
+    assert migrated["terminal_reason"] is None
+    assert migrated["claim_token"] is None
 
 
 def test_cron_runs_cli_prints_execution_history(monkeypatch, tmp_path, capsys):
@@ -165,6 +233,131 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
+def test_delivery_retry_keeps_only_failed_targets(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    clock = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: clock)
+    execution = executions.create_execution("fanout", source="builtin")
+    telegram = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+    discord = {"platform": "discord", "chat_id": "2", "thread_id": "3"}
+
+    queued = executions.enqueue_delivery(
+        execution["id"],
+        job={"id": "fanout", "name": "Fan out", "deliver": "all"},
+        content="exact agent result",
+        targets=[telegram, discord],
+    )
+    assert queued["status"] == "pending"
+    assert queued["targets"] == [telegram, discord]
+
+    claimed = executions.claim_delivery(execution["id"])
+    assert claimed["status"] == "delivering"
+    assert claimed["attempt_count"] == 1
+
+    waiting = executions.finish_delivery_attempt(
+        execution["id"],
+        claim_token=claimed["claim_token"],
+        failed_targets=[discord],
+        error="discord unavailable",
+    )
+    assert waiting["status"] == "retry_wait"
+    assert waiting["targets"] == [discord]
+    assert waiting["next_attempt_at"] == "2026-08-05T12:01:00+00:00"
+    assert executions.list_due_deliveries() == []
+
+    monkeypatch.setattr(
+        executions,
+        "_hermes_now",
+        lambda: datetime(2026, 8, 5, 12, 1, tzinfo=timezone.utc),
+    )
+    assert [row["execution_id"] for row in executions.list_due_deliveries()] == [
+        execution["id"]
+    ]
+
+    attempts = executions.list_delivery_attempts(execution["id"])
+    assert len(attempts) == 1
+    assert attempts[0]["outcome"] == "retry_wait"
+    assert attempts[0]["targets"] == [telegram, discord]
+
+
+def test_completed_delivery_discards_sensitive_payload(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution("private", source="builtin")
+    executions.enqueue_delivery(
+        execution["id"],
+        job={"id": "private", "origin": {"user_id": "secret-user"}},
+        content="private response",
+        targets=[{"platform": "telegram", "chat_id": "1"}],
+    )
+    claimed = executions.claim_delivery(execution["id"])
+
+    completed = executions.finish_delivery_attempt(
+        execution["id"], claim_token=claimed["claim_token"], failed_targets=[]
+    )
+
+    assert completed["status"] == "delivered"
+    assert completed["content"] is None
+    assert completed["job"] is None
+    assert completed["targets"] == []
+
+
+def test_delivery_attempts_exhaust_with_bounded_backoff(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    target = {"platform": "telegram", "chat_id": "1"}
+    current = datetime(2026, 8, 5, 12, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(executions, "_hermes_now", lambda: current)
+    execution = executions.create_execution("bounded", source="builtin")
+    executions.enqueue_delivery(
+        execution["id"], job={"id": "bounded"}, content="payload", targets=[target]
+    )
+
+    expected_delays = [60, 120, 600]
+    for delay in expected_delays:
+        claimed = executions.claim_delivery(execution["id"])
+        record = executions.finish_delivery_attempt(
+            execution["id"],
+            claim_token=claimed["claim_token"],
+            failed_targets=[target],
+            error="offline",
+        )
+        assert record["status"] == "retry_wait"
+        current = datetime.fromisoformat(record["next_attempt_at"])
+
+    claimed = executions.claim_delivery(execution["id"])
+    exhausted = executions.finish_delivery_attempt(
+        execution["id"],
+        claim_token=claimed["claim_token"],
+        failed_targets=[target],
+        error="still offline",
+    )
+    assert exhausted["status"] == "exhausted"
+    assert exhausted["attempt_count"] == 4
+    assert exhausted["content"] is None
+    assert exhausted["job"] is None
+    assert len(executions.list_delivery_attempts(execution["id"])) == 4
+
+
+def test_recovery_marks_inflight_delivery_unknown_without_retry(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    execution = executions.create_execution("ambiguous-delivery", source="builtin")
+    executions.enqueue_delivery(
+        execution["id"],
+        job={"id": "ambiguous-delivery"},
+        content="may already have been sent",
+        targets=[{"platform": "telegram", "chat_id": "1"}],
+    )
+    executions.claim_delivery(execution["id"])
+    monkeypatch.setattr(executions, "_PROCESS_ID", "replacement-process")
+    monkeypatch.setattr(executions, "_owner_is_live", lambda *_args: False)
+
+    assert executions.recover_interrupted_deliveries() == 1
+    recovered = executions.get_delivery(execution["id"])
+    assert recovered["status"] == "unknown"
+    assert recovered["content"] is None
+    assert executions.list_due_deliveries() == []
+    assert executions.list_delivery_attempts(execution["id"])[0]["outcome"] == "unknown"
+
+
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
     import cron.scheduler as scheduler
 
@@ -238,11 +431,21 @@ def test_provider_start_recovers_interrupted_records_before_tick(monkeypatch):
         lambda: events.append("recover") or 0,
         raising=False,
     )
+    monkeypatch.setattr(
+        "cron.executions.recover_interrupted_deliveries",
+        lambda: events.append("recover-delivery") or 0,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.retry_due_deliveries",
+        lambda **_kwargs: events.append("retry-delivery") or 0,
+        raising=False,
+    )
     monkeypatch.setattr("cron.jobs.record_ticker_heartbeat", lambda **_kwargs: events.append("heartbeat"))
 
     provider.InProcessCronScheduler().start(stop, interval=1)
 
-    assert events[:2] == ["recover", "heartbeat"]
+    assert events[:3] == ["recover", "recover-delivery", "heartbeat"]
 
 
 def test_external_provider_start_recovers_interrupted_records(monkeypatch):
@@ -255,11 +458,19 @@ def test_external_provider_start_recovers_interrupted_records(monkeypatch):
         "cron.executions.recover_interrupted_executions",
         lambda: events.append("recover") or 0,
     )
+    monkeypatch.setattr(
+        "cron.executions.recover_interrupted_deliveries",
+        lambda: events.append("recover-delivery") or 0,
+    )
+    monkeypatch.setattr(
+        "cron.scheduler.retry_due_deliveries",
+        lambda **_kwargs: events.append("retry-delivery") or 0,
+    )
     monkeypatch.setattr(provider, "reconcile", lambda: events.append("reconcile"))
 
     provider.start(__import__("threading").Event())
 
-    assert events == ["recover", "reconcile"]
+    assert events == ["recover", "recover-delivery", "retry-delivery", "reconcile"]
 
 
 class _TrackingConnection:

@@ -17,6 +17,7 @@ from cron.jobs import (
     pause_job,
     resume_job,
     remove_job,
+    mark_job_delivery,
     mark_job_run,
     advance_next_run,
     claim_dispatch,
@@ -379,6 +380,47 @@ class TestMarkJobRun:
         assert updated["last_status"] == "ok"
         assert updated["last_error"] is None
         assert updated["last_delivery_error"] == "platform 'telegram' not configured"
+
+    def test_delivery_retry_update_does_not_count_another_run(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error="offline")
+        before = get_job(job["id"])
+
+        assert mark_job_delivery(job["id"], None) is True
+
+        after = get_job(job["id"])
+        assert after["last_delivery_error"] is None
+        assert after["last_run_at"] == before["last_run_at"]
+        assert after["repeat"]["completed"] == before["repeat"]["completed"]
+
+    def test_older_retry_cannot_clear_newer_execution_failure(self, tmp_cron_dir):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(
+            job["id"], success=True, delivery_error="old failure", execution_id="old"
+        )
+        mark_job_run(
+            job["id"], success=True, delivery_error="new failure", execution_id="new"
+        )
+
+        assert mark_job_delivery(job["id"], None, execution_id="old") is False
+        updated = get_job(job["id"])
+        assert updated["last_execution_id"] == "new"
+        assert updated["last_delivery_error"] == "new failure"
+
+    def test_pre_upgrade_job_uses_ledger_to_accept_latest_retry(
+        self, tmp_cron_dir, monkeypatch
+    ):
+        job = create_job(prompt="Report", schedule="every 1h")
+        mark_job_run(job["id"], success=True, delivery_error="offline")
+        monkeypatch.setattr(
+            "cron.executions.latest_execution",
+            lambda _job_id: {"id": "legacy-latest"},
+        )
+
+        assert (
+            mark_job_delivery(job["id"], None, execution_id="legacy-latest") is True
+        )
+        assert get_job(job["id"])["last_delivery_error"] is None
 
 
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):

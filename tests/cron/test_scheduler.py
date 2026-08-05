@@ -440,6 +440,264 @@ class TestDeliverResultErrorReturns:
         assert result is not None
         assert "not configured" in result
 
+    def test_structured_report_isolates_failed_concrete_targets(self):
+        from gateway.config import Platform
+
+        telegram_cfg = MagicMock()
+        telegram_cfg.enabled = True
+        discord_cfg = MagicMock()
+        discord_cfg.enabled = False
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {
+            Platform.TELEGRAM: telegram_cfg,
+            Platform.DISCORD: discord_cfg,
+        }
+        telegram = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+        discord = {"platform": "discord", "chat_id": "2", "thread_id": None}
+
+        async def successful_send(*_args, **_kwargs):
+            return {"success": True}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.delivery.resolve_delivery_transport", return_value=None), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=successful_send):
+            report = _deliver_result(
+                {"id": "fanout", "deliver": "all"},
+                "Output.",
+                targets_override=[telegram, discord],
+                return_report=True,
+            )
+
+        assert report.error is not None
+        assert "discord" in report.error
+        assert report.delivered_targets == [telegram]
+        assert report.failed_targets == [discord]
+
+    def test_legacy_return_contract_remains_string_or_none(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = False
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        target = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg):
+            result = _deliver_result(
+                {"id": "legacy", "deliver": "telegram"},
+                "Output.",
+                targets_override=[target],
+            )
+
+        assert isinstance(result, str)
+        assert "not configured" in result
+
+    def test_authentication_failure_is_permanent(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        target = {"platform": "telegram", "chat_id": "1", "thread_id": None}
+
+        async def rejected(*_args, **_kwargs):
+            return {"error": "401 unauthorized token"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.delivery.resolve_delivery_transport", return_value=None), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=rejected):
+            report = _deliver_result(
+                {"id": "auth", "deliver": "telegram"},
+                "Output.",
+                targets_override=[target],
+                return_report=True,
+            )
+
+        assert report.failed_targets == [target]
+        assert report.retryable_failed_targets == []
+        assert any("401" in error for error in report.permanent_errors)
+
+    def test_missing_target_failure_is_permanent(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.TELEGRAM: pconfig}
+        target = {"platform": "telegram", "chat_id": "missing", "thread_id": None}
+
+        async def rejected(*_args, **_kwargs):
+            return {"error": "Bad Request: chat not found"}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("cron.scheduler.load_config", return_value={"cron": {"wrap_response": False}}), \
+             patch("gateway.delivery.resolve_delivery_transport", return_value=None), \
+             patch("tools.send_message_tool._send_to_platform", side_effect=rejected):
+            report = _deliver_result(
+                {"id": "missing", "deliver": "telegram:missing"},
+                "Output.",
+                targets_override=[target],
+                return_report=True,
+            )
+
+        assert report.failed_targets == [target]
+        assert report.retryable_failed_targets == []
+        assert any("chat not found" in error for error in report.permanent_errors)
+
+
+def test_retry_due_deliveries_claims_and_sends_failed_targets_only(monkeypatch):
+    import cron.scheduler as scheduler
+
+    target = {"platform": "discord", "chat_id": "2", "thread_id": None}
+    batch = {
+        "execution_id": "exec-retry",
+        "job_id": "job-retry",
+        "job": {"id": "job-retry", "name": "Retry"},
+        "content": "saved response",
+        "targets": [target],
+        "claim_token": "claim-retry",
+    }
+    calls = []
+    monkeypatch.setattr(scheduler, "list_due_deliveries", lambda **_kwargs: [batch], raising=False)
+    monkeypatch.setattr(
+        scheduler,
+        "get_job",
+        lambda _job_id: {"id": "job-retry", "enabled": True, "state": "scheduled"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "claim_delivery",
+        lambda execution_id: calls.append(("claim", execution_id)) or batch,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda job, content, **kwargs: calls.append(
+            ("deliver", job, content, kwargs["targets_override"])
+        ) or scheduler.DeliveryReport(None, [target], []),
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "finish_delivery_attempt",
+        lambda execution_id, **kwargs: calls.append(("finish", execution_id, kwargs))
+        or {"status": "delivered"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "mark_job_delivery",
+        lambda job_id, error=None, **kwargs: calls.append(
+            ("mark", job_id, error, kwargs)
+        ),
+        raising=False,
+    )
+
+    assert scheduler.retry_due_deliveries() == 1
+    assert calls[0] == ("claim", "exec-retry")
+    assert calls[1][0] == "deliver"
+    assert calls[1][3] == [target]
+    assert calls[2][2]["failed_targets"] == []
+    assert calls[3] == (
+        "mark",
+        "job-retry",
+        None,
+        {"execution_id": "exec-retry"},
+    )
+
+
+def test_retry_reconciliation_classifies_dead_delivery_owners(monkeypatch):
+    import cron.scheduler as scheduler
+
+    events = []
+    monkeypatch.setattr(
+        scheduler,
+        "recover_interrupted_deliveries",
+        lambda: events.append("recover") or 0,
+        raising=False,
+    )
+    monkeypatch.setattr(scheduler, "list_pending_deliveries", lambda **_kwargs: [])
+    monkeypatch.setattr(scheduler, "list_due_deliveries", lambda **_kwargs: [])
+
+    assert scheduler.retry_due_deliveries() == 0
+    assert events == ["recover"]
+
+
+def test_retry_due_deliveries_cancels_deleted_job(monkeypatch):
+    import cron.scheduler as scheduler
+
+    batch = {"execution_id": "deleted", "job_id": "gone"}
+    calls = []
+    monkeypatch.setattr(scheduler, "list_due_deliveries", lambda **_kwargs: [batch])
+    monkeypatch.setattr(scheduler, "get_job", lambda _job_id: None, raising=False)
+    monkeypatch.setattr(
+        scheduler,
+        "cancel_delivery",
+        lambda execution_id, **kwargs: calls.append((execution_id, kwargs)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not send")),
+    )
+
+    assert scheduler.retry_due_deliveries() == 0
+    assert calls == [("deleted", {"reason": "job was deleted before delivery retry"})]
+
+
+def test_retry_due_deliveries_cancels_paused_job(monkeypatch):
+    import cron.scheduler as scheduler
+
+    batch = {"execution_id": "paused", "job_id": "job-paused"}
+    calls = []
+    monkeypatch.setattr(scheduler, "list_due_deliveries", lambda **_kwargs: [batch])
+    monkeypatch.setattr(
+        scheduler,
+        "get_job",
+        lambda _job_id: {"id": "job-paused", "enabled": False, "state": "paused"},
+        raising=False,
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "cancel_delivery",
+        lambda execution_id, **kwargs: calls.append((execution_id, kwargs)),
+        raising=False,
+    )
+
+    assert scheduler.retry_due_deliveries() == 0
+    assert calls[0][0] == "paused"
+
+
+def test_invalid_unresolved_target_is_not_enqueued_for_retry(monkeypatch):
+    import cron.scheduler as scheduler
+
+    monkeypatch.setattr(scheduler, "_resolve_delivery_targets", lambda _job: [])
+    monkeypatch.setattr(
+        scheduler,
+        "_deliver_result",
+        lambda *_args, **_kwargs: "no delivery target resolved for deliver=bogus",
+    )
+    monkeypatch.setattr(
+        scheduler,
+        "enqueue_delivery",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("permanently invalid targets must not enter retry state")
+        ),
+    )
+
+    error = scheduler._deliver_durably(
+        "invalid-execution",
+        {"id": "invalid-job", "deliver": "bogus"},
+        "result",
+    )
+
+    assert error == "no delivery target resolved for deliver=bogus"
+
 
 class TestRunJobSessionPersistence:
     def test_run_job_passes_session_db_and_cron_platform(self, tmp_path):
@@ -959,12 +1217,15 @@ class TestSilentDelivery:
             tick(verbose=False)
 
         deliver_mock.assert_not_called()
-        mark_mock.assert_called_once_with(
+        mark_mock.assert_called_once()
+        args, kwargs = mark_mock.call_args
+        assert args == (
             "monitor-job",
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
-            delivery_error=None,
         )
+        assert kwargs["delivery_error"] is None
+        assert kwargs["execution_id"]
 
 
 class TestOneShotDispatchClaim:
@@ -1855,7 +2116,15 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             fail_future.result.side_effect = ConnectionError("SMTP connection refused")
             ok_future = MagicMock()
             ok_future.result.return_value = {"success": True}
-            mock_pool.submit.side_effect = [fail_future, ok_future]
+            futures = iter([fail_future, ok_future])
+
+            def submit_without_worker(_fn, coro):
+                # This test replaces the executor, so it also owns the coroutine
+                # that a real worker would consume.
+                coro.close()
+                return next(futures)
+
+            mock_pool.submit.side_effect = submit_without_worker
 
             result = _deliver_result(job, "Report content")
 
@@ -1884,7 +2153,12 @@ class TestMultiTargetDeliveryContinuesOnFailure:
 
             fail_future = MagicMock()
             fail_future.result.side_effect = ConnectionError("connection refused")
-            mock_pool.submit.return_value = fail_future
+
+            def submit_without_worker(_fn, coro):
+                coro.close()
+                return fail_future
+
+            mock_pool.submit.side_effect = submit_without_worker
 
             result = _deliver_result(job, "Report content")
 
@@ -1907,5 +2181,3 @@ class TestSetCronSessionTitle:
         out = _set_cron_session_title(db, "sess-1", "Nightly Synthesis")
         assert out == "Nightly Synthesis #2"
         db.get_next_title_in_lineage.assert_called_once_with("Nightly Synthesis")
-
-

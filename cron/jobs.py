@@ -1687,7 +1687,8 @@ def remove_job(job_id: str) -> bool:
 
 
 def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+                 delivery_error: Optional[str] = None,
+                 execution_id: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1696,6 +1697,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``execution_id`` identifies which run owns that delivery outcome so a
+    delayed retry from an older run cannot overwrite a newer run's result.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1707,6 +1710,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                if execution_id is not None:
+                    job["last_execution_id"] = str(execution_id)
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1790,6 +1795,41 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def mark_job_delivery(job_id: str, error: Optional[str] = None, *,
+                      execution_id: Optional[str] = None) -> bool:
+    """Update a delivery outcome only when it still belongs to the latest run."""
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] == job_id:
+                if execution_id is not None:
+                    expected_execution_id = job.get("last_execution_id")
+                    if expected_execution_id is None:
+                        # Additive migration for jobs whose run was recorded by
+                        # an earlier build of this branch. Consult the durable
+                        # ledger rather than accepting an unowned retry update.
+                        try:
+                            from cron.executions import latest_execution
+
+                            latest = latest_execution(job_id)
+                            expected_execution_id = latest.get("id") if latest else None
+                        except Exception:
+                            expected_execution_id = None
+                    if expected_execution_id != str(execution_id):
+                        logger.debug(
+                            "Ignoring stale delivery outcome for job %s execution %s",
+                            job_id,
+                            execution_id,
+                        )
+                        return False
+                    job["last_execution_id"] = str(execution_id)
+                job["last_delivery_error"] = str(error) if error else None
+                save_jobs(jobs)
+                return True
+    logger.debug("mark_job_delivery: job_id %s not found", job_id)
+    return False
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:

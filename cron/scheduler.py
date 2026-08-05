@@ -21,6 +21,7 @@ import subprocess
 import sys
 import threading
 import time
+from dataclasses import dataclass
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 try:
@@ -282,8 +283,28 @@ _LEGACY_HOME_TARGET_ENV_VARS = {
     "QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL",
 }
 
-from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_runs, claim_dispatch, heartbeat_run_claim
-from cron.executions import create_execution, finish_execution, mark_execution_running
+from cron.jobs import (
+    advance_next_runs,
+    claim_dispatch,
+    get_due_jobs,
+    get_job,
+    heartbeat_run_claim,
+    mark_job_delivery,
+    mark_job_run,
+    save_job_output,
+)
+from cron.executions import (
+    cancel_delivery,
+    claim_delivery,
+    create_execution,
+    enqueue_delivery,
+    finish_delivery_attempt,
+    finish_execution,
+    list_due_deliveries,
+    list_pending_deliveries,
+    mark_execution_running,
+    recover_interrupted_deliveries,
+)
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
 # response with this marker to suppress delivery.  Output is still saved
@@ -1458,7 +1479,65 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+@dataclass(frozen=True)
+class DeliveryReport:
+    """Concrete fan-out outcome used by the durable delivery queue."""
+
+    error: Optional[str]
+    delivered_targets: List[dict]
+    failed_targets: List[dict]
+    retryable_failed_targets: Optional[List[dict]] = None
+    permanent_errors: Optional[List[str]] = None
+
+    def __post_init__(self) -> None:
+        # Three-argument construction remains compatible: historical/internal
+        # test doubles treat every failure as retryable unless classified.
+        if self.retryable_failed_targets is None:
+            object.__setattr__(
+                self,
+                "retryable_failed_targets",
+                [dict(target) for target in self.failed_targets],
+            )
+        if self.permanent_errors is None:
+            object.__setattr__(self, "permanent_errors", [])
+
+
+def _is_permanent_delivery_error(error: str) -> bool:
+    """Classify deterministic target/config/auth failures that retries cannot fix."""
+    text = str(error or "").lower()
+    if (
+        "unknown platform" in text
+        or "not configured/enabled" in text
+        or "unauthorized" in text
+        or "forbidden" in text
+        or "authentication" in text
+        or re.search(r"\b(401|403)\b", text)
+    ):
+        return True
+    # Reuse the gateway's platform-neutral classification instead of growing a
+    # second list of provider-specific strings in cron. Retrying the same
+    # missing target, invalid format, or over-limit payload cannot recover.
+    try:
+        from gateway.platforms.base import classify_send_error
+
+        return classify_send_error(None, error_text=text) in {
+            "not_found",
+            "bad_format",
+            "too_long",
+        }
+    except Exception:
+        return False
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    targets_override: Optional[List[dict]] = None,
+    return_report: bool = False,
+) -> Optional[str] | DeliveryReport:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1467,13 +1546,43 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     the standalone HTTP path cannot encrypt.  Falls back to standalone send if
     the adapter path fails or is unavailable.
 
-    Returns None on success, or an error string on failure.
+    Returns None on success, or an error string on failure. Durable retry
+    callers may request a structured per-target report and pass the exact
+    previously-failed concrete targets, avoiding duplicate fan-out sends.
     """
-    targets = _resolve_delivery_targets(job)
+    targets = (
+        [dict(target) for target in targets_override]
+        if targets_override is not None
+        else _resolve_delivery_targets(job)
+    )
+    delivered_targets: List[dict] = []
+    failed_targets: List[dict] = []
+    retryable_failed_targets: List[dict] = []
+    permanent_errors: List[str] = []
+
+    def _result(error: Optional[str]):
+        if return_report:
+            return DeliveryReport(
+                error=error,
+                delivered_targets=delivered_targets,
+                failed_targets=failed_targets,
+                retryable_failed_targets=retryable_failed_targets,
+                permanent_errors=permanent_errors,
+            )
+        return error
+
+    def _record_target_failure(target: dict, error: str) -> None:
+        if target not in failed_targets:
+            failed_targets.append(dict(target))
+        if _is_permanent_delivery_error(error):
+            permanent_errors.append(str(error))
+        elif target not in retryable_failed_targets:
+            retryable_failed_targets.append(dict(target))
+
     if not targets:
         deliver_value = _normalize_deliver_value(job.get("deliver", "local"))
         if deliver_value == "local":
-            return None  # local-only jobs don't deliver — not a failure
+            return _result(None)  # local-only jobs don't deliver — not a failure
         # deliver=origin with no resolvable origin and no configured home
         # channels: treat as local rather than reporting an error.  CLI-created
         # jobs never capture a {platform, chat_id} origin, so failing here would
@@ -1486,10 +1595,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 "skipping delivery (output saved in last_output)",
                 job.get("name", job.get("id", "?")),
             )
-            return None
+            return _result(None)
         msg = f"no delivery target resolved for deliver={deliver_value}"
         logger.warning("Job '%s': %s", job["id"], msg)
-        return msg
+        return _result(msg)
 
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
@@ -1541,7 +1650,9 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception as e:
         msg = f"failed to load gateway config: {e}"
         logger.error("Job '%s': %s", job["id"], msg)
-        return msg
+        failed_targets.extend(dict(target) for target in targets)
+        retryable_failed_targets.extend(dict(target) for target in targets)
+        return _result(msg)
 
     delivery_errors = []
 
@@ -1583,6 +1694,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"unknown platform '{platform_name}'"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_target_failure(target, msg)
             continue
 
         from gateway.delivery import resolve_delivery_transport
@@ -1601,6 +1713,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             msg = f"platform '{platform_name}' not configured/enabled"
             logger.warning("Job '%s': %s", job["id"], msg)
             delivery_errors.append(msg)
+            _record_target_failure(target, msg)
             continue
 
         # Prefer the resolved live transport when the gateway is running. This
@@ -2017,6 +2130,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
                 delivery_errors.extend(target_errors)
+                _record_target_failure(target, "; ".join(target_errors))
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
             # OOM), scheduling any new delivery is futile — asyncio.run and a
@@ -2029,6 +2143,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.warning("Job '%s': %s", job["id"], msg)
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
+                _record_target_failure(target, "; ".join(target_errors))
                 continue
             # Standalone path: run the async send in a fresh event loop (safe from any thread)
             coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
@@ -2048,6 +2163,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     logger.warning("Job '%s': %s", job["id"], msg)
                     target_errors.append(msg)
                     delivery_errors.extend(target_errors)
+                    _record_target_failure(target, "; ".join(target_errors))
                     continue
                 # The thread-pool fallback can itself raise (SMTP ConnectionError,
                 # future.result timeout, etc.). An exception raised inside this
@@ -2072,17 +2188,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
+                        _record_target_failure(target, "; ".join(target_errors))
                         continue
                     msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                     logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                     target_errors.extend([msg])
                     delivery_errors.extend(target_errors)
+                    _record_target_failure(target, "; ".join(target_errors))
                     continue
             except Exception as e:
                 msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
                 logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                _record_target_failure(target, "; ".join(target_errors))
                 continue
 
             if result and result.get("error"):
@@ -2090,18 +2209,197 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
+                _record_target_failure(target, "; ".join(target_errors))
                 continue
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
+            delivered = True
             _maybe_mirror_cron_delivery(
                 job, platform_name, chat_id, mirror_text,
                 thread_id=thread_id, user_id=origin_user_id,
                 enabled=mirror_this_target and not thread_seeded,
             )
 
+        if delivered and target not in delivered_targets:
+            delivered_targets.append(dict(target))
+
     if delivery_errors:
-        return "; ".join(delivery_errors)
+        return _result("; ".join(delivery_errors))
+    return _result(None)
+
+
+_DELIVERY_SNAPSHOT_FIELDS = (
+    "id",
+    "name",
+    "deliver",
+    "origin",
+    "attach_to_session",
+)
+
+
+def _delivery_job_snapshot(job: dict) -> dict:
+    """Keep only fields required to reproduce delivery, excluding the prompt."""
+    return {key: job[key] for key in _DELIVERY_SNAPSHOT_FIELDS if key in job}
+
+
+def _coerce_delivery_report(result, targets: List[dict]) -> DeliveryReport:
+    """Normalize patched/legacy delivery implementations at the internal seam."""
+    if isinstance(result, DeliveryReport):
+        return result
+    error = str(result) if result else None
+    permanent = bool(error and _is_permanent_delivery_error(error))
+    return DeliveryReport(
+        error=error,
+        delivered_targets=[] if error else [dict(target) for target in targets],
+        failed_targets=[dict(target) for target in targets] if error else [],
+        retryable_failed_targets=[] if permanent else None,
+        permanent_errors=[error] if permanent and error else [],
+    )
+
+
+def _deliver_durably(
+    execution_id: str,
+    job: dict,
+    content: str,
+    *,
+    adapters=None,
+    loop=None,
+) -> Optional[str]:
+    """Persist, claim, and attempt one post-execution delivery batch."""
+    targets = _resolve_delivery_targets(job)
+    if not targets:
+        # Preserve local/unresolved/invalid-target compatibility without
+        # manufacturing an empty queue record.
+        result = _deliver_result(job, content, adapters=adapters, loop=loop)
+        return str(result) if result else None
+
+    try:
+        enqueue_delivery(
+            execution_id,
+            job=_delivery_job_snapshot(job),
+            content=content,
+            targets=targets,
+        )
+        claimed = claim_delivery(execution_id)
+    except Exception as exc:
+        logger.error("Failed to persist delivery for job %s: %s", job["id"], exc)
+        return f"durable delivery prepare failed: {exc}"
+    if claimed is None:
+        return "durable delivery could not be claimed; send skipped"
+
+    claimed_targets = claimed["targets"]
+    try:
+        result = _deliver_result(
+            claimed["job"],
+            claimed["content"],
+            adapters=adapters,
+            loop=loop,
+            targets_override=claimed_targets,
+            return_report=True,
+        )
+        report = _coerce_delivery_report(result, claimed_targets)
+    except Exception as exc:
+        logger.error("Delivery failed for job %s: %s", job["id"], exc)
+        report = DeliveryReport(str(exc), [], claimed_targets)
+
+    finish_delivery_attempt(
+        execution_id,
+        claim_token=claimed["claim_token"],
+        failed_targets=report.retryable_failed_targets or [],
+        error=report.error,
+        permanent_error="; ".join(report.permanent_errors or []) or None,
+    )
+    return report.error
+
+
+def _pending_delivery_cancel_reason(job_id: str) -> Optional[str]:
+    """Return why an unsent retry must be cancelled, or None when still valid."""
+    current = get_job(job_id)
+    if current is None:
+        return "job was deleted before delivery retry"
+    state = str(current.get("state") or "")
+    if state == "paused" or (
+        current.get("enabled") is False and state != "completed"
+    ):
+        return "job was disabled before delivery retry"
     return None
+
+
+def cancel_invalid_deliveries(*, limit: int = 500) -> int:
+    """Cancel and scrub queued batches whose job was deleted or disabled.
+
+    This scans future backoff rows as well as currently due rows, which matters
+    for Chronos: a job mutation is a warm callback, but there may be no later
+    process wake after the last job is deleted.
+    """
+    cancelled = 0
+    for pending in list_pending_deliveries(limit=limit):
+        reason = _pending_delivery_cancel_reason(pending["job_id"])
+        if reason and cancel_delivery(pending["execution_id"], reason=reason):
+            cancelled += 1
+    return cancelled
+
+
+def retry_due_deliveries(*, adapters=None, loop=None, limit: int = 50) -> int:
+    """Reconcile safe post-execution retries without ever re-running an agent."""
+    # Another scheduler process may have died since this process started. The
+    # owner/PID identity checks make this safe at every wake and keep ambiguous
+    # sends from remaining indefinitely in ``delivering``.
+    recover_interrupted_deliveries()
+    cancel_invalid_deliveries()
+    processed = 0
+    for due in list_due_deliveries(limit=limit):
+        execution_id = due["execution_id"]
+        cancel_reason = _pending_delivery_cancel_reason(due["job_id"])
+        if cancel_reason:
+            cancel_delivery(execution_id, reason=cancel_reason)
+            continue
+        claimed = claim_delivery(execution_id)
+        if claimed is None:
+            continue
+        # Re-check after the atomic claim and before network I/O. This closes
+        # the normal delete/disable-vs-reconciler race without allowing another
+        # process to cancel an attempt it does not own.
+        cancel_reason = _pending_delivery_cancel_reason(claimed["job_id"])
+        if cancel_reason:
+            cancel_delivery(
+                execution_id,
+                reason=cancel_reason,
+                claim_token=claimed["claim_token"],
+            )
+            continue
+        targets = claimed["targets"]
+        try:
+            result = _deliver_result(
+                claimed["job"],
+                claimed["content"],
+                adapters=adapters,
+                loop=loop,
+                targets_override=targets,
+                return_report=True,
+            )
+            report = _coerce_delivery_report(result, targets)
+        except Exception as exc:
+            logger.error(
+                "Retry delivery failed for job %s: %s", claimed["job_id"], exc
+            )
+            report = DeliveryReport(str(exc), [], targets)
+
+        finished = finish_delivery_attempt(
+            execution_id,
+            claim_token=claimed["claim_token"],
+            failed_targets=report.retryable_failed_targets or [],
+            error=report.error,
+            permanent_error="; ".join(report.permanent_errors or []) or None,
+        )
+        if finished is not None:
+            mark_job_delivery(
+                claimed["job_id"],
+                None if finished["status"] == "delivered" else finished["last_error"],
+                execution_id=execution_id,
+            )
+        processed += 1
+    return processed
 
 
 _DEFAULT_SCRIPT_TIMEOUT = 3600  # seconds (1 hour)
@@ -4022,7 +4320,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
                     and not _resolve_delivery_targets(job)
                 )
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    delivery_error = _deliver_durably(
+                        execution_id,
+                        job,
+                        deliver_content,
+                        adapters=adapters,
+                        loop=loop,
+                    )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4041,7 +4345,13 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                execution_id=execution_id,
+            )
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"
@@ -4073,7 +4383,9 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         try:
             if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+                mark_job_run(
+                    job["id"], False, _err_text, execution_id=execution_id
+                )
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(
