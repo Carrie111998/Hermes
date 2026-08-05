@@ -218,7 +218,7 @@ hermes config set model.provider xai
 
 ### 工具调用丢弃可选的多行字符串参数（空白邮件 / 空正文）
 
-xAI Grok（`grok-4.3` 及相邻变体）会静默丢弃**可选**的、值包含换行符的字符串函数调用参数。工具调用成功（无 HTTP 400），但被丢弃的参数不会出现在调用中——对于 schema 中仅将少量字段标记为 `required` 的 MCP 工具，这意味着内容丢失且无任何错误。
+xAI Grok（`grok-4.3`）会静默丢弃**可选**的、值包含换行符的字符串函数调用参数。工具调用成功（无 HTTP 400），但被丢弃的参数不会出现在调用中——对于 schema 中仅将少量字段标记为 `required` 的 MCP 工具，这意味着内容丢失且无任何错误。
 
 最常见于 AgentMail MCP 服务器（`agentmail-mcp`）：`send_message` 仅将 `inboxId` / `to` 标记为 required，因此 `subject` 和 `text` 是可选的，多行正文被剥离，邮件发出为空白。单行值不受影响；仅多行值被丢弃。发生此情况时，模型还倾向于发出 2–3 次重复调用。
 

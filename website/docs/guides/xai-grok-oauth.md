@@ -218,7 +218,7 @@ Or upgrade your subscription at [x.ai/grok](https://x.ai/grok) if the OAuth rout
 
 ### Tool calls drop optional multiline string args (blank emails / empty bodies)
 
-xAI Grok (`grok-4.3` and adjacent variants) silently drops **optional** string function-call arguments whose values contain newlines. The tool call succeeds (no HTTP 400), but the dropped parameter is absent from the call — for MCP tools whose schema only marks a few fields `required`, this means content is lost with no error.
+xAI Grok (`grok-4.3`) silently drops **optional** string function-call arguments whose values contain newlines. The tool call succeeds (no HTTP 400), but the dropped parameter is absent from the call — for MCP tools whose schema only marks a few fields `required`, this means content is lost with no error.
 
 Most commonly hit with the AgentMail MCP server (`agentmail-mcp`), where `send_message` only marks `inboxId` / `to` as required: `subject` and `text` are optional, so a multiline body is stripped and the email goes out blank. Single-line values survive; only multiline values are dropped. The model also tends to emit 2–3 duplicate calls when this happens.
 
