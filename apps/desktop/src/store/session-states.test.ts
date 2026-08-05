@@ -230,13 +230,20 @@ describe('reopenLastClosedTile focuses the restored tab', () => {
   it('drops a phantom tile (persisted but pane-less) and reports a miss', async () => {
     const { states, tree } = await setup()
 
-    // Simulate crash-stale storage: the tile list says "open", but the layout
-    // tree lost the pane (hard restart reset the tree; localStorage survived).
-    // Bypass closeSessionTile — that's the graceful path that keeps both in
-    // sync. Instead surgically remove the pane from the tree while leaving the
-    // $sessionTiles entry behind, exactly what a mid-write crash produces.
+    // A tile opened THIS run is exempt: pane adoption is async, so a briefly
+    // missing pane right after open is in-flight, not phantom. Simulate the
+    // adoption gap by removing the pane — the claim must survive.
     tree.removeTreePane(tilePane('closed'))
+    expect(states.focusOpenSession('closed')).toBe('tile')
     expect(states.$sessionTiles.get().some(t => t.storedSessionId === 'closed')).toBe(true)
+
+    // Crash-stale storage shape: the tile hydrates from localStorage on boot
+    // (no runtime open), and the layout tree lost the pane. Simulate by
+    // closing (clears the runtime mark), re-hydrating the atom directly the
+    // way boot does, and stripping the pane the harness re-adopted.
+    states.closeSessionTile('closed')
+    states.$sessionTiles.set([{ dir: 'center' as const, storedSessionId: 'closed' }])
+    tree.removeTreePane(tilePane('closed'))
     expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))).toBeNull()
 
     // Pre-fix this returned 'tile' (a dead click: nothing on screen to front,
