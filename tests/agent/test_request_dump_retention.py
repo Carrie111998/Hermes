@@ -172,22 +172,47 @@ class TestDirectoryStaysBounded:
 
 
 class TestConfigKnob:
-    def test_default_is_twenty_and_lives_in_config_defaults(self):
+    def test_code_default_and_config_default_do_not_drift(self):
+        """The two declarations of one default must agree.
+
+        Deliberately NOT a snapshot of the number. The cap is a tunable — a
+        maintainer may reasonably raise it — and asserting the literal would
+        turn a pure-tuning change with zero behavior difference into a CI
+        failure.  What must hold is the relationship: the value
+        ``_request_dump_keep()`` falls back to when the key is absent has to be
+        the value ``load_config()`` deep-merges in when it is present.  If
+        those drift, the effective cap depends on whether the user happens to
+        have a config.yaml, which is exactly the kind of split-brain default
+        that makes a retention bug unreproducible.
+        """
         from hermes_cli.config import DEFAULT_CONFIG
 
-        assert DEFAULT_CONFIG["sessions"]["request_dump_retention"] == 20
         assert (
             agent_runtime_helpers._REQUEST_DUMP_DEFAULT_KEEP
             == DEFAULT_CONFIG["sessions"]["request_dump_retention"]
         ), "code default and config default must not drift"
 
     def test_default_applies_with_no_config_file(self, agent):
-        """A fresh install (no config.yaml) is still bounded."""
+        """A fresh install (no config.yaml) is bounded at the shipped cap.
+
+        Behavioral, and driven off the constant rather than off ``20``: write
+        ``keep + 6`` dumps through the real path and require exactly ``keep``
+        survivors — the newest ones.  Retuning the default retunes the test
+        with it, while the assertion keeps its meaning (an unconfigured install
+        still prunes, and prunes to the cap the code declares).  This is the
+        test that would actually catch the bug; the drift check above cannot.
+        """
         assert not (Path(os.environ["HERMES_HOME"]) / "config.yaml").exists()
+        keep = agent_runtime_helpers._REQUEST_DUMP_DEFAULT_KEEP
+        assert keep > 0, "the shipped default must prune, not disable pruning"
 
-        _dump_n(agent, 26)
+        written = _dump_n(agent, keep + 6)
 
-        assert len(_dumps(agent.logs_dir)) == 20
+        survivors = {p.name for p in _dumps(agent.logs_dir)}
+        assert len(survivors) == keep, (
+            f"unconfigured install kept {len(survivors)} dumps, cap is {keep}"
+        )
+        assert survivors == {p.name for p in written[-keep:]}, "survivors are the newest"
 
     def test_custom_value_is_honored(self, agent):
         _write_config(
@@ -213,20 +238,26 @@ class TestConfigKnob:
 
     def test_malformed_value_falls_back_to_default_not_unlimited(self, agent):
         """A bad config must not silently restore unbounded growth."""
+        keep = agent_runtime_helpers._REQUEST_DUMP_DEFAULT_KEEP
         _write_config(
             Path(os.environ["HERMES_HOME"]),
             "sessions:\n  request_dump_retention: not-a-number\n",
         )
 
-        assert agent_runtime_helpers._request_dump_keep() == 20
+        assert agent_runtime_helpers._request_dump_keep() == keep
 
-        _dump_n(agent, 23)
-        assert len(_dumps(agent.logs_dir)) == 20
+        _dump_n(agent, keep + 3)
+        assert len(_dumps(agent.logs_dir)) == keep, (
+            "a malformed value must fall back to the cap, not to unlimited"
+        )
 
     def test_missing_sessions_block_falls_back_to_default(self, agent):
         _write_config(Path(os.environ["HERMES_HOME"]), "model:\n  name: gpt-4o\n")
 
-        assert agent_runtime_helpers._request_dump_keep() == 20
+        assert (
+            agent_runtime_helpers._request_dump_keep()
+            == agent_runtime_helpers._REQUEST_DUMP_DEFAULT_KEEP
+        )
 
     def test_shipped_example_config_matches_code_default(self):
         """The template is copied verbatim into ~/.hermes/config.yaml by the
