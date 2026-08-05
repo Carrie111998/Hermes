@@ -1180,6 +1180,44 @@ class HonchoMemoryProvider(MemoryProvider):
         t = threading.Thread(target=_write, daemon=True, name="honcho-memwrite")
         t.start()
 
+    def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
+        """Called before context compression discards old messages.
+
+        Triggers the Qdrant indexer to catch up so semantic search
+        covers the about-to-be-compacted messages.  Runs in a
+        background thread so it doesn't block compaction.
+        """
+        if self._cron_skipped:
+            return ""
+
+        # Check if Qdrant indexing is enabled (env var or config)
+        import os
+        if not os.environ.get("HERMES_QDRANT_INDEX_ON_COMPACT", "").lower() in ("1", "true", "yes"):
+            return ""
+
+        def _run_indexer():
+            try:
+                import subprocess
+                script = os.path.expanduser("~/.hermes/scripts/qdrant-indexer.py")
+                if not os.path.exists(script):
+                    logger.debug("Qdrant indexer script not found: %s", script)
+                    return
+                result = subprocess.run(
+                    ["python3", script],
+                    capture_output=True, text=True, timeout=120,
+                )
+                if result.returncode == 0:
+                    logger.info("Qdrant pre-compact index completed")
+                else:
+                    logger.debug("Qdrant pre-compact index failed (exit %d): %s",
+                                 result.returncode, result.stderr[:200])
+            except Exception as e:
+                logger.debug("Qdrant pre-compact index error: %s", e)
+
+        t = threading.Thread(target=_run_indexer, name="qdrant-pre-compact", daemon=True)
+        t.start()
+        return ""  # no text to inject into compression summary
+
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush all pending messages to Honcho on session end."""
         if self._cron_skipped:
