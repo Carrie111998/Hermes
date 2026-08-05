@@ -447,6 +447,28 @@ def test_accept_language_honors_quality_and_exclusions(plugin_api, header, expec
 
 
 @pytest.mark.parametrize(
+    "header",
+    [
+        "zh;q=1,zh-CN;q=0",
+        "zh-CN;q=0,zh;q=1",
+        "zh;q=1,zh-CN;q=0,zh-CN;q=0",
+        "zh;q=1,zh_CN;q=0",
+        "zh;q=1,zh-Hans-CN;q=0",
+    ],
+)
+def test_accept_language_specific_exclusion_overrides_broader_range(
+    plugin_api, header
+):
+    assert plugin_api._resolve_locale_from_request(_Request(header=header)) == "en"
+
+
+def test_accept_language_duplicate_specific_ranges_keep_best_quality(plugin_api):
+    request = _Request(header="zh;q=1,zh-CN;q=0,zh-CN;q=0.5")
+
+    assert plugin_api._resolve_locale_from_request(request) == "zh-CN"
+
+
+@pytest.mark.parametrize(
     ("header", "expected"),
     [
         ("zh-Hans-CN;q=0.7,en-GB;q=0.6", "zh-CN"),

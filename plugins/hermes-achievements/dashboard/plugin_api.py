@@ -119,7 +119,7 @@ def _resolve_locale_from_request(request: Any = None) -> str:
     if explicit:
         return _supported_locale(explicit) or "en"
 
-    preferences: Dict[str, Tuple[int, int]] = {}
+    preferences: Dict[str, Tuple[int, int, int]] = {}
     wildcard: Optional[Tuple[int, int]] = None
     for order, item in enumerate(header.split(",")):
         language_range, *parameters = (part.strip() for part in item.split(";"))
@@ -132,13 +132,21 @@ def _resolve_locale_from_request(request: Any = None) -> str:
                 wildcard = preference
             continue
         locale_code = _supported_locale(language_range)
-        if locale_code is not None and preference > preferences.get(locale_code, (-1, 0)):
-            preferences[locale_code] = preference
+        if locale_code is not None:
+            normalized = language_range.replace("_", "-")
+            candidate = (normalized.count("-") + 1, quality, -order)
+            if candidate > preferences.get(locale_code, (-1, -1, 0)):
+                preferences[locale_code] = candidate
 
     best_locale = "en"
     best_preference = (-1, 0)
     for locale_code in ("en", "zh-CN"):
-        preference = preferences.get(locale_code, wildcard or (-1, 0))
+        locale_preference = preferences.get(locale_code)
+        preference = (
+            locale_preference[1:]
+            if locale_preference is not None
+            else wildcard or (-1, 0)
+        )
         if preference[0] > 0 and preference > best_preference:
             best_locale = locale_code
             best_preference = preference
