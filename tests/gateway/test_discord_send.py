@@ -314,7 +314,6 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
 
     result = await adapter.send_video("555", str(video))
 
-<<<<<<< HEAD
     assert result.success is True
     assert result.message_id == "4242"
     assert captured["fp"] == str(video)
@@ -417,12 +416,6 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     thread_kwargs = forum_channel.create_thread.await_args.kwargs
     assert thread_kwargs.get("file") is None
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
-
-
-=======
-    await adapter.stop_typing("12345")
-    assert "12345" not in adapter._typing_tasks
->>>>>>> 58baeb138 (feat(discord): make link-preview suppression a config option)
 
 
 @pytest.mark.asyncio
