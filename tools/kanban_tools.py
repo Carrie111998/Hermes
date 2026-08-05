@@ -1358,7 +1358,18 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
-    body = args.get("body")
+    # The body IS the job spec — a worker handed a blank brief guesses. Reject
+    # null / empty / whitespace-only bodies and punctuation placeholders ('-',
+    # 'n/a', 'tbd') at CREATE time rather than letting a worker discover the
+    # gap at claim time. `triage` cards are the one designed no-body-yet path.
+    from hermes_cli.kanban_body_guard import BlankBodyError, validate_body
+
+    try:
+        body = validate_body(
+            args.get("body"), allow_missing=bool(args.get("triage"))
+        )
+    except BlankBodyError as exc:
+        return tool_error(f"kanban_create: {exc}")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
     # Stamp the originating session id when the agent loop runs under

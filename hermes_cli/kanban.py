@@ -26,6 +26,11 @@ from typing import Any, Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
+from hermes_cli.kanban_body_guard import (
+    BlankBodyError,
+    resolve_body as _resolve_body,
+    validate_body as _validate_body,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1542,11 +1547,23 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # The body IS the job spec. `--body -` is the shell "read from stdin"
+    # idiom; honour it (heredocs are how long briefs get passed) instead of
+    # storing a literal dash, then refuse anything that still carries no
+    # instruction. `--triage` is the one legitimate no-body-yet path.
+    try:
+        body = _resolve_body(args.body)
+        body = _validate_body(
+            body, allow_missing=bool(getattr(args, "triage", False))
+        )
+    except BlankBodyError as exc:
+        print(f"kanban create: {exc}", file=sys.stderr)
+        return 2
     with kb.connect_closing() as conn:
         task_id = kb.create_task(
             conn,
             title=args.title,
-            body=args.body,
+            body=body,
             assignee=args.assignee,
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind,

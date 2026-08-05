@@ -80,7 +80,10 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
     failures: list[str] = []
 
     def worker(board: str, title: str) -> None:
-        args = parser.parse_args(["kanban", "--board", board, "create", title])
+        args = parser.parse_args([
+            "kanban", "--board", board, "create", title,
+            "--body", f"Concurrency probe for board {board}.",
+        ])
         rc = kc.kanban_command(args)
         if rc != 0:
             failures.append(f"{board}:{rc}")
@@ -122,7 +125,10 @@ def test_run_slash_reclaim_running_task(kanban_home):
     import secrets
     from hermes_cli import kanban_db as kb
 
-    out1 = kc.run_slash("create 'stuck worker task' --assignee broken-model")
+    out1 = kc.run_slash(
+        "create 'stuck worker task' --assignee broken-model "
+        "--body 'Simulate a worker that claims and then stalls.'"
+    )
     m = re.search(r"(t_[a-f0-9]+)", out1)
     assert m
     tid = m.group(1)
