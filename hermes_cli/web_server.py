@@ -6065,7 +6065,7 @@ async def setup_memory_provider(
     _require_valid_memory_provider_name(name)
 
     def _run():
-        with _profile_scope(profile):
+        with _config_profile_scope(profile):
             provider = _load_memory_provider(name)
             if provider is None and not _memory_provider_manifest(name):
                 # No discoverable plugin directory → nothing whose manifest could
@@ -12748,7 +12748,7 @@ async def remove_credential_pool_entry(provider: str, index: int):
 @app.get("/api/memory")
 async def get_memory_status(profile: Optional[str] = None):
     def _run():
-        with _profile_scope(profile):
+        with _config_profile_scope(profile):
             cfg = load_config()
             active = ""
             mem = cfg.get("memory")
@@ -12777,7 +12777,7 @@ async def set_memory_provider(
     profile: Optional[str] = None,
 ):
     def _run():
-        with _profile_scope(profile):
+        with _config_profile_scope(profile):
             provider = _normalize_memory_provider_name(body.provider)
 
             _require_memory_provider_ready(provider)
@@ -12802,7 +12802,7 @@ async def reset_memory(
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
     def _run():
-        with _profile_scope(profile):
+        with _config_profile_scope(profile):
             mem_dir = get_hermes_home() / "memories"
             deleted = []
             targets = []
