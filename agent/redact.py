@@ -494,6 +494,83 @@ def _mask_token(token: str) -> str:
     return mask_secret(token, head=6, tail=4, floor=18)
 
 
+def mask_topic(topic: str) -> str:
+    """Mask an ntfy topic for logs, keeping only the last 6 characters.
+
+    An ntfy topic is a bearer credential: anyone who learns it can read the
+    channel and publish into it, and it carries no vendor prefix, so none of
+    the pattern passes in this module recognize it. Topics are therefore
+    never safe to log verbatim.
+
+    Semantics are deliberately identical to ``mask_topic()`` in the
+    ``hermes-push-ntfy`` plugin (``"…" + topic[-6:]``) so the two surfaces
+    produce the same string for the same topic — do not fork them.
+    """
+    return ("…" + topic[-6:]) if topic and len(topic) > 6 else "…"
+
+
+def mask_home_channel_id(platform: str, chat_id: object) -> str:
+    """Mask a home-channel chat id for platforms where the id IS the secret.
+
+    On ntfy the "chat id" is the topic name, i.e. the credential itself
+    (see :func:`mask_topic`). On every other platform a chat id is an opaque
+    routing identifier that operators need verbatim for debugging, so it is
+    returned unchanged.
+    """
+    value = "" if chat_id is None else str(chat_id)
+    return mask_topic(value) if platform == "ntfy" else value
+
+
+# ntfy topic literals — belt-and-braces companion to the call-site masking.
+# Even with every logger call masked, a raw topic can still reach tool output
+# (``cat ~/.hermes/.env``, ``hermes config``, a curl command line), so the
+# CONFIGURED topic values are redacted literally wherever they appear.
+#
+# Env is read per call rather than snapshotted at import because ``.env`` is
+# loaded by ``hermes_cli.env_loader`` AFTER this module may already be
+# imported; the compiled alternation is cached and only rebuilt when the raw
+# env values change (hot path = 4 dict lookups + one tuple compare).
+#
+# The 12-char floor keeps short, guessable topic names (``hermes-in``) from
+# turning into a substring sweep that would mangle unrelated text; those
+# topics are not private anyway and the call-site masking still covers them.
+_NTFY_TOPIC_ENV_VARS = (
+    "NTFY_TOPIC",
+    "NTFY_PUBLISH_TOPIC",
+    "NTFY_HOME_CHANNEL",
+    "HERMES_PUSH_NTFY_TOPIC",
+)
+_NTFY_TOPIC_MIN_LEN = 12
+_ntfy_topic_cache: tuple = ((), None)
+
+
+def _ntfy_topic_pattern():
+    """Return a compiled alternation of configured ntfy topics, or None."""
+    global _ntfy_topic_cache
+    raw = tuple(os.environ.get(name, "") for name in _NTFY_TOPIC_ENV_VARS)
+    cached_raw, cached_pattern = _ntfy_topic_cache
+    if raw == cached_raw:
+        return cached_pattern
+    topics = sorted(
+        {t for t in (v.strip() for v in raw) if len(t) >= _NTFY_TOPIC_MIN_LEN},
+        key=len,
+        reverse=True,
+    )
+    pattern = (
+        re.compile("|".join(re.escape(t) for t in topics)) if topics else None
+    )
+    _ntfy_topic_cache = (raw, pattern)
+    return pattern
+
+
+def _redact_ntfy_topics(text: str) -> str:
+    """Replace configured ntfy topic literals with their masked form."""
+    pattern = _ntfy_topic_pattern()
+    if pattern is None:
+        return text
+    return pattern.sub(lambda m: mask_topic(m.group(0)), text)
+
+
 def _redact_query_string(query: str) -> str:
     """Redact sensitive parameter values in a URL query string.
 
@@ -875,6 +952,10 @@ def redact_sensitive_text(
                 return phone[:2] + "****" + phone[-2:]
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
+
+    # ntfy topic literals — the topic name is itself the channel credential
+    # and matches no vendor prefix, so it has to be redacted by value.
+    text = _redact_ntfy_topics(text)
 
     return text
 

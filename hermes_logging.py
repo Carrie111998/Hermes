@@ -53,10 +53,11 @@ from typing import Optional, Sequence
 #   * The bug (WinError 32 on rename-while-open) is specific to Windows file
 #     locking semantics — POSIX renames an open file fine, so stdlib already
 #     works correctly on Linux/macOS.
-#   * On POSIX, managed-mode (NixOS) relies on the exact ``_open()`` /
+#   * On POSIX, the permission guarantee relies on the exact ``_open()`` /
 #     ``doRollover()`` lifecycle of stdlib ``RotatingFileHandler`` (the
-#     ``_ManagedRotatingFileHandler`` subclass chmods 0660 after each). CLH
-#     opens lazily and rotates differently, which breaks the group-writable
+#     ``_ManagedRotatingFileHandler`` subclass chmods 0600, or 0660 in
+#     managed mode, after each). CLH
+#     opens lazily and rotates differently, which breaks the permission
 #     guarantee and the eager file-creation those paths depend on.
 # Aliasing keeps every existing ``RotatingFileHandler`` reference in this
 # module (class declaration, ``isinstance`` checks, docstring) working
@@ -413,17 +414,19 @@ def setup_verbose_logging() -> None:
 # ---------------------------------------------------------------------------
 
 class _ManagedRotatingFileHandler(RotatingFileHandler):
-    """RotatingFileHandler that ensures group-writable perms in managed mode
-    AND survives external rotation.
+    """RotatingFileHandler that restricts log-file perms AND survives external
+    rotation.
 
     Two responsibilities:
 
-    1.  In managed mode (NixOS), the stateDir uses setgid (2770) so new files
-        inherit the hermes group. However, both ``_open()`` (initial creation)
-        and ``doRollover()`` create files via ``open()``, which uses the
-        process umask — typically 0022, producing 0644. This subclass applies
-        ``chmod 0660`` after both operations so the gateway and interactive
-        users can share log files.
+    1.  Both ``_open()`` (initial creation) and ``doRollover()`` create files
+        via ``open()``, which uses the process umask — typically 0022,
+        producing world-readable 0644. Hermes logs carry channel credentials
+        (ntfy topics are bearer tokens), session text, and command output, so
+        this subclass chmods after both operations: **0600** normally, and
+        **0660** in managed mode (NixOS), where the stateDir uses setgid
+        (2770) and the gateway and interactive users must share log files
+        through the hermes group.
 
     2.  ``RotatingFileHandler`` keeps an open file descriptor.  If anything
         rotates the file *externally* (``logrotate``, manual ``mv``,
@@ -447,12 +450,18 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
         self._stat_ino: Optional[int] = None
         self._record_stream_stat()
 
-    def _chmod_if_managed(self):
-        if self._managed:
-            try:
-                os.chmod(self.baseFilename, 0o660)
-            except OSError:
-                pass
+    def _chmod_log_file(self):
+        # Managed mode (NixOS): the gateway and interactive users share these
+        # files through the hermes group, so 0660 is required.
+        # Everything else: single-user install — logs carry channel
+        # credentials (ntfy topics, chat ids), session text, and command
+        # output, so the process umask default of 0644 (world-readable) is
+        # too loose. See AUDIT-20260801 S-1.
+        mode = 0o660 if self._managed else 0o600
+        try:
+            os.chmod(self.baseFilename, mode)
+        except OSError:
+            pass
 
     def _record_stream_stat(self) -> None:
         """Snapshot dev/ino of ``baseFilename`` so we can detect external rotation."""
@@ -536,12 +545,12 @@ class _ManagedRotatingFileHandler(RotatingFileHandler):
 
     def _open(self):
         stream = super()._open()
-        self._chmod_if_managed()
+        self._chmod_log_file()
         return stream
 
     def doRollover(self):
         super().doRollover()
-        self._chmod_if_managed()
+        self._chmod_log_file()
         # Our own rollover writes a new baseFilename; refresh the snapshot
         # so the next emit doesn't mistake it for external rotation.
         self._record_stream_stat()

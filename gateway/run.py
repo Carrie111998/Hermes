@@ -59,6 +59,10 @@ from agent.conversation_compression import (
 )
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
+# Home-channel chat ids are opaque routing identifiers on every platform
+# except ntfy, where the "chat id" IS the topic — a bearer credential that
+# must never be logged verbatim. See agent.redact.mask_home_channel_id.
+from agent.redact import mask_home_channel_id
 from agent.interrupt_compat import request_hard_interrupt
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
@@ -9311,7 +9315,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.debug(
                         "Failed to send shutdown notification to home channel %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        mask_home_channel_id(platform.value, home.chat_id),
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
@@ -9320,13 +9324,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info(
                     "Sent shutdown notification to home channel %s:%s",
                     platform.value,
-                    home.chat_id,
+                    mask_home_channel_id(platform.value, home.chat_id),
                 )
             except Exception as e:
                 logger.debug(
                     "Failed to send shutdown notification to home channel %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    mask_home_channel_id(platform.value, home.chat_id),
                     e,
                 )
 
@@ -11768,7 +11772,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         logger.info(
             "Handoff: dispatching synthetic turn for CLI session %s → %s "
             "(home=%s, thread=%s, session_key=%s)",
-            cli_session_id, platform_name, home.chat_id, effective_thread_id,
+            cli_session_id, platform_name,
+            mask_home_channel_id(platform_name, home.chat_id),
+            effective_thread_id,
             session_key,
         )
 
@@ -21053,7 +21059,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning(
                         "Home-channel startup notification failed for %s:%s: %s",
                         platform.value,
-                        home.chat_id,
+                        mask_home_channel_id(platform.value, home.chat_id),
                         getattr(result, "error", "send returned success=False"),
                     )
                     continue
@@ -21062,13 +21068,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.info(
                     "Sent home-channel startup notification to %s:%s",
                     platform.value,
-                    home.chat_id,
+                    mask_home_channel_id(platform.value, home.chat_id),
                 )
             except Exception as exc:
                 logger.warning(
                     "Home-channel startup notification failed for %s:%s: %s",
                     platform.value,
-                    home.chat_id,
+                    mask_home_channel_id(platform.value, home.chat_id),
                     exc,
                 )
 
