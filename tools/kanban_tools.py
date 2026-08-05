@@ -50,14 +50,21 @@ KANBAN_LIST_MAX_LIMIT = 200
 
 
 def _profile_has_kanban_toolset() -> bool:
-    # Uses load_config() which has mtime-based caching, so this adds
-    # negligible overhead. The check_fn results are further TTL-cached
-    # (~30s) by the tool registry.
+    """Return whether the active profile explicitly enables Kanban.
+
+    ``platform_toolsets.cli`` is the current configuration path. Keep the
+    legacy top-level ``toolsets: [kanban]`` form working for existing
+    orchestrator profiles until they migrate.
+    """
     try:
         from hermes_cli.config import load_config
+
         cfg = load_config()
-        toolsets = cfg.get("toolsets", [])
-        return "kanban" in toolsets
+        legacy = cfg.get("toolsets")
+        if isinstance(legacy, list) and "kanban" in legacy:
+            return True
+        configured = (cfg.get("platform_toolsets") or {}).get("cli")
+        return isinstance(configured, list) and "kanban" in configured
     except Exception:
         return False
 
@@ -109,17 +116,13 @@ def _check_kanban_mode() -> bool:
 
 
 def _check_kanban_orchestrator_mode() -> bool:
-    """Board-routing tools (kanban_list, kanban_unblock) are intentionally
-    hidden from task workers.
+    """Expose board-routing tools only to explicit Kanban profiles.
 
-    Dispatcher-spawned workers should close their own task via the
-    lifecycle tools (complete/block/heartbeat), not enumerate or unblock
-    board state. Profiles that explicitly opt into the kanban toolset
-    and are NOT scoped to a single task are the orchestrator surface.
+    Dispatcher workers always receive task-lifecycle tools, but routing is a
+    separate capability. A worker may enumerate, create, link, or unblock
+    board tasks only when its own CLI profile explicitly enables ``kanban``.
     """
     if _is_delegated_child_context():
-        return False
-    if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
 
@@ -428,19 +431,17 @@ def _parse_bool_arg(args: dict, name: str, *, default: bool = False):
 
 
 def _require_orchestrator_tool(tool_name: str) -> Optional[str]:
-    """Belt-and-suspenders runtime guard for orchestrator-only handlers.
+    """Runtime guard for board-routing handlers.
 
-    The check_fn (`_check_kanban_orchestrator_mode`) keeps these tools
-    out of the worker schema entirely, but in case a stale registration
-    or test harness routes a worker to one of them anyway, return a
-    structured tool_error so the model gets a clear refusal instead of
-    silently mutating board state from a worker context.
+    Schema gating is the primary boundary. This second check protects direct
+    handler calls and stale tool registries from granting routing mutations to
+    ordinary task workers.
     """
-    if os.environ.get("HERMES_KANBAN_TASK"):
+    if _is_delegated_child_context() or not _profile_has_kanban_toolset():
         return tool_error(
-            f"{tool_name} is orchestrator-only; dispatcher-spawned workers "
-            "must use kanban_complete, kanban_block, kanban_heartbeat, or "
-            "kanban_comment for their assigned task."
+            f"{tool_name} is orchestrator-only: the active profile must "
+            "explicitly enable the kanban CLI toolset; ordinary workers may "
+            "only manage their assigned task lifecycle."
         )
     return None
 
@@ -1203,6 +1204,9 @@ def _handle_create(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_create")
     if delegated_err:
         return delegated_err
+    guard = _require_orchestrator_tool("kanban_create")
+    if guard:
+        return guard
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1212,6 +1216,17 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    try:
+        from hermes_cli.profiles import normalize_profile_name, profile_exists
+
+        assignee = normalize_profile_name(str(assignee))
+        if not profile_exists(assignee):
+            return tool_error(
+                f"unknown assignee profile {assignee!r}; choose a registered "
+                "profile from `hermes profile list`"
+            )
+    except ValueError as exc:
+        return tool_error(f"invalid assignee profile: {exc}")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -1291,7 +1306,7 @@ def _handle_create(args: dict, **kw) -> str:
                 conn,
                 title=str(title).strip(),
                 body=body,
-                assignee=str(assignee),
+                assignee=assignee,
                 parents=tuple(parents),
                 tenant=tenant,
                 priority=int(priority) if priority is not None else 0,
@@ -1470,9 +1485,6 @@ def _handle_unblock(args: dict, **kw) -> str:
     tid = args.get("task_id")
     if not tid:
         return tool_error("task_id is required")
-    ownership_err = _enforce_worker_task_ownership(str(tid))
-    if ownership_err:
-        return ownership_err
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1496,6 +1508,9 @@ def _handle_link(args: dict, **kw) -> str:
     delegated_err = _reject_delegated_child_mutation("kanban_link")
     if delegated_err:
         return delegated_err
+    guard = _require_orchestrator_tool("kanban_link")
+    if guard:
+        return guard
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1922,10 +1937,9 @@ KANBAN_CREATE_SCHEMA = {
             "assignee": {
                 "type": "string",
                 "description": (
-                    "Profile name that should execute this task "
-                    "(e.g. 'researcher-a', 'reviewer', 'writer'). "
-                    "Required — tasks without an assignee are never "
-                    "dispatched."
+                    "Registered profile name that should execute this task "
+                    "(e.g. 'researcher', 'reviewer', 'writer'). Required; "
+                    "unknown profiles are rejected before a card is created."
                 ),
             },
             "body": {
@@ -2212,7 +2226,7 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_CREATE_SCHEMA,
     handler=_handle_create,
-    check_fn=_check_kanban_mode,
+    check_fn=_check_kanban_orchestrator_mode,
     emoji="➕",
 )
 
@@ -2230,6 +2244,5 @@ registry.register(
     toolset="kanban",
     schema=KANBAN_LINK_SCHEMA,
     handler=_handle_link,
-    check_fn=_check_kanban_mode,
-    emoji="🔗",
+    check_fn=_check_kanban_orchestrator_mode,
 )

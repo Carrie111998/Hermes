@@ -1,10 +1,9 @@
 """Tests for the Kanban tool surface (tools/kanban_tools.py).
 
 Verifies:
-  - Tools are gated on HERMES_KANBAN_TASK: a normal chat session sees
-    zero kanban tools in its schema; a worker session sees the kanban set.
-  - Each handler's happy path.
-  - Error paths (missing required args, bad metadata type, etc).
+  - Dispatcher workers receive task lifecycle tools.
+  - Explicit Kanban profiles additionally receive board-routing tools.
+  - Each handler's happy path and relevant error boundaries.
 """
 from __future__ import annotations
 
@@ -68,6 +67,82 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
     return tid
 
+@pytest.fixture
+def routing_worker_env(worker_env):
+    """Give the dispatcher worker an explicit Kanban routing capability."""
+    from pathlib import Path
+    from tools.registry import invalidate_check_fn_cache
+
+    home = Path(os.environ["HERMES_HOME"])
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - kanban\n"
+    )
+    for profile in ("peer", "qa", "coder", "reviewer"):
+        (home / "profiles" / profile).mkdir(parents=True, exist_ok=True)
+    invalidate_check_fn_cache()
+    return worker_env
+
+def _kanban_schema_names():
+    from tools.registry import invalidate_check_fn_cache, registry
+    from toolsets import resolve_toolset
+
+    invalidate_check_fn_cache()
+    schema = registry.get_definitions(
+        set(resolve_toolset("hermes-cli")),
+        quiet=True,
+    )
+    return {
+        item["function"]["name"]
+        for item in schema
+        if item.get("function", {}).get("name", "").startswith("kanban_")
+    }
+
+
+def test_ordinary_worker_schema_excludes_routing_tools(worker_env):
+    names = _kanban_schema_names()
+    assert {"kanban_show", "kanban_complete", "kanban_block"} <= names
+    assert {
+        "kanban_list",
+        "kanban_create",
+        "kanban_link",
+        "kanban_unblock",
+    }.isdisjoint(names)
+
+
+def test_routing_worker_schema_includes_routing_tools(routing_worker_env):
+    names = _kanban_schema_names()
+    assert {
+        "kanban_list",
+        "kanban_create",
+        "kanban_link",
+        "kanban_unblock",
+    } <= names
+
+
+def test_explicit_kanban_profile_routes_without_task_env(
+    routing_worker_env,
+    monkeypatch,
+):
+    monkeypatch.delenv("HERMES_KANBAN_TASK")
+    names = _kanban_schema_names()
+    assert {"kanban_create", "kanban_list", "kanban_link"} <= names
+
+
+def test_legacy_toolsets_profile_routes(routing_worker_env):
+    """Existing profiles using top-level ``toolsets`` retain routing."""
+    from pathlib import Path
+    from tools.registry import invalidate_check_fn_cache
+
+    Path(os.environ["HERMES_HOME"]).joinpath("config.yaml").write_text(
+        "toolsets:\n"
+        "  - kanban\n"
+    )
+    invalidate_check_fn_cache()
+    names = _kanban_schema_names()
+    assert {"kanban_create", "kanban_list", "kanban_link", "kanban_unblock"} <= names
+
 
 def test_show_defaults_to_env_task_id(worker_env):
     from tools import kanban_tools as kt
@@ -80,9 +155,8 @@ def test_show_defaults_to_env_task_id(worker_env):
     assert "runs" in d
 
 
-def test_list_filters_tasks(monkeypatch, worker_env):
-    """kanban_list gives orchestrators filtered board discovery."""
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+def test_list_filters_tasks(routing_worker_env):
+    """Kanban-enabled routing workers can inspect the shared board."""
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -395,28 +469,100 @@ def test_comment_ignores_caller_supplied_author(worker_env):
         conn.close()
 
 
-def test_create_happy_path(worker_env):
+def test_create_happy_path(routing_worker_env):
     from tools import kanban_tools as kt
+
     out = kt._handle_create({
         "title": "child task",
         "assignee": "peer",
-        "parents": [worker_env],
+        "parents": [routing_worker_env],
     })
-    d = json.loads(out)
-    assert d["ok"] is True
-    assert d["task_id"]
-    assert d["status"] == "todo"  # parent isn't done yet
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["task_id"]
+    assert result["status"] == "todo"
+
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        child = kb.get_task(conn, d["task_id"])
+        child = kb.get_task(conn, result["task_id"])
         assert child.title == "child task"
         assert child.assignee == "peer"
     finally:
         conn.close()
 
 
-def test_link_happy_path(worker_env):
+def test_create_rejects_unknown_assignee(routing_worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "must not park",
+        "assignee": "not-a-profile",
+    }))
+    assert result.get("ok") is not True
+    assert "unknown assignee profile" in result.get("error", "")
+
+
+def test_routing_task_resumes_after_review_dependency(routing_worker_env):
+    """Exercise Orchestrator → Coder → Reviewer → Orchestrator continuation."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    root = routing_worker_env
+    coder = json.loads(kt._handle_create({
+        "title": "implement change",
+        "assignee": "coder",
+    }))["task_id"]
+    reviewer = json.loads(kt._handle_create({
+        "title": "review change",
+        "assignee": "reviewer",
+        "parents": [coder],
+    }))["task_id"]
+    assert json.loads(kt._handle_link({
+        "parent_id": reviewer,
+        "child_id": root,
+    }))["ok"]
+
+    parked = json.loads(kt._handle_block({
+        "reason": "waiting for implementation and review",
+        "kind": "dependency",
+    }))
+    assert parked["ok"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, root).status == "todo"
+        assert kb.get_task(conn, coder).status == "ready"
+        assert kb.get_task(conn, reviewer).status == "todo"
+
+        assert kb.claim_task(conn, coder)
+        kb.complete_task(conn, coder, result="implemented; tests passed")
+        assert kb.get_task(conn, reviewer).status == "ready"
+
+        assert kb.claim_task(conn, reviewer)
+        kb.complete_task(conn, reviewer, result="approved")
+        assert kb.get_task(conn, root).status == "ready"
+
+        assert kb.claim_task(conn, root)
+    finally:
+        conn.close()
+
+    resumed = json.loads(kt._handle_show({}))
+    assert resumed["parents"] == [reviewer]
+    assert json.loads(kt._handle_complete({
+        "summary": "implementation reviewed and accepted",
+    }))["ok"]
+
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, root).status == "done"
+        assert kb.get_task(conn, coder).status == "done"
+        assert kb.get_task(conn, reviewer).status == "done"
+    finally:
+        conn.close()
+
+
+def test_link_happy_path(routing_worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -430,8 +576,7 @@ def test_link_happy_path(worker_env):
     assert d["ok"] is True
 
 
-def test_unblock_happy_path(monkeypatch, worker_env):
-    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+def test_unblock_happy_path(routing_worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
@@ -457,6 +602,9 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     home = tmp_path / ".hermes"
     home.mkdir()
+    (home / "config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - kanban\n"
+    )
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "orchestrator")
     from pathlib import Path as _Path
@@ -488,60 +636,45 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
 
 
 def test_worker_lifecycle_through_tools(worker_env):
-    """Drive the full claim -> heartbeat -> comment -> complete lifecycle
-    exclusively through the tools, then verify the DB state matches what
-    the dispatcher/notifier expect."""
+    """Ordinary workers can finish their task but cannot fan out."""
     from tools import kanban_tools as kt
 
-    # 1. show — worker orientation
     show = json.loads(kt._handle_show({}))
     assert show["task"]["id"] == worker_env
-
-    # 2. heartbeat during long op
     assert json.loads(kt._handle_heartbeat({"note": "warming up"}))["ok"]
-
-    # 3. comment for a future peer
     assert json.loads(kt._handle_comment({
         "task_id": worker_env,
         "body": "note: using stdlib sqlite3 bindings",
     }))["ok"]
 
-    # 4. spawn a child task for follow-up
-    child_out = json.loads(kt._handle_create({
+    rejected = json.loads(kt._handle_create({
         "title": "write integration test",
         "assignee": "qa",
-        "parents": [worker_env],
     }))
-    assert child_out["ok"]
+    assert rejected.get("ok") is not True
+    assert "orchestrator-only" in rejected.get("error", "")
 
-    # 5. complete with structured handoff
     comp = json.loads(kt._handle_complete({
-        "summary": "implemented + spawned QA follow-up",
-        "metadata": {"child_task": child_out["task_id"]},
+        "summary": "implemented and verified",
+        "metadata": {"tests_run": 1},
     }))
     assert comp["ok"]
 
-    # Verify final state
     from hermes_cli import kanban_db as kb
     conn = kb.connect()
     try:
-        parent = kb.get_task(conn, worker_env)
-        assert parent.status == "done"
-        assert parent.current_run_id is None
+        task = kb.get_task(conn, worker_env)
+        assert task.status == "done"
+        assert task.current_run_id is None
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
-        assert run.metadata == {"child_task": child_out["task_id"]}
-        # Child is todo (parent just finished, but recompute_ready may
-        # have promoted it — complete_task runs recompute internally).
-        child = kb.get_task(conn, child_out["task_id"])
-        assert child.status == "ready", (
-            f"child should be ready after parent done, got {child.status}"
-        )
-        # Comment is visible
+        assert run.metadata == {"tests_run": 1}
         assert len(kb.list_comments(conn, worker_env)) == 1
-        # Heartbeat event recorded
-        hb = [e for e in kb.list_events(conn, worker_env) if e.kind == "heartbeat"]
-        assert len(hb) == 1
+        heartbeats = [
+            event for event in kb.list_events(conn, worker_env)
+            if event.kind == "heartbeat"
+        ]
+        assert len(heartbeats) == 1
     finally:
         conn.close()
 
@@ -555,17 +688,10 @@ def test_worker_lifecycle_through_tools(worker_env):
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
 #
-# A worker process has HERMES_KANBAN_TASK set to its own task id. The
-# destructive tools (kanban_complete, kanban_block, kanban_heartbeat,
-# kanban_unblock) must refuse to operate
-# on any OTHER task id, even if the caller supplies an explicit `task_id`
-# argument. Workers legitimately call kanban_show / kanban_list /
-# kanban_comment / kanban_create / kanban_link on other tasks, so those
-# are unrestricted.
-#
-# Orchestrator profiles (no HERMES_KANBAN_TASK in env) are intentionally
-# exempt — their job is routing, and they sometimes close out child
-# tasks on behalf of the child.
+# A dispatcher worker is scoped to its own destructive lifecycle operations.
+# Cross-task comments and reads remain available. Board-routing mutations
+# (list/create/link/unblock) require the active profile to explicitly enable
+# the Kanban CLI toolset.
 
 
 def test_worker_complete_rejects_foreign_task_id(worker_env):
@@ -821,8 +947,13 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     home = tmp_path / "gate-home" / ".hermes"
     home.mkdir(parents=True)
     (home / "config.yaml").write_text(
-        "kanban:\n  auto_subscribe_on_create: false\n"
+        "kanban:\n"
+        "  auto_subscribe_on_create: false\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "    - kanban\n"
     )
+    (home / "profiles" / "peer").mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
@@ -839,7 +970,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
-def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
+def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, routing_worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent
     kanban_create. The function returns False and the parent create
