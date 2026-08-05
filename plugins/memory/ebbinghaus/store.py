@@ -2195,6 +2195,53 @@ class EbbinghausMemoryStore:
             ).fetchall()
         return [self._row_to_result(row, query_score=None) for row in rows]
 
+    def list_events(
+        self,
+        *,
+        event_type: str = "",
+        memory_id: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(str(event_type))
+        if memory_id is not None:
+            clauses.append("memory_id = ?")
+            params.append(int(memory_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT event_id, event_type, memory_id, related_memory_id, belief_id,
+                   session_id, payload, created_at
+            FROM memory_events
+            {where}
+            ORDER BY created_at DESC, event_id DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit))),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            out.append(
+                {
+                    "event_id": int(row["event_id"]),
+                    "event_type": str(row["event_type"] or ""),
+                    "memory_id": row["memory_id"],
+                    "related_memory_id": row["related_memory_id"],
+                    "belief_id": str(row["belief_id"] or ""),
+                    "session_id": str(row["session_id"] or ""),
+                    "payload": payload,
+                    "created_at": float(row["created_at"] or 0.0),
+                }
+            )
+        return out
+
     def stats(self) -> dict:
         active_row = self._conn.execute(
             """

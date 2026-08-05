@@ -61,11 +61,87 @@ EBBINGHAUS_MEMORY_SCHEMA = {
                     "list",
                     "stats",
                     "dream",
+                    "revise",
+                    "retract",
+                    "history",
+                    "events",
+                    "correction_check",
+                    "insight_propose",
+                    "insight_validate",
+                    "insight_reject",
                 ],
             },
             "content": {"type": "string", "description": "Memory content for remember."},
+            "new_content": {
+                "type": "string",
+                "description": "Replacement belief content for revise.",
+            },
             "query": {"type": "string", "description": "Cue/query for recall or rehearse."},
-            "memory_id": {"type": "integer", "description": "Memory id for rehearse/forget."},
+            "memory_id": {
+                "type": "integer",
+                "description": "Memory id for rehearse/forget/revise/retract/history.",
+            },
+            "belief_id": {
+                "type": "string",
+                "description": "Belief id for history when memory_id is omitted.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Non-empty reason for revise, retract, or insight_reject.",
+            },
+            "evidence": {
+                "type": "array",
+                "description": "Evidence objects for revise or insight_validate.",
+            },
+            "confidence": {
+                "type": "number",
+                "description": "Belief or insight confidence from 0.0 to 1.0.",
+            },
+            "test_query": {
+                "type": "string",
+                "description": "Correction rehearsal probe query for revise.",
+            },
+            "allow_rescue": {
+                "type": "boolean",
+                "description": "Allow latent/archive rescue on recall when experience is enabled.",
+            },
+            "include_history": {
+                "type": "boolean",
+                "description": "Include superseded/retracted/contested beliefs in recall.",
+            },
+            "include_experience": {
+                "type": "boolean",
+                "description": "Return full RecallAttemptResult fields for recall.",
+            },
+            "event_type": {
+                "type": "string",
+                "description": "Optional event_type filter for events action.",
+            },
+            "association_id": {
+                "type": "string",
+                "description": "Association preview id for insight_propose.",
+            },
+            "candidate_id": {
+                "type": "string",
+                "description": "Insight candidate id for validate/reject.",
+            },
+            "hypothesis": {
+                "type": "string",
+                "description": "Falsifiable hypothesis for insight_propose.",
+            },
+            "source_memory_ids": {
+                "type": "array",
+                "items": {"type": "integer"},
+                "description": "Source memory ids for insight_propose.",
+            },
+            "validation_method": {
+                "type": "string",
+                "description": "ValidationMethod wire value for insight_validate.",
+            },
+            "summary": {
+                "type": "string",
+                "description": "Optional validated insight summary.",
+            },
             "tags": {"type": "string", "description": "Comma-separated tags or cue labels."},
             "salience": {"type": "number", "description": "Importance from 0.05 to 1.0."},
             "valence": {"type": "number", "description": "Emotional valence from -1.0 to 1.0."},
@@ -107,8 +183,8 @@ EBBINGHAUS_MEMORY_SCHEMA = {
             },
             "mode": {
                 "type": "string",
-                "enum": ["preview", "apply"],
-                "description": "Dream mode: preview clusters or apply LLM-authored summaries.",
+                "enum": ["preview", "apply", "association_preview"],
+                "description": "Dream mode: preview clusters, apply summaries, or association_preview.",
             },
             "dreams": {
                 "type": "array",
@@ -264,13 +340,16 @@ class EbbinghausMemoryProvider(MemoryProvider):
             return ""
         # Fetch a slightly larger pool, then apply valence-aware score floors.
         pool_limit = max(self._max_prefetch * 3, self._max_prefetch)
-        results = self._store.recall(
+        attempt = self._store.recall_with_experience(
             query,
             limit=pool_limit,
             min_score=self._min_prefetch_score,
             reinforce=False,
             include_archived=False,
+            allow_rescue=None,
+            track=True,
         )
+        results = list(attempt.results)
         if not results:
             return ""
         neg_floor = float(self._policies.sleep.negative_prefetch_min_score)
@@ -301,7 +380,10 @@ class EbbinghausMemoryProvider(MemoryProvider):
                 f"[retention={item['retention']:.2f}, salience={item['salience']:.2f}] "
                 f"{item['content']}"
             )
-        return "## Ebbinghaus Memory\n" + "\n".join(lines)
+        body = "## Ebbinghaus Memory\n" + "\n".join(lines)
+        if attempt.state_note:
+            body = f"{body}\n\n{attempt.state_note}"
+        return body
 
     def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
         if not self._auto_encode_turns or not self._store:
@@ -398,16 +480,112 @@ class EbbinghausMemoryProvider(MemoryProvider):
                     ensure_ascii=False,
                 )
             if action == "recall":
+                include_experience = bool(args.get("include_experience", True))
+                attempt = self._store.recall_with_experience(
+                    args.get("query", ""),
+                    limit=int(args.get("limit", 5)),
+                    min_score=float(args.get("min_score", 0.12)),
+                    reinforce=True,
+                    include_archived=bool(args.get("include_archived", False)),
+                    include_history=bool(args.get("include_history", False)),
+                    allow_rescue=args.get("allow_rescue"),
+                    track=True,
+                )
+                if include_experience:
+                    return json.dumps(
+                        {
+                            "outcome": attempt.outcome.value,
+                            "results": attempt.results,
+                            "attempt_id": attempt.attempt_id,
+                            "matched_miss_id": attempt.matched_miss_id,
+                            "rescued_memory_id": attempt.rescued_memory_id,
+                            "direct_best_score": attempt.direct_best_score,
+                            "rescue_score": attempt.rescue_score,
+                            "surprise": attempt.surprise,
+                            "state_note": attempt.state_note,
+                        },
+                        ensure_ascii=False,
+                    )
+                return json.dumps({"results": attempt.results}, ensure_ascii=False)
+            if action == "revise":
+                return json.dumps(
+                    self._store.revise_memory(
+                        int(args["memory_id"]),
+                        str(args.get("new_content") or args.get("content") or ""),
+                        reason=str(args.get("reason") or ""),
+                        evidence=args.get("evidence") or [],
+                        confidence=float(args.get("confidence", 0.95)),
+                        test_query=str(args.get("test_query") or ""),
+                        source=str(args.get("source") or "explicit_correction"),
+                        session_id=self._session_id,
+                    ),
+                    ensure_ascii=False,
+                )
+            if action == "retract":
+                return json.dumps(
+                    self._store.retract_memory(
+                        int(args["memory_id"]),
+                        reason=str(args.get("reason") or ""),
+                        session_id=self._session_id,
+                    ),
+                    ensure_ascii=False,
+                )
+            if action == "history":
                 return json.dumps(
                     {
-                        "results": self._store.recall(
-                            args.get("query", ""),
-                            limit=int(args.get("limit", 5)),
-                            min_score=float(args.get("min_score", 0.12)),
-                            reinforce=True,
-                            include_archived=bool(args.get("include_archived", False)),
+                        "history": self._store.belief_history(
+                            memory_id=args.get("memory_id"),
+                            belief_id=str(args.get("belief_id") or ""),
                         )
                     },
+                    ensure_ascii=False,
+                )
+            if action == "events":
+                return json.dumps(
+                    {
+                        "events": self._store.list_events(
+                            event_type=str(args.get("event_type") or ""),
+                            memory_id=args.get("memory_id"),
+                            limit=int(args.get("limit", 20)),
+                        )
+                    },
+                    ensure_ascii=False,
+                )
+            if action == "correction_check":
+                return json.dumps(
+                    self._store.run_correction_check(
+                        rehearsal_id=args.get("rehearsal_id"),
+                        limit=int(args.get("limit", 10)),
+                    ),
+                    ensure_ascii=False,
+                )
+            if action == "insight_propose":
+                return json.dumps(
+                    self._store.propose_insight(
+                        association_id=str(args.get("association_id") or ""),
+                        hypothesis=str(args.get("hypothesis") or ""),
+                        source_memory_ids=args.get("source_memory_ids") or [],
+                        initial_confidence=float(args.get("confidence", 0.55)),
+                    ),
+                    ensure_ascii=False,
+                )
+            if action == "insight_validate":
+                return json.dumps(
+                    self._store.validate_insight(
+                        candidate_id=str(args.get("candidate_id") or ""),
+                        validation_method=str(args.get("validation_method") or "manual"),
+                        evidence=args.get("evidence") or [],
+                        validated_confidence=float(args.get("confidence", 0.8)),
+                        summary=str(args.get("summary") or ""),
+                    ),
+                    ensure_ascii=False,
+                )
+            if action == "insight_reject":
+                return json.dumps(
+                    self._store.reject_insight(
+                        candidate_id=str(args.get("candidate_id") or ""),
+                        reason=str(args.get("reason") or ""),
+                    ),
                     ensure_ascii=False,
                 )
             if action == "rehearse":
@@ -484,12 +662,21 @@ class EbbinghausMemoryProvider(MemoryProvider):
                 mode = str(args.get("mode") or "preview").lower()
                 if mode == "preview":
                     return json.dumps(self._store.dream_preview(), ensure_ascii=False)
+                if mode == "association_preview":
+                    return json.dumps(
+                        self._store.association_preview(
+                            limit=args.get("limit"),
+                        ),
+                        ensure_ascii=False,
+                    )
                 if mode == "apply":
                     return json.dumps(
                         self._store.dream_apply(args.get("dreams")),
                         ensure_ascii=False,
                     )
-                return tool_error("dream mode must be preview or apply")
+                return tool_error(
+                    "dream mode must be preview, apply, or association_preview"
+                )
             return tool_error(f"Unknown action: {action}")
         except CapacityError as exc:
             payload = {"error": str(exc), **(exc.details or {})}
