@@ -2899,6 +2899,14 @@ def compress_context(
             split_status="aborted",
             failure_class="explicit_interrupt",
         )
+        # An interrupted attempt did NOT compact in place. The run-level
+        # ``_last_compaction_in_place`` signal must be reset exactly like the
+        # other abort paths (lock-cancelled / fence-cancelled): a stale True
+        # from an EARLIER successful in-place compaction would make gateway /
+        # api_server consumers believe THIS attempt committed a boundary, and
+        # they would rewrite / archive the untouched transcript — permanently
+        # deleting the pre-compaction rows (#79391).
+        agent._last_compaction_in_place = False
         _existing_sp = getattr(agent, "_cached_system_prompt", None)
         if not _existing_sp:
             _existing_sp = agent._build_system_prompt(system_message)
@@ -2967,6 +2975,14 @@ def compress_context(
                         and "summary_generation_aborted"
                     ),
                 )
+                # No boundary was committed: an aborted summary attempt must
+                # not inherit a stale ``_last_compaction_in_place=True`` from
+                # an earlier successful in-place compaction. The run-level
+                # signal is what gateway/api_server consumers key their
+                # transcript rewrite on; leaving it stale would make them
+                # treat the untouched transcript as already-compacted and
+                # delete/overwrite the pre-compaction rows (#79391).
+                agent._last_compaction_in_place = False
                 return messages, _existing_sp
             finally:
                 _release_lock()

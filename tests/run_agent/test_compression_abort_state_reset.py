@@ -132,4 +132,149 @@ class TestAbortPathsResetPerAttemptState:
             assert new_history is history
             db.close()
 
+    def test_explicit_interrupt_resets_run_level_in_place_signal(self):
+        """A hard interrupt after an earlier in-place success must not leave
+        ``_last_compaction_in_place=True`` behind (#79391).
+
+        Every other abort path (lock-cancelled, fence-cancelled) resets the
+        run-level signal so gateway/api_server consumers cannot mistake an
+        interrupted attempt for a committed in-place boundary and rewrite /
+        archive the untouched transcript — which physically deletes the
+        pre-compaction rows. The explicit_interrupt path was missing the same
+        reset, so a session that had compressed in place earlier the day
+        (stale True) lost its pre-compaction history when a later compression
+        was interrupted mid-summary by an incoming user message.
+        """
+        from unittest.mock import MagicMock, patch as mock_patch
+
+        from agent import auxiliary_client as aux
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = _make_agent(db)
+            agent.compression_in_place = True
+            agent._cached_system_prompt = "system"
+
+            # Simulate an earlier successful in-place compaction: the run-level
+            # signal is True before this attempt starts (the exact stale state
+            # issue #79391 reports for a session compressed twice that day).
+            agent._last_compaction_in_place = True
+
+            compressor = MagicMock()
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = None
+            compressor._last_compress_aborted = False
+            compressor._last_aux_model_failure_model = None
+            compressor._last_aux_model_failure_error = None
+            compressor._last_compression_made_progress = False
+            compressor._last_summary_fallback_used = False
+            compressor._summary_failure_cooldown_until = 0.0
+            compressor._cooldown_persist_failed = False
+            compressor._last_summary_dropped_count = 0
+            compressor._verify_compaction_cleared_threshold = False
+            compressor._ineffective_compression_count = 0
+            compressor._anti_thrash_recovery_deadline = 0.0
+            compressor._fallback_compression_streak = 0
+            compressor._consecutive_timeout_failures = 0
+            compressor._previous_summary = None
+            compressor._summary_has_user_turn = False
+            compressor._last_summary_auth_failure = False
+            compressor._last_summary_network_failure = False
+            compressor._last_aux_model_failure_model = None
+            compressor._summary_model_fallen_back = False
+            compressor.summary_model = None
+            compressor._compression_telemetry_seed = None
+            compressor._last_compression_telemetry = None
+            compressor._active_compression_telemetry = None
+
+            def _interrupted_compress(current, *_args, **_kwargs):
+                agent._hard_interrupt_requested.set()
+                raise aux.AuxiliaryExplicitCancellation()
+
+            compressor.compress.side_effect = _interrupted_compress
+            agent.context_compressor = compressor
+            agent._compression_feasibility_checked = True
+
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+            with mock_patch.dict(
+                os.environ, {"OPENROUTER_API_KEY": "test-key"}
+            ), mock_patch("agent.model_metadata.get_model_context_length", return_value=100000):
+                compressed, _sp = compress_context(
+                    agent, messages, "system", approx_tokens=100_000
+                )
+
+            # The interrupted attempt is a true no-op: transcript unchanged...
+            assert compressed == messages
+            # ...AND the run-level signal must NOT claim an in-place boundary
+            # was committed. A stale True would make gateway/api_server rewrite
+            # the untouched transcript as if it were already compacted.
+            assert agent._last_compaction_in_place is False
+            db.close()
+
+    def test_summary_abort_resets_run_level_in_place_signal(self):
+        """A summary-failure abort after an earlier in-place success must reset
+        ``_last_compaction_in_place`` too (#79391)."""
+        from unittest.mock import MagicMock, patch as mock_patch
+
+        from agent.conversation_compression import compress_context
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db = SessionDB(db_path=Path(tmpdir) / "test.db")
+            agent = _make_agent(db)
+            agent.compression_in_place = True
+            agent._cached_system_prompt = "system"
+            agent._last_compaction_in_place = True  # stale from earlier success
+
+            compressor = MagicMock()
+            compressor.compression_count = 1
+            compressor.last_prompt_tokens = 0
+            compressor.last_completion_tokens = 0
+            compressor._last_summary_error = "provider 429"
+            compressor._last_compress_aborted = True
+            compressor._last_aux_model_failure_model = None
+            compressor._last_aux_model_failure_error = None
+            compressor._last_compression_made_progress = False
+            compressor._last_summary_fallback_used = False
+            compressor._summary_failure_cooldown_until = 0.0
+            compressor._cooldown_persist_failed = False
+            compressor._last_summary_dropped_count = 0
+            compressor._verify_compaction_cleared_threshold = False
+            compressor._ineffective_compression_count = 0
+            compressor._anti_thrash_recovery_deadline = 0.0
+            compressor._fallback_compression_streak = 0
+            compressor._consecutive_timeout_failures = 0
+            compressor._previous_summary = None
+            compressor._summary_has_user_turn = False
+            compressor._last_summary_auth_failure = False
+            compressor._last_summary_network_failure = False
+            compressor._summary_model_fallen_back = False
+            compressor.summary_model = None
+            compressor._compression_telemetry_seed = None
+            compressor._last_compression_telemetry = None
+            compressor._active_compression_telemetry = None
+
+            def _aborted_compress(current, *_args, **_kwargs):
+                return list(current)  # no-op transcript
+
+            compressor.compress.side_effect = _aborted_compress
+            agent.context_compressor = compressor
+            agent._compression_feasibility_checked = True
+
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+            with mock_patch.dict(
+                os.environ, {"OPENROUTER_API_KEY": "test-key"}
+            ), mock_patch("agent.model_metadata.get_model_context_length", return_value=100000):
+                compressed, _sp = compress_context(
+                    agent, messages, "system", approx_tokens=100_000
+                )
+
+            assert compressed == messages
+            assert agent._last_compaction_in_place is False
+            db.close()
+
 
