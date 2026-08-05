@@ -132,11 +132,24 @@ def test_reap_worker_zombies_reaps_and_records():
     """POSIX: spawn a child that exits; reap it and see it in the registry."""
     # fork() so the child becomes a real zombie: subprocess.wait() would reap
     # the child itself (waitpid consumes it), leaving nothing for
-    # reap_worker_zombies() to find.
+    # reap_worker_zombies() to find. A pipe handshake guarantees the child has
+    # actually exited before the parent reaps (otherwise the parent can call
+    # waitpid(WNOHANG) before the child's os._exit lands and reap []).
+    read_fd, write_fd = os.pipe()
     pid = os.fork()
     if pid == 0:
-        os._exit(0)  # child exits immediately; parent does not wait -> zombie
-    reaped = reap_worker_zombies()
+        os.close(read_fd)
+        os.write(write_fd, b"x")  # signal: I am about to exit
+        os.close(write_fd)
+        os._exit(0)
+    os.close(write_fd)
+    os.read(read_fd, 1)  # blocks until the child signals
+    os.close(read_fd)
+    reaped = []
+    for _ in range(100):  # bounded retry for scheduler slack
+        reaped = reap_worker_zombies()
+        if pid in reaped:
+            break
     assert pid in reaped
     kind, code = _classify_worker_exit(pid)
     assert kind == "clean_exit"
