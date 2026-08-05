@@ -253,8 +253,7 @@ In `per_user` mode:
 - The gateway session user (`HERMES_SESSION_USER_ID` + platform) selects which authorization is used
 - Missing identity fails closed — Hermes will not silently reuse another user's credentials
 - Operators can seed a user's tokens with `hermes mcp login <server> --user telegram:12345`
-
-Headless consent URL delivery in the originating messaging platform is tracked separately in [#78169](https://github.com/NousResearch/hermes-agent/issues/78169).
+- When a messaging user hits an OAuth MCP without tokens, Hermes sends the authorize URL **into that chat** (not only the host terminal). After authorizing, if the browser lands on a connection error, paste the full redirect URL back as a reply to complete the flow. Prefer configuring `oauth.redirect_uri` to a public HTTPS callback that reaches the Hermes host when possible.
 
 
 **Remote / headless hosts.** When Hermes runs on a different machine than your browser, the loopback callback can't reach your laptop. Two ways to complete the flow:

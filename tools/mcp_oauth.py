@@ -302,6 +302,14 @@ def _is_interactive() -> bool:
     if _oauth_interactive_forced.get():
         return True
     try:
+        from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
+
+        if get_dashboard_oauth_flow() is not None or get_gateway_oauth_flow() is not None:
+            return True
+    except Exception:
+        pass
+    try:
         return sys.stdin.isatty()
     except (AttributeError, ValueError):
         return False
@@ -732,10 +740,16 @@ def _make_redirect_handler(port: int, redirect_uri: str | None = None):
         as a fallback for headless/SSH/gateway environments.
         """
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
             await dashboard_flow.publish_authorization_url(authorization_url)
+            return
+
+        gateway_flow = get_gateway_oauth_flow()
+        if gateway_flow is not None:
+            await gateway_flow.publish_authorization_url(authorization_url)
             return
 
         # Fail fast at the authorization boundary in non-interactive contexts
@@ -852,10 +866,15 @@ def _make_callback_waiter(port: int):
 
     async def _wait() -> tuple[str, str | None]:
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
 
         dashboard_flow = get_dashboard_oauth_flow()
         if dashboard_flow is not None:
             return await dashboard_flow.wait_for_callback()
+
+        gateway_flow = get_gateway_oauth_flow()
+        # When gateway_flow is set we still bind loopback (redirect_uri tunnels)
+        # and race it against chat paste via gateway_flow below.
 
         # Reject before binding the callback listener in non-interactive
         # contexts. Reaching here means the SDK entered the authorization-code
@@ -931,6 +950,21 @@ def _make_callback_waiter(port: int):
                 target=_paste_callback_reader, args=(result,), daemon=True
             )
             paste_thread.start()
+
+        # Gateway chat paste: messaging user pastes redirect URL → deliver_callback
+        # fills gateway_flow; mirror that into the shared result dict.
+        if gateway_flow is not None:
+            def _gateway_paste_watch() -> None:
+                if not gateway_flow._callback_ready.wait(timeout=300.0):
+                    return
+                if result["auth_code"] is not None or result["error"] is not None:
+                    return
+                if gateway_flow._callback_error:
+                    result["error"] = gateway_flow._callback_error
+                elif gateway_flow._callback is not None:
+                    result["auth_code"], result["state"] = gateway_flow._callback
+
+            threading.Thread(target=_gateway_paste_watch, daemon=True).start()
 
         timeout = 300.0
         poll_interval = 0.5

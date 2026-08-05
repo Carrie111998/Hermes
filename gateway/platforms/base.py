@@ -5708,6 +5708,42 @@ class BasePlatformAdapter(ABC):
                         )
                     return
 
+            # MCP OAuth consent paste (#78169): while the agent is blocked
+            # waiting for an OAuth callback, a pasted redirect URL must reach
+            # the flow — not the pending-message queue (same deadlock class
+            # as /approve and clarify replies).
+            if not cmd and event.text:
+                try:
+                    from tools.mcp_gateway_oauth import try_deliver_oauth_paste
+
+                    if try_deliver_oauth_paste(session_key, event.text):
+                        logger.debug(
+                            "[%s] Consumed MCP OAuth paste for session %s",
+                            self.name, session_key,
+                        )
+                        try:
+                            _thread_meta = _thread_metadata_for_source(
+                                event.source, _reply_anchor_for_event(event)
+                            )
+                            await self._send_with_retry(
+                                chat_id=event.source.chat_id,
+                                content=(
+                                    "OAuth authorization received — "
+                                    "continuing MCP setup."
+                                ),
+                                reply_to=_reply_anchor_for_event(event),
+                                metadata=_mark_notify_metadata(_thread_meta),
+                            )
+                        except Exception as e:
+                            logger.debug(
+                                "[%s] OAuth paste ack failed: %s", self.name, e
+                            )
+                        return
+                except Exception as e:
+                    logger.debug(
+                        "[%s] MCP OAuth paste check failed: %s", self.name, e
+                    )
+
             if self._busy_session_handler is not None:
                 try:
                     if await self._busy_session_handler(event, session_key):

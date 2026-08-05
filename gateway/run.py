@@ -5036,6 +5036,38 @@ class TurnRunner:
                 UX.  Otherwise fall back to a plain text message with
                 ``/approve`` instructions.
                 """
+            # MCP OAuth consent URL (#78169): deliver authorize link to the
+            # originating chat — not an /approve prompt.
+            if approval_data.get("kind") == "mcp_oauth_consent":
+                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+                server = approval_data.get("server_name") or "MCP"
+                url = approval_data.get("authorization_url") or ""
+                msg = (
+                    f"MCP OAuth required for `{server}`.\n\n"
+                    f"Open this URL to authorize:\n{url}\n\n"
+                    f"After authorizing, if your browser shows a connection "
+                    f"error, copy the full redirect URL from the address bar "
+                    f"and paste it back here as a reply."
+                )
+                try:
+                    _oauth_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="mcp oauth consent send scheduling error",
+                    )
+                    if _oauth_fut is not None:
+                        _oauth_fut.result(timeout=15)
+                except Exception as _e:
+                    logger.warning(
+                        "Failed to deliver MCP OAuth consent URL: %s", _e
+                    )
+                return
+
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the
@@ -8686,6 +8718,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # waiting thread, resume typing, AND return a localized confirmation
         # string.  The busy-handler path does not auto-send that return, so
         # we deliver it ourselves (mirroring the draining-case send above).
+        try:
+            from tools.mcp_gateway_oauth import try_deliver_oauth_paste
+
+            if try_deliver_oauth_paste(session_key, event.text or ""):
+                try:
+                    adapter = self.adapters.get(event.source.platform)
+                    if adapter is not None:
+                        await adapter.send(
+                            event.source.chat_id,
+                            "OAuth authorization received — continuing MCP setup.",
+                        )
+                except Exception:
+                    pass
+                return True
+        except Exception:
+            pass
+
         try:
             from tools.approval import has_blocking_approval
             if has_blocking_approval(session_key):

@@ -583,9 +583,11 @@ class MCPOAuthManager:
         storage = HermesTokenStorage(server_name, user_key=user_key or None)
 
         from tools.mcp_dashboard_oauth import get_dashboard_oauth_flow
+        from tools.mcp_gateway_oauth import get_gateway_oauth_flow
 
         if (
             get_dashboard_oauth_flow() is None
+            and get_gateway_oauth_flow() is None
             and not _is_interactive()
             and not storage.has_cached_tokens()
         ):

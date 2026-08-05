@@ -4456,6 +4456,27 @@ def _wrap_with_dashboard_oauth_flow(coro):
     return _scoped()
 
 
+def _wrap_with_gateway_oauth_flow(coro):
+    """Propagate a gateway OAuth consent flow onto the dedicated MCP loop task."""
+    try:
+        from tools.mcp_gateway_oauth import (
+            gateway_oauth_flow,
+            get_gateway_oauth_flow,
+        )
+
+        flow = get_gateway_oauth_flow()
+    except Exception:
+        return coro
+    if flow is None:
+        return coro
+
+    async def _scoped():
+        with gateway_oauth_flow(flow):
+            return await coro
+
+    return _scoped()
+
+
 def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     """Schedule a coroutine on the MCP event loop and block until done.
 
@@ -4491,6 +4512,7 @@ def _run_on_mcp_loop(coro_or_factory, timeout: float = 30):
     # scopes don't interfere). No-op when no override is active.
     coro = _wrap_with_home_override(coro)
     coro = _wrap_with_dashboard_oauth_flow(coro)
+    coro = _wrap_with_gateway_oauth_flow(coro)
 
     future = safe_schedule_threadsafe(
         coro, loop,
@@ -4917,8 +4939,40 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     async def _connect():
         return await _discover_and_register_server(server_name, config)
 
+    from contextlib import ExitStack
+
     try:
-        _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
+        with ExitStack() as stack:
+            # Headless messaging: surface the authorize URL in-chat (#78169).
+            try:
+                from tools.mcp_gateway_oauth import (
+                    GatewayOAuthFlow,
+                    gateway_oauth_available,
+                    gateway_oauth_flow,
+                )
+                from tools.mcp_oauth import force_interactive_oauth
+                from tools.approval import get_current_session_key
+                from tools.mcp_oauth_identity import current_oauth_user_key
+
+                if (
+                    gateway_oauth_available()
+                    and _server_config_is_oauth(server_name, config)
+                ):
+                    session_key = get_current_session_key()
+                    if session_key:
+                        flow = GatewayOAuthFlow(
+                            server_name=server_name,
+                            session_key=session_key,
+                            user_key=current_oauth_user_key(require=False),
+                        )
+                        stack.enter_context(gateway_oauth_flow(flow))
+                        stack.enter_context(force_interactive_oauth())
+            except Exception as exc:
+                logger.debug(
+                    "MCP gateway OAuth context not entered for '%s': %s",
+                    server_name, exc,
+                )
+            _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
     except BaseException as exc:
         message = _format_connect_error(exc)
         with _lock:
