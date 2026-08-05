@@ -9,9 +9,10 @@ These tests mock both paths so they run under pytest without a real TTY.
 """
 
 from unittest.mock import MagicMock, patch
+import threading
 
 
-def _make_cli():
+def _make_cli(_app=None):
     from cli import HermesCLI
 
     cli_obj = HermesCLI.__new__(HermesCLI)
@@ -23,6 +24,11 @@ def _make_cli():
     cli_obj._session_db = MagicMock()
     cli_obj._pending_resume_sessions = None
     cli_obj.resume_display = "minimal"
+    # _app/_status_bar_visible are set in HermesCLI.__init__, which __new__
+    # bypasses. The off-the-main-thread default mirrors run(): a running
+    # prompt_toolkit app owns _app; when None the browser runs directly.
+    cli_obj._app = _app
+    cli_obj._status_bar_visible = True
     return cli_obj
 
 
@@ -42,10 +48,16 @@ class TestInteractiveBrowserFallback:
             "id": "sess_002",
             "title": "Coding",
         }
-        cli_obj._session_db.get_messages_as_conversation.return_value = [
-            {"role": "user", "content": "hello"},
-            {"role": "assistant", "content": "hi"},
-        ]
+        cli_obj._session_db.get_resume_conversations.return_value = (
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+            [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        )
         cli_obj._session_db.resolve_resume_session_id.return_value = "sess_002"
 
         with (
@@ -125,3 +137,69 @@ class TestInteractiveBrowserFallback:
 
         # Non-TTY path arms the one-shot pending selection (see #34584).
         assert cli_obj._pending_resume_sessions == sessions
+
+
+class TestLiveCliTerminalWrapper:
+    """The curses browser must be driven through ``run_in_terminal`` while a
+    prompt_toolkit app owns the terminal, so the compositor releases and
+    restores ownership cleanly instead of clobbering ``patch_stdout``.
+    """
+
+    def test_live_cli_routes_picker_through_run_in_terminal(self):
+        """With a running prompt_toolkit app on the main thread, the picker is
+        invoked via ``run_in_terminal`` (not directly) and the status-bar
+        visibility is restored afterwards."""
+        cli_obj = _make_cli(_app=MagicMock())
+        sessions = [
+            {"id": "sess_002", "title": "Coding"},
+            {"id": "sess_001", "title": "Research"},
+        ]
+
+        calls = {}
+
+        def fake_run_in_terminal(fn):
+            # Capture the wrapped callback and the app state at call time.
+            fn()
+            calls["status_bar_visible_inside"] = cli_obj._status_bar_visible
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch("sys.stdout") as mock_stdout,
+            patch("hermes_cli.main._session_browse_picker", return_value="sess_002") as mock_picker,
+            patch("prompt_toolkit.application.run_in_terminal", side_effect=fake_run_in_terminal),
+            patch("cli._cprint"),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdout.isatty.return_value = True
+            picked = cli_obj._browse_sessions_in_terminal(sessions)
+
+        # The picker ran through run_in_terminal, and the status bar was
+        # hidden while curses owned the terminal.
+        mock_picker.assert_called_once_with(sessions)
+        assert picked == "sess_002"
+        assert calls["status_bar_visible_inside"] is False
+        # Restored after the wrapper returns.
+        assert cli_obj._status_bar_visible is True
+
+    def test_background_thread_calls_picker_directly(self):
+        """Off the main thread (process_loop worker) there is no prompt_toolkit
+        event loop to run_in_terminal against, so the picker runs directly."""
+        cli_obj = _make_cli(_app=MagicMock())
+        sessions = [{"id": "sess_002", "title": "Coding"}]
+
+        with (
+            patch("sys.stdin") as mock_stdin,
+            patch("sys.stdout") as mock_stdout,
+            patch("hermes_cli.main._session_browse_picker", return_value="sess_002") as mock_picker,
+            patch("prompt_toolkit.application.run_in_terminal") as mock_run_in_terminal,
+            patch("cli._cprint"),
+        ):
+            mock_stdin.isatty.return_value = True
+            mock_stdout.isatty.return_value = True
+            # The test runs on the main thread; simulate a worker thread.
+            with patch("threading.current_thread", return_value=threading.Thread()):
+                picked = cli_obj._browse_sessions_in_terminal(sessions)
+
+        assert picked == "sess_002"
+        # Direct call — run_in_terminal was NOT used off the main thread.
+        mock_run_in_terminal.assert_not_called()
