@@ -10,12 +10,21 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import time
 from typing import Callable, Dict, Optional, Tuple
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
 WS_CLOSE_TERMINATED = 4411
+
+logger = logging.getLogger(__name__)
+
+
+async def _await_owned(task: asyncio.Task):
+    """Await a retained task without propagating waiter cancellation into it."""
+    await asyncio.wait({task})
+    return task.result()
 
 
 class RingBuffer:
@@ -72,6 +81,7 @@ class PtySession:
         self.bridge = bridge
         self.buffer = RingBuffer(buffer_cap)
         self.alive = True
+        self._process_exited = False
         self.attached = False
         self.last_detached_at: Optional[float] = None
         self._read_timeout = read_timeout
@@ -86,17 +96,29 @@ class PtySession:
         self._drain_task = asyncio.create_task(self._drain())
 
     async def _drain(self) -> None:
-        loop = asyncio.get_running_loop()
         while True:
-            chunk = await loop.run_in_executor(None, self.bridge.read, self._read_timeout)
+            read_task = asyncio.create_task(
+                asyncio.to_thread(self.bridge.read, self._read_timeout)
+            )
+            try:
+                chunk = await _await_owned(read_task)
+            except asyncio.CancelledError:
+                # Executor cancellation does not stop its worker thread. Own
+                # the read through completion before bridge.close can reuse
+                # or close the underlying fd.
+                try:
+                    await asyncio.wait({read_task})
+                    if not read_task.cancelled():
+                        read_task.exception()
+                except Exception:
+                    pass
+                raise
+            except Exception:
+                logger.exception("PTY read failed for session %s", self.key)
+                await self._mark_dead()
+                return
             if chunk is None:                       # EOF — the agent process exited
-                self.alive = False
-                ws = self._ws
-                if ws is not None:
-                    try:
-                        await ws.close(code=WS_CLOSE_PROCESS_EXITED)
-                    except Exception:
-                        pass
+                await self._mark_dead()
                 return
             if not chunk:                            # idle tick
                 await asyncio.sleep(0)
@@ -110,10 +132,41 @@ class PtySession:
                     except Exception:
                         pass                         # detached mid-send; keep buffering
 
+    async def _mark_dead(self) -> None:
+        """Fail closed on EOF/read failure under the output-state barrier."""
+        async with self._output_lock:
+            if self._closing:
+                return
+            self.alive = False
+            self._process_exited = True
+            sockets = []
+            for ws in (self._ws, self._attaching_ws):
+                if ws is not None and all(ws is not item for item in sockets):
+                    sockets.append(ws)
+            self._ws = None
+            self._attaching_ws = None
+            self.attached = False
+            self.last_detached_at = time.monotonic()
+            for ws in sockets:
+                try:
+                    await ws.close(code=WS_CLOSE_PROCESS_EXITED)
+                except Exception:
+                    pass
+            self.begin_close()
+
     async def attach(self, ws) -> None:
         # Drain forwarding shares this barrier, so buffered replay is always
         # delivered before bytes read concurrently from the live PTY.
         async with self._output_lock:
+            if self._process_exited:
+                try:
+                    snap = self.buffer.snapshot()
+                    if snap:
+                        await ws.send_bytes(snap)
+                    await ws.close(code=WS_CLOSE_PROCESS_EXITED)
+                except Exception:
+                    pass
+                return
             if self._closing:
                 raise SessionTerminated(self.key)
             old = self._ws
@@ -181,7 +234,7 @@ class PtySession:
             self.alive = False
             sockets = []
             for ws in (self._ws, self._attaching_ws):
-                if ws is not None and ws not in sockets:
+                if ws is not None and all(ws is not item for item in sockets):
                     sockets.append(ws)
             self._ws = None
             self._attaching_ws = None
@@ -194,7 +247,7 @@ class PtySession:
         task = self.begin_close()
         # Caller cancellation must not cancel process cleanup. Concurrent and
         # retrying callers all wait for the same idempotent close operation.
-        await asyncio.shield(task)
+        await _await_owned(task)
 
 class RegistryFull(Exception):
     pass
@@ -234,10 +287,20 @@ class PtySessionRegistry:
     @staticmethod
     async def _await_tasks(tasks: list[asyncio.Task]) -> None:
         if tasks:
-            await asyncio.gather(
-                *(asyncio.shield(task) for task in tasks),
-                return_exceptions=True,
-            )
+            done, _ = await asyncio.wait(tasks)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
+
+    @staticmethod
+    def _consume_spawn_result(task: asyncio.Task) -> None:
+        """Retrieve registry-owned failures even if every attach waiter leaves."""
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
 
     async def _spawn_and_register(
         self,
@@ -265,7 +328,7 @@ class PtySessionRegistry:
                     close_task = session.begin_close()
             if terminated:
                 assert close_task is not None
-                await asyncio.shield(close_task)
+                await _await_owned(close_task)
                 raise SessionTerminated(key)
             return session
         finally:
@@ -296,12 +359,13 @@ class PtySessionRegistry:
                 task = asyncio.create_task(
                     self._spawn_and_register(key, spawn)
                 )
+                task.add_done_callback(self._consume_spawn_result)
                 self._pending[key] = task
 
         await self._await_tasks(close_tasks)
         # A disconnected creator must not cancel a spawn that another attach
-        # is already awaiting. Explicit termination uses the generation check.
-        return await asyncio.shield(task), created
+        # is already awaiting. Explicit termination uses the tombstone check.
+        return await _await_owned(task), created
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)

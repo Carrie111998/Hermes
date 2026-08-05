@@ -176,6 +176,120 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     await s.close()
 
 
+@pytest.mark.asyncio
+async def test_process_exit_before_attach_closes_new_socket_without_publication():
+    from hermes_cli.pty_session import PtySession
+
+    session = PtySession("k", FakeBridge([]), buffer_cap=1024, read_timeout=0.01)
+    session.alive = False
+    session._process_exited = True
+    session.buffer.append(b"final")
+    ws = FakeWS()
+
+    await session.attach(ws)
+
+    assert ws.close_code == 4410
+    assert ws.sent == [("bytes", b"final")]
+    assert session.attached is False
+    assert session._ws is None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_eof_during_replay_closes_socket_and_prevents_ghost_attachment():
+    from hermes_cli.pty_session import PtySession
+
+    session = PtySession(
+        "k", FakeBridge([None]), buffer_cap=1024, read_timeout=0.01
+    )
+    session.buffer.append(b"final")
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    class BlockingReplayWS(FakeWS):
+        async def send_bytes(self, data):
+            replay_started.set()
+            await release_replay.wait()
+            await super().send_bytes(data)
+
+    ws = BlockingReplayWS()
+    attach_task = asyncio.create_task(session.attach(ws))
+    await replay_started.wait()
+    await session.start()
+    await asyncio.sleep(0.02)
+    release_replay.set()
+    await attach_task
+    for _ in range(50):
+        if ws.close_code == 4410:
+            break
+        await asyncio.sleep(0.01)
+
+    assert ws.close_code == 4410
+    assert session.alive is False
+    assert session.attached is False
+    assert session._ws is None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_read_failure_fails_closed_and_cleans_bridge():
+    from hermes_cli.pty_session import PtySession
+
+    class FailingReadBridge(FakeBridge):
+        def read(self, timeout):
+            raise RuntimeError("read exploded")
+
+    bridge = FailingReadBridge([])
+    session = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    ws = FakeWS()
+    await session.attach(ws)
+    await session.start()
+    for _ in range(50):
+        if bridge.closed:
+            break
+        await asyncio.sleep(0.01)
+
+    assert session.alive is False
+    assert session.attached is False
+    assert ws.close_code == 4410
+    assert bridge.closed is True
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_close_waits_for_inflight_executor_read_before_bridge_cleanup():
+    from hermes_cli.pty_session import PtySession
+
+    read_started = threading.Event()
+    release_read = threading.Event()
+
+    class BlockingReadBridge(FakeBridge):
+        def __init__(self):
+            super().__init__([])
+            self.closed_after_read = False
+
+        def read(self, timeout):
+            read_started.set()
+            release_read.wait(timeout=2)
+            return b""
+
+        def close(self):
+            self.closed_after_read = release_read.is_set()
+            super().close()
+
+    bridge = BlockingReadBridge()
+    session = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    await session.start()
+    assert await asyncio.to_thread(read_started.wait, 1)
+    close_task = asyncio.create_task(session.close())
+    await asyncio.sleep(0)
+    assert close_task.done() is False
+    release_read.set()
+    await close_task
+
+    assert bridge.closed_after_read is True
+
+
 from hermes_cli.pty_session import (
     PtySessionRegistry,
     RegistryFull,
@@ -534,6 +648,40 @@ async def test_cancelled_bulk_registry_cleanup_starts_every_session(operation):
 
     assert all(bridge.closed for bridge in bridges)
     assert not reg._sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_only_waiter_does_not_leave_unobserved_spawn_failure():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    loop = asyncio.get_running_loop()
+    contexts = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    def failing_spawn():
+        spawn_started.set()
+        release_spawn.wait(timeout=2)
+        raise RuntimeError("spawn exploded")
+
+    try:
+        waiter = asyncio.create_task(reg.attach_or_spawn("token", spawn=failing_spawn))
+        assert await asyncio.to_thread(spawn_started.wait, 1)
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+        release_spawn.set()
+        for _ in range(50):
+            if not reg._pending:
+                break
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert not reg._pending
+    assert contexts == []
 
 
 @pytest.mark.asyncio
