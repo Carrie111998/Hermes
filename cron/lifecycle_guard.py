@@ -316,6 +316,11 @@ def _contains_unsafe_gateway_action(
             return True
 
     for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+        # An embedded NUL can never name a filesystem entry.  Skip it before
+        # resolution or either local/remote reader gets a chance to reject it
+        # with ``ValueError: embedded null byte``.
+        if "\x00" in os.fspath(script_path):
+            continue
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):

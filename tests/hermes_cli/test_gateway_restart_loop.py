@@ -709,6 +709,21 @@ class TestLifecycleGuardModule:
         assert text is None
         assert unsafe is False
 
+    def test_command_with_nul_path_skips_script_readers(self):
+        """Invalid referenced paths must not reach local or remote readers."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def _remote_read(_path: str):
+            raise AssertionError("invalid path reached remote reader")
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/tmp/hermes\x00script.sh --run",
+            read_remote_script=_remote_read,
+        )
+        assert result is False
+
     def test_remote_read_fallback_binary_does_not_crash_guard(self):
         """#77703: in the gateway the referenced-script walk carries a
         ``read_remote_script`` fallback (SSH/Modal/Daytona backends read the
