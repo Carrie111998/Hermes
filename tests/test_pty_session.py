@@ -191,7 +191,7 @@ async def test_terminated_published_session_rejects_late_attach():
 
 
 @pytest.mark.asyncio
-async def test_termination_waits_for_in_progress_attach_then_closes_socket():
+async def test_termination_closes_socket_during_in_progress_attach():
     reg = make_registry()
     session, _ = await reg.attach_or_spawn(
         "token", spawn=lambda: FakeBridge([b"buffered"])
@@ -209,14 +209,12 @@ async def test_termination_waits_for_in_progress_attach_then_closes_socket():
     ws = BlockingWS()
     attach_task = asyncio.create_task(session.attach(ws))
     await send_started.wait()
-    terminate_task = asyncio.create_task(reg.terminate_attach_token("token"))
-    await asyncio.sleep(0)
-    assert terminate_task.done() is False
+    assert await reg.terminate_attach_token("token") == 1
+    assert ws.close_code == 4411
 
     release_send.set()
-    await attach_task
-    assert await terminate_task == 1
-    assert ws.close_code == 4411
+    with pytest.raises(SessionTerminated):
+        await attach_task
     assert session.attached is False
 
 
@@ -277,6 +275,117 @@ async def test_cancelled_close_caller_does_not_abandon_shared_cleanup():
     release_close.set()
     await retry
     assert bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_termination_still_closes_session_blocked_in_attach():
+    reg = make_registry()
+    bridge = FakeBridge([b"buffered"])
+    session, _ = await reg.attach_or_spawn("token", spawn=lambda: bridge)
+    await asyncio.sleep(0.02)
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    class BlockingSendWS(FakeWS):
+        async def send_bytes(self, data):
+            send_started.set()
+            await release_send.wait()
+            await super().send_bytes(data)
+
+    attach_task = asyncio.create_task(session.attach(BlockingSendWS()))
+    await send_started.wait()
+    terminate_task = asyncio.create_task(reg.terminate_attach_token("token"))
+    await asyncio.sleep(0)
+    terminate_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await terminate_task
+    release_send.set()
+    with pytest.raises(SessionTerminated):
+        await attach_task
+    await asyncio.sleep(0.05)
+    closed_without_retry = bridge.closed
+    await session.close()
+
+    assert closed_without_retry is True
+    assert "token" not in reg._sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_multi_session_termination_starts_every_cleanup():
+    reg = make_registry()
+    first_bridge = FakeBridge([b""])
+    second_bridge = FakeBridge([b""])
+    first, _ = await reg.attach_or_spawn("token", spawn=lambda: first_bridge)
+    second, _ = await reg.attach_or_spawn(
+        "token\0profile\0resume", spawn=lambda: second_bridge
+    )
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingCloseWS(FakeWS):
+        async def close(self, code=1000, reason=""):
+            close_started.set()
+            await release_close.wait()
+            await super().close(code=code, reason=reason)
+
+    await first.attach(BlockingCloseWS())
+    await second.attach(FakeWS())
+    terminate_task = asyncio.create_task(reg.terminate_attach_token("token"))
+    await close_started.wait()
+    terminate_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await terminate_task
+    release_close.set()
+    await asyncio.sleep(0.05)
+    closed_without_retry = (first_bridge.closed, second_bridge.closed)
+    await asyncio.gather(first.close(), second.close())
+
+    assert closed_without_retry == (True, True)
+    assert not reg._sessions
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["reap_idle", "close_all"])
+async def test_cancelled_bulk_registry_cleanup_starts_every_session(operation):
+    reg = make_registry()
+    release_close = threading.Event()
+
+    class BlockingCloseBridge(FakeBridge):
+        def __init__(self):
+            super().__init__([b""])
+            self.close_started = threading.Event()
+
+        def close(self):
+            self.close_started.set()
+            release_close.wait(timeout=2)
+            super().close()
+
+    bridges = [BlockingCloseBridge(), BlockingCloseBridge()]
+    sessions = []
+    for index, bridge in enumerate(bridges):
+        session, _ = await reg.attach_or_spawn(
+            f"token-{index}", spawn=lambda bridge=bridge: bridge
+        )
+        sessions.append(session)
+
+    for session in sessions:
+        session.last_detached_at = 0.0
+    reg._ttl = 0
+
+    if operation == "reap_idle":
+        cleanup = asyncio.create_task(reg.reap_idle(now=1.0))
+    else:
+        cleanup = asyncio.create_task(reg.close_all())
+    assert await asyncio.to_thread(bridges[0].close_started.wait, 1)
+    assert await asyncio.to_thread(bridges[1].close_started.wait, 1)
+    cleanup.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await cleanup
+    release_close.set()
+    await asyncio.gather(*(session.close() for session in sessions))
+
+    assert all(bridge.closed for bridge in bridges)
+    assert not reg._sessions
 
 
 @pytest.mark.asyncio
