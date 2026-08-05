@@ -10,7 +10,7 @@ import re
 import threading
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 try:
     from hermes_constants import get_hermes_home
@@ -57,6 +57,8 @@ FILE_RE = re.compile(r"(?:/home/|~/?|\./|/mnt/)[\w./-]+\.(?:py|js|ts|tsx|jsx|css
 TIER_NAMES = ["Copper", "Silver", "Gold", "Diamond", "Olympian"]
 _LOCALE_DIR = Path(__file__).parent / "locales"
 _LOCALE_CACHE: Dict[str, Dict[str, Any]] = {}
+_LANGUAGE_RANGE_RE = re.compile(r"^[a-z]{1,8}(?:-[a-z0-9]{1,8})*$")
+_QUALITY_RE = re.compile(r"^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$")
 
 
 def _load_locale(locale_code: str) -> Dict[str, Any]:
@@ -83,23 +85,64 @@ def _load_locale(locale_code: str) -> Dict[str, Any]:
     return {}
 
 
+def _supported_locale(language_range: str) -> Optional[str]:
+    normalized = language_range.replace("_", "-").lower()
+    if not _LANGUAGE_RANGE_RE.fullmatch(normalized):
+        return None
+    if normalized == "en" or normalized.startswith("en-"):
+        return "en"
+    if normalized == "zh" or normalized in {"zh-cn", "zh-hans", "zh-sg"}:
+        return "zh-CN"
+    if normalized.startswith(("zh-cn-", "zh-hans-", "zh-sg-")):
+        return "zh-CN"
+    return None
+
+
+def _parse_quality(parameters: List[str]) -> Optional[int]:
+    """Return an RFC 9110 quality value as an integer from 0 through 1000."""
+    if not parameters:
+        return 1000
+    if len(parameters) != 1 or "=" not in parameters[0]:
+        return None
+    name, value = (item.strip().lower() for item in parameters[0].split("=", 1))
+    if name != "q" or not _QUALITY_RE.fullmatch(value):
+        return None
+    whole, _, fraction = value.partition(".")
+    return 1000 if whole == "1" else int((fraction + "000")[:3])
+
+
 def _resolve_locale_from_request(request: Any = None) -> str:
     """Resolve supported achievement locale from query params or headers."""
     query_params = getattr(request, "query_params", {}) or {}
     explicit = str(query_params.get("locale") or query_params.get("lang") or "").strip()
     header = str((getattr(request, "headers", {}) or {}).get("accept-language", ""))
     if explicit:
-        normalized = explicit.replace("_", "-").lower()
-        if normalized in {"zh", "zh-cn", "zh-hans", "zh-sg"}:
-            return "zh-CN"
-        if normalized.startswith("en"):
-            return "en"
-        return "en"
-    for candidate in (part.split(";", 1)[0].strip() for part in header.split(",")):
-        normalized = candidate.replace("_", "-").lower()
-        if normalized in {"zh", "zh-cn", "zh-hans", "zh-sg"}:
-            return "zh-CN"
-    return "en"
+        return _supported_locale(explicit) or "en"
+
+    preferences: Dict[str, Tuple[int, int]] = {}
+    wildcard: Optional[Tuple[int, int]] = None
+    for order, item in enumerate(header.split(",")):
+        language_range, *parameters = (part.strip() for part in item.split(";"))
+        quality = _parse_quality(parameters)
+        if quality is None:
+            continue
+        preference = (quality, -order)
+        if language_range == "*":
+            if wildcard is None or preference > wildcard:
+                wildcard = preference
+            continue
+        locale_code = _supported_locale(language_range)
+        if locale_code is not None and preference > preferences.get(locale_code, (-1, 0)):
+            preferences[locale_code] = preference
+
+    best_locale = "en"
+    best_preference = (-1, 0)
+    for locale_code in ("en", "zh-CN"):
+        preference = preferences.get(locale_code, wildcard or (-1, 0))
+        if preference[0] > 0 and preference > best_preference:
+            best_locale = locale_code
+            best_preference = preference
+    return best_locale
 
 
 def _locale_string(locale_code: str, key: str, fallback: str = "") -> str:

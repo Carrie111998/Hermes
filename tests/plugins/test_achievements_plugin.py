@@ -434,10 +434,61 @@ def test_achievements_locale_resolution_accepts_query_and_header(plugin_api):
     assert plugin_api._resolve_locale_from_request(_Request(header="fr,en;q=0.8")) == "en"
 
 
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("en-US,en;q=0.9,zh-CN;q=0.8", "en"),
+        ("zh-CN;q=0,en;q=1", "en"),
+        ("en;q=1,zh-CN;q=0", "en"),
+    ],
+)
+def test_accept_language_honors_quality_and_exclusions(plugin_api, header, expected):
+    assert plugin_api._resolve_locale_from_request(_Request(header=header)) == expected
+
+
+@pytest.mark.parametrize(
+    ("header", "expected"),
+    [
+        ("zh-Hans-CN;q=0.7,en-GB;q=0.6", "zh-CN"),
+        ("zh-CN;q=0.8,en;q=0.8", "zh-CN"),
+        ("en;q=0,zh-SG;q=0.001", "zh-CN"),
+        ("*;q=1,zh-CN;q=0.5", "en"),
+        ("zh-Hant;q=1,zh-CN;q=0.5", "zh-CN"),
+    ],
+)
+def test_accept_language_handles_supported_ranges_ties_and_wildcards(
+    plugin_api, header, expected
+):
+    assert plugin_api._resolve_locale_from_request(_Request(header=header)) == expected
+
+
+@pytest.mark.parametrize(
+    "malformed_quality",
+    ["", ".8", "bogus", "-0.1", "1.001", "0.1234"],
+)
+def test_accept_language_ignores_malformed_quality_values(plugin_api, malformed_quality):
+    header = f"zh-CN;q={malformed_quality},en;q=0.5"
+
+    assert plugin_api._resolve_locale_from_request(_Request(header=header)) == "en"
+
+
 def test_explicit_locale_param_wins_over_accept_language(plugin_api):
     request = _Request({"locale": "ja"}, "zh-CN")
 
     assert plugin_api._resolve_locale_from_request(request) == "en"
+
+
+def test_explicit_locale_wins_over_lang_and_lang_wins_over_header(plugin_api):
+    assert (
+        plugin_api._resolve_locale_from_request(
+            _Request({"locale": "ja", "lang": "zh-CN"}, "zh-CN")
+        )
+        == "en"
+    )
+    assert (
+        plugin_api._resolve_locale_from_request(_Request({"lang": "en-US"}, "zh-CN"))
+        == "en"
+    )
 
 
 def test_zh_hant_does_not_fall_back_to_simplified(plugin_api):
