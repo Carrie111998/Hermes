@@ -11,6 +11,24 @@ def teardown_function():
     terminal_tool._reset_cached_sudo_passwords()
 
 
+def test_remote_lifecycle_script_read_is_bounded():
+    commands = []
+
+    class FakeEnvironment:
+        def execute(self, command):
+            commands.append(command)
+            return {"returncode": 0, "output": "script text"}
+
+    result = terminal_tool._read_remote_script_bounded(
+        FakeEnvironment(),
+        "/remote/script.sh",
+        max_bytes=7,
+    )
+
+    assert result == "script text"
+    assert commands == ["head -c 8 -- /remote/script.sh"]
+
+
 def test_searching_for_sudo_does_not_trigger_rewrite(monkeypatch):
     monkeypatch.delenv("SUDO_PASSWORD", raising=False)
     monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)

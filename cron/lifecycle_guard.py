@@ -253,28 +253,28 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
-    """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
+def _read_referenced_script(path: Path) -> tuple[Optional[str], bool, bool]:
+    """Return ``(text, unsafe, remote_fallback_allowed)`` using bounded reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except (OSError, ValueError):
-        # OSError: unreadable / missing / over-long paths. ValueError: an
-        # embedded NUL byte in *path* itself — a binary's decoded bytes
-        # tokenized into a bogus script path by the recursion (#77703). A
-        # guarded read must never crash the guard, so treat either as
-        # "nothing to scan" (mirrors the resolve() ValueError guard below).
-        return None, False
+    except ValueError:
+        # POSIX paths cannot contain NUL. Such candidates only come from
+        # tokenizing binary content and must not reach a remote reader either.
+        return None, False, False
+    except OSError:
+        # A path that cannot be opened locally may live on a remote backend.
+        return None, False, True
     try:
         metadata = os.fstat(descriptor)
         if not stat.S_ISREG(metadata.st_mode):
-            return None, True
+            return None, True, False
         # Read a bounded chunk first — even for oversized files, the first
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
     except OSError:
-        return None, False
+        return None, False, False
     finally:
         os.close(descriptor)
     # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
@@ -284,10 +284,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
     # executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
-        return None, False
+        return None, False, False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
-        return None, True
-    return data.decode("utf-8", errors="replace"), False
+        return None, True, False
+    return data.decode("utf-8", errors="replace"), False, False
 
 
 def _contains_unsafe_gateway_action(
@@ -326,12 +326,30 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe, remote_fallback_allowed = _read_referenced_script(
+            script_path
+        )
         if unsafe:
             return True
-        if script_text is None and read_remote_script is not None:
+        if (
+            script_text is None
+            and remote_fallback_allowed
+            and read_remote_script is not None
+        ):
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            # Apply the local reader's binary and size policy to remote
+            # content before recursive tokenization. This prevents a remote
+            # executable from feeding machine code or unbounded text into the
+            # lifecycle regex/path walk.
+            if script_text and "\x00" in script_text:
+                continue
+            if (
+                script_text
+                and len(script_text.encode("utf-8", errors="replace"))
+                > _MAX_REFERENCED_SCRIPT_BYTES
+            ):
+                return True
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
@@ -392,7 +410,7 @@ def _read_script_for_scanning(script_path: str) -> str:
     sentinel, while missing/unreadable paths remain empty so ordinary scheduler
     path validation can report them.
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
+    script_text, unsafe, _ = _read_referenced_script(_resolve_script_path(script_path))
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""

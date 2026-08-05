@@ -81,6 +81,24 @@ from tools.tool_backend_helpers import (
 )
 
 
+def _read_remote_script_bounded(
+    env: Any,
+    script_path: str,
+    *,
+    max_bytes: int,
+) -> Optional[str]:
+    """Read at most ``max_bytes + 1`` from a remote terminal environment."""
+    try:
+        result = env.execute(
+            f"head -c {max_bytes + 1} -- {shlex.quote(script_path)}"
+        )
+        if result.get("returncode", -1) == 0:
+            return result.get("output", "")
+    except Exception:
+        pass
+    return None
+
+
 def _safe_parse_import_env(
     name: str,
     default: Any,
@@ -2532,7 +2550,7 @@ def terminal_tool(
 
                 For local backends the script path is on the host filesystem. For
                 SSH/Modal/Daytona the same path is remote; the local read misses, so we
-                fall back to ``env.execute('cat ...')``.
+                fall back to a bounded read through ``env.execute``.
                 """
                 if env is None:
                     return None
@@ -2556,19 +2574,14 @@ def terminal_tool(
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
-                # Remote / sandboxed backend: read via the environment's shell.
-                try:
-                    result = env.execute(f"cat {shlex.quote(script_path)}")
-                    if result.get("returncode", -1) == 0:
-                        output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote `cat`: skip for the
-                            # same reason as the local branch above (#77703).
-                            return None
-                        return output
-                except Exception:
-                    pass
-                return None
+                # Remote / sandboxed backend: read a bounded prefix via the
+                # environment's shell. The guard detects NUL and oversized
+                # text before recursive scanning.
+                return _read_remote_script_bounded(
+                    env,
+                    script_path,
+                    max_bytes=1024 * 1024,
+                )
 
             if contains_gateway_lifecycle_command_or_referenced_script(
                 command,

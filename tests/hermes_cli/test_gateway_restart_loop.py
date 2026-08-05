@@ -705,9 +705,12 @@ class TestLifecycleGuardModule:
 
         from cron.lifecycle_guard import _read_referenced_script
 
-        text, unsafe = _read_referenced_script(Path("/tmp/hermes\x00binary"))
+        text, unsafe, remote_fallback_allowed = _read_referenced_script(
+            Path("/tmp/hermes\x00binary")
+        )
         assert text is None
         assert unsafe is False
+        assert remote_fallback_allowed is False
 
     def test_remote_read_fallback_binary_does_not_crash_guard(self):
         """#77703: in the gateway the referenced-script walk carries a
@@ -735,6 +738,117 @@ class TestLifecycleGuardModule:
             read_remote_script=_remote_read,
         )
         assert result is False
+
+    def test_local_binary_does_not_fall_back_to_remote_reader(self, tmp_path):
+        """A local NUL-bearing executable is present, not remotely missing."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        executable = tmp_path / "large-tool"
+        executable.write_bytes(b"\x7fELF\x00" + b"x" * (1024 * 1024))
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(executable),
+            read_remote_script=lambda path: (
+                remote_reads.append(path) or "hermes gateway restart"
+            ),
+        )
+
+        assert result is False
+        assert remote_reads == []
+
+    def test_missing_local_script_still_uses_remote_reader(self, tmp_path):
+        """Remote backends still scan scripts that are absent on the host."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing_script = tmp_path / "remote" / "restart.sh"
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing_script),
+            read_remote_script=lambda path: (
+                remote_reads.append(path) or "hermes gateway restart"
+            ),
+        )
+
+        assert result is True
+        assert remote_reads == [str(missing_script)]
+
+    def test_nul_bearing_candidate_neither_crashes_nor_uses_remote_reader(self):
+        """Binary-tokenization junk cannot name a real local or remote path."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        remote_reads = []
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "sh foo\x00bar.sh",
+            cwd="/tmp",
+            read_remote_script=lambda path: remote_reads.append(path) or "",
+        )
+
+        assert result is False
+        assert remote_reads == []
+
+    def test_post_open_read_failure_does_not_use_remote_reader(
+        self, tmp_path, monkeypatch
+    ):
+        """An opened local path must never be reclassified as remotely missing."""
+        from cron import lifecycle_guard
+
+        script = tmp_path / "tool"
+        script.write_text("#!/bin/sh\n")
+        remote_reads = []
+
+        def fail_read(_descriptor, _size):
+            raise OSError("simulated read failure")
+
+        monkeypatch.setattr(lifecycle_guard.os, "read", fail_read)
+
+        result = lifecycle_guard.contains_gateway_lifecycle_command_or_referenced_script(
+            str(script),
+            read_remote_script=lambda path: (
+                remote_reads.append(path) or "hermes gateway restart"
+            ),
+        )
+
+        assert result is False
+        assert remote_reads == []
+
+    def test_remote_binary_content_is_not_scanned_as_a_script(self, tmp_path):
+        """Remote readers apply the same NUL-bearing binary policy as local reads."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing_binary = tmp_path / "remote" / "tool"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing_binary),
+            read_remote_script=lambda _path: b"\x7fELF\x00hermes gateway restart".decode(),
+        )
+
+        assert result is False
+
+    def test_oversized_remote_script_fails_closed(self, tmp_path):
+        """Remote readers cannot feed unbounded text into recursive scanning."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        missing_script = tmp_path / "remote" / "large.sh"
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            str(missing_script),
+            read_remote_script=lambda _path: "x" * (1024 * 1024 + 1),
+        )
+
+        assert result is True
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
@@ -841,7 +955,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         import tools.terminal_tool as tt
 
         # Path only exists on the remote backend; locally it is absent, so the
-        # guard must fall back to env.execute('cat ...') to scan it.
+        # guard must use a bounded env.execute read to scan it.
         script = "/remote/workspace/remote.sh"
         calls = []
 
@@ -850,7 +964,10 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             cwd = str(tmp_path)
             def execute(self, command, **kwargs):
                 calls.append(command)
-                if "cat" in command and "/remote/workspace/remote.sh" in command:
+                if (
+                    "head -c 1048577 --" in command
+                    and "/remote/workspace/remote.sh" in command
+                ):
                     return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
@@ -862,7 +979,7 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
-        assert any("cat" in c for c in calls)
+        assert any("head -c 1048577 --" in c for c in calls)
 
 
 class TestCronCreateLifecycleBlockExtra:
