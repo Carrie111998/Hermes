@@ -1049,6 +1049,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        # Auto-join: when a configured user enters a configured voice channel,
+        # the bot hops in with them. Restarts on leave. Off by default.
+        # NOTE: original scaffolding by Sherlock — Newton to flesh out.
+        self._voice_autojoin_cfg: Dict[str, Any] = self._load_voice_autojoin_config()
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -1360,25 +1364,101 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
-                # Only track channels where the bot is connected
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
+                """Track voice channel join/leave events + drive auto-join."""
                 guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
                 # Ignore the bot itself
                 if member == adapter_self._client.user:
                     return
 
                 joined = before.channel is None and after.channel is not None
+                # In discord.py, a disconnected user has ``after.channel None``;
+                # a moved user has both non-None.
                 left = before.channel is not None and after.channel is None
                 switched = (
                     before.channel is not None
                     and after.channel is not None
                     and before.channel != after.channel
                 )
+
+                bot_already_in_guild = guild_id in adapter_self._voice_clients
+
+                cfg = getattr(adapter_self, "_voice_autojoin_cfg", {}) or {}
+                aj_enabled = bool(cfg.get("enabled"))
+                aj_user_id = str(cfg.get("user_id") or "")
+                aj_channel_id = str(cfg.get("channel_id") or "")
+                aj_text_channel_id = str(cfg.get("text_channel_id") or "")
+
+                # ----------------------------------------------------------------
+                # Auto-join: configured user enters the configured channel.
+                # ----------------------------------------------------------------
+                # TODO(Newton): flesh out the following scaffolding.
+                # Known issues from the prior attempt that need attention:
+                #  1. The source dict we hand to ``join_voice_channel`` must be
+                #     a valid SessionSource.to_dict() shape — the downstream
+                #     handler in gateway/run.py calls ``SessionSource.from_dict``
+                #     which KeyErrors on missing 'platform'/'chat_id' fields.
+                #  2. When the bot is already connected to a DIFFERENT channel
+                #     in the same guild, ``join_voice_channel`` calls
+                #     ``vc.move_to`` — that's fine, but make sure the
+                #     text_channel_id binding survives the move.
+                #  3. Consider debouncing join/leave if the user rapidly hops
+                #     between channels; the current code fires on every event.
+                #  4. The auto-leave branch only fires when the bot is the
+                #     SOLE human in the channel. If multiple humans are present
+                #     and the configured user leaves, the bot stays. That may
+                #     be intentional — confirm with the user.
+                # ----------------------------------------------------------------
+                if (
+                    aj_enabled
+                    and aj_user_id
+                    and aj_channel_id
+                    and str(member.id) == aj_user_id
+                    and after.channel is not None
+                    and str(after.channel.id) == aj_channel_id
+                ):
+                    # Avoid join-loop if we're already in that channel.
+                    vc = adapter_self._voice_clients.get(guild_id)
+                    if vc is None or vc.channel is None or vc.channel.id != after.channel.id:
+                        try:
+                            text_ch_id = int(aj_text_channel_id) if aj_text_channel_id else None
+                            logger.info(
+                                "Auto-join: user %s (%d) entered configured VC #%s in guild %d",
+                                member.display_name, member.id, after.channel.name, guild_id,
+                            )
+                            await adapter_self.join_voice_channel(
+                                after.channel,
+                                text_channel_id=text_ch_id,
+                                source={"trigger": "autojoin", "user_id": str(member.id)},
+                            )
+                        except Exception as e:
+                            logger.warning("Auto-join failed: %s", e)
+
+                # Auto-leave: that user leaves the configured channel and we're
+                # still in it. Don't drop the call if other humans are still in.
+                if (
+                    aj_enabled
+                    and aj_user_id
+                    and aj_channel_id
+                    and str(member.id) == aj_user_id
+                    and left
+                    and bot_already_in_guild
+                ):
+                    vc = adapter_self._voice_clients.get(guild_id)
+                    if vc is not None and vc.channel is not None and str(vc.channel.id) == aj_channel_id:
+                        # Only leave if the triggering user is the last human in
+                        # the channel — leaving while others are still there is
+                        # surprising. The configured user is the canonical
+                        # "alone" trigger.
+                        humans = [m for m in vc.channel.members if not m.bot]
+                        if len(humans) == 0:
+                            try:
+                                logger.info(
+                                    "Auto-leave: user %s (%d) left configured VC in guild %d",
+                                    member.display_name, member.id, guild_id,
+                                )
+                                await adapter_self.leave_voice_channel(guild_id)
+                            except Exception as e:
+                                logger.warning("Auto-leave failed: %s", e)
 
                 if joined or left or switched:
                     logger.info(
@@ -4025,6 +4105,35 @@ class DiscordAdapter(BasePlatformAdapter):
                         defaults[k] = v
         except Exception as e:
             logger.debug("Could not load discord.voice_fx config: %s", e)
+        return defaults
+
+    def _load_voice_autojoin_config(self) -> Dict[str, Any]:
+        """Auto-join voice channel when a specific user enters it.
+
+        Settings live under ``discord.voice.autojoin`` in config.yaml. The
+        feature is OFF by default and only triggers when ``enabled`` is true.
+        ``user_id`` and ``channel_id`` are Discord snowflake IDs (int strings).
+        ``text_channel_id`` is optional — when set, voice transcriptions route
+        to that text channel without requiring a separate ``/voice join``.
+
+        Returns a dict with safe defaults so callers never KeyError.
+        """
+        defaults: Dict[str, Any] = {
+            "enabled": False,
+            "user_id": "",          # Discord user snowflake (as string)
+            "channel_id": "",       # Discord voice channel snowflake (as string)
+            "text_channel_id": "",  # optional text channel for transcriptions
+        }
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            aj = ((cfg.get("discord") or {}).get("voice") or {}).get("autojoin")
+            if isinstance(aj, dict):
+                for k, v in aj.items():
+                    if k in defaults and v is not None:
+                        defaults[k] = v
+        except Exception as e:
+            logger.debug("Could not load discord.voice.autojoin config: %s", e)
         return defaults
 
     def _load_discord_int_config(self, key: str, default: int, *, minimum: int = 0) -> int:
