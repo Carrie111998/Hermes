@@ -217,14 +217,63 @@ def test_sensitive_env_files_hidden_from_listing(forced_files_client):
     assert ".env.prod" not in names
 
 
+def test_listing_skips_dangling_symlink_without_failing(local_files_client, tmp_path):
+    """An unavailable external volume behind one home symlink must not make
+    the entire Files page fail. Preserve the symlink and list other entries.
+    """
+    client, home = local_files_client
+    regular = home / "available.txt"
+    regular.write_text("available")
+    dangling = home / "Downloads"
+    dangling.symlink_to(tmp_path / "unmounted-volume", target_is_directory=True)
+
+    listing = client.get("/api/files")
+
+    assert listing.status_code == 200
+    names = [entry["name"] for entry in listing.json()["entries"]]
+    assert "available.txt" in names
+    assert "Downloads" not in names
 
 
+def test_home_credential_directories_are_hidden_and_blocked(local_files_client):
+    client, home = local_files_client
+    blocked_paths = [
+        home / ".ssh",
+        home / ".aws",
+        home / ".gnupg",
+        home / ".kube",
+        home / ".docker",
+        home / ".azure",
+        home / ".config" / "gh",
+        home / ".config" / "gcloud",
+        home / ".mcp-auth",
+    ]
+    for directory in blocked_paths:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "credential").write_text("secret", encoding="utf-8")
 
+    response = client.get("/api/files", params={"path": str(home)})
 
-
-
-
-
+    assert response.status_code == 200
+    names = {entry["name"] for entry in response.json()["entries"]}
+    assert names.isdisjoint(
+        {".ssh", ".aws", ".gnupg", ".kube", ".docker", ".azure", ".mcp-auth"}
+    )
+    for directory in (home / ".ssh", home / ".config" / "gh"):
+        listing = client.get("/api/files", params={"path": str(directory)})
+        assert listing.status_code == 200
+        assert listing.json()["entries"] == []
+        credential = directory / "credential"
+        assert (
+            client.get("/api/files/read", params={"path": str(credential)}).status_code
+            == 403
+        )
+        assert (
+            client.get(
+                "/api/files/download", params={"path": str(credential)}
+            ).status_code
+            == 403
+        )
 
 
 def test_other_credential_store_basenames_blocked(forced_files_client):

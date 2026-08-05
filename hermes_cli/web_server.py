@@ -310,7 +310,12 @@ def _get_pty_active_session_files(app: "FastAPI") -> dict[str, Path]:
         return app.state.pty_active_session_files
 
 
-app = FastAPI(title="Hermes Agent", version=__version__, lifespan=_lifespan)
+app = FastAPI(
+    title="Hermes Agent",
+    version=__version__,
+    lifespan=_lifespan,
+    docs_url="/api/docs",
+)
 
 # Memory-provider OAuth connect routes live in the memory layer, not here.
 from hermes_cli.memory_oauth import router as _memory_oauth_router  # noqa: E402
@@ -1801,6 +1806,38 @@ _SENSITIVE_MANAGED_DIR_NAMES = frozenset({
     "pairing",
 })
 
+# High-confidence OS and CLI credential trees under the user's home. Unlike
+# _SENSITIVE_MANAGED_DIR_NAMES these names are not globally blocked: a project
+# directory named ``.aws`` outside the home remains operator-browsable. Nested
+# entries are tuples so ``.config/gh`` does not hide unrelated ``gh`` folders.
+_SENSITIVE_HOME_CREDENTIAL_PATHS = frozenset({
+    (".ssh",),
+    (".aws",),
+    (".gnupg",),
+    (".kube",),
+    (".docker",),
+    (".azure",),
+    (".mcp-auth",),
+    (".config", "gh"),
+    (".config", "gcloud"),
+})
+
+
+def _is_sensitive_home_credential_path(path: Path) -> bool:
+    try:
+        relative_parts = tuple(
+            part.lower()
+            for part in path.resolve(strict=False)
+            .relative_to(Path.home().resolve(strict=False))
+            .parts
+        )
+    except (OSError, RuntimeError, ValueError):
+        return False
+    return any(
+        relative_parts[: len(protected)] == protected
+        for protected in _SENSITIVE_HOME_CREDENTIAL_PATHS
+    )
+
 
 def _is_sensitive_filename(name: str) -> bool:
     """Return True for a basename the managed-files API must never expose.
@@ -1841,6 +1878,8 @@ def _is_sensitive_path(path: Path) -> bool:
     scope for this fix.
     """
     if _is_sensitive_filename(path.name):
+        return True
+    if _is_sensitive_home_credential_path(path):
         return True
     return any(part.lower() in _SENSITIVE_MANAGED_DIR_NAMES for part in path.parts)
 
@@ -2360,11 +2399,19 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [
-            _managed_file_entry(policy, child)
-            for child in target.iterdir()
-            if not _is_sensitive_path(child)
-        ]
+        entries = []
+        for child in target.iterdir():
+            if _is_sensitive_path(child):
+                continue
+            try:
+                entries.append(_managed_file_entry(policy, child))
+            except HTTPException:
+                # Directory entries can disappear between iteration and stat,
+                # and home folders commonly contain symlinks to removable
+                # volumes. Omit an entry that cannot be resolved safely rather
+                # than failing the entire listing. Direct file endpoints retain
+                # their explicit errors.
+                continue
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
@@ -16621,14 +16668,35 @@ def _discover_dashboard_plugins() -> list:
                 # ``override`` to replace a built-in route, and ``hidden`` to
                 # register the plugin component/slots without adding a tab
                 # (useful for slot-only plugins like a header-crest injector).
+                from hermes_cli.dashboard_plugin_pages import safe_dashboard_plugin_tab_path
+
                 raw_tab = data.get("tab", {}) if isinstance(data.get("tab"), dict) else {}
+                raw_tab_path = raw_tab.get("path", f"/{name}")
+                safe_tab_path = safe_dashboard_plugin_tab_path(raw_tab_path)
+                if safe_tab_path is None:
+                    _log.warning(
+                        "Plugin %s: refusing unsafe dashboard tab path %r",
+                        name,
+                        raw_tab_path,
+                    )
+                    continue
                 tab_info = {
-                    "path": raw_tab.get("path", f"/{name}"),
+                    "path": safe_tab_path,
                     "position": raw_tab.get("position", "end"),
                 }
                 override_path = raw_tab.get("override")
-                if isinstance(override_path, str) and override_path.startswith("/"):
-                    tab_info["override"] = override_path
+                if override_path is not None:
+                    safe_override_path = safe_dashboard_plugin_tab_path(
+                        override_path, allow_builtin=True
+                    )
+                    if safe_override_path is None:
+                        _log.warning(
+                            "Plugin %s: refusing unsafe dashboard override path %r",
+                            name,
+                            override_path,
+                        )
+                        continue
+                    tab_info["override"] = safe_override_path
                 if bool(raw_tab.get("hidden")):
                     tab_info["hidden"] = True
                 # Slots: list of named slot locations this plugin populates.

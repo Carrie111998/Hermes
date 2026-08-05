@@ -551,6 +551,22 @@ class TestE2EDashboardPages:
         assert result["markdown"] == "[Open Sessions](http://127.0.0.1:9119/sessions)"
         assert "token" not in result["url"].lower()
 
+    def test_dashboard_tools_discover_and_link_active_extensions(
+        self, fake_mcp_server, _event_loop
+    ):
+        server, _ = fake_mcp_server
+
+        listed = _run_tool(server, "dashboard_pages_list", {"query": "kanban"})
+        linked = _run_tool(
+            server,
+            "dashboard_link_get",
+            {"page_id": "plugin-kanban"},
+        )
+
+        assert listed["pages"][0]["id"] == "plugin-kanban"
+        assert listed["pages"][0]["group"] == "extensions"
+        assert linked["url"] == "http://127.0.0.1:9119/kanban"
+
     def test_dashboard_link_get_rejects_unknown_page_and_hides_origin_argument(
         self, fake_mcp_server, _event_loop
     ):

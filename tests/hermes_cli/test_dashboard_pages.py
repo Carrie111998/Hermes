@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 import pytest
 
 
@@ -15,7 +18,36 @@ def test_dashboard_pages_are_unique_canonical_safe_routes():
     assert len(paths) == len(set(paths))
     assert all(path.startswith("/") for path in paths)
     assert all("?" not in path and "#" not in path and "\\" not in path for path in paths)
-    assert all(page["group"] in {"workspace", "automations", "integrations", "manage"} for page in pages)
+    assert all(
+        page["group"]
+        in {"workspace", "automations", "integrations", "manage", "extensions"}
+        for page in pages
+    )
+
+
+def test_canonical_manifest_matches_builtin_react_routes():
+    from hermes_cli.dashboard_pages import list_dashboard_pages
+
+    app_source = (
+        Path(__file__).resolve().parents[2] / "web" / "src" / "App.tsx"
+    ).read_text(encoding="utf-8")
+    route_block = re.search(
+        r"const BUILTIN_ROUTES_CORE:[^{]+\{(?P<body>.*?)\n\};",
+        app_source,
+        re.DOTALL,
+    )
+    assert route_block is not None
+    react_routes = set(
+        re.findall(r'^\s*"(/[^"]*)":', route_block.group("body"), re.MULTILINE)
+    )
+    discoverable_routes = (react_routes - {"/", "/profiles/new"}) | {"/chat"}
+    manifest_routes = {
+        page["path"]
+        for page in list_dashboard_pages()
+        if page["group"] != "extensions"
+    }
+
+    assert manifest_routes == discoverable_routes
 
 
 def test_dashboard_page_search_matches_id_label_description_and_group():

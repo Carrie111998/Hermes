@@ -927,6 +927,7 @@ const DASHBOARD_GROUP_LABELS: Record<DashboardPage["group"], string> = {
   automations: "Automations",
   integrations: "Integrations",
   manage: "Manage",
+  extensions: "Extensions",
 };
 
 export function DashboardContextSidebar({

@@ -189,10 +189,27 @@ _DASHBOARD_PAGES: Final[tuple[DashboardPage, ...]] = (
 _PAGE_BY_ID: Final = {page["id"]: page for page in _DASHBOARD_PAGES}
 
 
+def _all_dashboard_pages() -> tuple[DashboardPage, ...]:
+    try:
+        from hermes_cli.dashboard_plugin_pages import list_dashboard_plugin_pages
+
+        plugin_pages = list_dashboard_plugin_pages()
+    except Exception:
+        plugin_pages = []
+    builtin_ids = set(_PAGE_BY_ID)
+    builtin_paths = {page["path"] for page in _DASHBOARD_PAGES}
+    extensions = tuple(
+        page
+        for page in plugin_pages
+        if page["id"] not in builtin_ids and page["path"] not in builtin_paths
+    )
+    return _DASHBOARD_PAGES + extensions
+
+
 def list_dashboard_pages(query: str | None = None) -> list[DashboardPage]:
     """Return safe public page metadata, optionally filtered by free text."""
     needle = (query or "").strip().casefold()
-    pages = _DASHBOARD_PAGES
+    pages = _all_dashboard_pages()
     if needle:
         pages = tuple(
             page
@@ -215,7 +232,8 @@ def build_dashboard_link(
     HTTP(S) origin/path with no credentials, query, or fragment. Unknown page IDs
     are rejected instead of being interpolated into a path.
     """
-    page = _PAGE_BY_ID.get(page_id.strip().casefold())
+    pages_by_id = {page["id"]: page for page in _all_dashboard_pages()}
+    page = pages_by_id.get(page_id.strip().casefold())
     if page is None:
         raise KeyError(page_id)
 

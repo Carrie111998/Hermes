@@ -1344,7 +1344,7 @@ export interface AuthMeResponse {
 
 export interface DashboardPage {
   description: string;
-  group: "workspace" | "automations" | "integrations" | "manage";
+  group: "workspace" | "automations" | "integrations" | "manage" | "extensions";
   id: string;
   label: string;
   path: string;

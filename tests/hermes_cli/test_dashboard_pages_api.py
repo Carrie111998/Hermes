@@ -35,6 +35,18 @@ def test_dashboard_pages_endpoint_filters_pages(client):
     assert [page["id"] for page in response.json()["pages"]] == ["models"]
 
 
+def test_dashboard_pages_endpoint_includes_active_plugin_routes(client):
+    response = client.get("/api/dashboard/pages", params={"query": "kanban"})
+
+    assert response.status_code == 200
+    pages = response.json()["pages"]
+    assert len(pages) == 1
+    assert pages[0]["id"] == "plugin-kanban"
+    assert pages[0]["label"] == "Kanban"
+    assert pages[0]["path"] == "/kanban"
+    assert pages[0]["group"] == "extensions"
+
+
 def test_dashboard_theme_api_lists_all_studio_appearance_modes(client):
     response = client.get("/api/dashboard/themes")
 
@@ -43,6 +55,17 @@ def test_dashboard_theme_api_lists_all_studio_appearance_modes(client):
     assert themes["studio-system"]["label"] == "Hermes Studio — System"
     assert themes["studio-light"]["label"] == "Hermes Studio — Light"
     assert themes["studio-dark"]["label"] == "Hermes Studio — Dark"
+
+
+def test_dashboard_docs_deep_link_is_not_shadowed_by_swagger(client):
+    dashboard_docs = client.get("/docs")
+    api_docs = client.get("/api/docs")
+
+    assert dashboard_docs.status_code == 200
+    assert "Swagger UI" not in dashboard_docs.text
+    assert '<div id="root"></div>' in dashboard_docs.text
+    assert api_docs.status_code == 200
+    assert "Swagger UI" in api_docs.text
 
 
 def test_dashboard_pages_endpoint_requires_dashboard_auth():

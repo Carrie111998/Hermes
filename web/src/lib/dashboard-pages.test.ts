@@ -31,6 +31,20 @@ const pages: DashboardPage[] = [
     group: "integrations",
     description: "Tools",
   },
+  {
+    id: "plugin-kanban",
+    label: "Kanban",
+    path: "/kanban",
+    group: "extensions",
+    description: "Boards",
+  },
+  {
+    id: "plugin-achievements",
+    label: "Achievements",
+    path: "/achievements",
+    group: "extensions",
+    description: "Progress",
+  },
 ];
 
 describe("resolveDashboardContext", () => {
@@ -44,6 +58,16 @@ describe("resolveDashboardContext", () => {
 
   it("uses the longest parent route for nested pages", () => {
     expect(resolveDashboardContext(pages, "/mcp/catalog")?.active.id).toBe("mcp");
+  });
+
+  it("groups active plugin pages into extension context navigation", () => {
+    const context = resolveDashboardContext(pages, "/kanban");
+
+    expect(context?.group).toBe("extensions");
+    expect(context?.pages.map((page) => page.id)).toEqual([
+      "plugin-kanban",
+      "plugin-achievements",
+    ]);
   });
 
   it("suppresses the shell rail for chat and unknown pages", () => {
