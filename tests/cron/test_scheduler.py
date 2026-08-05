@@ -545,7 +545,7 @@ class TestRunJobSessionPersistence:
             "enabled": True,
         }
         with patch("cron.scheduler.get_due_jobs", return_value=[job]), patch(
-            "cron.scheduler.advance_next_run"
+            "cron.scheduler.advance_next_runs"
         ) as advance, patch("cron.scheduler.run_one_job") as run_one:
             assert tick(verbose=False, sync=True, can_dispatch=lambda: False) == 0
 
@@ -1149,12 +1149,20 @@ class TestBuildJobPromptBumpUse:
 
         with patch("tools.skills_tool.skill_view", side_effect=_skill_view), \
              patch("tools.skill_usage.bump_use") as mock_bump:
-            _build_job_prompt({"skills": ["alpha", "beta"], "prompt": "go"})
+            _build_job_prompt({
+                "id": "cron-task",
+                "skills": ["alpha", "beta"],
+                "prompt": "go",
+            })
 
         assert mock_bump.call_count == 2
         calls = [c[0][0] for c in mock_bump.call_args_list]
         assert "alpha" in calls
         assert "beta" in calls
+        assert all(
+            call.kwargs == {"task_id": "cron-task"}
+            for call in mock_bump.call_args_list
+        )
 
 
 class TestSendMediaViaAdapter:
@@ -1230,7 +1238,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
@@ -1275,7 +1283,7 @@ class TestParallelTick:
         ]
 
         with patch("cron.scheduler.get_due_jobs", return_value=jobs), \
-             patch("cron.scheduler.advance_next_run"), \
+             patch("cron.scheduler.advance_next_runs"), \
              patch("cron.scheduler.run_job", side_effect=mock_run_job), \
              patch("cron.scheduler.save_job_output", return_value="/tmp/out.md"), \
              patch("cron.scheduler._deliver_result", return_value=None), \
