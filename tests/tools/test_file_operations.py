@@ -673,3 +673,29 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_truncated_multibyte_sample_not_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # read_file samples with `head -c 1000`, which slices by BYTE. When
+        # byte 1000 cuts inside a multi-byte UTF-8 char, errors="replace"
+        # decoding yields exactly one synthetic trailing U+FFFD. That is a
+        # truncation artifact — the file itself is valid UTF-8 and must still
+        # read as text (CJK text hits this constantly: 3 bytes/char).
+        truncated_sample = ("火箭发动机液氧甲烷" * 60) + "火\ufffd"
+        assert ops._is_likely_binary("notes.txt", truncated_sample) is False
+
+    def test_real_byte_truncation_utf8_not_binary(self, tmp_path):
+        # E2E: reproduce read_file's sampling semantics on a real CJK file —
+        # take the first 1000 BYTES and decode with errors="replace" exactly
+        # like the terminal backend does. Byte 1000 lands mid-character here
+        # (3 bytes/char), so decoding yields a trailing U+FFFD that is a
+        # truncation artifact; the file itself is valid UTF-8 and must still
+        # read as text.
+        p = tmp_path / "中文.md"
+        p.write_text("液氧甲烷火箭发动机试车" * 100, encoding="utf-8")
+        sample = p.read_bytes()[:1000].decode("utf-8", errors="replace")
+        # Precondition: byte truncation really does produce a trailing U+FFFD
+        # on this file — otherwise the assertion below is vacuous.
+        assert sample.endswith("\ufffd")
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        assert ops._is_likely_binary(str(p), sample) is False
