@@ -142,6 +142,51 @@ def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) 
         logger.debug("session hygiene cooldown persist failed: %s", exc)
 
 
+def _handle_hygiene_worker_exception(
+    gateway: Any,
+    exc: BaseException,
+    session_id: str,
+    cooldown_seconds: float,
+    commit_fence: Any = None,
+    future: Any = None,
+    agent: Any = None,
+    cleanup_deferred: bool = False,
+) -> bool:
+    """Handle exceptions raised by the session-hygiene worker non-fatally.
+
+    System cancellation/exit signals (KeyboardInterrupt, CancelledError, SystemExit)
+    are re-raised so host shutdown proceeds. Worker runtime/timeout errors
+    record the failure cooldown, log a warning, and allow the gateway process to
+    continue without crashing. Returns True if handled non-fatally.
+    """
+    if commit_fence and hasattr(commit_fence, "revoke_commit_admission"):
+        try:
+            commit_fence.revoke_commit_admission()
+        except Exception:
+            pass
+
+    if future and agent and gateway and not cleanup_deferred:
+        defer = getattr(gateway, "_defer_agent_cleanup_until_future_done", None)
+        if callable(defer):
+            try:
+                defer(future, agent, context="session hygiene unwind")
+            except Exception:
+                pass
+
+    if isinstance(exc, (KeyboardInterrupt, asyncio.CancelledError, SystemExit)):
+        raise exc
+
+    if cooldown_seconds >= 0:
+        _record_hygiene_cooldown(gateway, session_id, cooldown_seconds)
+
+    logger.warning(
+        "Session hygiene compression encountered non-fatal error for session %s: %s; continuing without compression",
+        session_id,
+        exc,
+    )
+    return True
+
+
 def _status_template_to_regex(template: str) -> str:
     """Compile a compression status template constant into a regex source.
 
@@ -16957,25 +17002,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                                     "warning to user: %s",
                                                     _werr,
                                                 )
-                                            raise
-                                    except BaseException:
-                                        # #76354 F2: non-timeout unwind while the
-                                        # detached hygiene worker may still run —
-                                        # KeyboardInterrupt, task cancellation, or
-                                        # any unexpected error. Revoke commit
-                                        # admission (and release the worker's
-                                        # durable lease via the holder-qualified
-                                        # hook) BEFORE the host unwinds so the
-                                        # worker can never commit later.
-                                        _hyg_commit_fence.revoke_commit_admission()
-                                        if not _hyg_cleanup_deferred:
-                                            self._defer_agent_cleanup_until_future_done(
-                                                _hyg_future,
-                                                _hyg_agent,
-                                                context="session hygiene unwind",
-                                            )
-                                            _hyg_cleanup_deferred = True
-                                        raise
+                                    except BaseException as exc:
+                                        _handle_hygiene_worker_exception(
+                                            self,
+                                            exc,
+                                            session_id=session_entry.session_id,
+                                            cooldown_seconds=_hyg_failure_cooldown_seconds,
+                                            commit_fence=_hyg_commit_fence,
+                                            future=_hyg_future,
+                                            agent=_hyg_agent,
+                                            cleanup_deferred=_hyg_cleanup_deferred,
+                                        )
+                                        return
 
                                     # _compress_context ends the old session and creates
                                     # a new session_id.  Write compressed messages into
