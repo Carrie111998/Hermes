@@ -546,3 +546,19 @@ def test_insight_lifecycle_requires_evidence_for_validation(tmp_path):
     )
     assert out["status"] == "rejected"
     store.close()
+
+
+def test_fault_injection_keeps_state_machine_fail_closed(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    memory = store.remember("Seed belief for fault injection.")
+    with pytest.raises(ValueError, match="reason"):
+        store.revise_memory(memory["memory_id"], "replacement", reason="")
+    with pytest.raises(ValueError, match="not found"):
+        store.retract_memory(999999, reason="missing")
+    with pytest.raises(ValueError, match="memory_id or belief_id"):
+        store.belief_history()
+    # Compact smoke: exercise inserts after fail-closed guards.
+    for index in range(200):
+        store.remember(f"Smoke memory row {index} with unique content token {index}.")
+    assert store.stats()["count"] >= 200
+    store.close()
