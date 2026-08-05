@@ -6817,6 +6817,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 return thread
             except Exception as direct_error:
                 last_direct_error = direct_error
+                seed_msg = None
                 try:
                     seed_msg = await message.channel.send(
                         f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
@@ -6833,6 +6834,22 @@ class DiscordAdapter(BasePlatformAdapter):
                     return thread
                 except Exception as fallback_error:
                     last_fallback_error = fallback_error
+                    # The seed message announces "Thread created by Hermes"
+                    # *before* create_thread() is confirmed. When the thread
+                    # call then fails (commonly a Discord 429 on thread
+                    # creation), the announcement is left orphaned in the
+                    # channel with no thread behind it (#52422). The retry loop
+                    # runs this handler once per attempt, so each attempt's own
+                    # seed is cleaned up rather than only the last one.
+                    if seed_msg is not None:
+                        try:
+                            await seed_msg.delete()
+                        except Exception as cleanup_error:
+                            logger.debug(
+                                "[%s] Could not delete orphaned auto-thread seed message: %s",
+                                self.name,
+                                cleanup_error,
+                            )
                     if attempt == 0:
                         # Brief backoff before the second attempt — most failures
                         # in this path are transient connect errors that recover
