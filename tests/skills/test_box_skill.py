@@ -198,7 +198,7 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "active Hermes home" in ccg
     assert "~/.hermes/.env" not in ccg
     assert "Do you want me to create or open" in ccg
-    assert "I added the credentials" in ccg
+    assert "reply **“Done”**" in ccg
     assert "Do not tell the user to manually run Box CLI commands" in skill
     assert "automatically create and configure the App User" in ccg
     assert "uses POSIX shell syntax" in rest
@@ -213,7 +213,8 @@ def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
     assert "Always configure normal Hermes work as a dedicated App User" in ccg
     assert "it is not Hermes's runtime actor" in ccg
     assert "one App User per Hermes deployment or isolation boundary" in ccg
-    assert "current local computer user's signed-in Box browser session" in ccg
+    assert "use computer control to operate the signed-in browser" in ccg
+    assert "Hermes's computer-control capability" in ccg
     assert "If they decline, give this path with clickable links" in ccg
     assert "select **New App**" in ccg
     assert "https://app.box.com/developers/console/new" not in ccg
