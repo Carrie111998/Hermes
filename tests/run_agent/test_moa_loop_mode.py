@@ -830,6 +830,84 @@ def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
     assert captured["reasoning_config"] == expected_reasoning
 
 
+@pytest.mark.parametrize("provider", ["copilot", "github-copilot", "copilot-acp"])
+def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
+    monkeypatch, provider
+):
+    from agent import moa_loop
+
+    calls = []
+    agent = SimpleNamespace(_is_user_initiated_turn=True)
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+    )
+    monkeypatch.setattr(
+        moa_loop,
+        "call_llm",
+        lambda **kwargs: calls.append(kwargs) or _response("aggregator acted"),
+    )
+
+    facade = moa_loop.MoAChatCompletions("review", agent=agent)
+    prepared = {
+        "messages": [{"role": "user", "content": "question"}],
+        "aggregator": {"provider": provider, "model": "claude-sonnet-4.6"},
+        "aggregator_temperature": None,
+    }
+    request_headers = {"x-trace-id": "keep", "x-initiator": "agent"}
+
+    facade._call_prepared_aggregator(
+        prepared,
+        {"extra_headers": request_headers},
+    )
+    facade._call_prepared_aggregator(
+        prepared,
+        {"extra_headers": request_headers},
+    )
+
+    assert calls[0]["extra_headers"] == {
+        "x-trace-id": "keep",
+        "x-initiator": "user",
+    }
+    assert calls[1]["extra_headers"] == request_headers
+    assert request_headers == {"x-trace-id": "keep", "x-initiator": "agent"}
+    assert agent._is_user_initiated_turn is False
+
+
+def test_prepared_non_copilot_aggregator_preserves_request_headers(monkeypatch):
+    from agent import moa_loop
+
+    captured = {}
+    agent = SimpleNamespace(_is_user_initiated_turn=True)
+    request_headers = {"x-trace-id": "keep"}
+
+    monkeypatch.setattr(
+        moa_loop,
+        "_slot_runtime",
+        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+    )
+    monkeypatch.setattr(
+        moa_loop,
+        "call_llm",
+        lambda **kwargs: captured.update(kwargs) or _response("aggregator acted"),
+    )
+
+    facade = moa_loop.MoAChatCompletions("review", agent=agent)
+    facade._call_prepared_aggregator(
+        {
+            "messages": [{"role": "user", "content": "question"}],
+            "aggregator": {"provider": "openrouter", "model": "aggregator"},
+            "aggregator_temperature": None,
+        },
+        {"extra_headers": request_headers},
+    )
+
+    assert captured["extra_headers"] == request_headers
+    assert agent._is_user_initiated_turn is True
+
+
 
 
 

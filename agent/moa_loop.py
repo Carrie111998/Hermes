@@ -1717,7 +1717,20 @@ class MoAChatCompletions:
         max_tokens: Any = agg_kwargs.get("max_tokens")
         tools: Any = agg_kwargs.get("tools")
         extra_body: Any = agg_kwargs.get("extra_body")
+        extra_headers: Any = agg_kwargs.get("extra_headers")
         agg_runtime = _slot_runtime(aggregator)
+        _agent = getattr(self, "_agent", None)
+        from agent.auxiliary_client import _normalize_aux_provider
+
+        if (
+            _agent is not None
+            and getattr(_agent, "_is_user_initiated_turn", False)
+            and _normalize_aux_provider(str(agg_runtime.get("provider") or ""))
+            in ("copilot", "copilot-acp")
+        ):
+            extra_headers = dict(extra_headers or {})
+            extra_headers["x-initiator"] = "user"
+            _agent._is_user_initiated_turn = False
         try:
             from agent.agent_runtime_helpers import (
                 plan_cache_sections_for_destination,
@@ -1737,7 +1750,6 @@ class MoAChatCompletions:
             # Prepared-aggregator facades built via __new__ have no _agent;
             # getattr(self._agent, ...) raises and bool(None-agent) would
             # force False and suppress the planner's config fallback (#76085).
-            _agent = getattr(self, "_agent", None)
             _cache_disabled = (
                 getattr(_agent, "_cache_disabled", None)
                 if _agent is not None
@@ -1817,6 +1829,7 @@ class MoAChatCompletions:
             max_tokens=max_tokens,
             tools=tools,
             extra_body=agg_extra_body,
+            extra_headers=extra_headers,
             # Prepared requests must retain the acting aggregator's reasoning
             # policy exactly as the direct create() path does (#64187).
             reasoning_config=_aggregator_reasoning_config(aggregator),
