@@ -226,6 +226,7 @@ VALID_HOOKS: Set[str] = {
     # ``usage_extra`` — fired at the end of the /usage command render. Kwargs:
     #     provider, base_url, api_key, session_id. A plugin returns an extra
     #   section (string) appended after the account/credits blocks.
+    # Catalog + kwargs + return behavior: docs/plugins/hook-taxonomy.md
     "footer",
     "usage_extra",
 }
