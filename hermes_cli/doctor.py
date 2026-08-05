@@ -489,12 +489,31 @@ def run_doctor(args):
                 high = vuln_count.get("high", 0)
                 moderate = vuln_count.get("moderate", 0)
                 total = critical + high + moderate
+                # Check if .npmrc min-release-age cooldown would block the fix.
+                cooldown_note = ""
+                try:
+                    age_result = subprocess.run(
+                        ["npm", "config", "get", "min-release-age"],
+                        cwd=str(npm_dir),
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    age_str = age_result.stdout.strip()
+                    if age_str:
+                        cooldown_days = int(age_str)
+                        if cooldown_days > 0:
+                            cooldown_note = (
+                                f" — fixes published within the last {cooldown_days} days "
+                                "may be refused by .npmrc min-release-age — "
+                                "wait or update the lockfile directly"
+                            )
+                except (ValueError, subprocess.SubprocessError):
+                    pass
                 if total == 0:
                     check_ok(f"{label} deps", "(no known vulnerabilities)")
                 elif critical > 0 or high > 0:
                     check_warn(
                         f"{label} deps",
-                        f"({critical} critical, {high} high, {moderate} moderate — run: cd {npm_dir} && npm audit fix)"
+                        f"({critical} critical, {high} high, {moderate} moderate — run: cd {npm_dir} && npm audit fix{cooldown_note})"
                     )
                     issues.append(f"{label} has {total} npm vulnerability(ies)")
                 else:
