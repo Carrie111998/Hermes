@@ -3617,12 +3617,26 @@ def run_job(
                             pass
                     if _idle_secs >= _cron_inactivity_limit:
                         _inactivity_timeout = True
+                        # Request interrupt BEFORE shutting down the pool so the
+                        # running agent thread can see the flag and exit cleanly.
+                        # If the agent is stuck in a blocking tool call it may
+                        # not respond, but the shutdown(wait=True) below ensures
+                        # we don't return until the thread actually finishes.
+                        # See issue #79244.
+                        request_hard_interrupt(
+                            agent, "Cron job timed out (inactivity)"
+                        )
                         break
         except Exception:
             _cron_pool.shutdown(wait=False, cancel_futures=True)
             raise
         finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
+            # wait=True: block until the running future completes.  Combined
+            # with the interrupt signalled above, an agent that is between
+            # tool calls will check the flag at the next iteration boundary
+            # and exit promptly, instead of being silently left running
+            # behind a wait=False shutdown (#79244).
+            _cron_pool.shutdown(wait=True, cancel_futures=True)
 
         if _inactivity_timeout:
             # Build diagnostic summary from the agent's activity tracker.
@@ -3645,7 +3659,7 @@ def run_job(
                 _last_desc, _iter_n, _iter_max,
                 _cur_tool or "none",
             )
-            request_hard_interrupt(agent, "Cron job timed out (inactivity)")
+            # request_hard_interrupt was already called above before shutdown.
             raise TimeoutError(
                 f"Cron job '{job_name}' idle for "
                 f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
