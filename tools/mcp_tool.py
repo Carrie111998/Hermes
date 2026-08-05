@@ -6500,23 +6500,24 @@ def refresh_agent_mcp_tools(
     # Computed OUTSIDE the lock (get_tool_definitions can be slow); the diff and
     # publish below happen together in ONE critical section so two concurrent
     # callers can't torn-publish or compute overlapping ``added`` sets.
-    new_defs = list(
-        model_tools.get_tool_definitions(
-            enabled_toolsets=enabled,
-            disabled_toolsets=disabled,
-            quiet_mode=quiet_mode,
-        )
-        or []
+    new_defs, pre_assembly_names = model_tools.get_tool_definitions_with_meta(
+        enabled_toolsets=enabled,
+        disabled_toolsets=disabled,
+        quiet_mode=quiet_mode,
     )
+    new_defs = list(new_defs or [])
     new_names = {t["function"]["name"] for t in new_defs}
-    # Pre-assembly view of the SAME snapshot: get_tool_definitions restores
-    # model_tools._last_pre_assembly_tool_names on both the fresh-compute and
-    # cache-hit paths, so this always reflects the full granted set before
-    # tool_search assembly (description_only tools included). Published onto
-    # the agent atomically with the snapshot below — without this, a server
+    # Pre-assembly view of the SAME snapshot: get_tool_definitions_with_meta
+    # returns the pre-assembly names alongside the tools, so this reflects the
+    # full granted set before tool_search assembly (description_only tools
+    # included) WITHOUT re-reading the process-global. Reading
+    # model_tools._last_pre_assembly_tool_names after the call is the same
+    # cross-agent race class as #66826: a concurrent agent init / refresh can
+    # overwrite the global between the call and the read. Published onto the
+    # agent atomically with the snapshot below — without this, a server
     # registered AFTER agent_init (lazy refresh / /reload-mcp) would never
     # reach the system-prompt description_only inventory. (#66826)
-    new_pre_assembly = set(model_tools._last_pre_assembly_tool_names)
+    new_pre_assembly = set(pre_assembly_names)
 
     # Re-append the post-build injected families that get_tool_definitions does
     # NOT reproduce, so a refresh never strips them (memory-provider + context-

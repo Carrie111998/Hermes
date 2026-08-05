@@ -1,5 +1,6 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
+import contextlib
 import json
 
 import pytest
@@ -448,6 +449,31 @@ class TestPreAssemblyInventoryBinding:
             toolset=toolset,
         )
 
+    @staticmethod
+    def _deregister(name: str) -> None:
+        """Remove a tool registered by :meth:`_register`.
+
+        Keeps the global tool registry clean across tests — the gottz_*
+        toolsets must not leak into other tests' assemblies (mirrors the
+        registry hygiene the MCP tests follow).
+        """
+        from tools.registry import registry
+
+        registry.deregister(name)
+
+    @contextlib.contextmanager
+    def _registered_gottz_tools(self):
+        """Register the two disjoint gottz toolsets used by the regression
+        tests, deregistering them in a ``finally`` so no registry entry leaks
+        even when the test body raises."""
+        self._register("gottz_agent_a_tool", "gottz-ts-a")
+        self._register("gottz_agent_b_tool", "gottz-ts-b")
+        try:
+            yield
+        finally:
+            self._deregister("gottz_agent_a_tool")
+            self._deregister("gottz_agent_b_tool")
+
     # These tests assemble with quiet_mode=True; keep the memoization cache
     # clean so they neither see nor leave cross-test state.
     @pytest.fixture(autouse=True)
@@ -464,30 +490,107 @@ class TestPreAssemblyInventoryBinding:
         process-global after B's call and got B's names (cross-agent race)."""
         import model_tools
 
-        self._register("gottz_agent_a_tool", "gottz-ts-a")
-        self._register("gottz_agent_b_tool", "gottz-ts-b")
+        with self._registered_gottz_tools():
+            # Agent A assembles its session (captures its pre-assembly inventory).
+            tools_a, pre_a = model_tools.get_tool_definitions_with_meta(
+                enabled_toolsets=["gottz-ts-a"], quiet_mode=True,
+            )
+            # Agent B interleaves with a different session config...
+            tools_b, pre_b = model_tools.get_tool_definitions_with_meta(
+                enabled_toolsets=["gottz-ts-b"], quiet_mode=True,
+            )
+            # ...and A's inventory must still be A's — the value came from A's
+            # own assembly result, not from a process-global B just overwrote.
+            assert "gottz_agent_a_tool" in pre_a
+            assert "gottz_agent_b_tool" not in pre_a
+            assert "gottz_agent_b_tool" in pre_b
+            assert "gottz_agent_a_tool" not in pre_b
+            # The visible post-assembly list, minus the bridge tools assembly
+            # itself synthesizes, is a subset of the pre-assembly inventory
+            # (assembly only defers granted tools behind tool_search/describe/
+            # call — it never invents a non-bridge tool).
+            _bridge = {"tool_search", "tool_describe", "tool_call"}
+            assert {t["function"]["name"] for t in tools_a} - _bridge <= set(pre_a)
+            assert {t["function"]["name"] for t in tools_b} - _bridge <= set(pre_b)
 
-        # Agent A assembles its session (captures its pre-assembly inventory).
-        tools_a, pre_a = model_tools.get_tool_definitions_with_meta(
-            enabled_toolsets=["gottz-ts-a"], quiet_mode=True,
-        )
-        # Agent B interleaves with a different session config...
-        tools_b, pre_b = model_tools.get_tool_definitions_with_meta(
-            enabled_toolsets=["gottz-ts-b"], quiet_mode=True,
-        )
-        # ...and A's inventory must still be A's — the value came from A's
-        # own assembly result, not from a process-global B just overwrote.
-        assert "gottz_agent_a_tool" in pre_a
-        assert "gottz_agent_b_tool" not in pre_a
-        assert "gottz_agent_b_tool" in pre_b
-        assert "gottz_agent_a_tool" not in pre_b
-        # The visible post-assembly list, minus the bridge tools assembly
-        # itself synthesizes, is a subset of the pre-assembly inventory
-        # (assembly only defers granted tools behind tool_search/describe/
-        # call — it never invents a non-bridge tool).
-        _bridge = {"tool_search", "tool_describe", "tool_call"}
-        assert {t["function"]["name"] for t in tools_a} - _bridge <= set(pre_a)
-        assert {t["function"]["name"] for t in tools_b} - _bridge <= set(pre_b)
+    def test_agent_init_binds_own_inventory_across_interleaved_inits(self):
+        """Agent-level regression for the GottZ race: two AIAgents with
+        disjoint toolsets init with interleaved assembly; each agent's
+        ``_pre_assembly_tool_names`` must be its own, never the other's.
+
+        Pre-fix, ``agent_init`` copied the inventory from the process-global
+        ``model_tools._last_pre_assembly_tool_names`` AFTER the tool-definition
+        call. The side_effect here simulates agent B's assembly overwriting
+        that global between agent A's call and the (pre-fix) read — a
+        reverted implementation therefore binds B's inventory to A and this
+        test fails RED. The fix binds the names returned by the call itself,
+        which the interleaved global write cannot touch.
+        """
+        import model_tools
+        from run_agent import AIAgent
+
+        def _defs(name):
+            return [{
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"desc for {name}",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            }]
+
+        def _meta_side_effect(enabled_toolsets=None, **kwargs):
+            if enabled_toolsets == ["gottz-ts-a"]:
+                # Agent B's assembly lands between agent A's call and the
+                # (pre-fix) read of the process-global: the global now holds
+                # B's inventory.
+                model_tools._last_pre_assembly_tool_names = ["gottz_agent_b_tool"]
+                return _defs("gottz_agent_a_tool"), ["gottz_agent_a_tool"]
+            return _defs("gottz_agent_b_tool"), ["gottz_agent_b_tool"]
+
+        saved_global = list(model_tools._last_pre_assembly_tool_names)
+        try:
+            with self._registered_gottz_tools():
+                with (
+                    patch(
+                        "run_agent.get_tool_definitions_with_meta",
+                        side_effect=_meta_side_effect,
+                    ),
+                    patch("run_agent.check_toolset_requirements", return_value={}),
+                    patch("run_agent.OpenAI"),
+                ):
+                    agent_a = AIAgent(
+                        api_key="test-key-1234567890",
+                        base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True,
+                        skip_context_files=True,
+                        skip_memory=True,
+                        enabled_toolsets=["gottz-ts-a"],
+                    )
+                    agent_b = AIAgent(
+                        api_key="test-key-1234567890",
+                        base_url="https://openrouter.ai/api/v1",
+                        quiet_mode=True,
+                        skip_context_files=True,
+                        skip_memory=True,
+                        enabled_toolsets=["gottz-ts-b"],
+                    )
+
+                # Each agent carries ONLY its own granted inventory — the
+                # interleaved second agent never leaks in.
+                assert "gottz_agent_a_tool" in agent_a._pre_assembly_tool_names
+                assert "gottz_agent_b_tool" not in agent_a._pre_assembly_tool_names
+                assert "gottz_agent_b_tool" in agent_b._pre_assembly_tool_names
+                assert "gottz_agent_a_tool" not in agent_b._pre_assembly_tool_names
+                # And each agent's visible tool list matches its own toolset.
+                a_names = {t["function"]["name"] for t in agent_a.tools}
+                b_names = {t["function"]["name"] for t in agent_b.tools}
+                assert "gottz_agent_a_tool" in a_names
+                assert "gottz_agent_a_tool" not in b_names
+                assert "gottz_agent_b_tool" in b_names
+                assert "gottz_agent_b_tool" not in a_names
+        finally:
+            model_tools._last_pre_assembly_tool_names = saved_global
 
     def test_cache_hit_returns_same_pre_assembly_names(self):
         """Cache semantics: a quiet_mode cache hit must hand back the same

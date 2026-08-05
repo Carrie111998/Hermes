@@ -32,10 +32,13 @@ def test_refresh_adds_late_landing_tools(monkeypatch):
     agent = _agent(["read_file", "terminal"])
 
     new_defs = [_tool(n) for n in ("read_file", "terminal", "mcp_granola_get_account_info")]
-    monkeypatch.setattr(mcp_tool, "get_tool_definitions", lambda **kw: new_defs, raising=False)
-    # get_tool_definitions is imported inside the helper from model_tools, so patch there too.
+    # refresh_agent_mcp_tools calls get_tool_definitions_with_meta (it needs
+    # the pre-assembly inventory alongside the defs), so patch that.
     import model_tools
-    monkeypatch.setattr(model_tools, "get_tool_definitions", lambda **kw: new_defs)
+    monkeypatch.setattr(
+        model_tools, "get_tool_definitions_with_meta",
+        lambda **kw: (new_defs, [t["function"]["name"] for t in new_defs]),
+    )
 
     added = mcp_tool.refresh_agent_mcp_tools(agent)
 
@@ -73,8 +76,11 @@ def test_refresh_preserves_memory_provider_and_context_engine_tools(monkeypatch)
     # The registry now ALSO has a newly-connected MCP tool, but does NOT contain
     # the memory/context tools (they're never in get_tool_definitions output).
     monkeypatch.setattr(
-        model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_new_server_tool")],
+        model_tools, "get_tool_definitions_with_meta",
+        lambda **kw: (
+            [_tool("read_file"), _tool("mcp_new_server_tool")],
+            ["read_file", "mcp_new_server_tool"],
+        ),
     )
 
     added = mcp_tool.refresh_agent_mcp_tools(agent)
@@ -102,8 +108,8 @@ def test_refresh_does_not_reinject_disabled_memory_provider_tools(monkeypatch):
     import model_tools
     monkeypatch.setattr(
         model_tools,
-        "get_tool_definitions",
-        lambda **kw: [_tool("read_file")],
+        "get_tool_definitions_with_meta",
+        lambda **kw: ([_tool("read_file")], ["read_file"]),
     )
 
     mcp_tool.refresh_agent_mcp_tools(agent)
@@ -124,8 +130,11 @@ def test_refresh_respects_context_engine_toolset_gate(monkeypatch):
 
     import model_tools
     monkeypatch.setattr(
-        model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_new_tool")],
+        model_tools, "get_tool_definitions_with_meta",
+        lambda **kw: (
+            [_tool("read_file"), _tool("mcp_new_tool")],
+            ["read_file", "mcp_new_tool"],
+        ),
     )
 
     mcp_tool.refresh_agent_mcp_tools(agent)
@@ -141,8 +150,11 @@ def test_refreshed_tool_is_callable_through_valid_tool_names_guard(monkeypatch):
 
     import model_tools
     monkeypatch.setattr(
-        model_tools, "get_tool_definitions",
-        lambda **kw: [_tool("read_file"), _tool("mcp_granola_list_meetings")],
+        model_tools, "get_tool_definitions_with_meta",
+        lambda **kw: (
+            [_tool("read_file"), _tool("mcp_granola_list_meetings")],
+            ["read_file", "mcp_granola_list_meetings"],
+        ),
     )
 
     # Before refresh the run loop would reject the call ("Tool does not exist").
@@ -174,10 +186,11 @@ def test_refresh_is_thread_safe_under_concurrent_calls(monkeypatch):
 
     def _gtd(**kw):
         with flip_lock:
-            return list(next(flip))
+            defs = list(next(flip))
+            return defs, [t["function"]["name"] for t in defs]
 
     import model_tools
-    monkeypatch.setattr(model_tools, "get_tool_definitions", _gtd)
+    monkeypatch.setattr(model_tools, "get_tool_definitions_with_meta", _gtd)
 
     errors = []
 
