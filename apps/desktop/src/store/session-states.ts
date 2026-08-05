@@ -610,9 +610,18 @@ export function focusOpenSession(storedSessionId: string): 'main' | 'tile' | nul
 
     if (group) {
       noteActiveTreeGroup(group.id)
+
+      return 'tile'
     }
 
-    return 'tile'
+    // Phantom tile: persisted as "open", but no pane exists even after a
+    // reveal (crash-stale storage — the layout tree was reset while the tile
+    // list survived). Claiming 'tile' here makes every open a dead click and
+    // keeps the actions menu suppressing "Open in new tab" forever. Drop the
+    // stale entry and report a miss so the caller opens the session for real.
+    discardSessionTile(storedSessionId)
+
+    return null
   }
 
   // Already the main session: front the workspace tab and drop tile focus so

@@ -226,4 +226,25 @@ describe('reopenLastClosedTile focuses the restored tab', () => {
     expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))?.active).toBe(tilePane('closed'))
     expect(tree.$activeTreeGroup.get()).toBe('grp-main')
   })
+
+  it('drops a phantom tile (persisted but pane-less) and reports a miss', async () => {
+    const { states, tree } = await setup()
+
+    // Simulate crash-stale storage: the tile list says "open", but the layout
+    // tree lost the pane (hard restart reset the tree; localStorage survived).
+    // Bypass closeSessionTile — that's the graceful path that keeps both in
+    // sync. Instead surgically remove the pane from the tree while leaving the
+    // $sessionTiles entry behind, exactly what a mid-write crash produces.
+    tree.removeTreePane(tilePane('closed'))
+    expect(states.$sessionTiles.get().some(t => t.storedSessionId === 'closed')).toBe(true)
+    expect(findGroupOfPane(tree.$layoutTree.get()!, tilePane('closed'))).toBeNull()
+
+    // Pre-fix this returned 'tile' (a dead click: nothing on screen to front,
+    // menu suppresses "Open in new tab" forever). It must be a miss...
+    expect(states.focusOpenSession('closed')).toBeNull()
+
+    // ...and self-heal: the phantom entry is gone, so the NEXT open works and
+    // the actions menu offers "Open in new tab" again.
+    expect(states.$sessionTiles.get().some(t => t.storedSessionId === 'closed')).toBe(false)
+  })
 })
