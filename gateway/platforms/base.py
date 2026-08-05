@@ -2626,7 +2626,14 @@ def _strip_media_directives(text: str) -> str:
     return _strip_media_tag_directives(text)
 
 
-class BasePlatformAdapter(ABC):
+from gateway.platforms.stream_rendering_mixin import StreamRenderingMixin
+from gateway.platforms.ephemeral_mixin import EphemeralMixin
+from gateway.platforms.prompt_formatting_mixin import PromptFormattingMixin
+from gateway.platforms.interactive_sends_mixin import InteractiveSendsMixin
+from gateway.platforms.voice_tts_mixin import VoiceTtsMixin
+
+
+class BasePlatformAdapter(StreamRenderingMixin, EphemeralMixin, PromptFormattingMixin, InteractiveSendsMixin, VoiceTtsMixin, ABC):
     """
     Base class for platform adapters.
     
@@ -3026,100 +3033,6 @@ class BasePlatformAdapter(ABC):
             f"{type(self).__name__} does not implement send_draft"
         )
 
-    # ── Structured stream-event rendering ────────────────────────────────
-    #
-    # These methods let an adapter decide *how* to present each structured
-    # streaming event (see gateway/stream_events.py).  The default
-    # implementations reproduce the historical behavior exactly: assistant
-    # text/commentary/segment events delegate to the stream consumer, and
-    # tool events render the same "emoji tool_name: preview" chrome the
-    # gateway has always produced.  Adapters override these to be more native
-    # to their platform (e.g. Telegram streaming a MarkdownV2 ```bash``` block
-    # as a draft; iMessage eating tool chrome it cannot format).
-    #
-    # The contract is presentation-only: nothing rendered here is persisted to
-    # conversation history.  History is owned by the agent; what an adapter
-    # chooses to "eat" must never change the bytes the agent stored.
-
-    def render_message_event(self, event: Any, sink: Any) -> None:
-        """Render a MessageChunk / MessageStop / Commentary onto the sink.
-
-        Default: map onto the stream consumer's existing primitives, preserving
-        today's behavior 1:1.  ``sink`` is a GatewayStreamConsumer.
-        """
-        from gateway.stream_events import MessageChunk, MessageStop, Commentary
-
-        if isinstance(event, MessageChunk):
-            if event.text:
-                sink.on_delta(event.text)
-        elif isinstance(event, MessageStop):
-            # An intermediate stop (text → tool → text) is a segment break;
-            # the terminal stop is signalled by the gateway via finish(),
-            # not here, so we only break segments on non-final stops.
-            if not event.final:
-                sink.on_segment_break()
-        elif isinstance(event, Commentary):
-            if event.text:
-                sink.on_commentary(event.text)
-
-    def format_tool_event(self, event: Any, *, mode: str = "all",
-                          preview_max_len: int = 40) -> Optional[str]:
-        """Return the rendered chrome for a ToolCallChunk, or None to eat it.
-
-        Reproduces the gateway's historical tool-progress formatting: an emoji
-        for the tool, the tool name, and a short argument preview (or the full
-        args dict in ``verbose`` mode).  Adapters that cannot render tool chrome
-        (no message editing, plain-text only) should override to return None so
-        the event is dropped rather than spamming separate bubbles.
-
-        ``mode`` is the resolved tool-progress mode ("all" / "new" / "verbose");
-        ``preview_max_len`` mirrors the ``tool_preview_length`` config (0 means
-        "no cap" in verbose mode).
-        """
-        from gateway.stream_events import ToolCallChunk
-        if not isinstance(event, ToolCallChunk):
-            return None
-
-        from agent.display import get_tool_emoji
-        emoji = get_tool_emoji(event.tool_name, default="⚙️")
-
-        if mode == "verbose":
-            if event.args:
-                import json
-                args_str = json.dumps(event.args, ensure_ascii=False, default=str)
-                if preview_max_len > 0 and len(args_str) > preview_max_len:
-                    args_str = args_str[:preview_max_len - 3] + "..."
-                return f"{emoji} {event.tool_name}({list(event.args.keys())})\n{args_str}"
-            if event.preview:
-                return f"{emoji} {event.tool_name}: \"{event.preview}\""
-            return f"{emoji} {event.tool_name}..."
-
-        # "all" / "new": short preview, capped (default 40 to keep gateway
-        # progress bubbles compact — they persist as permanent messages).
-        preview = event.preview
-        if preview:
-            from agent.display import prepare_tool_preview
-
-            cap = preview_max_len if preview_max_len > 0 else 40
-            prepared = prepare_tool_preview(
-                event.tool_name,
-                event.args,
-                fallback=preview,
-                max_len=cap,
-            )
-            rendered = self.format_tool_preview(prepared)
-            return f"{emoji} {event.tool_name}: \"{rendered}\""
-        return f"{emoji} {event.tool_name}..."
-
-    def format_tool_preview(self, preview: "ToolPreview") -> str:
-        """Apply platform-native formatting to a compact tool preview.
-
-        Most adapters only need the compact text. Rich-text adapters can use
-        the preview's explicit metadata to preserve details such as a URL that
-        was shortened for display.
-        """
-        return preview.text
-
     @property
     def has_fatal_error(self) -> bool:
         return self._fatal_error_message is not None
@@ -3135,21 +3048,6 @@ class BasePlatformAdapter(ABC):
     @property
     def fatal_error_retryable(self) -> bool:
         return self._fatal_error_retryable
-
-    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
-        """Whether auto-TTS on voice input should fire for ``chat_id``.
-
-        Decision layers (Issue #16007):
-          1. Explicit ``/voice on`` or ``/voice tts`` → always fire (even if
-             ``voice.auto_tts`` is False).
-          2. Explicit ``/voice off`` → never fire.
-          3. Fall back to the global ``voice.auto_tts`` config default.
-        """
-        if chat_id in self._auto_tts_enabled_chats:
-            return True
-        if chat_id in self._auto_tts_disabled_chats:
-            return False
-        return bool(self._auto_tts_default)
 
     def set_fatal_error_handler(self, handler: Callable[["BasePlatformAdapter"], Awaitable[None] | None]) -> None:
         self._fatal_error_handler = handler
@@ -3599,64 +3497,6 @@ class BasePlatformAdapter(ABC):
         """
         return False
 
-    def _get_ephemeral_system_ttl_default(self) -> int:
-        """Read ``display.ephemeral_system_ttl`` from config.
-
-        Returns the TTL in seconds to use when an :class:`EphemeralReply`
-        does not specify one explicitly.  ``0`` (the default) disables
-        auto-deletion.  Non-fatal if config is unreadable.
-        """
-        try:
-            from hermes_cli.config import load_config_readonly as _load_config
-        except Exception:
-            return 0
-        try:
-            cfg = _load_config()  # read-only: .get() only, never mutated
-        except Exception:
-            return 0
-        display = cfg.get("display", {}) if isinstance(cfg, dict) else {}
-        if not isinstance(display, dict):
-            return 0
-        raw = display.get("ephemeral_system_ttl", 0)
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return 0
-
-    def _schedule_ephemeral_delete(
-        self,
-        chat_id: str,
-        message_id: str,
-        ttl_seconds: int,
-    ) -> None:
-        """Spawn a detached task that deletes ``message_id`` after ``ttl_seconds``.
-
-        Best-effort — failures (gateway restart, permission denied, message
-        too old for Telegram's 48h window) are swallowed at debug level.
-        Does not block the caller.
-        """
-
-        async def _run_delete() -> None:
-            try:
-                await asyncio.sleep(max(1, int(ttl_seconds)))
-                await self.delete_message(chat_id=chat_id, message_id=message_id)
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                logger.debug(
-                    "[%s] Ephemeral delete failed for %s/%s: %s",
-                    self.name, chat_id, message_id, e,
-                )
-
-        coro = _run_delete()
-        try:
-            asyncio.create_task(coro)
-        except RuntimeError:
-            # No running loop (e.g. unit tests that never reach the async
-            # path).  Close the coroutine cleanly so Python doesn't warn
-            # about it never being awaited, then drop silently.
-            coro.close()
-
     # ── Shared interactive-prompt formatting cores ─────────────────────────
     # Template attrs for ``_format_exec_approval``. Adapters override these to
     # keep their historical, platform-specific wording byte-identical while
@@ -3670,206 +3510,6 @@ class BasePlatformAdapter(ABC):
         "\n\nSmart DENY: owner override applies to this one operation only."
     )
     _EA_CMD_BUDGET: int = 3000
-
-    @staticmethod
-    def _truncate_preview(text: str, budget: int, suffix: str = "...") -> str:
-        """Truncate ``text`` to ``budget`` chars, appending ``suffix`` when cut.
-
-        The shared ``x[:budget] + "..." if len(x) > budget else x`` idiom used
-        by every adapter's approval/confirm preview construction.
-        """
-        text = str(text or "")
-        return text[:budget] + suffix if len(text) > budget else text
-
-    def _ea_escape(self, text: str) -> str:
-        """Escape hook applied to the command preview and reason text.
-
-        Default is pass-through; HTML-mode platforms (Telegram) override.
-        """
-        return text
-
-    def _format_exec_approval(
-        self,
-        command: str,
-        description: str = "dangerous command",
-        smart_denied: bool = False,
-    ) -> str:
-        """Shared formatting core for exec-approval prompt text.
-
-        Assembles ``_EA_HEADER`` + fenced command preview (truncated to
-        ``_EA_CMD_BUDGET``) + ``_EA_REASON_LABEL`` + description, plus
-        ``_EA_SMART_DENY_LINE`` when ``smart_denied``. Button construction
-        stays platform-local; adapters with additional trailing instructions
-        (e.g. reaction legends) append them to this core.
-        """
-        cmd_preview = self._truncate_preview(str(command or ""), self._EA_CMD_BUDGET)
-        text = (
-            f"{self._EA_HEADER}"
-            f"{self._EA_CODE_OPEN}{self._ea_escape(cmd_preview)}{self._EA_CODE_CLOSE}"
-            f"{self._EA_REASON_LABEL}{self._ea_escape(description)}"
-        )
-        if smart_denied:
-            text += self._EA_SMART_DENY_LINE
-        return text
-
-    @staticmethod
-    def _format_choice_page(
-        options: list,
-        page: int,
-        per_page: int,
-    ) -> "tuple[list, Dict[str, Any]]":
-        """Shared pagination core for picker keyboards/menus.
-
-        Clamps ``page`` into range, slices ``options`` for that page and
-        returns ``(page_options, meta)`` where ``meta`` carries ``page``,
-        ``total_pages``, ``start``, ``end``, ``total`` and ``page_info`` —
-        the `` (N–M of T)`` suffix text (empty when everything fits on one
-        page). Option/button rendering stays platform-local.
-        """
-        total = len(options)
-        total_pages = max(1, (total + per_page - 1) // per_page)
-        page = max(0, min(page, total_pages - 1))
-        start = page * per_page
-        end = min(start + per_page, total)
-        page_info = f" ({start + 1}–{end} of {total})" if total_pages > 1 else ""
-        meta: Dict[str, Any] = {
-            "page": page,
-            "total_pages": total_pages,
-            "start": start,
-            "end": end,
-            "total": total,
-            "page_info": page_info,
-        }
-        return options[start:end], meta
-
-    async def send_slash_confirm(
-        self,
-        chat_id: str,
-        title: str,
-        message: str,
-        session_key: str,
-        confirm_id: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send a three-option slash-command confirmation prompt.
-
-        Used by the gateway's generic slash-confirm primitive (see
-        ``GatewayRunner._request_slash_confirm``) for commands that have a
-        non-destructive but expensive side effect the user should explicitly
-        acknowledge — the current caller is ``/reload-mcp``, which
-        invalidates the provider prompt cache.
-
-        Platforms with inline-button support (Telegram, Discord, Slack,
-        Matrix, Feishu) should override this to render three buttons:
-        Approve Once / Always Approve / Cancel.  Button callbacks MUST be
-        routed back through the gateway by calling
-        ``GatewayRunner._resolve_slash_confirm(confirm_id, choice)`` where
-        ``choice`` is ``"once"`` / ``"always"`` / ``"cancel"``.
-
-        Platforms without button UIs leave this as the default and fall
-        through to the gateway's text fallback (which sends ``message`` as
-        plain text and intercepts the next ``/approve`` / ``/always`` /
-        ``/cancel`` reply).
-
-        ``confirm_id`` is a short string generated by the gateway; the
-        adapter stores it alongside any platform-specific state needed to
-        route the callback (e.g. Telegram's ``_approval_state`` dict).
-        """
-        return SendResult(success=False, error="Not supported")
-
-    async def send_clarify(
-        self,
-        chat_id: str,
-        question: str,
-        choices: Optional[list],
-        clarify_id: str,
-        session_key: str,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send a clarify prompt to the user.
-
-        Two render modes:
-
-          * **Multiple choice** (``choices`` is a non-empty list) — adapters
-            that override this should render inline buttons (one per choice
-            plus a final "Other" / free-text option).  Button callbacks
-            MUST resolve via
-            ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, response)``
-            with the chosen string.  Picking the "Other" button calls
-            ``mark_awaiting_text(clarify_id)`` so the next message in the
-            session is captured as the response.
-
-          * **Open-ended** (``choices`` is None or empty) — render the
-            question as a plain text message; the next user message in the
-            session is captured by the gateway's text-intercept and
-            resolves the clarify automatically (see
-            ``GatewayRunner._maybe_intercept_clarify_text``).
-
-        The default implementation falls back to a numbered text list,
-        which works on every platform — the user replies with a number
-        ("2") or with the literal choice text, and the gateway intercepts
-        and resolves.  For the text fallback path, the default calls
-        ``mark_awaiting_text()`` so that the gateway text-intercept
-        (:meth:`GatewayRunner._maybe_intercept_clarify_text`) catches the
-        user's reply instead of timing out.
-        Adapters with native button UIs (Telegram, Discord) SHOULD
-        override this for a richer UX.
-        """
-        if choices:
-            # Multi-select clarifies register their flag on the pending entry;
-            # look it up by id so the signature stays adapter-compatible.
-            _is_multi = False
-            try:
-                from tools import clarify_gateway as _cg
-                with _cg._lock:
-                    _entry = _cg._entries.get(clarify_id)
-                _is_multi = bool(_entry and getattr(_entry, "multi_select", False))
-            except Exception:
-                _is_multi = False
-            lines = [f"❓ {question}", ""]
-            for i, choice in enumerate(choices, start=1):
-                lines.append(f"  {i}. {choice}")
-            lines.append("")
-            if _is_multi:
-                lines.append(
-                    "Multiple selections allowed — reply with the numbers "
-                    "separated by commas or spaces (e.g. \"1, 3\"), the option "
-                    "text, or your own answer."
-                )
-            else:
-                lines.append("Reply with the number, the option text, or your own answer.")
-            text = "\n".join(lines)
-            # Text fallback: enable text-capture so the gateway intercept
-            # picks up the user's typed reply (e.g. "2" or choice text).
-            from tools.clarify_gateway import mark_awaiting_text
-            mark_awaiting_text(clarify_id)
-        else:
-            text = f"❓ {question}"
-        return await self.send(
-            chat_id=chat_id,
-            content=text,
-            metadata=metadata,
-        )
-
-    async def send_private_notice(
-        self,
-        chat_id: str,
-        user_id: Optional[str],
-        content: str,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-    ) -> SendResult:
-        """Send a notice privately when the platform supports it.
-
-        The default implementation falls back to a normal send so callers can
-        use one code path across platforms.
-        """
-        return await self.send(
-            chat_id=chat_id,
-            content=content,
-            reply_to=reply_to,
-            metadata=metadata,
-        )
 
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
@@ -4059,66 +3699,6 @@ class BasePlatformAdapter(ABC):
         
         return images, cleaned
     
-    async def send_voice(
-        self,
-        chat_id: str,
-        audio_path: str,
-        caption: Optional[str] = None,
-        reply_to: Optional[str] = None,
-        metadata: Optional[Dict[str, Any]] = None,
-        **kwargs,
-    ) -> SendResult:
-        """
-        Send an audio file as a native voice message via the platform API.
-
-        Override in subclasses to send audio as voice bubbles (Telegram)
-        or file attachments (Discord). Default falls back to a friendly
-        notice — never echo the local audio_path into chat, since it is a
-        host filesystem path that would leak the Hermes home layout.
-        """
-        # audio_path is intentionally NOT included in the chat text — it is a
-        # host-local path that leaks filesystem layout. The path is logged for
-        # operator diagnostics instead.
-        logger.warning(
-            "[%s] send_voice fallback: native audio send unavailable for %s",
-            self.name, audio_path,
-        )
-        text = "⚠️ Couldn't deliver the audio attachment."
-        if caption:
-            text = f"{caption}\n{text}"
-        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
-
-    def prepare_tts_text(self, text: str) -> str:
-        """Prepare a spoken script for TTS.
-
-        Auto-TTS should not feed raw chat Markdown, ``<think>`` reasoning
-        blocks, or compact symbols to the speech provider.  It should receive
-        a transcript-like script: reasoning blocks removed, headings and
-        bullets flattened into sentence pauses, and units like ``°C``
-        expanded to words such as ``degrees Celsius``.
-        """
-        try:
-            from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=4000)
-        except Exception:
-            # Keep auto-TTS best-effort if the normalizer ever fails.
-            text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)
-            return re.sub(r'[*_`#\[\]()]', '', text)[:4000].strip()
-
-    async def play_tts(
-        self,
-        chat_id: str,
-        audio_path: str,
-        **kwargs,
-    ) -> SendResult:
-        """
-        Play auto-TTS audio for voice replies.
-
-        Override in subclasses for invisible playback (e.g. Web UI).
-        Default falls back to send_voice (shows audio player).
-        """
-        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
-
     # ------------------------------------------------------------------
     # Streaming TTS adapter contract (#60671)
     # ------------------------------------------------------------------
