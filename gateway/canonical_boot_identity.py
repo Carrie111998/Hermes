@@ -75,8 +75,14 @@ def _read_bounded_file(path: Path, *, systemd_credential: bool) -> bytes:
                 raise RuntimeError(
                     "runtime boot identity credential directory is unavailable"
                 ) from exc
-            effective_uid = os.geteuid()
-            effective_gid = os.getegid()
+            get_effective_uid = getattr(os, "geteuid", None)
+            get_effective_gid = getattr(os, "getegid", None)
+            if not callable(get_effective_uid) or not callable(get_effective_gid):
+                raise RuntimeError(
+                    "runtime boot identity credential metadata is unsupported"
+                )
+            effective_uid = get_effective_uid()
+            effective_gid = get_effective_gid()
             directory_owner = (directory.st_uid, directory.st_gid)
             file_owner = (observed.st_uid, observed.st_gid)
             allowed_owners = {
