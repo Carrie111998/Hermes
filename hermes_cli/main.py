@@ -2604,7 +2604,7 @@ def cmd_chat(args):
             print(f"Error: --query-file {query_file!r} exceeds {_MAX_QUERY_FILE_BYTES} bytes")
             sys.exit(2)
         try:
-            args.query = raw.decode("utf-8")
+            args.query = raw.decode("utf-8-sig")
         except UnicodeDecodeError as exc:
             print(f"Error: --query-file {query_file!r} is not valid UTF-8: {exc}")
             sys.exit(2)

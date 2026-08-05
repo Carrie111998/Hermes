@@ -191,6 +191,16 @@ class TestCmdChatQueryFile:
         assert exc_info.value.code == 2
         assert "exceeds" in capsys.readouterr().out
 
+    def test_utf8_bom_query_file_stripped(self, monkeypatch, tmp_path):
+        # Windows GUI editors can save a UTF-8 BOM; it must not leak into
+        # the prompt (CONTRIBUTING cross-platform rule #4).
+        query_file = tmp_path / "bom.txt"
+        query_file.write_bytes(b"\xef\xbb\xbfbom-prefixed prompt")
+        args = _build_chat_args(["chat", "--query-file", str(query_file)])
+        captured = {}
+        _run_cmd_chat(monkeypatch, args, captured)
+        assert captured["query"] == "bom-prefixed prompt"
+
     def test_query_file_with_resume(self, monkeypatch, tmp_path):
         # Query normalization runs before resume resolution; both must land.
         import hermes_cli.main as main_mod
