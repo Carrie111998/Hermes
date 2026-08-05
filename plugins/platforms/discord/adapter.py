@@ -8138,12 +8138,16 @@ class DiscordAdapter(BasePlatformAdapter):
         # Only live plain text messages use split-message batching. Recovery
         # candidates are already complete historical messages; coalescing them
         # would lose constituent IDs and make later restarts replay them.
+        is_supervisor_gate = self._is_supervisor_gate_event(event)
         if (
             not recovered
             and msg_type == MessageType.TEXT
             and self._text_batch_delay_seconds > 0
+            and not is_supervisor_gate
         ):
             self._enqueue_text_event(event)
+        elif is_supervisor_gate:
+            await self._dispatch_supervisor_gate_event(event)
         else:
             await self.handle_message(event)
         return True
@@ -8168,6 +8172,27 @@ class DiscordAdapter(BasePlatformAdapter):
             thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
             profile=event.source.profile,
         )
+
+    @staticmethod
+    def _is_supervisor_gate_event(event: MessageEvent) -> bool:
+        from gateway.kanban_proactive_supervisor import is_supervisor_gate_reply
+
+        return is_supervisor_gate_reply(
+            event.reply_to_text,
+            reply_to_is_own_message=event.reply_to_is_own_message,
+        )
+
+    async def _dispatch_supervisor_gate_event(self, event: MessageEvent) -> None:
+        """Dispatch a gate reply without allowing batching to erase its identity."""
+        key = self._text_batch_key(event)
+        prior_task = self._pending_text_batch_tasks.pop(key, None)
+        pending = self._pending_text_batches.pop(key, None)
+        if prior_task and not prior_task.done():
+            prior_task.cancel()
+            await asyncio.gather(prior_task, return_exceptions=True)
+        if pending is not None:
+            await self.handle_message(pending)
+        await self.handle_message(event)
 
     def _enqueue_text_event(self, event: MessageEvent) -> None:
         """Buffer a text event and reset the flush timer.

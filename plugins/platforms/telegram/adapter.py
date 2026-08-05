@@ -9762,14 +9762,29 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             quote = getattr(message, "quote", None)
             quote_text = getattr(quote, "text", None) if quote is not None else None
+            full_reply_text = (
+                message.reply_to_message.text
+                or message.reply_to_message.caption
+                or None
+            )
             if quote_text:
                 reply_to_text = quote_text
-            else:
-                reply_to_text = (
-                    message.reply_to_message.text
-                    or message.reply_to_message.caption
-                    or None
+                # Partial quotes are the right general context behavior, but
+                # the supervisor token is an authenticated control-plane
+                # capability. Preserve the full bot-authored prompt when the
+                # selected quote omits that token so the decision cannot fall
+                # through into an ordinary agent turn.
+                from gateway.kanban_proactive_supervisor import (
+                    is_supervisor_gate_reply,
                 )
+
+                if is_supervisor_gate_reply(
+                    full_reply_text,
+                    reply_to_is_own_message=reply_to_is_own_message,
+                ):
+                    reply_to_text = full_reply_text
+            else:
+                reply_to_text = full_reply_text
                 if not reply_to_text:
                     # Prefer Telegram's native rich-message echo when present;
                     # keep the local send-time index only as a fallback for

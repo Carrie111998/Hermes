@@ -152,6 +152,22 @@ def test_message_event_authenticates_reply_to_current_bot_identity():
     assert other_reply.reply_to_is_own_message is False
 
 
+def test_partial_quote_preserves_authenticated_supervisor_gate_marker():
+    adapter = _make_adapter()
+    message = _group_message("approve", reply_to_bot=True)
+    message.reply_to_message.text = (
+        "Decision needed\n[kanban-gate:0123456789abcdef0123456789abcdef]"
+    )
+    message.quote = SimpleNamespace(text="Decision needed")
+
+    event = adapter._build_message_event(message, MessageType.TEXT)
+
+    assert event.reply_to_is_own_message is True
+    assert "[kanban-gate:0123456789abcdef0123456789abcdef]" in (
+        event.reply_to_text or ""
+    )
+
+
 def _mention_entities(text, mentions):
     return [_mention_entity(text, mention) for mention in mentions]
 
