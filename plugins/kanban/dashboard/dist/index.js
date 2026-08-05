@@ -87,25 +87,31 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "completed_pending_review", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
+    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    completed_pending_review: "Pending Review",
+    review: "Review",
     done: "Done",
     archived: "Archived",
   };
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
+    scheduled: "Waiting for a scheduled follow-up time",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    completed_pending_review: "Worker exited without a terminal signal repeatedly; review then complete or block",
+    review: "Needs review before final closure",
     done: "Completed",
     archived: "Archived",
   };
@@ -154,9 +160,12 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
+    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    completed_pending_review: "hermes-kanban-dot-completed-pending-review",
+    review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -521,6 +530,7 @@
     const boardData = kanbanBoard;
     const setBoardData = setKanbanBoard;
     const [config, setConfig] = useState(null);
+    const [stats, setStats] = useState(null);
     const [loading, setLoading] = useState(true);
     const [error, setError] = useState(null);
 
@@ -583,6 +593,12 @@
         .finally(function () { setLoading(false); });
     }, [tenantFilter, includeArchived, board]);
 
+    const loadStats = useCallback(function () {
+      return SDK.fetchJSON(withBoard(`${API}/stats`, board))
+        .then(function (data) { setStats(data || null); })
+        .catch(function () { setStats(null); });
+    }, [board]);
+
     // --- load list of boards for the switcher ------------------------------
     const loadBoardList = useCallback(function () {
       return SDK.fetchJSON(withBoard(`${API}/boards`, board))
@@ -617,13 +633,14 @@
 
     useEffect(function () {
       loadBoard();
+      loadStats();
       return function () {
         if (reloadTimerRef.current) {
           clearTimeout(reloadTimerRef.current);
           reloadTimerRef.current = null;
         }
       };
-    }, [loadBoard]);
+    }, [loadBoard, loadStats]);
 
     // --- WebSocket ---------------------------------------------------------
     useEffect(function () {
@@ -1071,6 +1088,7 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(BoardStatsStrip, { stats: stats }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
@@ -1237,6 +1255,34 @@
             }),
           )
         : null,
+    );
+  }
+
+  function pct(n) {
+    const value = Number(n);
+    if (!Number.isFinite(value)) return "—";
+    return (value * 100).toFixed(1) + "%";
+  }
+
+  function BoardStatsStrip(props) {
+    const stats = props.stats || {};
+    if (!Object.prototype.hasOwnProperty.call(stats, "missing_exit_signal_24h")) {
+      return null;
+    }
+    const missing = Number(stats.missing_exit_signal_24h) || 0;
+    const ended = Number(stats.ended_runs_24h) || 0;
+    const rate = stats.missing_exit_signal_rate_24h;
+    return h("div", {
+      className: cn(
+        "hermes-kanban-stats-strip",
+        missing > 0 ? "hermes-kanban-stats-strip--warning" : "",
+      ),
+      title: "Tasks reconciled to pending review after repeated worker exits without kanban_complete or kanban_block in the last 24 hours.",
+    },
+      h("span", { className: "hermes-kanban-stats-label" }, "Missing-exit-signal 24h"),
+      h("span", { className: "hermes-kanban-stats-value" }, String(missing)),
+      h("span", { className: "hermes-kanban-stats-detail" },
+        `${pct(rate)} of ${ended} ended run${ended === 1 ? "" : "s"}`),
     );
   }
 
@@ -2721,6 +2767,7 @@
     ready:   { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
     running: { amber: 10 * 60,       red: 60 * 60 },
     blocked: { amber: 1 * 60 * 60,   red: 24 * 60 * 60 },
+    completed_pending_review: { amber: 24 * 60 * 60, red: 7 * 24 * 60 * 60 },
     todo:    { amber: 7 * 24 * 60 * 60, red: 30 * 24 * 60 * 60 },
   };
 
