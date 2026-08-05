@@ -1305,8 +1305,17 @@ def test_post_install_failure_recovery_requires_exact_live_artifacts(
         recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
-@pytest.mark.parametrize("failure_stage", ["start_gateway", "collect_native"])
-def test_later_native_failure_stages_remain_fail_closed(
+@pytest.mark.parametrize(
+    "failure_stage",
+    [
+        "refresh_external_iam",
+        "start_writer",
+        "start_gateway",
+        "collect_native",
+        "stop_services",
+    ],
+)
+def test_post_install_failure_recovery_requires_exact_live_artifacts_for_each_stage(
     recovery_tree: dict[str, Any],
     failure_stage: str,
 ) -> None:
@@ -1314,24 +1323,28 @@ def test_later_native_failure_stages_remain_fail_closed(
         recovery_tree,
         install_failure=True,
         post_install_failure_stage=failure_stage,
-        installed_live_artifacts=True,
         current_native_schema=True,
     )
 
     with pytest.raises(
-        ValueError,
-        match="native failure quarantine binding is invalid",
+        RuntimeError,
+        match="post-install native failure lacks installed artifacts",
     ):
         recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
-def test_start_writer_failure_rejects_preserved_native_stage(
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["start_writer", "start_gateway", "collect_native"],
+)
+def test_post_install_failure_rejects_preserved_native_stage(
     recovery_tree: dict[str, Any],
+    failure_stage: str,
 ) -> None:
     _write_failed_native_bundle(
         recovery_tree,
         install_failure=True,
-        post_install_failure_stage="start_writer",
+        post_install_failure_stage=failure_stage,
         installed_live_artifacts=True,
         current_native_schema=True,
     )
@@ -1348,13 +1361,18 @@ def test_start_writer_failure_rejects_preserved_native_stage(
         recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
+@pytest.mark.parametrize("failure_stage", ["install", "start_gateway"])
 def test_install_failure_recovery_archives_exact_live_artifacts_and_reloads(
     recovery_tree: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
 ) -> None:
     _write_failed_native_bundle(
         recovery_tree,
         install_failure=True,
+        post_install_failure_stage=(
+            None if failure_stage == "install" else failure_stage
+        ),
         installed_live_artifacts=True,
     )
     before = [{

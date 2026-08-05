@@ -12,6 +12,7 @@ failed liveness evidence.
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import signal
 import stat
@@ -572,7 +573,16 @@ def main() -> int:
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        print("writer-only gateway failed closed", file=sys.stderr)
+        message = f"{type(exc).__name__}:{exc}".encode(
+            "utf-8",
+            errors="replace",
+        )
+        print(
+            "writer-only gateway failed closed "
+            f"error_type={type(exc).__name__} "
+            f"error_sha256={hashlib.sha256(message).hexdigest()}",
+            file=sys.stderr,
+        )
         return 1
 
 
