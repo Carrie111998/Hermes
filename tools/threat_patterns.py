@@ -177,7 +177,9 @@ _EMOJI_ZWJ_NEIGHBOR_RANGES = (
     (0x1F1E6, 0x1F1FF),
     (0x20E3, 0x20E3),
 )
-_EMOJI_VARIATION_SELECTOR_CP = 0xFE0F  # VS16 (emoji presentation)
+# Variation selectors that may sit between an emoji base and a U+200D joiner:
+# VS15 (U+FE0E, text presentation) and VS16 (U+FE0F, emoji presentation).
+_EMOJI_VARIATION_SELECTORS = frozenset({0xFE0E, 0xFE0F})
 
 
 def _is_emoji_zwj_neighbor(ch: str) -> bool:
@@ -190,18 +192,18 @@ def is_zwj_in_emoji_sequence(content: str, idx: int) -> bool:
     """True when the U+200D at *idx* is part of an emoji ZWJ sequence.
 
     Mirrors tools/cronjob_tools.py: a ZWJ only counts as an emoji sequence
-    member when it joins emoji bases on BOTH sides, after skipping an
-    optional VS16 (U+FE0F) on either side. ``A\\u200d🏄`` or ``🏄\\u200dA``
-    have an emoji on only one side and are NOT legitimate sequences — they
-    are still flagged as potential injections.
+    member when it joins emoji bases on BOTH sides, after skipping optional
+    variation selectors VS15 (U+FE0E) / VS16 (U+FE0F) on either side.
+    ``A\\u200d🏄`` or ``🏄\\u200dA`` have an emoji on only one side and are
+    NOT legitimate sequences — they are still flagged as potential injections.
 
     Shared with skills_guard.py so both scanners apply the same rule.
     """
     left = idx - 1
-    while left >= 0 and ord(content[left]) == _EMOJI_VARIATION_SELECTOR_CP:
+    while left >= 0 and ord(content[left]) in _EMOJI_VARIATION_SELECTORS:
         left -= 1
     right = idx + 1
-    while right < len(content) and ord(content[right]) == _EMOJI_VARIATION_SELECTOR_CP:
+    while right < len(content) and ord(content[right]) in _EMOJI_VARIATION_SELECTORS:
         right += 1
     return (
         left >= 0
