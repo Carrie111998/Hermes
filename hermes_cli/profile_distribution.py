@@ -591,7 +591,20 @@ def _replace_directory_atomic(
 
         # Step 2: if an existing destination exists, move it aside to backup
         if dest.exists():
-            os.replace(dest, backup_dir)
+            # This touches the potentially locked existing profile tree, so it
+            # can still fail on a transient WinError (a file handle held
+            # briefly by an antivirus/indexer).  Apply the same bounded
+            # retry/backoff used for the rename-into-place below.
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    os.replace(dest, backup_dir)
+                    break
+                except OSError:
+                    if attempt < max_attempts - 1:
+                        time.sleep(0.1)
+                    else:
+                        raise
 
         # Step 3: move the new content into place
         # On Windows, retry a few times for transient handle locks
