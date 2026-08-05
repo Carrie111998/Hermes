@@ -7,6 +7,7 @@ Short tokens (< 18 chars) are fully masked. Longer tokens preserve
 the first 6 and last 4 characters for debuggability.
 """
 
+import json
 import logging
 import os
 import re
@@ -877,6 +878,118 @@ def redact_sensitive_text(
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+_KOREAN_RESIDENT_NUMBER_RE = re.compile(
+    r"(?<!\d)\d{6}[- ]?[1-4]\d{6}(?!\d)"
+)
+_PHONE_NUMBER_RE = re.compile(
+    r"(?<!\d)(?:01[016789][-. ]?\d{3,4}[-. ]?\d{4}|"
+    r"\+\d{1,3}[-. ]?(?:\d{2,4}[-. ]?){2}\d{3,4})(?!\d)"
+)
+_EMAIL_ADDRESS_RE = re.compile(
+    r"(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@"
+    r"[A-Za-z0-9.-]+\.[A-Za-z]{2,}(?![A-Za-z0-9.-])"
+)
+_CLIENT_CONTEXT_RE = re.compile(
+    r"\b(?:client|customer)\b|(?:고객|클라이언트)", re.IGNORECASE
+)
+_BUSINESS_DETAIL_RE = re.compile(
+    r"\b(?:contract|contact|deadline|cost|price|quote|budget)\b|"
+    r"(?:계약|연락처|마감|납기|비용|견적)",
+    re.IGNORECASE,
+)
+_SENSITIVE_METADATA_VALUES = frozenset(
+    {"sensitive", "confidential", "restricted", "secret", "private"}
+)
+
+
+def _message_has_sensitive_metadata(message: object) -> bool:
+    if not isinstance(message, dict):
+        return False
+    containers = [message]
+    for key in ("metadata", "annotations"):
+        nested = message.get(key)
+        if isinstance(nested, dict):
+            containers.append(nested)
+    for container in containers:
+        for key in ("sensitive", "contains_sensitive_data"):
+            if container.get(key) is True:
+                return True
+        for key in ("classification", "sensitivity", "data_classification"):
+            value = container.get(key)
+            if isinstance(value, str) and value.strip().casefold() in _SENSITIVE_METADATA_VALUES:
+                return True
+    return False
+
+
+def classify_sensitive_fallback_context(
+    messages: object,
+    *,
+    explicit_markers: object = None,
+    sensitive_path_prefixes: object = None,
+) -> tuple[str, str] | None:
+    """Classify fallback context locally, returning only safe reason codes."""
+    if isinstance(messages, list) and any(
+        _message_has_sensitive_metadata(message) for message in messages
+    ):
+        return ("explicit_marker", "message_metadata")
+
+    text = json.dumps(
+        messages if messages is not None else [],
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    folded = text.casefold()
+
+    if isinstance(explicit_markers, (list, tuple, set)):
+        for marker in explicit_markers:
+            marker_text = str(marker or "").strip().casefold()
+            if marker_text and marker_text in folded:
+                return ("explicit_marker", "configured_marker")
+
+    if isinstance(sensitive_path_prefixes, (list, tuple, set)):
+        for prefix in sensitive_path_prefixes:
+            prefix_text = str(prefix or "").strip()
+            if prefix_text and prefix_text.casefold() in folded:
+                return ("sensitive_path", "configured_prefix")
+
+    if _KOREAN_RESIDENT_NUMBER_RE.search(text):
+        return ("pii", "korean_resident_number")
+    if _PHONE_NUMBER_RE.search(text):
+        return ("pii", "phone_number")
+    if _EMAIL_ADDRESS_RE.search(text):
+        return ("pii", "email_address")
+
+    # Static system policies routinely describe customer/contract/deadline
+    # categories without carrying any customer's actual data.  Treating those
+    # policy words as sensitive would disable cross-provider fallback for every
+    # turn.  Apply this contextual rule only to individual non-system messages
+    # so customer + business-detail terms must co-occur in an active message.
+    if isinstance(messages, list):
+        for message in messages:
+            if not isinstance(message, dict) or message.get("role") == "system":
+                continue
+            message_text = json.dumps(
+                message,
+                ensure_ascii=False,
+                sort_keys=True,
+                default=str,
+            )
+            if _CLIENT_CONTEXT_RE.search(message_text) and _BUSINESS_DETAIL_RE.search(
+                message_text
+            ):
+                return ("client_context", "contract_contact_deadline_cost")
+
+    redacted = redact_sensitive_text(
+        text,
+        force=True,
+        redact_url_credentials=True,
+    )
+    if redacted != text:
+        return ("secret_material", "redaction_match")
+    return None
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),

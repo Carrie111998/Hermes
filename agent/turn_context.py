@@ -448,6 +448,9 @@ def build_turn_context(
     agent._relay_pending_turn_id = None
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
+    # Rebuilt from the exact API-bound message list before each provider call.
+    # Clearing here prevents a new turn from inheriting a stale sensitive view.
+    agent._current_fallback_context_messages = None
     # Tripwire: warn (with both turn ids) when this turn starts before the
     # previous turn's turn-end persist — concurrent turns on one session
     # interleave transcript writes. Cleared in _persist_session.

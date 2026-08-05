@@ -21,6 +21,7 @@ import enum
 import contextvars
 import json
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 import os
@@ -100,13 +101,93 @@ def _subagent_auto_approve(command: str, description: str, **kwargs) -> str:
     return "once"
 
 
-def _get_subagent_approval_callback():
+def _scoped_command_denial_reason(
+    scope,
+    command: str,
+    *,
+    workdir: Optional[str] = None,
+    task_id: str = "default",
+) -> Optional[str]:
+    """Defense-in-depth terminal approval check shared with central preflight."""
+    from agent.delegation_context import delegated_terminal_denial_reason
+
+    return delegated_terminal_denial_reason(
+        scope,
+        command,
+        workdir=workdir or getattr(scope, "allowed_workspace_path", ""),
+        task_id=task_id,
+    )
+
+
+def _build_scoped_approval_callback(child, scope):
+    """Return a non-interactive callback bound to one child's safe scope."""
+
+    def _callback(command: str, description: str, **kwargs) -> str:
+        reason = _scoped_command_denial_reason(
+            scope,
+            command,
+            workdir=kwargs.get("workdir"),
+            task_id=str(kwargs.get("task_id") or "default"),
+        )
+        child_id = getattr(child, "_subagent_id", "unknown")
+        if reason:
+            escalations = getattr(child, "_approval_scope_escalations", None)
+            if not isinstance(escalations, list):
+                escalations = []
+                child._approval_scope_escalations = escalations
+            if reason not in escalations:
+                escalations.append(reason)
+            logger.warning(
+                "Delegated approval scope denied operation: child=%s reason=%s",
+                child_id,
+                reason,
+            )
+            return "deny"
+        logger.info(
+            "Delegated approval scope allowed one local operation: child=%s",
+            child_id,
+        )
+        return "once"
+
+    return _callback
+
+
+def _append_approval_scope_escalation_summary(child, summary: str) -> str:
+    """Append safe reason codes for scoped denials to the parent-facing summary."""
+    raw_codes = getattr(child, "_approval_scope_escalations", None)
+    if not isinstance(raw_codes, list):
+        return summary
+    codes = []
+    for raw in raw_codes:
+        code = str(raw or "")
+        if not re.fullmatch(r"[a-z0-9_]{1,64}", code):
+            code = "policy_denial"
+        if code not in codes:
+            codes.append(code)
+    if not codes:
+        return summary
+    note = (
+        "[APPROVAL ESCALATION REQUIRED: "
+        + ", ".join(codes)
+        + ". The blocked operation exceeded the delegated approval scope; "
+        "parent or user approval is required.]"
+    )
+    return f"{summary.rstrip()}\n\n{note}" if summary else note
+
+
+def _get_subagent_approval_callback(child=None):
     """Return the callback to install into subagent worker threads.
 
     Config key: delegation.subagent_auto_approve (bool, default False).
     Reads via the same _load_config() path as the rest of delegate_task so
     priority is config.yaml > (no env override for this knob) > default.
     """
+    from agent.delegation_context import DelegatedApprovalScope
+
+    scope = getattr(child, "_delegated_approval_scope", None)
+    if isinstance(scope, DelegatedApprovalScope) and scope.enabled:
+        return _build_scoped_approval_callback(child, scope)
+
     cfg = _load_config()
     val = cfg.get("subagent_auto_approve", False)
     if is_truthy_value(val):
@@ -797,6 +878,7 @@ def _build_child_system_prompt(
     context: Optional[str] = None,
     *,
     workspace_path: Optional[str] = None,
+    approval_scope=None,
     role: str = "leaf",
     max_spawn_depth: int = 2,
     child_depth: int = 1,
@@ -821,6 +903,19 @@ def _build_child_system_prompt(
             "\nWORKSPACE PATH:\n"
             f"{workspace_path}\n"
             "Use this exact path for local repository/workdir operations unless the task explicitly says otherwise."
+        )
+    if getattr(approval_scope, "enabled", False):
+        parts.append(
+            "\n## APPROVAL SCOPE\n"
+            f"Approved mission: {approval_scope.approved_mission_summary}\n"
+            f"Allowed workspace: {approval_scope.allowed_workspace_path}\n"
+            "Local file-tool operations inside that workspace may proceed. Terminal "
+            "commands require parent execution because inherited shell approval has no sandbox.\n"
+            "External transmission, destructive actions, credentials/accounts, "
+            "git commit/push/merge/PR, payments, global installs, and paths outside "
+            "the workspace remain denied. If an operation is denied, stop that "
+            "operation and include its approval escalation reason in your final "
+            "summary; never call clarify and never block on stdin."
         )
     parts.append(
         "\nComplete this task using the tools available to you. "
@@ -895,6 +990,95 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+def _normalise_scope_path(value: Any) -> str:
+    if not value:
+        return ""
+    try:
+        return os.path.realpath(os.path.abspath(os.path.expanduser(str(value))))
+    except Exception:
+        return ""
+
+
+def _path_within(path: str, root: str) -> bool:
+    if not path or not root:
+        return False
+    try:
+        return os.path.commonpath([path, root]) == root
+    except (OSError, ValueError):
+        return False
+
+
+def _mission_summary(goal: Any, limit: int = 240) -> str:
+    summary = " ".join(str(goal or "").split())
+    if len(summary) <= limit:
+        return summary
+    return summary[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _derive_delegated_approval_scope(
+    parent_agent,
+    *,
+    goal: str,
+    resolved_workspace: Optional[str],
+):
+    """Create a safe child scope, narrowing inherited scope when present."""
+    from agent.delegation_context import DelegatedApprovalScope
+
+    parent_scope = getattr(parent_agent, "_delegated_approval_scope", None)
+    workspace = _normalise_scope_path(resolved_workspace)
+    if isinstance(parent_scope, DelegatedApprovalScope):
+        parent_workspace = _normalise_scope_path(
+            parent_scope.allowed_workspace_path
+        )
+        requested_within_parent = _path_within(workspace, parent_workspace)
+        narrowed_workspace = workspace if requested_within_parent else ""
+        parent_mission = _mission_summary(parent_scope.approved_mission_summary)
+        child_mission = _mission_summary(goal)
+        mission = _mission_summary(
+            f"{parent_mission} > {child_mission}" if parent_mission else child_mission
+        )
+        return DelegatedApprovalScope(
+            enabled=bool(parent_scope.enabled),
+            approved_mission_summary=mission,
+            allowed_workspace_path=narrowed_workspace,
+            allow_local_non_destructive=(
+                parent_scope.allow_local_non_destructive
+                and requested_within_parent
+            ),
+            allow_external_transmission=False,
+            allow_destructive=False,
+            allow_credentials=False,
+        )
+
+    raw = _load_config().get("approval_inheritance", False)
+    if isinstance(raw, dict):
+        enabled = is_truthy_value(raw.get("enabled", False))
+        allow_local = is_truthy_value(
+            raw.get("allow_local_non_destructive", True), default=True
+        )
+        configured_workspace = _normalise_scope_path(
+            raw.get("allowed_workspace_path") or raw.get("workspace_path")
+        )
+        if configured_workspace:
+            if _path_within(configured_workspace, workspace):
+                workspace = configured_workspace
+            elif not _path_within(workspace, configured_workspace):
+                workspace = ""
+    else:
+        enabled = is_truthy_value(raw)
+        allow_local = True
+
+    return DelegatedApprovalScope(
+        enabled=bool(enabled),
+        approved_mission_summary=_mission_summary(goal),
+        allowed_workspace_path=workspace,
+        allow_local_non_destructive=bool(allow_local),
+        allow_external_transmission=False,
+        allow_destructive=False,
+        allow_credentials=False,
+    )
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -1322,10 +1506,16 @@ def _build_child_agent(
         child_toolsets.append("delegation")
 
     workspace_hint = _resolve_workspace_hint(parent_agent)
+    approval_scope = _derive_delegated_approval_scope(
+        parent_agent,
+        goal=goal,
+        resolved_workspace=workspace_hint,
+    )
     child_prompt = _build_child_system_prompt(
         goal,
         context,
         workspace_path=workspace_hint,
+        approval_scope=approval_scope,
         role=effective_role,
         max_spawn_depth=max_spawn,
         child_depth=child_depth,
@@ -1403,6 +1593,10 @@ def _build_child_agent(
         effective_api_mode = None  # force re-derivation from provider's defaults
     else:
         effective_api_mode = getattr(parent_agent, "api_mode", None)
+    # ponytail: keep scoped children on Hermes' guarded executor until the
+    # app-server's stateless MCP callback can carry and enforce immutable scopes.
+    if approval_scope.enabled and effective_api_mode == "codex_app_server":
+        effective_api_mode = "codex_responses"
     # Defensive: validate trusted delegation.command exists on PATH before
     # honoring it. Stale config should not force a child onto the ACP transport
     # and then fail at subprocess startup.
@@ -1564,6 +1758,8 @@ def _build_child_agent(
     child._subagent_id = subagent_id
     child._parent_subagent_id = parent_subagent_id
     child._subagent_goal = goal
+    child._delegated_approval_scope = approval_scope
+    child._approval_scope_escalations = []
     child._parent_turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
     # Stable sidebar marker: delegate subagent sessions must stay out of
     # session pickers even when a parent delete orphans them (parent_session_id
@@ -2176,7 +2372,7 @@ def _run_single_child(
             # input() and deadlock the parent's prompt_toolkit TUI.
             # Callback (deny vs approve) is governed by delegation.subagent_auto_approve.
             initializer=_set_subagent_approval_cb,
-            initargs=(_get_subagent_approval_callback(),),
+            initargs=(_get_subagent_approval_callback(child),),
         )
         # Capture the worker thread so the timeout diagnostic can dump its
         # Python stack (see #14726 — 0-API-call hangs are opaque without it).
@@ -2327,7 +2523,8 @@ def _run_single_child(
 
         duration = round(time.monotonic() - child_start, 2)
 
-        summary = result.get("final_response") or ""
+        model_summary = result.get("final_response") or ""
+        summary = _append_approval_scope_escalation_summary(child, model_summary)
         completed = result.get("completed", False)
         interrupted = result.get("interrupted", False)
         api_calls = result.get("api_calls", 0)
@@ -2337,11 +2534,11 @@ def _run_single_child(
         # transport bug (misrouted provider, adapter returning empty
         # ChatCompletion, etc.). Treat it as a failure so the parent surfaces
         # it instead of silently accepting zero-content "success".
-        _empty_sentinel = summary.strip() == "(empty)"
+        _empty_sentinel = model_summary.strip() == "(empty)"
 
         if interrupted:
             status = "interrupted"
-        elif summary and not _empty_sentinel:
+        elif model_summary and not _empty_sentinel:
             # A summary means the subagent produced usable output.
             # exit_reason ("completed" vs "max_iterations") already
             # tells the parent *how* the task ended.

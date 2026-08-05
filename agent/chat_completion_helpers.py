@@ -1725,6 +1725,47 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
     return None
 
 
+def _sensitive_cross_provider_fallback_reason(
+    agent,
+    *,
+    fallback_provider: str,
+    current_provider: str,
+    fallback_base_url: str,
+    current_base_url: str,
+) -> Optional[tuple[str, str]]:
+    """Return safe block codes for an enabled cross-provider context guard."""
+    guard = getattr(agent, "_sensitive_fallback_guard", None)
+    if not isinstance(guard, dict) or not guard.get("enabled", False):
+        return None
+    from agent.backend_identity import BackendIdentity
+
+    fallback_ident = BackendIdentity.build(
+        provider=fallback_provider,
+        base_url=fallback_base_url,
+    )
+    current_ident = BackendIdentity.build(
+        provider=current_provider,
+        base_url=current_base_url,
+    )
+    if (
+        fallback_ident.provider == current_ident.provider
+        and fallback_ident.base_url == current_ident.base_url
+    ):
+        return None
+    if str(guard.get("mode", "block") or "block").strip().lower() != "block":
+        return ("guard_config", "unsupported_mode")
+    try:
+        from agent.redact import classify_sensitive_fallback_context
+
+        return classify_sensitive_fallback_context(
+            getattr(agent, "_current_fallback_context_messages", None),
+            explicit_markers=guard.get("explicit_markers") or [],
+            sensitive_path_prefixes=guard.get("sensitive_path_prefixes") or [],
+        )
+    except Exception:
+        return ("guard_error", "classifier_error")
+
+
 
 def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool:
     """Switch to the next fallback model/provider in the chain.
@@ -1791,6 +1832,31 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
     fb_model = (fb.get("model") or "").strip()
     if not fb_provider or not fb_model:
         return agent._try_activate_fallback(reason)  # skip invalid, try next
+
+    current_provider = (getattr(agent, "provider", "") or "").strip().lower()
+    sensitive_reason = _sensitive_cross_provider_fallback_reason(
+        agent,
+        fallback_provider=fb_provider,
+        current_provider=current_provider,
+        fallback_base_url=str(fb.get("base_url") or ""),
+        current_base_url=str(getattr(agent, "base_url", "") or ""),
+    )
+    if sensitive_reason is not None:
+        # This is a turn-local privacy decision, not a provider health failure.
+        # The index has already advanced, so this attempt will not loop; do not
+        # poison the session-wide unavailable set or a later non-sensitive turn
+        # would lose this fallback permanently.
+        category, reason_code = sensitive_reason
+        logger.warning(
+            "Cross-provider fallback blocked by sensitive context guard: "
+            "category=%s reason=%s",
+            category,
+            reason_code,
+        )
+        agent._buffer_status(
+            "🔒 Fallback blocked because sensitive context was detected."
+        )
+        return agent._try_activate_fallback(reason)
 
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:

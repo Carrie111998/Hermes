@@ -1404,6 +1404,11 @@ def run_conversation(
     # See agent/transports/codex_app_server_session.py for the adapter
     # and references/codex-app-server-runtime.md for the rationale.
     if agent.api_mode == "codex_app_server":
+        scope = getattr(agent, "_delegated_approval_scope", None)
+        if getattr(scope, "enabled", False):
+            raise PermissionError(
+                "codex_app_server is unavailable under a delegated approval scope"
+            )
         return agent._run_codex_app_server_turn(
             user_message=user_message,
             original_user_message=original_user_message,
@@ -2099,6 +2104,12 @@ def run_conversation(
                     int(getattr(_compressor, "threshold_tokens", 0) or 0),
                 )
         
+        # Keep the exact context that this iteration would resend after a
+        # provider failure. This list already includes the system prompt,
+        # assistant tool calls, and all tool outputs accumulated so far; later
+        # retry shaping mutates the same list object in place.
+        agent._current_fallback_context_messages = api_messages
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         

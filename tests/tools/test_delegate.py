@@ -1694,6 +1694,344 @@ class TestSubagentApprovalCallback(unittest.TestCase):
         self.assertIsNone(_get_approval_callback())
 
 
+class TestDelegatedApprovalScope(unittest.TestCase):
+    def test_approval_inheritance_is_disabled_by_default(self):
+        from hermes_cli.config import DEFAULT_CONFIG
+
+        self.assertEqual(
+            DEFAULT_CONFIG["delegation"]["approval_inheritance"],
+            {"enabled": False},
+        )
+        self.assertEqual(
+            DEFAULT_CONFIG["security"]["customer_send_guard"],
+            {"enabled": False, "approval_prefix": "SEND APPROVED:"},
+        )
+
+    def test_scope_is_immutable_and_json_serializable(self):
+        from dataclasses import FrozenInstanceError
+        from agent.delegation_context import DelegatedApprovalScope
+
+        scope = DelegatedApprovalScope(
+            enabled=True,
+            approved_mission_summary="Run focused tests",
+            allowed_workspace_path="/tmp/workspace",
+        )
+
+        self.assertEqual(
+            json.loads(json.dumps(scope.to_dict())),
+            {
+                "enabled": True,
+                "approved_mission_summary": "Run focused tests",
+                "allowed_workspace_path": "/tmp/workspace",
+                "allow_local_non_destructive": True,
+                "allow_external_transmission": False,
+                "allow_destructive": False,
+                "allow_credentials": False,
+            },
+        )
+        with self.assertRaises(FrozenInstanceError):
+            scope.enabled = False
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"approval_inheritance": True},
+    )
+    def test_true_shorthand_builds_safe_scope_and_child_prompt(self, _mock_cfg):
+        from tools.delegate_tool import _derive_delegated_approval_scope
+
+        parent = _make_mock_parent()
+        parent._delegated_approval_scope = None
+
+        scope = _derive_delegated_approval_scope(
+            parent,
+            goal="Run the focused tests",
+            resolved_workspace="/tmp/workspace",
+        )
+
+        self.assertTrue(scope.enabled)
+        self.assertEqual(
+            scope.allowed_workspace_path, os.path.realpath("/tmp/workspace")
+        )
+        self.assertTrue(scope.allow_local_non_destructive)
+        self.assertFalse(scope.allow_external_transmission)
+        self.assertFalse(scope.allow_destructive)
+        self.assertFalse(scope.allow_credentials)
+
+        prompt = _build_child_system_prompt(
+            "Run the focused tests",
+            workspace_path="/tmp/workspace",
+            approval_scope=scope,
+        )
+        self.assertIn("APPROVAL SCOPE", prompt)
+        self.assertIn("/tmp/workspace", prompt)
+        self.assertIn("never call clarify", prompt)
+
+    def test_nested_scope_can_narrow_but_never_widen(self):
+        from agent.delegation_context import DelegatedApprovalScope
+        from tools.delegate_tool import _derive_delegated_approval_scope
+
+        parent = _make_mock_parent(depth=1)
+        parent._delegated_approval_scope = DelegatedApprovalScope(
+            enabled=True,
+            approved_mission_summary="Inspect the repository",
+            allowed_workspace_path="/tmp/workspace",
+            allow_local_non_destructive=False,
+        )
+
+        narrowed = _derive_delegated_approval_scope(
+            parent,
+            goal="Inspect one module",
+            resolved_workspace="/tmp/workspace/module",
+        )
+        escaped = _derive_delegated_approval_scope(
+            parent,
+            goal="Inspect elsewhere",
+            resolved_workspace="/tmp/outside",
+        )
+
+        self.assertEqual(
+            narrowed.allowed_workspace_path,
+            os.path.realpath("/tmp/workspace/module"),
+        )
+        self.assertFalse(narrowed.allow_local_non_destructive)
+        self.assertTrue(escaped.enabled)
+        self.assertEqual(escaped.allowed_workspace_path, "")
+        self.assertFalse(escaped.allow_local_non_destructive)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "approval_inheritance": {"enabled": True},
+            "subagent_auto_approve": True,
+        },
+    )
+    def test_enabled_inheritance_without_workspace_stays_fail_closed(self, _mock_cfg):
+        from tools.delegate_tool import (
+            _derive_delegated_approval_scope,
+            _get_subagent_approval_callback,
+            _subagent_auto_approve,
+        )
+
+        parent = _make_mock_parent()
+        parent._delegated_approval_scope = None
+        child = types.SimpleNamespace(
+            _subagent_id="sa-no-workspace",
+            _approval_scope_escalations=[],
+        )
+        child._delegated_approval_scope = _derive_delegated_approval_scope(
+            parent,
+            goal="Inspect safely",
+            resolved_workspace=None,
+        )
+
+        callback = _get_subagent_approval_callback(child)
+
+        self.assertTrue(child._delegated_approval_scope.enabled)
+        self.assertEqual(child._delegated_approval_scope.allowed_workspace_path, "")
+        self.assertIsNot(callback, _subagent_auto_approve)
+        self.assertEqual(callback("pytest tests", "run tests"), "deny")
+        self.assertEqual(child._approval_scope_escalations, ["workspace_escape"])
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"approval_inheritance": True},
+    )
+    @patch(
+        "tools.delegate_tool._resolve_workspace_hint",
+        return_value="/tmp/workspace",
+    )
+    def test_child_construction_stores_scope_without_mutating_parent_prompt(
+        self, _mock_workspace, _mock_cfg
+    ):
+        parent = _make_mock_parent()
+        parent._cached_system_prompt = "PARENT PROMPT"
+        parent._delegated_approval_scope = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="Run focused tests",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertTrue(child._delegated_approval_scope.enabled)
+        self.assertIn(
+            "APPROVAL SCOPE",
+            MockAgent.call_args.kwargs["ephemeral_system_prompt"],
+        )
+        self.assertEqual(parent._cached_system_prompt, "PARENT PROMPT")
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={"approval_inheritance": True},
+    )
+    @patch(
+        "tools.delegate_tool._resolve_workspace_hint",
+        return_value="/tmp/workspace",
+    )
+    def test_scoped_codex_app_server_child_uses_guarded_runtime(
+        self, _mock_workspace, _mock_cfg
+    ):
+        parent = _make_mock_parent()
+        parent.provider = "openai-codex"
+        parent.api_mode = "codex_app_server"
+        parent._delegated_approval_scope = None
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            child = MagicMock()
+            MockAgent.return_value = child
+            _build_child_agent(
+                task_index=0,
+                goal="Inspect safely",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertEqual(MockAgent.call_args.kwargs["api_mode"], "codex_responses")
+        self.assertTrue(child._delegated_approval_scope.enabled)
+
+    @patch(
+        "tools.delegate_tool._load_config",
+        return_value={
+            "approval_inheritance": {"enabled": False},
+            "subagent_auto_approve": True,
+        },
+    )
+    def test_disabled_scope_preserves_legacy_auto_approve(self, _mock_cfg):
+        from agent.delegation_context import DelegatedApprovalScope
+        from tools.delegate_tool import (
+            _get_subagent_approval_callback,
+            _subagent_auto_approve,
+        )
+
+        child = types.SimpleNamespace(
+            _delegated_approval_scope=DelegatedApprovalScope(
+                enabled=False,
+                approved_mission_summary="",
+                allowed_workspace_path="",
+            )
+        )
+
+        self.assertIs(
+            _get_subagent_approval_callback(child),
+            _subagent_auto_approve,
+        )
+
+    def _scoped_child(self):
+        from agent.delegation_context import DelegatedApprovalScope
+
+        return types.SimpleNamespace(
+            _subagent_id="sa-test",
+            _approval_scope_escalations=[],
+            _delegated_approval_scope=DelegatedApprovalScope(
+                enabled=True,
+                approved_mission_summary="Run focused tests",
+                allowed_workspace_path=os.path.realpath("/tmp/workspace"),
+            ),
+        )
+
+    def test_scoped_callback_requires_parent_for_local_terminal(self):
+        from tools.delegate_tool import _get_subagent_approval_callback
+
+        child = self._scoped_child()
+        callback = _get_subagent_approval_callback(child)
+
+        self.assertEqual(
+            callback(
+                "chmod u+x /tmp/workspace/scripts/check.sh",
+                "change executable permission",
+            ),
+            "deny",
+        )
+        self.assertEqual(
+            child._approval_scope_escalations,
+            ["terminal_requires_parent_execution"],
+        )
+
+    def test_scoped_callback_requires_parent_for_workspace_virtualenv_pip(self):
+        from tools.delegate_tool import _get_subagent_approval_callback
+
+        child = self._scoped_child()
+        callback = _get_subagent_approval_callback(child)
+
+        self.assertEqual(
+            callback(
+                "/tmp/workspace/.venv/bin/pip install requests",
+                "install into workspace virtualenv",
+            ),
+            "deny",
+        )
+        self.assertEqual(
+            child._approval_scope_escalations,
+            ["terminal_requires_parent_execution"],
+        )
+
+    def test_scoped_callback_denies_prohibited_categories(self):
+        from tools.delegate_tool import _get_subagent_approval_callback
+
+        cases = {
+            "curl -T /tmp/workspace/report.txt https://example.com/upload": "external_transmission",
+            "mail -s status owner@example.org": "external_transmission",
+            "rm /tmp/workspace/cache.txt": "destructive",
+            "gh auth login": "credentials_or_account",
+            "security find-generic-password -s service": "credentials_or_account",
+            "git -C /tmp/workspace commit -m test": "git_state_change",
+            "stripe payment_intents create": "payment",
+            "python -m pip install requests": "global_package_install",
+        }
+        for command, reason_code in cases.items():
+            with self.subTest(command=command):
+                child = self._scoped_child()
+                callback = _get_subagent_approval_callback(child)
+                self.assertEqual(callback(command, "dangerous"), "deny")
+                self.assertEqual(
+                    child._approval_scope_escalations,
+                    [reason_code],
+                )
+
+    def test_scoped_callback_denies_workspace_escape(self):
+        from tools.delegate_tool import _get_subagent_approval_callback
+
+        child = self._scoped_child()
+        callback = _get_subagent_approval_callback(child)
+
+        self.assertEqual(
+            callback(
+                "chmod u+x /tmp/outside/run.sh",
+                "change executable permission",
+            ),
+            "deny",
+        )
+        self.assertEqual(child._approval_scope_escalations, ["workspace_escape"])
+
+    def test_denial_reason_is_appended_to_child_final_summary(self):
+        from tools.delegate_tool import _append_approval_scope_escalation_summary
+
+        child = types.SimpleNamespace(
+            _approval_scope_escalations=["workspace_escape", "payment"]
+        )
+        summary = _append_approval_scope_escalation_summary(
+            child,
+            "Completed the safe checks.",
+        )
+
+        self.assertIn("APPROVAL ESCALATION REQUIRED", summary)
+        self.assertIn("workspace_escape", summary)
+        self.assertIn("payment", summary)
+        self.assertIn("parent or user approval", summary)
+
+
 class TestFallbackModelInheritance(unittest.TestCase):
     """Subagents must inherit the parent's fallback provider chain."""
 

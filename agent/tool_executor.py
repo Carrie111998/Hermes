@@ -394,6 +394,146 @@ def _managed_values(
     )
 
 
+def _latest_user_text(agent) -> str:
+    messages = getattr(agent, "_current_fallback_context_messages", None) or []
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue
+        content = message.get("content")
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = [
+                str(part.get("text") or "")
+                for part in content
+                if isinstance(part, dict) and part.get("type") in {"text", "input_text"}
+            ]
+            return "\n".join(parts).strip()
+    return ""
+
+
+def _consume_root_send_approval(
+    agent,
+    function_args: dict,
+    *,
+    consume: bool,
+) -> bool:
+    from agent.delegation_context import customer_send_targets
+
+    config = getattr(agent, "_customer_send_guard", None)
+    if not isinstance(config, dict) or not config.get("enabled", False):
+        return True
+    prefix = str(config.get("approval_prefix") or "SEND APPROVED:").strip()
+    latest_user = _latest_user_text(agent)
+    if not prefix or not latest_user.startswith(prefix):
+        return False
+    approved_target = latest_user[len(prefix):].strip()
+    targets = customer_send_targets(function_args)
+
+    def _target_set(values: tuple[str, ...]) -> set[str]:
+        return {
+            part.strip().casefold()
+            for value in values
+            for part in value.replace(";", ",").replace("\n", ",").split(",")
+            if part.strip()
+        }
+
+    approved_targets = _target_set((approved_target,))
+    requested_targets = _target_set(targets)
+    if not approved_targets or not requested_targets or requested_targets != approved_targets:
+        return False
+    approval_lock = getattr(agent, "_customer_send_approval_lock", None)
+    if approval_lock is None:
+        return False
+    with approval_lock:
+        turn_key = str(getattr(agent, "_current_turn_id", "") or latest_user)
+        if getattr(agent, "_customer_send_approval_consumed_turn", None) == turn_key:
+            return False
+        if consume:
+            agent._customer_send_approval_consumed_turn = turn_key
+        return True
+
+
+def _delegated_scope_preflight(
+    agent,
+    *,
+    function_name: str,
+    function_args: dict,
+    effective_task_id: str,
+    consume_send_approval: bool = True,
+) -> tuple[str, str] | None:
+    """Fail closed before inherited-scope or root send policy reaches dispatch."""
+    scope = getattr(agent, "_delegated_approval_scope", None)
+    scope_enabled = bool(getattr(scope, "enabled", False))
+    send_guard = getattr(agent, "_customer_send_guard", None)
+    send_guard_enabled = bool(
+        isinstance(send_guard, dict) and send_guard.get("enabled", False)
+    )
+    try:
+        if scope_enabled:
+            from agent.delegation_context import delegated_tool_denial_reason
+
+            assert scope is not None
+            reason = delegated_tool_denial_reason(
+                scope,
+                function_name,
+                function_args,
+                task_id=effective_task_id or "default",
+            )
+        elif send_guard_enabled:
+            from agent.delegation_context import customer_send_denial_reason
+
+            reason = customer_send_denial_reason(function_name, function_args)
+            if reason and _consume_root_send_approval(
+                agent,
+                function_args,
+                consume=consume_send_approval,
+            ):
+                reason = None
+        else:
+            return None
+    except Exception:
+        if not scope_enabled and not send_guard_enabled:
+            return None
+        reason = "scope_preflight_error" if scope_enabled else "customer_send_guard_error"
+
+    if not reason:
+        return None
+    raw_reason = str(reason)
+    safe_reason = (
+        raw_reason
+        if 1 <= len(raw_reason) <= 64
+        and raw_reason == raw_reason.lower()
+        and raw_reason.replace("_", "").isalnum()
+        else "policy_denial"
+    )
+    escalations = getattr(agent, "_approval_scope_escalations", None)
+    if not isinstance(escalations, list):
+        escalations = []
+        agent._approval_scope_escalations = escalations
+    if safe_reason not in escalations:
+        escalations.append(safe_reason)
+    logger.warning(
+        "Approval policy blocked tool call: tool=%s reason=%s",
+        function_name,
+        safe_reason,
+    )
+    result = json.dumps(
+        {
+            "error": (
+                "Delegated tool call blocked"
+                if scope_enabled
+                else "Customer send blocked"
+            ),
+            "reason_code": safe_reason,
+            "status": "blocked",
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    return result, safe_reason
+
+
 def _run_agent_tool_execution_middleware(
     agent,
     *,
@@ -424,7 +564,67 @@ def _run_agent_tool_execution_middleware(
     }
     dispatch_lock = threading.Lock()
 
+    def _advance_start_order(callback=None) -> None:
+        if begin_execution is None:
+            if callback is not None:
+                callback()
+            return
+        begin_execution(callback)
+
+    def _delegated_denial(block: tuple[str, str]) -> str:
+        result, reason = block
+        with dispatch_lock:
+            if state["dispatched"]:
+                raise RuntimeError(
+                    "Hermes tool execution callback invoked more than once"
+                )
+            state["dispatched"] = True
+            state["blocked"] = True
+            state["args"] = {}
+            state["middleware_trace"] = []
+        _advance_start_order()
+        _emit_terminal_post_tool_call(
+            agent,
+            function_name=function_name,
+            function_args={},
+            result=result,
+            effective_task_id=effective_task_id,
+            tool_call_id=tool_call_id,
+            status="blocked",
+            error_type="delegated_scope_block",
+            error_message=reason,
+            middleware_trace=[],
+        )
+        return result
+
+    if scope_block is None:
+        initial_block = _delegated_scope_preflight(
+            agent,
+            function_name=function_name,
+            function_args=function_args,
+            effective_task_id=effective_task_id,
+            consume_send_approval=False,
+        )
+        if initial_block is not None:
+            result = _delegated_denial(initial_block)
+            return _ManagedToolResult(
+                result=result,
+                args=state["args"],
+                middleware_trace=state["middleware_trace"],
+                blocked=True,
+            )
+
     def _authorized_dispatch(final_args: dict[str, Any]) -> Any:
+        if scope_block is None:
+            final_block = _delegated_scope_preflight(
+                agent,
+                function_name=function_name,
+                function_args=final_args,
+                effective_task_id=effective_task_id,
+            )
+            if final_block is not None:
+                return _delegated_denial(final_block)
+
         with dispatch_lock:
             if state["dispatched"]:
                 raise RuntimeError(
@@ -443,13 +643,6 @@ def _run_agent_tool_execution_middleware(
                 tool_call_id=tool_call_id,
                 display_index=display_index,
             )
-
-        def _advance_start_order(callback=None) -> None:
-            if begin_execution is None:
-                if callback is not None:
-                    callback()
-                return
-            begin_execution(callback)
 
         block_message = scope_block
         block_error_type = "tool_scope_block"

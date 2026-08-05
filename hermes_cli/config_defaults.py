@@ -1724,6 +1724,10 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Opt-in safe approval inheritance for delegate_task children. Boolean
+        # true is accepted as shorthand for the local, non-destructive scope;
+        # the mapping form can further narrow that scope.
+        "approval_inheritance": {"enabled": False},
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts
@@ -2131,6 +2135,20 @@ DEFAULT_CONFIG = {
     "security": {
         "allow_private_urls": False,  # Allow requests to private/internal IPs (for OpenWrt, proxies, VPNs)
         "redact_secrets": True,
+        # Local-only classifier that prevents sensitive turn context from
+        # crossing provider boundaries during fallback. Opt-in upstream.
+        "sensitive_fallback_guard": {
+            "enabled": False,
+            "mode": "block",
+            "explicit_markers": [],
+            "sensitive_path_prefixes": [],
+        },
+        # Customer-facing email/message sends require a one-turn, exact-target
+        # user command. Draft/save-draft operations remain available.
+        "customer_send_guard": {
+            "enabled": False,
+            "approval_prefix": "SEND APPROVED:",
+        },
         "tirith_enabled": True,
         "tirith_path": "tirith",
         "tirith_timeout": 5,

@@ -1614,6 +1614,56 @@ def init_agent(
     except Exception:
         _agent_cfg = {}
 
+    # Cross-provider fallback context guard. This is local deterministic state
+    # only; no environment-variable bridge and no remote classifier.
+    _security_cfg = _agent_cfg.get("security", {})
+    if not isinstance(_security_cfg, dict):
+        _security_cfg = {}
+    _fallback_guard_cfg = _security_cfg.get("sensitive_fallback_guard", {})
+    if isinstance(_fallback_guard_cfg, bool):
+        _fallback_guard_cfg = {"enabled": _fallback_guard_cfg}
+    if not isinstance(_fallback_guard_cfg, dict):
+        _fallback_guard_cfg = {}
+    _fallback_guard_markers = _fallback_guard_cfg.get("explicit_markers") or []
+    if not isinstance(_fallback_guard_markers, (list, tuple, set)):
+        _fallback_guard_markers = []
+    _fallback_guard_paths = (
+        _fallback_guard_cfg.get("sensitive_path_prefixes") or []
+    )
+    if not isinstance(_fallback_guard_paths, (list, tuple, set)):
+        _fallback_guard_paths = []
+    agent._sensitive_fallback_guard = {
+        "enabled": is_truthy_value(_fallback_guard_cfg.get("enabled", False)),
+        "mode": str(_fallback_guard_cfg.get("mode", "block") or "block")
+        .strip()
+        .lower(),
+        "explicit_markers": [
+            str(value)
+            for value in _fallback_guard_markers
+            if isinstance(value, str) and value.strip()
+        ],
+        "sensitive_path_prefixes": [
+            str(value)
+            for value in _fallback_guard_paths
+            if isinstance(value, str) and value.strip()
+        ],
+    }
+    agent._current_fallback_context_messages = None
+
+    _send_guard_cfg = _security_cfg.get("customer_send_guard", {})
+    if isinstance(_send_guard_cfg, bool):
+        _send_guard_cfg = {"enabled": _send_guard_cfg}
+    if not isinstance(_send_guard_cfg, dict):
+        _send_guard_cfg = {}
+    agent._customer_send_guard = {
+        "enabled": is_truthy_value(_send_guard_cfg.get("enabled", False)),
+        "approval_prefix": str(
+            _send_guard_cfg.get("approval_prefix") or "SEND APPROVED:"
+        ).strip(),
+    }
+    agent._customer_send_approval_consumed_turn = None
+    agent._customer_send_approval_lock = threading.Lock()
+
     # Codex commentary visibility (display.show_commentary, default true).
     # When true, completed Codex phase=commentary messages are delivered as
     # visible mid-turn updates through the interim message path. When false,
