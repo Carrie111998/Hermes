@@ -2914,52 +2914,73 @@ def terminal_tool(
                 from tools.interrupt import clear_current_thread_interrupt
                 clear_current_thread_interrupt()
 
-            while retry_count <= max_retries:
-                try:
-                    command_cwd = _resolve_command_cwd(
-                        workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
-                    )
-                    execute_kwargs = {
-                        "timeout": effective_timeout,
-                        "cwd": command_cwd,
-                        # Foreground model-facing output: cap retention while
-                        # streaming (head/tail window) so a verbose command
-                        # can't OOM the gateway before truncation (#64435).
-                        # Internal env.execute() consumers (file ops cat
-                        # reads, RPC reads) intentionally stay unbounded.
-                        "bounded_capture": True,
-                    }
-                    result = env.execute(command, **execute_kwargs)
-                except Exception as e:
-                    error_str = str(e).lower()
-                    if "timeout" in error_str:
+            # Capture the env's cwd before the command so a per-command
+            # workdir= override can be fully reverted afterward (#73683).
+            # Need_pre_command_env_cwd stays True whenever workdir= was passed
+            # AND the env exposes a cwd attribute — only that case can leak
+            # (#73717).
+            _pre_command_env_cwd = (
+                getattr(env, "cwd", None) if workdir and hasattr(env, "cwd") else None
+            )
+            _need_pre_command_env_cwd = _pre_command_env_cwd is not None
+
+            try:
+                while retry_count <= max_retries:
+                    try:
+                        command_cwd = _resolve_command_cwd(
+                            workdir=workdir,
+                            default_cwd=cwd,
+                            session_key=session_key,
+                        )
+                        execute_kwargs = {
+                            "timeout": effective_timeout,
+                            "cwd": command_cwd,
+                            # Foreground model-facing output: cap retention while
+                            # streaming (head/tail window) so a verbose command
+                            # can't OOM the gateway before truncation (#64435).
+                            # Internal env.execute() consumers (file ops cat
+                            # reads, RPC reads) intentionally stay unbounded.
+                            "bounded_capture": True,
+                        }
+                        result = env.execute(command, **execute_kwargs)
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if "timeout" in error_str:
+                            return json.dumps({
+                                "output": "",
+                                "exit_code": 124,
+                                "error": f"Command timed out after {effective_timeout} seconds"
+                            }, ensure_ascii=False)
+
+                        # Retry on transient errors
+                        if retry_count < max_retries:
+                            retry_count += 1
+                            wait_time = 2 ** retry_count
+                            logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                           wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
+                            time.sleep(wait_time)
+                            continue
+
+                        logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
+                                     max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
                         return json.dumps({
                             "output": "",
-                            "exit_code": 124,
-                            "error": f"Command timed out after {effective_timeout} seconds"
+                            "exit_code": -1,
+                            "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
                         }, ensure_ascii=False)
-                    
-                    # Retry on transient errors
-                    if retry_count < max_retries:
-                        retry_count += 1
-                        wait_time = 2 ** retry_count
-                        logger.warning("Execution error, retrying in %ds (attempt %d/%d) - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                       wait_time, retry_count, max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                        time.sleep(wait_time)
-                        continue
-                    
-                    logger.error("Execution failed after %d retries - Command: %s - Error: %s: %s - Task: %s, Backend: %s",
-                                 max_retries, _safe_command_preview(command), type(e).__name__, e, effective_task_id, env_type)
-                    return json.dumps({
-                        "output": "",
-                        "exit_code": -1,
-                        "error": f"Command execution failed: {type(e).__name__}: {str(e)}"
-                    }, ensure_ascii=False)
-                
-                # Got a result
-                break
+
+                    # Got a result
+                    break
+            finally:
+                # Per-command workdir= override: the env's post-command tracking
+                # has updated env.cwd to the command's end directory, but that
+                # was a one-off override — it must not mutate session-scoped
+                # state. Restore the env's pre-command cwd so the shared env
+                # doesn't leak the workdir to other sessions, REGARDLESS of
+                # whether the loop exited via success, timeout, or exhausted
+                # retries (#73683, #73717).
+                if _need_pre_command_env_cwd:
+                    env.cwd = _pre_command_env_cwd
 
             # Dual-write (cwd rearch step 1): the env's post-command tracking
             # (marker parse / local sync) has just updated env.cwd with the
@@ -2968,11 +2989,17 @@ def terminal_tool(
             # never depends on the shared env surviving or on who drives the
             # env next.
             #
-            # BUT: a per-command ``workdir`` override is transient by contract
-            # (docstring: "Working directory for this command"). Recording it
-            # would hijack the session's durable cwd for every later command
-            # that doesn't pass ``workdir``. Skip the dual-write in that case.
+            # Per-command workdir= override: a one-off override must not
+            # mutate session-scoped state — skip the durable session-record
+            # write so subsequent commands and the desktop session-folder UI
+            # keep pointing at the session's real cwd (#73683).
+            #
+            # Note: env.cwd restoration already happened in the try/finally
+            # above (so the shared env doesn't leak), independent of whether
+            # we record a durable cwd here.
             if not workdir:
+                # Normal command: record the env's post-command cwd so the
+                # durable record tracks the session's `cd` state.
                 record_session_cwd(session_key, getattr(env, "cwd", None))
 
             # Extract output
@@ -3081,7 +3108,12 @@ def terminal_tool(
             # borrowed from crush's <cwd> injection).
             try:
                 post_cwd = getattr(env, "cwd", None)
-                if post_cwd and command_cwd and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd)):
+                if (
+                    not workdir
+                    and post_cwd
+                    and command_cwd
+                    and os.path.realpath(str(post_cwd)) != os.path.realpath(str(command_cwd))
+                ):
                     result_dict["cwd"] = str(post_cwd)
             except Exception:
                 pass
