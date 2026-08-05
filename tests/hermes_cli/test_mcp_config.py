@@ -124,6 +124,123 @@ class TestMcpList:
 
 
 # ---------------------------------------------------------------------------
+# Tests: cmd_mcp_list --json
+# ---------------------------------------------------------------------------
+
+class TestMcpListJson:
+    def test_list_json_empty_config(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {})
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        out = capsys.readouterr().out
+        doc = jsonlib.loads(out)
+        assert doc == {"servers": []}
+
+    def test_list_json_server_fields(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "ink": {
+                "url": "https://mcp.ml.ink/mcp",
+                "auth": "oauth",
+                "enabled": True,
+            },
+            "github": {
+                "command": "npx",
+                "args": ["@mcp/github"],
+                "enabled": False,
+            },
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        servers = {s["name"]: s for s in doc["servers"]}
+        assert servers["ink"]["url"] == "https://mcp.ml.ink/mcp"
+        assert servers["ink"]["auth"] == "oauth"
+        assert servers["ink"]["enabled"] is True
+        assert servers["github"]["command"] == "npx"
+        assert servers["github"]["args"] == ["@mcp/github"]
+        assert servers["github"]["enabled"] is False
+
+    def test_list_json_tools_from_schema_cache(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "glider": {"url": "http://127.0.0.1:64342/stream"},
+        })
+        from tools.mcp_schema_cache import config_fingerprint, write_cache_entry
+
+        write_cache_entry(
+            "glider",
+            config_fingerprint({"url": "http://127.0.0.1:64342/stream"}),
+            tools=[
+                {"name": "find_callers", "description": "Trace callers of a symbol",
+                 "inputSchema": {}},
+                {"name": "get_type_info", "description": "Type details", "inputSchema": {}},
+            ],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        glider = doc["servers"][0]
+        assert glider["tools_known"] is True
+        names = [t["name"] for t in glider["tools"]]
+        assert names == ["find_callers", "get_type_info"]
+        assert glider["tools"][0]["description"] == "Trace callers of a symbol"
+
+    def test_list_json_tools_unknown_without_cache(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "fresh": {"url": "https://example.com/mcp"},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        server = doc["servers"][0]
+        assert server["tools_known"] is False
+        assert server["tools"] == []
+
+    def test_list_json_stale_cache_fingerprint(self, tmp_path, capsys):
+        import json as jsonlib
+
+        _seed_config(tmp_path, {
+            "changing": {"url": "https://example.com/mcp", "tools": {"exclude": ["x"]}},
+        })
+        from tools.mcp_schema_cache import write_cache_entry
+
+        write_cache_entry(
+            "changing",
+            "deadbeefdeadbeef",
+            tools=[{"name": "old_tool", "description": "", "inputSchema": {}}],
+        )
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list(_make_args(json=True))
+        doc = jsonlib.loads(capsys.readouterr().out)
+        server = doc["servers"][0]
+        assert server["tools_known"] is False
+        assert server["tools"] == []
+
+    def test_list_json_does_not_break_text_path(self, tmp_path, capsys):
+        _seed_config(tmp_path, {
+            "ink": {"url": "https://mcp.ml.ink/mcp", "enabled": True},
+        })
+        from hermes_cli.mcp_config import cmd_mcp_list
+
+        cmd_mcp_list()
+        out = capsys.readouterr().out
+        assert "ink" in out
+        assert "enabled" in out
+
+
+# ---------------------------------------------------------------------------
 # Tests: cmd_mcp_remove
 # ---------------------------------------------------------------------------
 

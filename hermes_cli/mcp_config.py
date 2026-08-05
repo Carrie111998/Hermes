@@ -9,6 +9,7 @@ configuration in ~/.hermes/config.yaml under the ``mcp_servers`` key.
 """
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -651,9 +652,75 @@ def cmd_mcp_remove(args):
 
 # ─── hermes mcp list ──────────────────────────────────────────────────────────
 
+def _mcp_server_json_payload(name: str, cfg: dict) -> dict:
+    """One server entry for `hermes mcp list --json`.
+
+    Tool detail comes from the on-disk schema cache (fingerprint-checked, the
+    same source lazy startup trusts), so a fresh CLI process reports real tool
+    names without spawning servers. No cache entry means ``tools_known: false``
+    — an honest "no tool detail", never a lying empty list.
+    """
+    payload: Dict[str, Any] = {"name": name}
+    enabled = cfg.get("enabled", True)
+    if isinstance(enabled, str):
+        payload["enabled"] = enabled.lower() in {"true", "1", "yes"}
+    else:
+        payload["enabled"] = bool(enabled)
+    if "url" in cfg:
+        payload["url"] = cfg["url"]
+    if "command" in cfg:
+        payload["command"] = cfg["command"]
+        args = cfg.get("args")
+        if isinstance(args, list):
+            payload["args"] = args
+    if cfg.get("auth"):
+        payload["auth"] = cfg["auth"]
+    tools = _cached_tool_list(name, cfg)
+    if tools is None:
+        payload["tools_known"] = False
+        payload["tools"] = []
+    else:
+        payload["tools_known"] = True
+        payload["tools"] = tools
+    return payload
+
+
+def _cached_tool_list(name: str, cfg: dict) -> Optional[List[dict]]:
+    """``[{name, description}]`` from the schema cache, or None when unknown."""
+    try:
+        from tools.mcp_schema_cache import config_fingerprint, get_cached_entry
+    except Exception:
+        return None
+    entry = get_cached_entry(name, config_fingerprint(cfg))
+    if entry is None:
+        return None
+    tools = entry.get("tools")
+    if not isinstance(tools, list):
+        return None
+    return [
+        {"name": tool["name"], "description": tool.get("description", "")}
+        for tool in tools
+        if isinstance(tool, dict) and tool.get("name")
+    ]
+
+
+def _print_mcp_servers_json(servers: dict) -> None:
+    """Print the server inventory as one JSON document on stdout."""
+    payload = {
+        "servers": [
+            _mcp_server_json_payload(name, cfg) for name, cfg in servers.items()
+        ]
+    }
+    print(json.dumps(payload, indent=2, sort_keys=True))
+
+
 def cmd_mcp_list(args=None):
     """List all configured MCP servers."""
     servers = _get_mcp_servers()
+
+    if args is not None and getattr(args, "json", False):
+        _print_mcp_servers_json(servers)
+        return
 
     if not servers:
         print()
