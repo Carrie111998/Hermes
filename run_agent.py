@@ -285,6 +285,7 @@ _DB_PERSISTENCE_UNIT_ID = "_db_persistence_unit_id"
 _DB_PERSISTENCE_MESSAGE_KEY = "_db_persistence_message_key"
 _DB_PERSISTENCE_ORDINAL = "_db_persistence_ordinal"
 _DB_PERSISTENCE_TIMESTAMP = "_db_persistence_timestamp"
+_DB_PERSISTENCE_PAYLOAD_FINGERPRINT = "_db_persistence_payload_fingerprint"
 _DB_CANONICAL_COMMIT_MARKER = "_db_canonical_commit"
 
 
@@ -321,6 +322,36 @@ class _PlannedPersistenceUnit:
 @dataclass(frozen=True)
 class _SessionPersistencePlan:
     pending_units: tuple[_PlannedPersistenceUnit, ...]
+    mutated_spooled_unit_ids: tuple[str, ...] = ()
+
+
+def _batch_message_payload_fingerprint(message: Any) -> str:
+    """Hash only the row payload, excluding retry identity metadata."""
+    payload = {
+        "role": message.role,
+        "content": message.content,
+        "timestamp": message.timestamp,
+        "tool_name": message.tool_name,
+        "tool_calls": message.tool_calls,
+        "tool_call_id": message.tool_call_id,
+        "finish_reason": message.finish_reason,
+        "reasoning": message.reasoning,
+        "reasoning_content": message.reasoning_content,
+        "reasoning_details": message.reasoning_details,
+        "codex_reasoning_items": message.codex_reasoning_items,
+        "codex_message_items": message.codex_message_items,
+        "api_content": message.api_content,
+        "display_kind": message.display_kind,
+        "display_metadata": message.display_metadata,
+    }
+    encoded = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -2140,6 +2171,7 @@ class AIAgent:
                     _DB_PERSISTENCE_MESSAGE_KEY,
                     _DB_PERSISTENCE_ORDINAL,
                     _DB_PERSISTENCE_TIMESTAMP,
+                    _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
                     _DB_CANONICAL_COMMIT_MARKER,
                 ):
                     msg.pop(private_key, None)
@@ -2149,6 +2181,7 @@ class AIAgent:
             pending_messages.append((msg_idx, msg))
 
         units = []
+        mutated_spooled_unit_ids = []
         while pending_messages:
             keyed_idx = next(
                 (
@@ -2171,6 +2204,66 @@ class AIAgent:
                 ):
                     unit_items.append(pending_messages[cursor])
                     cursor += 1
+            batch_messages = tuple(
+                _build_batch_message(unit_msg, unit_idx)
+                for unit_idx, unit_msg in unit_items
+            )
+            fingerprints = tuple(
+                _batch_message_payload_fingerprint(batch_message)
+                for batch_message in batch_messages
+            )
+            fingerprint_changed = any(
+                (
+                    source_msg.get(_DB_PERSISTENCE_PAYLOAD_FINGERPRINT) is not None
+                    and source_msg.get(_DB_PERSISTENCE_PAYLOAD_FINGERPRINT)
+                    != fingerprint
+                )
+                or (
+                    source_msg.get(_DB_SPOOLED_MARKER)
+                    and source_msg.get(_DB_PERSISTENCE_PAYLOAD_FINGERPRINT) is None
+                )
+                for (_unit_idx, source_msg), fingerprint in zip(
+                    unit_items, fingerprints
+                )
+            )
+            unit_blocked = fingerprint_changed and any(
+                source_msg.get(_DB_SPOOLED_MARKER)
+                for _unit_idx, source_msg in unit_items
+            )
+            if unit_blocked:
+                mutated_spooled_unit_ids.append(
+                    str(
+                        unit_items[0][1].get(_DB_PERSISTENCE_UNIT_ID)
+                        or "unknown"
+                    )
+                )
+            elif fingerprint_changed:
+                for _unit_idx, source_msg in unit_items:
+                    for private_key in (
+                        _DB_SPOOLED_MARKER,
+                        _DB_PERSISTENCE_UNIT_ID,
+                        _DB_PERSISTENCE_MESSAGE_KEY,
+                        _DB_PERSISTENCE_ORDINAL,
+                        _DB_PERSISTENCE_TIMESTAMP,
+                        _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
+                        _DB_CANONICAL_COMMIT_MARKER,
+                    ):
+                        source_msg.pop(private_key, None)
+                _assign_new_unit(unit_items)
+                batch_messages = tuple(
+                    _build_batch_message(unit_msg, unit_idx)
+                    for unit_idx, unit_msg in unit_items
+                )
+                fingerprints = tuple(
+                    _batch_message_payload_fingerprint(batch_message)
+                    for batch_message in batch_messages
+                )
+            if not unit_blocked:
+                for (_unit_idx, source_msg), fingerprint in zip(
+                    unit_items, fingerprints
+                ):
+                    source_msg[_DB_PERSISTENCE_PAYLOAD_FINGERPRINT] = fingerprint
+
             selected_ids = {id(unit_msg) for _unit_idx, unit_msg in unit_items}
             pending_messages = [
                 item for item in pending_messages if id(item[1]) not in selected_ids
@@ -2179,14 +2272,14 @@ class AIAgent:
                 _PlannedPersistenceUnit(
                     message_indices=tuple(unit_idx for unit_idx, _msg in unit_items),
                     source_messages=tuple(unit_msg for _unit_idx, unit_msg in unit_items),
-                    batch_messages=tuple(
-                        _build_batch_message(unit_msg, unit_idx)
-                        for unit_idx, unit_msg in unit_items
-                    ),
+                    batch_messages=batch_messages,
                 )
             )
 
-        return _SessionPersistencePlan(pending_units=tuple(units))
+        return _SessionPersistencePlan(
+            pending_units=tuple(units),
+            mutated_spooled_unit_ids=tuple(dict.fromkeys(mutated_spooled_unit_ids)),
+        )
 
     def _finalize_full_canonical_flush(self, messages: List[Dict]) -> None:
         self._flushed_db_message_ids = set()
@@ -2221,6 +2314,7 @@ class AIAgent:
                         _DB_PERSISTENCE_MESSAGE_KEY,
                         _DB_PERSISTENCE_ORDINAL,
                         _DB_PERSISTENCE_TIMESTAMP,
+                        _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
                     ):
                         source_msg.pop(private_key, None)
                 committed_units.append(unit)
@@ -2376,6 +2470,13 @@ class AIAgent:
             self._session_messages = messages
             self._save_session_log(messages)
 
+            if getattr(self, "_persist_disabled", False):
+                return SessionPersistResult(
+                    state=SessionPersistState.NOT_DURABLE,
+                    error_class="PersistenceDisabled",
+                    error_message="session persistence disabled for this agent",
+                )
+
             # Preserve the established instance-level persistence seam used by
             # lightweight agents and shutdown tests. Real AIAgent instances use
             # the class method and therefore continue through the classified
@@ -2398,6 +2499,19 @@ class AIAgent:
                     ),
                 )
 
+            plan = self._plan_session_persistence_units(
+                messages, conversation_history
+            )
+            if plan.mutated_spooled_unit_ids:
+                self._db_flush_scan_prefix = None
+                return SessionPersistResult(
+                    state=SessionPersistState.NOT_DURABLE,
+                    error_class="SpooledPersistenceUnitMutated",
+                    error_message=(
+                        "a durably spooled persistence unit changed before replay"
+                    ),
+                )
+
             replay_result = self._replay_pending_session_spool(trigger="pre_persist")
             blocked, replay_state_value = self._replay_result_blocks_canonical_persist(
                 replay_result
@@ -2409,14 +2523,6 @@ class AIAgent:
                     error_message="session spool replay blocked canonical persistence",
                 )
 
-            if getattr(self, "_persist_disabled", False):
-                return SessionPersistResult(
-                    state=SessionPersistState.NOT_DURABLE,
-                    error_class="PersistenceDisabled",
-                    error_message="session persistence disabled for this agent",
-                )
-
-            plan = self._plan_session_persistence_units(messages, conversation_history)
             if not plan.pending_units:
                 self._finalize_full_canonical_flush(messages)
                 if self._session_db is not None:
@@ -3378,6 +3484,7 @@ class AIAgent:
                             _DB_PERSISTENCE_MESSAGE_KEY,
                             _DB_PERSISTENCE_ORDINAL,
                             _DB_PERSISTENCE_TIMESTAMP,
+                            _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
                             _DB_CANONICAL_COMMIT_MARKER,
                         }
                     }

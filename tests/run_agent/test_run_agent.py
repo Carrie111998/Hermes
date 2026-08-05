@@ -511,6 +511,64 @@ def test_spooled_marker_skips_duplicate_spool_only_and_never_blocks_canonical_re
     assert message[run_agent._DB_PERSISTED_MARKER] is True
 
 
+def test_rewritten_spooled_message_blocks_before_stale_replay(agent, monkeypatch):
+    db = _RecordingBatchDB(outcomes=[RuntimeError("first failure")])
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "spooled snapshot"}
+    spool_calls = []
+
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "append_records",
+        lambda records: (
+            spool_calls.append(records) or _spool_append_result(*records)
+        ),
+    )
+    replay = MagicMock(return_value=None)
+    agent._replay_pending_session_spool = replay
+
+    first = agent._persist_session([message], [])
+    assert first.state is run_agent.SessionPersistState.SPOOLED
+    assert "_db_persistence_payload_fingerprint" in message
+
+    message["content"] = "rewritten after spool"
+    second = agent._persist_session([message], [])
+
+    assert second.state is run_agent.SessionPersistState.NOT_DURABLE
+    assert second.error_class == "SpooledPersistenceUnitMutated"
+    assert replay.call_count == 1
+    assert len(db.calls) == 1
+    assert len(spool_calls) == 1
+
+
+def test_rewritten_failed_nonspooled_unit_rekeys_before_retry(agent, monkeypatch):
+    db = _RecordingBatchDB(
+        outcomes=[
+            RuntimeError("first failure"),
+            SimpleNamespace(inserted_count=1, duplicate_count=0),
+        ]
+    )
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "user", "content": "first payload"}
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "append_records",
+        MagicMock(side_effect=spool.SpoolDurabilityError("spool down")),
+    )
+
+    first = agent._persist_session([message], [])
+    first_key = message[run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    assert first.state is run_agent.SessionPersistState.NOT_DURABLE
+
+    message["content"] = "replacement payload"
+    second = agent._persist_session([message], [])
+
+    assert second.state is run_agent.SessionPersistState.CANONICAL
+    assert len(db.calls) == 2
+    assert db.calls[1]["messages"][0].content == "replacement payload"
+    assert db.calls[1]["messages"][0].persistence_message_key != first_key
+
+
 def test_persist_session_disabled_never_touches_db_or_spool(agent, monkeypatch):
     db = MagicMock()
     db.flush_token_counts = MagicMock()
@@ -563,6 +621,7 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
         run_agent._DB_SPOOLED_MARKER: True,
         run_agent._DB_PERSISTENCE_UNIT_ID: "unit-1",
         "_db_canonical_commit": True,
+        "_db_persistence_payload_fingerprint": "fingerprint-1",
     }
 
     agent._save_session_log([message])
@@ -571,6 +630,7 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
     assert run_agent._DB_SPOOLED_MARKER not in saved["messages"][0]
     assert run_agent._DB_PERSISTENCE_UNIT_ID not in saved["messages"][0]
     assert "_db_canonical_commit" not in saved["messages"][0]
+    assert "_db_persistence_payload_fingerprint" not in saved["messages"][0]
 
 
 def test_persist_session_replays_spool_before_canonical_append_under_persist_lock(agent, monkeypatch):
