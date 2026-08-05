@@ -11,6 +11,8 @@ import time
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+from hermes_cli.web_deps import _server
+
 _log = logging.getLogger("hermes_cli.web_gateway_topology")
 
 # Host TCP ports each port-binding gateway platform listens on, as
@@ -85,7 +87,7 @@ def _profile_platform_ports(profile_home: Path, runtime: Optional[dict]) -> Dict
     return ports
 
 
-def _collect_profile_gateway_topology() -> Dict[str, Any]:
+def _collect_profile_gateway_topology_impl() -> Dict[str, Any]:
     """Enumerate profiles and the gateways serving them for ``/api/status``.
 
     Returns ``{"profiles": [...], "gateway_mode": ..., "gateways": [...]}``:
@@ -145,6 +147,34 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
 
 
+def _collect_profile_gateway_topology_seam() -> Dict[str, Any]:
+    """Late-bound seam for the topology collector.
+
+    ``web_server`` imports this name, and tests (plus any third-party
+    code) patch it with ``monkeypatch.setattr(web_server, ...)``.  The TTL
+    cache wrapper below reads this name from THIS module's globals, so a
+    patch applied only to ``web_server``'s attribute would otherwise be a
+    silent no-op.  Resolving ``web_server._collect_profile_gateway_topology``
+    at call time — the same late-binding seam ``web_deps.late`` provides
+    for the extracted routers — keeps such monkeypatches authoritative.
+    When ``web_server`` still points at this seam (unpatched), delegate to
+    the real collector.
+    """
+    target = getattr(_server(), "_collect_profile_gateway_topology")
+    if target is not _collect_profile_gateway_topology:
+        return target()
+    return _collect_profile_gateway_topology_impl()
+
+
+# Public binding: ``web_server`` imports this exact object (the seam tests
+# pin ``is``-identity), and every internal caller resolves this name from
+# THIS module's globals.  Tests that swap ``web_server``'s attribute stay
+# authoritative (the seam re-reads it at call time); tests that swap this
+# module's binding directly get the swapped collector straight from the
+# globals, as before the extraction.
+_collect_profile_gateway_topology = _collect_profile_gateway_topology_seam
+
+
 # /api/status is polled ~1/s by the desktop app while it waits for the backend
 # (and again by the dashboard badge). Each uncached call above walks 7+ profile
 # homes (yaml.safe_load with the pure-Python loader + psutil process-table
@@ -173,6 +203,12 @@ def _topology_cache_get(fn: Any) -> Optional[Dict[str, Any]]:
 
 def _collect_profile_gateway_topology_cached() -> Dict[str, Any]:
     fn = _collect_profile_gateway_topology
+    if fn is _collect_profile_gateway_topology_seam:
+        # Unpatched on this module: resolve web_server's LIVE attribute so
+        # its monkeypatches stay authoritative — and so the cache keys on
+        # the actual collector object (a swapped collector is a miss; a
+        # stable seam identity would hand out stale in-TTL data).
+        fn = _server()._collect_profile_gateway_topology
     cached = _topology_cache_get(fn)
     if cached is not None:
         return cached
