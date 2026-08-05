@@ -46,7 +46,7 @@ class FakeStore:
     def __init__(self):
         self.facts: List[Dict[str, Any]] = []
 
-    def add_fact(self, fact: str, category: str = "", tags: str = "") -> int:
+    def add_fact(self, fact: str, category: str = "", tags: str = "", initial_trust: float | None = None) -> int:
         self.facts.append({"fact": fact, "category": category, "tags": tags})
         return 1
 
