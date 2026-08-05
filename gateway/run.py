@@ -20273,22 +20273,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # 85% * 1.4 = 119% of context — which exceeds the model's limit
                     # and prevented hygiene from ever firing for ~200K models (GLM-5).
 
-                # Hard safety valve: force compression if message count is
-                # extreme, regardless of token estimates.  This breaks the
-                # death spiral where API disconnects prevent token data
-                # collection, which prevents compression, which causes more
-                # disconnects.  5000 messages is far above any normal session
-                # but catches truly runaway growth before it becomes
-                # unrecoverable.  Set well clear of legitimate large-context
-                # (1M+) sessions doing thousands of short turns — those
-                # compress on the token threshold, not this count-based floor.
+                # Hard safety valve: force compression by message count only
+                # when no trustworthy API token count exists.  A positive
+                # ``last_prompt_tokens`` value is provider-reported evidence;
+                # overriding it with a locally configured count floor can
+                # synchronously compact a healthy large-context conversation
+                # and block the next user turn for minutes.  The count valve
+                # still breaks the disconnect death spiral that motivated
+                # #2153, because those sessions have no successful API count.
                 # Threshold is configurable via
                 # compression.hygiene_hard_message_limit.
-                # (#2153)
                 _HARD_MSG_LIMIT = _hyg_hard_msg_limit
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
-                    or _msg_count >= _HARD_MSG_LIMIT
+                    or (
+                        _stored_tokens <= 0
+                        and _msg_count >= _HARD_MSG_LIMIT
+                    )
                 )
 
                 if _needs_compress:

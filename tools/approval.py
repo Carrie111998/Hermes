@@ -3203,6 +3203,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            choice="notify_failed",
+        )
         notify_failure = {
             "resolved": False,
             "choice": None,

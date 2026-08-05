@@ -31,6 +31,7 @@ DEFAULT = {
     "scan": True,
     "deps": True,
     "npm_lock": True,
+    "installer": True,
     "mcp_catalog": False,
     "owner_gate": True,
     "ci_review": True,
@@ -44,6 +45,7 @@ def _lanes(
     scan=False,
     deps=False,
     npm_lock=False,
+    installer=False,
     mcp_catalog=False,
     owner_gate=False,
     docker_meta=False,
@@ -61,6 +63,7 @@ def _lanes(
         "scan": scan,
         "deps": deps,
         "npm_lock": npm_lock,
+        "installer": installer,
         "mcp_catalog": mcp_catalog,
         "owner_gate": owner_gate,
         "ci_review": ci_review,
@@ -107,6 +110,14 @@ CASES = {
         ["scripts/run_tests.sh"],
         _lanes(python=True, owner_gate=True),
     ),
+    # install.ps1 is a shell script Python never imports, but it's also not
+    # provably prose, so python stays on (fail-open) alongside the Windows lane.
+    "install.ps1 → installer": (["scripts/install.ps1"], _lanes(python=True, installer=True)),
+    "installer test → installer": (
+        ["scripts/tests/test-install-ps1-longpath.ps1"],
+        _lanes(python=True, installer=True),
+    ),
+    "python source alone → no installer lane": (["run_agent.py"], _lanes(python=True, scan=True)),
     # Unknown top-level file keeps Python on rather than risk a silent skip.
     "unknown toplevel → python": (["Makefile"], _lanes(python=True)),
     "mixed docs+python → python": (["README.md", "agent/x.py"], _lanes(python=True, scan=True)),

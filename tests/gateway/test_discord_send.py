@@ -48,6 +48,41 @@ import plugins.platforms.discord.adapter as discord_adapter_module  # noqa: E402
 from plugins.platforms.discord.adapter import DiscordAdapter  # noqa: E402
 
 
+@pytest.mark.asyncio
+async def test_send_rejects_whitespace_and_records_failed_final_reply(
+    caplog, monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("DISCORD_MISSED_MESSAGE_BACKFILL", "true")
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    channel = SimpleNamespace(send=AsyncMock())
+    get_channel = MagicMock(return_value=channel)
+    adapter._client = SimpleNamespace(
+        get_channel=get_channel,
+        fetch_channel=AsyncMock(),
+    )
+    with caplog.at_level("WARNING"):
+        result = await adapter.send(
+            "555",
+            "  \n\t ",
+            reply_to="123",
+            metadata={"notify": True},
+        )
+
+    assert result.success is False
+    assert result.error == "Refusing to send empty message"
+    get_channel.assert_not_called()
+    channel.send.assert_not_awaited()
+    row = adapter._with_discord_recovery_db(
+        lambda conn: conn.execute(
+            "SELECT status, replied, outage_response, response_message_id "
+            "FROM discord_messages WHERE message_id='123'"
+        ).fetchone()
+    )
+    assert tuple(row) == ("failed", 0, 0, None)
+    assert "Dropped empty message to chat=555" in caplog.text
+
+
 @pytest.fixture(autouse=True)
 def _isolate_discord_channel_policy(monkeypatch):
     """Keep local gateway credentials/config from affecting unit policy tests."""

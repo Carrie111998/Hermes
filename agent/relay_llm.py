@@ -463,15 +463,6 @@ def _logical_parent(
                         "hermes.call_role": str(
                             (metadata or {}).get("call_role") or "primary"
                         ),
-                        "hermes.provider": str(
-                            (metadata or {}).get("provider") or "unknown"
-                        ),
-                        "hermes.model": str(
-                            (metadata or {}).get("model") or "unknown"
-                        ),
-                        "hermes.api_mode": str(
-                            (metadata or {}).get("api_mode") or "unknown"
-                        ),
                     },
                 )
                 turn.logical_llm_calls[request_id] = handle
@@ -540,6 +531,9 @@ def _complete_logical(
     logical: tuple[relay_runtime.RelayTurnContext, Any, str] | None,
     *,
     outcome: str,
+    model_name: str | None = None,
+    provider_name: str | None = None,
+    response_model_name: str | None = None,
 ) -> None:
     if logical is None:
         return
@@ -554,11 +548,16 @@ def _complete_logical(
         if lease.session is None:
             return
         try:
+            output: dict[str, Any] = {"outcome": outcome}
+            if model_name is not None and provider_name is not None:
+                output.update({"model": model_name, "provider": provider_name})
+                if response_model_name is not None:
+                    output["response_model"] = response_model_name
             lease.host.run_in_session(
                 lease.session,
                 lease.host.relay.scope.pop,
                 handle,
-                output={"outcome": outcome},
+                output=output,
                 metadata={
                     relay_runtime.RUNTIME_SCHEMA_KEY: relay_runtime.RUNTIME_SCHEMA_VERSION,
                     relay_runtime.RUNTIME_INSTANCE_KEY: lease.host.runtime_id,
@@ -577,7 +576,14 @@ def _complete_logical(
                 turn.logical_llm_calls.pop(request_id, None)
 
 
-def complete_logical_call(api_request_id: str, *, outcome: str) -> None:
+def complete_logical_call(
+    api_request_id: str,
+    *,
+    outcome: str,
+    model_name: str | None = None,
+    provider_name: str | None = None,
+    response_model_name: str | None = None,
+) -> None:
     """Complete the active turn's logical LLM call after caller validation."""
     turn = relay_runtime.active_turn()
     if turn is None or not api_request_id:
@@ -585,7 +591,13 @@ def complete_logical_call(api_request_id: str, *, outcome: str) -> None:
     with turn.logical_llm_lock:
         handle = turn.logical_llm_calls.get(api_request_id)
     if handle is not None:
-        _complete_logical((turn, handle, api_request_id), outcome=outcome)
+        _complete_logical(
+            (turn, handle, api_request_id),
+            outcome=outcome,
+            model_name=model_name,
+            provider_name=provider_name,
+            response_model_name=response_model_name,
+        )
 
 
 def _jsonable(value: Any) -> Any:
