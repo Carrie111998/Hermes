@@ -830,7 +830,7 @@ def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
     assert captured["reasoning_config"] == expected_reasoning
 
 
-@pytest.mark.parametrize("provider", ["copilot", "github-copilot", "copilot-acp"])
+@pytest.mark.parametrize("provider", ["copilot", "github-copilot"])
 def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
     monkeypatch, provider
 ):

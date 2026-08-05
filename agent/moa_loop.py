@@ -1725,8 +1725,9 @@ class MoAChatCompletions:
         if (
             _agent is not None
             and getattr(_agent, "_is_user_initiated_turn", False)
-            and _normalize_aux_provider(str(agg_runtime.get("provider") or ""))
-            in ("copilot", "copilot-acp")
+            and _normalize_aux_provider(
+                str(agg_runtime.get("provider") or "")
+            ) == "copilot"
         ):
             extra_headers = dict(extra_headers or {})
             extra_headers["x-initiator"] = "user"
