@@ -64,6 +64,7 @@ import {
   localProfileEntry,
   modeIsRemoteLike,
   normalizeRemoteBaseUrl,
+  normalizeRemoteProfile,
   normalizeSshConfig,
   normAuthMode,
   pathWithGlobalRemoteProfile,
@@ -6835,6 +6836,7 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
       authMode?: string
       token?: object
       org?: string
+      remoteProfile?: string
       savedSsh?: object
     } = {
       mode: modeIsRemoteLike(entry.mode) ? entry.mode : 'local'
@@ -6858,6 +6860,12 @@ function sanitizeConnectionProfiles(raw: Record<string, any>) {
 
     if ((entry as any).token && typeof entry.token === 'object') {
       cleaned.token = entry.token
+    }
+
+    const remoteProfile = normalizeRemoteProfile(entry.remoteProfile)
+
+    if (remoteProfile) {
+      cleaned.remoteProfile = remoteProfile
     }
 
     // Preserve the Hermes Cloud org tag on cloud-mode entries so Settings can
@@ -7010,6 +7018,7 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
     cloudOrg: mode === 'cloud' ? String(block.org || '') : '',
     remoteTokenPreview: tokenPreview(remoteToken),
     remoteTokenSet: Boolean(remoteToken),
+    remoteProfile: modeIsRemoteLike(mode) ? normalizeRemoteProfile(block.remoteProfile) || '' : '',
     sshHost: (ssh || savedSsh)?.host || '',
     sshUser: (ssh || savedSsh)?.user || '',
     sshPort: (ssh || savedSsh)?.port || null,
@@ -7028,12 +7037,12 @@ async function sanitizeDesktopConnectionConfig(config = readDesktopConnectionCon
 // `org` (optional) is the Hermes Cloud org slug/id the instance was discovered
 // under — persisted so Settings can reopen into the same org; omitted from the
 // block when empty so plain remote connections stay unchanged.
-function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
+function buildRemoteBlock(remoteUrl, authMode, token, org?: string, remoteProfile?: string) {
   if (authMode !== 'oauth' && !decryptDesktopSecret(token)) {
     throw new Error('Remote gateway session token is required.')
   }
 
-  const block: { url: string; authMode: string; token: object; org?: string } = {
+  const block: { url: string; authMode: string; token: object; org?: string; remoteProfile?: string } = {
     url: normalizeRemoteBaseUrl(remoteUrl),
     authMode,
     token
@@ -7043,6 +7052,12 @@ function buildRemoteBlock(remoteUrl, authMode, token, org?: string) {
 
   if (orgValue) {
     block.org = orgValue
+  }
+
+  const remoteProfileValue = normalizeRemoteProfile(remoteProfile)
+
+  if (remoteProfileValue) {
+    block.remoteProfile = remoteProfileValue
   }
 
   return block
@@ -7077,6 +7092,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
   // (switching cloud→remote drops it), so it stays unset unless mode is cloud.
   const cloudOrg = mode === 'cloud' ? String(input.cloudOrg ?? existingBlock.org ?? '').trim() : ''
   const incomingToken = typeof input.remoteToken === 'string' ? input.remoteToken.trim() : ''
+  const remoteProfile = input.remoteProfile ?? existingBlock.remoteProfile
 
   const nextToken = incomingToken
     ? persistToken
@@ -7107,7 +7123,7 @@ function coerceDesktopConnectionConfig(input: any = {}, existing = readDesktopCo
     const profiles = { ...(existing.profiles || {}) }
 
     if (remoteLike) {
-      profiles[key] = { mode, ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg) }
+      profiles[key] = { mode, ...buildRemoteBlock(remoteUrl, authMode, nextToken, cloudOrg, remoteProfile) }
     } else {
       const localEntry = localProfileEntry(rawExistingBlock)
 
@@ -7177,7 +7193,8 @@ async function buildRemoteConnection(
   source,
   remoteHost?,
   remoteKind = 'url',
-  remoteIdentity?
+  remoteIdentity?,
+  remoteProfile?
 ) {
   const baseUrl = normalizeRemoteBaseUrl(rawUrl)
   // For token/oauth remotes the meaningful host is the real backend URL; for
@@ -7234,6 +7251,7 @@ async function buildRemoteConnection(
       remoteHost: host || undefined,
       remoteIdentity,
       remoteKind,
+      remoteProfile: normalizeRemoteProfile(remoteProfile) || undefined,
       // No static token in OAuth mode; REST is cookie-authed via the partition.
       token: null,
       wsUrl: buildGatewayWsUrlWithTicket(baseUrl, ticket)
@@ -7255,6 +7273,7 @@ async function buildRemoteConnection(
     remoteHost: host || undefined,
     remoteIdentity,
     remoteKind,
+    remoteProfile: normalizeRemoteProfile(remoteProfile) || undefined,
     token,
     wsUrl: buildGatewayWsUrl(baseUrl, token)
   }
@@ -7566,7 +7585,9 @@ async function resolveRemoteBackend(profile) {
       token,
       'profile',
       undefined,
-      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url'
+      config.profiles?.[connectionScopeKey(profile)]?.mode === 'cloud' ? 'cloud' : 'url',
+      undefined,
+      override.remoteProfile
     )
   }
 
@@ -8005,10 +8026,13 @@ function primaryProfileKey() {
 
 // Options describing the current connection setup for `resolveProfileBackendRoute`.
 function profileRouteOptions(profile) {
+  const override = profileRemoteOverride(readDesktopConnectionConfig(), profile)
+
   return {
     globalRemote: globalRemoteActive(),
     primaryProfile: primaryProfileKey(),
-    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile))
+    profileRemoteOverride: Boolean(profileHasRemoteOverride(profile)),
+    remoteProfile: override?.remoteProfile
   }
 }
 
@@ -8418,6 +8442,8 @@ async function startHermes() {
         remoteHost: remote.remoteHost,
         remoteKind: remote.remoteKind,
         remoteHermesVersion: remote.remoteHermesVersion,
+        profile: primaryProfileKey(),
+        remoteProfile: remote.remoteProfile,
         token: remote.token,
         wsUrl: remote.wsUrl,
         logs: hermesLog.slice(-80),
