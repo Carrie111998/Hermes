@@ -317,8 +317,27 @@ def _disable_nagle(ws: Any) -> None:
         _log.debug("ws TCP_NODELAY skip: %s", exc)
 
 
+def _bind_connection_identity(request: dict, info: dict | None) -> dict:
+    """Copy the server-verified identity over client-supplied RPC fields."""
+    if not info:
+        return request
+    params = dict(request.get("params") or {})
+    if info.get("user_id") == "server-internal":
+        params.pop("pty_user_id", None)
+        params.pop("pty_provider", None)
+    else:
+        params.update(
+            pty_user_id=str(info["user_id"]),
+            pty_provider=str(info.get("provider") or ""),
+        )
+    bound = dict(request)
+    bound["params"] = params
+    return bound
+
+
 async def handle_ws(
     ws: Any,
+    principal_info: dict | None = None,
     *,
     auth_identity: dict | None = None,
     subprotocol: str | None = None,
@@ -331,7 +350,12 @@ async def handle_ws(
     only identity authority for browser-controller registration. Existing
     callers (stdio-free harnesses, the embedded TUI child) omit it and get a
     ``None`` transport identity — unchanged behaviour.
+    
+    ``principal_info`` is retained for callers using the identity-binding
+    interface; dashboard callers also pass ``auth_identity`` so the verified
+    identity reaches the transport used by browser-control ownership checks.
     """
+    connection_identity = auth_identity if auth_identity is not None else principal_info
     peer = _ws_peer_label(ws)
     transport: WSTransport | None = None
     messages = 0
@@ -462,6 +486,9 @@ async def handle_ws(
                     _log.warning("ws parse-error reply send failed peer=%s", peer)
                     break
                 continue
+
+            if isinstance(req, dict):
+                req = _bind_connection_identity(req, connection_identity)
 
             # dispatch() may schedule long handlers on the pool; it returns
             # None in that case and the worker writes the response itself via
