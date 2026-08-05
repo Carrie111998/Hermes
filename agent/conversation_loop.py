@@ -931,6 +931,60 @@ def _compression_deferred_result(
     }
 
 
+def _fresh_tail_context_exhausted_result(
+    agent,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]],
+    api_call_count: int,
+    *,
+    attempted_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return a terminal result when protected recent context cannot fit.
+
+    Context engines such as LCM may preserve a fresh tail verbatim.  When the
+    engine reports that even forced overflow recovery is still over its assembly
+    cap, retrying the same request only burns compression attempts and repeats
+    the provider overflow.  Stop immediately with a handoff/new-session hint.
+    """
+    try:
+        agent._flush_status_buffer()
+    except Exception:
+        pass
+    token_hint = f" (~{attempted_tokens:,} tokens)" if attempted_tokens else ""
+    agent._vprint(
+        f"{agent.log_prefix}❌ Protected recent context is still too large after forced compression{token_hint}.",
+        force=True,
+    )
+    agent._vprint(
+        f"{agent.log_prefix}   💡 Start a fresh session or create a concise handoff; older details remain recoverable through context tools.",
+        force=True,
+    )
+    logger.error(
+        "%sContext overflow recovery failed because the protected fresh tail still exceeds the safe assembly budget%s.",
+        agent.log_prefix,
+        token_hint,
+    )
+    agent._persist_session(messages, conversation_history)
+    _final = (
+        "Context recovery failed: the protected recent context/tool-output tail "
+        "is still too large to fit safely after compression. Start a fresh "
+        "session or ask for a concise handoff before continuing."
+    )
+    return {
+        "final_response": _final,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": _final,
+        "partial": True,
+        "failed": True,
+        "compression_exhausted": True,
+        "context_handoff_required": True,
+        "fresh_tail_exhausted": True,
+        "session_id": agent.session_id,
+    }
+
+
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
     """Rewrite a cache-decorated system message in place, keeping its blocks.
 
@@ -1933,9 +1987,13 @@ def run_conversation(
         # relative to a recent real provider prompt that fit under threshold
         # (schema overhead / post-compaction over-count, #36718); (2) skip
         # while a same-session compression-failure cooldown is active; (3) then
-        # should_compress() — reusing the canonical threshold_tokens (output
-        # room already reserved by _compute_threshold_tokens) and its summary-
-        # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
+        # should_compress_request_pressure() — reusing the canonical
+        # threshold_tokens (output room already reserved by
+        # _compute_threshold_tokens) and its summary-LLM cooldown + anti-thrash
+        # guards (#11529) via the default delegate.  The message-aware hook lets
+        # alternative engines combine host pressure with their own
+        # eligible-backlog/protected-tail rules, preventing no-op retries when
+        # the engine has no material it can compact. compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
         _preflight_threshold = int(
@@ -1975,6 +2033,24 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _request_pressure_eligible = None
+        _request_pressure_hook = getattr(
+            _compressor, "should_compress_request_pressure", None
+        )
+        if callable(_request_pressure_hook):
+            try:
+                _request_pressure_eligible = _request_pressure_hook(
+                    messages,
+                    request_pressure_tokens,
+                )
+            except Exception:
+                logger.exception(
+                    "context engine should_compress_request_pressure failed; falling back to should_compress"
+                )
+        if _request_pressure_eligible is None:
+            _request_pressure_eligible = _compressor.should_compress(
+                request_pressure_tokens
+            )
         if (
             agent.compression_enabled
             and len(messages) > 1
@@ -1982,7 +2058,7 @@ def run_conversation(
             and not _preflight_compression_blocked
             and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and _request_pressure_eligible
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -2048,6 +2124,14 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
+                if getattr(_compressor, "_last_overflow_recovery_failed", False) is True:
+                    return _fresh_tail_context_exhausted_result(
+                        agent,
+                        messages,
+                        conversation_history,
+                        api_call_count,
+                        attempted_tokens=request_pressure_tokens,
+                    )
                 # Reset retry/empty-response state so the compacted request
                 # gets a fresh chance instead of inheriting stale recovery
                 # counters from the pre-compaction history.
@@ -4673,6 +4757,16 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
+                    if getattr(agent.context_compressor, "_last_overflow_recovery_failed", False) is True:
+                        return _fresh_tail_context_exhausted_result(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            attempted_tokens=estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            ),
+                        )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -4973,6 +5067,16 @@ def run_conversation(
                         agent._persist_session(messages, conversation_history)
                         return _compression_deferred_result(
                             agent, messages, api_call_count
+                        )
+                    if getattr(agent.context_compressor, "_last_overflow_recovery_failed", False) is True:
+                        return _fresh_tail_context_exhausted_result(
+                            agent,
+                            messages,
+                            conversation_history,
+                            api_call_count,
+                            attempted_tokens=estimate_request_tokens_rough(
+                                api_messages, tools=agent.tools or None
+                            ),
                         )
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history

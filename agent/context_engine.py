@@ -346,6 +346,27 @@ class ContextEngine(ABC):
         """
         return False
 
+    # -- Optional: mid-turn request-pressure hook --------------------------
+
+    def should_compress_request_pressure(
+        self, messages: List[Dict[str, Any]], prompt_tokens: int
+    ) -> bool:
+        """Return True when a pre-API pressure check should compact now.
+
+        This hook is distinct from :meth:`should_compress_preflight`: preflight
+        is a turn-prologue/deferred-maintenance signal, while request pressure
+        fires immediately before an API call after tools, injected context, and
+        API-only overhead have been assembled.  The default delegates to the
+        legacy token-only :meth:`should_compress` so the built-in compressor and
+        older engines keep their existing behavior.
+
+        Context engines with protected/fresh-tail semantics should override this
+        to inspect ``messages`` and return False when the over-threshold request
+        has no eligible material to compact.  That prevents no-op compression
+        retries that cannot shrink the protected tail.
+        """
+        return self.should_compress(prompt_tokens)
+
     def get_automatic_compaction_status_message(
         self,
         *,

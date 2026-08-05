@@ -623,6 +623,85 @@ class TestPreflightCompression:
             "Pre-API compression" in msg for _ev, msg in status_messages
         )
 
+    def test_pre_api_pressure_uses_context_engine_message_aware_hook(self, agent):
+        """Engines can decline no-op pressure compaction for protected tails."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+        pressure_hook = MagicMock(return_value=False)
+        agent.context_compressor.should_compress_request_pressure = pressure_hook
+
+        history = [
+            {"role": "user", "content": "live task"},
+            {"role": "tool", "content": "fresh protected tool output"},
+        ]
+        ok_resp = _mock_response(content="No proactive no-op compression", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=140_000,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+
+        assert result["completed"] is True
+        pressure_hook.assert_called_once()
+        assert pressure_hook.call_args.args[1] >= 140_000
+        mock_compress.assert_not_called()
+        agent.context_compressor.should_compress.assert_not_called()
+
+    def test_context_overflow_stops_when_engine_reports_fresh_tail_exhausted(self, agent):
+        """Do not retry provider overflow after LCM says the protected tail cannot fit."""
+        err_400 = Exception(
+            "Error code: 400 - {'error': {'message': "
+            "\"This endpoint's maximum context length is 272000 tokens. "
+            "However, you requested about 286232 tokens.\", 'code': 400}}"
+        )
+        err_400.status_code = 400  # type: ignore[attr-defined]
+        agent.client.chat.completions.create.side_effect = [err_400]
+        agent.context_compressor._last_overflow_recovery_failed = False
+
+        history = [
+            {"role": "user", "content": "live task"},
+            {"role": "tool", "content": "oversized protected output"},
+        ]
+
+        def _compress_reports_tail_exhausted(msgs, *_args, **_kwargs):
+            agent.context_compressor._last_overflow_recovery_failed = True
+            return msgs, "compressed prompt"
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=10_000,
+            ),
+            patch(
+                "agent.conversation_loop.estimate_request_tokens_rough",
+                return_value=286_232,
+            ),
+            patch.object(agent, "_compress_context", side_effect=_compress_reports_tail_exhausted) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+
+        mock_compress.assert_called_once()
+        assert agent.client.chat.completions.create.call_count == 1
+        assert result["failed"] is True
+        assert result["context_handoff_required"] is True
+        assert result["fresh_tail_exhausted"] is True
+        assert "protected recent context" in result["final_response"]
+
 
     def test_preflight_compresses_oversized_history(self, agent):
         """When loaded history exceeds the model's context threshold, compress before API call."""
