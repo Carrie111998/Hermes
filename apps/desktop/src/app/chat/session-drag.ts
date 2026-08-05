@@ -28,7 +28,7 @@
 import type { PointerEvent as ReactPointerEvent } from 'react'
 
 import { queryAllVisible } from '@/components/pane-shell/pane-visibility'
-import { findGroup } from '@/components/pane-shell/tree/model'
+import { findGroup, findGroupOfPane } from '@/components/pane-shell/tree/model'
 import {
   type DoubleTapContext,
   rectContains,
@@ -44,6 +44,7 @@ import {
   $treeDragging,
   type DropHint,
   isSessionStripPane,
+  reorderTreePane,
   revealTreePane,
   SESSION_TILE_DRAG
 } from '@/components/pane-shell/tree/store'
@@ -89,12 +90,21 @@ function chatZonePane(groupId: string): null | string {
 }
 
 /**
- * Begin dragging a session — a sidebar row OR a tile's own tab (same drop
+ * Begin dragging a session — a sidebar row OR a tile/workspace tab (same drop
  * language either way: stack, split, or composer link). Sub-threshold releases
  * stay ordinary clicks, so `opts.onTap` (activate the tile) and `opts.double`
- * (hide the tab bar) ride the tab's gestures; Esc aborts instantly. A stack/
- * split commits through `openSessionTile`, which OPENS a new tile from a sidebar
- * row and MOVES the existing one when its tab is the drag source.
+ * (hide the tab bar) ride the tab's gestures; Esc aborts instantly.
+ *
+ * Drop commits:
+ *   - **In-strip reorder** when the drag source is already a tab in that strip
+ *     (workspace or `session-tile:*`) → `reorderTreePane` (browser-tab order).
+ *     Session-tab chrome hijacks pointerdown via this resolver, so without this
+ *     path the generic pane reorder never runs and history tabs only "dock" to
+ *     limited targets (or the main tab no-ops via openSessionTile's selected
+ *     early-return).
+ *   - **Stack / split** from a sidebar row (or a tab torn onto another zone)
+ *     → `openSessionTile`.
+ *   - **Composer center** → `@session` link chip.
  */
 export function startSessionDrag(
   payload: SessionDragPayload,
@@ -111,13 +121,20 @@ export function startSessionDrag(
   // move before commit, so these always match the released-at position).
   let split: { anchor: string; before?: null | string; pos: TileDock } | null = null
   let link: null | string = null
+  let reorder: { groupId: string; paneId: string; before: null | string } | null = null
 
   // The drag SOURCE (sidebar row or tile tab). Captured synchronously — React
   // clears `currentTarget` after the pointerdown handler returns, but this runs
   // inside it. Dimmed while lifted so the source reads as "picked up" — the
   // same in-place feedback pane-tab drags use, replacing the old cursor chip.
-  const source = e.currentTarget
+  const source = e.currentTarget as HTMLElement | null
   const restoreOpacity = source?.style.opacity ?? ''
+  // Tab chrome sets data-tree-tab on the PaneTab (or an ancestor). Sidebar rows
+  // have none — they only stack/open, never strip-reorder.
+  const sourcePaneId =
+    source?.closest?.('[data-tree-tab]')?.getAttribute('data-tree-tab') ||
+    source?.getAttribute?.('data-tree-tab') ||
+    null
 
   startDragSession(e, {
     double: opts?.double,
@@ -149,6 +166,7 @@ export function startSessionDrag(
       if (!zone || !host) {
         split = null
         link = null
+        reorder = null
 
         return null
       }
@@ -157,14 +175,28 @@ export function startSessionDrag(
       const strip = strips.find(s => s.groupId === zone.id && rectContains(s.rect, x, y))
 
       if (strip) {
-        // Exclude the tile's OWN tab from the slots so re-dropping it in its
-        // home strip reorders cleanly (a no-op for a sidebar-row drag).
-        const stack = slotBefore(strip.slots, x, `session-tile:${payload.id}`)
-        split = { anchor: host, before: stack.before, pos: 'center' }
-        link = null
+        // Prefer the real tab pane id (workspace OR session-tile:…) so the
+        // main tab is excluded from slot geometry the same way tiles are.
+        const excludeId = sourcePaneId ?? `session-tile:${payload.id}`
+        const stack = slotBefore(strip.slots, x, excludeId)
+        const tree = $layoutTree.get()
+        const home = sourcePaneId && tree ? findGroupOfPane(tree, sourcePaneId) : null
+
+        // Already a tab in this strip → browser-style reorder (not openSessionTile).
+        if (sourcePaneId && home?.id === strip.groupId) {
+          reorder = { groupId: strip.groupId, paneId: sourcePaneId, before: stack.before }
+          split = null
+          link = null
+        } else {
+          reorder = null
+          split = { anchor: host, before: stack.before, pos: 'center' }
+          link = null
+        }
 
         return { kind: 'group', groupId: zone.id, groupIds: [zone.id], pos: 'center', stack }
       }
+
+      reorder = null
 
       // The composer (and everything in it) is always the link/attach drop;
       // elsewhere the shared radial targeting decides center vs edge.
@@ -183,6 +215,22 @@ export function startSessionDrag(
     },
 
     onCommit() {
+      // Capture for TS control-flow narrowing: callbacks (filter) would
+      // otherwise see `reorder` as still possibly null (TS18047).
+      const activeReorder = reorder
+      if (activeReorder) {
+        const tree = $layoutTree.get()
+        const panes = tree ? (findGroup(tree, activeReorder.groupId)?.panes ?? []) : []
+        const others = panes.filter(id => id !== activeReorder.paneId)
+        const toIndex = activeReorder.before ? others.indexOf(activeReorder.before) : others.length
+
+        if (toIndex >= 0) {
+          reorderTreePane(activeReorder.groupId, activeReorder.paneId, toIndex)
+        }
+
+        return
+      }
+
       if (split) {
         openSessionTile(payload.id, split.pos, split.anchor, split.before)
         // A tile for this session may already exist (openSessionTile is

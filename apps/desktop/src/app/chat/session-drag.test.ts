@@ -2,7 +2,8 @@ import type { PointerEvent as ReactPointerEvent } from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { group } from '@/components/pane-shell/tree/model'
-import { $layoutTree } from '@/components/pane-shell/tree/store'
+import { $layoutTree, reorderTreePane } from '@/components/pane-shell/tree/store'
+import type * as TreeStoreModule from '@/components/pane-shell/tree/store'
 import { openSessionTile } from '@/store/session-states'
 
 import { requestComposerInsertRefs } from './composer/focus'
@@ -17,9 +18,18 @@ import { startSessionDrag } from './session-drag'
 
 vi.mock('@/store/session-states', () => ({ openSessionTile: vi.fn() }))
 vi.mock('./composer/focus', () => ({ requestComposerInsertRefs: vi.fn() }))
+vi.mock('@/components/pane-shell/tree/store', async importActual => {
+  const actual = await importActual<typeof TreeStoreModule>()
+
+  return {
+    ...actual,
+    reorderTreePane: vi.fn(actual.reorderTreePane)
+  }
+})
 
 const ZONE = { left: 0, top: 0, right: 1000, bottom: 800 }
 const COMPOSER = { left: 100, top: 700, right: 900, bottom: 780 }
+const STRIP = { left: 0, top: 0, right: 1000, bottom: 40 }
 
 const stubRect = (el: Element, box: { left: number; top: number; right: number; bottom: number }) => {
   el.getBoundingClientRect = () =>
@@ -109,5 +119,93 @@ describe('session drop targeting across stacked tabs', () => {
 
     expect(requestComposerInsertRefs).not.toHaveBeenCalled()
     expect(openSessionTile).not.toHaveBeenCalled()
+  })
+})
+
+describe('session tab strip reorder', () => {
+  it('reorders an existing tab via reorderTreePane instead of openSessionTile', () => {
+    document.body.innerHTML = `
+      <div data-tree-group="g1">
+        <div data-zone-tabstrip="g1" id="strip">
+          <div data-tree-tab="workspace" id="tab-ws"></div>
+          <div data-tree-tab="session-tile:a" id="tab-a"></div>
+          <div data-tree-tab="session-tile:b" id="tab-b"></div>
+        </div>
+        <div data-session-anchor="workspace" data-composer-target="main">
+          <div data-slot="composer-root"></div>
+        </div>
+      </div>
+    `
+
+    stubRect(document.querySelector('[data-tree-group]')!, ZONE)
+    stubRect(document.getElementById('strip')!, STRIP)
+    // Three equal tabs across the strip: mids at 100 / 300 / 500
+    stubRect(document.getElementById('tab-ws')!, { left: 0, top: 0, right: 200, bottom: 40 })
+    stubRect(document.getElementById('tab-a')!, { left: 200, top: 0, right: 400, bottom: 40 })
+    stubRect(document.getElementById('tab-b')!, { left: 400, top: 0, right: 600, bottom: 40 })
+    stubRect(document.querySelector('[data-session-anchor]')!, ZONE)
+    stubRect(document.querySelector('[data-slot="composer-root"]')!, COMPOSER)
+
+    $layoutTree.set(group(['workspace', 'session-tile:a', 'session-tile:b'], { id: 'g1' }))
+
+    const tabA = document.getElementById('tab-a')!
+    // Drag tab A to the left of workspace (x=50 → before workspace)
+    startSessionDrag(
+      { id: 'a', profile: 'default', title: 'A' },
+      {
+        button: 0,
+        clientX: 300,
+        clientY: 20,
+        currentTarget: tabA,
+        pointerId: 1
+      } as unknown as ReactPointerEvent<HTMLElement>
+    )
+    window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 50, clientY: 20 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 50, clientY: 20 }))
+
+    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(reorderTreePane).toHaveBeenCalledWith('g1', 'session-tile:a', 0)
+  })
+
+  it('reorders the workspace/main tab (selected session) instead of no-op openSessionTile', () => {
+    document.body.innerHTML = `
+      <div data-tree-group="g1">
+        <div data-zone-tabstrip="g1" id="strip">
+          <div data-tree-tab="workspace" id="tab-ws"></div>
+          <div data-tree-tab="session-tile:b" id="tab-b"></div>
+        </div>
+        <div data-session-anchor="workspace" data-composer-target="main">
+          <div data-slot="composer-root"></div>
+        </div>
+      </div>
+    `
+
+    stubRect(document.querySelector('[data-tree-group]')!, ZONE)
+    stubRect(document.getElementById('strip')!, STRIP)
+    stubRect(document.getElementById('tab-ws')!, { left: 0, top: 0, right: 200, bottom: 40 })
+    stubRect(document.getElementById('tab-b')!, { left: 200, top: 0, right: 400, bottom: 40 })
+    stubRect(document.querySelector('[data-session-anchor]')!, ZONE)
+    stubRect(document.querySelector('[data-slot="composer-root"]')!, COMPOSER)
+
+    $layoutTree.set(group(['workspace', 'session-tile:b'], { id: 'g1' }))
+
+    const tabWs = document.getElementById('tab-ws')!
+    // Drag workspace past B (x=350 → append)
+    startSessionDrag(
+      { id: 'main-session', profile: 'default', title: 'Main' },
+      {
+        button: 0,
+        clientX: 100,
+        clientY: 20,
+        currentTarget: tabWs,
+        pointerId: 1
+      } as unknown as ReactPointerEvent<HTMLElement>
+    )
+    window.dispatchEvent(new MouseEvent('pointermove', { bubbles: true, clientX: 350, clientY: 20 }))
+    window.dispatchEvent(new MouseEvent('pointerup', { bubbles: true, clientX: 350, clientY: 20 }))
+
+    // openSessionTile would early-return for the selected main session — reorder must win.
+    expect(openSessionTile).not.toHaveBeenCalled()
+    expect(reorderTreePane).toHaveBeenCalledWith('g1', 'workspace', 1)
   })
 })
