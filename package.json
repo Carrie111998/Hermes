@@ -51,7 +51,8 @@
     "yauzl": "^3.3.1",
     "protobufjs": "^8.7.1",
     "brace-expansion": "5.0.9",
-    "undici": "^6.28.0"
+    "undici": "^6.28.0",
+    "fast-uri": "^4.1.2"
   },
   "engines": {
     "node": ">=22.22.0"
