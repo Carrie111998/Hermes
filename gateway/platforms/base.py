@@ -5878,10 +5878,7 @@ class BasePlatformAdapter(ABC):
                 media_files, response = self.extract_media(response)
                 media_files, rejected_media = self.filter_media_delivery_paths_with_rejected(media_files)
                 if rejected_media:
-                    note = "[MEDIA paths were outside the delivery allowlist and were not attached: {}]"
-                    response = (response or "") + "\n" + note.format("; ".join(rejected_media[:3]))
-                    if len(rejected_media) > 3:
-                        response += f" (and {len(rejected_media) - 3} more)"
+                    response = (response or "") + "\n[MEDIA path was outside the delivery allowlist and was not attached]"
 
                 # Do NOT deduplicate MEDIA tags against prior turns here.
                 # The auto-append path in GatewayRunner._run_agent_inner already
