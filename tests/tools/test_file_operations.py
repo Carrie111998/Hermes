@@ -242,7 +242,11 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
-def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
+def make_real_subprocess_env(
+    cwd: str,
+    include_stderr: bool = False,
+    lossy_utf8: bool = False,
+) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 
     For tests that need the generated shell scripts to actually run
@@ -250,17 +254,26 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     intercepted by a bare MagicMock.  ``include_stderr`` folds stderr
     into ``output`` for tests that surface shell error text; leave it
     off for tests that parse structured stdout (e.g. find results).
+
+    ``lossy_utf8`` decodes exactly like ``LocalEnvironment`` does
+    (``encoding="utf-8", errors="replace"`` — see environments/local.py),
+    so undecodable bytes arrive as U+FFFD instead of raising.  Needed by
+    the tests that pin how ``_is_likely_binary`` reacts to those.
     """
     env = MagicMock()
     env.cwd = cwd
 
     def execute(command, **kwargs):
+        decode_kwargs = (
+            {"encoding": "utf-8", "errors": "replace"} if lossy_utf8 else {}
+        )
         completed = subprocess.run(
             command,
             shell=True,
             text=True,
             capture_output=True,
             input=kwargs.get("stdin_data"),
+            **decode_kwargs,
         )
         output = completed.stdout
         if include_stderr:
@@ -328,6 +341,20 @@ class TestShellFileOpsHelpers:
         assert file_ops._is_likely_binary("code.py") is False
         assert file_ops._is_likely_binary("readme.md") is False
 
+    def test_is_likely_binary_ignores_truncated_char_at_sample_end(self, file_ops):
+        """A U+FFFD produced by the probe's own byte cut is not evidence.
+
+        The sample comes from ``head -c 1000`` — a byte cut.  When it lands
+        inside a multibyte codepoint the terminal's errors="replace" decode
+        leaves a trailing U+FFFD.  That artifact belongs to the probe, not
+        to the file.
+        """
+        assert file_ops._is_likely_binary("szene.fountain", "Renie sagt: h�") is False
+
+    def test_is_likely_binary_still_flags_undecodable_bytes_in_body(self, file_ops):
+        """The real guard stays: lossy bytes mid-sample mean don't touch it."""
+        assert file_ops._is_likely_binary("blob.txt", "head��tail") is True
+
 
     def test_cwd_fallback_to_slash(self):
         env = MagicMock(spec=[])  # no cwd attribute
@@ -362,6 +389,72 @@ class TestShellFileOpsHelpers:
         assert "\x1b]" not in result.content
         assert "\x07" not in result.content
         assert "1|print('ok')" in result.content
+
+    def test_read_file_raw_reads_utf8_split_by_the_sample_byte_cut(self, tmp_path):
+        """German prose stays readable when byte 1000 lands inside a char.
+
+        Real-world repro: a .fountain screenplay whose umlaut straddles the
+        ``head -c 1000`` boundary was reported as "Binary file — cannot
+        display as text" by both read_file and patch, so the agent could
+        neither read nor edit it.
+        """
+        target = tmp_path / "szene.fountain"
+        content = "x" * 999 + "ä" + "\n\nRENIE\n    Wo ist Stephen?\n"
+        target.write_bytes(content.encode("utf-8"))
+        # Pin the premise: the cut really does split the 'ä'.
+        assert len(content.encode("utf-8")[:1000].decode("utf-8", "replace")) == 1000
+
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), lossy_utf8=True)
+        )
+        result = ops.read_file_raw(str(target))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert result.content == content
+
+    def test_read_file_raw_refuses_a_bad_byte_sitting_on_the_sample_cut(self, tmp_path):
+        """A real undecodable byte at the cut is not a truncation artifact.
+
+        Both produce a single trailing U+FFFD, so the decoded sample alone
+        cannot tell them apart. Reading this file as text would put U+FFFD
+        into the content and a write-back would destroy the original byte —
+        exactly the corruption the binary guard exists to prevent.
+        """
+        target = tmp_path / "sabotage.txt"
+        target.write_bytes(b"a" * 999 + b"\xff" + b"tail\n" * 50)
+
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), lossy_utf8=True)
+        )
+        result = ops.read_file_raw(str(target))
+
+        assert result.is_binary is True
+        assert result.content in (None, "")
+
+    def test_read_file_raw_refuses_a_bad_byte_the_file_ends_on(self, tmp_path):
+        """Nothing was cut off, so the marker cannot be a cut artifact."""
+        target = tmp_path / "ends_badly.txt"
+        target.write_bytes(b"a" * 999 + b"\xff")
+
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), lossy_utf8=True)
+        )
+
+        assert ops.read_file_raw(str(target)).is_binary is True
+
+    def test_read_file_raw_still_refuses_a_file_with_undecodable_bytes(self, tmp_path):
+        """The corruption guard survives: lossy content is read-only."""
+        target = tmp_path / "mixed.txt"
+        target.write_bytes(b"header\n" + b"\xff\xfe\xff\xfe" + b"tail\n" * 40)
+
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), lossy_utf8=True)
+        )
+        result = ops.read_file_raw(str(target))
+
+        assert result.is_binary is True
+        assert "Binary file" in result.error
 
     def test_read_file_raw_strips_leaked_terminal_fence_markers(self, mock_env):
         leaked = (

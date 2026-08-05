@@ -903,7 +903,21 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # Except at the very end: callers sample with ``head -c N``, a
+            # BYTE cut, so a multibyte codepoint straddling the limit decodes
+            # to a trailing U+FFFD that the probe itself created. Judging the
+            # file by that artifact made ordinary UTF-8 prose both unreadable
+            # and unpatchable whenever byte N landed inside an umlaut \u2014 which
+            # non-ASCII text hits constantly. Only U+FFFD in the body is
+            # evidence of genuinely undecodable bytes.
+            probe = content_sample[:1000]
+            body = probe.rstrip("\ufffd")
+            if "\ufffd" in body:
+                return True
+            if body != probe and self._cut_marker_is_a_real_bad_byte(
+                path, probe
+            ):
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
@@ -911,6 +925,30 @@ class ShellFileOperations(FileOperations):
         
         return False
     
+    def _cut_marker_is_a_real_bad_byte(self, path: str, probe: str) -> bool:
+        """Decide whether a U+FFFD on the sample's cut is genuine.
+
+        A trailing marker has two possible causes and the decoded text
+        cannot tell them apart: the byte cut split a codepoint (harmless,
+        the probe's own doing), or an undecodable byte happens to sit on
+        the cut (real, and reading the file would corrupt it on write-back).
+
+        So look past the boundary. Four more bytes is the most a UTF-8
+        codepoint can need: a split one completes and its marker vanishes,
+        while a bad byte moves into the body where it is unmistakable. If
+        the longer read returns nothing new the file simply ended there —
+        nothing was cut off, so the marker was never an artifact.
+        """
+        result = self._exec(
+            f"head -c 1004 {self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        if result.exit_code != 0:
+            return True  # can't confirm it's harmless — stay read-only
+        extended = _strip_terminal_fence_leaks(result.stdout)
+        if extended == probe:
+            return True
+        return "�" in extended.rstrip("�")
+
     def _is_image(self, path: str) -> bool:
         """Check if file is an image we can return as base64."""
         ext = os.path.splitext(path)[1].lower()
