@@ -2,6 +2,7 @@ import { atom } from 'nanostores'
 
 import { persistString, storedString } from '@/lib/storage'
 import type { ModelOptionProvider } from '@/types/hermes'
+
 import { $gateway } from './gateway'
 import { $activeGatewayProfile, normalizeProfileKey } from './profile'
 
@@ -90,7 +91,8 @@ let saveChain: Promise<void> = Promise.resolve()
 
 function enqueueBackendSave(keys: Set<string>): void {
   const gateway = $gateway.get()
-  if (!gateway) return
+
+  if (!gateway) {return}
   const snapshot = [...keys]
   saveChain = saveChain.then(async () => {
     try {
@@ -119,18 +121,23 @@ type BackendVisibility =
 
 async function loadVisibleFromBackend(): Promise<BackendVisibility | null> {
   const gateway = $gateway.get()
-  if (!gateway) return null
+
+  if (!gateway) {return null}
+
   try {
     const result = await gateway.request<{ keys: string[]; customized?: boolean }>(
       'model_visibility.get',
       { profile: visibilityProfile() }
     )
+
     if (result && Array.isArray(result.keys)) {
       const keys = new Set(result.keys.filter((x): x is string => typeof x === 'string'))
+
       // A missing file is reported as `customized: false`; treat that as unset
       // so an empty array is NOT conflated with the user hiding everything.
       return result.customized === false ? { kind: 'unset' } : { kind: 'customized', keys }
     }
+
     return null
   } catch {
     return null
@@ -141,9 +148,12 @@ async function loadVisibleFromBackend(): Promise<BackendVisibility | null> {
  *  set, or null if there was nothing to migrate. */
 function migrateFromLocalStorage(): Set<string> | null {
   const raw = storedString(STORAGE_KEY)
-  if (!raw) return null
+
+  if (!raw) {return null}
+
   try {
     const parsed = JSON.parse(raw)
+
     return Array.isArray(parsed) ? new Set(parsed.filter((x): x is string => typeof x === 'string')) : null
   } catch {
     return null
@@ -156,12 +166,14 @@ function migrateFromLocalStorage(): Set<string> | null {
  *  active profile changed in the meantime. */
 export async function syncVisibleModelsForProfile(profile: string): Promise<void> {
   const backend = await loadVisibleFromBackend()
+
   if (backend !== null) {
     // A profile switch landed while we were in flight — don't clobber the new
     // profile's freshly-loaded (or user-edited) state.
     if (normalizeProfileKey($activeGatewayProfile.get()) !== normalizeProfileKey(profile)) {
       return
     }
+
     if (backend.kind === 'customized') {
       $visibleModels.set(backend.keys)
       persistString(STORAGE_KEY, JSON.stringify([...backend.keys]))
@@ -170,14 +182,17 @@ export async function syncVisibleModelsForProfile(profile: string): Promise<void
       $visibleModels.set(null)
       persistString(STORAGE_KEY, '')
     }
+
     return
   }
 
   const local = migrateFromLocalStorage()
+
   if (local !== null) {
     // Migrate localStorage data to backend (fire-and-forget, serialized)
     enqueueBackendSave(local)
     $visibleModels.set(local)
+
     return
   }
 
@@ -189,6 +204,7 @@ export async function syncVisibleModelsForProfile(profile: string): Promise<void
  *  profile's preferences never bleed into another. Returns an unsubscribe fn. */
 export function watchVisibleModels(): () => void {
   void syncVisibleModelsForProfile($activeGatewayProfile.get())
+
   return $activeGatewayProfile.subscribe(profile => {
     void syncVisibleModelsForProfile(profile)
   })
