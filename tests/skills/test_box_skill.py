@@ -200,6 +200,7 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "Do you want me to create or open" in ccg
     assert "I added the credentials" in ccg
     assert "Do not tell the user to manually run Box CLI commands" in skill
+    assert "automatically create and configure the App User" in ccg
     assert "uses POSIX shell syntax" in rest
 
 
@@ -223,6 +224,8 @@ def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
     assert "Manage users is required to create the App User" in ccg
     assert "**Generate User Access Tokens**" in ccg
     assert 'box users:create "Hermes Production Agent" --app-user' in ccg
+    assert "create the dedicated App User without asking for confirmation" in ccg
+    assert "get approval: it creates a new Box identity" not in ccg
     assert "Do not assume an App User confirmation email is delivered or required" in ccg
     assert "continue when the returned actor ID is the new App User ID" in ccg
     assert "user_email_confirmation_required" in ccg

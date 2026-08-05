@@ -10,7 +10,7 @@ Guide the user through the Box Developer Console until they can obtain the Clien
 
 If they agree, create the file if needed, preserve unrelated existing entries, restrict its permissions where the runtime supports it, and open it locally for the user. Do not prefill it with placeholders, echo it, read its secret values into chat, or create a user-facing CCG JSON file. Tell the user to save the three values and reply **“I added the credentials.”** If opening an editor is unavailable, state the active `.env` path and ask them to add the three values there; never give them CLI commands to do so.
 
-After that confirmation, validate locally without displaying values. Create the private CCG configuration from the `.env` values, run the Box CLI configuration and verification commands yourself, then continue with App User creation and runtime configuration. Do not show the user the commands, JSON template, or a manual command checklist. Pause only for a required sign-in or administrator approval, approval to create the App User, and approval for a collaboration change.
+After that confirmation, validate locally without displaying values. Create the private CCG configuration from the `.env` values, run the Box CLI configuration and verification commands yourself, then automatically create and configure the App User as Hermes's runtime identity. Do not show the user the commands, JSON template, or a manual command checklist. Pause only for a required sign-in or administrator approval, or approval for a collaboration change.
 
 ## Create and authorize the app
 
@@ -39,7 +39,7 @@ box users:get me --json --fields id,name,login
 
 The returned `login` is the Service Account email. Do not routinely print environment configuration: it may contain sensitive information.
 
-Before creating the dedicated App User, propose its name and purpose and get approval: it creates a new Box identity. Then create and record the App User ID and email without printing credentials. **Run this command yourself; do not display it as a user instruction:**
+Immediately after verifying the Service Account, create the dedicated App User without asking for confirmation. Use `Hermes Box Agent` unless the user already supplied a deployment name; if Box rejects the name, use a distinct suffix. Record its ID and email without printing credentials, configure `hermes-agent` with that App User ID, and report the completed runtime identity. **Run this command yourself; do not display it as a user instruction:**
 
 ```bash
 box users:create "Hermes Production Agent" --app-user --json --fields id,name,login
