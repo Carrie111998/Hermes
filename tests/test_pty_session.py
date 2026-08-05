@@ -221,6 +221,65 @@ async def test_termination_waits_for_in_progress_attach_then_closes_socket():
 
 
 @pytest.mark.asyncio
+async def test_concurrent_close_callers_wait_for_shared_cleanup():
+    from hermes_cli.pty_session import PtySession
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingCloseWS(FakeWS):
+        async def close(self, code=1000, reason=""):
+            close_started.set()
+            await release_close.wait()
+            await super().close(code=code, reason=reason)
+
+    bridge = FakeBridge([b""])
+    session = PtySession("token", bridge, buffer_cap=1024, read_timeout=0.01)
+    await session.start()
+    await session.attach(BlockingCloseWS())
+    first = asyncio.create_task(session.close())
+    await close_started.wait()
+    second = asyncio.create_task(session.close())
+    await asyncio.sleep(0)
+    assert second.done() is False
+
+    release_close.set()
+    await asyncio.gather(first, second)
+    assert bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_caller_does_not_abandon_shared_cleanup():
+    from hermes_cli.pty_session import PtySession
+
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingCloseWS(FakeWS):
+        async def close(self, code=1000, reason=""):
+            close_started.set()
+            await release_close.wait()
+            await super().close(code=code, reason=reason)
+
+    bridge = FakeBridge([b""])
+    session = PtySession("token", bridge, buffer_cap=1024, read_timeout=0.01)
+    await session.start()
+    await session.attach(BlockingCloseWS())
+    first = asyncio.create_task(session.close())
+    await close_started.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+
+    retry = asyncio.create_task(session.close())
+    await asyncio.sleep(0)
+    assert retry.done() is False
+    release_close.set()
+    await retry
+    assert bridge.closed is True
+
+
+@pytest.mark.asyncio
 async def test_terminated_token_rejects_late_replacement_spawn():
     reg = make_registry()
 

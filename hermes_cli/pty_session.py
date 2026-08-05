@@ -53,6 +53,7 @@ class PtySession:
         self._drain_task: Optional[asyncio.Task] = None
         self._lifecycle_lock = asyncio.Lock()
         self._closing = False
+        self._close_task: Optional[asyncio.Task[None]] = None
 
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
@@ -110,15 +111,7 @@ class PtySession:
         self.attached = False
         self.last_detached_at = time.monotonic()
 
-    async def close(self) -> None:
-        async with self._lifecycle_lock:
-            if self._closing:
-                return
-            self._closing = True
-            self.alive = False
-            ws = self._ws
-            self._ws = None
-            self.attached = False
+    async def _finish_close(self, ws) -> None:
         if ws is not None:
             try:
                 await ws.close(code=WS_CLOSE_TERMINATED)
@@ -136,6 +129,21 @@ class PtySession:
             await asyncio.to_thread(self.bridge.close)
         except Exception:
             pass
+
+    async def close(self) -> None:
+        async with self._lifecycle_lock:
+            task = self._close_task
+            if task is None:
+                self._closing = True
+                self.alive = False
+                ws = self._ws
+                self._ws = None
+                self.attached = False
+                task = asyncio.create_task(self._finish_close(ws))
+                self._close_task = task
+        # Caller cancellation must not cancel process cleanup. Concurrent and
+        # retrying callers all wait for the same idempotent close operation.
+        await asyncio.shield(task)
 
 class RegistryFull(Exception):
     pass
