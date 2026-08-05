@@ -92,6 +92,42 @@ class TestBlueBubblesHelpers:
         assert api_get_paths == ["/api/v1/ping", "/api/v1/server/info"]
         assert api_post_paths == ["/api/v1/message/text"]
 
+    @pytest.mark.asyncio
+    async def test_send_reuses_live_gateway_adapter(self, monkeypatch):
+        from types import SimpleNamespace
+        from gateway.platforms.base import SendResult
+        from gateway.platforms.bluebubbles import BlueBubblesAdapter
+        from tools.send_message_tool import _send_bluebubbles
+
+        calls = []
+
+        class LiveAdapter:
+            async def send(self, chat_id, message):
+                calls.append((chat_id, message))
+                return SendResult(success=True, message_id="live-message")
+
+        runner = SimpleNamespace(adapters={Platform.BLUEBUBBLES: LiveAdapter()})
+        monkeypatch.setattr("gateway.run._gateway_runner_ref", lambda: runner)
+
+        async def fail_if_second_adapter_connects(self, *, start_webhook_listener=True):
+            raise AssertionError("standalone adapter must not start when a live adapter exists")
+
+        monkeypatch.setattr(BlueBubblesAdapter, "connect", fail_if_second_adapter_connects)
+
+        result = await _send_bluebubbles(
+            {"server_url": "http://localhost:1234", "password": "secret"},
+            "iMessage;-;user@example.com",
+            "hello live adapter",
+        )
+
+        assert result == {
+            "success": True,
+            "platform": "bluebubbles",
+            "chat_id": "iMessage;-;user@example.com",
+            "message_id": "live-message",
+        }
+        assert calls == [("iMessage;-;user@example.com", "hello live adapter")]
+
     def test_format_message_preserves_underscores_in_identifiers(self, monkeypatch):
         adapter = _make_adapter(monkeypatch)
         text = "Use /api_v2 with FEATURE_FLAG_NAME and config_file.json"

@@ -1938,6 +1938,33 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
 
 async def _send_bluebubbles(extra, chat_id, message):
     """Send via BlueBubbles iMessage server using the adapter's REST API."""
+    live_adapter = None
+    try:
+        from gateway.config import Platform
+        from gateway.run import _gateway_runner_ref
+
+        runner = _gateway_runner_ref()
+        if runner is not None:
+            live_adapter = runner.adapters.get(Platform.BLUEBUBBLES)
+    except Exception:
+        live_adapter = None
+
+    if live_adapter is not None:
+        try:
+            result = await live_adapter.send(chat_id, message)
+            if not result.success:
+                return _error(f"BlueBubbles send failed: {result.error}")
+            return {
+                "success": True,
+                "platform": "bluebubbles",
+                "chat_id": chat_id,
+                "message_id": result.message_id,
+            }
+        except Exception as e:
+            # Never fall through to a second adapter after a live send attempt:
+            # the remote request may have succeeded before the exception.
+            return _error(f"BlueBubbles live send failed: {e}")
+
     try:
         from gateway.platforms.bluebubbles import BlueBubblesAdapter, check_bluebubbles_requirements
         if not check_bluebubbles_requirements():
@@ -1956,7 +1983,12 @@ async def _send_bluebubbles(extra, chat_id, message):
             result = await adapter.send(chat_id, message)
             if not result.success:
                 return _error(f"BlueBubbles send failed: {result.error}")
-            return {"success": True, "platform": "bluebubbles", "chat_id": chat_id, "message_id": result.message_id}
+            return {
+                "success": True,
+                "platform": "bluebubbles",
+                "chat_id": chat_id,
+                "message_id": result.message_id,
+            }
         finally:
             await adapter.disconnect()
     except Exception as e:
