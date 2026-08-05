@@ -73,11 +73,18 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
         # it must not create resource-owning per-agent runtimes.
         available = True
         try:
-            engine = _load_engine_prototype_from_dir(child)
-            if engine is None:
+            prototype_key = str(child.resolve())
+            with _ENGINE_PROTOTYPES_LOCK:
+                prototype = _ENGINE_PROTOTYPES.get(prototype_key)
+                if prototype is None:
+                    prototype = _load_engine_prototype_from_dir(child)
+                    if prototype is not None:
+                        _ENGINE_PROTOTYPES[prototype_key] = prototype
+
+            if prototype is None:
                 available = False
-            elif hasattr(engine, "is_available"):
-                available = engine.is_available()
+            elif hasattr(prototype, "is_available"):
+                available = prototype.is_available()
         except Exception:
             available = False
 

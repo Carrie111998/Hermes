@@ -274,9 +274,14 @@ def test_discovery_checks_prototype_without_creating_or_leaking_runtime(tmp_path
 from agent.context_engine import ContextEngine
 
 factory_calls = 0
+prototype_calls = 0
 close_calls = 0
 
 class Engine(ContextEngine):
+    def __init__(self):
+        global prototype_calls
+        prototype_calls += 1
+
     @property
     def name(self): return 'test_discovery'
     def update_from_response(self, usage): pass
@@ -301,6 +306,7 @@ def register(ctx): ctx.register_context_engine(Engine())
     assert loader.discover_context_engines() == [("test_discovery", "", True)]
     assert loader.discover_context_engines() == [("test_discovery", "", True)]
     module = __import__("plugins.context_engine.test_discovery", fromlist=["*"])
+    assert module.prototype_calls == 1
     assert module.factory_calls == 0
     assert module.close_calls == 0
 
