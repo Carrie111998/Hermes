@@ -26,6 +26,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
+    AuxiliaryCompressionLimitError,
     AuxiliaryExplicitCancellation,
     _is_connection_error,
     aux_interrupt_protection,
@@ -2417,6 +2418,10 @@ class ContextCompressor(ContextEngine):
         # strictly better than discarding context for a transient blip
         # (#29559, #25585). Independent of abort_on_summary_failure.
         self._last_summary_network_failure: bool = False
+        # Set when a mandatory provider/output retention bound trips. This is
+        # terminal for the current compression attempt: committing a partial
+        # summary would violate atomic compaction and lose transcript context.
+        self._last_summary_limit_failure: bool = False
         # retrying on the main model, record the failure so gateway /
         # CLI callers can still warn the user even though compression
         # succeeded.  Silent recovery would hide the broken config.
@@ -3773,15 +3778,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "api_mode": self.api_mode,
                 },
                 "messages": [{"role": "user", "content": prompt}],
-                # NO max_tokens: the output cap must never truncate a summary.
-                # ``summary_budget`` is prompt-level guidance only ("Target ~N
-                # tokens" above). Most OpenAI-compatible wires already omit the
-                # param (see _build_call_kwargs), but the Anthropic Messages
-                # wire and NVIDIA NIM forward it — a hard cap there cut
-                # summaries mid-section (thinking models burn the cap on
-                # reasoning first), producing truncated/thinking-only
-                # summaries and compaction loops. Omitting lets the adapter
-                # fall back to the model's native output ceiling.
+                # The hard output ceiling is injected centrally by
+                # auxiliary_client._build_call_kwargs. Keep this compressor API
+                # prompt-guidance-only so direct test/plugin call shims do not
+                # mistake the safety cap for the summary target envelope.
                 # timeout resolved from auxiliary.compression.timeout config by call_llm
             }
             if self.summary_model:
@@ -3814,9 +3814,6 @@ This compaction should PRIORITISE preserving all information related to the focu
             finally:
                 self._record_aux_compression_call(
                     prompt_messages=call_kwargs["messages"],
-                    # Current main intentionally omits max_tokens from the aux
-                    # call (summary_budget is prompt-level guidance only) —
-                    # use .get() so the telemetry hook never breaks the call.
                     max_tokens=call_kwargs.get("max_tokens"),
                     duration_ms=int((time.monotonic() - _aux_call_start) * 1000),
                     aux_provider=_aux_provider,
@@ -3876,8 +3873,24 @@ This compaction should PRIORITISE preserving all information related to the focu
             self._last_summary_error = None
             self._last_summary_auth_failure = False
             self._last_summary_network_failure = False
+            self._last_summary_limit_failure = False
             return self._with_summary_prefix(summary)
         except Exception as e:
+            from agent.codex_runtime import CodexStreamLimitError
+
+            if isinstance(e, (AuxiliaryCompressionLimitError, CodexStreamLimitError)):
+                self._last_summary_limit_failure = True
+                self._last_summary_error = "compression output safety limit exceeded"
+                self._record_compression_failure_cooldown(
+                    _SUMMARY_FAILURE_COOLDOWN_SECONDS,
+                    self._last_summary_error,
+                )
+                logger.warning(
+                    "Context compression output safety limit exceeded; "
+                    "preserving transcript unchanged (error_class=%s)",
+                    type(e).__name__,
+                )
+                return None
             # ``call_llm`` raises ``RuntimeError`` for two very different cases:
             #   1. No provider configured ("No LLM provider configured ...") —
             #      a permanent misconfiguration, long cooldown is correct.
@@ -5985,8 +5998,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         self._last_aux_model_failure_model = None
         self._last_compress_aborted = False
         self._last_compression_made_progress = False
-        # NOTE: do NOT reset _last_summary_auth_failure or
-        # _last_summary_network_failure here.  These flags are set by
+        # NOTE: do NOT reset _last_summary_auth_failure,
+        # _last_summary_network_failure, or _last_summary_limit_failure here.
+        # These flags are set by
         # _generate_summary() on a terminal failure and are already cleared on
         # a successful summary.  Resetting them eagerly defeats the cooldown
         # protection: _generate_summary() returns None from the cooldown
@@ -6355,6 +6369,7 @@ This compaction should PRIORITISE preserving all information related to the focu
             self.abort_on_summary_failure
             or self._last_summary_auth_failure
             or self._last_summary_network_failure
+            or self._last_summary_limit_failure
         ):
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -6364,6 +6379,8 @@ This compaction should PRIORITISE preserving all information related to the focu
                 telemetry["failure_class"] = "summary_auth_failure"
             elif self._last_summary_network_failure:
                 telemetry["failure_class"] = "summary_network_failure"
+            elif self._last_summary_limit_failure:
+                telemetry["failure_class"] = "summary_output_limit"
             else:
                 telemetry["failure_class"] = "summary_generation_aborted"
             # Roll back the self-heal rehydration so this aborted attempt is a
@@ -6389,6 +6406,13 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "unchanged; the session was NOT rotated. This is "
                         "transient: retry with /compress once connectivity "
                         "recovers, or continue the conversation as-is.",
+                        n_skipped,
+                    )
+                elif self._last_summary_limit_failure:
+                    logger.warning(
+                        "Summary generation exceeded a mandatory output safety "
+                        "limit — aborting compression. %d message(s) preserved "
+                        "unchanged; the session was NOT rotated.",
                         n_skipped,
                     )
                 else:

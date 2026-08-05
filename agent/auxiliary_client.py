@@ -1173,6 +1173,25 @@ class _CodexCompletionsAdapter:
     def create(self, **kwargs) -> Any:
         messages = kwargs.get("messages", [])
         model = kwargs.get("model", self._model)
+        # Codex's backend rejects max_output_tokens/max_completion_tokens on
+        # the Responses wire. When an auxiliary caller supplies a chat-style
+        # cap (compression and MoA), consume it locally as strict retained SSE
+        # byte/item limits instead of forwarding an unsupported parameter.
+        raw_output_cap = kwargs.get("max_completion_tokens", kwargs.get("max_tokens"))
+        retained_stream_limits: Optional[dict[str, int]] = None
+        if raw_output_cap is not None:
+            try:
+                output_cap = int(raw_output_cap)
+            except (TypeError, ValueError, OverflowError):
+                output_cap = 0
+            if output_cap > 0:
+                retained_stream_limits = {
+                    "max_output_items": 256,
+                    "max_text_bytes": output_cap * 8,
+                    "max_commentary_bytes": output_cap * 8,
+                    "max_reasoning_bytes": output_cap * 16,
+                    "max_done_item_bytes": output_cap * 32,
+                }
 
         # Separate system/instructions from replayable conversation messages,
         # then route the rest through the SINGLE shared chat->Responses
@@ -1511,6 +1530,7 @@ class _CodexCompletionsAdapter:
                         event_stream,
                         model=str(resp_kwargs.get("model") or model),
                         on_event=_on_each_event,
+                        retention_limits=retained_stream_limits,
                     )
             finally:
                 close_fn = getattr(event_stream, "close", None)
@@ -7492,6 +7512,12 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 # (they finish before the deadline) and is a minimum, so a higher config value
 # is kept unchanged.
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
+_DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS = 12_000
+_MAX_COMPRESSION_MAX_OUTPUT_TOKENS = 20_000
+
+
+class AuxiliaryCompressionLimitError(RuntimeError):
+    """A required compression output bound could not be enforced."""
 
 
 def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
@@ -7536,6 +7562,21 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
         pass
 
     return task_config
+
+
+def compression_max_output_tokens() -> int:
+    """Return a positive configured compression cap, clamped at 20K."""
+    raw = _get_auxiliary_task_config("compression").get("max_output_tokens")
+    if raw is None:
+        configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    else:
+        try:
+            configured = int(raw)
+        except (TypeError, ValueError, OverflowError):
+            configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    if configured <= 0:
+        configured = _DEFAULT_COMPRESSION_MAX_OUTPUT_TOKENS
+    return min(configured, _MAX_COMPRESSION_MAX_OUTPUT_TOKENS)
 
 
 def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float:
@@ -7838,6 +7879,18 @@ def _build_call_kwargs(
         "timeout": timeout,
     }
 
+    # Keep compression's hard output ceiling below the ContextCompressor API.
+    # That preserves the compressor's long-standing prompt-guidance contract
+    # while ensuring every real provider request (including Codex's local SSE
+    # adapter) receives a bounded, centrally clamped value.
+    if str(task or "") == "compression":
+        configured_cap = compression_max_output_tokens()
+        try:
+            requested_cap = int(max_tokens) if max_tokens is not None else configured_cap
+        except (TypeError, ValueError, OverflowError):
+            requested_cap = configured_cap
+        max_tokens = min(max(1, requested_cap), configured_cap)
+
     fixed_temperature = _fixed_temperature_for_model(model, base_url)
     if fixed_temperature is OMIT_TEMPERATURE:
         temperature = None  # strip — let server choose
@@ -7869,7 +7922,8 @@ def _build_call_kwargs(
         # The one exception is the Anthropic Messages wire (MiniMax and any
         # ``/anthropic`` endpoint reached through the OpenAI SDK wrapper), where
         # max_tokens is a MANDATORY field — omitting it is a hard 400. Keep it only
-        # there.
+        # there. Compression is also an explicit exception: its output cap is
+        # an RSS safety invariant, translated provider-appropriately below.
         #
         # NVIDIA NIM (integrate.api.nvidia.com and local NIM endpoints) is a
         # second exception: some models—notably minimaxai/minimax-m3—return HTTP
@@ -7885,6 +7939,7 @@ def _build_call_kwargs(
             or base_url_host_matches(_effective_base, "integrate.api.nvidia.com")
         )
         _is_moa = bool(task) and str(task) == "moa_reference"
+        _is_compression = bool(task) and str(task) == "compression"
         # Gemini's native generateContent maps max_tokens → maxOutputTokens and,
         # when it is omitted, applies a fixed 65,535-token ceiling rather than
         # "the model's full budget" (see gemini_native_adapter.build_gemini_request).
@@ -7910,6 +7965,7 @@ def _build_call_kwargs(
             or _nous_on_messages
             or _is_nvidia_nim
             or _is_moa
+            or _is_compression
             or _is_gemini_native
         ):
             # Use auxiliary_max_tokens_param() so models that require
@@ -8946,6 +9002,10 @@ def _call_llm_impl(
             or _is_unsupported_parameter_error(first_err, "max_tokens")
             or _is_zai_param_error
         ):
+            if task == "compression":
+                raise AuxiliaryCompressionLimitError(
+                    "provider rejected mandatory compression output limit"
+                ) from first_err
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:
@@ -9631,6 +9691,10 @@ async def _async_call_llm_impl(
             or _is_unsupported_parameter_error(first_err, "max_tokens")
             or _is_zai_param_error
         ):
+            if task == "compression":
+                raise AuxiliaryCompressionLimitError(
+                    "provider rejected mandatory compression output limit"
+                ) from first_err
             kwargs.pop("max_tokens", None)
             kwargs.pop("max_completion_tokens", None)
             try:

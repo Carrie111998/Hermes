@@ -43,10 +43,10 @@ thread, not the conversation thread. Extension authors must assume:
 * Publication to caller-visible / durable state happens ONLY on an admitted
   commit (:class:`CompressionCommitFence`); after a host timeout the still-
   running engine's work is discarded.
-* Two compression passes never run concurrently for one session (durable
-  per-session lock), but passes for DIFFERENT sessions may run concurrently
-  on pool siblings — engine/provider instances shared across sessions must
-  be thread-safe or internally locked.
+* A process-wide, fail-fast permit admits only one expensive snapshot/summary
+  phase at a time.  The permit remains owned by a detached timed-out worker
+  until that worker exits, so a second session never overlaps its allocation
+  spike or queues stale work behind it.
 """
 
 from __future__ import annotations
@@ -58,6 +58,7 @@ import json
 import logging
 import math
 import os
+import sys
 import tempfile
 import time
 import uuid
@@ -75,6 +76,361 @@ from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 
 logger = logging.getLogger(__name__)
+
+
+# Process-wide RSS fence defaults.  The byte limits are intentionally generous
+# for normal transcripts while still bounding a single pathological message
+# graph before any recursive copy is attempted.  Operators can lower them via
+# the matching ``compression.memory_*`` keys in config.yaml.
+_DEFAULT_COMPRESSION_RSS_CEILING_BYTES = 2 * 1024 * 1024 * 1024
+_DEFAULT_COMPRESSION_MESSAGE_GRAPH_BYTES = 64 * 1024 * 1024
+_DEFAULT_COMPRESSION_SNAPSHOT_BYTES = 64 * 1024 * 1024
+_DEFAULT_COMPRESSION_AUX_RESERVE_BYTES = 1024 * 1024
+_MAX_COMPRESSION_PREFLIGHT_NODES = 1_000_000
+
+# Provider replay sidecars can contain large SDK objects/encrypted reasoning
+# blobs.  They are counted for admission but retained by reference in the
+# private worker snapshot; recursively copying them is both unnecessary for
+# summary generation and the amplification vector this fence closes.
+_OPAQUE_REPLAY_SIDECAR_KEYS = frozenset(
+    {
+        "api_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+    }
+)
+
+# The full-compression permit is deliberately independent of the executor's
+# queue admission.  Gateway hygiene can call ``compress_context`` directly,
+# and a worker that timed out remains alive after its host stops waiting.  The
+# permit therefore lives at the compression boundary and is released only by
+# that worker's outermost finally path.
+_process_compression_permit = threading.BoundedSemaphore(1)
+
+
+class CompressionSnapshotTooLargeError(RuntimeError):
+    """A bounded private compression snapshot could not be constructed."""
+
+
+def _utf8_size(value: str, *, stop_after: Optional[int] = None) -> int:
+    """Return UTF-8 byte size without allocating a second full-sized bytestring."""
+    total = 0
+    for char in value:
+        codepoint = ord(char)
+        total += (
+            1
+            if codepoint < 0x80
+            else 2
+            if codepoint < 0x800
+            else 3
+            if codepoint < 0x10000
+            else 4
+        )
+        if stop_after is not None and total > stop_after:
+            return stop_after + 1
+    return total
+
+
+def _estimate_value_bytes(
+    value: Any,
+    *,
+    stop_after: int,
+    seen: set[int],
+    state: dict[str, int],
+    depth: int = 0,
+) -> int:
+    """Bounded, content-free byte-mass estimate for JSON-ish message values."""
+    before = state["bytes"]
+    if before > stop_after:
+        return 0
+    state["nodes"] += 1
+    if state["nodes"] > _MAX_COMPRESSION_PREFLIGHT_NODES or depth > 64:
+        state["bytes"] = stop_after + 1
+        return state["bytes"] - before
+
+    if value is None or isinstance(value, (bool, int, float)):
+        state["bytes"] += 8
+    elif isinstance(value, str):
+        state["bytes"] += _utf8_size(
+            value, stop_after=stop_after - state["bytes"]
+        )
+    elif isinstance(value, (bytes, bytearray, memoryview)):
+        state["bytes"] += len(value)
+    else:
+        value_id = id(value)
+        if value_id in seen:
+            return 0
+        seen.add(value_id)
+        if isinstance(value, dict):
+            state["bytes"] += 16
+            for key, item in value.items():
+                _estimate_value_bytes(
+                    key,
+                    stop_after=stop_after,
+                    seen=seen,
+                    state=state,
+                    depth=depth + 1,
+                )
+                _estimate_value_bytes(
+                    item,
+                    stop_after=stop_after,
+                    seen=seen,
+                    state=state,
+                    depth=depth + 1,
+                )
+                if state["bytes"] > stop_after:
+                    break
+        elif isinstance(value, (list, tuple, set, frozenset)):
+            state["bytes"] += 16
+            for item in value:
+                _estimate_value_bytes(
+                    item,
+                    stop_after=stop_after,
+                    seen=seen,
+                    state=state,
+                    depth=depth + 1,
+                )
+                if state["bytes"] > stop_after:
+                    break
+        else:
+            # Unknown SDK/plugin objects are opaque.  Never call repr()/str()
+            # here: either can expose content or perform unbounded work.
+            try:
+                state["bytes"] += max(1, int(sys.getsizeof(value)))
+            except Exception:
+                state["bytes"] += 64
+
+    if state["bytes"] > stop_after:
+        state["bytes"] = stop_after + 1
+    return state["bytes"] - before
+
+
+def _estimate_compression_message_graph(
+    messages: list,
+    *,
+    stop_after: int,
+) -> dict[str, int]:
+    """Estimate total and replay-sidecar bytes without serializing content."""
+    total_state = {"bytes": 0, "nodes": 0}
+    total_seen: set[int] = set()
+    opaque_state = {"bytes": 0, "nodes": 0}
+    opaque_seen: set[int] = set()
+
+    for message in messages:
+        _estimate_value_bytes(
+            message,
+            stop_after=stop_after,
+            seen=total_seen,
+            state=total_state,
+        )
+        if isinstance(message, dict):
+            for key in _OPAQUE_REPLAY_SIDECAR_KEYS:
+                if key in message:
+                    _estimate_value_bytes(
+                        message[key],
+                        stop_after=stop_after,
+                        seen=opaque_seen,
+                        state=opaque_state,
+                    )
+        if total_state["bytes"] > stop_after:
+            break
+
+    total = total_state["bytes"]
+    opaque = min(opaque_state["bytes"], total)
+    return {
+        "message_graph_bytes": total,
+        "opaque_replay_bytes": opaque,
+        "snapshot_clone_bytes": max(0, total - opaque),
+        "message_graph_nodes": total_state["nodes"],
+    }
+
+
+def _snapshot_budget_add(budget: dict[str, int], amount: int) -> None:
+    budget["bytes"] += max(0, int(amount))
+    budget["nodes"] += 1
+    if (
+        budget["bytes"] > budget["limit"]
+        or budget["nodes"] > _MAX_COMPRESSION_PREFLIGHT_NODES
+    ):
+        raise CompressionSnapshotTooLargeError(
+            "compression snapshot exceeded configured content-free bounds"
+        )
+
+
+def _clone_bounded_snapshot_value(
+    value: Any,
+    *,
+    budget: dict[str, int],
+    memo: dict[int, Any],
+    stats: dict[str, int],
+    depth: int = 0,
+) -> Any:
+    """Clone mutable message semantics while sharing opaque SDK objects."""
+    if depth > 64:
+        raise CompressionSnapshotTooLargeError(
+            "compression snapshot exceeded maximum nesting depth"
+        )
+    if value is None or isinstance(value, (bool, int, float)):
+        _snapshot_budget_add(budget, 8)
+        return value
+    if isinstance(value, str):
+        _snapshot_budget_add(
+            budget,
+            _utf8_size(value, stop_after=budget["limit"] - budget["bytes"]),
+        )
+        return value
+    if isinstance(value, bytes):
+        _snapshot_budget_add(budget, len(value))
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        _snapshot_budget_add(budget, len(value))
+        return bytearray(value)
+
+    value_id = id(value)
+    if value_id in memo:
+        return memo[value_id]
+
+    if isinstance(value, dict):
+        cloned: dict[Any, Any] = {}
+        memo[value_id] = cloned
+        for key, item in value.items():
+            key_size = _utf8_size(key) if isinstance(key, str) else 16
+            _snapshot_budget_add(budget, key_size)
+            if isinstance(key, str) and key in _OPAQUE_REPLAY_SIDECAR_KEYS:
+                cloned[key] = item
+                stats["opaque_sidecar_fields"] += 1
+                # Account a bounded fingerprint slot, never the replay value.
+                _snapshot_budget_add(budget, 64)
+                continue
+            cloned[key] = _clone_bounded_snapshot_value(
+                item,
+                budget=budget,
+                memo=memo,
+                stats=stats,
+                depth=depth + 1,
+            )
+        return cloned
+    if isinstance(value, list):
+        cloned_list: list[Any] = []
+        memo[value_id] = cloned_list
+        for item in value:
+            cloned_list.append(
+                _clone_bounded_snapshot_value(
+                    item,
+                    budget=budget,
+                    memo=memo,
+                    stats=stats,
+                    depth=depth + 1,
+                )
+            )
+        return cloned_list
+    if isinstance(value, tuple):
+        placeholder: list[Any] = []
+        memo[value_id] = placeholder
+        placeholder.extend(
+            _clone_bounded_snapshot_value(
+                item,
+                budget=budget,
+                memo=memo,
+                stats=stats,
+                depth=depth + 1,
+            )
+            for item in value
+        )
+        cloned_tuple = tuple(placeholder)
+        memo[value_id] = cloned_tuple
+        return cloned_tuple
+
+    # Unknown provider/plugin objects are intentionally shared, not deep-copied.
+    stats["opaque_object_refs"] += 1
+    _snapshot_budget_add(budget, 64)
+    return value
+
+
+def _build_bounded_compression_snapshot(
+    messages: list,
+    *,
+    max_bytes: int,
+    stats: Optional[dict[str, int]] = None,
+) -> list:
+    """Return an isolated, bounded worker transcript without replay amplification."""
+    snapshot_stats = stats if stats is not None else {}
+    snapshot_stats.setdefault("opaque_sidecar_fields", 0)
+    snapshot_stats.setdefault("opaque_object_refs", 0)
+    budget = {"bytes": 0, "nodes": 0, "limit": max(1, int(max_bytes))}
+    cloned = _clone_bounded_snapshot_value(
+        messages,
+        budget=budget,
+        memo={},
+        stats=snapshot_stats,
+    )
+    if not isinstance(cloned, list):  # defensive: public contract is always list
+        raise CompressionSnapshotTooLargeError("compression snapshot is not a list")
+    snapshot_stats["snapshot_retained_bytes"] = budget["bytes"]
+    snapshot_stats["snapshot_nodes"] = budget["nodes"]
+    return cloned
+
+
+def _current_process_rss_bytes() -> int:
+    """Read current Linux RSS without importing psutil or using RSS high-water."""
+    try:
+        statm = Path("/proc/self/statm").read_text(encoding="ascii").split()
+        resident_pages = int(statm[1])
+        return resident_pages * int(os.sysconf("SC_PAGE_SIZE"))
+    except Exception:
+        return 0
+
+
+def _compression_memory_limits() -> dict[str, int]:
+    """Resolve bounded memory-fence config, falling back safely on bad input."""
+    cfg: dict[str, Any] = {}
+    try:
+        from hermes_cli.config import load_config
+
+        loaded = load_config()
+        maybe = loaded.get("compression", {}) if isinstance(loaded, dict) else {}
+        if isinstance(maybe, dict):
+            cfg = maybe
+    except Exception:
+        pass
+
+    def _mb(key: str, default_bytes: int) -> int:
+        try:
+            value = float(cfg.get(key, default_bytes / (1024 * 1024)))
+            if value > 0:
+                return int(value * 1024 * 1024)
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return default_bytes
+
+    return {
+        "rss_ceiling_bytes": _mb(
+            "memory_rss_ceiling_mb", _DEFAULT_COMPRESSION_RSS_CEILING_BYTES
+        ),
+        "message_graph_limit_bytes": _mb(
+            "memory_message_graph_limit_mb",
+            _DEFAULT_COMPRESSION_MESSAGE_GRAPH_BYTES,
+        ),
+        "snapshot_limit_bytes": _mb(
+            "memory_snapshot_limit_mb", _DEFAULT_COMPRESSION_SNAPSHOT_BYTES
+        ),
+    }
+
+
+def _trim_compression_attempt_memory(
+    commit_fence: Optional["CompressionCommitFence"] = None,
+) -> None:
+    """Force one abort-path trim, coalesced with host-timeout cleanup."""
+    if commit_fence is not None:
+        commit_fence.trim_attempt_memory_once()
+        return
+    try:
+        from hermes_cli.mem_trim import trim_memory
+
+        trim_memory(reason="compression-attempt-finally", force=True)
+    except Exception:
+        logger.debug("compression attempt memory trim failed", exc_info=True)
 
 # Terminal compression outcomes published by host/hygiene timeout or cooldown
 # writers. Detached heartbeat workers must not clobber these back to
@@ -486,6 +842,11 @@ class CompressionCommitFence:
         # a SLOW-but-alive summary model from a HUNG one, so slow models are
         # not killed by a fixed wall-clock deadline while tokens are moving.
         self._last_progress = time.monotonic()
+        # Multiple worker-side abort paths can reach cleanup. Coalesce their
+        # forced allocator trim so one attempt never stacks duplicate full
+        # gc.collect()/malloc_trim passes.
+        self._attempt_trim_lock = threading.Lock()
+        self._attempt_trimmed = False
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -499,6 +860,20 @@ class CompressionCommitFence:
     def seconds_since_progress(self) -> float:
         """Seconds since the worker last reported forward progress."""
         return max(0.0, time.monotonic() - self._last_progress)
+
+    def trim_attempt_memory_once(self) -> bool:
+        """Run the abort-path allocator trim at most once for this attempt."""
+        with self._attempt_trim_lock:
+            if self._attempt_trimmed:
+                return False
+            self._attempt_trimmed = True
+        try:
+            from hermes_cli.mem_trim import trim_memory
+
+            trim_memory(reason="compression-attempt-finally", force=True)
+        except Exception:
+            logger.debug("compression attempt memory trim failed", exc_info=True)
+        return True
 
     def cancel_before_commit(self, cancel_event: Any = None) -> bool:
         """Cancel a pending commit, or wait for an active commit to finish.
@@ -1076,7 +1451,9 @@ def run_compress_context_with_progress_timeout(
                 ceiling,
             )
         # Leave the future on the shared pool: fence cancel won, so a late
-        # commit cannot land (same detachment model as gateway hygiene).
+        # commit cannot land (same detachment model as gateway hygiene). The
+        # detached worker owns allocator cleanup after it releases its private
+        # snapshot; trimming here while those references are live is ineffective.
         return messages, _resolve_fallback_prompt()
     finally:
         if not handled_exit:
@@ -2137,6 +2514,167 @@ def compress_context(
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
 ) -> Tuple[list, str]:
+    """Admit one bounded private compression attempt, or fail closed quickly.
+
+    This outer boundary owns process-wide serialization, pre-deepcopy memory
+    admission, worker isolation, and abort-path allocator cleanup.  The inner
+    implementation retains the established compression/commit semantics.
+    """
+    started_at = time.monotonic()
+    attempt_id = uuid.uuid4().hex
+
+    def _existing_prompt() -> str:
+        cached = getattr(agent, "_cached_system_prompt", None)
+        if cached:
+            return cached
+        return agent._build_system_prompt(system_message)
+
+    def _record_rejection(
+        failure_class: str,
+        *,
+        metrics: Optional[dict[str, int]] = None,
+    ) -> Tuple[list, str]:
+        agent._last_compression_attempt_recorded = True
+        agent._last_compression_attempt_in_place = None
+        agent._compression_skipped_due_to_lock = None
+        agent._compression_attempt_id = attempt_id
+        payload: dict[str, Any] = {
+            "event": "compression_attempt",
+            "attempt_id": attempt_id,
+            "session_id": getattr(agent, "session_id", "") or "",
+            "trigger_source": "manual" if force else "auto",
+            "message_count": len(messages),
+            "failure_class": failure_class,
+        }
+        if metrics:
+            payload.update(
+                {
+                    key: int(value)
+                    for key, value in metrics.items()
+                    if isinstance(value, (int, float))
+                }
+            )
+        try:
+            agent.context_compressor._last_compression_telemetry = payload
+        except Exception:
+            pass
+        _emit_compression_attempt_telemetry(
+            agent,
+            started_at=started_at,
+            commit_status="aborted",
+            split_status="aborted",
+            failure_class=failure_class,
+        )
+        logger.warning(
+            "Context compression rejected by memory fence: failure_class=%s "
+            "messages=%d",
+            failure_class,
+            len(messages),
+        )
+        return messages, _existing_prompt()
+
+    if not _process_compression_permit.acquire(blocking=False):
+        return _record_rejection("process_compression_busy")
+
+    # Clear any prior attempt marker before preflight so an exception cannot
+    # inherit stale "committed" state and skip abort cleanup.
+    agent._last_compression_attempt_recorded = False
+    agent._last_compression_attempt_in_place = None
+    committed = False
+    private_messages: Optional[list] = None
+    result_messages: Optional[list] = None
+    try:
+        limits = _compression_memory_limits()
+        estimate = _estimate_compression_message_graph(
+            messages,
+            stop_after=limits["message_graph_limit_bytes"],
+        )
+        rss_bytes = _current_process_rss_bytes()
+        metrics = {
+            **estimate,
+            "rss_bytes": rss_bytes,
+            "rss_ceiling_bytes": limits["rss_ceiling_bytes"],
+            "message_graph_limit_bytes": limits["message_graph_limit_bytes"],
+            "snapshot_limit_bytes": limits["snapshot_limit_bytes"],
+        }
+        if estimate["message_graph_bytes"] > limits["message_graph_limit_bytes"]:
+            return _record_rejection("snapshot_too_large", metrics=metrics)
+        if estimate["snapshot_clone_bytes"] > limits["snapshot_limit_bytes"]:
+            return _record_rejection("snapshot_too_large", metrics=metrics)
+
+        # The worker snapshot plus the rollback/equality snapshot are both
+        # bounded. Include both in the projected RSS charge, along with a
+        # conservative retained auxiliary-output reserve.
+        projected_rss = (
+            rss_bytes
+            + 2 * estimate["snapshot_clone_bytes"]
+            + _DEFAULT_COMPRESSION_AUX_RESERVE_BYTES
+        )
+        metrics["projected_rss_bytes"] = projected_rss
+        if rss_bytes and projected_rss > limits["rss_ceiling_bytes"]:
+            return _record_rejection("rss_headroom", metrics=metrics)
+
+        snapshot_stats: dict[str, int] = {}
+        try:
+            private_messages = _build_bounded_compression_snapshot(
+                messages,
+                max_bytes=limits["snapshot_limit_bytes"],
+                stats=snapshot_stats,
+            )
+        except CompressionSnapshotTooLargeError:
+            metrics.update(snapshot_stats)
+            return _record_rejection("snapshot_too_large", metrics=metrics)
+
+        metrics.update(snapshot_stats)
+        logger.info(
+            "context compression memory preflight: %s",
+            json.dumps(metrics, sort_keys=True, separators=(",", ":")),
+        )
+        result_messages, result_prompt = _compress_context_impl(
+            agent,
+            private_messages,
+            system_message,
+            approx_tokens=approx_tokens,
+            task_id=task_id,
+            focus_topic=focus_topic,
+            force=force,
+            defer_context_engine_notification=defer_context_engine_notification,
+            commit_fence=commit_fence,
+            _snapshot_max_bytes=limits["snapshot_limit_bytes"],
+        )
+        committed = getattr(agent, "_last_compression_attempt_in_place", None) is not None
+        if not committed:
+            # Rejections, cancellations, cap failures and no-progress outcomes
+            # preserve the exact caller-owned list/object even if a legacy
+            # engine mutated its private snapshot before aborting.
+            return messages, result_prompt
+        return result_messages, result_prompt
+    finally:
+        try:
+            if not committed:
+                # Drop worker-owned transcript/output references before the
+                # allocator trim. A host timeout cannot do this for a detached
+                # worker; only this worker-side finally path can reclaim them.
+                private_messages = None
+                result_messages = None
+                _trim_compression_attempt_memory(commit_fence)
+        finally:
+            _process_compression_permit.release()
+
+
+def _compress_context_impl(
+    agent: Any,
+    messages: list,
+    system_message: str,
+    *,
+    approx_tokens: Optional[int] = None,
+    task_id: str = "default",
+    focus_topic: Optional[str] = None,
+    force: bool = False,
+    defer_context_engine_notification: bool = False,
+    commit_fence: Optional[CompressionCommitFence] = None,
+    _snapshot_max_bytes: int = _DEFAULT_COMPRESSION_SNAPSHOT_BYTES,
+) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
     Args:
@@ -2630,6 +3168,9 @@ def compress_context(
                     _lock_sid,
                     agent.session_id,
                 )
+                # Adoption is a successful rotated outcome even though this
+                # contender did not author the already-committed child.
+                agent._last_compression_attempt_in_place = False
                 return recovered_messages, _existing_sp
             logger.warning(
                 "compression skipped: session=%s was already rotated by "
@@ -2779,7 +3320,10 @@ def compress_context(
                     engine_name,
                 )
 
-        messages_before_compression = copy.deepcopy(messages)
+        messages_before_compression = _build_bounded_compression_snapshot(
+            messages,
+            max_bytes=_snapshot_max_bytes,
+        )
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
@@ -2870,7 +3414,10 @@ def compress_context(
                 messages_before_compression is not None
                 and messages != messages_before_compression
             ):
-                messages[:] = copy.deepcopy(messages_before_compression)
+                messages[:] = _build_bounded_compression_snapshot(
+                    messages_before_compression,
+                    max_bytes=_snapshot_max_bytes,
+                )
             if _activity_heartbeat is not None:
                 _activity_heartbeat.stop("context compression rollback failed")
                 _activity_heartbeat = None
@@ -2887,7 +3434,10 @@ def compress_context(
             messages_before_compression is not None
             and messages != messages_before_compression
         ):
-            messages[:] = copy.deepcopy(messages_before_compression)
+            messages[:] = _build_bounded_compression_snapshot(
+                messages_before_compression,
+                max_bytes=_snapshot_max_bytes,
+            )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
             _activity_heartbeat = None
@@ -2977,7 +3527,10 @@ def compress_context(
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
             if messages != messages_before_compression:
-                messages[:] = copy.deepcopy(messages_before_compression)
+                messages[:] = _build_bounded_compression_snapshot(
+                    messages_before_compression,
+                    max_bytes=_snapshot_max_bytes,
+                )
             logger.info(
                 "Compression made no progress (session=%s) — skipping boundary rewrite.",
                 agent.session_id or "none",
@@ -3027,7 +3580,10 @@ def compress_context(
                     messages_before_compression is not None
                     and messages != messages_before_compression
                 ):
-                    messages[:] = copy.deepcopy(messages_before_compression)
+                    messages[:] = _build_bounded_compression_snapshot(
+                        messages_before_compression,
+                        max_bytes=_snapshot_max_bytes,
+                    )
                 logger.info(
                     "Compression commit cancelled before session mutation "
                     "(session=%s).",
@@ -3326,7 +3882,10 @@ def compress_context(
                     # Atomic publication failed (including lease loss): keep the
                     # parent live and discard the stale compacted snapshot.
                     old_session_id = None
-                    messages[:] = copy.deepcopy(messages_before_compression)
+                    messages[:] = _build_bounded_compression_snapshot(
+                        messages_before_compression,
+                        max_bytes=_snapshot_max_bytes,
+                    )
                     compressed = messages
                     _compression_made_progress = False
                 split_status = (
@@ -3511,6 +4070,10 @@ def compress_context(
             f"{_compressed_est:,}",
         )
         _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        if _commit_status != "committed":
+            # The outer isolation boundary must return the exact caller-owned
+            # list on every failed publication, not an equal private snapshot.
+            agent._last_compression_attempt_in_place = None
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,
