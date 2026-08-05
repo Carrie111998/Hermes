@@ -37,6 +37,7 @@ from tools.registry import (
     tool_error,
 )
 from toolsets import resolve_toolset, validate_toolset
+from agent.turn_gate import tool_block_message
 
 logger = logging.getLogger(__name__)
 
@@ -1161,6 +1162,13 @@ def handle_function_call(
     Returns:
         Function result as a JSON string.
     """
+    _host_gate_block = tool_block_message(function_name)
+    if _host_gate_block is not None:
+        return json.dumps(
+            {"error": _host_gate_block, "error_type": "turn_gate_block"},
+            ensure_ascii=False,
+        )
+
     # Coerce string arguments to their schema-declared types (e.g. "42"→42)
     function_args = coerce_tool_args(function_name, function_args)
     if not isinstance(function_args, dict):
@@ -1423,20 +1431,43 @@ def handle_function_call(
                 # the parent's tool set via the process-global.
                 sandbox_enabled = enabled_tools if enabled_tools is not None else _last_resolved_tool_names
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         enabled_tools=sandbox_enabled,
+                        _hermes_tool_call_id=tool_call_id or "",
                     )
+                    # Only the host-side registry handler may emit an
+                    # observation. Providers — not Hermes core — decide which
+                    # tool/result has policy meaning.
+                    from agent.turn_gate import record_tool_observation
+                    record_tool_observation(
+                        tool_name=function_name,
+                        tool_args=dict(next_args),
+                        tool_call_id=tool_call_id or "",
+                        result=result,
+                    )
+                    return result
             else:
                 def _dispatch(next_args: Dict[str, Any]) -> Any:
-                    return registry.dispatch(
+                    result = registry.dispatch(
                         function_name, next_args,
                         task_id=task_id,
                         session_id=session_id,
                         user_task=user_task,
+                        _hermes_tool_call_id=tool_call_id or "",
                     )
+                    # See the execute_code branch above: observation evidence
+                    # is recorded only after the real registry handler returns.
+                    from agent.turn_gate import record_tool_observation
+                    record_tool_observation(
+                        tool_name=function_name,
+                        tool_args=dict(next_args),
+                        tool_call_id=tool_call_id or "",
+                        result=result,
+                    )
+                    return result
             if skip_tool_execution_middleware:
                 result = _dispatch(function_args)
             else:
