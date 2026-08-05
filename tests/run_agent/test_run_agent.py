@@ -532,6 +532,11 @@ def test_rewritten_spooled_message_blocks_before_stale_replay(agent, monkeypatch
     assert "_db_persistence_payload_fingerprint" in message
 
     message["content"] = "rewritten after spool"
+    direct = agent._flush_messages_to_session_db([message], [])
+    assert direct is False
+    assert replay.call_count == 1
+    assert len(db.calls) == 1
+
     second = agent._persist_session([message], [])
 
     assert second.state is run_agent.SessionPersistState.NOT_DURABLE

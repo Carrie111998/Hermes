@@ -2743,6 +2743,12 @@ class AIAgent:
             return None
 
         try:
+            plan = AIAgent._plan_session_persistence_units(
+                self, messages, conversation_history
+            )
+            if plan.mutated_spooled_unit_ids:
+                self._db_flush_scan_prefix = None
+                return False
             replay_result = AIAgent._replay_pending_session_spool(
                 self, trigger="pre_persist"
             )
@@ -2751,9 +2757,6 @@ class AIAgent:
             )
             if blocked:
                 return False
-            plan = AIAgent._plan_session_persistence_units(
-                self, messages, conversation_history
-            )
             if not plan.pending_units:
                 AIAgent._finalize_full_canonical_flush(self, messages)
                 return True
