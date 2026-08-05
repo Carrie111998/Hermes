@@ -1,7 +1,7 @@
 ---
 name: ebbinghaus-memory
 description: "Use Ebbinghaus memory sleep, recall, dream, and decay."
-version: 1.1.0
+version: 1.2.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -106,6 +106,25 @@ Then synthesize a reusable lesson with the agent LLM and apply:
 | `forget` | Delete one memory by `memory_id`. |
 | `list` | Inspect stored memories. |
 | `stats` | Inspect active/archived counts, capacity, and valence summary. |
+| `revise` | Correct an existing belief; prefer this over remember for corrections. |
+| `retract` | Retract a belief while preserving history. |
+| `history` | Show belief versions when the user explicitly asks for history. |
+| `events` | Inspect experiential events (miss, reactivation, revision). |
+| `correction_check` | Replay a pending correction rehearsal without reinforcing. |
+| `insight_propose` | Propose an insight candidate from an association preview. |
+| `insight_validate` | Promote a candidate to semantic memory with non-empty evidence. |
+| `insight_reject` | Keep a false insight on the ledger without deleting it. |
+
+## Experiential memory rules
+
+- When the user corrects an existing memory, use `revise` rather than `remember`.
+- `history` is for explicit requests only; do not dump version chains by default.
+- A rescued / reactivated memory is recalled context, not verified truth.
+- Run association preview, then propose one hypothesis as an insight candidate.
+- Never present an insight candidate as a settled fact.
+- Do not call `insight_validate` with empty evidence.
+- Do not delete rejected insights; keep them as false-insight history.
+- When a validated insight's source is revised, treat the insight as contested.
 
 ## Important semantics
 
@@ -121,24 +140,26 @@ Then synthesize a reusable lesson with the agent LLM and apply:
 
 1. Check whether the task is about memory behavior, not ordinary file or session state.
 2. If the answer depends on existing memory, call `ebbinghaus_memory` with `action="recall"` before relying on memory.
-3. If the user gives a durable preference, fact, or operating constraint, call `action="remember"` with short tags and an appropriate salience value.
+3. If the user gives a durable preference, fact, or operating constraint, call `action="remember"` with short tags and an appropriate salience value. If they correct an earlier memory, call `action="revise"` with a non-empty reason and optional evidence.
 4. If a memory is important but retention is low, call `action="rehearse"` or include it in a sleep pass.
 5. If the user asks for agent sleep or maintenance, call `action="sleep"` with `prune_mode="archive"` unless they explicitly demand delete.
 6. For dream work: preview → LLM synthesis → apply. Never invent source ids.
-7. If the user asks to remove a memory, prefer `action="forget"` for a known `memory_id`.
+7. For insight work: association preview → propose one candidate → validate only with evidence. Rejected candidates stay as false insights.
+8. If the user asks to remove a memory, prefer `action="forget"` for a known `memory_id` (protected rows need explicit force). For belief retraction that keeps history, use `action="retract"`.
 
 ## Pitfalls
 
 - Do not treat `sleep` as a background thread. The built-in idle path is lazy and runs before the next turn after the idle threshold.
 - Do not permanently auto-rehearse high-salience memories every sleep forever.
-- Do not assume a recalled memory is current truth. Use it as context, then verify live state when the fact can drift.
+- Do not assume a recalled memory is current truth. Use it as context, then verify live state when the fact can drift. Recovered latent/archived traces are especially provisional.
 - Do not hardcode `~/.hermes` in instructions or code. The plugin is profile-aware through `HERMES_HOME`.
 - Do not use this skill when `memory.provider` is set to another provider unless the user is switching to `ebbinghaus`.
+- Do not validate insight candidates without evidence, and do not speak candidates as facts.
 
 ## Verification
 
 - `ebbinghaus_memory` appears in the active tool list.
-- `{"action":"stats"}` returns active/archived/capacity fields.
+- `{"action":"stats"}` returns active/archived/capacity fields plus experiential counters when enabled.
 - `remember` followed by `recall` returns the stored content.
-- A sleep pass returns `mode: "sleep_cycle"` with `rehearsed`, `forgotten`, `archived`, and `pruned` arrays.
+- A sleep pass returns `mode: "sleep_cycle"` with `rehearsed`, `forgotten`, `archived`, and `pruned` arrays (and `latent` when experiential forgetting is enabled).
 - Idle sleep is configured under `memory.sleep` if the user expects automatic agent sleep.

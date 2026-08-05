@@ -49,7 +49,18 @@ def test_ebbinghaus_memory_skill_links_to_plugin_and_tool():
     assert "plugin: plugins/memory/ebbinghaus" in text
     assert "tools: [ebbinghaus_memory]" in text
     assert "memory.provider` is set to another provider" in body
-    for action in ("remember", "recall", "rehearse", "decay", "sleep", "forget"):
+    for action in (
+        "remember",
+        "recall",
+        "rehearse",
+        "decay",
+        "sleep",
+        "forget",
+        "revise",
+        "retract",
+        "history",
+        "insight_validate",
+    ):
         assert action in body
 
 
