@@ -247,6 +247,33 @@ def set_secret_capture_callback(callback) -> None:
     _secret_capture_callback = callback
 
 
+def capture_secret(
+    env_var: str,
+    prompt: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Capture one secret through the active interactive-surface callback."""
+    callback = _secret_capture_callback
+    if callback is None:
+        return {
+            "success": False,
+            "stored_as": env_var,
+            "validated": False,
+            "skipped": True,
+            "message": "No interactive secret-capture surface is available.",
+        }
+    result = callback(env_var, prompt, metadata or {})
+    if isinstance(result, dict):
+        return result
+    return {
+        "success": False,
+        "stored_as": env_var,
+        "validated": False,
+        "skipped": True,
+        "message": "Secret-capture callback returned an invalid result.",
+    }
+
+
 def skill_matches_platform(frontmatter: Dict[str, Any]) -> bool:
     """Check if a skill is compatible with the current OS platform.
 

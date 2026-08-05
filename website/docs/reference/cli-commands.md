@@ -454,9 +454,16 @@ hermes secrets prompt PENPOT_MCP_TOKEN \
   --prompt "Enter the Penpot MCP token"
 ```
 
-The value is never included in the command output. For interactive Desktop/TUI
-flows, use the existing `secret.request` setup path (for example, a skill that
-declares a required environment variable) to receive the masked in-app overlay.
+The value is never included in the command output. In the interactive
+Desktop/TUI, use the slash command below to route through the existing
+`secret.request` overlay instead of the terminal prompt:
+
+```text
+/secrets prompt PENPOT_MCP_TOKEN Enter the Penpot MCP token
+```
+
+The Desktop/TUI command stores through the same secure environment writer and
+falls back to no action when no interactive secret-capture surface is present.
 
 The remaining subcommands pull API keys from external secret managers at
 process startup instead of storing them in `~/.hermes/.env`. Currently they
