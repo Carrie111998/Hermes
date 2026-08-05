@@ -2,6 +2,15 @@
 
 Use this sequence when helping a user set up the repo locally.
 
+Resolve the helper from the loaded skill's `skill_dir`. If only the active
+Hermes home is available, initialize the profile-safe path:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+SKILL_DIR="${SKILL_DIR:-$HERMES_HOME/skills/media/youtube-automation-agent}"
+SCRIPT="$SKILL_DIR/scripts/youtube_automation_helper.py"
+```
+
 ## 1. Clone
 
 ```bash
@@ -12,7 +21,7 @@ cd youtube-automation-agent
 ## 2. Inspect before running
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py inspect --repo .
+python3 "$SCRIPT" inspect --repo .
 ```
 
 ## 3. Install dependencies
@@ -55,7 +64,7 @@ Expected local port from the repo docs and setup path:
 ## 8. Verify endpoints
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py probe --base-url http://localhost:3456
+python3 "$SCRIPT" probe --base-url http://localhost:3456
 ```
 
 Check these endpoints explicitly:

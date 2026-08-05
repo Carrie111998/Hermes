@@ -69,9 +69,39 @@ def _check(path: Path, label: str) -> CheckResult:
     return CheckResult(label=label, ok=path.exists(), detail=str(path))
 
 
-def _load_package_json(repo: Path) -> dict[str, Any]:
+def _load_package_json(repo: Path) -> tuple[dict[str, Any], dict[str, Any]]:
     pkg_path = repo / "package.json"
-    return json.loads(pkg_path.read_text(encoding="utf-8"))
+    try:
+        payload = json.loads(pkg_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}, {"ok": False, "error": "package.json is missing"}
+    except UnicodeDecodeError as exc:
+        error = f"package.json is malformed: invalid UTF-8 at byte {exc.start}"
+        return {}, {"ok": False, "error": error}
+    except json.JSONDecodeError as exc:
+        error = f"package.json is malformed: line {exc.lineno} column {exc.colno}"
+        return {}, {"ok": False, "error": error}
+    except OSError as exc:
+        return {}, {"ok": False, "error": f"package.json could not be read: {exc}"}
+
+    if not isinstance(payload, dict):
+        return {}, {
+            "ok": False,
+            "error": "package.json is malformed: expected a JSON object",
+        }
+
+    scripts = payload.get("scripts", {})
+    if not isinstance(scripts, dict):
+        return {}, {
+            "ok": False,
+            "error": "package.json is malformed: scripts must be a JSON object",
+        }
+    if any(not isinstance(command, str) for command in scripts.values()):
+        return {}, {
+            "ok": False,
+            "error": "package.json is malformed: script commands must be strings",
+        }
+    return payload, {"ok": True, "error": None}
 
 
 def inspect_repo(repo: Path) -> dict[str, Any]:
@@ -86,7 +116,9 @@ def inspect_repo(repo: Path) -> dict[str, Any]:
     results.append(CheckResult("command:node", node_path is not None, node_path or "node not found"))
     results.append(_check(repo / "node_modules", "deps:node_modules"))
 
-    package_json = _load_package_json(repo)
+    package_json, package_metadata = _load_package_json(repo)
+    metadata_detail = package_metadata["error"] or str(repo / "package.json")
+    results.append(CheckResult("metadata:package.json", package_metadata["ok"], metadata_detail))
     missing_script_targets: list[dict[str, str]] = []
     for name, command in package_json.get("scripts", {}).items():
         parts = command.split()
@@ -118,16 +150,18 @@ def inspect_repo(repo: Path) -> dict[str, Any]:
 
     required_missing = [r.label for r in results if r.label.startswith("required:") and not r.ok]
     config_missing = [r.label for r in results if r.label.startswith("config:") and not r.ok]
+    syntax_failed = any(not item["ok"] for item in syntax_checks)
     verdict = "ready"
-    if required_missing or missing_script_targets:
+    if required_missing or missing_script_targets or not package_metadata["ok"] or syntax_failed:
         verdict = "blocked"
-    elif config_missing or not (repo / "node_modules").exists():
+    elif config_missing or not (repo / "node_modules").exists() or not node_path:
         verdict = "needs-setup"
 
     return {
         "repo": str(repo),
         "verdict": verdict,
         "checks": [r.__dict__ for r in results],
+        "package_metadata": package_metadata,
         "missing_script_targets": missing_script_targets,
         "syntax_checks": syntax_checks,
     }
@@ -153,7 +187,11 @@ def probe_server(base_url: str) -> dict[str, Any]:
             if endpoint == "/health":
                 try:
                     payload = json.loads(body)
-                    endpoint_ok = endpoint_ok and payload.get("status") == "healthy"
+                    endpoint_ok = (
+                        endpoint_ok
+                        and isinstance(payload, dict)
+                        and payload.get("status") == "healthy"
+                    )
                 except json.JSONDecodeError:
                     endpoint_ok = False
             healthy = healthy and endpoint_ok

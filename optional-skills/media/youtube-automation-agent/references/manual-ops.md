@@ -5,12 +5,22 @@ Use these commands in two modes:
 1. upstream repo operations
 2. Hermes-native workflow operations
 
+Resolve the helper from the loaded skill's `skill_dir`. If only the active
+Hermes home is available, initialize the path without assuming the default
+profile:
+
+```bash
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+SKILL_DIR="${SKILL_DIR:-$HERMES_HOME/skills/media/youtube-automation-agent}"
+SCRIPT="$SKILL_DIR/scripts/youtube_automation_helper.py"
+```
+
 ## Hermes-native workflow commands
 
 ### Start a run
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py init-run \
+python3 "$SCRIPT" init-run \
   --channel "Ladera Labs" \
   --niche "AI productivity" \
   --audience "founders and operators" \
@@ -22,21 +32,21 @@ python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automati
 ### Check run status
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py status \
+python3 "$SCRIPT" status \
   --workspace /path/to/run.json
 ```
 
 ### Get the current stage brief
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py brief \
+python3 "$SCRIPT" brief \
   --workspace /path/to/run.json
 ```
 
 ### Complete a stage
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py complete-stage \
+python3 "$SCRIPT" complete-stage \
   --workspace /path/to/run.json \
   --stage strategy \
   --notes "selected founder ops angle" \
@@ -46,7 +56,7 @@ python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automati
 ### Export final deliverables
 
 ```bash
-python3 ~/.hermes/skills/media/youtube-automation-agent/scripts/youtube_automation_helper.py export \
+python3 "$SCRIPT" export \
   --workspace /path/to/run.json
 ```
 

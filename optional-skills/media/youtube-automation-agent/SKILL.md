@@ -1,66 +1,64 @@
 ---
 name: youtube-automation-agent
-description: Run a Hermes-native YouTube automation workflow that mirrors the darkzOGx/youtube-automation-agent stages: strategy, script, thumbnail, SEO, production, publishing, and analytics. Also supports inspecting and probing the upstream repo locally.
-version: 1.1.0
-author: Hermes Agent
+description: Orchestrate staged YouTube production workflows.
+version: 1.2.0
+author: Haithum Abdelfattah (@darkzOGx)
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
-    tags: [youtube, automation, media, nodejs, express, seo, thumbnails, publishing, analytics]
+    tags: [youtube, automation, media, seo, publishing, analytics]
     related_skills: [youtube-content, google-workspace]
     category: media
     homepage: https://github.com/darkzOGx/youtube-automation-agent
 ---
 
-# YouTube Automation Agent
+# YouTube Automation Agent Skill
 
-This optional skill now does two related jobs:
+Run a persistent, interactive workflow from channel strategy through
+post-publish analytics, or inspect the related Node.js project. This skill
+organizes deliverables; it does not replace YouTube credentials, rendering,
+or upload infrastructure.
 
-1. It helps Hermes inspect, configure, and troubleshoot the external repo `darkzOGx/youtube-automation-agent`.
-2. It gives Hermes a native interactive workflow that mirrors the repo's claimed pipeline:
-   - strategy
-   - script
-   - thumbnail
-   - SEO
-   - production
-   - publishing
-   - analytics
+## When to Use
 
-The goal is to capture the essence of the upstream project as a reusable Hermes workflow without pretending Hermes has magically replaced YouTube OAuth, video rendering, or upload APIs.
+Use this skill when the user wants to:
 
-## What this skill is good for
+- develop a channel idea through a stage-by-stage content pipeline;
+- produce strategy, script, thumbnail, SEO, production, publishing, and
+  analytics deliverables across multiple sessions;
+- inspect a local clone of `darkzOGx/youtube-automation-agent`; or
+- probe that project's local health, schedule, and analytics endpoints.
 
-Use this skill when the user wants Hermes to:
-- turn a channel concept into a structured YouTube production workflow
-- manage a stage-by-stage content pipeline inside Hermes
-- generate a strategy brief, script brief, thumbnail brief, SEO package, publishing checklist, and analytics review plan
-- inspect whether the upstream repo is actually runnable
-- validate the local server and its main endpoints
+Do not use it for a one-off transcript or summary when the `youtube-content`
+skill is sufficient.
 
-## The Hermes-native workflow
+## Prerequisites
 
-This skill mirrors the upstream repo's main agent flow:
+- Python 3.9 or newer for the bundled helper.
+- An installed copy of this optional skill.
+- For the external Node.js app only: Node.js, npm dependencies, YouTube OAuth,
+  and the AI-provider credentials expected by that project.
 
-1. Content Strategy Agent
-2. Script Writer Agent
-3. Thumbnail Designer Agent
-4. SEO Optimizer Agent
-5. Production Management Agent
-6. Publishing & Scheduling Agent
-7. Analytics & Optimization Agent
-
-In Hermes, those stages are represented as an interactive run workspace that can persist across sessions.
-
-## Locate the helper script
+Resolve paths from the loaded skill rather than assuming the default profile.
+Use the `skill_dir` returned by `skill_view` as `SKILL_DIR`. When only the
+active Hermes home is available, use this fallback:
 
 ```bash
-SCRIPT="$(find ~/.hermes/skills -path '*/youtube-automation-agent/scripts/youtube_automation_helper.py' -print -quit)"
+HERMES_HOME="${HERMES_HOME:-$HOME/.hermes}"
+SKILL_DIR="${SKILL_DIR:-$HERMES_HOME/skills/media/youtube-automation-agent}"
+SCRIPT="$SKILL_DIR/scripts/youtube_automation_helper.py"
 ```
 
-## Start a new Hermes workflow run
+Named profiles set `HERMES_HOME` to their profile directory, so this resolves
+the category-preserving official install without searching another profile.
+
+## How to Run
+
+Initialize a workflow workspace:
 
 ```bash
-python3 "$SCRIPT" init-run \
+python3 "$SKILL_DIR/scripts/youtube_automation_helper.py" init-run \
   --channel "Ladera Labs" \
   --niche "AI productivity" \
   --audience "founders and operators" \
@@ -69,142 +67,114 @@ python3 "$SCRIPT" init-run \
   --topic "AI workflow automations"
 ```
 
-This creates a run workspace JSON file under the skill data directory and sets the current stage to `strategy`.
+The helper writes a JSON workspace beneath the active profile's installed
+skill directory and starts at `strategy`. Pass `--output /path/to/run.json`
+to choose another location, or `--json` for machine-readable output.
 
-## Check workflow status
+## Quick Reference
 
-```bash
-python3 "$SCRIPT" status --workspace /path/to/run.json
-```
+| Goal | Command |
+|---|---|
+| Create a run | `python3 "$SCRIPT" init-run <channel options>` |
+| Show progress | `python3 "$SCRIPT" status --workspace RUN.json` |
+| Get current brief | `python3 "$SCRIPT" brief --workspace RUN.json` |
+| Get another brief | `python3 "$SCRIPT" brief --workspace RUN.json --stage seo` |
+| Save a stage | `python3 "$SCRIPT" complete-stage --workspace RUN.json --stage STAGE --notes TEXT` |
+| Export deliverables | `python3 "$SCRIPT" export --workspace RUN.json` |
+| Inspect Node repo | `python3 "$SCRIPT" inspect --repo /path/to/repo` |
+| Probe local app | `python3 "$SCRIPT" probe --base-url http://localhost:3456` |
 
-## Get the next stage brief
+Workflow stages, in order:
 
-```bash
-python3 "$SCRIPT" brief --workspace /path/to/run.json
-```
+1. `strategy`
+2. `script`
+3. `thumbnail`
+4. `seo`
+5. `production`
+6. `publishing`
+7. `analytics`
 
-Or a specific stage:
+Use `read_file` on these references only when their branch applies:
 
-```bash
-python3 "$SCRIPT" brief --workspace /path/to/run.json --stage seo
-```
+- `references/hermes-native-flow.md` — stage artifact contracts;
+- `references/repo-caveats.md` — grounded upstream limitations;
+- `references/setup-notes.md` — external Node.js setup; and
+- `references/manual-ops.md` — command examples and local endpoints.
 
-Each brief includes:
-- the goal for that stage
-- the contextual channel inputs
-- a Hermes-ready prompt
-- expected artifacts to produce
+## Procedure
 
-## Complete a stage
+### 1. Initialize the run
 
-After Hermes or the user finishes a stage, save the outcome:
+Collect the channel name, niche, audience, style, frequency, and optional
+topic. Run `init-run`, record the returned workspace path, and verify its
+current stage is `strategy`.
+
+### 2. Produce the current stage
+
+Run `brief` against the workspace. Use its goal, context, prompt, and expected
+artifacts as the contract for the stage; do not silently omit required
+artifacts.
+
+### 3. Persist the result
+
+After the user accepts the deliverable, save it with `complete-stage`:
 
 ```bash
 python3 "$SCRIPT" complete-stage \
   --workspace /path/to/run.json \
   --stage strategy \
-  --notes "Selected a founder-focused AI automation angle" \
+  --notes "Selected a founder-focused automation angle" \
   --artifacts-json '{
     "selected_topic": "AI workflow automations for founders",
-    "angle": "replace repetitive ops work with reusable agents",
+    "angle": "replace repetitive operations with reusable agents",
     "content_type": "Explainer",
-    "keywords": ["ai automation", "workflow automation", "founder productivity"]
+    "keywords": ["ai automation", "workflow automation"]
   }'
 ```
 
-The helper automatically advances the current stage to the next incomplete stage.
+Run `status` and confirm the completed stage is recorded and the next
+incomplete stage is `in_progress`.
 
-## Export a finished run
+### 4. Repeat and export
 
-```bash
-python3 "$SCRIPT" export --workspace /path/to/run.json
-```
+Repeat the brief, production, acceptance, and completion loop through
+`analytics`. Run `export` and verify every completed stage appears under
+`deliverables`.
 
-This gives Hermes a portable summary of all completed deliverables.
+### 5. Inspect the external project when requested
 
-## How to use this as an interactive Hermes skill
+Run `inspect --repo` before claiming a local clone is runnable. A `blocked`
+report can include missing required files, unreadable or malformed
+`package.json`, or package scripts whose targets do not exist. A
+`needs-setup` report indicates missing configuration or dependencies.
 
-Recommended operator loop:
+After the app starts, run `probe`. Success requires 2xx responses from
+`/health`, `/schedule`, and `/analytics`, plus `{"status":"healthy"}` from
+`/health`.
 
-1. create a run with `init-run`
-2. ask for the current stage brief with `brief`
-3. use Hermes to generate the requested deliverables for that stage
-4. save the result with `complete-stage`
-5. repeat until analytics is complete
+## Pitfalls
 
-This turns the repo's abstract pipeline into a real session-by-session Hermes workflow.
+1. **Default-profile paths.** Never hardcode the installed helper beneath the
+   default home. Resolve `SKILL_DIR` from `skill_view` or active `HERMES_HOME`.
+2. **Turnkey claims.** The inspected upstream revision references missing
+   `workflows/daily-content-pipeline.js`,
+   `workflows/weekly-strategy-review.js`, and `database/init.js` targets.
+3. **Gemini-only setup.** Upstream credential validation currently expects
+   `youtube` and `openai`; do not present Gemini-only configuration as tested.
+4. **Planning versus execution.** Thumbnail and production stages create
+   briefs and assembly plans unless an external image, audio, or video tool is
+   actually available and exercised.
+5. **Premature completion.** Do not mark a stage complete before its artifacts
+   are accepted and persisted in the workspace.
 
-## Upstream repo inspection mode
+## Verification
 
-The skill still supports repo validation.
+Before reporting success:
 
-### Inspect a local clone
-
-```bash
-python3 "$SCRIPT" inspect --repo /path/to/youtube-automation-agent
-```
-
-Checks include:
-- required files
-- missing package script targets
-- config file presence
-- `node_modules/` presence
-- `node --check` syntax checks for key entry files
-
-### Probe a running local server
-
-```bash
-python3 "$SCRIPT" probe --base-url http://localhost:3456
-```
-
-This probes:
-- `/health`
-- `/schedule`
-- `/analytics`
-
-## Known upstream caveats
-
-Before claiming the upstream repo is turnkey, remember:
-
-1. `package.json` references missing script targets in the inspected repo:
-   - `workflows/daily-content-pipeline.js`
-   - `workflows/weekly-strategy-review.js`
-   - `database/init.js`
-2. The README mentions a `workflows/` directory, but it is absent in the inspected repo.
-3. The docs market Gemini as an option, but `utils/credential-manager.js` currently validates `youtube` and `openai`, so Gemini-only setup is not turnkey without upstream changes.
-4. A dashboard alone is not enough; confirm `/health`.
-
-See also:
-- `references/repo-caveats.md`
-- `references/setup-notes.md`
-- `references/manual-ops.md`
-- `references/hermes-native-flow.md`
-
-## Practical boundaries
-
-This skill can help Hermes achieve the same claimed flow structure as the upstream project:
-- strategy
-- scripting
-- thumbnail planning
-- SEO packaging
-- production planning
-- publishing prep
-- analytics feedback loop
-
-But it does not claim that Hermes alone can, without credentials or infrastructure:
-- upload to YouTube automatically
-- render final videos out of thin air
-- authenticate external APIs without setup
-- replace all manual production steps
-
-Instead, it gives a strong, reusable workflow layer that Hermes can run interactively.
-
-## Verification checklist
-
-Before telling the user a workflow is ready:
-
-1. the run workspace exists
-2. the current stage brief is clear
-3. each completed stage has notes and artifacts saved
-4. the export summary contains the expected deliverables
-5. if using the upstream repo, `inspect` and `probe` have been run successfully
+- [ ] `status` identifies the expected current and completed stages.
+- [ ] Every completed stage contains notes and accepted artifacts.
+- [ ] `export` contains each completed stage under `deliverables`.
+- [ ] The workspace is beneath the active profile or the requested output path.
+- [ ] External-project claims are backed by a fresh `inspect` report.
+- [ ] Running-server claims are backed by a successful `probe` report.
+- [ ] Credential, rendering, and upload dependencies are stated honestly.
