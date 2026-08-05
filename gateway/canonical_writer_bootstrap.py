@@ -16,6 +16,7 @@ import os
 import re
 import signal
 import stat
+import threading
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -60,6 +61,11 @@ from gateway.canonical_writer_postgres_backend import (
     EXPECTED_ROUTINE_SIGNATURES,
     PRODUCTION_STATEMENT_CATALOG,
     PostgresCanonicalWriterBackend,
+)
+from gateway.canonical_writer_pre_phase_b_start import (
+    DEFAULT_PRE_PHASE_B_START_PERMIT_PATH,
+    PRE_PHASE_B_START_PERMIT_SCHEMA,
+    validate_installed_pre_phase_b_start_permit,
 )
 from gateway.canonical_projection_export import (
     PROJECTION_EXPORT_SCHEMA,
@@ -1415,6 +1421,7 @@ def _validate_startup_phase_b_readiness(
     *,
     production_release_revision: str | None,
     production_phase_b_receipt: str | None,
+    config_path: str | None = None,
 ) -> Mapping[str, Any]:
     """Select exactly one canary or production startup-readiness contract."""
 
@@ -1432,11 +1439,48 @@ def _validate_startup_phase_b_readiness(
             release_revision=production_release_revision,
             receipt_path=production_phase_b_receipt,
         )
-    from gateway.canonical_writer_phase_b_runtime import (
-        validate_fixed_phase_b_runtime_readiness,
-    )
+    from gateway import canonical_writer_phase_b_runtime as phase_b_runtime
 
-    return validate_fixed_phase_b_runtime_readiness()
+    try:
+        return phase_b_runtime.validate_fixed_phase_b_runtime_readiness()
+    except phase_b_runtime.PhaseBRuntimeError as exc:
+        if (
+            exc.code != phase_b_runtime.PHASE_B_AUTHORITY_UNAVAILABLE_CODE
+            or not phase_b_runtime.phase_b_authority_storage_absent()
+            or config_path is None
+            or not os.path.lexists(DEFAULT_PRE_PHASE_B_START_PERMIT_PATH)
+        ):
+            raise
+        # The only readiness alternative is a short-lived root-published
+        # mechanical permit bound to this exact release, config, boot, plan,
+        # owner approval, IAM observation, and non-root writer identity.  It
+        # exists only around the two stop-on-exit pre-Phase-B observations.
+        return validate_installed_pre_phase_b_start_permit(
+            config_path=config_path,
+            writer_uid=config.writer_uid,
+            writer_gid=config.writer_gid,
+            module_file=__file__,
+        )
+
+
+def _pre_phase_b_expiry_timer(
+    readiness: Mapping[str, Any],
+    *,
+    shutdown: Callable[[], None],
+) -> threading.Timer | None:
+    """Bound a permit-started process lifetime to the permit's exact expiry."""
+
+    if readiness.get("schema") != PRE_PHASE_B_START_PERMIT_SCHEMA:
+        return None
+    expires_at = readiness.get("expires_at_unix")
+    if type(expires_at) is not int:
+        raise RuntimeError("pre-Phase-B startup expiry is invalid")
+    remaining = expires_at - time.time()
+    if remaining <= 0:
+        raise RuntimeError("pre-Phase-B startup permit expired")
+    timer = threading.Timer(remaining, shutdown)
+    timer.daemon = True
+    return timer
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1469,11 +1513,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             "production Phase-B readiness arguments are only valid in service mode"
         )
     config = load_service_config(arguments.config)
+    startup_readiness: Mapping[str, Any] = {}
     if not arguments.export_events:
         # The non-root writer independently consumes the matching root-published
         # readiness proof before constructing any DB-backed service object,
         # binding a socket, or notifying READY.
-        _validate_startup_phase_b_readiness(
+        startup_readiness = _validate_startup_phase_b_readiness(
             config,
             production_release_revision=(
                 arguments.production_release_revision
@@ -1481,6 +1526,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             production_phase_b_receipt=(
                 arguments.production_phase_b_receipt
             ),
+            config_path=arguments.config,
         )
     bootstrap = build_service(config)
     if arguments.export_events:
@@ -1491,6 +1537,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         print(json.dumps({"success": True, "event_count": count}, sort_keys=True))
         return 0
+    expiry_timer = _pre_phase_b_expiry_timer(
+        startup_readiness,
+        shutdown=bootstrap.server.shutdown,
+    )
     try:
         bootstrap.server.start()
         publish_writer_runtime_readiness(bootstrap)
@@ -1499,8 +1549,12 @@ def main(argv: Sequence[str] | None = None) -> int:
 
         signal.signal(signal.SIGTERM, _shutdown)
         signal.signal(signal.SIGINT, _shutdown)
+        if expiry_timer is not None:
+            expiry_timer.start()
         bootstrap.server.serve_forever()
     finally:
+        if expiry_timer is not None:
+            expiry_timer.cancel()
         bootstrap.server.shutdown()
     return 0
 

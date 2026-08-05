@@ -106,6 +106,84 @@ def test_pre_phase_b_writer_start_ignores_only_the_dependency_job_graph():
     )
 
 
+def test_pre_phase_b_start_permit_binds_exact_native_lifecycle(monkeypatch):
+    plan = activation.NativeObservationPlan(value={
+        "revision": "a" * 40,
+        "artifact_root": "/opt/muncho-canary-releases/" + "a" * 40,
+        "artifact_sha256": "b" * 64,
+        "release_manifest_file_sha256": "c" * 64,
+        "writer_config": {
+            "path": "/etc/muncho-canonical-writer/writer.json",
+            "sha256": "d" * 64,
+        },
+        "identities": {"writer_uid": 999, "writer_gid": 994},
+        "boot_id_sha256": "e" * 64,
+    })
+    owner = _owner_approval("native_observation", plan.sha256)
+    iam = SimpleNamespace(sha256="f" * 64)
+    calls = []
+    monkeypatch.setattr(
+        activation.NativeObservationPlan,
+        "from_mapping",
+        lambda _value: plan,
+    )
+    monkeypatch.setattr(
+        activation,
+        "build_pre_phase_b_start_permit",
+        lambda **kwargs: calls.append(("build", kwargs)) or {"permit": "exact"},
+    )
+    monkeypatch.setattr(
+        activation,
+        "canonical_pre_phase_b_start_permit_bytes",
+        lambda value: calls.append(("encode", value)) or b"exact-permit\n",
+    )
+    monkeypatch.setattr(
+        activation,
+        "_unlink_exact",
+        lambda *args, **kwargs: calls.append(("unlink", args, kwargs)),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_install_exact_bytes",
+        lambda *args, **kwargs: calls.append(("install", args, kwargs)) or True,
+    )
+
+    file_sha256, writer_gid = activation._install_pre_phase_b_start_permit(
+        plan,
+        owner_approval_receipt=owner,
+        external_iam_receipt=iam,
+    )
+
+    assert writer_gid == 994
+    assert file_sha256 == activation.hashlib.sha256(b"exact-permit\n").hexdigest()
+    assert calls[0] == (
+        "build",
+        {
+            "revision": "a" * 40,
+            "artifact_root": "/opt/muncho-canary-releases/" + "a" * 40,
+            "artifact_sha256": "b" * 64,
+            "release_manifest_file_sha256": "c" * 64,
+            "writer_config_path": "/etc/muncho-canonical-writer/writer.json",
+            "writer_config_sha256": "d" * 64,
+            "writer_uid": 999,
+            "writer_gid": 994,
+            "boot_id_sha256": "e" * 64,
+            "scope": "native_observation",
+            "plan_sha256": plan.sha256,
+            "owner_approval_receipt_sha256": owner.sha256,
+            "owner_approval_expires_at_unix": owner.value["expires_at_unix"],
+            "external_iam_receipt_sha256": "f" * 64,
+        },
+    )
+    assert calls[1] == ("encode", {"permit": "exact"})
+    assert calls[2][0] == "unlink"
+    assert calls[3] == (
+        "install",
+        (activation.DEFAULT_PRE_PHASE_B_START_PERMIT_PATH, b"exact-permit\n"),
+        {"uid": 0, "gid": 994, "mode": 0o440},
+    )
+
+
 def test_activation_lock_is_under_root_controlled_run_not_world_writable_run_lock():
     assert activation.ACTIVATION_LOCK_PATH == Path("/run/muncho-writer-activation.lock")
 
@@ -1121,6 +1199,7 @@ def test_final_activation_rechecks_owner_freshness_before_each_dangerous_step(
     lifecycle = []
     invalidations = []
     seals = []
+    permits = []
     paths = SimpleNamespace(
         quarantine_path=tmp_path / "quarantine.json",
         root_receipt_path=tmp_path / "root.json",
@@ -1210,6 +1289,16 @@ def test_final_activation_rechecks_owner_freshness_before_each_dangerous_step(
     monkeypatch.setattr(
         activation, "_require_off_disabled", lambda *_args, **_kwargs: None
     )
+    monkeypatch.setattr(
+        activation,
+        "_install_pre_phase_b_start_permit",
+        lambda *_args, **_kwargs: ("f" * 64, activation.CANARY_WRITER_GID),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_remove_pre_phase_b_start_permit",
+        lambda **kwargs: permits.append(kwargs),
+    )
 
     def sealed(*_args, **_kwargs):
         seals.append(True)
@@ -1241,6 +1330,14 @@ def test_final_activation_rechecks_owner_freshness_before_each_dangerous_step(
             if argv[:2] == (activation.SYSTEMCTL, "start")
         )
         assert writer_start == activation.PRE_PHASE_B_WRITER_START_ARGV
+        assert permits == [
+            {
+                "file_sha256": "f" * 64,
+                "writer_gid": activation.CANARY_WRITER_GID,
+            }
+        ]
+    else:
+        assert permits == []
     assert activation.GATEWAY_UNIT not in started
     assert bool(seals) is expected_sealed
     if expire_on_require <= 3:
@@ -1481,6 +1578,7 @@ def test_native_observation_uses_exact_pre_phase_b_writer_start(
     owner = _owner_approval("native_observation", plan.sha256)
     commands = []
     writes = []
+    permits = []
 
     def runner(command):
         commands.append(command.argv)
@@ -1565,6 +1663,16 @@ def test_native_observation_uses_exact_pre_phase_b_writer_start(
         "_write_root_receipt",
         lambda path, value: writes.append((path, value)),
     )
+    monkeypatch.setattr(
+        activation,
+        "_install_pre_phase_b_start_permit",
+        lambda *_args, **_kwargs: ("f" * 64, activation.CANARY_WRITER_GID),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_remove_pre_phase_b_start_permit",
+        lambda **kwargs: permits.append(kwargs),
+    )
 
     with pytest.raises(RuntimeError, match="failed closed"):
         executor.observe(
@@ -1574,6 +1682,12 @@ def test_native_observation_uses_exact_pre_phase_b_writer_start(
         )
 
     assert activation.PRE_PHASE_B_WRITER_START_ARGV in commands
+    assert permits == [
+        {
+            "file_sha256": "f" * 64,
+            "writer_gid": activation.CANARY_WRITER_GID,
+        }
+    ]
     assert [path for path, _value in writes] == [failure, quarantine]
     assert {value["stage"] for _path, value in writes} == {"start_writer"}
     assert all(value["stage_preserved"] is False for _path, value in writes)
@@ -1748,6 +1862,7 @@ def test_writer_start_failure_still_unconditionally_stops_gateway_then_writer(
 ):
     commands = []
     receipts = []
+    permits = []
     paths = SimpleNamespace(
         quarantine_path=tmp_path / "quarantine.json",
         root_receipt_path=tmp_path / "root.json",
@@ -1819,6 +1934,16 @@ def test_writer_start_failure_still_unconditionally_stops_gateway_then_writer(
     monkeypatch.setattr(
         activation, "_require_off_disabled", lambda *_args, **_kwargs: None
     )
+    monkeypatch.setattr(
+        activation,
+        "_install_pre_phase_b_start_permit",
+        lambda *_args, **_kwargs: ("f" * 64, activation.CANARY_WRITER_GID),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_remove_pre_phase_b_start_permit",
+        lambda **kwargs: permits.append(kwargs),
+    )
     failure_path = tmp_path / "failure.json"
     monkeypatch.setattr(
         activation,
@@ -1844,6 +1969,12 @@ def test_writer_start_failure_still_unconditionally_stops_gateway_then_writer(
         "stop",
         activation.GATEWAY_UNIT,
     )) < commands.index((activation.SYSTEMCTL, "stop", activation.WRITER_UNIT))
+    assert permits == [
+        {
+            "file_sha256": "f" * 64,
+            "writer_gid": activation.CANARY_WRITER_GID,
+        }
+    ]
     assert [path for path, _value in receipts] == [
         failure_path,
         paths.quarantine_path,

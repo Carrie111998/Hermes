@@ -970,6 +970,208 @@ def test_startup_readiness_preserves_canary_contract(
     ) == receipt
 
 
+def test_startup_readiness_uses_exact_permit_only_after_canary_readiness_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import canonical_writer_phase_b_runtime as canary_readiness
+
+    calls = []
+    permit = {"schema": "muncho-writer-pre-phase-b-start-permit.v1"}
+    config = SimpleNamespace(writer_uid=999, writer_gid=994)
+
+    def unavailable():
+        calls.append("phase_b")
+        raise canary_readiness.PhaseBRuntimeError(
+            "phase_b_runtime_authority_file_unavailable"
+        )
+
+    monkeypatch.setattr(
+        canary_readiness,
+        "validate_fixed_phase_b_runtime_readiness",
+        unavailable,
+    )
+    monkeypatch.setattr(
+        canary_readiness,
+        "phase_b_authority_storage_absent",
+        lambda: True,
+    )
+    monkeypatch.setattr(writer_bootstrap.os.path, "lexists", lambda _path: True)
+    monkeypatch.setattr(
+        writer_bootstrap,
+        "validate_installed_pre_phase_b_start_permit",
+        lambda **kwargs: calls.append(kwargs) or permit,
+    )
+
+    assert writer_bootstrap._validate_startup_phase_b_readiness(
+        config,
+        production_release_revision=None,
+        production_phase_b_receipt=None,
+        config_path="/etc/muncho-canonical-writer/writer.json",
+    ) == permit
+    assert calls == [
+        "phase_b",
+        {
+            "config_path": "/etc/muncho-canonical-writer/writer.json",
+            "writer_uid": 999,
+            "writer_gid": 994,
+            "module_file": writer_bootstrap.__file__,
+        },
+    ]
+
+
+def test_startup_readiness_does_not_hide_failure_without_exact_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import canonical_writer_phase_b_runtime as canary_readiness
+
+    failure = canary_readiness.PhaseBRuntimeError(
+        "phase_b_runtime_authority_file_unavailable"
+    )
+    monkeypatch.setattr(
+        canary_readiness,
+        "validate_fixed_phase_b_runtime_readiness",
+        lambda: (_ for _ in ()).throw(failure),
+    )
+    monkeypatch.setattr(writer_bootstrap.os.path, "lexists", lambda _path: False)
+    monkeypatch.setattr(
+        writer_bootstrap,
+        "validate_installed_pre_phase_b_start_permit",
+        lambda **_kwargs: pytest.fail("permit validator must not run"),
+    )
+
+    with pytest.raises(
+        canary_readiness.PhaseBRuntimeError,
+        match="phase_b_runtime_authority_file_unavailable",
+    ):
+        writer_bootstrap._validate_startup_phase_b_readiness(
+            SimpleNamespace(writer_uid=999, writer_gid=994),
+            production_release_revision=None,
+            production_phase_b_receipt=None,
+            config_path="/etc/muncho-canonical-writer/writer.json",
+        )
+
+
+@pytest.mark.parametrize(
+    ("failure_code", "authority_absent"),
+    (
+        ("phase_b_runtime_authority_file_untrusted", True),
+        ("phase_b_runtime_authority_file_unavailable", False),
+        ("phase_b_runtime_full_canary_anchor_release_mismatch", True),
+    ),
+)
+def test_startup_readiness_permit_never_hides_integrity_or_partial_state(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_code: str,
+    authority_absent: bool,
+) -> None:
+    from gateway import canonical_writer_phase_b_runtime as canary_readiness
+
+    monkeypatch.setattr(
+        canary_readiness,
+        "validate_fixed_phase_b_runtime_readiness",
+        lambda: (_ for _ in ()).throw(
+            canary_readiness.PhaseBRuntimeError(failure_code)
+        ),
+    )
+    monkeypatch.setattr(
+        canary_readiness,
+        "phase_b_authority_storage_absent",
+        lambda: authority_absent,
+    )
+    monkeypatch.setattr(writer_bootstrap.os.path, "lexists", lambda _path: True)
+    monkeypatch.setattr(
+        writer_bootstrap,
+        "validate_installed_pre_phase_b_start_permit",
+        lambda **_kwargs: pytest.fail("permit validator must not run"),
+    )
+
+    with pytest.raises(canary_readiness.PhaseBRuntimeError, match=failure_code):
+        writer_bootstrap._validate_startup_phase_b_readiness(
+            SimpleNamespace(writer_uid=999, writer_gid=994),
+            production_release_revision=None,
+            production_phase_b_receipt=None,
+            config_path="/etc/muncho-canonical-writer/writer.json",
+        )
+
+
+def test_startup_readiness_never_consults_permit_after_phase_b_success(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gateway import canonical_writer_phase_b_runtime as canary_readiness
+
+    receipt = {"schema": "muncho-writer-phase-b-runtime-readiness.v1"}
+    monkeypatch.setattr(
+        canary_readiness,
+        "validate_fixed_phase_b_runtime_readiness",
+        lambda: receipt,
+    )
+    monkeypatch.setattr(
+        writer_bootstrap.os.path,
+        "lexists",
+        lambda _path: pytest.fail("permit path must not be consulted"),
+    )
+    monkeypatch.setattr(
+        writer_bootstrap,
+        "validate_installed_pre_phase_b_start_permit",
+        lambda **_kwargs: pytest.fail("permit validator must not run"),
+    )
+
+    assert writer_bootstrap._validate_startup_phase_b_readiness(
+        SimpleNamespace(writer_uid=999, writer_gid=994),
+        production_release_revision=None,
+        production_phase_b_receipt=None,
+        config_path="/etc/muncho-canonical-writer/writer.json",
+    ) == receipt
+
+
+def test_pre_phase_b_expiry_timer_applies_only_to_exact_permit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timers = []
+
+    class FakeTimer:
+        def __init__(self, interval, callback):
+            self.interval = interval
+            self.callback = callback
+            self.daemon = False
+            timers.append(self)
+
+    shutdown = object()
+    monkeypatch.setattr(writer_bootstrap.time, "time", lambda: 1000.25)
+    monkeypatch.setattr(writer_bootstrap.threading, "Timer", FakeTimer)
+
+    assert writer_bootstrap._pre_phase_b_expiry_timer(
+        {"schema": "muncho-writer-phase-b-runtime-readiness.v1"},
+        shutdown=shutdown,
+    ) is None
+    timer = writer_bootstrap._pre_phase_b_expiry_timer(
+        {
+            "schema": writer_bootstrap.PRE_PHASE_B_START_PERMIT_SCHEMA,
+            "expires_at_unix": 1180,
+        },
+        shutdown=shutdown,
+    )
+    assert timer is timers[0]
+    assert timer.interval == pytest.approx(179.75)
+    assert timer.callback is shutdown
+    assert timer.daemon is True
+
+
+def test_pre_phase_b_expiry_timer_rejects_expired_or_untyped_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(writer_bootstrap.time, "time", lambda: 1000.0)
+    for expiry in (1000, "1180", None):
+        with pytest.raises(RuntimeError, match="pre-Phase-B startup"):
+            writer_bootstrap._pre_phase_b_expiry_timer(
+                {
+                    "schema": writer_bootstrap.PRE_PHASE_B_START_PERMIT_SCHEMA,
+                    "expires_at_unix": expiry,
+                },
+                shutdown=lambda: None,
+            )
+
+
 @pytest.mark.parametrize(
     ("revision", "receipt"),
     (

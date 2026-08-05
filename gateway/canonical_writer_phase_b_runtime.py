@@ -73,6 +73,7 @@ PHASE_B_RUNTIME_RECEIPT_PATH = Path(
 PHASE_B_FULL_CANARY_ANCHOR_PATH = Path(
     "/var/lib/muncho/canonical-writer-phase-b/full-canary-anchor.json"
 )
+PHASE_B_AUTHORITY_UNAVAILABLE_CODE = "phase_b_runtime_authority_file_unavailable"
 
 _ROOT_UID = 0
 _ROOT_GID = 0
@@ -188,6 +189,20 @@ class PhaseBRuntimeError(RuntimeError):
 
 def _fail(code: str) -> None:
     raise PhaseBRuntimeError(code)
+
+
+def phase_b_authority_storage_absent() -> bool:
+    """Return true only before any fixed Phase-B authority root exists."""
+
+    for path in (PHASE_B_AUTHORITY_ROOT, PHASE_B_JOURNAL_ROOT.parent):
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        return False
+    return True
 
 
 def _canonical_bytes(value: Any) -> bytes:
@@ -309,9 +324,7 @@ def _open_trusted_absolute_directory(path: Path) -> int:
     except OSError as exc:
         if descriptor is not None:
             os.close(descriptor)
-        raise PhaseBRuntimeError(
-            "phase_b_runtime_authority_file_unavailable"
-        ) from exc
+        raise PhaseBRuntimeError(PHASE_B_AUTHORITY_UNAVAILABLE_CODE) from exc
     assert descriptor is not None
     return descriptor
 
@@ -356,9 +369,7 @@ def _read_json_at(directory_fd: int, name: str) -> Mapping[str, Any]:
     except PhaseBRuntimeError:
         raise
     except OSError as exc:
-        raise PhaseBRuntimeError(
-            "phase_b_runtime_authority_file_unavailable"
-        ) from exc
+        raise PhaseBRuntimeError(PHASE_B_AUTHORITY_UNAVAILABLE_CODE) from exc
     finally:
         if descriptor is not None:
             os.close(descriptor)
@@ -3144,6 +3155,7 @@ if __name__ == "__main__":  # pragma: no cover - exercised by installed CLI.
 
 __all__ = [
     "PHASE_B_APPROVAL_PATH",
+    "PHASE_B_AUTHORITY_UNAVAILABLE_CODE",
     "PHASE_B_AUTHORITY_ROOT",
     "PHASE_B_JOURNAL_ROOT",
     "PHASE_B_PLAN_PATH",
@@ -3156,6 +3168,7 @@ __all__ = [
     "load_fixed_phase_b_readiness_anchor",
     "load_fixed_phase_b_approval_chain",
     "main",
+    "phase_b_authority_storage_absent",
     "publish_fixed_phase_b_readiness",
     "validate_fixed_phase_b_readiness_descendant",
     "validate_fixed_phase_b_readiness_lineage",
