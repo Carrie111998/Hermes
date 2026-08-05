@@ -1587,205 +1587,6 @@ _compute_host_supervisor = None
 _compute_host_supervisor_lock = threading.Lock()
 
 
-def _inside_compute_host_child() -> bool:
-    return os.environ.get("HERMES_COMPUTE_HOST_CHILD") == "1"
-
-
-def _turn_isolation_enabled(cfg: dict | None = None) -> bool:
-    if _inside_compute_host_child():
-        return False
-    isolation_cfg = cfg or _load_dashboard_process_isolation_config()
-    return bool(isolation_cfg.get("turn_isolation"))
-
-
-def _session_uses_compute_host(session: dict, cfg: dict | None = None) -> bool:
-    if not _turn_isolation_enabled(cfg):
-        return False
-    # Phase 1 routes lazy/dashboard sessions whose live AIAgent has not been
-    # built inside the serving process. Already-built in-process sessions keep
-    # the historical path unless a prior isolated turn marked host ownership.
-    return bool(session.get("_compute_host_active")) or (
-        session.get("agent") is None and session.get("agent_ready") is not None
-    )
-
-
-def _get_compute_host_supervisor(cfg: dict | None = None):
-    global _compute_host_supervisor
-    isolation_cfg = cfg or _load_dashboard_process_isolation_config()
-    with _compute_host_supervisor_lock:
-        if _compute_host_supervisor is None:
-            from tui_gateway.host_supervisor import HostSupervisor
-
-            _compute_host_supervisor = HostSupervisor(
-                rpc_sink=write_json,
-                heartbeat_secs=int(isolation_cfg.get("compute_host_heartbeat_secs") or 15),
-                respawn_max=int(isolation_cfg.get("compute_host_respawn_max") or 3),
-            )
-        return _compute_host_supervisor
-
-
-def _compute_host_turn_frame(
-    rid: str,
-    sid: str,
-    session: dict,
-    text: Any,
-    image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None,
-) -> dict:
-    with session["history_lock"]:
-        history = list(session.get("history", []))
-        history_version = int(session.get("history_version", 0))
-        attached_images = (
-            list(image_paths)
-            if image_paths is not None
-            else list(session.get("attached_images", []))
-        )
-    return {
-        "type": "turn.start",
-        "sid": sid,
-        "request_id": rid,
-        "session_key": session.get("session_key") or sid,
-        "text": text,
-        "history": history,
-        "history_version": history_version,
-        "cols": int(session.get("cols", 80) or 80),
-        "cwd": _session_cwd(session),
-        "profile_home": session.get("profile_home") or "",
-        "model_override": session.get("model_override"),
-        "reasoning_config_override": session.get("create_reasoning_override"),
-        "service_tier_override": session.get("create_service_tier_override"),
-        "source": _session_source(session),
-        "attached_images": attached_images,
-        "queued_prompt_generation": queued_prompt_generation,
-    }
-
-
-def _metadata_mirror(session: dict | None) -> dict:
-    mirror = (session or {}).get("_metadata_mirror")
-    return mirror if isinstance(mirror, dict) else {}
-
-
-def _apply_compute_host_metadata_mirror(session: dict, frame: dict | None) -> None:
-    """Mirror host-owned session metadata in the serving process.
-
-    The compute host is the only writer of live agent/history state while turn
-    isolation is active. The serving process keeps read metadata from the last
-    host frame so UI reads do not construct a second in-process agent.
-    """
-    if not isinstance(frame, dict):
-        return
-    with session.get("history_lock", threading.Lock()):
-        if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
-        if frame.get("history_version") is not None:
-            try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
-                pass
-        if frame.get("message_count") is not None:
-            try:
-                session["_metadata_message_count"] = int(frame.get("message_count") or 0)
-            except Exception:
-                pass
-    info = frame.get("session_info")
-    if isinstance(info, dict):
-        mirror = dict(_metadata_mirror(session))
-        mirror.update(info)
-        session["_metadata_mirror"] = mirror
-        session["_metadata_mirror_updated_at"] = time.time()
-
-
-def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -> None:
-    is_error = frame.get("type") == "turn.error"
-    with session["history_lock"]:
-        if frame.get("session_key"):
-            session["session_key"] = str(frame.get("session_key"))
-        if frame.get("history_version") is not None:
-            try:
-                session["history_version"] = max(
-                    int(session.get("history_version", 0)),
-                    int(frame.get("history_version") or 0),
-                )
-            except Exception:
-                pass
-        session["running"] = False
-        session["last_active"] = time.time()
-        _clear_inflight_turn(session)
-    if is_error:
-        message = str(frame.get("message") or "compute host turn failed")
-        _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
-    _apply_compute_host_metadata_mirror(session, frame)
-    try:
-        info = _session_info(session.get("agent"), session)
-    except TypeError:
-        info = _session_info(session.get("agent"))
-    if not frame.get("session_info_emitted"):
-        _emit("session.info", sid, info)
-    _drain_queued_prompt(rid, sid, session)
-
-
-def _submit_prompt_to_compute_host(
-    rid: str,
-    sid: str,
-    session: dict,
-    text: Any,
-    image_paths: list[str] | None = None,
-    queued_prompt_generation: int | None = None,
-) -> dict:
-    cfg = _load_dashboard_process_isolation_config()
-    frame = _compute_host_turn_frame(
-        rid,
-        sid,
-        session,
-        text,
-        image_paths=image_paths,
-        queued_prompt_generation=queued_prompt_generation,
-    )
-
-    def _complete(done: dict) -> None:
-        # submit_turn reports a synchronous pipe failure through the callback
-        # before re-raising. Leave the parent session untouched so prompt.submit
-        # can fail open to the historical in-process path without emitting a
-        # duplicate terminal error.
-        if done.get("reason") == "send_failed":
-            return
-        _on_compute_host_turn_done(rid, sid, session, done)
-
-    try:
-        _get_compute_host_supervisor(cfg).submit_turn(frame, on_complete=_complete)
-    except Exception as exc:
-        return _err(rid, 5019, f"compute-host dispatch failed: {exc}")
-    with session["history_lock"]:
-        session["_compute_host_active"] = True
-        if image_paths is None:
-            session["attached_images"] = []
-    return _ok(rid, {"status": "streaming", "turn_isolation": True})
-
-
-def _send_compute_host_control(
-    sid: str,
-    *,
-    route_name: str,
-    command: str = "",
-    payload: dict | None = None,
-    wait: bool = True,
-    timeout: float = 30.0,
-) -> dict:
-    frame = dict(payload or {})
-    frame.setdefault("type", "control")
-    frame.setdefault("command", command)
-    return _get_compute_host_supervisor().control(
-        sid,
-        route_name=route_name,
-        payload=frame,
-        wait=wait,
-        timeout=timeout,
-    )
-
-
 def _emit_approval_request(sid: str, data: dict | None) -> None:
     """Emit an ``approval.request`` event to the TUI client with the command
     redacted. The approval payload is built from the RAW command string, so a
@@ -2282,86 +2083,6 @@ def _sess(params, rid):
     return (s, _wait_agent(s, rid))
 
 
-def _normalize_completion_path(path_part: str) -> str:
-    expanded = os.path.expanduser(path_part)
-    if os.name != "nt":
-        normalized = expanded.replace("\\", "/")
-        if (
-            len(normalized) >= 3
-            and normalized[1] == ":"
-            and normalized[2] == "/"
-            and normalized[0].isalpha()
-        ):
-            return f"/mnt/{normalized[0].lower()}/{normalized[3:]}"
-    return expanded
-
-
-def _completion_cwd(params: dict | None = None) -> str:
-    params = params or {}
-    raw = (
-        params.get("cwd")
-        or _sessions.get(params.get("session_id") or "", {}).get("cwd")
-        # A session bound to another profile resolves its workspace from THAT
-        # profile's config before falling back to the launch profile's env var.
-        or _profile_configured_cwd(_profile_home(params.get("profile")))
-        # The launch profile's dashboard /chat attaches to the dashboard's
-        # in-memory gateway, which does NOT inherit the PTY child's bridged
-        # TERMINAL_CWD. Read the launch profile's config.yaml directly so a
-        # configured terminal.cwd wins over a stale process env / launch dir.
-        or _launch_configured_cwd()
-        or os.environ.get("TERMINAL_CWD")
-        or os.getcwd()
-    )
-    try:
-        resolved = os.path.abspath(os.path.expanduser(str(raw)))
-        if os.path.isdir(resolved):
-            return resolved
-    except Exception:
-        pass
-    return os.getcwd()
-
-
-def _terminal_task_cwd(session: dict | None) -> str:
-    """Return the cwd that terminal_tool should use for this TUI session.
-
-    ``_completion_cwd`` validates paths on the host so file completion does not
-    point at nonsense.  Non-local terminal backends are different: their cwd is
-    inside the target environment, so an SSH path like /home/user/workspace may
-    not exist on the local macOS host but is still the correct execution cwd.
-
-    When ``TERMINAL_ENV`` is unset (dashboard/TUI process) the config's
-    ``terminal.backend`` is consulted as a fallback so the non-local cwd
-    resolution path is taken even when the dashboard entrypoint did not call
-    ``apply_terminal_config_to_env`` on its own ``os.environ``.
-    """
-    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
-    if not backend or backend == "local":
-        # Fall back to config when TERMINAL_ENV is unset (dashboard/TUI process
-        # never calls apply_terminal_config_to_env on os.environ).
-        try:
-            terminal_cfg = _load_cfg().get("terminal", {})
-            if isinstance(terminal_cfg, dict):
-                cfg_backend = str(terminal_cfg.get("backend") or "").strip().lower()
-                if cfg_backend and cfg_backend != "local":
-                    backend = cfg_backend
-        except Exception:
-            pass
-
-    if backend and backend != "local":
-        raw = os.environ.get("TERMINAL_CWD", "").strip()
-        if not raw:
-            try:
-                terminal_cfg = _load_cfg().get("terminal", {})
-                if isinstance(terminal_cfg, dict):
-                    raw = str(terminal_cfg.get("cwd") or "").strip()
-            except Exception:
-                raw = ""
-        if raw and raw not in {".", "auto", "cwd"}:
-            return raw
-
-    return _session_cwd(session)
-
-
 # Git working-tree probing (run git, resolve roots, fold worktrees) lives in a
 # focused, single-flight-cached module; these stay as the in-server names every
 # call site already uses.
@@ -2372,206 +2093,10 @@ _git_common_repo_root_for_cwd = git_probe.common_repo_root
 _resolve_cwd_git = git_probe.resolve
 
 
-def _session_cwd(session: dict | None) -> str:
-    if session and session.get("cwd"):
-        return str(session["cwd"])
-    return _completion_cwd()
-
-
 # Sources whose launch directory is an artifact of how the app was started, not
 # a workspace the user picked. Everything else is terminal-started: the process
 # runs in a directory the user deliberately cd'd into.
 _LAUNCH_CWD_NOT_A_WORKSPACE = {"desktop"}
-
-
-def _persisted_session_cwd(session: dict) -> str | None:
-    """The cwd to stamp on the session's DB row, or None to leave it unset.
-
-    See :func:`_ensure_session_db_row` for why the launch directory counts as a
-    workspace for terminal sessions but not for the desktop.
-    """
-    if session.get("explicit_cwd"):
-        return _session_cwd(session)
-    if _session_source(session) in _LAUNCH_CWD_NOT_A_WORKSPACE:
-        return None
-    # Only the session's OWN directory. `_session_cwd` falls back to the
-    # gateway-wide completion cwd, which belongs to no session in particular —
-    # stamping that would invent a workspace for a session that never had one.
-    return str(session.get("cwd") or "") or None
-
-
-def _heal_dead_cwd(cwd: str) -> str:
-    """Resolve a session cwd that points at a now-deleted directory.
-
-    A session anchored to a linked worktree (``<repo>/.worktrees/<name>``) keeps
-    that path after the worktree is removed (branch merged, `git worktree
-    remove`, etc). The literal dir is gone, so a probe of it returns nothing and
-    the composer shows no branch — while the sidebar still folds the path up to
-    the repo's main lane. Heal the mismatch: walk up to the first existing
-    ancestor, then resolve its common git root, so a dead-worktree cwd collapses
-    to the live repo root (and its real current branch).
-
-    Only meaningful for local backends; a remote/SSH cwd may legitimately not
-    exist on the host, so callers must skip healing there.
-    """
-    raw = (cwd or "").strip()
-    if not raw or os.path.isdir(raw):
-        return raw
-
-    probe = raw
-    # Climb to the first ancestor that still exists on disk.
-    for _ in range(64):
-        parent = os.path.dirname(probe)
-        if not parent or parent == probe:
-            break
-        probe = parent
-        if os.path.isdir(probe):
-            break
-
-    if not os.path.isdir(probe):
-        return raw
-
-    try:
-        root = _git_common_repo_root_for_cwd(probe) or _git_repo_root_for_cwd(probe)
-    except Exception:
-        root = ""
-
-    return root or probe
-
-
-def _is_local_terminal_backend() -> bool:
-    backend = (os.environ.get("TERMINAL_ENV") or "").strip().lower()
-    return not backend or backend == "local"
-
-
-def _display_session_cwd(session: dict | None) -> str:
-    """Session cwd for display/probe surfaces, healed past deleted worktrees.
-
-    Persists the healed value back to the session row (best-effort, local only)
-    so the next load is already coherent and the sidebar lane stops showing a
-    session pinned to a vanished path.
-    """
-    cwd = _session_cwd(session)
-    if not _is_local_terminal_backend():
-        return cwd
-
-    healed = _heal_dead_cwd(cwd)
-    if healed and healed != cwd and session is not None:
-        session["cwd"] = healed
-        try:
-            with _session_db(session) as db:
-                if db is not None:
-                    db.update_session_cwd(session.get("session_key", ""), healed)
-        except Exception:
-            logger.debug("failed to persist healed session cwd", exc_info=True)
-        _persist_session_git_meta(session, healed)
-
-    return healed
-
-
-def _reconcile_session_cwd_from_terminal(session: dict | None) -> bool:
-    """Re-anchor a session that SETTLED in another git checkout. Returns moved.
-
-    An agent told to work in a fresh worktree does exactly that — `git worktree
-    add`, `cd` into it, and every later command runs there — but the session
-    stayed pinned to wherever it started, so the desktop kept labelling the chat
-    with the primary checkout's branch while all the work landed elsewhere.
-
-    A plain `cd` is deliberately NOT a workspace move (see
-    ``_apply_project_workspace``): browsing to /tmp to read a log must not
-    re-home the chat. What we adopt here is narrower — the session's recorded
-    cwd is in a DIFFERENT working tree of the SAME repository (the shape
-    ``git worktree add`` produces). Everything else — a non-git workspace
-    stepping into a repo, or a git workspace visiting an unrelated repo — is
-    a browsing visit, and a user's explicitly chosen workspace is never
-    overridden at all.
-
-    Local backends only: a remote/SSH cwd names a path on the host, which this
-    gateway can neither stat nor probe with git.
-    """
-    if not session or not _is_local_terminal_backend():
-        return False
-
-    # A workspace the user (or GUI) explicitly chose is never overridden by
-    # where the agent's terminal happened to settle — only another explicit
-    # action (`_set_session_cwd`, a project switch) moves it. A cwd this very
-    # function adopted is marked `cwd_from_settle` so a session can keep
-    # following the agent through successive worktrees.
-    if session.get("explicit_cwd") and not session.get("cwd_from_settle"):
-        return False
-
-    try:
-        from tools.terminal_tool import get_session_cwd
-
-        recorded = get_session_cwd(session.get("session_key") or "")
-    except Exception:
-        return False
-
-    if not recorded:
-        return False
-
-    resolved = os.path.abspath(os.path.expanduser(str(recorded)))
-    current = os.path.abspath(os.path.expanduser(_session_cwd(session)))
-    if resolved == current or not os.path.isdir(resolved):
-        return False
-
-    # The worktree ROOT, not the common repo root: folding worktrees together
-    # here is exactly what hides the move we're looking for.
-    landed = _git_repo_root_for_cwd(resolved)
-    current_root = _git_repo_root_for_cwd(current)
-    # A relocation is a move between two DIFFERENT git working trees. When the
-    # session's own workspace is not in a git repo, the agent stepping into one
-    # to read a file or run a command is a browsing visit, not a re-home:
-    # adopting it would hijack a non-git workspace onto whatever repo a tool
-    # call touched first (e.g. a home-directory session pinned to the checkout
-    # it read a file from).
-    if not landed or not current_root or landed == current_root:
-        return False
-
-    # And only between checkouts of the SAME repository — the shape a real
-    # `git worktree add` produces (linked worktrees share the common .git
-    # dir). Settling in an UNRELATED repo (`cd ~/other-project && git log`)
-    # is likewise a visit: adopting it would re-home the chat onto whatever
-    # foreign repo the terminal last touched.
-    landed_common = _git_common_repo_root_for_cwd(resolved)
-    current_common = _git_common_repo_root_for_cwd(current)
-    if not landed_common or landed_common != current_common:
-        return False
-
-    session["cwd"] = resolved
-    # The session works here now, so this is its workspace — a desktop chat
-    # whose cwd was an unpersisted launch artifact earns a real row. The
-    # settle marker keeps this adoption overridable by the NEXT settle while
-    # still yielding to a user's explicit choice (see the guard above).
-    session["explicit_cwd"] = True
-    session["cwd_from_settle"] = True
-    _register_session_cwd(session)
-
-    with _session_db(session) as db:
-        if db is not None:
-            try:
-                db.update_session_cwd(session.get("session_key", ""), resolved)
-            except Exception:
-                logger.debug("failed to persist settled session cwd", exc_info=True)
-
-    _persist_session_git_meta(session, resolved)
-    return True
-
-
-def _emit_settled_session_info(sid: str, session: dict, agent) -> None:
-    """Emit end-of-turn ``session.info``, reconciling a settled cwd first.
-
-    The turn is over, so the agent has stopped moving: this is the one moment
-    where its recorded cwd is a stable answer to "where does this session
-    work". Reconciling before building the payload means the same event that
-    already tells the desktop the turn ended also carries the new cwd/branch —
-    the client follows it with no new event type and no extra round trip.
-    """
-    try:
-        _reconcile_session_cwd_from_terminal(session)
-    except Exception:
-        logger.debug("failed to reconcile settled session cwd", exc_info=True)
-    _emit("session.info", sid, _session_info(agent, session))
 
 
 def _session_source(session: dict | None) -> str:
@@ -2580,19 +2105,6 @@ def _session_source(session: dict | None) -> str:
         if source:
             return source
     return _resolve_session_platform()
-
-
-def _register_session_cwd(session: dict | None) -> None:
-    if not session:
-        return
-    try:
-        from tools.terminal_tool import register_task_env_overrides
-
-        register_task_env_overrides(
-            session["session_key"], {"cwd": _terminal_task_cwd(session)}
-        )
-    except Exception:
-        pass
 
 
 def _ensure_session_db_row(session: dict) -> None:
@@ -13903,3 +13415,60 @@ for _m in (
 ):
     _m.register(sys.modules[__name__])
 del _m
+
+# ── Split helper-function mixins (session_cwd_mixin / compute_host_mixin) ──
+# Imported at the end so every global the moved functions close over already
+# exists; install() rebinds their __globals__ onto this namespace exactly like
+# the methods_* handler split above (method_ctx.py).
+from . import (  # noqa: E402
+    compute_host_mixin as _compute_host_mixin,
+    session_cwd_mixin as _session_cwd_mixin,
+)
+import types as _types  # noqa: E402
+
+
+def _install_split_mixin_functions(_mixin, _names) -> None:
+    _g = globals()
+    for _name in _names:
+        _fn = getattr(_mixin, _name)
+        _real = _types.FunctionType(
+            _fn.__code__, _g, _fn.__name__, _fn.__defaults__, _fn.__closure__
+        )
+        _real.__kwdefaults__ = _fn.__kwdefaults__
+        _real.__doc__ = _fn.__doc__
+        _real.__dict__.update(_fn.__dict__)
+        _g[_name] = _real
+
+
+_install_split_mixin_functions(
+    _session_cwd_mixin,
+    (
+        "_normalize_completion_path",
+        "_completion_cwd",
+        "_terminal_task_cwd",
+        "_session_cwd",
+        "_persisted_session_cwd",
+        "_heal_dead_cwd",
+        "_is_local_terminal_backend",
+        "_display_session_cwd",
+        "_reconcile_session_cwd_from_terminal",
+        "_emit_settled_session_info",
+        "_register_session_cwd",
+    ),
+)
+_install_split_mixin_functions(
+    _compute_host_mixin,
+    (
+        "_inside_compute_host_child",
+        "_turn_isolation_enabled",
+        "_session_uses_compute_host",
+        "_get_compute_host_supervisor",
+        "_compute_host_turn_frame",
+        "_metadata_mirror",
+        "_apply_compute_host_metadata_mirror",
+        "_on_compute_host_turn_done",
+        "_submit_prompt_to_compute_host",
+        "_send_compute_host_control",
+    ),
+)
+del _install_split_mixin_functions
