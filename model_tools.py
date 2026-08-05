@@ -10,6 +10,7 @@ environments consume.
 
 Public API (signatures preserved from the original 2,400-line version):
     get_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode) -> list
+    get_tool_definitions_with_meta(...) -> (tools, pre_assembly_names)
     handle_function_call(function_name, function_args, task_id, user_task) -> str
     TOOL_TO_TOOLSET_MAP: dict          (for batch_runner.py)
     TOOLSET_REQUIREMENTS: dict         (for cli.py, doctor.py)
@@ -235,9 +236,14 @@ _last_resolved_tool_names: List[str] = []
 # ``_last_resolved_tool_names``, whose semantics flip with cache state (fresh
 # compute stores pre-assembly names at model_tools._compute_tool_definitions,
 # a cache hit overwrites it with the cached POST-assembly list), this global is
-# restored consistently on BOTH paths, so callers deriving the session's
-# granted tool set (agent_init's description_only inventory capture) never
-# depend on whether the call hit the quiet_mode cache. (#66826)
+# restored consistently on BOTH paths.
+#
+# Primary consumers no longer read this global: get_tool_definitions_with_meta()
+# returns the pre-assembly names from the calling assembly itself, and
+# agent/agent_init.py binds that return value directly onto the receiving agent
+# (#66826, GottZ race). The global is kept for legacy consumers (mcp_tool's
+# refresh snapshot, execute_code sandbox fallback, tests) that still read it
+# after their own get_tool_definitions() call.
 _last_pre_assembly_tool_names: List[str] = []
 
 
@@ -320,6 +326,38 @@ def get_tool_definitions(
     Returns:
         Filtered list of OpenAI-format tool definitions.
     """
+    return get_tool_definitions_with_meta(
+        enabled_toolsets=enabled_toolsets,
+        disabled_toolsets=disabled_toolsets,
+        quiet_mode=quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )[0]
+
+
+def get_tool_definitions_with_meta(
+    enabled_toolsets: Optional[List[str]] = None,
+    disabled_toolsets: Optional[List[str]] = None,
+    quiet_mode: bool = False,
+    skip_tool_search_assembly: bool = False,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Same as :func:`get_tool_definitions`, but also returns the list of
+    tool names captured *before* Tool Search assembly ran.
+
+    Returns:
+        (tools, pre_assembly_names): ``tools`` is the filtered list of
+        OpenAI-format tool definitions; ``pre_assembly_names`` is the list of
+        tool names the session was granted before tool_search bridge assembly
+        collapsed deferrable (MCP/plugin/description_only) tools behind
+        tool_search/tool_describe/tool_call.
+
+        The receiving agent must bind ``pre_assembly_names`` directly to
+        itself (e.g. the description_only system-prompt inventory) — it must
+        NOT be re-read from a process-global afterwards. With concurrent
+        agent initialization (gateway multi-chat, delegate subagents, parallel
+        cron), another agent's assembly can overwrite the global between this
+        call and the read, binding the wrong session's inventory to this agent
+        (cross-agent race, GottZ on #66826).
+    """
     # Fast path: memoized result when the caller doesn't need stdout prints.
     # The cache key captures every argument-level input; the registry
     # generation captures registry mutations (MCP refresh, plugin load).
@@ -347,22 +385,25 @@ def get_tool_definitions(
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
-            # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit. The cached value carries
-            # the PRE-assembly names alongside the post-assembly list, so
+            # Update the process-globals so legacy consumers (mcp_tool's
+            # refresh snapshot, execute_code sandbox fallback) see consistent
+            # state even on a cache hit. The cached value carries the
+            # PRE-assembly names alongside the post-assembly list, so
             # _last_pre_assembly_tool_names is restored identically on the
-            # cache-hit path — callers that derive the session's granted
-            # tool set (agent_init's description_only inventory) never see
-            # the post-assembly collapse. (#66826)
+            # cache-hit path. The pre-assembly names handed to THIS caller
+            # come from the tuple below, never from the global. (#66826)
             global _last_resolved_tool_names, _last_pre_assembly_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached[0]]
-            _last_pre_assembly_tool_names = list(cached[1])
+            cached_tools, cached_pre_assembly = cached
+            _last_resolved_tool_names = [t["function"]["name"] for t in cached_tools]
+            _last_pre_assembly_tool_names = list(cached_pre_assembly)
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
-            return list(cached[0])
+            return list(cached_tools), list(cached_pre_assembly)
 
-    result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
-                                       skip_tool_search_assembly=skip_tool_search_assembly)
+    result, pre_assembly_names = _compute_tool_definitions(
+        enabled_toolsets, disabled_toolsets, quiet_mode,
+        skip_tool_search_assembly=skip_tool_search_assembly,
+    )
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -379,9 +420,9 @@ def get_tool_definitions(
         # Store the PRE-assembly names alongside the final (post-assembly) list
         # so a later cache hit can restore _last_pre_assembly_tool_names to the
         # same pre-assembly view this fresh compute produced. (#66826)
-        _tool_defs_cache[cache_key] = (result, _last_pre_assembly_tool_names)
-        return list(result)
-    return result
+        _tool_defs_cache[cache_key] = (result, pre_assembly_names)
+        return list(result), list(pre_assembly_names)
+    return result, pre_assembly_names
 
 
 def _compute_tool_definitions(
@@ -389,8 +430,18 @@ def _compute_tool_definitions(
     disabled_toolsets: Optional[List[str]] = None,
     quiet_mode: bool = False,
     skip_tool_search_assembly: bool = False,
-) -> List[Dict[str, Any]]:
-    """Uncached implementation of :func:`get_tool_definitions`."""
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Uncached implementation of :func:`get_tool_definitions_with_meta`.
+
+    Returns:
+        (tools, pre_assembly_names): the filtered tool definitions, and the
+        list of tool names captured *before* Tool Search assembly ran (i.e.
+        the session's full granted inventory, not the post-assembly
+        bridge-collapsed surface). ``pre_assembly_names`` is returned to the
+        caller so the receiving agent binds it directly; the module-globals
+        are kept in sync for legacy consumers only (mcp_tool's refresh
+        snapshot, execute_code sandbox fallback). (#66826)
+    """
     # Determine which tool names the caller wants
     tools_to_include: set = set()
 
@@ -554,12 +605,16 @@ def _compute_tool_definitions(
             print("🛠️  No tools selected (all filtered out or unavailable)")
 
     global _last_resolved_tool_names, _last_pre_assembly_tool_names
-    _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
     # Snapshot the PRE-assembly names (before tool_search assembly may swap
-    # deferrable tools for the bridge) so the description_only inventory can
-    # always derive the session's granted tool set regardless of whether the
-    # caller later hits the quiet_mode cache. (#66826)
-    _last_pre_assembly_tool_names = list(_last_resolved_tool_names)
+    # deferrable tools for the bridge). This is the session's full granted
+    # inventory — returned to the caller via get_tool_definitions_with_meta()
+    # so the receiving agent binds it directly. Reading it back from a
+    # process-global later would race with other agents' assembly (two agents
+    # initializing concurrently could bind each other's inventory; issue
+    # #66826, GottZ race). The global writes are kept for legacy consumers.
+    pre_assembly_names = [t["function"]["name"] for t in filtered_tools]
+    _last_resolved_tool_names = list(pre_assembly_names)
+    _last_pre_assembly_tool_names = list(pre_assembly_names)
 
     # Sanitize schemas for broad backend compatibility. llama.cpp's
     # json-schema-to-grammar converter (used by its OAI server to build
@@ -608,7 +663,7 @@ def _compute_tool_definitions(
     except Exception as e:  # pragma: no cover — never break tool loading
         logger.warning("Tool search assembly skipped: %s", e)
 
-    return filtered_tools
+    return filtered_tools, pre_assembly_names
 
 
 def _resolve_active_context_length() -> int:

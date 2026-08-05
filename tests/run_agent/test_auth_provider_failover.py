@@ -25,6 +25,7 @@ from agent.turn_retry_state import TurnRetryState
 def _make_agent(fallback_model=None):
     with (
         patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.get_tool_definitions_with_meta", return_value=([], [])),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
     ):

@@ -26,6 +26,7 @@ class _FakeOpenAI:
 
 def _make_agent(monkeypatch, enabled_toolsets=None, skip_memory=True):
     monkeypatch.setattr("run_agent.get_tool_definitions", lambda **kw: [])
+    monkeypatch.setattr("run_agent.get_tool_definitions_with_meta", lambda **kw: ([], []))
     monkeypatch.setattr("run_agent.check_toolset_requirements", lambda: {})
     monkeypatch.setattr("run_agent.OpenAI", _FakeOpenAI)
     return AIAgent(

@@ -47,6 +47,10 @@ def _make_agent_with_fallback(fb_chain):
     """Build a minimal AIAgent with the given fallback chain configured."""
     with (
         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()),
+        patch(
+            "run_agent.get_tool_definitions_with_meta",
+            return_value=(_make_tool_defs(), ["web_search"]),
+        ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI", return_value=MagicMock()),
     ):

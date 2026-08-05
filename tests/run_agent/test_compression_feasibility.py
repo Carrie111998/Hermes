@@ -232,6 +232,7 @@ def test_init_feasibility_check_uses_aux_context_override_from_config():
     with (
         patch("hermes_cli.config.load_config", return_value=cfg), patch("hermes_cli.config.load_config_readonly", return_value=cfg),
         patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.get_tool_definitions_with_meta", return_value=([], [])),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
         patch("run_agent.ContextCompressor", new=_StubCompressor),

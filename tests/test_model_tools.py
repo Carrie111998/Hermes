@@ -1,6 +1,8 @@
 """Tests for model_tools.py — function call dispatch, agent-loop interception, legacy toolsets."""
 
 import json
+
+import pytest
 from unittest.mock import ANY, call, patch
 
 
@@ -404,3 +406,139 @@ class TestDisabledToolsetsPostureToolset:
             )
         }
         assert "write_file" not in no_file
+
+
+# =========================================================================
+# Pre-assembly inventory binding — PR #66826 (GottZ race) regression
+# =========================================================================
+
+class TestPreAssemblyInventoryBinding:
+    """Regression tests for the GottZ (AI triage) finding on PR #66826.
+
+    ``agent/agent_init.py`` used to copy the description_only inventory from
+    the process-global ``model_tools._last_pre_assembly_tool_names`` *after*
+    calling ``get_tool_definitions()``. Two agents initializing concurrently
+    (gateway multi-chat, delegate subagents, parallel cron) could therefore
+    bind the *other* agent's tool inventory. The fix returns the pre-assembly
+    name list directly from tool-definition assembly via
+    ``get_tool_definitions_with_meta``, so the inventory is bound to the
+    receiving agent's own call — never read back from a process-global.
+    """
+
+    @staticmethod
+    def _register(name: str, toolset: str) -> None:
+        """Register a disposable tool in a synthetic toolset (mirrors
+        TestDescriptionOnly._register in tests/tools/test_tool_search.py)."""
+        from tools.registry import registry
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True, "tool": name})
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema={
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": f"desc for {name}",
+                    "parameters": {"type": "object", "properties": {}},
+                },
+            },
+            toolset=toolset,
+        )
+
+    # These tests assemble with quiet_mode=True; keep the memoization cache
+    # clean so they neither see nor leave cross-test state.
+    @pytest.fixture(autouse=True)
+    def _clear_cache(self):
+        import model_tools
+
+        model_tools._tool_defs_cache.clear()
+        yield
+        model_tools._tool_defs_cache.clear()
+
+    def test_pre_assembly_names_bound_to_calling_agent_not_process_global(self):
+        """Two agents with disjoint toolsets assemble alternately; each must
+        keep its own pre-assembly inventory. Pre-fix, agent A read the
+        process-global after B's call and got B's names (cross-agent race)."""
+        import model_tools
+
+        self._register("gottz_agent_a_tool", "gottz-ts-a")
+        self._register("gottz_agent_b_tool", "gottz-ts-b")
+
+        # Agent A assembles its session (captures its pre-assembly inventory).
+        tools_a, pre_a = model_tools.get_tool_definitions_with_meta(
+            enabled_toolsets=["gottz-ts-a"], quiet_mode=True,
+        )
+        # Agent B interleaves with a different session config...
+        tools_b, pre_b = model_tools.get_tool_definitions_with_meta(
+            enabled_toolsets=["gottz-ts-b"], quiet_mode=True,
+        )
+        # ...and A's inventory must still be A's — the value came from A's
+        # own assembly result, not from a process-global B just overwrote.
+        assert "gottz_agent_a_tool" in pre_a
+        assert "gottz_agent_b_tool" not in pre_a
+        assert "gottz_agent_b_tool" in pre_b
+        assert "gottz_agent_a_tool" not in pre_b
+        # The visible post-assembly list, minus the bridge tools assembly
+        # itself synthesizes, is a subset of the pre-assembly inventory
+        # (assembly only defers granted tools behind tool_search/describe/
+        # call — it never invents a non-bridge tool).
+        _bridge = {"tool_search", "tool_describe", "tool_call"}
+        assert {t["function"]["name"] for t in tools_a} - _bridge <= set(pre_a)
+        assert {t["function"]["name"] for t in tools_b} - _bridge <= set(pre_b)
+
+    def test_cache_hit_returns_same_pre_assembly_names(self):
+        """Cache semantics: a quiet_mode cache hit must hand back the same
+        pre-assembly inventory as the first call. The cache stores
+        (tools, pre_assembly_names), so the second session's inventory keeps
+        every deferred tool."""
+        import model_tools
+
+        first_tools, first_pre = model_tools.get_tool_definitions_with_meta(
+            quiet_mode=True,
+        )
+        second_tools, second_pre = model_tools.get_tool_definitions_with_meta(
+            quiet_mode=True,
+        )
+        assert second_pre == first_pre
+        assert second_tools == first_tools
+        # The pre-assembly inventory covers every visible tool except the
+        # bridge tools assembly synthesized itself (tool_search/describe/call).
+        _bridge = {"tool_search", "tool_describe", "tool_call"}
+        assert {t["function"]["name"] for t in first_tools} - _bridge <= set(first_pre)
+
+    def test_pre_assembly_names_captured_before_tool_search_assembly(self, monkeypatch):
+        """pre_assembly_names is captured before tool_search assembly runs: a
+        tool that assembly synthesizes must never leak into the inventory."""
+        from types import SimpleNamespace
+
+        import model_tools
+        from tools import tool_search as ts_mod
+
+        def _fake_assemble(filtered_tools, context_length=None, config=None):
+            return SimpleNamespace(
+                activated=True,
+                tool_defs=[{
+                    "type": "function",
+                    "function": {"name": "post_assembly_synthetic"},
+                }],
+                deferred_count=1,
+                deferred_tokens=0,
+                threshold_tokens=0,
+            )
+
+        # Force the model_tools gate (ts_cfg.enabled != "off") to run the
+        # (fake) assembly so we can observe what "pre-assembly" means.
+        monkeypatch.setattr(
+            ts_mod, "load_config",
+            lambda: ts_mod.ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        monkeypatch.setattr(ts_mod, "assemble_tool_defs", _fake_assemble)
+
+        tools, pre = model_tools.get_tool_definitions_with_meta(quiet_mode=True)
+        visible = {t["function"]["name"] for t in tools}
+        assert "post_assembly_synthetic" in visible  # assembly replaced defs
+        assert "post_assembly_synthetic" not in pre  # pre-assembly captured first
+        assert pre, "pre-assembly inventory must not be empty"

@@ -1409,7 +1409,7 @@ def init_agent(
         agent._tool_snapshot_generation = _snapshot_registry._generation
     except Exception:
         agent._tool_snapshot_generation = 0
-    agent.tools = _ra().get_tool_definitions(
+    agent.tools, pre_assembly = _ra().get_tool_definitions_with_meta(
         enabled_toolsets=enabled_toolsets,
         disabled_toolsets=disabled_toolsets,
         quiet_mode=agent.quiet_mode,
@@ -1419,21 +1419,20 @@ def init_agent(
     agent.valid_tool_names = set()
     if agent.tools:
         agent.valid_tool_names = {tool["function"]["name"] for tool in agent.tools}
-        # Capture pre-assembly tool names for the description_only inventory in
-        # the system prompt.  ``agent.valid_tool_names`` reflects the
-        # post-tool_search-assembly visible list (description_only tools are
-        # deferred behind bridge tools), but the system prompt's MCP tool
-        # inventory must list every tool the session was granted — not just
-        # the ones that happen to be visible after assembly.
+        # Bind the pre-assembly tool names for the description_only inventory
+        # in the system prompt directly from THIS call's assembly result.
+        # ``agent.valid_tool_names`` reflects the post-tool_search-assembly
+        # visible list (description_only tools are deferred behind bridge
+        # tools), but the system prompt's MCP tool inventory must list every
+        # tool the session was granted — not just the ones that happen to be
+        # visible after assembly. The names come from the call's return value,
+        # never from a process-global: with concurrent agent initialization
+        # (gateway multi-chat, delegate subagents, parallel cron) another
+        # agent's assembly can overwrite model_tools._last_pre_assembly_tool_names
+        # between this call and a later read, binding the wrong session's
+        # inventory to this agent (issue #66826, GottZ race).
         try:
-            import model_tools
-            # Read the PRE-assembly snapshot, not ``_last_resolved_tool_names``:
-            # the latter is overwritten with the cached POST-assembly list on a
-            # quiet_mode cache hit, which would silently empty the inventory
-            # for every session after the first with the same toolset key.
-            # ``_last_pre_assembly_tool_names`` is restored identically on both
-            # the fresh-compute and cache-hit paths. (#66826)
-            agent._pre_assembly_tool_names = set(model_tools._last_pre_assembly_tool_names)
+            agent._pre_assembly_tool_names = set(pre_assembly)
         except Exception as e:
             agent._pre_assembly_tool_names = set()
             logger.warning("Failed to capture pre-assembly tool names: %s", e)

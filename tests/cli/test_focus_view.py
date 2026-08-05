@@ -252,6 +252,10 @@ def _make_agent(tool_progress_mode: str):
     ]
     with (
         patch("run_agent.get_tool_definitions", return_value=tool_defs),
+        patch(
+            "run_agent.get_tool_definitions_with_meta",
+            return_value=(tool_defs, [t["function"]["name"] for t in tool_defs]),
+        ),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("hermes_cli.config.load_config", return_value={}),
         patch("run_agent.OpenAI"),

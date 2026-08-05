@@ -136,6 +136,7 @@ else:
 # Import our tool system
 from model_tools import (
     get_tool_definitions,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.get_tool_definitions")
+    get_tool_definitions_with_meta,  # noqa: F401  # re-exported for agent_init's _ra().get_tool_definitions_with_meta (pre-assembly inventory binding, #66826)
     get_toolset_for_tool,
     handle_function_call,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.handle_function_call")
     check_toolset_requirements,  # noqa: F401  # re-exported for tests that mock.patch("run_agent.check_toolset_requirements")
