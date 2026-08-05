@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events'
 
 import React from 'react'
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import Text from './components/Text.js'
 import Ink from './ink.js'
@@ -21,21 +21,92 @@ class FakeTty extends EventEmitter {
   }
 }
 
-const tick = () => new Promise<void>(resolve => queueMicrotask(resolve))
+const settleResize = async () => {
+  await vi.advanceTimersByTimeAsync(160)
+  await vi.runAllTimersAsync()
+}
+
+const makeInk = (stdout: FakeTty, stdin = new FakeTty(), stderr = new FakeTty()) =>
+  new Ink({
+    exitOnCtrlC: false,
+    patchConsole: false,
+    stderr: stderr as unknown as NodeJS.WriteStream,
+    stdin: stdin as unknown as NodeJS.ReadStream,
+    stdout: stdout as unknown as NodeJS.WriteStream
+  })
+
+const expectCleanRepaint = (stdout: FakeTty) => {
+  const out = stdout.chunks.join('')
+
+  expect(out).toContain(ERASE_SCREEN)
+  expect(out).toContain(CURSOR_HOME)
+  expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+}
 
 describe('Ink resize healing', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('waits for a resize burst to settle before emitting one clean repaint', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+
+    try {
+      ink.setAltScreenActive(true)
+      ink.render(React.createElement(Text, null, 'hello'))
+      ink.onRender()
+      stdout.chunks = []
+
+      stdout.columns = 12
+      stdout.rows = 8
+      stdout.emit('resize')
+
+      await vi.advanceTimersByTimeAsync(0)
+
+      const duringResize = stdout.chunks.join('')
+
+      expect(duringResize).not.toContain(ERASE_SCREEN)
+      expect(duringResize).not.toContain('hello')
+
+      await vi.advanceTimersByTimeAsync(159)
+      expect(stdout.chunks.join('')).not.toContain(ERASE_SCREEN)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await vi.runAllTimersAsync()
+
+      expectCleanRepaint(stdout)
+    } finally {
+      ink.unmount()
+    }
+  })
+
+  it('lets a manual redraw supersede a pending resize heal', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+
+    ink.setAltScreenActive(true)
+    ink.render(React.createElement(Text, null, 'hello'))
+    ink.onRender()
+    stdout.chunks = []
+
+    stdout.columns = 12
+    stdout.emit('resize')
+    await vi.advanceTimersByTimeAsync(0)
+
+    ink.forceRedraw()
+    expectCleanRepaint(stdout)
+
+    const writesAfterRedraw = stdout.chunks.length
+
+    await vi.advanceTimersByTimeAsync(200)
+    expect(stdout.chunks).toHaveLength(writesAfterRedraw)
+
+    ink.unmount()
+  })
+
   it('heals same-dimension alt-screen resize events with an erase before repaint', async () => {
     const stdout = new FakeTty()
-    const stdin = new FakeTty()
-    const stderr = new FakeTty()
-
-    const ink = new Ink({
-      exitOnCtrlC: false,
-      patchConsole: false,
-      stderr: stderr as unknown as NodeJS.WriteStream,
-      stdin: stdin as unknown as NodeJS.ReadStream,
-      stdout: stdout as unknown as NodeJS.WriteStream
-    })
+    const ink = makeInk(stdout)
 
     ink.setAltScreenActive(true)
     ink.render(React.createElement(Text, null, 'hello'))
@@ -43,38 +114,23 @@ describe('Ink resize healing', () => {
     stdout.chunks = []
 
     stdout.emit('resize')
-    ink.onRender()
-    await tick()
+    await settleResize()
 
     // The heal may also erase scrollback (CSI 3J interposed between 2J and H)
     // depending on which recovery path runs, so assert the invariant — screen
     // erased, then content repainted after — rather than an exact byte run.
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectCleanRepaint(stdout)
 
     ink.unmount()
   })
 
   // Regression for issue #18449: dragging the terminal back and forth quickly
-  // emits a BURST of resize events (the single-event test above only covers one
-  // tick). Each tick resets the frame buffers and arms needsEraseBeforePaint, so
-  // the burst must still converge to a clean erase+repaint — a stacked event
-  // must never consume the erase and leave the final paint as a partial diff
-  // that lets stale glyphs survive.
+  // emits a BURST of resize events. Intermediate paints race the terminal
+  // host's physical reflow and can strand stale glyphs. The burst must stay
+  // quiet until it settles, then converge through one clean erase+repaint.
   it('converges to a clean erased frame after a rapid resize burst', async () => {
     const stdout = new FakeTty()
-    const stdin = new FakeTty()
-    const stderr = new FakeTty()
-
-    const ink = new Ink({
-      exitOnCtrlC: false,
-      patchConsole: false,
-      stderr: stderr as unknown as NodeJS.WriteStream,
-      stdin: stdin as unknown as NodeJS.ReadStream,
-      stdout: stdout as unknown as NodeJS.WriteStream
-    })
+    const ink = makeInk(stdout)
 
     ink.setAltScreenActive(true)
     ink.render(React.createElement(Text, null, 'hello'))
@@ -98,17 +154,16 @@ describe('Ink resize healing', () => {
       stdout.emit('resize')
     }
 
-    ink.onRender()
-    await tick()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(stdout.chunks.join('')).not.toContain(ERASE_SCREEN)
+
+    await settleResize()
 
     // The heal can erase scrollback too (CSI 3J interposed), so assert the
     // semantic invariant rather than an exact byte sequence: the screen was
     // erased and the content was repainted AFTER the erase — i.e. the final
     // frame is a clean repaint, not a partial diff over drifted cells.
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectCleanRepaint(stdout)
 
     ink.unmount()
   })
@@ -120,16 +175,7 @@ describe('Ink resize healing', () => {
   // diff path cannot see (see log-update "drift repro").
   it('heals a same-dimension resize even when no React commit changes the tree', async () => {
     const stdout = new FakeTty()
-    const stdin = new FakeTty()
-    const stderr = new FakeTty()
-
-    const ink = new Ink({
-      exitOnCtrlC: false,
-      patchConsole: false,
-      stderr: stderr as unknown as NodeJS.WriteStream,
-      stdin: stdin as unknown as NodeJS.ReadStream,
-      stdout: stdout as unknown as NodeJS.WriteStream
-    })
+    const ink = makeInk(stdout)
 
     ink.setAltScreenActive(true)
     ink.render(React.createElement(Text, null, 'hello'))
@@ -138,13 +184,9 @@ describe('Ink resize healing', () => {
 
     // Dimensions are identical to the initial render — the tree never changes.
     stdout.emit('resize')
-    ink.onRender()
-    await tick()
+    await settleResize()
 
-    const out = stdout.chunks.join('')
-    expect(out).toContain(ERASE_SCREEN)
-    expect(out).toContain(CURSOR_HOME)
-    expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('hello'))
+    expectCleanRepaint(stdout)
 
     ink.unmount()
   })

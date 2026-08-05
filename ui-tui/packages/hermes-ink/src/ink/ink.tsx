@@ -597,6 +597,10 @@ export default class Ink {
       this.resetFramesForAltScreen()
       this.needsEraseBeforePaint = true
       this.render(this.currentNode!)
+      // React may bail out when the current tree is referentially unchanged.
+      // The physical terminal still needs the trailing erase+repaint, so do
+      // not depend on a reconciler commit to schedule it.
+      this.onRender()
     }, 160)
   }
 
@@ -686,6 +690,16 @@ export default class Ink {
   }
   onRender() {
     if (this.isUnmounted || this.isPaused) {
+      return
+    }
+
+    // A terminal host reflows its physical buffer while a resize burst is in
+    // flight. Writing intermediate frames during that window races the host:
+    // cells painted for one geometry can be reflowed again by the next event,
+    // leaving stale rows that Ink's virtual diff can no longer see. Keep
+    // layout commits current, but defer terminal output until the trailing
+    // resize heal can erase and repaint exactly once at the settled geometry.
+    if (this.altScreenActive && this.resizeSettleTimer !== null) {
       return
     }
 
@@ -1255,6 +1269,13 @@ export default class Ink {
   forceRedraw(): void {
     if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
       return
+    }
+
+    // Manual recovery must not be swallowed by the resize-output guard above.
+    // Cancel the trailing heal; this full repaint supersedes it.
+    if (this.resizeSettleTimer !== null) {
+      clearTimeout(this.resizeSettleTimer)
+      this.resizeSettleTimer = null
     }
 
     this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
