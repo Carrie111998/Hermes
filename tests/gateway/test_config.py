@@ -93,6 +93,24 @@ class TestPlatformConfigRoundtrip:
         assert restored.typing_status_text == "chasing yarn…"
 
 
+    def test_suppress_link_embeds_defaults_false(self):
+        assert PlatformConfig().suppress_link_embeds is False
+        assert PlatformConfig.from_dict({}).suppress_link_embeds is False
+
+    def test_suppress_link_embeds_roundtrip_true(self):
+        pc = PlatformConfig(enabled=True, suppress_link_embeds=True)
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert restored.suppress_link_embeds is True
+
+    def test_suppress_link_embeds_coerces_quoted_true(self):
+        restored = PlatformConfig.from_dict({"suppress_link_embeds": "true"})
+        assert restored.suppress_link_embeds is True
+
+    def test_suppress_link_embeds_resolved_from_extra(self):
+        # Mirrors typing_indicator: bridged into extra by the shared-key loop.
+        restored = PlatformConfig.from_dict({"extra": {"suppress_link_embeds": True}})
+        assert restored.suppress_link_embeds is True
+
     def test_channel_overrides_roundtrip(self):
         pc = PlatformConfig(
             enabled=True,

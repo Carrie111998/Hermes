@@ -341,12 +341,16 @@ discord:
   no_thread_channels: []          # Channel IDs where bot responds without threading
   history_backfill: true          # Prepend recent channel scrollback on mention (default: true)
   history_backfill_limit: 50      # Max messages to scan backwards (default: 50)
+<<<<<<< HEAD
   missed_message_backfill:        # Replay messages missed while disconnected (opt-in)
     enabled: false
     channels: []                  # Empty uses free_response_channels
     window_seconds: 21600         # Look back at most 6 hours
     limit: 100                    # Global scan cap per reconnect
     max_dispatches: 10            # Recovery dispatch cap per reconnect
+=======
+  suppress_link_embeds: false     # Send messages with suppress_embeds (no link preview cards)
+>>>>>>> 58baeb138 (feat(discord): make link-preview suppression a config option)
   channel_prompts: {}             # Per-channel ephemeral system prompts
   voice_channel_inactivity_timeout_seconds: 300  # Set 0 to stay in VC until explicit /voice leave
   voice_playback_timeout_seconds: 120             # Minimum playback watchdog; long clips get duration+padding
@@ -518,6 +522,7 @@ discord:
   history_backfill_limit: 50
 ```
 
+<<<<<<< HEAD
 #### `discord.missed_message_backfill`
 
 **Type:** object — **Default:** disabled
@@ -536,6 +541,21 @@ discord:
 
 If `channels` is empty, Hermes uses `discord.free_response_channels`. Set it to `"*"` only when the bot should inspect every reachable server text channel. The recovery ledger is stored per profile under `gateway/discord_message_recovery.db`, preventing a successfully answered message from being replayed again after a later restart.
 
+=======
+#### `discord.suppress_link_embeds`
+
+**Type:** boolean — **Default:** `false`
+
+When enabled, outgoing Discord text messages are sent with `suppress_embeds=True`, so Discord skips link-preview unfurling entirely: URLs in messages stay clean and clickable, but no preview card (title, description, thumbnail) is generated. Useful on channels where link previews are unwanted clutter.
+
+Only plain-text sends are affected. Explicit UI embeds — command approval buttons, clarify prompts, the model picker — are never suppressed.
+
+```yaml
+discord:
+  suppress_link_embeds: true
+```
+
+>>>>>>> 58baeb138 (feat(discord): make link-preview suppression a config option)
 #### `group_sessions_per_user`
 
 **Type:** boolean — **Default:** `true`

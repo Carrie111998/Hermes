@@ -629,6 +629,15 @@ class PlatformConfig:
     # Telegram, Matrix, …) ignore it.
     typing_status_text: Optional[str] = None
 
+    # Whether outgoing Discord text messages are sent with
+    # ``suppress_embeds=True`` so Discord skips link-preview unfurling.
+    # Default False preserves prior behavior (links render as preview cards).
+    # Set True on channels where link previews are unwanted clutter — links
+    # stay clickable, only the auto-generated embed is suppressed. Only
+    # affects plain-text sends; explicit UI embeds (approval/clarify/model
+    # picker) are never suppressed.
+    suppress_link_embeds: bool = False
+
     # Per-channel model/provider/system_prompt overrides (channel_id -> ChannelOverride)
     channel_overrides: Dict[str, ChannelOverride] = field(default_factory=dict)
 
@@ -642,6 +651,7 @@ class PlatformConfig:
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
             "typing_indicator": self.typing_indicator,
+            "suppress_link_embeds": self.suppress_link_embeds,
         }
         if self.typing_status_text is not None:
             result["typing_status_text"] = self.typing_status_text
@@ -686,6 +696,11 @@ class PlatformConfig:
         if _typing_text is None:
             _typing_text = extra.get("typing_status_text")
 
+        # suppress_link_embeds likewise may arrive top-level or inside extra.
+        _suppress_embeds = data.get("suppress_link_embeds")
+        if _suppress_embeds is None:
+            _suppress_embeds = extra.get("suppress_link_embeds")
+
         channel_overrides: Dict[str, ChannelOverride] = {}
         raw_overrides = data.get("channel_overrides") or {}
         if isinstance(raw_overrides, dict):
@@ -702,6 +717,7 @@ class PlatformConfig:
             gateway_restart_notification=_coerce_bool(_grn, True),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
+            suppress_link_embeds=_coerce_bool(_suppress_embeds, False),
             channel_overrides=channel_overrides,
             extra=extra,
         )
@@ -1596,6 +1612,8 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                if "suppress_link_embeds" in platform_cfg:
+                    bridged["suppress_link_embeds"] = platform_cfg["suppress_link_embeds"]
                 # Bridge top-level port/host/secret into extra for platforms
                 # whose adapters read these from config.extra (webhook,
                 # msgraph_webhook, api_server).  Without this, YAML like:

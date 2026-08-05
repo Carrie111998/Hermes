@@ -116,7 +116,7 @@ async def test_send_retries_without_reference_when_reply_target_is_deleted():
     sent_msgs = [SimpleNamespace(id=1001), SimpleNamespace(id=1002)]
     send_calls = []
 
-    async def fake_send(*, content, reference=None):
+    async def fake_send(*, content, reference=None, **kwargs):
         send_calls.append({"content": content, "reference": reference})
         if len(send_calls) == 1:
             raise RuntimeError(
@@ -314,6 +314,7 @@ async def test_send_video_uses_path_based_files_kwarg(tmp_path, monkeypatch):
 
     result = await adapter.send_video("555", str(video))
 
+<<<<<<< HEAD
     assert result.success is True
     assert result.message_id == "4242"
     assert captured["fp"] == str(video)
@@ -418,3 +419,69 @@ async def test_send_file_attachment_forum_uses_files_kwarg(tmp_path, monkeypatch
     assert isinstance(thread_kwargs.get("files"), list) and len(thread_kwargs["files"]) == 1
 
 
+=======
+    await adapter.stop_typing("12345")
+    assert "12345" not in adapter._typing_tasks
+>>>>>>> 58baeb138 (feat(discord): make link-preview suppression a config option)
+
+
+@pytest.mark.asyncio
+async def test_send_suppress_link_embeds_disabled_by_default():
+    """Default config (suppress_link_embeds=False) passes suppress_embeds=False
+    so Discord keeps rendering link-preview cards — prior behavior preserved."""
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    assert adapter._suppress_link_embeds is False
+
+    sent_msg = SimpleNamespace(id=1234)
+    send_kwargs = []
+
+    async def fake_send(*, content, reference=None, **kwargs):
+        send_kwargs.append(kwargs)
+        return sent_msg
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "hello https://example.com")
+
+    assert result.success is True
+    assert send_kwargs, "expected at least one send call"
+    assert send_kwargs[0].get("suppress_embeds") is False
+
+
+@pytest.mark.asyncio
+async def test_send_suppress_link_embeds_enabled_passes_flag():
+    """With suppress_link_embeds=True the adapter passes suppress_embeds=True,
+    so Discord skips link-preview unfurling entirely."""
+    adapter = DiscordAdapter(
+        PlatformConfig(enabled=True, token="***", suppress_link_embeds=True)
+    )
+    assert adapter._suppress_link_embeds is True
+
+    sent_msg = SimpleNamespace(id=1234)
+    send_kwargs = []
+
+    async def fake_send(*, content, reference=None, **kwargs):
+        send_kwargs.append(kwargs)
+        return sent_msg
+
+    channel = SimpleNamespace(
+        fetch_message=AsyncMock(),
+        send=AsyncMock(side_effect=fake_send),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=lambda _chat_id: channel,
+        fetch_channel=AsyncMock(),
+    )
+
+    result = await adapter.send("555", "hello https://example.com")
+
+    assert result.success is True
+    assert send_kwargs, "expected at least one send call"
+    assert send_kwargs[0].get("suppress_embeds") is True

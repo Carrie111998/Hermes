@@ -1100,6 +1100,11 @@ class DiscordAdapter(BasePlatformAdapter):
         # chunk only, default), "all" (reply-reference on every chunk).
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._slash_commands: bool = self.config.extra.get("slash_commands", True)
+        # When True, plain-text sends pass suppress_embeds=self._suppress_link_embeds so Discord
+        # skips link-preview unfurling (config.platforms.discord.suppress_link_embeds).
+        self._suppress_link_embeds: bool = bool(
+            getattr(config, "suppress_link_embeds", False)
+        )
         # In-memory cache of the bot's last message ID per channel, used by
         # history backfill to skip the full scan on hot paths.  Falls back to
         # scanning channel.history() on cache miss (cold start / restart).
@@ -3117,6 +3122,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     msg = await channel.send(
                         content=chunk,
                         reference=chunk_reference,
+                        suppress_embeds=self._suppress_link_embeds,
                     )
                 except Exception as e:
                     err_text = str(e)
@@ -3139,6 +3145,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         msg = await channel.send(
                             content=chunk,
                             reference=None,
+                            suppress_embeds=self._suppress_link_embeds,
                         )
                     else:
                         raise
@@ -3202,6 +3209,7 @@ class DiscordAdapter(BasePlatformAdapter):
             thread = await forum_channel.create_thread(
                 name=thread_name,
                 content=starter_content,
+                suppress_embeds=self._suppress_link_embeds,
             )
         except Exception as e:
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
@@ -3218,7 +3226,7 @@ class DiscordAdapter(BasePlatformAdapter):
         warnings: list[str] = []
         for chunk in chunks[1:]:
             try:
-                msg = await thread_channel.send(content=chunk)
+                msg = await thread_channel.send(content=chunk, suppress_embeds=self._suppress_link_embeds)
                 message_ids.append(str(msg.id))
             except Exception as e:
                 warning = f"Failed to send follow-up chunk to forum thread {thread_id}: {e}"
@@ -3265,7 +3273,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     hint = getattr(files[0], "filename", "") or ""
             thread_name = _derive_forum_thread_name(hint) if hint.strip() else "New Post"
 
-        kwargs: Dict[str, Any] = {"name": thread_name}
+        kwargs: Dict[str, Any] = {"name": thread_name, "suppress_embeds": self._suppress_link_embeds}
         if content:
             kwargs["content"] = content
         if file is not None:
@@ -3494,7 +3502,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # overflow continuations stay threaded.
                 reference = self._message_reference_from_ids(prev_msg.id, channel)
             try:
-                sent = await channel.send(content=chunk, reference=reference)
+                sent = await channel.send(content=chunk, reference=reference, suppress_embeds=self._suppress_link_embeds)
             except Exception as send_err:
                 # Drop the reply anchor and retry once — a deleted/expired
                 # anchor (10008) or system-message reply (50035) shouldn't lose
@@ -3504,7 +3512,7 @@ class DiscordAdapter(BasePlatformAdapter):
                     self.name, send_err,
                 )
                 try:
-                    sent = await channel.send(content=chunk, reference=None)
+                    sent = await channel.send(content=chunk, reference=None, suppress_embeds=self._suppress_link_embeds)
                 except Exception as retry_err:
                     logger.warning(
                         "[%s] Overflow split: stopped at %d/%d chunks delivered: %s",
@@ -3596,6 +3604,7 @@ class DiscordAdapter(BasePlatformAdapter):
         msg = await channel.send(
             content=caption if caption else None,
             files=[discord_file],
+            suppress_embeds=self._suppress_link_embeds,
         )
         attachments = getattr(msg, "attachments", None) or []
         if not attachments:
@@ -3731,7 +3740,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         files=files,
                     )
                 else:
-                    await channel.send(content=content, files=files)
+                    await channel.send(content=content, files=files, suppress_embeds=self._suppress_link_embeds)
             except Exception as e:
                 logger.warning(
                     "[%s] Multi-image Discord send failed (chunk %d/%d), falling back to per-image: %s",
@@ -5109,6 +5118,7 @@ class DiscordAdapter(BasePlatformAdapter):
                         channel,
                         content=(caption or "").strip(),
                         file=file,
+                        suppress_embeds=self._suppress_link_embeds,
                     )
 
                 msg = await channel.send(
@@ -6754,7 +6764,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 reason=reason,
             )
             if starter_message:
-                await thread.send(starter_message)
+                await thread.send(starter_message, suppress_embeds=self._suppress_link_embeds)
             return {
                 "success": True,
                 "thread_id": str(thread.id),
@@ -6763,7 +6773,7 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as direct_error:
             try:
                 seed_content = starter_message or f"\U0001f9f5 Thread created by Hermes: **{name}**"
-                seed_msg = await parent_channel.send(seed_content)
+                seed_msg = await parent_channel.send(seed_content, suppress_embeds=self._suppress_link_embeds)
                 thread = await seed_msg.create_thread(
                     name=name,
                     auto_archive_duration=auto_archive_duration,
@@ -6834,7 +6844,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 last_direct_error = direct_error
                 try:
                     seed_msg = await message.channel.send(
-                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**"
+                        f"\U0001f9f5 Thread created by Hermes: **{thread_name}**",
+                        suppress_embeds=self._suppress_link_embeds,
                     )
                     thread = await seed_msg.create_thread(
                         name=thread_name,
