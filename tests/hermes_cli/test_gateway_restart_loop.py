@@ -664,6 +664,26 @@ class TestLifecycleGuardModule:
         )
         check_gateway_lifecycle("clean prompt", str(script))
 
+    def test_non_py_extension_python_script_with_tilde_not_blocked(
+        self, tmp_path
+    ):
+        """#78980: a cron script without a .py extension (but executed as
+        Python per the scheduler) containing a ~/... path literal must NOT
+        be blocked.
+
+        The scheduler treats .sh/.bash as bash and everything else as
+        Python.  The guard must match this policy: non-shell scripts skip
+        the shell-script reference walk, not just .py files.
+        """
+        from cron.lifecycle_guard import check_gateway_lifecycle
+        script = tmp_path / "watchdog"
+        script.write_text(
+            "import os\n"
+            'root = os.path.expanduser("~/.hermes/skills")\n'
+            'print(f"scanning {root}")\n'
+        )
+        check_gateway_lifecycle("", str(script))
+
     def test_python_script_with_literal_lifecycle_command_still_blocked(
         self, tmp_path
     ):

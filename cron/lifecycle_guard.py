@@ -412,7 +412,13 @@ def check_gateway_lifecycle(
     combined = prompt or ""
     python_script = False
     if script:
-        python_script = _resolve_script_path(script).suffix == ".py"
+        # Match the scheduler's interpreter selection (cron/scheduler.py:2275):
+        # .sh/.bash → bash, everything else → Python.  The shell-script
+        # reference walk produces false positives on Python source (pathlib's
+        # "/" operator, ~/… literals) — skip it for all non-shell scripts,
+        # not just those with a .py extension (#78980).
+        _script_suffix = _resolve_script_path(script).suffix.lower()
+        python_script = _script_suffix not in (".sh", ".bash")
         script_text = _read_script_for_scanning(script)
         if script_text:
             combined = f"{combined}\n{script_text}"
