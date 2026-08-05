@@ -416,11 +416,15 @@ def validate_installed_pre_phase_b_start_permit(
 ) -> dict[str, Any]:
     value = read_pre_phase_b_start_permit(path, expected_writer_gid=writer_gid)
     current = int(time.time()) if now_unix is None else now_unix
+    effective_uid = getattr(os, "geteuid", None)
+    effective_gid = getattr(os, "getegid", None)
     if (
         type(current) is not int
         or not value["created_at_unix"] <= current < value["expires_at_unix"]
-        or os.geteuid() != writer_uid
-        or os.getegid() != writer_gid
+        or effective_uid is None
+        or effective_gid is None
+        or effective_uid() != writer_uid
+        or effective_gid() != writer_gid
         or value["writer_uid"] != writer_uid
         or value["writer_gid"] != writer_gid
         or value["boot_id_sha256"] != _boot_id_sha256()
