@@ -5051,10 +5051,20 @@ class FeishuAdapter(BasePlatformAdapter):
                             exc_code,
                             chat_id,
                         )
-                        active_reply_to = None
-                        if metadata:
-                            metadata.pop("reply_to_message_id", None)
-                        continue  # retry this attempt without reply_to
+                        # Send a reply-free message directly rather than
+                        # consuming a retry iteration on the next loop pass. If
+                        # this exception is raised on the final attempt, the
+                        # loop would otherwise exit and re-raise without ever
+                        # sending the message. Non-thread sends do not consult
+                        # reply_to_message_id, so keep retry state local and do
+                        # not mutate the caller-provided metadata here.
+                        return await self._send_raw_message(
+                            chat_id=chat_id,
+                            msg_type=msg_type,
+                            payload=payload,
+                            reply_to=None,
+                            metadata=metadata,
+                        )
                 if attempt >= _FEISHU_SEND_ATTEMPTS - 1:
                     raise
                 wait_seconds = 2 ** attempt
