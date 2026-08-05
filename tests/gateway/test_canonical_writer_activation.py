@@ -875,8 +875,10 @@ def test_root_receipt_archive_cross_binds_exact_evidence_bundle(monkeypatch):
     assert installed[0][1] == root_raw
 
 
+@pytest.mark.parametrize("mode", [0o644, 0o755])
 def test_durable_native_replay_rehashes_external_library_before_mutation(
     monkeypatch,
+    mode,
 ):
     path = Path("/usr/lib/muncho-reviewed.so")
     payload = b"current-reviewed-native-library"
@@ -906,7 +908,7 @@ def test_durable_native_replay_rehashes_external_library_before_mutation(
         }
     )
     observed = SimpleNamespace(
-        st_mode=stat.S_IFREG | 0o444,
+        st_mode=stat.S_IFREG | mode,
         st_nlink=1,
         st_uid=0,
         st_gid=0,
@@ -931,6 +933,62 @@ def test_durable_native_replay_rehashes_external_library_before_mutation(
     ] = "f" * 64
 
     with pytest.raises(RuntimeError, match="mapping digest drifted"):
+        activation._rehash_native_receipt_external_mappings(receipt)
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o646])
+def test_durable_native_replay_rejects_group_or_other_writable_library(
+    monkeypatch,
+    mode,
+):
+    path = Path("/usr/lib/muncho-rejected.so")
+    payload = b"rejected-native-library"
+    receipt = activation.NativeObservationReceipt(
+        value={
+            "plan": {},
+            "observation": {
+                "gateway_service": {
+                    "external_native_mappings": [
+                        {"path": str(path), "sha256": activation._sha256_bytes(payload)}
+                    ]
+                },
+                "writer_service": {
+                    "external_native_mappings": [
+                        {"path": str(path), "sha256": activation._sha256_bytes(payload)}
+                    ]
+                },
+            },
+        }
+    )
+    monkeypatch.setattr(
+        activation.NativeObservationPlan,
+        "from_mapping",
+        lambda _value: SimpleNamespace(
+            value={
+                "artifact_root": "/opt/muncho-canary-releases/" + "a" * 40,
+                "native_discovery_policy": {
+                    "allowed_roots": ["/usr/lib"],
+                    "maximum_mappings": 256,
+                    "required_owner_uid": 0,
+                    "required_owner_gid": 0,
+                },
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        activation.os,
+        "lstat",
+        lambda _path: SimpleNamespace(
+            st_mode=stat.S_IFREG | mode,
+            st_nlink=1,
+            st_uid=0,
+            st_gid=0,
+            st_size=len(payload),
+        ),
+    )
+    monkeypatch.setattr(activation, "_list_xattrs", lambda _path: ())
+
+    with pytest.raises(RuntimeError, match="mapping protection drifted"):
         activation._rehash_native_receipt_external_mappings(receipt)
 
 

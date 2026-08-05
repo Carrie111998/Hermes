@@ -3156,7 +3156,11 @@ def _hash_native_mapping(path: Path, policy: Mapping[str, Any]) -> dict[str, str
         or before.st_nlink != policy["require_single_link"]
         or before.st_uid != policy["required_owner_uid"]
         or before.st_gid != policy["required_owner_gid"]
-        or stat.S_IMODE(before.st_mode) & 0o222
+        # The mapping is pinned to the required root owner above.  Normal
+        # distro libraries are root-writable (0644/0755); the unprivileged
+        # canary identities still cannot mutate them.  Only group/other write
+        # access would cross that trust boundary.
+        or stat.S_IMODE(before.st_mode) & 0o022
         or xattrs
         or before.st_size < 1
         or before.st_size > 1024 * 1024 * 1024
