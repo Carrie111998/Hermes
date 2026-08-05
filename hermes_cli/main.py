@@ -6902,6 +6902,11 @@ def _desktop_linux_sandbox_helper_is_regular_file(packaged_executable: Path) -> 
     return stat.S_ISREG(sandbox_lstat.st_mode)
 
 
+def _desktop_linux_requires_sandbox_fixup(electron_flags: list[str]) -> bool:
+    """Return False when the user explicitly disabled Electron's sandbox."""
+    return "--no-sandbox" not in electron_flags
+
+
 
 def _desktop_linux_sandbox_fixup(packaged_executable: Path) -> bool:
     """Configure Electron's Linux SUID sandbox helper when required."""
@@ -7211,7 +7216,7 @@ def cmd_gui(args: argparse.Namespace):
         sys.exit(1)
 
     launch_command = [str(packaged_executable)]
-    if not _desktop_linux_sandbox_fixup(packaged_executable):
+    if _desktop_linux_requires_sandbox_fixup(config_electron_flags) and not _desktop_linux_sandbox_fixup(packaged_executable):
         if _desktop_linux_needs_no_sandbox() and _desktop_linux_sandbox_helper_is_regular_file(packaged_executable):
             print("⚠ Falling back to --no-sandbox because this Linux host restricts unprivileged user namespaces and the Electron sandbox helper could not be configured.")
             launch_command.append("--no-sandbox")

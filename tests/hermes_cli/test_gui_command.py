@@ -382,3 +382,25 @@ def test_relaunchable_fixup_falls_back_to_legacy_adhoc_on_failure(tmp_path, monk
 # --- desktop.* launch options (config.yaml) -------------------------------
 
 
+def test_explicit_no_sandbox_flag_skips_linux_suid_fixup(tmp_path, monkeypatch):
+    """An explicit no-sandbox launch must never attempt the sudo fixup."""
+    root = _make_desktop_tree(tmp_path)
+    monkeypatch.setattr(cli_main, "PROJECT_ROOT", root)
+    packaged_exe = _make_packaged_executable(root, monkeypatch, platform="linux")
+    launch_ok = subprocess.CompletedProcess([str(packaged_exe), "--no-sandbox"], 0)
+
+    with patch(
+        "hermes_cli.main._desktop_launch_options",
+        return_value=(["--no-sandbox"], "auto"),
+    ), patch(
+        "hermes_cli.main._desktop_linux_sandbox_fixup"
+    ) as mock_fixup, patch(
+        "hermes_cli.main.subprocess.run", return_value=launch_ok
+    ) as mock_run, pytest.raises(SystemExit) as exc:
+        cli_main.cmd_gui(_ns(skip_build=True))
+
+    assert exc.value.code == 0
+    mock_fixup.assert_not_called()
+    assert mock_run.call_args.args[0] == [str(packaged_exe), "--no-sandbox"]
+
+
