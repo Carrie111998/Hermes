@@ -559,6 +559,76 @@ def test_skipped_save_is_reported_not_raised(tmp_path, monkeypatch, hermes_home,
         f"the notice must say the trajectory was not saved: {[r.getMessage() for r in warnings]}"
 
 
+def test_failed_append_is_reported_on_the_terminal(tmp_path, monkeypatch, hermes_home, capsys):
+    """A dropped turn must be visible without ``--verbose``.
+
+    The resolver refuses to silently drop a trajectory, but the *append* can
+    still fail (permissions, full disk, destination replaced) — and that path
+    only called ``logger.warning``, which reaches no terminal because
+    ``hermes_logging.setup_logging`` installs no stderr handler unless
+    ``--verbose``. The turn was lost with nothing on screen, which is the same
+    silent drop the guard exists to prevent.
+    """
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    save_trajectory(SAMPLE, "m", completed=True)  # creates the destination
+    landed = _landed(hermes_home)
+    landed.chmod(stat.S_IRUSR)  # r--: the next append cannot open it
+    capsys.readouterr()  # drop the redirect notice from the first save
+
+    try:
+        save_trajectory(SAMPLE, "m", completed=True)  # must not raise
+    finally:
+        landed.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    err = capsys.readouterr().err
+    assert "NOT saved" in err, f"a lost turn must be reported on stderr: {err!r}"
+    assert str(landed) in err, "the notice must name the path that failed"
+    assert len(_jsonl(landed)) == 1, "the failed append added nothing"
+
+
+def test_repeated_append_failures_log_every_time_but_print_once(
+    tmp_path, monkeypatch, hermes_home, capsys, caplog
+):
+    """errors.log records every lost turn; the terminal says it once.
+
+    A datagen run saves every turn, so N failures must not mean N screen lines
+    — but the per-occurrence record is how a user learns how many turns were
+    lost, so the log must not be deduped.
+    """
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    save_trajectory(SAMPLE, "m", completed=True)
+    landed = _landed(hermes_home)
+    landed.chmod(stat.S_IRUSR)
+    capsys.readouterr()
+
+    try:
+        with caplog.at_level("WARNING", logger="agent.trajectory"):
+            for _ in range(3):
+                save_trajectory(SAMPLE, "m", completed=True)
+    finally:
+        landed.chmod(stat.S_IRUSR | stat.S_IWUSR)
+
+    logged = [r for r in caplog.records if "NOT saved" in r.getMessage()]
+    assert len(logged) == 3, f"every lost turn must be logged, got {len(logged)}"
+    assert capsys.readouterr().err.count("NOT saved") == 1, "one terminal line"
+
+
+def test_successful_save_prints_no_failure_notice(tmp_path, monkeypatch, hermes_home, capsys):
+    """The failure notice must not fire on the happy path."""
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    save_trajectory(SAMPLE, "m", completed=True)
+
+    err = capsys.readouterr().err
+    assert "NOT saved" not in err, f"nothing failed, so nothing may claim it did: {err!r}"
+    assert _jsonl(_landed(hermes_home)) and True
+
+
 def test_opt_out_still_wins_when_containment_is_undetermined(tmp_path, monkeypatch, hermes_home):
     """``trajectory_allow_git_cwd: true`` means "my CWD, my choice" — always.
 

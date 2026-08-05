@@ -59,10 +59,30 @@ def _notify_once(key: str, message: str, *args: Any) -> None:
         return
     _REDIRECT_WARNED.add(key)
     logger.warning(message, *args)
+    _print_notice(message, *args)
+
+
+def _print_notice(message: str, *args: Any) -> None:
+    """Put one line on stderr. Never raises — a notice must not break a turn."""
     try:
         print(f"⚠️  {message % args}", file=sys.stderr, flush=True)
     except Exception:  # pragma: no cover - a notice must never break a turn
         pass
+
+
+def _notify_every_log_once_on_terminal(key: str, message: str, *args: Any) -> None:
+    """Log *every* occurrence, but show the terminal one line per *key*.
+
+    For a repeated failure of the same write: each occurrence belongs in
+    ``errors.log`` (that is the forensic record of how many turns were lost),
+    while the terminal only needs to say it once per destination so a datagen
+    run saving every turn is not flooded.
+    """
+    logger.warning(message, *args)
+    if key in _REDIRECT_WARNED:
+        return
+    _REDIRECT_WARNED.add(key)
+    _print_notice(message, *args)
 
 
 def _explicit_work_tree() -> Optional[Path]:
@@ -411,6 +431,12 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
     **skipped** rather than written into a checkout; a skipped save is logged
     and reported on the terminal, never raised, because this runs during turn
     finalization.
+
+    A save that is *attempted* and fails (permissions, full disk, a destination
+    replaced under us) is reported the same way. Only ``logger.warning`` fired
+    before, and the CLI installs no stderr handler without ``--verbose``, so a
+    dropped turn was visible only in ``errors.log`` — the same silent-drop the
+    resolver deliberately refuses to allow.
     """
     if filename is None:
         filename = "trajectory_samples.jsonl" if completed else "failed_trajectories.jsonl"
@@ -433,4 +459,13 @@ def save_trajectory(trajectory: List[Dict[str, Any]], model: str,
             f.write(json.dumps(entry, ensure_ascii=False) + "\n")
         logger.info("Trajectory saved to %s", filename)
     except Exception as e:
-        logger.warning("Failed to save trajectory: %s", e)
+        # Every occurrence is logged (errors.log is the record of how many
+        # turns were lost); the terminal gets one line per destination.
+        _notify_every_log_once_on_terminal(
+            f"write-failed:{filename}",
+            "This trajectory was NOT saved: writing to %s failed (%s). Later "
+            "turns will keep trying, and each failure is recorded in "
+            "errors.log. Free space or fix permissions on that path, or pass "
+            "an absolute filename to write elsewhere.",
+            filename, e,
+        )
