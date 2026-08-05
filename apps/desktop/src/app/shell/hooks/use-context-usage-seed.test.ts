@@ -96,9 +96,11 @@ describe('useContextUsageSeed', () => {
 
   it('skips publishing a stale result after the session changes mid-fetch', async () => {
     const resolvers: Array<(data: ContextBreakdown) => void> = []
+
     const requestGateway = vi
       .fn()
       .mockImplementation(() => new Promise<ContextBreakdown>(r => resolvers.push(r)))
+
     const published = vi.fn()
 
     const { rerender } = renderHook(

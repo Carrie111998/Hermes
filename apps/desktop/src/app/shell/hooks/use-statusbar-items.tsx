@@ -49,6 +49,7 @@ import type { StatusResponse, UsageStats } from '@/types/hermes'
 
 import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
+
 import { useContextUsageSeed } from './use-context-usage-seed'
 
 const EMPTY_USAGE = { calls: 0, input: 0, output: 0, total: 0 } as const
