@@ -1357,6 +1357,7 @@ def validate_terminal_for_owner(
     observation = _validate_observation(
         raw.get("post_cleanup_observation"),
         phase="post_cleanup",
+        allow_routeback_helper_present=True,
     )
     if (
         raw.get("schema") != TERMINAL_SCHEMA
@@ -3418,8 +3419,14 @@ def _require_exact_target_helper_replay(
     A stopped schema upgrade can commit the target helper before its terminal
     owner receipt is delivered.  The control bootstrap may replay across that
     state only when the complete live schema is byte-for-byte the reviewed
-    target.  The allowance is derived from catalog evidence; no caller or wire
-    frame can select it.
+    target.  This check runs only after Cloud SQL has proved the temporary
+    dual-role control login absent.  While that login exists, its exact
+    membership in the migration-owner role is intentionally visible to the
+    complete contract as a dangerous owner edge, so a target comparison would
+    be structurally impossible.  The pre-cleanup replay path is read-only and
+    the terminal receipt remains unavailable until this post-cleanup writer
+    check succeeds.  The allowance is derived from catalog evidence; no caller
+    or wire frame can select it.
     """
 
     helper_absent = observation.get("helper_absent")
@@ -3431,11 +3438,29 @@ def _require_exact_target_helper_replay(
     try:
         config = context.base.dependencies.writer_config()
         target = context.base.target
+        if (
+            config.user != foundation.SQL_USER
+            or getattr(session, "username", None) != config.user
+        ):
+            _fail("schema_reconciliation_control_routeback_writer_boundary_invalid")
+    except BaseException as exc:
+        if isinstance(exc, ControlBootstrapError):
+            raise
+        raise ControlBootstrapError(
+            "schema_reconciliation_control_routeback_writer_boundary_invalid"
+        ) from exc
+    try:
         managed_hba_receipt = context.base.dependencies.collect_hba(
             config,
             now_unix=context.base.dependencies.now(),
             ttl_seconds=300,
         )
+    except BaseException as exc:
+        raise ControlBootstrapError(
+            "schema_reconciliation_control_routeback_hba_attestation_invalid"
+        ) from exc
+
+    try:
         observed = collect_schema_contract(
             session,
             config=config,
@@ -3444,17 +3469,11 @@ def _require_exact_target_helper_replay(
             subject_user=config.user,
         )
     except BaseException as exc:
-        if (
-            isinstance(exc, ControlBootstrapError)
-            and exc.code
-            == "schema_reconciliation_control_routeback_helper_contract_invalid"
-        ):
-            raise
         raise ControlBootstrapError(
-            "schema_reconciliation_control_routeback_helper_contract_invalid"
+            "schema_reconciliation_control_routeback_contract_collection_failed"
         ) from exc
     if observed.sha256 != target.sha256:
-        _fail("schema_reconciliation_control_routeback_helper_contract_invalid")
+        _fail("schema_reconciliation_control_routeback_contract_mismatch")
 
 
 def _execute_install_artifact(
@@ -3536,7 +3555,6 @@ def _runtime_install_callback(
             observed_at_unix=context.base.dependencies.now,
             allow_routeback_helper_present=True,
         )
-        _require_exact_target_helper_replay(context, session, before)
         _revalidate_stopped(
             context,
             "schema_reconciliation_control_install_stopped_boundary_drifted",
@@ -3556,7 +3574,6 @@ def _runtime_install_callback(
             observed_at_unix=context.base.dependencies.now,
             allow_routeback_helper_present=True,
         )
-        _require_exact_target_helper_replay(context, session, after)
         if after["state"] != "exact_installed":
             _fail("schema_reconciliation_control_install_reattestation_failed")
     except BaseException as exc:
