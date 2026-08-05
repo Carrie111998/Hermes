@@ -638,9 +638,9 @@ async def test_hash_dedupe_keeps_existing_card_actions_valid(tmp_path) -> None:
     adapter = _adapter(tmp_path)
     client = adapter._team_clients["T1"]
     client.chat_postMessage = AsyncMock(return_value={"ts": "20.0"})
-    first = _state(adapter, [{"id": "user:a", "content": "A", "status": "pending"}])
+    first = _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
     assert await _reconcile(adapter, "sk", first["desired_revision"])
-    same = _state(adapter, [{"id": "user:a", "content": "A", "status": "pending"}])
+    same = _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
     assert await _reconcile(adapter, "sk", same["desired_revision"])
     client.chat_update.assert_not_awaited()
 
@@ -1714,7 +1714,7 @@ async def test_plan_action_acks_authorizes_validates_dedupes_and_emits_internal_
     adapter = _adapter(tmp_path)
     _state(adapter, [
         {"id": "agent:a", "content": "Agent", "status": "pending"},
-        {"id": "user:a", "content": "A", "status": "pending"},
+        {"id": "user:a", "content": "A", "status": "in_progress"},
         {"id": "user:b", "content": "B", "status": "completed"},
     ])
     adapter._plan_store.mark_applied(
@@ -1759,9 +1759,13 @@ async def test_plan_action_acks_authorizes_validates_dedupes_and_emits_internal_
     assert trusted["action_kind"] == "complete_reopen"
     assert trusted["task_ids"] == ["user:a", "user:b"]
     assert trusted["complete_task_ids"] == ["user:a"]
+    assert trusted["complete_task_status"] == "completed"
     assert trusted["reopen_task_ids"] == ["user:b"]
+    assert trusted["reopen_task_status"] == "in_progress"
     assert trusted["revision"] == 1
     assert "todo" in event.text.lower()
+    assert '"complete_task_status": "completed"' in event.text
+    assert '"reopen_task_status": "in_progress"' in event.text
     assert adapter.validate_plan_action_metadata(trusted)
 
     await adapter._handle_plan_action(ack, body, action)
@@ -1804,8 +1808,12 @@ async def test_plan_action_rejects_mixed_duplicate_and_ineligible_ids_atomically
         },
         {
             "action_id": "hermes_plan_complete", "block_id": block_id,
+            "selected_options": [{"value": "user:pending"}],
+        },
+        {
+            "action_id": "hermes_plan_complete", "block_id": block_id,
             "selected_options": [
-                {"value": "user:pending"}, {"value": "user:pending"},
+                {"value": "user:active"}, {"value": "user:active"},
             ],
         },
         {
@@ -1818,7 +1826,7 @@ async def test_plan_action_rejects_mixed_duplicate_and_ineligible_ids_atomically
         },
         {
             "action_id": "hermes_plan_cancel", "block_id": block_id,
-            "selected_option": {"value": "user:active"},
+            "selected_option": {"value": "user:pending"},
         },
     )):
         body["actions"][0]["action_ts"] = f"invalid-{index}"
@@ -1830,19 +1838,20 @@ async def test_plan_action_rejects_mixed_duplicate_and_ineligible_ids_atomically
     body["actions"][0]["action_ts"] = "valid-cancel"
     await adapter._handle_plan_action(AsyncMock(), body, {
         "action_id": "hermes_plan_cancel", "block_id": block_id,
-        "selected_option": {"value": "user:pending"},
+        "selected_option": {"value": "user:active"},
     })
     await asyncio.sleep(0)
     assert len(events) == 1
     assert events[0].metadata["slack_plan_action"]["action_kind"] == "cancel"
-    assert events[0].metadata["slack_plan_action"]["cancel_task_ids"] == ["user:pending"]
+    assert events[0].metadata["slack_plan_action"]["cancel_task_ids"] == ["user:active"]
+    assert events[0].metadata["slack_plan_action"]["cancel_task_status"] == "cancelled"
 
 
 def test_adapter_claim_validator_rejects_direct_forged_plan_metadata(tmp_path) -> None:
     adapter = _adapter(tmp_path)
     state = _state(adapter, [
         {"id": "agent:a", "content": "Agent", "status": "pending"},
-        {"id": "user:a", "content": "User", "status": "pending"},
+        {"id": "user:a", "content": "User", "status": "in_progress"},
     ])
     assert adapter._plan_store.mark_applied(
         "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
@@ -1857,15 +1866,19 @@ def test_adapter_claim_validator_rejects_direct_forged_plan_metadata(tmp_path) -
     assert not adapter.validate_plan_action_metadata({
         **base, "action_kind": "complete_reopen",
         "task_ids": ["agent:a", "user:a"],
-        "complete_task_ids": ["agent:a", "user:a"], "reopen_task_ids": [],
+        "complete_task_ids": ["agent:a", "user:a"],
+        "complete_task_status": "completed", "reopen_task_ids": [],
+        "reopen_task_status": "in_progress",
     })
     assert not adapter.validate_plan_action_metadata({
         **base, "action_kind": "complete_reopen", "task_ids": ["agent:a"],
-        "complete_task_ids": [], "reopen_task_ids": ["agent:a"],
+        "complete_task_ids": [], "complete_task_status": "completed",
+        "reopen_task_ids": ["agent:a"], "reopen_task_status": "in_progress",
     })
     assert not adapter.validate_plan_action_metadata({
         **base, "action_kind": "add_user_task", "task_ids": ["user:new"],
         "add_task_ids": ["user:replacement"], "add_task_content": "New",
+        "add_task_status": "in_progress",
     })
 
 
@@ -1906,7 +1919,7 @@ async def test_plan_action_requires_persisted_route_owner_for_group_and_dm(tmp_p
     adapter = _adapter(tmp_path)
     _state(
         adapter,
-        [{"id": "user:a", "content": "A", "status": "pending"}],
+        [{"id": "user:a", "content": "A", "status": "in_progress"}],
         route_user_id="U-owner",
         chat_type=chat_type,
     )
@@ -1948,7 +1961,7 @@ async def test_plan_action_requires_persisted_route_owner_for_group_and_dm(tmp_p
 @pytest.mark.parametrize("invalid_field", ["team", "channel", "message", "thread", "block"])
 async def test_plan_action_rejects_each_stale_or_wrong_route_dimension(tmp_path, invalid_field) -> None:
     adapter = _adapter(tmp_path)
-    _state(adapter, [{"id": "user:a", "content": "A", "status": "pending"}])
+    _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
     state = adapter._plan_store.get_session("sk")
     adapter._plan_store.mark_applied(
         "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
@@ -1982,7 +1995,7 @@ async def test_plan_action_rejects_each_stale_or_wrong_route_dimension(tmp_path,
 @pytest.mark.asyncio
 async def test_plan_action_queues_silently_when_original_session_is_busy(tmp_path) -> None:
     adapter = _adapter(tmp_path)
-    _state(adapter, [{"id": "user:a", "content": "A", "status": "pending"}])
+    _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
     state = adapter._plan_store.get_session("sk")
     adapter._plan_store.mark_applied(
         "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
@@ -2084,7 +2097,10 @@ async def test_add_modal_is_signed_and_submission_tamper_fails_closed(tmp_path) 
     assert trusted["add_task_ids"] == [generated_id]
     assert trusted["task_ids"] == [generated_id]
     assert trusted["add_task_content"] == "New task"
-    assert generated_id in events[0].text
+    assert trusted["add_task_status"] == "in_progress"
+    assert f'"add_task_ids": ["{generated_id}"]' in events[0].text
+    assert '"add_task_content": "New task"' in events[0].text
+    assert '"add_task_status": "in_progress"' in events[0].text
 
     await adapter._handle_plan_add_view(ack, submit_body, AsyncMock())
     assert len(events) == 1
@@ -2097,18 +2113,18 @@ async def test_add_modal_is_signed_and_submission_tamper_fails_closed(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_inactive_user_tasks_do_not_block_pending_action_or_add_modal(tmp_path) -> None:
+async def test_future_user_tasks_do_not_block_active_action_or_add_modal(tmp_path) -> None:
     adapter = _adapter(tmp_path)
-    inactive = [
+    read_only = [
         {
-            "id": f"user:inactive-{index}",
+            "id": f"user:read-only-{index}",
             "content": str(index),
-            "status": "cancelled" if index % 2 else "in_progress",
+            "status": "cancelled" if index % 2 else "pending",
         }
         for index in range(15)
     ]
-    state = _state(adapter, inactive + [
-        {"id": "user:pending", "content": "Pending", "status": "pending"},
+    state = _state(adapter, read_only + [
+        {"id": "user:active", "content": "Active", "status": "in_progress"},
     ])
     assert adapter._plan_store.mark_applied(
         "sk", revision=state["desired_revision"],
@@ -2131,11 +2147,11 @@ async def test_inactive_user_tasks_do_not_block_pending_action_or_add_modal(tmp_
     block_id = "hermes-plan-controls-r1-" + state["desired_hash"][:10]
     await adapter._handle_plan_action(AsyncMock(), body, {
         "action_id": "hermes_plan_complete", "block_id": block_id,
-        "selected_options": [{"value": "user:pending"}],
+        "selected_options": [{"value": "user:active"}],
     })
     await asyncio.sleep(0)
     assert len(events) == 1
-    assert events[0].metadata["slack_plan_action"]["complete_task_ids"] == ["user:pending"]
+    assert events[0].metadata["slack_plan_action"]["complete_task_ids"] == ["user:active"]
 
     body["actions"][0]["action_ts"] = "add"
     await adapter._handle_plan_action(AsyncMock(), body, {
@@ -2203,6 +2219,7 @@ async def test_add_modal_keeps_validated_lineage_across_concurrent_route_change(
     assert trusted["revision"] == original["desired_revision"]
     assert trusted["snapshot_hash"] == original["desired_hash"]
     assert trusted["add_task_ids"] == ["user:new"]
+    assert trusted["add_task_status"] == "in_progress"
 
     runner = object.__new__(GatewayRunner)
     runner.adapters = {events[0].source.platform: adapter}

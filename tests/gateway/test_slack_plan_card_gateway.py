@@ -63,7 +63,7 @@ async def _ingress_plan_event(
         thread_ts="10.0",
         route_user_id="U1",
         chat_type="group",
-        todos=[{"id": "user:a", "content": "A", "status": "pending"}],
+        todos=[{"id": "user:a", "content": "A", "status": "in_progress"}],
     )
     assert adapter._plan_store.mark_applied(
         "sk", revision=state["desired_revision"],
@@ -310,7 +310,7 @@ async def test_claim_time_rejects_current_ineligible_task_status(tmp_path) -> No
         thread_ts="10.0",
         route_user_id="U1",
         chat_type="group",
-        todos=[{"id": "user:a", "content": "A", "status": "in_progress"}],
+        todos=[{"id": "user:a", "content": "A", "status": "pending"}],
     )
     assert adapter._plan_store.mark_applied(
         "sk", revision=current["desired_revision"],

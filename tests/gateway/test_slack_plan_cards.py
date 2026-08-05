@@ -114,15 +114,46 @@ def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> N
     assert [task["task_id"] for task in rendered.native_blocks[0]["tasks"]] == [
         task["id"] for task in todos
     ]
+    assert "`user:pending`" in json.dumps(rendered.fallback_blocks)
     elements = _action_elements(rendered)
     checkbox = next(item for item in elements if item["action_id"] == "hermes_plan_complete")
     cancel = next(item for item in elements if item["action_id"] == "hermes_plan_cancel")
     assert [option["value"] for option in checkbox["options"]] == [
-        "user:pending", "user:done"
+        "user:done", "user:active"
     ]
     assert [option["value"] for option in checkbox["initial_options"]] == ["user:done"]
-    assert [option["value"] for option in cancel["options"]] == ["user:pending"]
+    assert [option["value"] for option in cancel["options"]] == ["user:active"]
     assert next(item for item in elements if item["action_id"] == "hermes_plan_add")["text"]["text"] == "Add user task"
+
+
+def test_pending_user_task_becomes_actionable_with_same_id_when_in_progress() -> None:
+    pending = build_plan_blocks(
+        [{"id": "user:stable", "content": "Stable", "status": "pending"}],
+        revision=1,
+        snapshot_hash="pending",
+        signing_secret=b"secret",
+    )
+    assert [item["action_id"] for item in _action_elements(pending)] == [
+        "hermes_plan_add", "hermes_plan_refresh",
+    ]
+
+    active = build_plan_blocks(
+        [{"id": "user:stable", "content": "Stable", "status": "in_progress"}],
+        revision=2,
+        snapshot_hash="active",
+        signing_secret=b"secret",
+    )
+    checkbox = next(
+        item for item in _action_elements(active)
+        if item["action_id"] == "hermes_plan_complete"
+    )
+    cancel = next(
+        item for item in _action_elements(active)
+        if item["action_id"] == "hermes_plan_cancel"
+    )
+    assert [option["value"] for option in checkbox["options"]] == ["user:stable"]
+    assert "initial_options" not in checkbox
+    assert [option["value"] for option in cancel["options"]] == ["user:stable"]
 
 
 def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> None:
@@ -130,7 +161,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         {"id": f"agent:{index}", "content": f"Agent {index}", "status": "pending"}
         for index in range(40)
     ] + [
-        {"id": "user:one", "content": "One", "status": "pending"},
+        {"id": "user:one", "content": "One", "status": "in_progress"},
         {"id": "user:two", "content": "Two", "status": "completed"},
     ]
     normal = build_plan_blocks(
@@ -147,14 +178,14 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
     assert [element["action_id"] for element in _action_elements(normal, fallback=True)] == action_ids
 
     at_capacity = build_plan_blocks(
-        [{"id": f"user:{index}", "content": str(index), "status": "pending"}
+        [{"id": f"user:{index}", "content": str(index), "status": "in_progress"}
          for index in range(MAX_INTERACTIVE_TASKS)],
         revision=4, snapshot_hash="capacity", signing_secret=b"secret",
     )
     assert "hermes_plan_add" not in [item["action_id"] for item in _action_elements(at_capacity)]
 
     oversized = build_plan_blocks(
-        [{"id": f"user:{index}", "content": str(index), "status": "pending"}
+        [{"id": f"user:{index}", "content": str(index), "status": "in_progress"}
          for index in range(MAX_INTERACTIVE_TASKS + 1)],
         revision=5, snapshot_hash="oversized", signing_secret=b"secret",
     )
@@ -186,7 +217,7 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
             {"id": f"agent:long-{index}", "content": "x" * 3000, "status": "pending"}
             for index in range(80)
         ] + [
-            {"id": "user:pending", "content": "Pending", "status": "pending"},
+            {"id": "user:active", "content": "Active", "status": "in_progress"},
             {"id": "user:done", "content": "Done", "status": "completed"},
         ],
         revision=7,
@@ -206,17 +237,17 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
     ]
 
 
-def test_inactive_user_tasks_do_not_consume_mutation_capacity() -> None:
-    inactive = [
+def test_future_and_cancelled_user_tasks_do_not_consume_mutation_capacity() -> None:
+    read_only = [
         {
-            "id": f"user:inactive-{index}",
-            "content": f"Inactive {index}",
-            "status": "cancelled" if index % 2 else "in_progress",
+            "id": f"user:read-only-{index}",
+            "content": f"Read only {index}",
+            "status": "cancelled" if index % 2 else "pending",
         }
         for index in range(MAX_INTERACTIVE_TASKS + 5)
     ]
     rendered = build_plan_blocks(
-        inactive + [{"id": "user:pending", "content": "Pending", "status": "pending"}],
+        read_only + [{"id": "user:active", "content": "Active", "status": "in_progress"}],
         revision=7,
         snapshot_hash="inactive-capacity",
         signing_secret=b"secret",
@@ -232,8 +263,8 @@ def test_inactive_user_tasks_do_not_consume_mutation_capacity() -> None:
     ]
     checkbox = next(item for item in elements if item["action_id"] == "hermes_plan_complete")
     cancel = next(item for item in elements if item["action_id"] == "hermes_plan_cancel")
-    assert [option["value"] for option in checkbox["options"]] == ["user:pending"]
-    assert [option["value"] for option in cancel["options"]] == ["user:pending"]
+    assert [option["value"] for option in checkbox["options"]] == ["user:active"]
+    assert [option["value"] for option in cancel["options"]] == ["user:active"]
     assert "controls unavailable" not in json.dumps(rendered.fallback_blocks).lower()
     assert [item["action_id"] for item in _action_elements(rendered, fallback=True)] == [
         item["action_id"] for item in elements
@@ -243,7 +274,7 @@ def test_inactive_user_tasks_do_not_consume_mutation_capacity() -> None:
 def test_fallback_splits_single_overlong_lines_without_undisclosed_loss() -> None:
     todos = [
         {"id": "agent:long", "content": "a" * 3000, "status": "pending"},
-        {"id": "user:long", "content": "u" * 3000, "status": "pending"},
+        {"id": "user:long", "content": "u" * 3000, "status": "in_progress"},
     ]
     rendered = build_plan_blocks(
         todos,
@@ -259,7 +290,7 @@ def test_fallback_splits_single_overlong_lines_without_undisclosed_loss() -> Non
     expected = "\n".join([
         "*Hermes plan* (2 tasks)",
         f"• *Pending* `agent:long` — {'a' * 3000}",
-        f"• *Pending* `user:long` — {'u' * 3000}",
+        f"• *In progress* `user:long` — {'u' * 3000}",
     ])
 
     assert section_text == expected
@@ -563,7 +594,8 @@ def test_validate_action_returns_exact_matching_snapshot(tmp_path) -> None:
         **route, "message_ts": "20.0", "revision": original["desired_revision"],
         "snapshot_hash": original["desired_hash"], "task_ids": ["user:new"],
         "action_kind": "add_user_task", "add_task_ids": ["user:new"],
-        "add_task_content": "New", "action_user_id": "U1",
+        "add_task_content": "New", "add_task_status": "in_progress",
+        "action_user_id": "U1",
         "action_dedupe_id": "dedupe",
     }
     assert store.consume_action_id("dedupe")
@@ -587,7 +619,7 @@ def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_
     }
     state = store.record_desired_snapshot(route, [
         {"id": "agent:a", "content": "Agent", "status": "pending"},
-        {"id": "user:a", "content": "User", "status": "pending"},
+        {"id": "user:a", "content": "User", "status": "in_progress"},
     ])
     assert store.mark_applied(
         "sk", revision=state["desired_revision"], snapshot_hash=state["desired_hash"],
@@ -601,15 +633,17 @@ def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_
     assert store.consume_action_id("dedupe")
     assert store.validate_action({
         **base, "action_kind": "complete_reopen", "task_ids": ["agent:a", "user:a"],
-        "complete_task_ids": ["agent:a", "user:a"], "reopen_task_ids": [],
+        "complete_task_ids": ["agent:a", "user:a"], "complete_task_status": "completed",
+        "reopen_task_ids": [], "reopen_task_status": "in_progress",
     }) is None
     assert store.validate_action({
         **base, "action_kind": "cancel", "task_ids": ["agent:a"],
-        "cancel_task_ids": ["agent:a"],
+        "cancel_task_ids": ["agent:a"], "cancel_task_status": "cancelled",
     }) is None
     assert store.validate_action({
         **base, "action_kind": "add_user_task", "task_ids": ["user:new"],
         "add_task_ids": ["user:replacement"], "add_task_content": "New",
+        "add_task_status": "in_progress",
     }) is None
 
     data = json.loads(store.state_path.read_text(encoding="utf-8"))
@@ -618,26 +652,26 @@ def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_
     store.state_path.write_text(json.dumps(data), encoding="utf-8")
     assert store.validate_action({
         **base, "action_kind": "cancel", "task_ids": ["user:a"],
-        "cancel_task_ids": ["user:a"],
+        "cancel_task_ids": ["user:a"], "cancel_task_status": "cancelled",
     }) is None
 
 
-def test_validate_add_capacity_counts_only_pending_and_completed_user_tasks(tmp_path) -> None:
+def test_validate_add_capacity_counts_only_in_progress_and_completed_user_tasks(tmp_path) -> None:
     store = PlanCardStore(tmp_path)
     route = {
         "session_key": "sk", "session_id": "sid", "team_id": "T1",
         "channel_id": "C1", "thread_ts": "10.0",
     }
-    inactive = [
+    read_only = [
         {
-            "id": f"user:inactive-{index}",
+            "id": f"user:read-only-{index}",
             "content": str(index),
-            "status": "cancelled" if index % 2 else "in_progress",
+            "status": "cancelled" if index % 2 else "pending",
         }
         for index in range(MAX_INTERACTIVE_TASKS + 3)
     ]
-    below_capacity = store.record_desired_snapshot(route, inactive + [
-        {"id": "user:pending", "content": "Pending", "status": "pending"},
+    below_capacity = store.record_desired_snapshot(route, read_only + [
+        {"id": "user:active", "content": "Active", "status": "in_progress"},
     ])
     assert store.mark_applied(
         "sk", revision=below_capacity["desired_revision"],
@@ -647,14 +681,19 @@ def test_validate_add_capacity_counts_only_pending_and_completed_user_tasks(tmp_
         **route, "message_ts": "20.0", "revision": below_capacity["desired_revision"],
         "snapshot_hash": below_capacity["desired_hash"], "task_ids": ["user:new"],
         "action_kind": "add_user_task", "add_task_ids": ["user:new"],
-        "add_task_content": "New", "action_user_id": "U1",
+        "add_task_content": "New", "add_task_status": "in_progress",
+        "action_user_id": "U1",
         "action_dedupe_id": "below-capacity",
     }
     assert store.consume_action_id("below-capacity")
     assert store.validate_action(metadata) is not None
 
-    at_capacity = store.record_desired_snapshot(route, inactive + [
-        {"id": f"user:mutable-{index}", "content": str(index), "status": "pending"}
+    at_capacity = store.record_desired_snapshot(route, read_only + [
+        {
+            "id": f"user:mutable-{index}",
+            "content": str(index),
+            "status": "in_progress" if index % 2 else "completed",
+        }
         for index in range(MAX_INTERACTIVE_TASKS)
     ])
     assert store.mark_applied(

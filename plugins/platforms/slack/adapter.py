@@ -4831,7 +4831,9 @@ class SlackAdapter(BasePlatformAdapter):
         prompt = (
             "[Trusted Slack plan action]\n"
             "Use the todo tool to apply exactly this structured change to the current full todo list. "
-            "Preserve every task not named by the action.\n"
+            "Preserve every task not named by the action. Set each named task to the exact status "
+            "specified by its *_task_status field. For add_task_ids, create exactly one Todo with "
+            "the supplied ID, add_task_content, and add_task_status.\n"
             + json.dumps(changes, ensure_ascii=False, sort_keys=True)
         )
         await self.handle_message(MessageEvent(
@@ -4957,7 +4959,7 @@ class SlackAdapter(BasePlatformAdapter):
             task_id = str(selected.get("value") or "")
             eligible_cancel = {
                 task["id"] for task in tasks
-                if is_user_task_id(task["id"]) and task["status"] == "pending"
+                if is_user_task_id(task["id"]) and task["status"] == "in_progress"
             }
             if task_id in eligible_cancel:
                 await self._dispatch_plan_action_event(
@@ -4965,7 +4967,10 @@ class SlackAdapter(BasePlatformAdapter):
                     body=body,
                     action_kind=PLAN_ACTION_CANCEL,
                     action_dedupe_id=dedupe_id,
-                    changes={"cancel_task_ids": [task_id]},
+                    changes={
+                        "cancel_task_ids": [task_id],
+                        "cancel_task_status": "cancelled",
+                    },
                 )
             return
         if action_id == "hermes_plan_complete":
@@ -4982,7 +4987,7 @@ class SlackAdapter(BasePlatformAdapter):
             eligible = {
                 task["id"] for task in tasks
                 if is_user_task_id(task["id"])
-                and task["status"] in {"pending", "completed"}
+                and task["status"] in {"in_progress", "completed"}
             }
             completed = {
                 task["id"] for task in tasks
@@ -5001,7 +5006,9 @@ class SlackAdapter(BasePlatformAdapter):
                 action_dedupe_id=dedupe_id,
                 changes={
                     "complete_task_ids": complete_ids,
+                    "complete_task_status": "completed",
                     "reopen_task_ids": reopen_ids,
+                    "reopen_task_status": "in_progress",
                 },
             )
 
@@ -5029,7 +5036,11 @@ class SlackAdapter(BasePlatformAdapter):
         content = str((((values.get("task") or {}).get("content") or {}).get("value")) or "").strip()
         if not content or len(content) > MAX_USER_TASK_CONTENT_LENGTH:
             return
-        validated_metadata = {**payload, "add_task_content": content}
+        validated_metadata = {
+            **payload,
+            "add_task_content": content,
+            "add_task_status": "in_progress",
+        }
         state = self._plan_store.validate_action(validated_metadata)
         if not state:
             return
@@ -5069,6 +5080,7 @@ class SlackAdapter(BasePlatformAdapter):
             changes={
                 "add_task_ids": list(payload["add_task_ids"]),
                 "add_task_content": content,
+                "add_task_status": "in_progress",
             },
         )
 

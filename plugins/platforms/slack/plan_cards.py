@@ -30,7 +30,7 @@ MAX_USER_TASK_CONTENT_LENGTH = 3000
 MAX_NATIVE_TASK_TITLE_LENGTH = 3000
 MAX_ACTION_DEDUPE_IDS = 512
 USER_TASK_ID_PREFIX = "user:"
-INTERACTIVE_USER_TASK_STATUSES = frozenset({"pending", "completed"})
+INTERACTIVE_USER_TASK_STATUSES = frozenset({"in_progress", "completed"})
 PLAN_ACTION_COMPLETE_REOPEN = "complete_reopen"
 PLAN_ACTION_CANCEL = "cancel"
 PLAN_ACTION_ADD_USER_TASK = "add_user_task"
@@ -236,7 +236,7 @@ def _control_blocks(
     cancel_options = [
         {"text": _plain_text(task["content"][:75]), "value": task["id"]}
         for task in user_tasks
-        if task["status"] == "pending"
+        if task["status"] == "in_progress"
     ]
     if cancel_options and not over_capacity:
         elements.append({
@@ -984,17 +984,24 @@ class PlanCardStore:
                 return None
             change_keys = {
                 "complete_task_ids", "reopen_task_ids", "cancel_task_ids",
-                "add_task_ids", "add_task_content",
+                "add_task_ids", "add_task_content", "complete_task_status",
+                "reopen_task_status", "cancel_task_status", "add_task_status",
             }
 
             if action_kind == PLAN_ACTION_COMPLETE_REOPEN:
                 if any(key in metadata for key in change_keys - {
                     "complete_task_ids", "reopen_task_ids",
+                    "complete_task_status", "reopen_task_status",
                 }):
                     return None
                 complete_ids = id_list("complete_task_ids")
                 reopen_ids = id_list("reopen_task_ids")
-                if complete_ids is None or reopen_ids is None:
+                if (
+                    complete_ids is None
+                    or reopen_ids is None
+                    or metadata.get("complete_task_status") != "completed"
+                    or metadata.get("reopen_task_status") != "in_progress"
+                ):
                     return None
                 combined = complete_ids + reopen_ids
                 if not combined or len(combined) != len(set(combined)):
@@ -1004,7 +1011,7 @@ class PlanCardStore:
                 if any(
                     not is_user_task_id(task_id)
                     or task_id not in by_id
-                    or by_id[task_id]["status"] != "pending"
+                    or by_id[task_id]["status"] != "in_progress"
                     for task_id in complete_ids
                 ):
                     return None
@@ -1016,21 +1023,28 @@ class PlanCardStore:
                 ):
                     return None
             elif action_kind == PLAN_ACTION_CANCEL:
-                if any(key in metadata for key in change_keys - {"cancel_task_ids"}):
+                if any(key in metadata for key in change_keys - {
+                    "cancel_task_ids", "cancel_task_status",
+                }):
                     return None
                 cancel_ids = id_list("cancel_task_ids")
-                if cancel_ids is None or len(cancel_ids) != 1 or task_ids != cancel_ids:
+                if (
+                    cancel_ids is None
+                    or len(cancel_ids) != 1
+                    or task_ids != cancel_ids
+                    or metadata.get("cancel_task_status") != "cancelled"
+                ):
                     return None
                 task_id = cancel_ids[0]
                 if (
                     not is_user_task_id(task_id)
                     or task_id not in by_id
-                    or by_id[task_id]["status"] != "pending"
+                    or by_id[task_id]["status"] != "in_progress"
                 ):
                     return None
             else:
                 if any(key in metadata for key in change_keys - {
-                    "add_task_ids", "add_task_content",
+                    "add_task_ids", "add_task_content", "add_task_status",
                 }):
                     return None
                 add_ids = id_list("add_task_ids")
@@ -1042,6 +1056,7 @@ class PlanCardStore:
                     or not is_user_task_id(add_ids[0])
                     or add_ids[0] in by_id
                     or user_task_count >= MAX_INTERACTIVE_TASKS
+                    or metadata.get("add_task_status") != "in_progress"
                     or not isinstance(content, str)
                     or not content.strip()
                     or len(content) > MAX_USER_TASK_CONTENT_LENGTH
