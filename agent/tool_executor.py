@@ -576,6 +576,16 @@ def _begin_tool_execution(
     except Exception:
         pass
 
+    try:
+        from tools.session_timeline import record_start as _timeline_record_start
+
+        _timeline_record_start(
+            getattr(agent, "session_id", None), tool_call_id,
+            function_name, function_args,
+        )
+    except Exception:
+        pass
+
     if agent.tool_progress_callback:
         try:
             display_args = (
@@ -1253,6 +1263,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
+        try:
+            from tools.session_timeline import record_end as _timeline_record_end
+
+            _timeline_record_end(
+                getattr(agent, "session_id", None), tc.id,
+                status="blocked" if blocked else ("failed" if is_error else "succeeded"),
+                duration=tool_duration,
+            )
+        except Exception:
+            pass
+
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
             cute_msg = _get_cute_tool_message_impl(
@@ -1909,6 +1930,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        try:
+            from tools.session_timeline import record_end as _timeline_record_end
+
+            _timeline_record_end(
+                getattr(agent, "session_id", None), tool_call.id,
+                status="blocked" if _execution_blocked else ("failed" if _is_error_result else "succeeded"),
+                duration=tool_duration,
+            )
+        except Exception:
+            pass
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:
