@@ -2544,6 +2544,12 @@ def terminal_tool(
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
+                            # Binary (ELF/Mach-O/PE/etc.) is not a shell script;
+                            # scanning its decoded bytes would tokenize machine
+                            # code and feed NUL-containing junk paths into the
+                            # recursion (#76762). Mirror _read_referenced_script.
+                            if b"\x00" in data:
+                                return None
                             if len(data) <= 1024 * 1024:
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
@@ -2552,7 +2558,14 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        # Binary content (ELF/Mach-O/PE) read through `cat`
+                        # carries NUL bytes; scanning it would tokenize machine
+                        # code into junk paths and crash the recursion with
+                        # "embedded null byte" (#76762). Mirror the local path.
+                        if "\x00" in output:
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None
