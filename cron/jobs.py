@@ -1733,7 +1733,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                         and completed > 0
                     )
                     if not preclaimed_oneshot:
-                        completed += 1
+                        completed = (completed or 0) + 1
                         repeat["completed"] = completed
 
                     # Check if we've hit the repeat limit
