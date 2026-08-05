@@ -1847,6 +1847,12 @@ export interface Translations {
     applyingClose: string
     errorTitle: string
     errorBody: string
+    blockerTitle: string
+    blockerBody: string
+    closePreviewsAndUpdate: string
+    localPreview: string
+    portLabel: (port: number) => string
+    technicalDetails: string
     notNow: string
     applyStatus: {
       preparing: string
