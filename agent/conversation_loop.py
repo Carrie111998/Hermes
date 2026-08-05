@@ -1472,6 +1472,7 @@ def run_conversation(
     # A configured SessionDB append failure halts only the affected turn. A
     # cached gateway agent must recover on the next message if storage did.
     agent._incremental_persistence_failed = False
+    agent._persistence_failure_reason = None
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
@@ -6517,7 +6518,9 @@ def run_conversation(
                     # run side-effecting tools from state that exists only in
                     # this process. Breaking also avoids retrying the same
                     # unpersisted turn until the iteration budget is exhausted.
-                    _turn_exit_reason = "session_persistence_failed"
+                    _turn_exit_reason = getattr(
+                        agent, "_persistence_failure_reason", None
+                    ) or "session_persistence_failed"
                     final_response = ""
                     failed = True
                     break
@@ -6546,7 +6549,9 @@ def run_conversation(
                     # A tool result could not be made canonical. Do not send
                     # the in-memory result back to the model or project any
                     # later events from this turn.
-                    _turn_exit_reason = "session_persistence_failed"
+                    _turn_exit_reason = getattr(
+                        agent, "_persistence_failure_reason", None
+                    ) or "session_persistence_failed"
                     final_response = ""
                     failed = True
                     break

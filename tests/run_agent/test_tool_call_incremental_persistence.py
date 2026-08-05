@@ -243,6 +243,34 @@ def test_failed_assistant_persist_blocks_ui_projection_and_tool_side_effects():
     assert result["turn_exit_reason"] == "session_persistence_failed"
 
 
+def test_closed_compression_session_surfaces_specific_failure_reason():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(call_id="must-not-run")
+    assert agent.client is not None
+    agent.client.chat.completions.create.return_value = _mock_response(
+        content="I'll inspect the repository now.",
+        finish_reason="tool_calls",
+        tool_calls=[tool_call],
+    )
+
+    def _closed_session_flush(*_args, **_kwargs):
+        agent._persistence_failure_reason = "compression_session_closed"
+        return False
+
+    agent._flush_messages_to_session_db = MagicMock(
+        side_effect=_closed_session_flush
+    )
+    agent._execute_tool_calls = MagicMock()
+
+    result = agent.run_conversation("inspect the repository")
+
+    agent._execute_tool_calls.assert_not_called()
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "compression_session_closed"
+    assert "compression continuation" in result["error"].lower()
+    assert "disk" not in result["error"].lower()
+
+
 # ---------------------------------------------------------------------------
 # Contract 2: the SEQUENTIAL path flushes each tool result immediately, BEFORE
 # the next tool dispatches.  Dispatch goes through run_agent.handle_function_call

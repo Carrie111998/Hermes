@@ -165,6 +165,41 @@ class TestAppendMessagesBatch:
         with pytest.raises(CompressionSessionClosedError):
             db.append_messages_batch("sess-batch", _turn_messages())
 
+    def test_atomic_reroute_appends_to_unique_live_compression_child(self, db):
+        db.end_session("sess-batch", "compression")
+        db.create_session(
+            "sess-child",
+            source="cli",
+            parent_session_id="sess-batch",
+        )
+
+        child_id = db.append_messages_batch_to_live_compression_child(
+            "sess-batch",
+            _turn_messages(),
+        )
+
+        assert child_id == "sess-child"
+        assert len(db.get_messages("sess-child")) == 4
+        assert db.get_messages("sess-batch") == []
+
+    def test_atomic_reroute_rejects_ambiguous_live_children(self, db):
+        db.end_session("sess-batch", "compression")
+        for child_id in ("sess-child-a", "sess-child-b"):
+            db.create_session(
+                child_id,
+                source="cli",
+                parent_session_id="sess-batch",
+            )
+
+        with pytest.raises(CompressionSessionClosedError):
+            db.append_messages_batch_to_live_compression_child(
+                "sess-batch",
+                _turn_messages(),
+            )
+
+        assert db.get_messages("sess-child-a") == []
+        assert db.get_messages("sess-child-b") == []
+
     def test_multimodal_content_encoded(self, db):
         msgs = [
             {
