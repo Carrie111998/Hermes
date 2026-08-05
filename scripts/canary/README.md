@@ -862,6 +862,27 @@ Install/revalidate the schema reconciliation control, run
 and `--activate-writer-stopped` exactly as shown above. Next publish the
 secret-free, public-channel fixture:
 
+If a predecessor control bootstrap reached its exact temporary Cloud SQL
+login but the local trusted runtime can no longer replay that release, recover
+only that predecessor protocol through a reviewed successor before continuing:
+
+```bash
+/Users/emillomliev/.local/share/uv/python/\
+cpython-3.11.15-macos-aarch64-none/bin/python3.11 \
+  -I -S -B -X pycache_prefix=/var/empty/muncho-canary \
+  /absolute/clean/hermes-agent/scripts/canary/full_canary_owner_launcher.py \
+  --release-sha <exact-successor-release-sha> \
+  --recover-historical-schema-reconciliation-control \
+  --schema-reconciliation-source-release-sha <exact-predecessor-release-sha>
+```
+
+The caller cannot select a login or database object. The predecessor's sealed
+stopped-release gate deterministically reproduces the exact protocol and login;
+the successor supplies only the current trusted local runtime. Success requires
+the predecessor terminal receipt to prove the control installed, the temporary
+admin absent, and services stopped. A current-release source, an unrelated
+source, or any partial terminal receipt fails closed.
+
 ```bash
 /Users/emillomliev/.local/share/uv/python/\
 cpython-3.11.15-macos-aarch64-none/bin/python3.11 \
