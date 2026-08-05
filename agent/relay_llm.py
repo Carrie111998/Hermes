@@ -450,19 +450,22 @@ def _logical_parent(
         with turn.logical_llm_lock:
             handle = turn.logical_llm_calls.get(request_id)
             if handle is None:
-                handle = runtime.run_in_session(
-                    session,
-                    runtime.relay.scope.push,
-                    relay_runtime.LOGICAL_LLM_SCOPE,
-                    runtime.relay.ScopeType.Function,
-                    handle=parent,
-                    input={},
-                    metadata={
-                        relay_runtime.RUNTIME_SCHEMA_KEY: relay_runtime.RUNTIME_SCHEMA_VERSION,
-                        relay_runtime.RUNTIME_INSTANCE_KEY: runtime.runtime_id,
-                        "hermes.call_role": str(
-                            (metadata or {}).get("call_role") or "primary"
-                        ),
+                call_role = str(
+                    (metadata or {}).get("call_role") or "primary"
+                )
+                lifecycle_metadata = {
+                    relay_runtime.RUNTIME_SCHEMA_KEY: relay_runtime.RUNTIME_SCHEMA_VERSION,
+                    relay_runtime.RUNTIME_INSTANCE_KEY: runtime.runtime_id,
+                    "hermes.call_role": call_role,
+                }
+                # Auxiliary retries publish their accepted terminal route in
+                # the validated scope output.  Keeping the attempted route in
+                # metadata would both duplicate that identity and make the
+                # strict shared-metrics contract reject the terminal event.
+                # Primary calls have no equivalent route-bearing output, so
+                # retain their detached lifecycle identity here.
+                if not call_role.startswith("auxiliary:"):
+                    lifecycle_metadata.update({
                         "hermes.provider": str(
                             (metadata or {}).get("provider") or "unknown"
                         ),
@@ -472,7 +475,15 @@ def _logical_parent(
                         "hermes.api_mode": str(
                             (metadata or {}).get("api_mode") or "unknown"
                         ),
-                    },
+                    })
+                handle = runtime.run_in_session(
+                    session,
+                    runtime.relay.scope.push,
+                    relay_runtime.LOGICAL_LLM_SCOPE,
+                    runtime.relay.ScopeType.Function,
+                    handle=parent,
+                    input={},
+                    metadata=lifecycle_metadata,
                 )
                 turn.logical_llm_calls[request_id] = handle
     return turn, handle, request_id

@@ -4588,6 +4588,7 @@ class TestAgentRuntimePostHookOwnershipSync:
         ("memory", {"action": "view", "target": "memory"}),
         ("clarify", {"question": "Continue?"}),
         ("read_terminal", {}),
+        ("read_preview", {}),
         ("delegate_task", {"goal": "Check the child path"}),
     )
 
@@ -4625,6 +4626,10 @@ class TestAgentRuntimePostHookOwnershipSync:
         )
         monkeypatch.setattr(
             "tools.read_terminal_tool.read_terminal_tool",
+            lambda **kwargs: '{"ok":true}',
+        )
+        monkeypatch.setattr(
+            "tools.read_preview_tool.read_preview_tool",
             lambda **kwargs: '{"ok":true}',
         )
         monkeypatch.setattr(agent, "_get_session_db_for_recall", lambda: None)
@@ -8475,10 +8480,12 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 402
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -8503,10 +8510,12 @@ class TestCredentialPoolRecovery:
                 status_code,
                 error_context=None,
                 api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 400
                 assert error_context == {"reason": "out_of_extra_usage"}
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "billing"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -8534,11 +8543,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 429
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "rate_limit"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -8642,11 +8653,13 @@ class TestCredentialPoolRecovery:
                 return None  # refresh failed
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None,
             ):
                 assert status_code == 401
                 assert error_context is None
                 assert api_key_hint == agent.api_key
+                assert failure_reason == "auth"
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -8669,9 +8682,11 @@ class TestCredentialPoolRecovery:
                 return None
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None,
             ):
                 assert error_context is None
+                assert failure_reason == "auth"
                 return None  # no more credentials
 
         agent._credential_pool = _Pool()
@@ -8751,11 +8766,13 @@ class TestCredentialPoolRecovery:
                 return []
 
             def mark_exhausted_and_rotate(
-                self, *, status_code, error_context=None, api_key_hint=None
+                self, *, status_code, error_context=None, api_key_hint=None,
+                failure_reason=None,
             ):
                 captured["status_code"] = status_code
                 captured["error_context"] = error_context
                 captured["api_key_hint"] = api_key_hint
+                captured["failure_reason"] = failure_reason
                 return next_entry
 
         agent._credential_pool = _Pool()
@@ -8771,6 +8788,7 @@ class TestCredentialPoolRecovery:
         assert retry_same is False
         assert captured["status_code"] == 429
         assert captured["error_context"]["reason"] == "device_code_exhausted"
+        assert captured["failure_reason"] == "rate_limit"
 
 
 class TestMaxTokensParam:
