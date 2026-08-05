@@ -14,7 +14,7 @@ import {
 import { onReleaseTypingFocus } from '@/components/ui/keyboard-first'
 import { findBarClaimsCombo } from '@/lib/find-in-page'
 import { contributedKeybindHandler, PROFILE_SLOT_COUNT, SESSION_SLOT_COUNT } from '@/lib/keybinds/actions'
-import { comboAllowedInInput, comboFromEvent, isEditableTarget } from '@/lib/keybinds/combo'
+import { comboAllowedInInput, comboFromEvent, isEditableTarget, isFocusWithin } from '@/lib/keybinds/combo'
 import { composerFocusKeysAllowed, isComposerFocusSoftCombo, typeToFocusChar } from '@/lib/keybinds/composer-focus-keys'
 import { $repoStatus } from '@/store/coding-status'
 import { toggleCommandPalette } from '@/store/command-palette'
@@ -366,6 +366,20 @@ export function useKeybinds(deps: KeybindRuntimeDeps): void {
         event.preventDefault()
         requestComposerFocus('active', { typeChar: combo === '/' ? '/' : undefined })
 
+        return
+      }
+
+      // An interactive terminal owns plain Ctrl+W as readline word erase.
+      // Agent terminals and rebound close-tab chords keep the close action.
+      if (
+        actionId === 'view.closeTab' &&
+        event.key.toLowerCase() === 'w' &&
+        event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        !event.shiftKey &&
+        isFocusWithin('[data-interactive-terminal]')
+      ) {
         return
       }
 

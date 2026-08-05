@@ -28,6 +28,10 @@ import { $workspaceIsPage } from '../routes'
 
 import { closeActiveTab, closeWorkspaceTab } from './close-tab'
 
+const closeActiveTerminal = vi.hoisted(() => vi.fn())
+
+vi.mock('@/app/right-sidebar/terminal/terminals', () => ({ closeActiveTerminal }))
+
 function fileTarget(path: string): PreviewTarget {
   return {
     kind: 'file',
@@ -46,7 +50,6 @@ function loadedMainOnly() {
 }
 
 beforeEach(() => {
-  vi.stubGlobal('document', { activeElement: null })
   closeRightRail()
   window.localStorage.clear()
   $selectedStoredSessionId.set(null)
@@ -62,9 +65,23 @@ afterEach(() => {
   vi.unstubAllGlobals()
   closeRightRail()
   window.localStorage.clear()
+  closeActiveTerminal.mockReset()
+  document.body.replaceChildren()
 })
 
 describe('closeActiveTab', () => {
+  it('keeps the direct close command for a focused terminal', () => {
+    const terminal = document.createElement('div')
+    terminal.dataset.terminal = ''
+    const input = document.createElement('textarea')
+    terminal.append(input)
+    document.body.append(terminal)
+    input.focus()
+
+    expect(closeActiveTab()).toBe(true)
+    expect(closeActiveTerminal).toHaveBeenCalledOnce()
+  })
+
   it('closes the active file preview tab (⌘W happy path)', () => {
     openPreview(fileTarget('/work/notes.md'), 'manual')
 
