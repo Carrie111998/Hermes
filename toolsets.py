@@ -296,6 +296,7 @@ TOOLSETS = {
         ),
         "tools": [
             "kanban_show", "kanban_list", "kanban_complete", "kanban_block",
+            "kanban_advance_linear_pr_after_qa",
             "kanban_heartbeat", "kanban_comment",
             "kanban_create", "kanban_link",
             "kanban_unblock",

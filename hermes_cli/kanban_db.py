@@ -99,7 +99,10 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "review", "awaiting_human", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -1364,6 +1367,55 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Typed, exact-head human-review gate. The linked task is intentionally kept
+-- separate from generic ``review`` because review tasks are dispatchable to an
+-- agent while a human gate must never be claimed by the dispatcher.
+CREATE TABLE IF NOT EXISTS human_review_gates (
+    id                              TEXT PRIMARY KEY,
+    task_id                         TEXT NOT NULL UNIQUE,
+    schema_version                  INTEGER NOT NULL,
+    gate_kind                       TEXT NOT NULL,
+    reviewer_principal              TEXT NOT NULL,
+    notification_principal          TEXT,
+    repo                            TEXT NOT NULL,
+    pr_number                       INTEGER NOT NULL,
+    pr_url                          TEXT NOT NULL,
+    linear_issue_id                 TEXT,
+    base_branch                     TEXT NOT NULL,
+    head_branch                     TEXT NOT NULL,
+    approved_head_sha               TEXT NOT NULL,
+    implementation_task_id          TEXT NOT NULL,
+    qa_task_id                      TEXT NOT NULL,
+    qa_run_id                       INTEGER NOT NULL,
+    qa_worker_session_id            TEXT,
+    qa_verdict                      TEXT NOT NULL,
+    qa_attempt_count                INTEGER NOT NULL,
+    coder_correction_attempt_count  INTEGER NOT NULL,
+    qa_approved_at                  INTEGER NOT NULL,
+    approval_packet_json            TEXT NOT NULL,
+    approval_packet_sha256          TEXT NOT NULL,
+    state                           TEXT NOT NULL,
+    superseded_by_gate_id           TEXT,
+    created_at                      INTEGER NOT NULL,
+    updated_at                      INTEGER NOT NULL
+);
+
+-- One independently retryable row per external destination. This table holds
+-- no credentials and grants no merge or branch-write capability.
+CREATE TABLE IF NOT EXISTS review_gate_deliveries (
+    gate_id          TEXT NOT NULL,
+    channel          TEXT NOT NULL,
+    destination      TEXT NOT NULL,
+    state            TEXT NOT NULL,
+    attempt_count    INTEGER NOT NULL DEFAULT 0,
+    next_attempt_at  INTEGER,
+    external_id      TEXT,
+    dedupe_marker    TEXT NOT NULL,
+    last_error       TEXT,
+    created_at       INTEGER NOT NULL,
+    updated_at       INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1374,6 +1426,15 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_human_review_gate_exact_head
+    ON human_review_gates(repo, pr_number, gate_kind, approved_head_sha);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_human_review_gate_active_pr
+    ON human_review_gates(repo, pr_number, gate_kind)
+    WHERE state IN ('pending_delivery', 'awaiting_human', 'seen', 'delivery_failed');
+CREATE UNIQUE INDEX IF NOT EXISTS uq_review_gate_delivery_channel
+    ON review_gate_deliveries(gate_id, channel);
+CREATE INDEX IF NOT EXISTS idx_review_gate_delivery_due
+    ON review_gate_deliveries(state, next_attempt_at, created_at);
 """
 
 
