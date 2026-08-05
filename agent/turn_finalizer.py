@@ -491,9 +491,24 @@ def finalize_turn(
     #
     # Same gate as the file-mutation verifier: only applied when a
     # real text response exists and the turn wasn't interrupted.
+    #
+    # The tool-call guardrail already surfaces repeated-failure warnings
+    # inline in the tool result and, on a hard stop, synthesises its own
+    # halt response.  Suppress the footer for tools the guardrail already
+    # intervened on so the turn-end response isn't double-flagging the same
+    # failure (and so the guardrail's own streamed halt text stays intact).
     if final_response and not interrupted:
         try:
-            _failures = getattr(agent, "_turn_tool_failures", None) or []
+            _failures = getattr(agent, "_turn_tool_failures", None) or {}
+            _guardrail = getattr(agent, "_tool_guardrails", None)
+            if _failures and _guardrail is not None:
+                _intervened = _guardrail.intervened_tools()
+                if _intervened:
+                    _failures = {
+                        _t: _f
+                        for _t, _f in _failures.items()
+                        if _t not in _intervened
+                    }
             if _failures and agent._tool_failure_verifier_enabled():
                 footer = agent._format_tool_failure_footer(_failures)
                 if footer:
