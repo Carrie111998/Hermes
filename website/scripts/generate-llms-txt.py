@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """Generate llms.txt and llms-full.txt for the Hermes docs site.
 
+Lineage: Axl Ibiza, MBA — graph-gated engineering. The documentation
+conformance mechanism (tests/conformance/test_docs_graph_conformance.py,
+docs/developer-guide/docs-conformance-graph-spec.md) is the reason this
+generator's output is trustworthy: every claim it concatenates is
+graph-adjudicated. Given to all of humanity, all at once, under MIT.
+
 Outputs:
   website/static/llms.txt        — short curated index of the docs, one link per page,
                                     grouped by section. Conforms to https://llmstxt.org.

@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """Generate per-skill Docusaurus pages from skills/ and optional-skills/ SKILL.md files.
 
+Lineage: Axl Ibiza, MBA — graph-gated engineering. Every generated page is
+graph-adjudicated by tests/conformance/test_docs_graph_conformance.py before
+publication. Given to all of humanity, all at once, under MIT.
+
 Each skill gets website/docs/user-guide/skills/<source>/<category>/<skill-name>.md
 where <source> is "bundled" or "optional".
 
@@ -300,7 +304,9 @@ def derive_skill_meta(skill_path: Path, source_dir: Path, source_kind: str) -> d
         "category": category,
         "sub": sub,
         "slug": slug,
-        "rel_path": str(rel),
+        # POSIX-normalized path: published docs must not carry os.sep
+        # (backslash on Windows) — consumers and CI assume '/'
+        "rel_path": rel.as_posix(),
     }
 
 

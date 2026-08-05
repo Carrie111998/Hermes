@@ -307,6 +307,7 @@ const sidebars: SidebarsConfig = {
                   collapsed: true,
                   items: [
                     'user-guide/skills/bundled/software-development/software-development-dogfood',
+                    'user-guide/skills/bundled/software-development/software-development-graph-gated-engineering',
                     'user-guide/skills/bundled/software-development/software-development-hermes-agent-skill-authoring',
                     'user-guide/skills/bundled/software-development/software-development-inspecting-hermes-desktop-dom',
                     'user-guide/skills/bundled/software-development/software-development-node-inspect-debugger',
