@@ -52,6 +52,14 @@ class TestOpenRouterProfile:
         body = p.build_extra_body(provider_preferences={"allow": ["anthropic"]})
         assert body["provider"] == {"allow": ["anthropic"]}
 
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("openrouter")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
+
 
 
 
@@ -132,6 +140,14 @@ class TestNousProfile:
         p = get_provider_profile("nous")
         body = p.build_extra_body()
         assert body["tags"] == nous_portal_tags()
+
+    def test_sticky_session_id_normalizes_cron_timestamp(self):
+        """Cron re-fires of the same job keep the same sticky routing key."""
+        p = get_provider_profile("nous")
+        first = p.build_extra_body(session_id="cron_job42_20260801_090000")
+        second = p.build_extra_body(session_id="cron_job42_20260802_090000")
+        assert first["session_id"] == "cron_job42"
+        assert first["session_id"] == second["session_id"]
 
 
 

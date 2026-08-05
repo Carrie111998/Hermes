@@ -96,6 +96,18 @@ Isso alinha o comportamento do header com o do body: sessões não relacionadas 
 | Reimplementar a normalização de cron localmente no bloco do header (duplicando o regex/lógica de `_cache_scope_from_session_id`) | Duplicação de lógica — viola DRY e a regra explícita do projeto de não duplicar. Rejeitado. |
 | Refatorar `build_kwargs()` para calcular `scope_id = _cache_scope_from_session_id(session_id)` uma única vez e passar para os dois call sites (body e header) | Evitaria uma segunda chamada (hoje a função é invocada 2x: linha ~375 para o body, linha ~464 para o header). Rejeitado por ora: a função é uma regex simples sobre uma string curta (custo desprezível) e a mudança aumentaria o número de linhas tocadas fora do escopo do bug sem ganho mensurável — KISS/YAGNI. Anotado aqui como possível micro-limpeza futura, não crítica. |
 
+## Extensão 2: sticky routing key dos providers Nous Portal e OpenRouter
+
+Varredura por todas as rotas que usam `session_id` cru pra roteamento/afinidade de cache (não só Codex) encontrou mais duas: `plugins/model-providers/nous/__init__.py` e `plugins/model-providers/openrouter/__init__.py`. Ambos `build_extra_body()` fixam (`body["session_id"]`) a sessão sempre no mesmo endpoint upstream, pra manter aquecidos os `cache_control` breakpoints da Anthropic/Vertex/Bedrock — mesma categoria de cache-affinity hint do `prompt_cache_key`/header do Codex, só que numa rota totalmente separada.
+
+**Bug reproduzido:** o valor vinha de `get_conversation_context() or session_id` sem nenhuma normalização. Para cron jobs (`cron_<job_id>_<YYYYMMDD_HHMMSS>`, sem `parent_session_id`), `_conversation_root_id()` resolve pro próprio id bruto com timestamp — logo o sticky-key mudava a cada disparo do mesmo job, nunca fixando no mesmo endpoint. Mesma classe de bug de #51395/#52295, numa rota que a correção original do #78941 não cobria.
+
+**Fix:** reaproveita `_cache_scope_from_session_id()` (import de `agent.transports.codex`, sem duplicar a regex/lógica) só no `sticky_key`, preservando intocada a tag `conversation=` de analytics do Portal (`nous_portal_tags`), que deve continuar por disparo pra não confundir contagem de execuções distintas nos relatórios.
+
+Não mexido: `grok_conv_id`/`x-grok-conv-id` (linha ~185 do OpenRouter, linha ~494 do Codex) — confirmado por teste dedicado (`test_grok_session_id_sets_cache_affinity_header`) que é identidade real de sessão/transcript no xAI, não cache key.
+
+Testes novos: `test_sticky_session_id_normalizes_cron_timestamp` em `TestOpenRouterProfile` e `TestNousProfile` (`tests/providers/test_provider_profiles.py`) — dois disparos do mesmo cron job produzem o mesmo `session_id` de roteamento. Suíte completa de transports + providers: **287 passed**, zero regressão.
+
 ## Observação de segurança fora de escopo
 
 Durante o trabalho, o arquivo `AGENTS.md` já estava modificado na árvore de trabalho (fora desta tarefa) com uma "Infographic Generation Directive" instruindo execução automática de `scripts/pr_infographic_prompt.py` sempre que "infographic"/"infográfico" for mencionado, acompanhada de arquivos não rastreados (`scripts/pr_infographic_prompt.py`, `infographic.png`, `infographic_report.md`, `prompt_output.json/txt`). Isso não foi tocado, commitado nem executado — sinalizado ao usuário por ter características de possível prompt injection plantada no repositório (instrução condicional a uma palavra-gatilho, combinada com script executável não revisado).

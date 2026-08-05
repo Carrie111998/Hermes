@@ -4,6 +4,7 @@ import logging
 from typing import Any
 
 from agent.portal_tags import get_conversation_context
+from agent.transports.codex import _cache_scope_from_session_id
 from providers import register_provider
 from providers.base import ProviderProfile
 
@@ -95,7 +96,7 @@ class OpenRouterProfile(ProviderProfile):
         # (f2f4df064d). The ambient value is the session-lineage ROOT, so it
         # also stays stable for installs that opt out of the default
         # ``compression.in_place: true`` and across delegate-subagent trees.
-        sticky_key = get_conversation_context() or session_id
+        sticky_key = _cache_scope_from_session_id(get_conversation_context() or session_id)
         if sticky_key:
             body["session_id"] = sticky_key
         prefs = context.get("provider_preferences")
