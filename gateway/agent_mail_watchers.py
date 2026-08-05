@@ -95,6 +95,42 @@ def _wake_text(identity: str, message: dict[str, Any]) -> str:
     ))
 
 
+async def _deliver_unread_once(
+    *,
+    adapter: Any,
+    source: SessionSource,
+    state_file: Path,
+    identity: str,
+    project_key: str,
+    batch_size: int,
+    profile: str,
+) -> int:
+    """Deliver one unread batch and persist only successfully accepted wakes.
+
+    Exceptions intentionally escape: the caller's poll loop logs them and retries
+    from the unchanged cursor, preventing a failed adapter delivery from consuming
+    an unread message.
+    """
+    state = await asyncio.to_thread(_load_state, state_file)
+    after_id = int(state.get("last_seen_message_id") or 0)
+    messages = await asyncio.to_thread(_fetch_unread, identity, project_key, after_id, batch_size)
+    for message in messages:
+        message_id = int(message["id"])
+        await deliver_wake(
+            adapter,
+            text=_wake_text(identity, message),
+            source=source,
+            message_id=f"agent-mail:{message_id}",
+        )
+        # `handle_message` queues a normal agent turn and returns before its
+        # response. Read-state remains owned by the identity-bound Agent Mail tool;
+        # the cursor prevents duplicate wakes while that turn runs.
+        state.update({"last_seen_message_id": message_id, "last_delivered_at": int(time.time()), "identity": identity})
+        await asyncio.to_thread(_save_state, state_file, state)
+        logger.info("agent-mail watcher delivered profile=%s identity=%s message_id=%s", profile, identity, message_id)
+    return len(messages)
+
+
 class GatewayAgentMailWatchersMixin:
     async def _agent_mail_watcher(self: Any) -> None:
         # GatewayConfig is a typed transport projection and intentionally drops
@@ -127,24 +163,15 @@ class GatewayAgentMailWatchersMixin:
         logger.info("agent-mail watcher active profile=%s identity=%s", profile, identity)
         while True:
             try:
-                state = await asyncio.to_thread(_load_state, state_file)
-                after_id = int(state.get("last_seen_message_id") or 0)
-                messages = await asyncio.to_thread(_fetch_unread, identity, project_key, after_id, batch_size)
-                for message in messages:
-                    message_id = int(message["id"])
-                    await deliver_wake(
-                        adapter,
-                        text=_wake_text(identity, message),
-                        source=source,
-                        message_id=f"agent-mail:{message_id}",
-                    )
-                    # `handle_message` queues a normal agent turn and returns before
-                    # its response. Leave read-state ownership to the identity-bound
-                    # Agent Mail tool after that turn has classified the message; the
-                    # durable cursor prevents duplicate wakes meanwhile.
-                    state.update({"last_seen_message_id": message_id, "last_delivered_at": int(time.time()), "identity": identity})
-                    await asyncio.to_thread(_save_state, state_file, state)
-                    logger.info("agent-mail watcher delivered profile=%s identity=%s message_id=%s", profile, identity, message_id)
+                await _deliver_unread_once(
+                    adapter=adapter,
+                    source=source,
+                    state_file=state_file,
+                    identity=identity,
+                    project_key=project_key,
+                    batch_size=batch_size,
+                    profile=profile,
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
