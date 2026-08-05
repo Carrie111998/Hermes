@@ -4040,8 +4040,14 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             success = False
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
-        if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        # Always write mark_job_run — the interrupted-handler (
+        # mark_running_jobs_interrupted) may have also tried to write, but
+        # under the single-writer invariant (flock + RLock) only one process
+        # persists the store.  If the interrupted-path's mark_job_run silently
+        # dropped (e.g. job removed by dead-pin sweep), the normal-path call
+        # here is the only surviving chance to write last_run_at (#C2 t_95fbd07c).
+        mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+        _consume_interrupted_flag(job["id"])  # discard stale flag for next cycle
         normalized_deliver = _normalize_deliver_value(job.get("deliver", "local"))
         if delivery_error:
             delivery_outcome = "failed"

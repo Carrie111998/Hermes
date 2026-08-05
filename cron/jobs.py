@@ -106,6 +106,14 @@ _jobs_lock_state = threading.local()
 
 # Upper bound on waiting for the cross-process .jobs.lock flock (#60703).
 # Every cron function in the process funnels through _jobs_lock(), and the
+
+# Process-global counter for mark_job_run writes dropped because the job no
+# longer exists in the store (e.g. dead-pin sweep removed it mid-execution).
+# Surfaces via scheduler._last_mark_not_found_count so the liveness collector
+# can report it as last_error instead of letting it vanish silently (#C2 t_95fbd07c).
+_last_mark_not_found_count = 0
+_last_mark_not_found_at: Optional[str] = None
+_last_mark_not_found_job: Optional[str] = None
 # flock is taken while holding the process-wide RLock — so an unbounded wait
 # on a lock held by a wedged sibling process silently freezes the ticker
 # heartbeat and every job forever.  30s is orders of magnitude above any
@@ -1789,7 +1797,21 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 save_jobs(jobs)
                 return
 
-        logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+        # C2 (t_95fbd07c): surfaced drop counter so the liveness collector can
+        # report this class of failure as last_error / probe-visible metrics
+        # instead of a silent metadata-lag false positive.
+        global _last_mark_not_found_count, _last_mark_not_found_at, _last_mark_not_found_job
+        now = _hermes_now().isoformat()
+        _last_mark_not_found_count += 1
+        _last_mark_not_found_at = now
+        _last_mark_not_found_job = job_id
+        logger.warning(
+            "mark_job_run: job_id %s not found, skipping save "
+            "(total dropped writes: %d; last at %s)",
+            job_id,
+            _last_mark_not_found_count,
+            now,
+        )
 
 
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
