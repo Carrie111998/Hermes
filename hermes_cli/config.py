@@ -4910,27 +4910,6 @@ def set_config_value(key: str, value: str, force: bool = False):
             coerced_value = int(value)
         elif value.replace('.', '', 1).isdigit():
             coerced_value = float(value)
-        # List/dict literals (e.g. `hermes config set platform_toolsets.discord
-        # '["clarify","file"]'`). Without this, the literal is stored as a raw
-        # string and every reader gated on isinstance(..., list) silently
-        # ignores it, falling back to its default — the setting looks saved but
-        # never takes effect (#57063). Parse as YAML flow; only accept real
-        # list/dict results, warn (and keep the legacy string) otherwise.
-        elif value.lstrip().startswith(("[", "{")):
-            try:
-                parsed = yaml.safe_load(value)
-            except Exception:
-                parsed = None
-            if isinstance(parsed, (list, dict)):
-                coerced_value = parsed
-            else:
-                print(
-                    f"⚠ Value for '{key}' looks like a list/map but parsed to "
-                    f"{type(parsed).__name__ if parsed is not None else 'nothing'} — "
-                    f"storing as a string. Check quoting (e.g. "
-                    f"'[\"clarify\", \"file\"]').",
-                    file=sys.stderr,
-                )
 
     value = coerced_value
     # Normalize a scalar ``model`` key before writing sub-keys so that
