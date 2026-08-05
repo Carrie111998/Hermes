@@ -355,3 +355,35 @@ class TestChannelAliases:
                  if e["id"] == "120363@g.us"]
         assert names == ["general"]
 
+
+
+class TestSlackResolveLimit:
+    def test_unresolved_raw_id_resolution_is_capped(self, monkeypatch):
+        """A large session history must not trigger unbounded serial
+        conversations.info calls during startup (startup-restore gate)."""
+        from gateway import channel_directory as cd
+
+        async def _run():
+            return await cd._build_slack(adapter)
+
+        raw_entries = [
+            {"id": f"D0{i:08X}", "name": f"D0{i:08X}", "type": "dm"}
+            for i in range(cd._SLACK_DIRECTORY_RESOLVE_LIMIT + 25)
+        ]
+        monkeypatch.setattr(cd, "_build_from_sessions", lambda platform: raw_entries)
+
+        client = MagicMock()
+        client.users_conversations = AsyncMock(
+            return_value={"ok": True, "channels": [], "response_metadata": {}}
+        )
+        client.conversations_info = AsyncMock(
+            return_value={"ok": True, "channel": {"is_im": False, "name": "x"}}
+        )
+        adapter = SimpleNamespace(_team_clients={"T0TEST": client})
+
+        result = asyncio.run(_run())
+
+        assert client.conversations_info.await_count == cd._SLACK_DIRECTORY_RESOLVE_LIMIT
+        # All entries are still present — unresolved ones keep raw IDs,
+        # which remain valid delivery targets.
+        assert len(result) == len(raw_entries)

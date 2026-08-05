@@ -11385,9 +11385,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Build initial channel directory for send_message name resolution
         try:
             from gateway.channel_directory import build_channel_directory
-            directory = await build_channel_directory(self.adapters)
+            # BOUNDED: directory enrichment must never hold the startup
+            # restore gate (inbound queue) indefinitely.  On timeout the
+            # gateway continues with raw IDs, which are valid targets.
+            directory = await asyncio.wait_for(
+                build_channel_directory(self.adapters), timeout=30.0
+            )
             ch_count = sum(len(chs) for chs in directory.get("platforms", {}).values())
             logger.info("Channel directory built: %d target(s)", ch_count)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Channel directory build timed out after 30s; continuing startup "
+                "with raw IDs (name resolution remains best-effort)"
+            )
         except Exception as e:
             logger.warning("Channel directory build failed: %s", e)
         

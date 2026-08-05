@@ -18,6 +18,11 @@ from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
 
+# Max number of raw Slack channel/DM IDs resolved via conversations.info /
+# users.info per directory build.  Prevents a large session history from
+# serially blocking gateway startup for minutes (see startup-restore gate).
+_SLACK_DIRECTORY_RESOLVE_LIMIT = 50
+
 DIRECTORY_PATH = get_hermes_home() / "channel_directory.json"
 # Throttle window for repeated Slack channel-directory refresh failures.
 # The directory rebuilds on a timer, so a persistent workspace error (e.g.
@@ -370,8 +375,19 @@ async def _build_slack(adapter) -> List[Dict[str, Any]]:
             seen_ids.add(eid)
 
     # Resolve remaining raw-ID entries (DMs, private channels not in bot scope)
-    # by calling conversations.info + users.info for each.
+    # by calling conversations.info + users.info for each.  BOUNDED: a large
+    # session history can produce hundreds of raw IDs, and uncapped serial
+    # API resolution blocks gateway startup (holding the inbound gate) for
+    # minutes.  Raw IDs remain valid delivery targets without friendly names.
     unresolved = [ch for ch in channels if ch.get("name", "").startswith(("C0", "D0", "G0"))]
+    if len(unresolved) > _SLACK_DIRECTORY_RESOLVE_LIMIT:
+        logger.info(
+            "Channel directory: %d unresolved Slack IDs; resolving first %d only "
+            "(rest keep raw IDs, which remain valid delivery targets)",
+            len(unresolved),
+            _SLACK_DIRECTORY_RESOLVE_LIMIT,
+        )
+        unresolved = unresolved[:_SLACK_DIRECTORY_RESOLVE_LIMIT]
     if unresolved and team_clients:
         client = next(iter(team_clients.values()))
         for entry in unresolved:
