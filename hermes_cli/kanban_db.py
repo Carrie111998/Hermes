@@ -2384,13 +2384,19 @@ def init_db(
 
 # Events that end a breaker decision. Each one corresponds exactly to a code
 # path that clears ``tasks.breaker_limit``: ``unblock_task`` ("unblocked"),
-# ``promote_task`` ("promoted_manual"), ``reclaim_task`` ("reclaimed", via
-# ``_clear_failure_counter``) and ``complete_task`` ("completed", same). The
-# legacy event-log fallback reads this list, so the two representations of
-# "the trip was reset" cannot drift apart. A plain ``claimed`` is NOT a reset
-# — claiming is not an operator decision about the retry budget.
+# ``promote_task`` ("promoted_manual") and ``complete_task`` ("completed", via
+# ``_clear_failure_counter``). The legacy event-log fallback reads this list,
+# so the two representations of "the trip was reset" cannot drift apart.
+#
+# A plain ``claimed`` is NOT a reset — claiming is not an operator decision
+# about the retry budget. Neither is ``"reclaimed"``: a reclaim recovers a
+# *worker*, and ``reclaim_task`` keeps the recorded limit for a task that is
+# staying blocked. Listing it here would undo that one tick later on exactly
+# the boards this fallback exists for — a trip recorded only in the event log
+# would be cleared by the reclaim's own event, and the next
+# ``recompute_ready`` would promote the task.
 _BREAKER_RESET_KINDS = (
-    "unblocked", "promoted_manual", "reclaimed", "completed",
+    "unblocked", "promoted_manual", "completed",
 )
 
 
@@ -4300,13 +4306,21 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     ``triage`` where the auto-decomposer promoted it straight back into
     the work pool; now it stays ``blocked`` and this predicate is what
     keeps it there.
+
+    Two events end it, both deliberate operator acts: ``unblock_task``
+    (``"unblocked"``) and ``promote_task`` (``"promoted_manual"``). A
+    ``reclaim`` is NOT one of them — reclaim recovers a *worker*, and
+    reading it as a release is what let an operator poke at a stuck row and
+    silently resurrect a task nobody had decided to resume.
     """
     return _latest_block_event_kind(conn, task_id) in (
         "blocked", "block_loop_detected",
     )
 
 
-_BLOCK_LIFECYCLE_KINDS = ("blocked", "unblocked", "block_loop_detected")
+_BLOCK_LIFECYCLE_KINDS = (
+    "blocked", "unblocked", "block_loop_detected", "promoted_manual",
+)
 
 
 def _latest_block_event_kind(
@@ -4315,7 +4329,7 @@ def _latest_block_event_kind(
     """Return the most recent block-lifecycle event kind for ``task_id``.
 
     One of :data:`_BLOCK_LIFECYCLE_KINDS`, or ``None`` when the task has
-    never been blocked or unblocked.
+    never been blocked, unblocked or manually promoted.
     """
     placeholders = ", ".join("?" for _ in _BLOCK_LIFECYCLE_KINDS)
     row = conn.execute(
@@ -4338,7 +4352,11 @@ def has_block_loop_escalation(
     no matter which column it happens to sit in — including a legacy row
     still parked in ``triage`` by the pre-fix routing, or one an operator
     dragged there by hand. Auto-decompose / specify must never advance it.
-    An explicit ``unblock_task`` (which emits ``"unblocked"``) clears this.
+    An explicit ``unblock_task`` or ``promote_task`` clears this.
+
+    Most callers want the broader :func:`terminal_hold_reason`, which covers
+    the plain sticky block and the breaker trip as well. This one stays for
+    code that needs to distinguish the escalation specifically.
     """
     return _latest_block_event_kind(conn, task_id) == "block_loop_detected"
 
@@ -4351,8 +4369,9 @@ def _breaker_limit_from_events(
     Fallback for rows written before ``tasks.breaker_limit`` existed (the
     migration backfills them, but a board can also be restored from an old
     dump). Only the most recent lifecycle event counts: a ``gave_up``
-    followed by an ``unblocked`` / manual promote / reclaim / completion has
-    already been cleared by an operator and must NOT bind.
+    followed by an ``unblocked`` / manual promote / completion has already
+    been cleared by an operator and must NOT bind. A ``reclaimed`` is not on
+    that list — see :data:`_BREAKER_RESET_KINDS`.
     """
     kinds = ("gave_up",) + _BREAKER_RESET_KINDS
     placeholders = ", ".join("?" for _ in kinds)
@@ -4377,8 +4396,9 @@ def recorded_breaker_limit(
     """Return the effective limit the breaker last tripped against, or None.
 
     ``None`` means "no binding decision on record" — either the task never
-    tripped, or an operator cleared it (unblock / manual promote / reclaim)
-    or it completed successfully. Callers that promote tasks must honour a
+    tripped, or an operator cleared it (unblock / manual promote) or it
+    completed successfully. A reclaim is NOT one of those: it recovers a
+    worker, not the task. Callers that promote tasks must honour a
     non-None value instead of resolving a limit of their own: the limit that
     tripped the breaker is the one the task actually exhausted, and a
     gateway restart, a changed ``kanban.failure_limit``, or a caller that
@@ -4423,6 +4443,55 @@ def _breaker_trip_is_active(
     return _breaker_limit_from_events(conn, task_id) is not None
 
 
+_UNREAD = object()
+
+
+def terminal_hold_reason(
+    conn: sqlite3.Connection,
+    task_id: str,
+    breaker_limit: Any = _UNREAD,
+) -> Optional[str]:
+    """Why ``task_id`` may not be advanced by automation, or ``None``.
+
+    A terminal hold is a decision *about the task*, not a property of the
+    column it happens to sit in. Two produce one:
+
+    * ``"sticky_block"`` / ``"block_loop_escalation"`` — a worker or
+      operator called ``kanban_block``, or the unblock-loop breaker
+      escalated (see :func:`_has_sticky_block`).
+    * ``"breaker_trip"`` — the circuit breaker recorded ``gave_up`` and
+      persisted the limit it tripped against (see
+      :func:`recorded_breaker_limit`).
+
+    Both were already understood — but only by ``recompute_ready``, and
+    only for rows it found in ``blocked``. Every other door into the work
+    pool re-derived a narrower rule of its own, so a held row that reached
+    another column by any route was advanced anyway: ``claim_task`` had no
+    check at all, the triage promoters gated on the escalation alone, and
+    ``reclaim_task`` flipped ``blocked -> ready`` outright. This is the one
+    predicate all of them share, so a new promotion path cannot quietly
+    disagree with the others about what "blocked" means.
+
+    ``breaker_limit`` lets a caller that already selected the column pass
+    it in; omit it and the row is read (falling back to the event log for
+    boards written before the column existed).
+
+    Released only by the explicit operator escapes — ``unblock_task`` and
+    ``promote_task`` — or by a successful completion, which clears the
+    breaker decision outright.
+    """
+    kind = _latest_block_event_kind(conn, task_id)
+    if kind == "block_loop_detected":
+        return "block_loop_escalation"
+    if kind == "blocked":
+        return "sticky_block"
+    if breaker_limit is _UNREAD:
+        tripped = recorded_breaker_limit(conn, task_id) is not None
+    else:
+        tripped = _breaker_trip_is_active(conn, task_id, breaker_limit)
+    return "breaker_trip" if tripped else None
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4435,9 +4504,12 @@ def recompute_ready(
     blocked purely by a parent dependency unblocks itself when the
     parent completes), *except* in two cases:
 
-    1. The most recent block event was a worker-initiated
-       ``kanban_block`` — those stay blocked until an explicit
-       ``kanban_unblock`` (#28712).
+    1. The row is on a terminal hold — a worker-initiated
+       ``kanban_block`` (#28712), the unblock-loop escalation, or a
+       recorded breaker trip. :func:`terminal_hold_reason` is the single
+       predicate, and it is checked for ``todo`` candidates too: the hold
+       is a decision about the task, so it cannot be something a row
+       escapes by being in a different column.
 
     2. The task's ``consecutive_failures`` has reached the effective
        failure limit.  This prevents infinite retry loops when a task
@@ -4477,11 +4549,17 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if cur_status == "blocked" and _has_sticky_block(conn, task_id):
-                # Worker / operator asked for human review — do not
-                # silently auto-recover.  ``unblock_task`` is the only
-                # legitimate exit (it emits ``"unblocked"`` which flips
-                # this predicate back).
+            # A terminal hold binds in EVERY column, not just ``blocked``.
+            # Checking it only on the blocked branch meant anything that
+            # moved a held row to ``todo`` — a re-specify, an operator drag,
+            # a restored dump — got it promoted on the very next tick. A
+            # ``dependency`` block routes to ``todo`` deliberately and emits
+            # ``dependency_wait`` (not ``blocked``), so it is untouched by
+            # this and still frees itself when its parents finish.
+            if terminal_hold_reason(conn, task_id, row["breaker_limit"]):
+                # Worker / operator asked for human review, or the breaker
+                # gave up — do not silently auto-recover. ``unblock_task``
+                # and ``promote_task`` are the legitimate exits.
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4499,19 +4577,13 @@ def recompute_ready(
                     # exhausted → block → …  The counter must also
                     # be preserved so the breaker can accumulate
                     # across recovery cycles.
-                    failures = int(row["consecutive_failures"] or 0)
                     # A recorded trip binds on its OWN, not on a counter
-                    # comparison. The breaker already made the give-up
-                    # decision — including the ``force_trip`` paths (systemic
-                    # error fingerprints, the protocol-violation streak),
-                    # which record ``gave_up`` with ``failures`` BELOW the
-                    # limit. Re-deriving "is it over budget?" here let those
-                    # tasks promote themselves on the very next tick. The
-                    # decision stands until something explicitly resets it:
-                    # unblock, manual promote, operator reclaim, or a
-                    # successful completion (see ``_BREAKER_RESET_KINDS``).
-                    if _breaker_trip_is_active(conn, task_id, row["breaker_limit"]):
-                        continue
+                    # comparison — that is ``terminal_hold_reason``'s job
+                    # above, and it has already run for this row. What is
+                    # left here is #35072's lenient path: a task that never
+                    # tripped (blocked by hand, or on a dependency) whose
+                    # counter has nonetheless reached the limit.
+                    failures = int(row["consecutive_failures"] or 0)
                     task_limit = row["max_retries"]
                     effective_limit = (
                         int(task_limit) if task_limit is not None
@@ -4572,6 +4644,26 @@ def claim_task(
             )
         return None
     with write_txn(conn):
+        # Structural invariant, same shape as the parent gate below: a
+        # terminal hold binds no matter which writer put this row in
+        # 'ready'. ``recompute_ready`` refuses to promote a held task, but
+        # it is not the only writer of status='ready' — a racy promote, a
+        # stale-claim release, a restored dump or an operator's manual SQL
+        # all reach here, and this is the only door into 'running'. Demote
+        # to 'blocked' (where a held task belongs) so the next tick doesn't
+        # re-litigate the same decision.
+        hold = terminal_hold_reason(conn, task_id)
+        if hold:
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "terminal_hold", "hold": hold},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4729,6 +4821,26 @@ def claim_review_task(
             )
         return None
     with write_txn(conn):
+        # Same terminal-hold gate as ``claim_task``: the review column is a
+        # second door into 'running', and a held card must not walk through
+        # it either.
+        #
+        # Refuse WITHOUT demoting, unlike the ``ready`` gate. ``ready`` is the
+        # active work pool that ``recompute_ready`` keeps re-examining, so
+        # parking a held row at 'blocked' settles it; ``review`` is neither —
+        # recompute only ever promotes out of 'todo'/'blocked', so refusing
+        # the claim already binds the hold. Demoting would be a one-way door:
+        # ``unblock_task`` restores 'ready' (or 'todo' behind open parents)
+        # and never 'review', so the card would come back as ordinary
+        # implementation work with its PR already open — the very failure
+        # ``_claim_source_status`` exists to prevent.
+        hold = terminal_hold_reason(conn, task_id)
+        if hold:
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "terminal_hold", "hold": hold, "gate": "review"},
+            )
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5016,6 +5128,14 @@ def reclaim_task(
         # ``unblock`` are the documented overrides.
         return False
     prev_lock = row["claim_lock"]
+    # A reclaim recovers a *worker*; it is not a decision to resume the
+    # *task*. A held row can still reach here — a blocked task that kept a
+    # fence from an unconfirmed termination passes the gate above — and
+    # unconditionally writing 'ready' resurrected it, breaker decision
+    # cleared and all. Release the claim, kill the group, resolve the fence,
+    # and leave it blocked: ``promote`` / ``unblock`` remain the overrides.
+    hold = terminal_hold_reason(conn, task_id)
+    new_status = "blocked" if hold else "ready"
 
     # Which process do we probe? A task that still owns a worker has it on
     # the row. A task that was already requeued behind a fence does NOT: the
@@ -5099,12 +5219,12 @@ def reclaim_task(
 
     with write_txn(conn):
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL, worker_pgid = NULL, "
             "worker_identity = NULL" + fence_set_sql + " "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ? AND worker_fence IS ?",
-            (*fence_param, task_id, prev_lock, fence_raw),
+            (new_status, *fence_param, task_id, prev_lock, fence_raw),
         )
         if cur.rowcount != 1:
             # Nothing was written: the task moved on, or a newer fence
@@ -5135,6 +5255,7 @@ def reclaim_task(
             "reason": reason,
             "prev_lock": prev_lock,
             "fence_held": keep_fence,
+            "terminal_hold": hold,
         }
         payload.update(termination)
         _append_event(
@@ -5145,8 +5266,11 @@ def reclaim_task(
     # Operator intervention — they've looked at the task, so the
     # consecutive-failures counter is now stale. Give the next retry
     # a fresh budget. (_clear_failure_counter opens its own write_txn,
-    # so it runs after the enclosing one commits.)
-    _clear_failure_counter(conn, task_id)
+    # so it runs after the enclosing one commits.) The breaker's give-up
+    # decision survives when it is what is holding the task: clearing it
+    # here would leave the row blocked but freely promotable by the next
+    # ``recompute_ready``, which is the same resurrection by a slower route.
+    _clear_failure_counter(conn, task_id, keep_breaker_limit=hold is not None)
     return True
 
 
@@ -6523,10 +6647,12 @@ def specify_triage_task(
         ).fetchone()
         if existing is None:
             return False
-        if has_block_loop_escalation(conn, task_id):
-            # A row carrying an unblock-loop escalation is a human hold, even
-            # if something parked it in ``triage``. Promoting it here is the
-            # resurrection path the breaker exists to prevent.
+        if terminal_hold_reason(conn, task_id):
+            # A row on a terminal hold is a human hold, even if something
+            # parked it in ``triage``. Promoting it here is the resurrection
+            # path the breaker exists to prevent. The escalation was already
+            # caught; a plain sticky block and a recorded give-up are the
+            # same class of decision and were not.
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -6685,9 +6811,9 @@ def decompose_triage_task(
             return None
         if root_row["status"] != "triage":
             return None
-        if has_block_loop_escalation(conn, task_id):
+        if terminal_hold_reason(conn, task_id):
             # Same human-hold guard as ``specify_triage_task``: never fan out
-            # a card that the unblock-loop breaker escalated.
+            # a card that a worker blocked or the breaker gave up on.
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out
@@ -8972,6 +9098,29 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     return crashed
 
 
+def _claim_source_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Which column the task's current run was claimed out of.
+
+    ``"review"`` when ``claim_review_task`` made the claim (it stamps
+    ``source_status`` on the ``claimed`` event), ``"ready"`` otherwise —
+    including for every pre-existing event that predates the stamp. Read
+    from the event rather than threaded through the callers so a requeue
+    lands in the right column no matter which failure path reached it.
+    """
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'claimed' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if not row or not row["payload"]:
+        return "ready"
+    try:
+        source = json.loads(row["payload"]).get("source_status")
+    except (ValueError, TypeError):
+        return "ready"
+    return "review" if source == "review" else "ready"
+
+
 def _record_task_failure(
     conn: sqlite3.Connection,
     task_id: str,
@@ -8999,8 +9148,10 @@ def _record_task_failure(
 
     * ``release_claim=True, end_run=True`` — spawn-failure path.
       Caller has a running task with an open run; this transitions
-      it back to ``ready`` (or ``blocked`` when the breaker trips),
-      releases the claim, and closes the run with ``outcome=<outcome>``.
+      it back to the column the claim came from — ``ready``, or
+      ``review`` for a claim made by :func:`claim_review_task` (or
+      ``blocked`` when the breaker trips) — releases the claim, and
+      closes the run with ``outcome=<outcome>``.
 
     * ``release_claim=False, end_run=False`` — timeout/crash path.
       Caller has ALREADY flipped the task to ``ready`` and closed the
@@ -9117,14 +9268,23 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: transition running → back to the column this
+                # run was claimed out of, and clear the claim. A review claim
+                # must land in ``review``, not ``ready``: the dispatcher
+                # force-loads the ``sdlc-review`` skill for review claims, so
+                # requeueing to ``ready`` hands the card to the next tick as
+                # ordinary work and spawns a plain implementation worker
+                # against a task whose PR is already open.
                 counted_rows = conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "worker_pgid = NULL, worker_identity = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (
+                        _claim_source_status(conn, task_id),
+                        failures, error[:500], task_id,
+                    ),
                 ).rowcount
             else:
                 # Timeout/crash path: task is already at ``ready`` via its
@@ -9249,7 +9409,12 @@ def _set_worker_pid(
         )
 
 
-def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
+def _clear_failure_counter(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    keep_breaker_limit: bool = False,
+) -> None:
     """Reset the unified consecutive-failures counter.
 
     Called from ``complete_task`` on successful completion — a fresh
@@ -9258,11 +9423,16 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     a successful spawn proves the worker could start but says nothing
     about whether the run will succeed, so we need to let timeouts and
     crashes accumulate across spawn boundaries.
+
+    ``keep_breaker_limit`` preserves the recorded give-up decision while
+    still zeroing the counter. ``reclaim_task`` uses it for a task that is
+    staying blocked: the operator freed the worker, not the task.
     """
+    breaker_sql = "" if keep_breaker_limit else ", breaker_limit = NULL"
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL, breaker_limit = NULL WHERE id = ?",
+            "last_failure_error = NULL" + breaker_sql + " WHERE id = ?",
             (task_id,),
         )
 

@@ -283,18 +283,21 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
-        escalated = task is not None and kb.has_block_loop_escalation(conn, task_id)
+        hold = (
+            kb.terminal_hold_reason(conn, task_id) if task is not None else None
+        )
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
         )
-    if escalated:
-        # The unblock-loop breaker escalated this task; it needs an operator
-        # decision, not another LLM fan-out. ``hermes kanban unblock`` resumes.
+    if hold:
+        # A worker blocked this, or the breaker gave up on it; it needs an
+        # operator decision, not another LLM fan-out. ``hermes kanban
+        # unblock`` (or ``promote``) resumes it.
         return DecomposeOutcome(
-            task_id, False, "task is block-loop escalated — unblock it first",
+            task_id, False, f"task is on a terminal hold ({hold}) — unblock it first",
         )
 
     cfg = _load_config()
@@ -467,10 +470,11 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
     """Return task ids currently in the triage column that are safe to
     auto-decompose.
 
-    Rows carrying an unblock-loop escalation are excluded: they are a human
-    hold that only ``kanban unblock`` clears. Before this filter the
-    gateway's auto-decompose tick picked such a card up and silently promoted
-    it back into the work pool.
+    Rows on a terminal hold are excluded — an unblock-loop escalation, a
+    worker's ``kanban_block``, or a recorded breaker trip. All three are a
+    human hold that only ``kanban unblock`` / ``promote`` clears. Before
+    this filter the gateway's auto-decompose tick picked such a card up and
+    silently promoted it back into the work pool.
     """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
@@ -481,5 +485,5 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
         )
         return [
             row.id for row in rows
-            if not kb.has_block_loop_escalation(conn, row.id)
+            if not kb.terminal_hold_reason(conn, row.id)
         ]
