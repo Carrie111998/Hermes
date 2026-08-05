@@ -667,6 +667,51 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         agent.client.chat.completions.create.assert_called_once()
 
+    def test_tool_tail_spill_rebases_prepared_moa_request(self, agent):
+        """Tail spilling must not rerun MoA advisors on the rebuilt request."""
+        agent.provider = "moa"
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+
+        completions = agent.client.chat.completions
+        prepared_request = {"messages": [{"role": "user", "content": "prepared"}]}
+        rebased_request = {"messages": [{"role": "user", "content": "rebased"}]}
+        completions.prepare = MagicMock(return_value=prepared_request)
+        completions.rebase_prepared_request = MagicMock(return_value=rebased_request)
+        completions.create.side_effect = [
+            _mock_response(content="After rebased tail spill", finish_reason="stop")
+        ]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                side_effect=[140_000, 10_000],
+            ),
+            patch(
+                "agent.conversation_loop.enforce_recent_tool_tail_budget",
+                return_value=True,
+            ),
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "earlier"},
+                    {"role": "assistant", "content": "earlier answer"},
+                ],
+            )
+
+        assert result["completed"] is True
+        completions.prepare.assert_called_once()
+        assert completions.rebase_prepared_request.call_count >= 1
+        assert completions.rebase_prepared_request.call_args_list[0].args[0] is prepared_request
+        mock_compress.assert_not_called()
+
     def test_pre_api_pressure_uses_context_engine_message_aware_hook(self, agent):
         """Engines can decline no-op pressure compaction for protected tails."""
         agent.compression_enabled = True

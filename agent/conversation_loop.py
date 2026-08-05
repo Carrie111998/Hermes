@@ -89,7 +89,7 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
-from tools.budget_config import budget_for_context_window
+from tools.budget_config import DEFAULT_BUDGET, budget_for_context_window
 from tools.skill_provenance import set_current_write_origin
 from tools.tool_result_storage import enforce_recent_tool_tail_budget
 from utils import base_url_host_matches, env_var_enabled
@@ -119,6 +119,15 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _budget_for_context_compressor(compressor: Any):
+    """Resolve tool-result budgets from a context compressor, with fallback."""
+    try:
+        context_length = getattr(compressor, "context_length", None)
+        return budget_for_context_window(int(context_length)) if context_length else DEFAULT_BUDGET
+    except Exception:
+        return DEFAULT_BUDGET
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -2047,8 +2056,7 @@ def run_conversation(
             and _preflight_threshold > 0
             and request_pressure_tokens >= _preflight_threshold
         ):
-            _context_length = int(getattr(_compressor, "context_length", 0) or 0)
-            _tail_budget_config = budget_for_context_window(_context_length)
+            _tail_budget_config = _budget_for_context_compressor(_compressor)
             try:
                 from tools.terminal_tool import get_active_env
                 _tail_budget_env = get_active_env(effective_task_id)
@@ -2069,7 +2077,7 @@ def run_conversation(
                     f"{request_pressure_tokens:,}",
                     f"{_preflight_threshold:,}",
                 )
-                pending_moa_prepared_request = None
+                pending_moa_prepared_request = _moa_prepared_request
                 _last_preflight_pressure = None
                 api_call_count -= 1
                 agent._api_call_count = api_call_count

@@ -347,6 +347,50 @@ class TestEnforceRecentToolTailBudget:
         assert changed is False
         assert all(PERSISTED_OUTPUT_TAG not in m.get("content", "") for m in messages)
 
+    def test_ignores_synthetic_user_scaffolding_when_selecting_tail(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 70_000},
+            {
+                "role": "user",
+                "content": "[Your active task list was preserved across context compression]",
+                "_todo_snapshot_synthetic": True,
+            },
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 65_000},
+        ]
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=env,
+            config=BudgetConfig(turn_budget=120_000),
+        )
+
+        assert changed is True
+        assert sum(PERSISTED_OUTPUT_TAG in m.get("content", "") for m in messages) == 1
+
+    def test_does_not_accept_non_reducing_no_env_replacements(self):
+        messages = [
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 100},
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 100},
+            {"role": "tool", "tool_call_id": "t3", "content": "c" * 100},
+        ]
+        before = sum(len(m["content"]) for m in messages if m.get("role") == "tool")
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=None,
+            config=BudgetConfig(turn_budget=150),
+        )
+
+        after = sum(len(m["content"]) for m in messages if m.get("role") == "tool")
+        assert changed is False
+        assert after == before
+        assert all(PERSISTED_OUTPUT_TAG not in m.get("content", "") for m in messages)
+
 
 # ── Per-tool threshold integration ────────────────────────────────────
 

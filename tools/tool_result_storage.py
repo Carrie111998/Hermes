@@ -43,6 +43,47 @@ HEREDOC_MARKER = "HERMES_PERSIST_EOF"
 _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
+_SYNTHETIC_TAIL_USER_FLAGS = (
+    "_todo_snapshot_synthetic",
+    "_empty_recovery_synthetic",
+    "_verification_stop_synthetic",
+    "_pre_verify_synthetic",
+    "_dropped_toolcall_nudge",
+)
+_SYNTHETIC_TAIL_USER_PREFIXES = (
+    "[System: Your previous response was truncated",
+    "[System: The previous response was cut off",
+    "[System: Your previous tool call",
+    "[Your active task list was preserved across context compression]",
+    "[IMPORTANT: Background process ",
+    "[CONTEXT COMPACTION",
+    "[CONTEXT SUMMARY]",
+)
+
+
+def _message_text(message: dict) -> str:
+    content = message.get("content")
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(part.get("text") or part.get("content") or "")
+            for part in content
+            if isinstance(part, dict)
+        )
+    return ""
+
+
+def _is_tail_user_anchor(message: dict) -> bool:
+    """Return True for user messages that can anchor a protected tool tail."""
+    if message.get("role") != "user":
+        return False
+    if any(message.get(flag) for flag in _SYNTHETIC_TAIL_USER_FLAGS):
+        return False
+    text = _message_text(message).strip()
+    if not text:
+        return False
+    return not text.startswith(_SYNTHETIC_TAIL_USER_PREFIXES)
 
 
 def _resolve_storage_dir(env) -> str:
@@ -200,6 +241,76 @@ def maybe_persist_tool_result(
     )
 
 
+def _enforce_tool_subset_budget(
+    messages: list[dict],
+    indices: list[int],
+    *,
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+    fallback_id_prefix: str,
+    log_label: str,
+) -> bool:
+    """Persist largest indexed tool-result messages until under budget."""
+    candidates: list[tuple[int, int]] = []
+    total_size = 0
+    for idx in indices:
+        msg = messages[idx]
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        size = len(content)
+        total_size += size
+        if PERSISTED_OUTPUT_TAG not in content:
+            candidates.append((idx, size))
+
+    if total_size <= config.turn_budget:
+        return False
+
+    changed = False
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    for idx, size in candidates:
+        if total_size <= config.turn_budget:
+            break
+        msg = messages[idx]
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        tool_use_id = msg.get("tool_call_id", f"{fallback_id_prefix}_{idx}")
+        if env is None and size <= config.preview_size:
+            continue
+        replacement = maybe_persist_tool_result(
+            content=content,
+            tool_name=_BUDGET_TOOL_NAME,
+            tool_use_id=tool_use_id,
+            env=env,
+            config=config,
+            threshold=0,
+        )
+        if replacement == content:
+            continue
+        if len(replacement) >= size:
+            logger.info(
+                "%s skipped non-reducing replacement for %s (%d -> %d chars)",
+                log_label,
+                tool_use_id,
+                size,
+                len(replacement),
+            )
+            continue
+        msg["content"] = replacement
+        total_size -= size
+        total_size += len(replacement)
+        changed = True
+        logger.info(
+            "%s: persisted tool result %s (%d chars)",
+            log_label,
+            tool_use_id,
+            size,
+        )
+
+    return changed
+
+
 def enforce_recent_tool_tail_budget(
     messages: list[dict],
     env=None,
@@ -222,62 +333,23 @@ def enforce_recent_tool_tail_budget(
 
     tail_start = 0
     for idx in range(len(messages) - 1, -1, -1):
-        msg = messages[idx]
-        if msg.get("role") != "user":
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and not content.strip():
-            continue
-        if content:
+        if _is_tail_user_anchor(messages[idx]):
             tail_start = idx + 1
             break
 
-    candidates: list[tuple[int, int]] = []
-    total_size = 0
+    tool_indices: list[int] = []
     for idx, msg in enumerate(messages[tail_start:], start=tail_start):
-        if msg.get("role") != "tool":
-            continue
-        content = msg.get("content", "")
-        if not isinstance(content, str) or not content:
-            continue
-        size = len(content)
-        total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
-            candidates.append((idx, size))
+        if msg.get("role") == "tool":
+            tool_indices.append(idx)
 
-    if total_size <= config.turn_budget:
-        return False
-
-    changed = False
-    candidates.sort(key=lambda item: item[1], reverse=True)
-    for idx, size in candidates:
-        if total_size <= config.turn_budget:
-            break
-        msg = messages[idx]
-        content = msg.get("content", "")
-        if not isinstance(content, str) or not content:
-            continue
-        tool_use_id = msg.get("tool_call_id", f"tail_budget_{idx}")
-        replacement = maybe_persist_tool_result(
-            content=content,
-            tool_name=_BUDGET_TOOL_NAME,
-            tool_use_id=tool_use_id,
-            env=env,
-            config=config,
-            threshold=0,
-        )
-        if replacement != content:
-            msg["content"] = replacement
-            total_size -= size
-            total_size += len(replacement)
-            changed = True
-            logger.info(
-                "Recent tool-tail budget enforcement: persisted tool result %s (%d chars)",
-                tool_use_id,
-                size,
-            )
-
-    return changed
+    return _enforce_tool_subset_budget(
+        messages,
+        tool_indices,
+        env=env,
+        config=config,
+        fallback_id_prefix="tail_budget",
+        log_label="Recent tool-tail budget enforcement",
+    )
 
 
 def enforce_turn_budget(
@@ -293,42 +365,13 @@ def enforce_turn_budget(
 
     Mutates the list in-place and returns it.
     """
-    candidates = []
-    total_size = 0
-    for i, msg in enumerate(tool_messages):
-        content = msg.get("content", "")
-        size = len(content)
-        total_size += size
-        if PERSISTED_OUTPUT_TAG not in content:
-            candidates.append((i, size))
-
-    if total_size <= config.turn_budget:
-        return tool_messages
-
-    candidates.sort(key=lambda x: x[1], reverse=True)
-
-    for idx, size in candidates:
-        if total_size <= config.turn_budget:
-            break
-        msg = tool_messages[idx]
-        content = msg["content"]
-        tool_use_id = msg.get("tool_call_id", f"budget_{idx}")
-
-        replacement = maybe_persist_tool_result(
-            content=content,
-            tool_name=_BUDGET_TOOL_NAME,
-            tool_use_id=tool_use_id,
-            env=env,
-            config=config,
-            threshold=0,
-        )
-        if replacement != content:
-            total_size -= size
-            total_size += len(replacement)
-            tool_messages[idx]["content"] = replacement
-            logger.info(
-                "Budget enforcement: persisted tool result %s (%d chars)",
-                tool_use_id, size,
-            )
+    _enforce_tool_subset_budget(
+        tool_messages,
+        list(range(len(tool_messages))),
+        env=env,
+        config=config,
+        fallback_id_prefix="budget",
+        log_label="Budget enforcement",
+    )
 
     return tool_messages
