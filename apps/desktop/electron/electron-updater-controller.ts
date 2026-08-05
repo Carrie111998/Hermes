@@ -111,9 +111,12 @@ export function configureElectronUpdater(config: ElectronUpdaterConfig): void {
   })
 }
 
-/** Query the feed for a newer version (and download it in the background). */
-export async function checkForUpdates(): Promise<void> {
-  await autoUpdater.checkForUpdates()
+/** Query the feed for a newer version (and download it in the background).
+ *  Returns electron-updater's check result so the detection path
+ *  (`checkUpdates`) can compare feed vs running version synchronously; the
+ *  event handlers keep driving the progress stream either way. */
+export async function checkForUpdates(): Promise<{ updateInfo?: { version?: string } } | null> {
+  return await autoUpdater.checkForUpdates()
 }
 
 /**

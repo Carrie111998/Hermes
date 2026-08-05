@@ -397,6 +397,15 @@ export async function applyUpdates(opts: DesktopUpdateApplyOptions = {}): Promis
   try {
     const result = await bridge.apply(opts)
 
+    // electron-updater rung (packaged client + feed): the IPC resolves as
+    // soon as the check starts — download progress and the terminal 'ready'
+    // stage arrive via the progress stream. Do NOT fall through to the
+    // generic ok-branch: that closes/resets the overlay mid-download (the
+    // sweeper-flagged hang). Leave the state to ingestProgress.
+    if (result?.ok && (result as { electronUpdater?: boolean }).electronUpdater) {
+      return result
+    }
+
     // CLI install with no staged updater: not an error — the user just runs
     // `hermes update` themselves. Land on a dedicated manual state so the
     // overlay shows the command + copy button instead of a dead retry loop.
@@ -690,6 +699,26 @@ export function applyBackendUpdate(): Promise<DesktopUpdateApplyResult> {
   return backendUpdateInFlight
 }
 
+/** electron-updater rung: restart into the downloaded release binary. */
+export async function installDownloadedUpdate(): Promise<{ ok: boolean; pendingVersion: string | null }> {
+  const bridge = window.hermesDesktop?.updates
+
+  if (!bridge?.installDownloaded) {
+    return { ok: false, pendingVersion: null }
+  }
+
+  // The app quits into the installer on success; on failure (nothing
+  // downloaded yet) fall back to a fresh check so the UI recovers.
+  const result = await bridge.installDownloaded()
+
+  if (!result.ok) {
+    resetUpdateApplyState()
+    void checkUpdates()
+  }
+
+  return result
+}
+
 function ingestProgress(payload: DesktopUpdateProgress): void {
   const current = $updateApply.get()
   const log = [...current.log, { stage: payload.stage, message: payload.message, at: payload.at }].slice(-50)
@@ -698,7 +727,13 @@ function ingestProgress(payload: DesktopUpdateProgress): void {
     payload.stage === 'error' ||
     payload.stage === 'restart' ||
     payload.stage === 'manual' ||
-    payload.stage === 'guiSkew'
+    payload.stage === 'guiSkew' ||
+    // electron-updater: binary downloaded, waiting for the user's explicit
+    // "restart to update" — a resting state, not an in-flight spinner.
+    payload.stage === 'ready' ||
+    // electron-updater: check finished with no newer version. Without this
+    // the overlay would keep 'applying' forever on an up-to-date client.
+    payload.stage === 'idle'
 
   $updateApply.set({
     applying: !terminal,

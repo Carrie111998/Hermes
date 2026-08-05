@@ -201,7 +201,7 @@ import {
   sandboxPreflight
 } from './update-relaunch'
 import { isOfficialSshRemote, OFFICIAL_REPO_HTTPS_URL } from './update-remote'
-import { resolveUpdateStrategy } from './update-strategy'
+import { resolveUpdateStrategy, usesElectronUpdater } from './update-strategy'
 import { configureElectronUpdater, checkForUpdates, quitAndInstall, pendingUpdateVersion } from './electron-updater-controller'
 import {
   resolveStagedUpdaterBinary,
@@ -2472,10 +2472,60 @@ async function resolveHealedBranch(updateRoot, branch) {
 
 async function checkUpdates() {
   const updateRoot = resolveUpdateRoot()
-  let { branch } = readDesktopUpdateConfig()
+  let { branch, feedUrl } = readDesktopUpdateConfig()
   const gitDir = path.join(updateRoot, '.git')
 
   if (!directoryExists(gitDir)) {
+    // Teknium review (#76248): a packaged client with a configured feed is
+    // NOT unsupported — it is the electron-updater rung of the strategy
+    // ladder. Rejecting here made the overlay render "not available" before
+    // the apply path could ever run, so the new mechanism was unreachable
+    // from the UI. Detection for this rung is a feed query: configure the
+    // updater and let its event stream drive check/download/ready stages.
+    if (
+      usesElectronUpdater({
+        isPackaged: app.isPackaged,
+        feedUrl,
+        hasStagedUpdater: Boolean(resolveUpdaterBinary()),
+        isWindows: IS_WINDOWS
+      })
+    ) {
+      configureElectronUpdater({ feedUrl, onProgress: emitUpdateProgress, log: rememberLog })
+
+      try {
+        const result = await checkForUpdates()
+        const current = app.getVersion()
+        const target = result?.updateInfo?.version || current
+        const updateAvailable = Boolean(target && target !== current)
+
+        return {
+          supported: true,
+          electronUpdater: true,
+          updateAvailable,
+          behind: updateAvailable ? 1 : 0,
+          currentSha: current,
+          targetSha: target,
+          commits: [],
+          dirty: false,
+          hermesRoot: updateRoot,
+          branch,
+          fetchedAt: Date.now(),
+          // A downloaded-and-waiting version survives overlay close/reopen.
+          pendingVersion: pendingUpdateVersion()
+        }
+      } catch (error) {
+        return {
+          supported: true,
+          electronUpdater: true,
+          branch,
+          error: 'fetch-failed',
+          message: error?.message || 'Update feed unreachable.',
+          hermesRoot: updateRoot,
+          fetchedAt: Date.now()
+        }
+      }
+    }
+
     return {
       supported: false,
       reason: 'not-a-git-checkout',
