@@ -1230,6 +1230,62 @@ def test_native_discovery_rejects_anonymous_and_detects_map_race(monkeypatch):
         authority._discover_native_mappings(process, plan)
 
 
+@pytest.mark.parametrize("mode", [0o644, 0o755])
+def test_native_mapping_accepts_root_owned_distribution_modes(monkeypatch, mode):
+    path = Path("/usr/lib/muncho-reviewed.so")
+    observed = SimpleNamespace(
+        st_mode=stat.S_IFREG | mode,
+        st_nlink=1,
+        st_uid=0,
+        st_gid=0,
+        st_size=32,
+    )
+    policy = {
+        "require_single_link": True,
+        "required_owner_uid": 0,
+        "required_owner_gid": 0,
+    }
+    monkeypatch.setattr(authority.os, "lstat", lambda _path: observed)
+    monkeypatch.setattr(
+        authority.os,
+        "listxattr",
+        lambda _path, *, follow_symlinks: [],
+        raising=False,
+    )
+    monkeypatch.setattr(authority, "_trusted_file_sha256", lambda _path: "f" * 64)
+
+    assert authority._hash_native_mapping(path, policy) == {
+        "path": str(path),
+        "sha256": "f" * 64,
+    }
+
+
+@pytest.mark.parametrize("mode", [0o664, 0o646])
+def test_native_mapping_rejects_group_or_other_writable_files(monkeypatch, mode):
+    observed = SimpleNamespace(
+        st_mode=stat.S_IFREG | mode,
+        st_nlink=1,
+        st_uid=0,
+        st_gid=0,
+        st_size=32,
+    )
+    policy = {
+        "require_single_link": True,
+        "required_owner_uid": 0,
+        "required_owner_gid": 0,
+    }
+    monkeypatch.setattr(authority.os, "lstat", lambda _path: observed)
+    monkeypatch.setattr(
+        authority.os,
+        "listxattr",
+        lambda _path, *, follow_symlinks: [],
+        raising=False,
+    )
+
+    with pytest.raises(RuntimeError, match="mapping protection is invalid"):
+        authority._hash_native_mapping(Path("/usr/lib/rejected.so"), policy)
+
+
 def test_native_receipt_wrong_path_fails_before_filesystem_write(monkeypatch):
     receipt = authority.NativeObservationReceipt.from_mapping(_receipt_mapping())
     monkeypatch.setattr(authority, "_require_root_linux", lambda: None)

@@ -4439,7 +4439,11 @@ def _rehash_native_receipt_external_mappings(
                 or before.st_nlink != 1
                 or before.st_uid != policy["required_owner_uid"]
                 or before.st_gid != policy["required_owner_gid"]
-                or mode & 0o222
+                # Root ownership is pinned immediately above.  Preserve the
+                # live-observation contract: root may own writable package
+                # files, while the unprivileged service identities must never
+                # be able to modify them through group/other permissions.
+                or mode & 0o022
                 or _list_xattrs(path)
                 or before.st_size < 1
                 or before.st_size > _MAX_NATIVE_MAPPING_BYTES
