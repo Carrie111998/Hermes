@@ -128,24 +128,20 @@ async def resolve_image_source(
     # path outside the caches never yields the host's bytes.
     host_target = _permitted_host_read_target(p, ctx)
     if host_target is not None and host_target.is_file():
-        # Shared credential-read guard (agent.file_safety, #57698): refuse
-        # secret-bearing files (.env, auth.json, ...) with an intentional,
-        # specific error instead of relying on the magic-byte sniff to
-        # reject them incidentally. Same chokepoint the image-gen/video-gen
-        # provider plugins enforce on model-supplied local paths. Import is
-        # best-effort (guard unavailability must not break image loading);
-        # a real block always propagates.
-        try:
-            from agent.file_safety import raise_if_read_blocked
-        except Exception:  # noqa: BLE001 — guard unavailable: proceed
-            raise_if_read_blocked = None
-        if raise_if_read_blocked is not None:
-            try:
-                raise_if_read_blocked(str(host_target))
-            except ValueError as exc:
-                raise SourceUnsafe(str(exc), src=s, origin="file")
-        data = await asyncio.to_thread(host_target.read_bytes)
-        return _finalize(data, "", "file", s, permitted)
+        return await _read_host_file(host_target, s, permitted)
+    if host_target is not None:
+        # Exact miss on a permitted host read. macOS screenshot filenames
+        # embed U+202F (narrow no-break space) before AM/PM and models
+        # routinely rewrite it to a plain ASCII space when filling tool
+        # args, so the exact path misses even though the file exists next
+        # to it (#76334). Recover the UNIQUE same-directory sibling whose
+        # basename matches after mapping Unicode space separators to ASCII
+        # space; zero or multiple matches refuse (no fuzzy basename
+        # guessing). Never runs for sandbox-routed paths (host_target is
+        # None there), so confinement is unchanged.
+        recovered = _unique_space_normalized_sibling(host_target)
+        if recovered is not None:
+            return await _read_host_file(recovered, s, permitted)
     if _is_local_terminal_backend():
         # Local backend: any path was host-readable, so a miss simply means
         # the file doesn't exist — no sandbox to fall back to.
@@ -154,6 +150,61 @@ async def resolve_image_source(
     # bytes inside the sandbox. Under a sandbox this reads the container's
     # filesystem, never the host's.
     return await _resolve_container_fallback(p, ctx, s, permitted)
+
+
+async def _read_host_file(host_target: Path, src: str, permitted: tuple) -> ResolvedImage:
+    """Credential-guarded host file read shared by the exact path and the
+    Unicode-space sibling recovery path."""
+    # Shared credential-read guard (agent.file_safety, #57698): refuse
+    # secret-bearing files (.env, auth.json, ...) with an intentional,
+    # specific error instead of relying on the magic-byte sniff to
+    # reject them incidentally. Same chokepoint the image-gen/video-gen
+    # provider plugins enforce on model-supplied local paths. Import is
+    # best-effort (guard unavailability must not break image loading);
+    # a real block always propagates.
+    try:
+        from agent.file_safety import raise_if_read_blocked
+    except Exception:  # noqa: BLE001 — guard unavailable: proceed
+        raise_if_read_blocked = None
+    if raise_if_read_blocked is not None:
+        try:
+            raise_if_read_blocked(str(host_target))
+        except ValueError as exc:
+            raise SourceUnsafe(str(exc), src=src, origin="file")
+    data = await asyncio.to_thread(host_target.read_bytes)
+    return _finalize(data, "", "file", src, permitted)
+
+
+def _unique_space_normalized_sibling(p: Path) -> Optional[Path]:
+    """Return the unique sibling of ``p`` whose basename matches after mapping
+    Unicode space separators to ASCII space, else ``None``.
+
+    Exact-miss recovery only (#76334): macOS screenshot names use U+202F
+    (narrow no-break space) before AM/PM, and models commonly normalize it to
+    a plain ASCII space when filling ``image_url``, so ``p`` misses even though
+    the file exists next to it. Scoped to the same parent directory; refuses
+    (returns ``None``) when zero or more than one sibling match — no fuzzy
+    basename guessing. The space set stays aligned with
+    ``tools.fuzzy_match.UNICODE_MAP``, and both directions are covered: a
+    requested name may hold the Unicode space while the real file uses ASCII,
+    or vice versa.
+    """
+    from tools.fuzzy_match import UNICODE_MAP
+
+    def _norm(name: str) -> str:
+        for ch, repl in UNICODE_MAP.items():
+            name = name.replace(ch, repl)
+        return name
+
+    wanted = _norm(p.name)
+    try:
+        entries = list(p.parent.iterdir())
+    except OSError:
+        return None
+    matches = [e for e in entries if e.is_file() and _norm(e.name) == wanted]
+    if len(matches) != 1:
+        return None
+    return matches[0]
 
 
 def _resolve_data_url(s: str) -> tuple[bytes, str]:

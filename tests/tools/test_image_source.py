@@ -270,3 +270,71 @@ class TestSvgNormalization:
             path, mime, err = vt._normalize_to_supported_image(svg, "image/svg+xml")
         assert path is None
         assert "rasterizer" in err
+
+
+class TestUnicodeSpaceSiblingRecovery:
+    """#76334: macOS screenshot names embed U+202F (narrow no-break space)
+    before AM/PM and models routinely rewrite it to ASCII space when filling
+    image_url. On exact miss the resolver recovers the UNIQUE same-directory
+    sibling whose basename matches after mapping Unicode space separators to
+    ASCII space; zero or multiple matches refuse (no fuzzy basename guessing).
+    """
+
+    @pytest.mark.asyncio
+    async def test_recovers_unique_u202f_sibling_on_exact_miss(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        real = tmp_path / "Screenshot 2026-08-01 at 10.30.00\u202fPM.png"
+        real.write_bytes(PNG)
+        # Model rewrote U+202F as a plain ASCII space.
+        requested = tmp_path / "Screenshot 2026-08-01 at 10.30.00 PM.png"
+        res = await isrc.resolve_image_source(str(requested), isrc.ResolveContext())
+        assert res.data == PNG
+        assert res.origin == "file"
+
+    @pytest.mark.asyncio
+    async def test_refuses_ambiguous_multi_match(self, tmp_path, monkeypatch):
+        """Two siblings normalizing to the same name -> refuse, no guessing."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (tmp_path / "Screenshot 2026-08-01 at 10.30.00\u202fPM.png").write_bytes(PNG)
+        (tmp_path / "Screenshot 2026-08-01 at 10.30.00\u00a0PM.png").write_bytes(PNG)
+        requested = tmp_path / "Screenshot 2026-08-01 at 10.30.00 PM.png"
+        with pytest.raises(isrc.SourceNotFound):
+            await isrc.resolve_image_source(str(requested), isrc.ResolveContext())
+
+    @pytest.mark.asyncio
+    async def test_no_matching_sibling_still_raises(self, tmp_path, monkeypatch):
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        (tmp_path / "unrelated.png").write_bytes(PNG)
+        requested = tmp_path / "Screenshot 2026-08-01 at 10.30.00 PM.png"
+        with pytest.raises(isrc.SourceNotFound):
+            await isrc.resolve_image_source(str(requested), isrc.ResolveContext())
+
+    @pytest.mark.asyncio
+    async def test_exact_path_wins_over_sibling(self, tmp_path, monkeypatch):
+        """When the exact path exists (U+202F preserved), no recovery runs —
+        an ASCII-space sibling with different bytes must not shadow it."""
+        isrc = _reload(monkeypatch, tmp_path / "hermes")
+        monkeypatch.setenv("TERMINAL_ENV", "local")
+        exact = tmp_path / "Screenshot 2026-08-01 at 10.30.00\u202fPM.png"
+        exact.write_bytes(PNG)
+        (tmp_path / "Screenshot 2026-08-01 at 10.30.00 PM.png").write_bytes(b"x" * 16)
+        res = await isrc.resolve_image_source(str(exact), isrc.ResolveContext())
+        assert res.data == PNG
+
+    @pytest.mark.asyncio
+    async def test_recovery_applies_to_permitted_cache_host_read(self, tmp_path, monkeypatch):
+        """Non-local backend: recovery works for permitted host reads (media
+        cache paths) and never scans host dirs outside the caches."""
+        home = tmp_path / "hermes"
+        isrc = _reload(monkeypatch, home)
+        monkeypatch.setenv("TERMINAL_ENV", "docker")
+        real = home / "cache" / "images" / "Screenshot 2026-08-01 at 10.30.00\u202fPM.png"
+        real.parent.mkdir(parents=True)
+        real.write_bytes(PNG)
+        requested = home / "cache" / "images" / "Screenshot 2026-08-01 at 10.30.00 PM.png"
+        res = await isrc.resolve_image_source(str(requested), isrc.ResolveContext())
+        assert res.data == PNG
+        assert res.origin == "file"
