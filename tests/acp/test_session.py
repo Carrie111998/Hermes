@@ -255,6 +255,32 @@ class TestPersistence:
         assert state.session_id in session_ids
 
 
+    def test_persist_heals_named_custom_provider_identity(self, manager, monkeypatch):
+        """Write-path metadata must retain the routable custom provider name."""
+        endpoint = "https://ark.example.invalid/v1"
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.load_config",
+            lambda: {
+                "model": {"default": "ark-code-latest", "provider": "custom:ark"},
+                "providers": {
+                    "ark": {
+                        "base_url": endpoint,
+                        "model": "ark-code-latest",
+                    }
+                },
+            },
+        )
+
+        state = manager.create_session()
+        state.model = "ark-code-latest"
+        state.agent.provider = "custom"
+        state.agent.base_url = endpoint
+
+        manager.save_session(state.session_id)
+
+        row = manager._get_db().get_session(state.session_id)
+        assert json.loads(row["model_config"])["provider"] == "custom:ark"
+
     def test_assistant_reasoning_fields_persisted(self, manager):
         """ACP session restore should preserve assistant reasoning context."""
         state = manager.create_session()

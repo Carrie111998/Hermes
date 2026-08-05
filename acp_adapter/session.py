@@ -426,7 +426,18 @@ class SessionManager:
         base_url = getattr(state.agent, "base_url", None)
         api_mode = getattr(state.agent, "api_mode", None)
         if isinstance(provider, str) and provider.strip():
-            session_meta["provider"] = provider.strip()
+            persisted_provider = provider.strip()
+            if persisted_provider == "custom":
+                try:
+                    from hermes_cli.runtime_provider import canonical_custom_identity
+
+                    persisted_provider = canonical_custom_identity(
+                        base_url=base_url if isinstance(base_url, str) else None,
+                        model=model_str,
+                    ) or persisted_provider
+                except Exception:
+                    logger.debug("Failed to recover ACP custom provider identity", exc_info=True)
+            session_meta["provider"] = persisted_provider
         if isinstance(base_url, str) and base_url.strip():
             session_meta["base_url"] = base_url.strip()
         if isinstance(api_mode, str) and api_mode.strip():
