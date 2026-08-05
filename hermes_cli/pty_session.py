@@ -51,6 +51,8 @@ class PtySession:
         self._read_timeout = read_timeout
         self._ws = None
         self._drain_task: Optional[asyncio.Task] = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._closing = False
 
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
@@ -80,18 +82,21 @@ class PtySession:
                     pass                             # detached mid-send; keep buffering
 
     async def attach(self, ws) -> None:
-        old = self._ws
-        if old is not None and old is not ws:
-            try:
-                await old.close(code=WS_CLOSE_SUPERSEDED)
-            except Exception:
-                pass
-        self._ws = ws
-        self.attached = True
-        self.last_detached_at = None
-        snap = self.buffer.snapshot()
-        if snap:
-            await ws.send_bytes(snap)
+        async with self._lifecycle_lock:
+            if self._closing:
+                raise SessionTerminated(self.key)
+            old = self._ws
+            if old is not None and old is not ws:
+                try:
+                    await old.close(code=WS_CLOSE_SUPERSEDED)
+                except Exception:
+                    pass
+            self._ws = ws
+            self.attached = True
+            self.last_detached_at = None
+            snap = self.buffer.snapshot()
+            if snap:
+                await ws.send_bytes(snap)
 
     def detach(self, ws) -> None:
         # Only the currently-attached socket may mark the session detached.
@@ -106,10 +111,14 @@ class PtySession:
         self.last_detached_at = time.monotonic()
 
     async def close(self) -> None:
-        self.alive = False
-        ws = self._ws
-        self._ws = None
-        self.attached = False
+        async with self._lifecycle_lock:
+            if self._closing:
+                return
+            self._closing = True
+            self.alive = False
+            ws = self._ws
+            self._ws = None
+            self.attached = False
         if ws is not None:
             try:
                 await ws.close(code=WS_CLOSE_TERMINATED)
@@ -156,6 +165,7 @@ class PtySessionRegistry:
         self._sessions: Dict[str, PtySession] = {}
         self._pending: Dict[str, asyncio.Task[PtySession]] = {}
         self._generations: Dict[str, int] = {}
+        self._terminated_tokens: set[str] = set()
         self._lock = asyncio.Lock()
 
     @staticmethod
@@ -180,6 +190,8 @@ class PtySessionRegistry:
             await session.start()
             async with self._lock:
                 terminated = (
+                    self._base_token(key) in self._terminated_tokens
+                    or
                     self._generations.get(self._base_token(key), 0) != generation
                 )
                 if not terminated:
@@ -199,6 +211,8 @@ class PtySessionRegistry:
         await self.reap_idle()
         to_close: list[PtySession] = []
         async with self._lock:
+            if self._base_token(key) in self._terminated_tokens:
+                raise SessionTerminated(key)
             existing = self._sessions.get(key)
             if existing is not None and existing.alive:
                 return existing, False
@@ -232,6 +246,7 @@ class PtySessionRegistry:
         """Close every direct/profile/resume session owned by an attach token."""
         qualified_prefix = f"{token}\0"
         async with self._lock:
+            self._terminated_tokens.add(token)
             self._generations[token] = self._generations.get(token, 0) + 1
             keys = [
                 key
@@ -273,6 +288,7 @@ class PtySessionRegistry:
         async with self._lock:
             for key in self._pending:
                 token = self._base_token(key)
+                self._terminated_tokens.add(token)
                 self._generations[token] = self._generations.get(token, 0) + 1
             sessions = list(self._sessions.values())
             self._sessions.clear()

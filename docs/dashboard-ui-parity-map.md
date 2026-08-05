@@ -122,6 +122,6 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 - Browser console errors: 0
 - Desktop viewport: 1440×1000
 - Responsive navigation checks: 390×844, 1024×800, and 1280×800
-- Frontend tests after Chat tabs and mobile/responsive remediation: 214/214
+- Frontend tests after Chat tabs and mobile/responsive remediation: 218/218
 - Dynamic plugin routes discovered from rendered navigation: 2
 - Raw sanitized crawl artifact (local, not committed): `/Users/aibot/.hermes/designs/hermes-dashboard-live-inventory.json`

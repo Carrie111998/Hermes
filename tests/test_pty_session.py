@@ -175,6 +175,72 @@ async def test_termination_wins_over_in_flight_spawn():
 
 
 @pytest.mark.asyncio
+async def test_terminated_published_session_rejects_late_attach():
+    reg = make_registry()
+    bridge = FakeBridge([b""])
+    session, _ = await reg.attach_or_spawn("token", spawn=lambda: bridge)
+
+    assert await reg.terminate_attach_token("token") == 1
+
+    ws = FakeWS()
+    with pytest.raises(SessionTerminated):
+        await session.attach(ws)
+    assert session.alive is False
+    assert session.attached is False
+    assert ws.sent == []
+
+
+@pytest.mark.asyncio
+async def test_termination_waits_for_in_progress_attach_then_closes_socket():
+    reg = make_registry()
+    session, _ = await reg.attach_or_spawn(
+        "token", spawn=lambda: FakeBridge([b"buffered"])
+    )
+    await asyncio.sleep(0.02)
+    send_started = asyncio.Event()
+    release_send = asyncio.Event()
+
+    class BlockingWS(FakeWS):
+        async def send_bytes(self, data):
+            send_started.set()
+            await release_send.wait()
+            await super().send_bytes(data)
+
+    ws = BlockingWS()
+    attach_task = asyncio.create_task(session.attach(ws))
+    await send_started.wait()
+    terminate_task = asyncio.create_task(reg.terminate_attach_token("token"))
+    await asyncio.sleep(0)
+    assert terminate_task.done() is False
+
+    release_send.set()
+    await attach_task
+    assert await terminate_task == 1
+    assert ws.close_code == 4411
+    assert session.attached is False
+
+
+@pytest.mark.asyncio
+async def test_terminated_token_rejects_late_replacement_spawn():
+    reg = make_registry()
+
+    assert await reg.terminate_attach_token("token") == 0
+
+    spawned = False
+
+    def spawn():
+        nonlocal spawned
+        spawned = True
+        return FakeBridge([b""])
+
+    with pytest.raises(SessionTerminated):
+        await reg.attach_or_spawn("token\0profile\0resume", spawn=spawn)
+    assert spawned is False
+    assert not reg._sessions
+    assert not reg._pending
+
+
+@pytest.mark.asyncio
 async def test_terminate_attach_token_closes_all_qualified_sessions():
     reg = make_registry()
     direct_bridge = FakeBridge([b""])

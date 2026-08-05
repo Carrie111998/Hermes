@@ -45,8 +45,7 @@ export function setChatTabResume(
       return tab;
     }
     changed = true;
-    const { resumeSessionId: _old, ...rest } = tab;
-    return resumeSessionId ? { ...rest, resumeSessionId } : rest;
+    return resumeSessionId ? { ...tab, resumeSessionId } : { id: tab.id };
   });
   return changed ? { ...state, tabs } : state;
 }

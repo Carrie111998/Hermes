@@ -155,6 +155,25 @@ describe("ChatWorkspace", () => {
     expect(document.activeElement).toBe(tabs()[1]);
   });
 
+  it("keeps inactive close buttons out of the tab order without stealing focus", async () => {
+    await renderWorkspace();
+    await act(async () => click(container.querySelector('[aria-label="New chat tab"]')));
+    await act(async () => click(container.querySelector('[aria-label="New chat tab"]')));
+    const firstTab = container.querySelector<HTMLElement>('[role="tab"]');
+    await act(async () => click(firstTab));
+    firstTab?.focus();
+    const inactiveClose = container.querySelector<HTMLElement>(
+      '[aria-label="Close Chat 2"]',
+    );
+
+    expect(inactiveClose?.tabIndex).toBe(-1);
+    await act(async () => click(inactiveClose));
+
+    expect(container.querySelectorAll('[role="tab"]')).toHaveLength(2);
+    expect(firstTab?.getAttribute("aria-selected")).toBe("true");
+    expect(document.activeElement).toBe(firstTab);
+  });
+
   it("retains the attach token when termination retries fail", async () => {
     vi.useFakeTimers();
     const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);

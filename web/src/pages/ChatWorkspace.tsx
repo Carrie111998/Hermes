@@ -155,11 +155,13 @@ export default function ChatWorkspace({ isActive = true }: { isActive?: boolean 
     });
     const token = readChatPtyToken(id);
     if (token) terminateTabPty(id, token);
-    document
-      .querySelector<HTMLElement>(
-        `[role="tab"][data-tab-id="${nextState.activeId}"]`,
-      )
-      ?.focus();
+    if (state.activeId === id) {
+      document
+        .querySelector<HTMLElement>(
+          `[role="tab"][data-tab-id="${nextState.activeId}"]`,
+        )
+        ?.focus();
+    }
   }, [state, terminateTabPty, writeActiveResumeToUrl]);
 
   const updateTabResume = useCallback(
@@ -234,9 +236,11 @@ export default function ChatWorkspace({ isActive = true }: { isActive?: boolean 
                 <button
                   type="button"
                   aria-label={`Close ${label}`}
+                  tabIndex={-1}
                   disabled={state.tabs.length === 1}
                   className="grid size-6 shrink-0 place-items-center rounded-md opacity-70 outline-none hover:bg-muted-foreground/15 hover:opacity-100 focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-25"
                   onClick={() => closeTab(tab.id)}
+                  onMouseDown={(event) => event.preventDefault()}
                 >
                   <X className="size-3.5" aria-hidden="true" />
                 </button>
