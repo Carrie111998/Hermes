@@ -2715,7 +2715,8 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             prefix_words += 1
             continue
         return word_start
-    return current
+    word_start, word_end, _ = _read_shell_word(command, current)
+    return word_start if word_start < word_end else current
 
 
 def _mark_unwrapped_executables(command: str) -> str:

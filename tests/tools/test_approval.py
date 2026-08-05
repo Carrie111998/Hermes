@@ -1004,6 +1004,10 @@ class TestAnsiCQuotingBypass:
         safe = ("command " * 13) + "printf safe"
 
         assert detect_hardline_command(safe_at_limit) == (False, None)
+        assert detect_hardline_command(("exec " * 12) + "printf safe") == (False, None)
+        assert detect_hardline_command(("sudo " * 12) + "printf safe") == (False, None)
+        assert detect_hardline_command(("env -i " * 6) + "printf safe") == (False, None)
+        assert detect_hardline_command(("env -u HOME " * 4) + "printf safe") == (False, None)
         is_hardline, desc = detect_hardline_command(dangerous_at_limit)
         assert is_hardline is True
         assert "parser limit" not in desc
