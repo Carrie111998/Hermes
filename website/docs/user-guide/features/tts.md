@@ -263,7 +263,8 @@ Credentials come from your shell environment (`VOLCENGINE_APP_ID` / `VOLCENGINE_
 #### Example: Kesha Voice Kit (local TTS)
 
 [Kesha Voice Kit](https://github.com/drakulavich/kesha-voice-kit) is a local-first
-voice toolkit with command-line TTS via Kokoro, Vosk-TTS, and macOS system voices.
+voice toolkit with command-line TTS in 9 languages via Kokoro, Vosk-TTS, and macOS
+system voices.
 Install it once, then point a Hermes command provider at `kesha say`:
 
 ```bash
