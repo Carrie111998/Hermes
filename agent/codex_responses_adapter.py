@@ -30,6 +30,7 @@ def _classify_responses_issuer(
     is_xai_responses: bool = False,
     is_github_responses: bool = False,
     is_codex_backend: bool = False,
+    is_deepseek_responses: bool = False,
     base_url: Optional[str] = None,
 ) -> str:
     """Stable identifier for the Responses endpoint that mints encrypted_content.
@@ -47,6 +48,8 @@ def _classify_responses_issuer(
         return "github_responses"
     if is_codex_backend:
         return "codex_backend"
+    if is_deepseek_responses:
+        return "deepseek_responses"
     if base_url:
         return f"other:{base_url}"
     return "other"

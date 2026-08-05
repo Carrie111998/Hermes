@@ -134,6 +134,11 @@ HERMES_OVERLAYS: Dict[str, HermesOverlay] = {
         transport="openai_chat",
         base_url_env_var="DEEPSEEK_BASE_URL",
     ),
+    "deepseek-responses": HermesOverlay(
+        transport="codex_responses",
+        base_url_override="https://api.deepseek.com",
+        base_url_env_var="DEEPSEEK_RESPONSES_BASE_URL",
+    ),
     "alibaba": HermesOverlay(
         transport="openai_chat",
         base_url_env_var="DASHSCOPE_BASE_URL",

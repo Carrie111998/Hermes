@@ -363,6 +363,73 @@ class TestCodexBuildKwargs:
         assert "web_search" not in names
         assert "hermes_web_search" not in names
 
+    def test_deepseek_injects_native_web_search_when_client_web_search_present(self, transport):
+        """DeepSeek's /responses surface (deepseek-v4-flash) runs a
+        server-side ``web_search`` built-in. When the client web toolset is
+        enabled, swap the client ``web_search`` function 1:1 for the native
+        built-in so the search executes server-side (verified live 2026-08).
+        Non-conflicting client tools are preserved.
+        """
+        messages = [{"role": "user", "content": "Find current prices."}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash", messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+            ],
+            is_deepseek_responses=True,
+        )
+        tool_types = [t.get("type") for t in kw.get("tools", [])]
+        assert "web_search" in tool_types, kw.get("tools")
+        names = [t.get("name") for t in kw.get("tools", []) if t.get("type") == "function"]
+        assert "read_file" in names
+        assert "web_search" not in names
+        assert "hermes_web_search" not in names
+
+    def test_deepseek_hostname_detection_injects_native_web_search(self, transport):
+        """Hostname fallback: an api.deepseek.com base_url without an explicit
+        is_deepseek_responses flag still routes to the native web_search swap.
+        """
+        messages = [{"role": "user", "content": "Find current prices."}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash", messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object",
+                                   "properties": {"query": {"type": "string"}}}}},
+            ],
+            base_url="https://api.deepseek.com",
+        )
+        tool_types = [t.get("type") for t in kw.get("tools", [])]
+        assert "web_search" in tool_types, kw.get("tools")
+        # DeepSeek's /responses surface has no prompt_cache_key; skip it so
+        # unsupported-param noise stays out of the request.
+        assert "prompt_cache_key" not in kw, kw.keys()
+
+    def test_deepseek_does_not_inject_native_web_search_without_client_web_search(self, transport):
+        """The native ``web_search`` built-in is a 1:1 swap for an
+        already-requested client ``web_search`` — NOT an additive grant.
+        """
+        messages = [{"role": "user", "content": "Say hi."}]
+        kw = transport.build_kwargs(
+            model="deepseek-v4-flash", messages=messages,
+            tools=[
+                {"type": "function", "function": {
+                    "name": "read_file", "description": "Read a file.",
+                    "parameters": {"type": "object",
+                                   "properties": {"path": {"type": "string"}}}}},
+            ],
+            is_deepseek_responses=True,
+        )
+        assert not any(t.get("type") == "web_search" for t in kw.get("tools", [])), kw.get("tools")
+
     def test_xai_renames_client_web_search_when_firecrawl_configured(self, transport, monkeypatch):
         """Configured Firecrawl (or any non-xai backend) must keep Hermes
         dispatch — rename the wire tool so Grok cannot hijack ``web_search``.
