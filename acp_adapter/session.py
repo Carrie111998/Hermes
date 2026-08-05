@@ -605,20 +605,6 @@ class SessionManager:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         config = load_config()
-
-        # Register shell hooks so pre/post_tool_call hooks are wired into the
-        # plugin manager before the agent is created.  Uses accept_hooks=False
-        # so register_from_config resolves consent from HERMES_ACCEPT_HOOKS and
-        # hooks_auto_accept in config, matching every other entry point.
-        try:
-            from agent.shell_hooks import register_from_config
-            register_from_config(config, accept_hooks=False)
-        except Exception:
-            logger.debug(
-                "shell-hook registration failed at ACP agent startup",
-                exc_info=True,
-            )
-
         model_cfg = config.get("model")
         default_model = ""
         config_provider = None
