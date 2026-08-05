@@ -510,6 +510,7 @@ def test_runtime_main_sync_happens_after_restore():
             "api_mode": "anthropic_messages",
             "auth_mode": "",
             "requested_provider": "anthropic",
+            "session_id": "sess-1",
         },
     )]
 
