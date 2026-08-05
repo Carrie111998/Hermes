@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Optional
+from typing import Callable, Dict, Optional, Tuple
 
 WS_CLOSE_PROCESS_EXITED = 4410
 WS_CLOSE_SUPERSEDED = 4409
+WS_CLOSE_TERMINATED = 4411
 
 
 class RingBuffer:
@@ -105,6 +106,15 @@ class PtySession:
         self.last_detached_at = time.monotonic()
 
     async def close(self) -> None:
+        self.alive = False
+        ws = self._ws
+        self._ws = None
+        self.attached = False
+        if ws is not None:
+            try:
+                await ws.close(code=WS_CLOSE_TERMINATED)
+            except Exception:
+                pass
         if self._drain_task is not None:
             self._drain_task.cancel()
             try:
@@ -118,12 +128,12 @@ class PtySession:
         except Exception:
             pass
 
-
-from typing import Callable, Dict, Tuple
-
-
 class RegistryFull(Exception):
     pass
+
+
+class SessionTerminated(Exception):
+    """An attach was explicitly terminated while its PTY was spawning."""
 
 
 async def run_reaper(registry: "PtySessionRegistry", *, interval: float = 60.0) -> None:
@@ -144,52 +154,127 @@ class PtySessionRegistry:
         self._buffer_cap = buffer_cap
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
+        self._pending: Dict[str, asyncio.Task[PtySession]] = {}
+        self._generations: Dict[str, int] = {}
+        self._lock = asyncio.Lock()
+
+    @staticmethod
+    def _base_token(key: str) -> str:
+        return key.split("\0", 1)[0]
+
+    async def _spawn_and_register(
+        self,
+        key: str,
+        generation: int,
+        spawn: Callable[[], object],
+    ) -> PtySession:
+        session: Optional[PtySession] = None
+        try:
+            bridge = await asyncio.to_thread(spawn)
+            session = PtySession(
+                key,
+                bridge,
+                buffer_cap=self._buffer_cap,
+                read_timeout=self._read_timeout,
+            )
+            await session.start()
+            async with self._lock:
+                terminated = (
+                    self._generations.get(self._base_token(key), 0) != generation
+                )
+                if not terminated:
+                    self._sessions[key] = session
+            if terminated:
+                await session.close()
+                raise SessionTerminated(key)
+            return session
+        finally:
+            current = asyncio.current_task()
+            async with self._lock:
+                if self._pending.get(key) is current:
+                    self._pending.pop(key, None)
 
     async def attach_or_spawn(self, key: str, *, spawn: Callable[[], object]
                               ) -> Tuple[PtySession, bool]:
         await self.reap_idle()
-        existing = self._sessions.get(key)
-        if existing is not None and existing.alive:
-            return existing, False
-        if existing is not None:                       # dead remnant
-            await existing.close()
-            self._sessions.pop(key, None)
-        if len(self._sessions) >= self._max:
-            self._reap_one_idle_or_raise()
-        # PTY spawn does blocking fork/exec work — keep it off the event
-        # loop (#53227).
-        bridge = await asyncio.to_thread(spawn)
-        session = PtySession(key, bridge, buffer_cap=self._buffer_cap,
-                             read_timeout=self._read_timeout)
-        await session.start()
-        self._sessions[key] = session
-        return session, True
+        to_close: list[PtySession] = []
+        async with self._lock:
+            existing = self._sessions.get(key)
+            if existing is not None and existing.alive:
+                return existing, False
+            if existing is not None:                   # dead remnant
+                self._sessions.pop(key, None)
+                to_close.append(existing)
+
+            task = self._pending.get(key)
+            created = task is None
+            if task is None:
+                if len(self._sessions) + len(self._pending) >= self._max:
+                    to_close.append(self._reap_one_idle_or_raise())
+                generation = self._generations.get(self._base_token(key), 0)
+                task = asyncio.create_task(
+                    self._spawn_and_register(key, generation, spawn)
+                )
+                self._pending[key] = task
+
+        for session in to_close:
+            await session.close()
+        # A disconnected creator must not cancel a spawn that another attach
+        # is already awaiting. Explicit termination uses the generation check.
+        return await asyncio.shield(task), created
 
     def detach(self, key: str, ws) -> None:
         s = self._sessions.get(key)
         if s is not None:
             s.detach(ws)
 
+    async def terminate_attach_token(self, token: str) -> int:
+        """Close every direct/profile/resume session owned by an attach token."""
+        qualified_prefix = f"{token}\0"
+        async with self._lock:
+            self._generations[token] = self._generations.get(token, 0) + 1
+            keys = [
+                key
+                for key in self._sessions
+                if key == token or key.startswith(qualified_prefix)
+            ]
+            pending_count = sum(
+                key == token or key.startswith(qualified_prefix)
+                for key in self._pending
+            )
+            sessions = [self._sessions.pop(key) for key in keys]
+        for session in sessions:
+            await session.close()
+        return len(sessions) + pending_count
+
     async def reap_idle(self, now: Optional[float] = None) -> None:
         now = time.monotonic() if now is None else now
-        doomed = [
-            key for key, s in self._sessions.items()
-            if (not s.alive)
-            or (not s.attached and s.last_detached_at is not None
-                and (now - s.last_detached_at) > self._ttl)
-        ]
-        for key in doomed:
-            await self._sessions.pop(key).close()
+        async with self._lock:
+            doomed = [
+                key for key, s in self._sessions.items()
+                if (not s.alive)
+                or (not s.attached and s.last_detached_at is not None
+                    and (now - s.last_detached_at) > self._ttl)
+            ]
+            sessions = [self._sessions.pop(key) for key in doomed]
+        for session in sessions:
+            await session.close()
 
-    def _reap_one_idle_or_raise(self) -> None:
+    def _reap_one_idle_or_raise(self) -> PtySession:
         idle = [s for s in self._sessions.values()
                 if not s.attached and s.last_detached_at is not None]
         if not idle:
             raise RegistryFull()
         oldest = min(idle, key=lambda s: s.last_detached_at or 0.0)
         self._sessions.pop(oldest.key, None)
-        asyncio.create_task(oldest.close())
+        return oldest
 
     async def close_all(self) -> None:
-        for key in list(self._sessions):
-            await self._sessions.pop(key).close()
+        async with self._lock:
+            for key in self._pending:
+                token = self._base_token(key)
+                self._generations[token] = self._generations.get(token, 0) + 1
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            await session.close()

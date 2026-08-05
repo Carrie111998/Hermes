@@ -1,4 +1,5 @@
 import asyncio
+import threading
 import time
 
 import pytest
@@ -92,7 +93,11 @@ async def test_eof_marks_dead_and_closes_socket_4410():
     await s.close()
 
 
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull
+from hermes_cli.pty_session import (
+    PtySessionRegistry,
+    RegistryFull,
+    SessionTerminated,
+)
 
 
 def make_registry(ttl=1800.0, max_sessions=16):
@@ -109,6 +114,86 @@ async def test_same_key_reattaches_same_session():
     assert created1 is True and created2 is False
     assert s1 is s2
     assert s2.bridge is b1                     # second spawn callable was NOT used
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_same_key_attaches_share_one_spawn():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    bridges = []
+
+    def blocked_spawn():
+        bridge = FakeBridge([b""])
+        bridges.append(bridge)
+        spawn_started.set()
+        assert release_spawn.wait(timeout=2)
+        return bridge
+
+    first = asyncio.create_task(reg.attach_or_spawn("token", spawn=blocked_spawn))
+    assert await asyncio.to_thread(spawn_started.wait, 2)
+    second = asyncio.create_task(
+        reg.attach_or_spawn("token", spawn=lambda: FakeBridge([b""]))
+    )
+    release_spawn.set()
+
+    (first_session, first_created), (second_session, second_created) = (
+        await asyncio.gather(first, second)
+    )
+    assert len(bridges) == 1
+    assert first_session is second_session
+    assert sorted((first_created, second_created)) == [False, True]
+    await reg.close_all()
+
+
+@pytest.mark.asyncio
+async def test_termination_wins_over_in_flight_spawn():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    bridge = FakeBridge([b""])
+
+    def blocked_spawn():
+        spawn_started.set()
+        assert release_spawn.wait(timeout=2)
+        return bridge
+
+    attach = asyncio.create_task(
+        reg.attach_or_spawn("token\0profile\0resume", spawn=blocked_spawn)
+    )
+    assert await asyncio.to_thread(spawn_started.wait, 2)
+
+    assert await reg.terminate_attach_token("token") == 1
+    release_spawn.set()
+
+    with pytest.raises(SessionTerminated):
+        await attach
+    assert bridge.closed is True
+    assert not reg._sessions
+    assert not reg._pending
+
+
+@pytest.mark.asyncio
+async def test_terminate_attach_token_closes_all_qualified_sessions():
+    reg = make_registry()
+    direct_bridge = FakeBridge([b""])
+    scoped_bridge = FakeBridge([b""])
+    other_bridge = FakeBridge([b""])
+    await reg.attach_or_spawn("token-a", spawn=lambda: direct_bridge)
+    await reg.attach_or_spawn(
+        "token-a\0profile\0resume",
+        spawn=lambda: scoped_bridge,
+    )
+    await reg.attach_or_spawn("token-b", spawn=lambda: other_bridge)
+
+    terminated = await reg.terminate_attach_token("token-a")
+
+    assert terminated == 2
+    assert direct_bridge.closed is True
+    assert scoped_bridge.closed is True
+    assert other_bridge.closed is False
+    assert set(reg._sessions) == {"token-b"}
     await reg.close_all()
 
 

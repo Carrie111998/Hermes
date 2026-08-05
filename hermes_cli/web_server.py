@@ -14493,7 +14493,12 @@ _PTY_READ_CHUNK_TIMEOUT = 0.2
 
 # Keep-alive PTY sessions: a terminal connecting with ``?attach=<token>`` is
 # bound to a process that survives disconnect/refresh and is reattachable.
-from hermes_cli.pty_session import PtySessionRegistry, RegistryFull, run_reaper  # noqa: E402
+from hermes_cli.pty_session import (  # noqa: E402
+    PtySessionRegistry,
+    RegistryFull,
+    SessionTerminated,
+    run_reaper,
+)
 
 PTY_REGISTRY = PtySessionRegistry(
     ttl=30 * 60,
@@ -15711,6 +15716,26 @@ async def console_ws(ws: WebSocket) -> None:
                 pass
 
 
+class PtyTerminateRequest(BaseModel):
+    attach_token: str
+
+    @field_validator("attach_token")
+    @classmethod
+    def validate_attach_token(cls, value: str) -> str:
+        if re.fullmatch(r"[0-9a-f]{32}", value) is None:
+            raise ValueError("invalid PTY attach token")
+        return value
+
+
+@app.post("/api/pty/terminate")
+async def terminate_pty(body: PtyTerminateRequest):
+    """Terminate keep-alive PTYs owned by one browser chat tab."""
+    if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        raise HTTPException(status_code=404, detail="Embedded chat disabled")
+    terminated = await PTY_REGISTRY.terminate_attach_token(body.attach_token)
+    return {"ok": True, "terminated": terminated}
+
+
 @app.websocket("/api/pty")
 async def pty_ws(ws: WebSocket) -> None:
     peer = ws.client.host if ws.client else "?"
@@ -15838,6 +15863,12 @@ async def pty_ws(ws: WebSocket) -> None:
         session, _created = await PTY_REGISTRY.attach_or_spawn(
             attach_token, spawn=_spawn
         )
+    except SessionTerminated:
+        try:
+            await ws.close(code=4411, reason="chat tab closed")
+        except Exception:
+            pass
+        return
     except PtyUnavailableError as exc:
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
         await ws.close(code=1011)

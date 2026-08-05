@@ -61,7 +61,7 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 | Route | Navigation state | Visible fields/actions in default live state | Page-specific live API paths | Canonical MCP page |
 |---|---|---|---|---|
 | `/sessions` | Primary; Workspace; no context rail | Source tabs (Chats/Automation/All), source filter, Overview/History, prune, import, session list actions | `/api/sessions`, `/api/sessions/stats`, `/api/sessions/empty/count` | Yes |
-| `/chat` | Primary when embedded chat is enabled; Workspace; no context rail | Persistent xterm chat, model/tools inspector, copy last response; image paste/upload and PTY controls are runtime-driven | `/api/model/info`, `/api/sessions`, PTY WebSocket | Yes |
+| `/chat` | Primary when embedded chat is enabled; Workspace; no context rail | Browser-style session tabs with independently persistent xterm chats, model/tools inspector, copy last response; image paste/upload and PTY controls are runtime-driven | `/api/model/info`, `/api/sessions`, PTY WebSocket, `/api/pty/terminate` | Yes |
 | `/files` | Primary; Workspace; no context rail | Path, Go, refresh, upload, create folder, open/download/delete entries, preview/editor dialogs | `/api/files` plus read/upload/mkdir/delete actions | Yes |
 | `/analytics` | Conditional primary item (`showTokenAnalytics`); Workspace | Hidden-state explanation when token analytics are unavailable; analytics filters/charts when supported | Provider/session analytics hooks | Yes, but availability is not expressed |
 | `/models` | Primary; Manage context | Time range, refresh, provider/model cards, Configure, Change, Use as, auxiliary/MoA assignment controls | `/api/model/moa`, `/api/analytics/models`, `/api/model/auxiliary` | Yes |
@@ -106,6 +106,7 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 6. **Plugin routes were visible but absent from canonical discovery/context.** Active plugin tabs now use validated paths, deterministic `plugin-*` IDs, an `extensions` context group, and shared REST/focused-MCP/broad-MCP links. Canonical and React discovery share source-aware activation and deterministic first-owner collision rules; unauthenticated browser asset serving shares the activation policy and fails closed on indeterminate configuration. Explicit overrides must target a known built-in route.
 7. **Closed primary mobile navigation remained keyboard-accessible off-screen.** The drawer is now inert and assistive-technology-hidden while closed; while open it has modal semantics, initial focus, Tab/Shift+Tab containment, Escape/backdrop dismissal, and trigger-focus restoration.
 8. **The persistent context rail compressed pages at the 1024px breakpoint.** The rail now begins at `xl`; the related-pages trigger and modal drawer remain available from mobile through 1279px, with no horizontal overflow at 1024px or 1280px.
+9. **Chat exposed only one persistent browser PTY.** The Chat workspace now supports up to eight accessible browser-style tabs, each with an independent attach token, resume identity, mounted xterm session, and explicit authenticated termination on close. Tabs persist for the browser session, remain alive while inactive, support Arrow/Home/End keyboard navigation, and scroll horizontally without page overflow on narrow screens.
 
 ### Open gaps / decisions
 
@@ -121,6 +122,6 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 - Browser console errors: 0
 - Desktop viewport: 1440×1000
 - Responsive navigation checks: 390×844, 1024×800, and 1280×800
-- Frontend tests after mobile/responsive remediation: 204/204
+- Frontend tests after Chat tabs and mobile/responsive remediation: 214/214
 - Dynamic plugin routes discovered from rendered navigation: 2
 - Raw sanitized crawl artifact (local, not committed): `/Users/aibot/.hermes/designs/hermes-dashboard-live-inventory.json`

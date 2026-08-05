@@ -36,6 +36,7 @@ import { usePageHeader } from "@/contexts/usePageHeader";
 import { useI18n } from "@/i18n";
 import { api, HERMES_BASE_PATH } from "@/lib/api";
 import { latchChatActivation } from "@/lib/chat-activation";
+import { getOrCreateChatPtyToken } from "@/lib/chat-pty-token";
 import { normalizeSessionTitle } from "@/lib/chat-title";
 import { PtyResumeSanitizer } from "@/lib/pty-resume-sanitizer";
 import {
@@ -69,33 +70,6 @@ import { PluginSlot } from "@/plugins";
 import { useTheme } from "@/themes";
 import { useProfileScope } from "@/contexts/useProfileScope";
 
-// Stable per-browser token identifying THIS chat tab's keep-alive PTY session.
-// Sent as ?attach=; lets a refresh/disconnect reattach to the same live process
-// instead of spawning a fresh one. Per-localStorage, so other devices can't grab it.
-// ``rotate`` mints a new token — used when the user explicitly starts a fresh
-// session so the old keep-alive PTY is NOT reattached (the registry reaps it).
-const PTY_ATTACH_TOKEN_KEY = "hermes.pty.token.chat";
-function ptyAttachToken(rotate = false): string {
-  let t = "";
-  if (!rotate) {
-    try {
-      t = window.localStorage.getItem(PTY_ATTACH_TOKEN_KEY) ?? "";
-    } catch {
-      /* private mode / storage blocked */
-    }
-  }
-  if (!t) {
-    const a = new Uint8Array(16);
-    crypto.getRandomValues(a);
-    t = Array.from(a, (b) => b.toString(16).padStart(2, "0")).join("");
-    try {
-      window.localStorage.setItem(PTY_ATTACH_TOKEN_KEY, t);
-    } catch {
-      /* ignore */
-    }
-  }
-  return t;
-}
 
 // Channel id ties this chat tab's PTY child (publisher) to its sidebar
 // (subscriber).  Generated once per mount so a tab refresh starts a fresh
@@ -162,7 +136,23 @@ function terminalLineHeightForWidth(layoutWidthPx: number): number {
   return layoutWidthPx < 1024 ? 1.02 : 1.15;
 }
 
-export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
+type ChatPageProps = {
+  isActive?: boolean;
+  managePageHeader?: boolean;
+  ptyTabId?: string;
+  resumeSessionId?: string | null;
+  onResumeSessionChange?: (sessionId: string | null) => void;
+  onSessionTitleChange?: (title: string | null) => void;
+};
+
+export default function ChatPage({
+  isActive = true,
+  managePageHeader = true,
+  ptyTabId = "primary",
+  resumeSessionId,
+  onResumeSessionChange,
+  onSessionTitleChange,
+}: ChatPageProps) {
   const navigate = useNavigate();
   const hostRef = useRef<HTMLDivElement | null>(null);
   const termRef = useRef<Terminal | null>(null);
@@ -260,21 +250,29 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     setReconnectNonce((n) => n + 1);
   }, [clearReconnectTimer]);
   const startFreshDashboardChat = useCallback(() => {
-    const next = new URLSearchParams(searchParams);
-
-    next.delete("resume");
     forceFreshPtyRef.current = true;
     reconnectAttemptRef.current = 0;
     clearReconnectTimer();
     blockedInputNoticeRef.current = false;
     ptyInputLineRef.current = "";
     mobileReplacementInputUntilRef.current = 0;
-    setSearchParams(next, { replace: true });
+    if (onResumeSessionChange) {
+      onResumeSessionChange(null);
+    } else {
+      const next = new URLSearchParams(searchParams);
+      next.delete("resume");
+      setSearchParams(next, { replace: true });
+    }
     setBanner(null);
     setLastCloseCode(null);
     setPtyState("connecting");
     setReconnectNonce((n) => n + 1);
-  }, [clearReconnectTimer, searchParams, setSearchParams]);
+  }, [
+    clearReconnectTimer,
+    onResumeSessionChange,
+    searchParams,
+    setSearchParams,
+  ]);
   // Raw state for the mobile side-sheet + a derived value that force-
   // closes whenever the chat tab isn't active.  The *derived* value is
   // what side-effects (body-scroll lock, keydown listener, portal render)
@@ -319,7 +317,10 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // Sessions page relies on `/chat?resume=<id>` changing at runtime, so we must
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
-  const resumeParam = searchParams.get("resume");
+  const resumeParam =
+    resumeSessionId === undefined
+      ? searchParams.get("resume")
+      : resumeSessionId;
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
@@ -332,11 +333,15 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   const sessionTitle =
     sessionTitleState.scope === titleScope ? sessionTitleState.title : null;
   const handleSessionTitleChange = useCallback(
-    (title: string | null) => setSessionTitleState({ scope: titleScope, title }),
-    [titleScope],
+    (title: string | null) => {
+      setSessionTitleState({ scope: titleScope, title });
+      onSessionTitleChange?.(title);
+    },
+    [onSessionTitleChange, titleScope],
   );
 
   useEffect(() => {
+    if (!managePageHeader) return;
     if (!isActive) {
       setTitle(null);
       return;
@@ -344,7 +349,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
 
     setTitle(sessionTitle);
     return () => setTitle(null);
-  }, [isActive, sessionTitle, setTitle]);
+  }, [isActive, managePageHeader, sessionTitle, setTitle]);
 
   useEffect(() => {
     if (!resumeParam) return;
@@ -378,9 +383,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
           return;
         }
 
-        const next = new URLSearchParams(searchParams);
-        next.set("resume", res.session_id);
-        setSearchParams(next, { replace: true });
+        if (onResumeSessionChange) {
+          onResumeSessionChange(res.session_id);
+        } else {
+          const next = new URLSearchParams(searchParams);
+          next.set("resume", res.session_id);
+          setSearchParams(next, { replace: true });
+        }
       })
       .catch(() => {
         // Best-effort: old servers or missing sessions should not block chat.
@@ -389,7 +398,13 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     return () => {
       cancelled = true;
     };
-  }, [resumeParam, scopedProfile, searchParams, setSearchParams]);
+  }, [
+    onResumeSessionChange,
+    resumeParam,
+    scopedProfile,
+    searchParams,
+    setSearchParams,
+  ]);
 
   useEffect(() => {
     const mql = window.matchMedia("(max-width: 1023px)");
@@ -990,12 +1005,29 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       // Keep-alive identity: reattach to this tab's living PTY across
       // refresh/transient drops. A forced-fresh start rotates the token so
       // the previous keep-alive PTY is not reattached (registry reaps it).
-      params.attach = ptyAttachToken(forceFresh);
+      params.attach = getOrCreateChatPtyToken(ptyTabId, forceFresh);
       // Profile-scoped chat: the PTY child gets HERMES_HOME pointed at the
       // selected profile, so the conversation runs with that profile's model,
       // skills, memory, and sessions (see web_server._resolve_chat_argv).
       if (scopedProfile) params.profile = scopedProfile;
-      const url = await api.buildWsUrl("/api/pty", params);
+      let url: string;
+      try {
+        url = await api.buildWsUrl("/api/pty", params);
+      } catch (error) {
+        connectInFlightRef.current = false;
+        if (!unmounting) {
+          setPtyState("closed");
+          setBanner(
+            `Chat websocket unavailable: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
+        return;
+      }
+      // The gated-mode ticket request above is asynchronous. A tab may close
+      // while it is pending; never create a late WebSocket after cleanup.
+      if (unmounting) return;
       const ws = new WebSocket(url);
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
@@ -1294,6 +1326,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     scopedProfile,
     reconnectNonce,
     navigate,
+    ptyTabId,
   ]);
 
   // When the user returns to the chat tab (isActive: false → true), the
