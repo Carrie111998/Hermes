@@ -5471,6 +5471,35 @@ def _resume_status_from_events(conn: sqlite3.Connection, task_id: str) -> str:
     return "ready"
 
 
+def _has_unresolved_block(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Return True when ``task_id`` has an unresolved ``blocked`` control event.
+
+    Audit-aligned version of :func:`_has_sticky_block` used by the dispatch
+    claim gate and ``claim_task``'s fail-closed guard. The soak monitor
+    (``blocked_card_soak_monitor.py``) defines the legitimate unblock event
+    set as ``UNBLOCK_KINDS = {unblocked, promoted_manual, promoted}`` — an
+    operator ``hermes kanban promote`` emits ``promoted_manual`` and an
+    auto-clear (e.g. ``apply_approvals``) emits ``promoted``; both are
+    legitimate ways to leave ``blocked`` without a ``kanban_unblock``.
+
+    ``_has_sticky_block`` intentionally only considers ``{blocked,
+    unblocked}`` because it gates ``recompute_ready`` auto-recovery for
+    circuit-breaker blocks (``gave_up`` only) — those must still auto-recover.
+    The claim/dispatch gate is stricter in the other direction: a card whose
+    MOST RECENT control event is ``blocked`` (no later unblock of any kind)
+    must never be claimed, even if an external writer flipped the status
+    column to ``ready`` (the 2026-08-05 stale-unblock race).
+    """
+    row = conn.execute(
+        "SELECT kind FROM task_events "
+        "WHERE task_id = ? AND kind IN "
+        "('blocked', 'unblocked', 'promoted', 'promoted_manual') "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    return bool(row) and row["kind"] == "blocked"
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -5868,6 +5897,25 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Fail-closed: a card with an unresolved blocked control event (worker /
+        # operator ``kanban_block`` without a subsequent ``unblocked`` /
+        # ``promoted`` / ``promoted_manual``) must never be claimed — even if
+        # an external writer (e.g. a recovery actuator, a manual DB edit, or a
+        # racy recompute) flipped the status column to 'ready'. This closes the
+        # race/stale-event path from the 2026-08-05 soak audit: cards were
+        # silent-flipped to 'ready' with NO explicit unblock event and then
+        # claimed+spawned. The dispatch-layer gate in ``_dispatch_once_locked``
+        # is the primary guard; this event-level check is the independent
+        # fail-closed backstop at the claim primitive itself. The predicate is
+        # audit-aligned: ``promoted_manual`` / ``promoted`` are legitimate
+        # unblocks (operator ``kanban promote``, approval auto-clear), so a
+        # card that received one after the block is claimable.
+        if _has_unresolved_block(conn, task_id):
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "sticky_blocked"},
+            )
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -12359,8 +12407,15 @@ def _dispatch_once_locked(
         _blocked_row_status = (
             _blocked_row_status["status"] if _blocked_row_status else None
         )
+        # Gate decision is audit-aligned: an unresolved ``blocked`` control
+        # event (no later unblock of ANY legitimate kind) makes the card
+        # non-claimable even if the status column reads 'ready'. Keep the
+        # legacy sticky predicate separate for the back-compat telemetry
+        # bucket (skipped_block_gate / block_gate_audit) that downstream
+        # dashboards already read.
         _sticky = _has_sticky_block(conn, row["id"])
-        _is_blocked = (_blocked_row_status == "blocked") or _sticky
+        _unresolved = _has_unresolved_block(conn, row["id"])
+        _is_blocked = (_blocked_row_status == "blocked") or _unresolved
         if _is_blocked:
             # Back-compat telemetry bucket (t_fc1fdf31) — populated when the
             # card is blocked by a sticky block event, matching the prior
@@ -12370,6 +12425,11 @@ def _dispatch_once_locked(
             # t_73a70cde acceptance (b): every blocked-card claim attempt is
             # logged with card id + timestamp + dispatcher id.
             result.blocked_claim_attempts.append(row["id"])
+            _log.warning(
+                "kanban dispatch: refusing to claim blocked card %s "
+                "(status_column=%r, sticky=%s, unresolved_block=%s)",
+                row["id"], _blocked_row_status, _sticky, _unresolved,
+            )
             if not dry_run:
                 at = _claimer_id()
                 at_ts = int(time.time())
@@ -12401,6 +12461,7 @@ def _dispatch_once_locked(
                             "timestamp": at_ts,
                             "status_column": _blocked_row_status,
                             "sticky_block": _sticky,
+                            "unresolved_block": _unresolved,
                             "reason": "dispatcher refused to claim a blocked card",
                         },
                     )
