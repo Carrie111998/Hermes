@@ -67,3 +67,27 @@ def test_init_raises_when_no_fallback_configured():
                 skip_memory=True,
                 fallback_model=None,
             )
+
+
+def test_init_tells_oauth_provider_user_to_reauthenticate():
+    """OAuth providers must not suggest a fabricated API-key variable."""
+    with patch("agent.auxiliary_client.resolve_provider_client", return_value=(None, None)), \
+         patch("run_agent.get_tool_definitions", return_value=_make_tool_defs()), \
+         patch("run_agent.check_toolset_requirements", return_value={}), \
+         patch("run_agent.OpenAI", return_value=MagicMock()):
+
+        with pytest.raises(RuntimeError) as error_info:
+            AIAgent(
+                provider="minimax-oauth",
+                model="MiniMax-M3",
+                api_key=None,
+                base_url=None,
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+                fallback_model=None,
+            )
+
+    error_message = str(error_info.value)
+    assert "Re-authenticate with `hermes model`" in error_message
+    assert "MINIMAX-OAUTH_API_KEY" not in error_message
