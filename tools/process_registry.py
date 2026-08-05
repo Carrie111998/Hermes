@@ -695,6 +695,7 @@ class ProcessRegistry:
         session_key: str = "",
         env_vars: dict = None,
         use_pty: bool = False,
+        stdin_data: str | None = None,
     ) -> ProcessSession:
         """
         Spawn a background process locally.
@@ -705,6 +706,12 @@ class ProcessRegistry:
             use_pty: If True, use a pseudo-terminal via ptyprocess for interactive
                      CLI tools (Codex, Claude Code, Python REPL). Falls back to
                      subprocess.Popen if ptyprocess is not installed.
+            stdin_data: Optional spawn-time stdin to feed the process. This is
+                     used to pipe a ``sudo -S`` password (produced by
+                     ``_transform_sudo_command``) so background local sudo
+                     commands can authenticate (#78608). On the Popen path the
+                     data is written and stdin closed (matching the foreground
+                     path); on the PTY path it is written to the pty handle.
         """
         # Guard against the `A && B &` subshell-wait trap (issue #68915).
         # Bash parses ``A && B &`` as ``(A && B) &`` — a subshell that holds
@@ -744,6 +751,18 @@ class ProcessRegistry:
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
+
+                # Feed spawn-time stdin (e.g. the sudo -S password) to the pty
+                # so a background sudo under a pty can authenticate (#78608).
+                # The kernel pty buffer holds the bytes until the slave reads.
+                if stdin_data:
+                    try:
+                        if _IS_WINDOWS:
+                            session._pty.write(str(stdin_data))
+                        else:
+                            session._pty.write(stdin_data.encode("utf-8"))
+                    except (BrokenPipeError, OSError):
+                        pass
 
                 # PTY reader thread
                 reader = threading.Thread(
@@ -787,7 +806,7 @@ class ProcessRegistry:
             errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True,
             **_popen_kwargs,
         )
@@ -795,6 +814,15 @@ class ProcessRegistry:
         session.process = proc
         session.pid = proc.pid
         session.host_start_time = self._safe_host_start_time(session.pid)
+
+        # Feed spawn-time stdin (e.g. the sudo -S password) on a daemon thread
+        # to avoid pipe-buffer deadlocks, matching the foreground path. The
+        # data is written and stdin closed so sudo -S reads exactly one line
+        # then sees EOF (#78608).
+        if stdin_data is not None:
+            from tools.environments.base import _pipe_stdin
+
+            _pipe_stdin(proc, stdin_data)
 
         try:
             # Start output reader thread

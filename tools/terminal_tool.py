@@ -2663,13 +2663,20 @@ def terminal_tool(
             )
             try:
                 if env_type == "local":
+                    # Apply the sudo transform so background local commands can
+                    # also use SUDO_PASSWORD (#78608). The foreground path does
+                    # this via BaseEnvironment._prepare_command(); the local
+                    # background path used to skip it entirely and spawn with
+                    # stdin=DEVNULL, so sudo could never read its password.
+                    bg_command, bg_sudo_stdin = _transform_sudo_command(command)
                     proc_session = process_registry.spawn_local(
-                        command=command,
+                        command=bg_command if bg_command is not None else command,
                         cwd=effective_cwd,
                         task_id=effective_task_id,
                         session_key=session_key,
                         env_vars=env.env if hasattr(env, 'env') else None,
                         use_pty=effective_pty,
+                        stdin_data=bg_sudo_stdin,
                     )
                 else:
                     proc_session = process_registry.spawn_via_env(
