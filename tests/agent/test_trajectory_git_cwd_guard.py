@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import stat
 import subprocess
 from pathlib import Path
@@ -291,7 +292,7 @@ def test_config_default_is_redirect(tmp_path, monkeypatch, hermes_home):
     assert _tracked_and_untracked(repo) == ""
 
 
-def test_documented_default_matches_the_shipped_default():
+def test_documented_default_matches_the_shipped_default(hermes_home):
     """``DEFAULT_CONFIG`` is what the read path resolves through.
 
     ``load_config()`` deep-merges ``DEFAULT_CONFIG`` at read time, so the key
@@ -301,11 +302,28 @@ def test_documented_default_matches_the_shipped_default():
     ``load_config()``, which merges ``DEFAULT_CONFIG`` first, so a declared key
     is never reported missing.) Asserts the contract between the two, not a
     snapshot of the value.
+
+    Two assertions, two different jobs:
+
+    * the *drift* invariant — whatever ``DEFAULT_CONFIG`` declares is what the
+      reader resolves to on a config-less home. ``is`` rather than ``==`` so a
+      truthy non-bool in either place is a failure, not a coincidence;
+    * the *direction* — stated once, and only here: this guard is a security
+      default, so "off unless the user opts in" is the contract, not a tunable.
+      A future PR flipping the shipped default to ``true`` should have to
+      delete this line and argue for it.
     """
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
-    assert DEFAULT_CONFIG["agent"]["trajectory_allow_git_cwd"] is False
-    assert trajectory._allow_git_cwd() is False
+    assert not (hermes_home / "config.yaml").exists(), "premise: no user override"
+    assert trajectory._allow_git_cwd() is DEFAULT_CONFIG["agent"]["trajectory_allow_git_cwd"], (
+        "the read path must resolve to the declared default; a value only in "
+        "cli-config.yaml.example is not merged at read time"
+    )
+    assert trajectory._allow_git_cwd() is False, (
+        "CWD placement must stay opt-in: defaulting this on puts a full "
+        "verbatim transcript back in the user's checkout"
+    )
 
 
 def test_relative_subdir_is_preserved(tmp_path, monkeypatch, hermes_home):
@@ -1134,6 +1152,20 @@ def test_escaping_dotdot_is_still_contained(tmp_path, monkeypatch, hermes_home):
 
 
 # ── Docs must match shipped behaviour (review item 6) ───────────────────────
+#
+# Scope, deliberately narrow: the only doc claim asserted here is one *derived
+# from the code at runtime* — the destination ``resolve_trajectory_path``
+# actually produces — plus the config key that turns the guard off. Both are
+# identifiers, so they can only disagree with the docs when the code and the
+# docs genuinely disagree; a faithful reword of the surrounding prose is free.
+#
+# Known gap, worth stating rather than papering over: these live in the Python
+# lane, and ``scripts/ci/classify_changes.py`` emits ``python=false`` for a
+# docs-only diff (``website/`` is in ``_PY_SKIP``). So a PR that *only* edits
+# these pages does not run them — they catch the code→docs direction (a rename
+# that leaves the docs stale, which does run the Python lane), not the
+# docs→code one. That is precisely why the assertions are derived from code:
+# the direction they can actually enforce is the one they now assert.
 
 
 # The reference pages must carry the full contract (destination + opt-out); the
@@ -1150,37 +1182,74 @@ DOCS_GUIDE = (
 DOCS = DOCS_REFERENCE + DOCS_GUIDE
 
 
-@pytest.mark.parametrize("rel", DOCS)
-def test_docs_name_the_redirect_destination(rel):
-    """These are the snippets a datagen user copies.
+def _doc_text(rel: str) -> str:
+    return (Path(__file__).resolve().parents[2] / rel).read_text(encoding="utf-8")
 
-    English *and* the zh-Hans mirrors: a page that still says the file is in the
-    working directory sends the reader to a path that stops receiving entries.
+
+def _names_token(text: str, token: str) -> bool:
+    """Does *text* name *token* as a whole path component / filename?
+
+    A bare ``in`` is too weak to be a real check here: renaming the default
+    dataset to ``samples.jsonl`` still substring-matches the documented
+    ``trajectory_samples.jsonl``, so the assertion passed against code that no
+    longer wrote that file (found by mutating the source and watching this test
+    stay green). Require a non-word character on the left and no word character
+    or ``.`` continuing on the right, so ``traject`` does not match
+    ``trajectories`` and ``samples.jsonl`` does not match
+    ``trajectory_samples.jsonl``, while the delimiters docs actually use around
+    a path — space, ``/``, backtick, quote, ``<``, line start — all do.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / rel).read_text(encoding="utf-8")
-    assert "<HERMES_HOME>/trajectories/" in text, f"{rel} does not name the destination"
+    return re.search(rf"(?:(?<=\W)|^){re.escape(token)}(?![\w.])", text) is not None
+
+
+@pytest.mark.parametrize("rel", DOCS)
+def test_docs_name_the_destination_the_code_produces(rel, tmp_path, monkeypatch, hermes_home):
+    """The pages a datagen user copies must name where the write actually lands.
+
+    Derived, not frozen: run the real ``resolve_trajectory_path`` in a real git
+    work tree, read the directory component and the default dataset filename
+    *off the resolved path*, and require the docs to contain those. Rename
+    ``trajectories/`` or the default filename in ``agent/trajectory.py`` and
+    all four pages fail until they are updated; reword the prose around them
+    and nothing fails, because no prose is asserted.
+
+    English *and* the zh-Hans mirrors: a page that still points at the working
+    directory sends the reader to a path that stops receiving entries, and a
+    directory name is not translated, so the same derived token applies to both.
+    """
+    repo = _git_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+
+    # Everything asserted below comes off a real write: save_trajectory owns
+    # the default filename (completed → samples) and resolve_trajectory_path
+    # owns the directory. Found by globbing HERMES_HOME itself — deliberately
+    # NOT via the ``_landed`` helper, which knows the name ``trajectories``
+    # and would make the derivation circular (rename the directory in the
+    # code and this test must fail on the doc assertion, not on the helper).
+    save_trajectory(SAMPLE, "m", completed=True)
+    hits = [p for p in hermes_home.resolve().rglob("*.jsonl") if p.is_file()]
+    assert len(hits) == 1, f"expected exactly one dataset under {hermes_home}, got {hits}"
+    landed = hits[0]
+    relative = landed.relative_to(hermes_home.resolve())
+    directory, filename = relative.parts[0], landed.name
+
+    text = _doc_text(rel)
+    assert _names_token(text, directory), (
+        f"{rel} does not name the {directory}/ destination the code writes to"
+    )
+    assert _names_token(text, filename), (
+        f"{rel} does not name {filename}, the dataset file the code writes"
+    )
 
 
 @pytest.mark.parametrize("rel", DOCS_REFERENCE)
 def test_reference_docs_name_the_opt_out(rel):
-    """The reference page is where the escape hatch has to be discoverable."""
-    repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / rel).read_text(encoding="utf-8")
-    assert "trajectory_allow_git_cwd" in text, f"{rel} does not name the config key"
+    """The reference page is where the escape hatch has to be discoverable.
 
-
-@pytest.mark.parametrize("rel", DOCS_REFERENCE)
-def test_trajectory_format_doc_drops_the_plain_cwd_claim(rel):
-    """"written to files in the current working directory" is now conditional.
-
-    The unqualified claim was the line a datagen user trusted, and the upgrade
-    path (a pre-existing dataset that stops growing) has to be written down —
-    the terminal notice scrolls away, the docs don't.
+    A config key is an identifier, not prose: ``_allow_git_cwd()`` reads this
+    exact string, so the docs naming something else is a real defect, and
+    rewording the paragraph around it is not.
     """
-    repo_root = Path(__file__).resolve().parents[2]
-    text = (repo_root / rel).read_text(encoding="utf-8")
-    assert "Trajectories are written to files in the current working directory:" not in text
-    assert "轨迹写入当前工作目录下的文件：" not in text
-    assert ("Upgrading an existing pipeline" in text) or ("升级既有流水线" in text), \
-        f"{rel} does not document the upgrade/staleness path"
+    assert "trajectory_allow_git_cwd" in _doc_text(rel), (
+        f"{rel} does not name the config key the code reads"
+    )
