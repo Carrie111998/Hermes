@@ -1416,6 +1416,85 @@ CREATE TABLE IF NOT EXISTS review_gate_deliveries (
     updated_at       INTEGER NOT NULL
 );
 
+-- Linear is an intent/readback source, not the workflow authority.  These
+-- rows live in the Kanban DB so one stable issue coordinator can fan out to
+-- many repository/PR aggregates without creating a card for every webhook.
+CREATE TABLE IF NOT EXISTS linear_issue_coordinators (
+    linear_issue_id     TEXT PRIMARY KEY,
+    linear_identifier   TEXT NOT NULL UNIQUE,
+    title               TEXT NOT NULL,
+    issue_url           TEXT NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    snapshot_sha256     TEXT NOT NULL,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
+-- Signed, normalized Linear wakeups land here before any provider readback or
+-- workflow transition.  Provider event IDs suppress literal retries, while
+-- source_key + source_revision suppress semantically identical replays that
+-- arrive under a different delivery ID.
+CREATE TABLE IF NOT EXISTS linear_event_inbox (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider            TEXT NOT NULL,
+    event_id            TEXT NOT NULL,
+    event_kind          TEXT NOT NULL,
+    linear_issue_id     TEXT NOT NULL,
+    source_key          TEXT NOT NULL,
+    source_revision     INTEGER NOT NULL,
+    payload_sha256      TEXT NOT NULL,
+    status              TEXT NOT NULL,
+    read_attempt_count  INTEGER NOT NULL DEFAULT 0,
+    last_error          TEXT,
+    received_at         INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL,
+    processed_at        INTEGER
+);
+
+-- Issue-to-PR links are historical one-to-many associations observed through
+-- Linear.  They deliberately contain no PR state or head; those facts only
+-- enter through the trusted read-only PR snapshot provider below.
+CREATE TABLE IF NOT EXISTS linear_issue_pr_links (
+    linear_issue_id       TEXT NOT NULL,
+    repository            TEXT NOT NULL,
+    pr_number              INTEGER NOT NULL,
+    first_seen_revision    INTEGER NOT NULL,
+    last_seen_revision     INTEGER NOT NULL,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (linear_issue_id, repository, pr_number)
+);
+
+-- Current PR aggregate state is provider readback only.  Repository names are
+-- stored in canonical case-folded form by hermes_cli.kanban_linear.
+CREATE TABLE IF NOT EXISTS linear_pr_aggregates (
+    repository            TEXT NOT NULL,
+    pr_number              INTEGER NOT NULL,
+    pr_url                 TEXT NOT NULL,
+    state                  TEXT NOT NULL,
+    is_draft               INTEGER NOT NULL,
+    base_branch            TEXT NOT NULL,
+    head_branch            TEXT NOT NULL,
+    current_head_sha       TEXT NOT NULL,
+    provider_revision      INTEGER NOT NULL,
+    snapshot_sha256        TEXT NOT NULL,
+    observed_at            INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+
+-- Immutable PR head generations preserve exact-head identity independently
+-- from the mutable aggregate pointer.
+CREATE TABLE IF NOT EXISTS linear_pr_head_generations (
+    repository          TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL,
+    head_sha             TEXT NOT NULL,
+    first_observed_at    INTEGER NOT NULL,
+    provider_revision    INTEGER NOT NULL,
+    state_at_observation TEXT NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1435,6 +1514,16 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_review_gate_delivery_channel
     ON review_gate_deliveries(gate_id, channel);
 CREATE INDEX IF NOT EXISTS idx_review_gate_delivery_due
     ON review_gate_deliveries(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_linear_event_provider_id
+    ON linear_event_inbox(provider, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_linear_event_source_revision
+    ON linear_event_inbox(provider, source_key, source_revision);
+CREATE INDEX IF NOT EXISTS idx_linear_event_status
+    ON linear_event_inbox(status, received_at, id);
+CREATE INDEX IF NOT EXISTS idx_linear_issue_pr
+    ON linear_issue_pr_links(repository, pr_number, linear_issue_id);
+CREATE INDEX IF NOT EXISTS idx_linear_pr_state
+    ON linear_pr_aggregates(state, repository, pr_number);
 """
 
 
