@@ -1,5 +1,6 @@
 """Tests for agent.redact -- secret masking in logs and output."""
 
+import json
 import logging
 
 import pytest
@@ -142,6 +143,18 @@ class TestJsonFields:
         assert "secret_value_long_enough" not in result
         assert result.startswith('{"api_key": "')
         assert result.endswith('"}')
+
+    def test_json_escaped_quote_at_mask_prefix_boundary_stays_parseable(self):
+        # _mask_token keeps 6 prefix chars; value ``abcde\"long…`` puts the
+        # cut on the backslash of ``\"``. Re-embedding that prefix must not
+        # emit a lone ``\`` (invalid JSON) and must not leak the suffix.
+        text = '{"password": "abcde\\"long_secret_value_xyz"}'
+        result = redact_sensitive_text(text, force=True)
+        assert "long_secret" not in result
+        assert '"***"long' not in result
+        parsed = json.loads(result)
+        assert "password" in parsed
+        assert "long_secret" not in parsed["password"]
 
 
 class TestAuthHeaders:
