@@ -15,8 +15,10 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 
+from agent.context_engine import ContextEngine
 from agent.context_compressor import SUMMARY_PREFIX
 from agent.conversation_compression import COMPACTION_DONE_STATUS, COMPACTION_STATUS
+from agent.conversation_loop import _context_engine_overflow_recovery_failed
 from run_agent import AIAgent
 import run_agent
 
@@ -658,6 +660,50 @@ class TestPreflightCompression:
         mock_compress.assert_not_called()
         agent.context_compressor.should_compress.assert_not_called()
 
+    def test_pre_api_pressure_none_hook_falls_back_to_should_compress(self, agent):
+        """A None hook result preserves the legacy token-only fallback."""
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+        agent.context_compressor.should_compress = MagicMock(return_value=True)
+        pressure_hook = MagicMock(return_value=None)
+        agent.context_compressor.should_compress_request_pressure = pressure_hook
+
+        history = [
+            {"role": "user", "content": "live task"},
+            {"role": "assistant", "content": "fresh protected assistant output"},
+        ]
+        ok_resp = _mock_response(content="Fallback compressed", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        compressed_messages = [
+            {"role": "user", "content": "compressed history"},
+            {"role": "assistant", "content": "ready"},
+            {"role": "user", "content": "continue"},
+        ]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                return_value=140_000,
+            ),
+            patch.object(
+                agent,
+                "_compress_context",
+                return_value=(compressed_messages, "compressed prompt"),
+            ) as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("continue", conversation_history=history)
+
+        assert result["completed"] is True
+        pressure_hook.assert_called_once()
+        agent.context_compressor.should_compress.assert_called_once()
+        mock_compress.assert_called_once()
+
     def test_pre_api_pressure_hook_skipped_when_cheap_guards_block(self, agent):
         """Avoid side-effectful engine hooks when pre-API compression cannot run."""
         agent.compression_enabled = False
@@ -665,6 +711,8 @@ class TestPreflightCompression:
         agent.context_compressor.threshold_tokens = 100_000
         pressure_hook = MagicMock(return_value=True)
         agent.context_compressor.should_compress_request_pressure = pressure_hook
+        defer_hook = MagicMock(return_value=False)
+        agent.context_compressor.should_defer_preflight_to_real_usage = defer_hook
 
         ok_resp = _mock_response(content="Compression disabled", finish_reason="stop")
         agent.client.chat.completions.create.side_effect = [ok_resp]
@@ -687,7 +735,38 @@ class TestPreflightCompression:
 
         assert result["completed"] is True
         pressure_hook.assert_not_called()
+        defer_hook.assert_not_called()
         mock_compress.assert_not_called()
+
+    def test_inherited_overflow_hook_falls_back_to_legacy_private_flag(self):
+        """Default ContextEngine hook must not mask older engine state."""
+
+        class LegacyEngine(ContextEngine):
+            @property
+            def name(self) -> str:
+                return "legacy"
+
+            def update_from_response(self, usage):
+                return None
+
+            def should_compress(self, prompt_tokens=None):
+                return False
+
+            def compress(
+                self,
+                messages,
+                current_tokens=None,
+                focus_topic=None,
+                force=False,
+                memory_context="",
+            ):
+                return messages
+
+        engine = LegacyEngine()
+        engine._last_overflow_recovery_failed = True
+        assert _context_engine_overflow_recovery_failed(
+            SimpleNamespace(context_compressor=engine)
+        ) is True
 
     def test_context_overflow_stops_when_engine_reports_fresh_tail_exhausted(self, agent):
         """Do not retry provider overflow after LCM says the protected tail cannot fit."""

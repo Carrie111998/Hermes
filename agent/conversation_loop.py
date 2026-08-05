@@ -35,7 +35,7 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import ContextEngine, automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -990,11 +990,19 @@ def _context_engine_overflow_recovery_failed(agent) -> bool:
     _compressor = getattr(agent, "context_compressor", None)
     _checker = getattr(_compressor, "overflow_recovery_failed", None)
     if callable(_checker):
-        try:
-            return bool(_checker())
-        except Exception:
-            logger.exception("context engine overflow_recovery_failed hook failed")
-            return False
+        _class_checker = getattr(type(_compressor), "overflow_recovery_failed", None)
+        _instance_checker = getattr(_compressor, "__dict__", {}).get(
+            "overflow_recovery_failed"
+        )
+        if (
+            _instance_checker is not None
+            or _class_checker is not ContextEngine.overflow_recovery_failed
+        ):
+            try:
+                return bool(_checker())
+            except Exception:
+                logger.exception("context engine overflow_recovery_failed hook failed")
+                return False
     # Compatibility for older plugin engines that predate the public hook.
     return getattr(_compressor, "_last_overflow_recovery_failed", False) is True
 
@@ -2060,43 +2068,46 @@ def run_conversation(
                 f"{_previous_preflight_pressure:,}",
                 f"{request_pressure_tokens:,}",
             )
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
-        )
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
-        _preflight_deferred = _defer_preflight(request_pressure_tokens)
+        _preflight_deferred = False
         _can_run_pre_api_compression = (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _preflight_deferred
             and not _compression_cooldown
         )
+        if _can_run_pre_api_compression:
+            _defer_preflight = getattr(
+                _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+            )
+            _preflight_deferred = bool(_defer_preflight(request_pressure_tokens))
+            if _preflight_deferred:
+                _can_run_pre_api_compression = False
         _request_pressure_eligible = False
         if _can_run_pre_api_compression:
             _request_pressure_hook = getattr(
                 _compressor, "should_compress_request_pressure", None
             )
+            _request_pressure_decision = None
             if callable(_request_pressure_hook):
                 try:
-                    _request_pressure_eligible = bool(_request_pressure_hook(
+                    _request_pressure_decision = _request_pressure_hook(
                         messages,
                         request_pressure_tokens,
-                    ))
+                    )
                 except Exception:
                     logger.exception(
                         "context engine should_compress_request_pressure failed; falling back to should_compress"
                     )
-                    _request_pressure_eligible = _compressor.should_compress(
-                        request_pressure_tokens
-                    )
-            else:
+            if _request_pressure_decision is None:
                 _request_pressure_eligible = _compressor.should_compress(
                     request_pressure_tokens
                 )
+            else:
+                _request_pressure_eligible = bool(_request_pressure_decision)
         if _can_run_pre_api_compression and _request_pressure_eligible:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
