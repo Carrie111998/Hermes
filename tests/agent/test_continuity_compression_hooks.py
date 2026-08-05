@@ -120,6 +120,4 @@ def test_ensure_compressed_restores_real_user_when_only_handoff_marker_present()
 
     _ensure_compressed_has_user_turn(original_messages, compressed)
 
-    assert any(_is_real_user_message(m) for m in compressed), (
-        "compressed must contain at least one real user message after restoration"
-    )
+    assert any(m.get("content") == "What is the capital of France?" for m in compressed)
