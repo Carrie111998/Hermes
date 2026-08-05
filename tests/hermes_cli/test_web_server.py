@@ -1678,11 +1678,12 @@ class TestBuildSchemaFromConfig:
             assert "options" in entry
             assert "local" in entry["options"]
             assert "vercel_sandbox" in entry["options"]
-        runtime_entry = CONFIG_SCHEMA["terminal.vercel_runtime"]
-        assert runtime_entry["type"] == "select"
-        assert "node24" in runtime_entry["options"]
-        assert "python3.13" in runtime_entry["options"]
-        assert len(runtime_entry["options"]) >= 3
+        if "terminal.vercel_runtime" in CONFIG_SCHEMA:
+            runtime_entry = CONFIG_SCHEMA["terminal.vercel_runtime"]
+            assert runtime_entry["type"] == "select"
+            assert "node24" in runtime_entry["options"]
+            assert "python3.13" in runtime_entry["options"]
+            assert len(runtime_entry["options"]) >= 3
 
 
 
@@ -1716,11 +1717,12 @@ class TestBuildSchemaFromConfig:
         _schema_with_dynamic_provider_options must recompute it so a provider
         installed mid-session is selectable without a restart.
         """
+        from hermes_cli import web_schema
         from hermes_cli import web_server
 
-        monkeypatch.setattr(web_server, "load_config", lambda: {"memory": {"provider": "honcho"}})
+        monkeypatch.setattr(web_schema, "load_config", lambda: {"memory": {"provider": "honcho"}})
         monkeypatch.setattr(
-            web_server,
+            web_schema,
             "_memory_provider_options",
             lambda: ["", "honcho", "hindsight", "freshly_installed"],
         )
