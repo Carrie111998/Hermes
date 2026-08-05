@@ -458,6 +458,9 @@ TRUSTED_SDK_PUBLICATION_INTENT_SCHEMA = (
 TRUSTED_SDK_BYTECODE_REPAIR_RECEIPT_SCHEMA = (
     "muncho-full-canary-owner-trusted-sdk-bytecode-repair-receipt.v1"
 )
+SCHEMA_RECONCILIATION_CONTROL_SUCCESSOR_RECOVERY_SCHEMA = (
+    "muncho-schema-reconciliation-control-successor-recovery.v1"
+)
 TRUSTED_SDK_BYTECODE_REPAIR_INTENT_SCHEMA = (
     "muncho-full-canary-owner-trusted-sdk-bytecode-repair-intent.v1"
 )
@@ -15120,6 +15123,95 @@ def bootstrap_schema_reconciliation_control(
     return terminal
 
 
+def recover_historical_schema_reconciliation_control(
+    *,
+    release_sha: str,
+    source_release_sha: str,
+    transport: IapSchemaReconciliationControlBootstrapTransport,
+    cloud_sql_client: GoogleRestClient,
+    owner_identity: GcloudOwnerAccessToken,
+    now: Callable[[], int] = lambda: int(time.time()),
+    provenance_guard: Callable[
+        [str], None
+    ] = require_owner_runtime_and_launcher_provenance,
+) -> Mapping[str, Any]:
+    """Finish one predecessor's exact control bootstrap through a successor.
+
+    The predecessor remains the remote protocol authority, so its deterministic
+    temporary login and stopped-release gate are reproduced exactly.  Only the
+    local trusted runtime and launcher provenance move forward to the successor.
+    This is deliberately narrower than accepting a caller-selected login name.
+    """
+
+    if (
+        not isinstance(release_sha, str)
+        or _RELEASE_SHA.fullmatch(release_sha) is None
+        or not isinstance(source_release_sha, str)
+        or _RELEASE_SHA.fullmatch(source_release_sha) is None
+        or source_release_sha == release_sha
+    ):
+        raise OwnerLauncherError(
+            "schema_reconciliation_control_successor_recovery_invalid"
+        )
+
+    def successor_bound_guard(observed_source_release: str) -> None:
+        if observed_source_release != source_release_sha:
+            raise OwnerLauncherError(
+                "schema_reconciliation_control_successor_recovery_invalid"
+            )
+        provenance_guard(release_sha)
+
+    terminal = bootstrap_schema_reconciliation_control(
+        release_sha=source_release_sha,
+        transport=transport,
+        cloud_sql_client=cloud_sql_client,
+        owner_identity=owner_identity,
+        provenance_guard=successor_bound_guard,
+    )
+    from gateway import (
+        canonical_writer_schema_reconciliation_control_bootstrap as bootstrap,
+    )
+
+    recovered_at = now()
+    if not isinstance(terminal, Mapping):
+        raise OwnerLauncherError(
+            "schema_reconciliation_control_successor_recovery_invalid"
+        )
+    completed_at = terminal.get("completed_at_unix")
+    if (
+        terminal.get("schema") != bootstrap.TERMINAL_SCHEMA
+        or terminal.get("ok") is not True
+        or terminal.get("state") != "control_installed_admin_absent_stopped"
+        or terminal.get("release_revision") != source_release_sha
+        or terminal.get("temporary_control_admin_absent") is not True
+        or not isinstance(terminal.get("terminal_sha256"), str)
+        or _SHA256.fullmatch(str(terminal["terminal_sha256"])) is None
+        or type(recovered_at) is not int
+        or type(completed_at) is not int
+        or recovered_at < completed_at
+    ):
+        raise OwnerLauncherError(
+            "schema_reconciliation_control_successor_recovery_invalid"
+        )
+    provenance_guard(release_sha)
+    unsigned = {
+        "schema": SCHEMA_RECONCILIATION_CONTROL_SUCCESSOR_RECOVERY_SCHEMA,
+        "ok": True,
+        "state": "historical_control_recovered_admin_absent_stopped",
+        "release_sha": release_sha,
+        "source_release_sha": source_release_sha,
+        "source_terminal": dict(terminal),
+        "source_terminal_sha256": terminal["terminal_sha256"],
+        "temporary_control_admin_absent": True,
+        "services_stopped": True,
+        "recovered_at_unix": recovered_at,
+    }
+    return {
+        **unsigned,
+        "receipt_sha256": _sha256(_canonical_bytes(unsigned)),
+    }
+
+
 def upgrade_canonical_writer_schema(
     *,
     release_sha: str,
@@ -22976,6 +23068,14 @@ def _cli_parser() -> argparse.ArgumentParser:
         ),
     )
     actions.add_argument(
+        "--recover-historical-schema-reconciliation-control",
+        action="store_true",
+        help=(
+            "finish one exact predecessor control bootstrap through the "
+            "current sealed runtime while all canary services remain stopped"
+        ),
+    )
+    actions.add_argument(
         "--upgrade-canonical-writer-schema",
         action="store_true",
         help=(
@@ -23015,6 +23115,14 @@ def _cli_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--external-iam-policy-sha256",
         help="exact external IAM policy digest bound into writer staging",
+        action=_OwnerStoreOnce,
+    )
+    parser.add_argument(
+        "--schema-reconciliation-source-release-sha",
+        help=(
+            "exact predecessor release whose deterministic stopped control "
+            "bootstrap must be recovered"
+        ),
         action=_OwnerStoreOnce,
     )
     parser.add_argument(
@@ -23086,6 +23194,27 @@ def _validate_storage_growth_cli_arguments(arguments: argparse.Namespace) -> Non
         raise OwnerLauncherError("storage_growth_owner_cli_invalid")
 
 
+def _validate_schema_control_recovery_cli_arguments(
+    arguments: argparse.Namespace,
+    *,
+    release_sha: str,
+) -> None:
+    recovery = bool(arguments.recover_historical_schema_reconciliation_control)
+    source = arguments.schema_reconciliation_source_release_sha
+    if recovery is (source is None):
+        raise OwnerLauncherError(
+            "schema_reconciliation_control_successor_recovery_cli_invalid"
+        )
+    if source is not None and (
+        not isinstance(source, str)
+        or _RELEASE_SHA.fullmatch(source) is None
+        or source == release_sha
+    ):
+        raise OwnerLauncherError(
+            "schema_reconciliation_control_successor_recovery_cli_invalid"
+        )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     arguments = _cli_parser().parse_args(argv)
     release_sha = arguments.release_sha
@@ -23108,6 +23237,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             arguments.expected_current_boot_id_sha256,
         )
         _validate_storage_growth_cli_arguments(arguments)
+        _validate_schema_control_recovery_cli_arguments(
+            arguments,
+            release_sha=release_sha,
+        )
         if (
             arguments.author_v1_credential_migration
             and arguments.external_iam_policy_sha256 is not None
@@ -23124,6 +23257,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             (
                 arguments.reconcile_legacy_canary_db
                 or arguments.bootstrap_schema_reconciliation_control
+                or arguments.recover_historical_schema_reconciliation_control
                 or arguments.upgrade_canonical_writer_schema
                 or arguments.apply_phase_b_foundation
                 or arguments.publish_coordinator_input
@@ -23135,6 +23269,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 if (
                     arguments.reconcile_legacy_canary_db
                     or arguments.bootstrap_schema_reconciliation_control
+                    or arguments.recover_historical_schema_reconciliation_control
                     or arguments.upgrade_canonical_writer_schema
                 )
                 else (
@@ -23487,6 +23622,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             runtime_and_provenance_guard(release_sha)
             _emit_canonical_line(receipt)
             return 0
+        if arguments.recover_historical_schema_reconciliation_control:
+            source_release_sha = str(
+                arguments.schema_reconciliation_source_release_sha
+            )
+            transport = IapSchemaReconciliationControlBootstrapTransport(
+                owner_identity,
+                gcloud_executable=gcloud_executable,
+                gcloud_configuration=gcloud_configuration,
+            )
+            receipt = recover_historical_schema_reconciliation_control(
+                release_sha=release_sha,
+                source_release_sha=source_release_sha,
+                transport=transport,
+                cloud_sql_client=GoogleRestClient(owner_identity),
+                owner_identity=owner_identity,
+                provenance_guard=runtime_and_provenance_guard,
+            )
+            runtime_and_provenance_guard(release_sha)
+            _emit_canonical_line(receipt)
+            return 0
         if arguments.upgrade_canonical_writer_schema:
             transport = IapCanonicalWriterSchemaUpgradeTransport(
                 owner_identity,
@@ -23718,6 +23873,7 @@ __all__ = [
     "SCHEMA_RECONCILIATION_ADMIN_CLEANUP_SSHSIG_NAMESPACE",
     "SCHEMA_RECONCILIATION_ADMIN_PREFLIGHT_MAGIC",
     "SCHEMA_RECONCILIATION_ADMIN_PREFLIGHT_SSHSIG_NAMESPACE",
+    "SCHEMA_RECONCILIATION_CONTROL_SUCCESSOR_RECOVERY_SCHEMA",
     "SCHEMA_RECONCILIATION_CREDENTIAL_BYTES",
     "SCHEMA_RECONCILIATION_MIN_GATE_REMAINING_SECONDS",
     "SCHEMA_RECONCILIATION_PREFLIGHT_AUTHORIZATION_MAGIC",
