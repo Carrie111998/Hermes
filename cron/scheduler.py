@@ -4078,8 +4078,12 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
         _err_text = str(e) or type(e).__name__
         logger.error("Error processing job %s: %s", job['id'], _err_text)
         try:
-            if not _consume_interrupted_flag(job["id"]):
-                mark_job_run(job["id"], False, _err_text)
+            # C2 (t_95fbd07c) follow-up: unconditional mark_job_run so that
+            # even interrupted-flag-set BaseExceptions write last_run_at instead
+            # of silently skipping the write.  Flag cleared after so stale
+            # flags are drained regardless of whether mark_job_run succeeds.
+            mark_job_run(job["id"], False, _err_text)
+            _consume_interrupted_flag(job["id"])  # discard stale flag
         except Exception as record_err:
             # Never let bookkeeping mask the original interruption.
             logger.error(

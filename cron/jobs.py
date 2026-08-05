@@ -1732,7 +1732,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 if job.get("repeat"):
                     repeat = job["repeat"]
                     times = repeat.get("times")
-                    completed = repeat.get("completed", 0)
+                    completed = repeat.get("completed") or 0
                     kind = job.get("schedule", {}).get("kind")
                     preclaimed_oneshot = (
                         kind == "once"
@@ -1905,7 +1905,7 @@ def claim_dispatch(job_id: str) -> bool:
             times = repeat.get("times")
             if times is None or times <= 0:
                 return True  # infinite — always dispatch
-            completed = repeat.get("completed", 0)
+            completed = repeat.get("completed") or 0
             if completed >= times:
                 # Already dispatched the max number of times.
                 if job.get("last_run_at") is not None:
@@ -2481,7 +2481,7 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
                     repeat = job.get("repeat")
                     if repeat:
                         times = repeat.get("times")
-                        completed = repeat.get("completed", 0)
+                        completed = repeat.get("completed") or 0
                         if times is not None and times > 0 and completed >= times:
                             # A live run must never have its job record deleted
                             # underneath it (#62002): a run that outlives the
