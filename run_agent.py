@@ -686,6 +686,20 @@ class AIAgent:
         if not engine:
             return
 
+        _speculative_manager = getattr(
+            self, "_speculative_compression_manager", None
+        )
+        _speculative_session_id = old_session_id or getattr(self, "session_id", "")
+        if _speculative_manager is not None and _speculative_session_id:
+            try:
+                _speculative_manager.invalidate_session(_speculative_session_id)
+            except Exception:
+                logger.debug(
+                    "speculative compression invalidation failed for session=%s",
+                    _speculative_session_id,
+                    exc_info=True,
+                )
+
         if old_session_id and previous_messages is not None and hasattr(engine, "on_session_end"):
             try:
                 engine.on_session_end(old_session_id, previous_messages)
@@ -7312,6 +7326,7 @@ class AIAgent:
         force: bool = False,
         defer_context_engine_notification: bool = False,
         commit_fence=None,
+        speculative_candidate=None,
     ) -> tuple:
         """Forwarder — see ``agent.conversation_compression.compress_context``.
 
@@ -7379,6 +7394,7 @@ class AIAgent:
                         defer_context_engine_notification
                     ),
                     commit_fence=fence,
+                    speculative_candidate=speculative_candidate,
                 )
 
             # Callers that already own a progress-aware wait (gateway session

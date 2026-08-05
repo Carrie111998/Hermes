@@ -560,6 +560,18 @@ DEFAULT_CONFIG = {
 
     "compression": {
         "enabled": True,
+        # Experimental v1 tool-wait-only speculative preparation.  The
+        # runtime stays disabled until an operator explicitly opts in.
+        "speculative": {
+            "enabled": False,
+            "start_ratio": 0.70,
+            "hard_ratio": 0.85,
+            "max_age_seconds": 180,
+            "hard_wait_seconds": 2,
+            "during_tool_wait": True,
+            # Speculation currently overlaps only tool execution.
+
+        },
         "progress_notices": False,    # opt-in (#52995): when True, routine compression
                                       # progress statuses (compacting/preflight/pre-API/
                                       # idle/retry) are delivered to chat gateway
@@ -884,6 +896,7 @@ DEFAULT_CONFIG = {
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
             "extra_body": {},
             "reasoning_effort": "",  # per-task thinking level: none|minimal|low|medium|high|xhigh|max|ultra (empty = provider default)
+
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —
         # single-shape tool returns DB content directly). The old
@@ -1102,6 +1115,7 @@ DEFAULT_CONFIG = {
         # Mirrors `hermes -c` muscle memory.  Default off so existing
         # users aren't surprised.  HERMES_TUI_RESUME=<id> always wins.
         "tui_auto_resume_recent": False,
+
         # When true (default), `hermes --tui` drops a one-time hint
         # ("subagents working · /agents to watch live") the first time a turn
         # starts delegating, nudging the user toward the live spawn-tree

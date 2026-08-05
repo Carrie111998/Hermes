@@ -480,6 +480,10 @@ class CompressionCommitFence:
         self._lock_release_guard = threading.Lock()
         self._cancelled_lock_release: Optional[Callable[[], None]] = None
         self._cancelled_lock_release_requested = False
+        # Completion marker: a commit that ran to completion disables this
+        # fence generation, so a later speculative attempt cannot reuse it
+        # (cancel_before_commit on a completed fence cancels it).
+        self._commit_completed = False
         # Forward-progress telemetry: the compression worker touches this
         # whenever the streamed summary call produces a token (see
         # ContextCompressor._call_summary_llm). Waiters use it to distinguish
@@ -512,6 +516,12 @@ class CompressionCommitFence:
                 if cancel_event is not None:
                     cancel_event.set()
                 return False
+            if self._commit_completed:
+                # A completed commit is already past the cancellation point.
+                # Keep the fence cancelled so a later speculative attempt
+                # cannot reuse this disabled generation.
+                self._cancelled = True
+                return False
             self._cancelled = True
             if cancel_event is not None:
                 cancel_event.set()
@@ -527,6 +537,9 @@ class CompressionCommitFence:
             return None
         try:
             if self._commit_started:
+                return False
+            if self._commit_completed:
+                self._cancelled = True
                 return False
             self._cancelled = True
             return True
@@ -554,11 +567,14 @@ class CompressionCommitFence:
         # Set while the fence lock is held so observers can never see
         # commit_in_flight=True for a commit that lost to cancellation.
         self._commit_phase.set()
+        self._commit_completed = False
         return True
 
     def finish_commit(self) -> None:
         """Leave a commit boundary entered by :meth:`begin_commit`."""
         self._commit_phase.clear()
+        self._commit_started = False
+        self._commit_completed = True
         self._lock.release()
         if self._admission_revoked:
             # Round-2 #1: a revoke that arrived while THIS commit was in
@@ -2136,6 +2152,7 @@ def compress_context(
     force: bool = False,
     defer_context_engine_notification: bool = False,
     commit_fence: Optional[CompressionCommitFence] = None,
+    speculative_candidate: Any = None,
 ) -> Tuple[list, str]:
     """Compress conversation context and split the session in SQLite.
 
@@ -2158,6 +2175,10 @@ def compress_context(
         commit_fence: Optional cooperative fence for executor callers that
             may time out. It prevents a late worker from mutating session state
             after its caller has moved on.
+        speculative_candidate: An uncommitted candidate produced by the
+            tool-wait-only speculative worker. It is validated again after the
+            normal session compression lock is acquired and then follows the
+            same durable commit path as synchronous compression.
 
     Returns:
         ``(compressed_messages, new_system_prompt)`` tuple.  When
@@ -2191,6 +2212,45 @@ def compress_context(
     # second clear before lock acquisition below stays for the same reason
     # it was added in #69870 and is simply idempotent now.
     agent._compression_skipped_due_to_lock = None
+    # Terminal-status contract for candidate-bearing calls: any exit other
+    # than a committed install reports "rejected" (or "deferred_lock" when
+    # the session compression lock was contended), so callers and telemetry
+    # can distinguish a genuine rejection from a transient deferral.
+    agent._speculative_install_status = (
+        "rejected" if speculative_candidate is not None else None
+    )
+
+    if speculative_candidate is not None:
+        _claimed_epoch = getattr(agent, "_speculative_epoch_claimed", None)
+        _epoch_before = (
+            _claimed_epoch
+            if _claimed_epoch is not None
+            else getattr(agent, "_speculative_epoch", 0)
+        )
+        if not getattr(agent, "speculative_compression_enabled", False):
+            agent._speculative_install_status = "rejected"
+            existing_prompt = getattr(agent, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = agent._build_system_prompt(system_message)
+            return messages, existing_prompt
+        try:
+            from agent.speculative_compression import is_builtin_compression_eligible
+
+            if not is_builtin_compression_eligible(
+                api_mode=getattr(agent, "api_mode", None),
+                context_engine=getattr(agent, "context_compressor", None),
+            ):
+                agent._speculative_install_status = "rejected"
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+        except Exception:
+            agent._speculative_install_status = "rejected"
+            existing_prompt = getattr(agent, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = agent._build_system_prompt(system_message)
+            return messages, existing_prompt
 
     _attempt_started_at = time.monotonic()
     _attempt_id = uuid.uuid4().hex
@@ -2263,7 +2323,9 @@ def compress_context(
     # The check itself sets ``agent._compression_warning`` so the
     # status-callback replay machinery still emits the warning to the user
     # the first time it would matter.
-    if not getattr(agent, "_compression_feasibility_checked", False):
+    if speculative_candidate is None and not getattr(
+        agent, "_compression_feasibility_checked", False
+    ):
         # Mark as checked only after the probe completes. If the check
         # raises (e.g. a fatal aux-context ValueError that aborts the
         # session), leaving the flag unset is harmless; a non-fatal
@@ -2515,6 +2577,8 @@ def compress_context(
                 failure_class="lock_contended",
             )
             _complete_compaction_lifecycle()
+            if speculative_candidate is not None:
+                agent._speculative_install_status = "deferred_lock"
             return messages, _existing_sp
     _lock_released = False
     _lock_release_guard = threading.Lock()
@@ -2755,6 +2819,152 @@ def compress_context(
                 pass
 
         compress_fn = agent.context_compressor.compress
+        if speculative_candidate is not None:
+            # The candidate was produced from a copied transcript. Revalidate
+            # the covered prefix and exact cut while the durable session lock
+            # is held, then splice only the current live suffix. The existing
+            # post-compression code below remains the sole persistence path.
+            _speculative_settings = getattr(
+                agent, "speculative_compression_settings", None
+            )
+            # Preserve an explicit 0 (immediate expiry) — ``or 180.0`` would
+            # silently convert a configured zero into the default.
+            _spec_raw_max_age = getattr(
+                _speculative_settings, "max_age_seconds", None
+            )
+            _speculative_max_age = (
+                float(_spec_raw_max_age)
+                if _spec_raw_max_age is not None
+                else 180.0
+            )
+            _spec_compressor_fp = getattr(
+                speculative_candidate, "compressor_fingerprint", None
+            )
+            # This is the linearization point for the runtime kill switch:
+            # the flag may have changed while this caller waited for the
+            # session lock. No candidate may cross this final gate into
+            # assemble/commit after /speculative off has returned.
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or getattr(agent, "_speculative_epoch", 0)
+                != _epoch_before
+            ):
+                agent._speculative_install_status = "rejected"
+                _release_lock()
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+            _spec_live_compressor_fp = None
+            if _spec_compressor_fp is not None:
+                try:
+                    from agent.speculative_compression import (
+                        compressor_settings_fingerprint,
+                    )
+
+                    _spec_live_compressor_fp = compressor_settings_fingerprint(
+                        agent.context_compressor
+                    )
+                except Exception:
+                    _spec_live_compressor_fp = None
+            if (
+                speculative_candidate.is_expired(_speculative_max_age)
+                or not speculative_candidate.matches(messages, agent.session_id)
+                or (
+                    _spec_compressor_fp is not None
+                    and _spec_live_compressor_fp is not None
+                    and _spec_compressor_fp != _spec_live_compressor_fp
+                )
+            ):
+                agent._speculative_install_status = "rejected"
+                _release_lock()
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or getattr(agent, "_speculative_epoch", 0)
+                != _epoch_before
+            ):
+                agent._speculative_install_status = "rejected"
+                _release_lock()
+                existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                if not existing_prompt:
+                    existing_prompt = agent._build_system_prompt(system_message)
+                return messages, existing_prompt
+            try:
+                _speculative_compressed = speculative_candidate.assemble(
+                    messages, agent.session_id
+                )
+                live_compressor = agent.context_compressor
+                # Mirror the worker's real verdicts instead of assuming
+                # progress: a no-op candidate (e.g. everything already inside
+                # the tail budget) must feed the anti-thrash accounting the
+                # same way a synchronous no-op does, or a stuck session would
+                # silently stop warning.
+                _candidate_made_progress = getattr(
+                    speculative_candidate, "made_progress", None
+                )
+                live_compressor._last_compression_made_progress = bool(
+                    _candidate_made_progress
+                    if _candidate_made_progress is not None
+                    else True
+                )
+                if not live_compressor._last_compression_made_progress:
+                    # The worker already classified this as an ineffective
+                    # synchronous compression attempt. Carry that verdict to
+                    # the foreground compressor so speculative no-ops cannot
+                    # bypass the same anti-thrash/overflow-warning path.
+                    record_ineffective = getattr(
+                        live_compressor,
+                        "_record_ineffective_compression_verdict",
+                        None,
+                    )
+                    if callable(record_ineffective):
+                        record_ineffective(
+                            int(
+                                getattr(
+                                    live_compressor,
+                                    "_ineffective_compression_count",
+                                    0,
+                                )
+                                or 0
+                            )
+                            + 1
+                        )
+                _candidate_savings_pct = getattr(
+                    speculative_candidate, "savings_pct", None
+                )
+                if _candidate_savings_pct is not None:
+                    live_compressor._last_compression_savings_pct = float(
+                        _candidate_savings_pct
+                    )
+                live_compressor._last_summary_fallback_used = bool(
+                    speculative_candidate.used_fallback
+                )
+                live_compressor._last_feasibility_skip = bool(
+                    speculative_candidate.feasibility_skip
+                )
+                live_compressor._last_summary_error = speculative_candidate.summary_error
+                live_compressor._last_compress_aborted = False
+                if speculative_candidate.previous_summary is not None:
+                    live_compressor._previous_summary = (
+                        speculative_candidate.previous_summary
+                    )
+                if speculative_candidate.summary_has_user_turn is not None:
+                    live_compressor._summary_has_user_turn = (
+                        speculative_candidate.summary_has_user_turn
+                    )
+
+                def _return_speculative_candidate(*_args, **_kwargs):
+                    return _speculative_compressed
+
+                compress_fn = _return_speculative_candidate
+                agent._speculative_install_status = "prepared"
+            except Exception:
+                agent._speculative_install_status = "rejected"
+                raise
         compress_kwargs = _supported_compression_kwargs(
             compress_fn,
             current_tokens=approx_tokens,
@@ -2780,9 +2990,68 @@ def compress_context(
                 )
 
         messages_before_compression = copy.deepcopy(messages)
+        # A rejected speculative install must leave the session row
+        # byte-identical: the durable activity stamp the heartbeat writes
+        # must not advertise "context compression completed" for a candidate
+        # that never crossed the commit boundary. Capture the pre-attempt
+        # activity projection so the rejection/rollback paths below can
+        # restore it verbatim.
+        _activity_row_before = None
+        if speculative_candidate is not None and agent._session_db is not None:
+            try:
+                _sb = agent._session_db.get_session(agent.session_id)
+                if isinstance(_sb, dict):
+                    _activity_row_before = {
+                        "last_activity_at": _sb.get("last_activity_at"),
+                        "last_activity_provenance": _sb.get(
+                            "last_activity_provenance"
+                        ),
+                        "last_activity_description": _sb.get(
+                            "last_activity_description"
+                        ),
+                    }
+            except Exception:
+                _activity_row_before = None
         _activity_heartbeat = _CompressionActivityHeartbeat(
             agent, commit_fence=commit_fence
         ).start()
+
+        def _restore_speculative_activity_row() -> None:
+            if (
+                speculative_candidate is None
+                or _activity_row_before is None
+                or agent._session_db is None
+            ):
+                return
+            _sid = agent.session_id
+            _at = _activity_row_before.get("last_activity_at")
+            _desc = _activity_row_before.get("last_activity_description")
+            _prov = _activity_row_before.get("last_activity_provenance")
+            try:
+                def _do(conn):
+                    # Verbatim restore: touch_session_activity refuses to move
+                    # last_activity_at backwards and normalizes NULLs away, so
+                    # a rejected install would still differ from its pre-attempt
+                    # row. Write the captured projection directly instead.
+                    conn.execute(
+                        "UPDATE sessions SET "
+                        "last_activity_at = ?, "
+                        "last_activity_description = ?, "
+                        "last_activity_provenance = ? "
+                        "WHERE id = ?",
+                        (_at, _desc, _prov, _sid),
+                    )
+
+                agent._session_db._execute_write(
+                    _do,
+                    patience_s=getattr(
+                        agent._session_db, "_ACTIVITY_WRITE_PATIENCE_S", 1.0
+                    ),
+                )
+            except Exception:
+                logger.debug(
+                    "failed to restore speculative activity row", exc_info=True
+                )
         # Publish forward progress to the commit fence while the summary LLM
         # call streams. Async hosts (gateway session hygiene) poll
         # ``commit_fence.seconds_since_progress()`` to extend their deadline
@@ -2840,6 +3109,23 @@ def compress_context(
                 with aux_progress_hook(_progress_hook), aux_interrupt_protection(
                     cancel_event=_hard_cancel_event
                 ):
+                    if (
+                        speculative_candidate is not None
+                        and (
+                            not getattr(agent, "speculative_compression_enabled", False)
+                            or getattr(agent, "_speculative_epoch", 0)
+                            != _epoch_before
+                        )
+                    ):
+                        agent._speculative_install_status = "rejected"
+                        # The heartbeat already stamped terminal activity;
+                        # undo it so a rejected install leaves no durable trace.
+                        _restore_speculative_activity_row()
+                        _release_lock()
+                        existing_prompt = getattr(agent, "_cached_system_prompt", None)
+                        if not existing_prompt:
+                            existing_prompt = agent._build_system_prompt(system_message)
+                        return messages, existing_prompt
                     compressed = compress_fn(messages, **compress_kwargs)
                     # Freeze a hard stop that arrived after the final provider
                     # attempt unwound but before this transaction can rotate
@@ -2921,6 +3207,16 @@ def compress_context(
         raise
     finally:
         if _activity_heartbeat is not None:
+            if (
+                speculative_candidate is not None
+                and agent._speculative_install_status == "rejected"
+            ):
+                # A rejected speculative install must not advertise a durable
+                # "context compression completed" — the attempt never crossed
+                # the commit boundary. Stop the heartbeat suppressed so the
+                # daemon thread terminates without persisting a terminal stamp
+                # (the pre-return restore already rewrote the row verbatim).
+                _activity_heartbeat._suppressed = True
             _activity_heartbeat.stop("context compression completed")
 
     _commit_fence_entered = False
@@ -2976,6 +3272,15 @@ def compress_context(
         # the live list while returning an unchanged snapshot. Neither case may
         # rotate or rewrite the session.
         if compressed == messages_before_compression:
+            if speculative_candidate is not None:
+                # A no-progress candidate is still a real compression attempt:
+                # preserve the anti-thrash accounting used by the synchronous
+                # path, even though it is rejected as a boundary install.
+                live_compressor = agent.context_compressor
+                live_compressor.compression_count = (
+                    int(getattr(live_compressor, "compression_count", 0) or 0) + 1
+                )
+                agent._speculative_install_status = "rejected"
             if messages != messages_before_compression:
                 messages[:] = copy.deepcopy(messages_before_compression)
             logger.info(
@@ -2996,6 +3301,8 @@ def compress_context(
             return messages, _existing_sp
 
         if not compressed:
+            if speculative_candidate is not None:
+                agent._speculative_install_status = "rejected"
             logger.error(
                 "context compression returned an empty transcript; refusing to "
                 "rotate session=%s so the parent remains resumable",
@@ -3163,6 +3470,8 @@ def compress_context(
             agent._cached_system_prompt = new_system_prompt
 
         _session_commit_succeeded = False
+        _in_place_archive_committed = False
+
         split_status = "not_applicable"
         if agent._session_db:
             split_status = "pending"
@@ -3193,6 +3502,15 @@ def compress_context(
                     # WITHOUT destroying history, unlike a hard replace_messages).
                     # See #38763.
                     agent._session_db.archive_and_compact(agent.session_id, compressed)
+                    # archive_and_compact is the atomic durable compaction
+                    # boundary. A later best-effort prompt write can fail, but
+                    # must not relabel this already-published candidate as
+                    # rejected or skip its foreground accounting.
+                    _in_place_archive_committed = True
+                    _session_commit_succeeded = True
+                    agent._last_flushed_db_idx = 0
+
+
                     split_status = "in_place_committed"
                     # Reset the flush identity set so the next turn's appends are
                     # diffed against the COMPACTED transcript: the compacted dicts
@@ -3307,7 +3625,6 @@ def compress_context(
                     agent._session_db.update_system_prompt(
                         agent.session_id, new_system_prompt
                     )
-                    agent._last_flushed_db_idx = 0
                 else:
                     agent._last_flushed_db_idx = len(compressed)
                     agent._flushed_db_message_session_id = agent.session_id
@@ -3329,23 +3646,67 @@ def compress_context(
                     messages[:] = copy.deepcopy(messages_before_compression)
                     compressed = messages
                     _compression_made_progress = False
-                split_status = (
-                    "aborted"
-                    if locals().get("old_session_id") is None and not in_place
-                    else "failed_not_indexed"
-                )
+                if in_place and _in_place_archive_committed:
+                    split_status = "in_place_committed_prompt_update_failed"
+                else:
+                    split_status = (
+                        "aborted"
+                        if locals().get("old_session_id") is None and not in_place
+                        else "failed_not_indexed"
+                    )
+                # A failed durable commit for a speculative candidate must not
+                # advertise "context compression completed" on the session row —
+                # the install was rejected, so leave activity byte-identical.
+                if speculative_candidate is not None and not _session_commit_succeeded:
+                    _restore_speculative_activity_row()
                 # If the rotation rolled back to the parent (orphan-avoidance
                 # above), agent.session_id is the still-indexed parent and
                 # old_session_id was cleared — so this is recovery, not an
                 # un-indexed orphan. Otherwise an earlier step failed before the
                 # child was created and the warning's original meaning holds.
-                if locals().get("old_session_id") is None and not in_place:
+                if in_place and _in_place_archive_committed:
+                    logger.warning(
+                        "Session DB system-prompt update failed after durable "
+                        "in-place compaction for session %s: %s",
+                        agent.session_id or "?",
+                        e,
+                    )
+                elif locals().get("old_session_id") is None and not in_place:
                     logger.warning(
                         "Compression rotation aborted and rolled back to the "
                         "parent session (%s): %s", agent.session_id or "?", e,
                     )
                 else:
                     logger.warning("Session DB compression split failed — new session will NOT be indexed: %s", e)
+
+        if speculative_candidate is not None and agent._speculative_install_status == "prepared":
+            agent._speculative_install_status = (
+                "installed"
+                if agent._session_db is None or _session_commit_succeeded
+                else "rejected"
+            )
+            if agent._speculative_install_status == "installed":
+                # Count speculative work only after the candidate has crossed
+                # the durable session boundary. Rejected assembly/fence paths
+                # and failed publication must not look committed in status/UI.
+                live_compressor = agent.context_compressor
+                live_compressor.compression_count = (
+                    int(getattr(live_compressor, "compression_count", 0) or 0) + 1
+                )
+            if agent._speculative_install_status == "installed":
+                logger.info(
+                    "speculative compression session=%s disposition=installed "
+                    "fingerprint=%s tokens=%s",
+                    agent.session_id or "none",
+                    speculative_candidate.source_fingerprint[:12],
+                    getattr(speculative_candidate, "source_tokens", None),
+                )
+            else:
+                logger.info(
+                    "speculative compression session=%s disposition=rejected "
+                    "(durable commit failed)",
+                    agent.session_id or "none",
+                )
 
         # Compaction-boundary bookkeeping, computed once. `old_session_id` is only
         # bound in the rotation branch; in-place leaves it unset. `_boundary_parent`
@@ -3402,6 +3763,14 @@ def compress_context(
                     new_session_id=agent.session_id or "",
                     old_session_id=_boundary_parent,
                 )
+
+        # Context-engine/session rebinding can reset per-call compressor
+        # fields. Preserve the speculative verdict that was captured before
+        # those callbacks so the foreground accounting remains authoritative.
+        if speculative_candidate is not None:
+            agent.context_compressor._last_compression_made_progress = (
+                _compression_made_progress
+            )
 
         # Notify memory providers of the compaction boundary so provider-cached
         # per-session state (Hindsight's _document_id, accumulated turn buffers,
@@ -3510,7 +3879,18 @@ def compress_context(
             agent.session_id or "none", _pre_msg_count, len(compressed),
             f"{_compressed_est:,}",
         )
-        _commit_status = "committed" if split_status in {"not_applicable", "in_place_committed", "rotated_committed"} else "aborted"
+        _commit_status = (
+            "committed"
+            if split_status
+            in {
+                "not_applicable",
+                "in_place_committed",
+                "in_place_committed_prompt_update_failed",
+                "rotated_committed",
+            }
+            else "aborted"
+        )
+
         _emit_compression_attempt_telemetry(
             agent,
             started_at=_attempt_started_at,

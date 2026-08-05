@@ -1,0 +1,1494 @@
+"""Opt-in, tool-wait-only speculative context compression.
+
+The worker side of this module is deliberately detached from the live agent.
+It owns only a copied transcript and a freshly constructed built-in compressor.
+The foreground path is the only place that can install a candidate or touch
+session state.
+"""
+
+from __future__ import annotations
+
+import contextvars
+import copy
+import hashlib
+import json
+import logging
+import math
+import threading
+import time
+import uuid
+from concurrent.futures import CancelledError, Future, TimeoutError
+from dataclasses import dataclass, field
+from queue import Empty, Queue
+from types import MappingProxyType
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
+
+logger = logging.getLogger(__name__)
+
+_DB_PERSISTED_MARKER = "_db_persisted"
+_TAIL_MARKER = "_speculative_tail_marker"
+_STATUS_PREFIX = "[speculative:"
+_SPECULATIVE_FENCE_INIT_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class SpeculativeCompressionSettings:
+    """Normalized feature settings."""
+
+    enabled: bool = False
+    start_ratio: float = 0.70
+    hard_ratio: float = 0.85
+    max_age_seconds: float = 180.0
+    hard_wait_seconds: float = 2.0
+    during_tool_wait: bool = True
+
+
+DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS = SpeculativeCompressionSettings()
+
+
+def _format_token_budget(value: int) -> str:
+    return f"~{int(value):,}"
+
+
+def _emit_speculative_status(agent: Any, state: str, text: str) -> None:
+    """Surface speculative state without making it part of the transcript."""
+
+    try:
+        agent._vprint(f"{getattr(agent, 'log_prefix', '')}{text}", force=True)
+    except Exception:
+        pass
+    callback = getattr(agent, "status_callback", None)
+    if callback is None:
+        return
+    try:
+        callback("speculative", f"{_STATUS_PREFIX}{state}] {text}")
+    except Exception:
+        logger.debug("speculative status callback failed", exc_info=True)
+
+
+def _pressure_status(
+    settings: SpeculativeCompressionSettings,
+    request_tokens: int,
+    soft_trigger: int,
+    hard_trigger: int,
+) -> str:
+    return (
+        f"estimated {_format_token_budget(request_tokens)} tokens; "
+        f"soft trigger {settings.start_ratio:.2f} ({_format_token_budget(soft_trigger)}), "
+        f"hard trigger {settings.hard_ratio:.2f} ({_format_token_budget(hard_trigger)}); "
+        f"hard wait up to {settings.hard_wait_seconds:.1f}s, then synchronous fallback remains available"
+    )
+
+
+def _parse_bool(value: Any, default: bool, log: logging.Logger, name: str) -> bool:
+    """Parse a boolean config value, warning and defaulting on garbage."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    try:
+        return float(value) != 0.0
+    except (TypeError, ValueError):
+        pass
+    log.warning(
+        "Invalid compression.speculative %s=%r; using default %r",
+        name,
+        value,
+        default,
+    )
+    return default
+
+
+def _finite_float(value: Any, default: float, *, minimum: float | None = None) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return default
+    if not math.isfinite(parsed) or (minimum is not None and parsed < minimum):
+        return default
+    return parsed
+
+
+def normalize_speculative_compression_settings(
+    raw: Any,
+    *,
+    warning_logger: logging.Logger | None = None,
+) -> SpeculativeCompressionSettings:
+    """Normalize ``compression.speculative`` without raising on bad config."""
+
+    log = warning_logger or logger
+    values = raw if isinstance(raw, Mapping) else {}
+    defaults = DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS
+
+    raw_start = values.get("start_ratio", defaults.start_ratio)
+    raw_hard = values.get("hard_ratio", defaults.hard_ratio)
+    try:
+        start = float(raw_start)
+        hard = float(raw_hard)
+        ratios_valid = (
+            math.isfinite(start) and math.isfinite(hard) and 0.0 < start < hard < 1.0
+        )
+    except (TypeError, ValueError):
+        ratios_valid = False
+        start = hard = 0.0
+    if not ratios_valid:
+        log.warning(
+            "Invalid compression.speculative ratios start_ratio=%r hard_ratio=%r; "
+            "using defaults %.2f/%.2f",
+            raw_start,
+            raw_hard,
+            defaults.start_ratio,
+            defaults.hard_ratio,
+        )
+        start = defaults.start_ratio
+        hard = defaults.hard_ratio
+
+    max_age = _finite_float(
+        values.get("max_age_seconds", defaults.max_age_seconds),
+        defaults.max_age_seconds,
+        minimum=0.0,
+    )
+    hard_wait = _finite_float(
+        values.get("hard_wait_seconds", defaults.hard_wait_seconds),
+        defaults.hard_wait_seconds,
+        minimum=0.0,
+    )
+    return SpeculativeCompressionSettings(
+        enabled=_parse_bool(values.get("enabled"), defaults.enabled, log, "enabled"),
+        start_ratio=start,
+        hard_ratio=hard,
+        max_age_seconds=max_age,
+        hard_wait_seconds=max(0.0, hard_wait),
+        during_tool_wait=_parse_bool(
+            values.get("during_tool_wait"),
+            defaults.during_tool_wait,
+            log,
+            "during_tool_wait",
+        ),
+    )
+def is_builtin_compression_eligible(
+    *,
+    api_mode: Any,
+    context_engine: Any,
+) -> bool:
+    """Return whether v1 may use the built-in compressor."""
+
+    if str(api_mode or "") == "codex_app_server":
+        return False
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        return isinstance(context_engine, ContextCompressor)
+    except Exception:
+        return False
+
+
+def _config_speculative_settings() -> SpeculativeCompressionSettings:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly()
+    except Exception:
+        config = {}
+    compression = config.get("compression", {}) if isinstance(config, Mapping) else {}
+    raw_settings = (
+        compression.get("speculative", {})
+        if isinstance(compression, Mapping)
+        else {}
+    )
+    return normalize_speculative_compression_settings(raw_settings)
+
+
+def _apply_speculative_settings(agent: Any, settings: SpeculativeCompressionSettings) -> bool:
+    setattr(agent, "speculative_compression_settings", settings)
+    eligible = bool(
+        getattr(agent, "compression_enabled", False)
+        and settings.enabled
+        and is_builtin_compression_eligible(
+            api_mode=getattr(agent, "api_mode", None),
+            context_engine=getattr(agent, "context_compressor", None),
+        )
+    )
+    setattr(agent, "speculative_compression_enabled", eligible)
+    if eligible:
+        try:
+            setattr(agent, "_speculative_compression_manager", get_default_manager())
+            fence = getattr(agent, "_speculative_commit_fence", None)
+            if fence is None or bool(getattr(fence, "_cancelled", False)):
+                setattr(agent, "_speculative_commit_fence", _new_speculative_commit_fence())
+        except Exception:
+            setattr(agent, "speculative_compression_enabled", False)
+            setattr(agent, "_speculative_compression_manager", None)
+            setattr(agent, "_speculative_commit_fence", None)
+    else:
+        setattr(agent, "_speculative_compression_manager", None)
+    return bool(getattr(agent, "speculative_compression_enabled", False))
+
+
+def _ensure_speculative_epoch(agent: Any) -> None:
+    epoch = getattr(agent, "_speculative_epoch", None)
+    if not isinstance(epoch, int) or isinstance(epoch, bool):
+        setattr(agent, "_speculative_epoch", 0)
+
+
+def _bump_speculative_epoch(agent: Any) -> None:
+    _ensure_speculative_epoch(agent)
+    agent._speculative_epoch += 1
+
+
+def _new_speculative_commit_fence() -> Any:
+    """Construct the narrow fence used only by speculative installs."""
+    from agent.conversation_compression import CompressionCommitFence
+
+    return CompressionCommitFence()
+
+
+def _get_speculative_commit_fence(agent: Any) -> Any:
+    """Return the agent-local speculative commit fence, creating it safely."""
+    fence = getattr(agent, "_speculative_commit_fence", None)
+    if fence is not None:
+        return fence
+    # Agent construction initializes this field. This narrow initialization
+    # lock keeps older already-running agents safe when installer and
+    # /speculative off race during lazy initialization; it is not held during
+    # candidate preparation or session mutation.
+    with _SPECULATIVE_FENCE_INIT_LOCK:
+        fence = getattr(agent, "_speculative_commit_fence", None)
+        if fence is None:
+            fence = _new_speculative_commit_fence()
+            setattr(agent, "_speculative_commit_fence", fence)
+    return fence
+
+
+def _get_speculative_state_lock(agent: Any) -> threading.Lock:
+    """Return the per-agent lock that serializes runtime switch generations."""
+    lock = getattr(agent, "_speculative_state_lock", None)
+    if lock is not None:
+        return lock
+    with _SPECULATIVE_FENCE_INIT_LOCK:
+        lock = getattr(agent, "_speculative_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            setattr(agent, "_speculative_state_lock", lock)
+    return lock
+
+
+def _cancel_speculative_commit_fence(agent: Any) -> None:
+    # Lazily create the same fence an older already-running agent would use in
+    # the installer. This closes the initialization race where /speculative off
+    # could otherwise return before a concurrent installer published its fence.
+    fence = _get_speculative_commit_fence(agent)
+    try:
+        fence.cancel_before_commit()
+    except Exception:
+        logger.debug("speculative commit fence cancellation failed", exc_info=True)
+
+
+def _invalidate_speculative_session(manager: Any, agent: Any) -> None:
+    invalidate = getattr(manager, "invalidate_session", None)
+    if not callable(invalidate):
+        return
+    try:
+        invalidate(str(getattr(agent, "session_id", "") or ""))
+    except Exception:
+        logger.debug(
+            "speculative compression invalidation failed for session=%s",
+            getattr(agent, "session_id", ""),
+            exc_info=True,
+        )
+
+
+def reset_speculative_compression_to_config(agent: Any) -> bool:
+    """Clear the session override and restore config-driven wiring."""
+
+    with _get_speculative_state_lock(agent):
+        setattr(agent, "_speculative_runtime_override", None)
+        manager = getattr(agent, "_speculative_compression_manager", None)
+        setattr(agent, "speculative_compression_enabled", False)
+        _bump_speculative_epoch(agent)
+        _cancel_speculative_commit_fence(agent)
+        _invalidate_speculative_session(manager, agent)
+        return _apply_speculative_settings(agent, _config_speculative_settings())
+
+
+def configure_speculative_compression(agent: Any, enabled: bool) -> bool:
+    """Apply the runtime speculative-compression switch to *agent*.
+
+    Enabling mirrors the construction-time wiring: normalize the current
+    ``compression.speculative`` settings, require ordinary compression and
+    built-in-compressor eligibility, then attach the process manager.  The
+    slash-command switch is intentionally session-local; it does not write
+    config.yaml.
+    """
+
+    with _get_speculative_state_lock(agent):
+        _ensure_speculative_epoch(agent)
+        manager = getattr(agent, "_speculative_compression_manager", None)
+        setattr(agent, "_speculative_runtime_override", bool(enabled))
+        if not enabled:
+            # Clear the flag before cancelling work so a racing foreground or
+            # tool-wait path cannot start more speculative work during invalidation.
+            setattr(agent, "speculative_compression_enabled", False)
+            _bump_speculative_epoch(agent)
+            _cancel_speculative_commit_fence(agent)
+            _invalidate_speculative_session(manager, agent)
+            return False
+
+        settings = _config_speculative_settings()
+        raw_settings = dict(vars(settings))
+        raw_settings = dict(raw_settings) if isinstance(raw_settings, Mapping) else {}
+        # A runtime ``/speculative on`` is an explicit session override.  Keep all
+        # configured thresholds/gates, but do not require the persisted opt-in bit
+        # to be true for this session.
+        raw_settings["enabled"] = True
+        settings = normalize_speculative_compression_settings(raw_settings)
+        return _apply_speculative_settings(agent, settings)
+
+
+def speculative_compression_status(agent: Any) -> str:
+    """Return the authoritative operator-facing runtime switch state."""
+
+    if agent is None:
+        return (
+            "Speculative compression: enabled=False; eligible=False "
+            "(api_mode=uninitialized, context_engine=uninitialized); "
+            "install_status=uninitialized; runtime_override=None; blocker=uninitialized"
+        )
+    api_mode = str(getattr(agent, "api_mode", None) or "unknown")
+    context_engine = getattr(agent, "context_compressor", None)
+    engine_name = type(context_engine).__name__ if context_engine is not None else "none"
+    try:
+        builtin_eligible = is_builtin_compression_eligible(
+            api_mode=api_mode,
+            context_engine=context_engine,
+        )
+    except Exception:
+        builtin_eligible = False
+    eligible = bool(getattr(agent, "compression_enabled", False) and builtin_eligible)
+    if not getattr(agent, "compression_enabled", False):
+        blocker = "compression_disabled"
+    elif api_mode == "codex_app_server":
+        blocker = "codex_app_server"
+    elif not builtin_eligible:
+        blocker = "context_engine_not_builtin"
+    else:
+        blocker = "none"
+    install_status = getattr(agent, "_speculative_install_status", None)
+    if not isinstance(install_status, str) or not install_status:
+        install_status = "none"
+    return (
+        f"Speculative compression: enabled={bool(getattr(agent, 'speculative_compression_enabled', False))}; "
+        f"eligible={bool(eligible)} (api_mode={api_mode}, context_engine={engine_name}); "
+        f"install_status={install_status}; "
+        f"runtime_override={getattr(agent, '_speculative_runtime_override', None)!s}; "
+        f"blocker={blocker}"
+    )
+
+
+def _canonical_value(value: Any, *, top_level: bool = False) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            str(key): _canonical_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if not (top_level and str(key) in {_DB_PERSISTED_MARKER, _TAIL_MARKER})
+        }
+    if isinstance(value, (list, tuple)):
+        return [_canonical_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_canonical_value(item) for item in value), key=repr)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if hasattr(value, "model_dump") and callable(value.model_dump):
+        try:
+            return _canonical_value(value.model_dump())
+        except Exception:
+            pass
+    if hasattr(value, "__dict__"):
+        try:
+            return _canonical_value(vars(value))
+        except Exception:
+            pass
+    return repr(value)
+
+
+def fingerprint_messages(messages: Iterable[Mapping[str, Any]]) -> str:
+    """Hash provider-visible message content deterministically."""
+
+    encoded = json.dumps(
+        [_canonical_value(message, top_level=True) for message in messages],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def memory_context_fingerprint(memory_context: Any) -> str:
+    """Fingerprint sanitized provider context for candidate identity checks."""
+    try:
+        from agent.context_engine import sanitize_memory_context
+
+        normalized = sanitize_memory_context(memory_context or "")
+    except Exception:
+        normalized = str(memory_context or "")
+    return fingerprint_messages([{"memory_context": normalized}])
+
+
+def _freeze(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, tuple):
+        return tuple(_freeze(item) for item in value)
+    if isinstance(value, set):
+        return frozenset(_freeze(item) for item in value)
+    # Unsupported objects are snapshotted by value, not by reference: a
+    # retained mutable object must not mutate the source transcript after
+    # fingerprinting.
+    return copy.deepcopy(value)
+
+
+def _thaw(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    if isinstance(value, frozenset):
+        return {_thaw(item) for item in value}
+    return copy.deepcopy(value)
+
+
+def _message_list(
+    snapshot_messages: Iterable[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    return [_thaw(message) for message in snapshot_messages]
+
+
+def _boundary_splits_tool_batch(messages: List[Mapping[str, Any]], cut: int) -> bool:
+    if cut <= 0 or cut >= len(messages):
+        return False
+    if messages[cut].get("role") == "tool":
+        return True
+    previous = messages[cut - 1]
+    return bool(previous.get("role") == "assistant" and previous.get("tool_calls"))
+
+
+@dataclass(frozen=True)
+class SpeculativeSnapshot:
+    """Immutable copied source state for one candidate job."""
+
+    session_id: str
+    messages: Tuple[Mapping[str, Any], ...]
+    source_fingerprint: str
+    boundary_fingerprint: str
+    cut_index: int
+    compress_start: int
+    original_count: int
+    request_tokens: int | None
+    captured_at: float
+    compressor_fingerprint: str | None = None
+
+    memory_context: str = ""
+    memory_context_fingerprint: str | None = None
+
+    @property
+    def source_message_count(self) -> int:
+        return self.original_count
+
+
+def capture_snapshot(
+    messages: List[Dict[str, Any]],
+    compressor: Any,
+    request_tokens: int | None,
+    session_id: str,
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    memory_context: str = "",
+) -> SpeculativeSnapshot:
+    """Capture a stable prefix/tail boundary using compressor-owned helpers."""
+
+    copied = copy.deepcopy(messages)
+    if not copied:
+        raise ValueError("cannot capture an empty speculative transcript")
+    head_end = compressor._protect_head_size(copied)
+    cut = compressor._find_tail_cut_by_tokens(copied, head_end)
+    cut = compressor._align_boundary_forward(copied, cut)
+    if cut <= head_end or cut >= len(copied):
+        raise ValueError("speculative transcript has no stable compressible window")
+    if _boundary_splits_tool_batch(copied, cut):
+        # The aligner is deterministic: a cut that still splits a batch after
+        # one alignment has no safe forward move. Reject the snapshot — the
+        # synchronous path handles this transcript instead.
+        raise ValueError("speculative boundary splits a tool-call/result batch")
+
+    covered = copied[:cut]
+    boundary = copied[cut]
+    return SpeculativeSnapshot(
+        session_id=str(session_id or ""),
+        messages=tuple(_freeze(message) for message in copied),
+        source_fingerprint=fingerprint_messages(covered),
+        boundary_fingerprint=fingerprint_messages([boundary]),
+        compressor_fingerprint=compressor_settings_fingerprint(compressor),
+        cut_index=cut,
+        compress_start=head_end,
+        original_count=len(copied),
+        request_tokens=request_tokens,
+        captured_at=clock(),
+        memory_context=memory_context if isinstance(memory_context, str) else str(memory_context or ""),
+        memory_context_fingerprint=memory_context_fingerprint(memory_context),
+    )
+
+
+@dataclass(frozen=True)
+class SpeculativeCandidate:
+    """Uncommitted compressed prefix plus source validation metadata."""
+
+    session_id: str
+    source_fingerprint: str
+    boundary_fingerprint: str
+    cut_index: int
+    compress_start: int
+    original_count: int
+    compressed_prefix: Tuple[Mapping[str, Any], ...]
+    created_at: float
+    source_tokens: int | None = None
+    used_fallback: bool = False
+    feasibility_skip: bool = False
+    summary_error: str | None = None
+    previous_summary: str | None = None
+    summary_has_user_turn: bool | None = None
+    made_progress: bool | None = None
+    savings_pct: float | None = None
+    compressor_fingerprint: str | None = None
+    memory_context_fingerprint: str | None = None
+
+    @property
+    def source_session_id(self) -> str:
+        return self.session_id
+
+    @property
+    def compressed_prefix_result(self) -> Tuple[Mapping[str, Any], ...]:
+        return self.compressed_prefix
+
+    def is_expired(self, max_age_seconds: float, *, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        # >= so an explicit 0 means immediate expiry even at the creation
+        # timestamp (elapsed 0 with max_age 0 must already be expired).
+        return now - self.created_at >= max(0.0, float(max_age_seconds))
+
+    def matches(
+        self, messages: List[Dict[str, Any]], session_id: str | None = None
+    ) -> bool:
+        if session_id is not None and str(session_id or "") != self.session_id:
+            return False
+        # A shorter live transcript could be an older/reloaded view. Installing
+        # the candidate into it would silently drop the snapshot's preserved
+        # suffix, so only equal-or-longer transcripts are eligible.
+        if len(messages) < self.original_count or len(messages) < self.cut_index:
+            return False
+        if fingerprint_messages(messages[: self.cut_index]) != self.source_fingerprint:
+            return False
+        if self.cut_index < len(messages):
+            return (
+                fingerprint_messages([messages[self.cut_index]])
+                == self.boundary_fingerprint
+            )
+        return self.cut_index == self.original_count
+
+    def assemble(
+        self, messages: List[Dict[str, Any]], session_id: str | None = None
+    ) -> List[Dict[str, Any]]:
+        if not self.matches(messages, session_id):
+            raise ValueError("speculative candidate no longer matches the transcript")
+        prefix = _message_list(self.compressed_prefix)
+        suffix = copy.deepcopy(messages[self.cut_index :])
+        for message in prefix + suffix:
+            if isinstance(message, dict):
+                message.pop(_TAIL_MARKER, None)
+        return prefix + suffix
+
+
+def build_candidate(
+    snapshot: SpeculativeSnapshot,
+    compressor_factory: Callable[[], Any],
+    *,
+    clock: Callable[[], float] = time.monotonic,
+    cancel_event: threading.Event | None = None,
+) -> SpeculativeCandidate:
+    """Generate a candidate without touching the foreground compressor."""
+
+    worker = compressor_factory()
+    worker_messages = _message_list(snapshot.messages)
+    marker = uuid.uuid4().hex
+    worker_messages[snapshot.cut_index][_TAIL_MARKER] = marker
+    if cancel_event is not None and cancel_event.is_set():
+        raise CancelledError()
+    # The claim in _run_job already linearized past the kill switch, but a
+    # cancel set before this point must still abort before any provider cost.
+    try:
+        compressed = worker.compress(
+            worker_messages,
+            current_tokens=snapshot.request_tokens,
+            force=False,
+            memory_context=snapshot.memory_context,
+        )
+    except Exception:
+        raise
+    if not isinstance(compressed, list) or not compressed:
+        raise ValueError("speculative compressor returned no transcript")
+
+    marker_index = next(
+        (
+            index
+            for index, message in enumerate(compressed)
+            if isinstance(message, dict) and message.get(_TAIL_MARKER) == marker
+        ),
+        None,
+    )
+    if marker_index is None:
+        raise ValueError("speculative compressor did not preserve the tail marker")
+
+    source_tail_head = _message_list(snapshot.messages)[snapshot.cut_index]
+    candidate_tail_head = copy.deepcopy(compressed[marker_index])
+    candidate_tail_head.pop(_TAIL_MARKER, None)
+    if fingerprint_messages([candidate_tail_head]) != fingerprint_messages([
+        source_tail_head
+    ]):
+        # A summary merged into the first tail message cannot be safely spliced
+        # with a later live suffix. Rejecting it preserves the tail verbatim and
+        # lets the synchronous path handle the uncommon alternation collision.
+        raise ValueError("speculative compression rewrote the protected tail")
+
+    prefix = tuple(
+        _freeze(copy.deepcopy(message)) for message in compressed[:marker_index]
+    )
+    if not prefix:
+        raise ValueError("speculative compressor returned an empty compressed prefix")
+
+    return SpeculativeCandidate(
+        session_id=snapshot.session_id,
+        source_fingerprint=snapshot.source_fingerprint,
+        boundary_fingerprint=snapshot.boundary_fingerprint,
+        compressor_fingerprint=snapshot.compressor_fingerprint,
+        cut_index=snapshot.cut_index,
+        compress_start=snapshot.compress_start,
+        original_count=snapshot.original_count,
+        compressed_prefix=prefix,
+        created_at=clock(),
+        source_tokens=snapshot.request_tokens,
+        used_fallback=bool(getattr(worker, "_last_summary_fallback_used", False)),
+        feasibility_skip=bool(getattr(worker, "_last_feasibility_skip", False)),
+        summary_error=getattr(worker, "_last_summary_error", None),
+        previous_summary=getattr(worker, "_previous_summary", None),
+        summary_has_user_turn=getattr(worker, "_summary_has_user_turn", None),
+        made_progress=getattr(worker, "_last_compression_made_progress", None),
+        savings_pct=getattr(worker, "_last_compression_savings_pct", None),
+        memory_context_fingerprint=snapshot.memory_context_fingerprint,
+    )
+
+
+def clone_builtin_compressor(compressor: Any) -> Any:
+    """Build an isolated built-in compressor with the live budget settings."""
+
+    from agent.context_compressor import ContextCompressor
+
+    if not isinstance(compressor, ContextCompressor):
+        raise TypeError("speculative compression requires the built-in compressor")
+    context_length = getattr(compressor, "_resolved_context_length", None)
+    if context_length is None:
+        context_length = compressor.context_length
+    worker = ContextCompressor(
+        model=compressor.model,
+        threshold_percent=compressor.threshold_percent,
+        protect_first_n=compressor.protect_first_n,
+        protect_last_n=compressor.protect_last_n,
+        summary_target_ratio=compressor.summary_target_ratio,
+        quiet_mode=True,
+        summary_model_override=getattr(compressor, "summary_model", "") or None,
+        base_url=getattr(compressor, "base_url", ""),
+        api_key=getattr(compressor, "api_key", ""),
+        config_context_length=context_length,
+        provider=getattr(compressor, "provider", ""),
+        api_mode=getattr(compressor, "api_mode", ""),
+        abort_on_summary_failure=getattr(compressor, "abort_on_summary_failure", False),
+        max_tokens=getattr(compressor, "max_tokens", None),
+        model_thresholds=getattr(compressor, "model_thresholds", None),
+        threshold_tokens_cap=getattr(compressor, "threshold_tokens_cap", None),
+        proactive_prune_tokens=getattr(compressor, "proactive_prune_tokens", 0),
+        proactive_prune_min_result_chars=getattr(
+            compressor, "proactive_prune_min_result_chars", 8000
+        ),
+        proactive_prune_min_reclaim_tokens=getattr(
+            compressor, "proactive_prune_min_reclaim_tokens", 4096
+        ),
+        min_tail_user_messages=getattr(compressor, "min_tail_user_messages", 1),
+    )
+    worker._threshold_tokens = getattr(compressor, "_threshold_tokens", None)
+    for name in (
+        "_summary_failure_cooldown_until",
+        "_last_summary_error",
+        "_cooldown_persist_failed",
+        "_summary_model_fallen_back",
+        "_last_aux_model_failure_error",
+        "_last_aux_model_failure_model",
+    ):
+        if hasattr(compressor, name):
+            setattr(worker, name, getattr(compressor, name))
+    return worker
+
+
+def speculative_thresholds(
+    compressor: Any,
+    settings: SpeculativeCompressionSettings,
+) -> Tuple[int, int]:
+    """Return soft/hard trigger budgets from the effective input window.
+
+    When ``compression.threshold_tokens`` (an absolute cap) is configured
+    below the ratio-derived watermark, ordinary synchronous compression
+    fires at the cap first and the speculative overlap would never engage.
+    Cap the speculative watermarks at the same admission point so the
+    optimization stays aligned with the operator's effective budget.
+    """
+
+    context_length = int(getattr(compressor, "context_length", 0) or 0)
+    max_tokens = getattr(compressor, "max_tokens", None)
+    compute = getattr(type(compressor), "_compute_threshold_tokens", None)
+    if callable(compute) and context_length > 0:
+        soft, hard = (
+            int(compute(context_length, settings.start_ratio, max_tokens)),
+            int(compute(context_length, settings.hard_ratio, max_tokens)),
+        )
+    else:
+        effective = context_length - int(max_tokens or 0)
+        if effective <= 0:
+            effective = context_length
+        soft, hard = (
+            int(effective * settings.start_ratio),
+            int(effective * settings.hard_ratio),
+        )
+    if hard <= soft:
+        # The minimum-window floor collapsed the watermarks (e.g. a 64K
+        # window yields identical soft/hard triggers). Fall back to
+        # hard-only tool-wait overlap: schedule at the collapse point and
+        # let the bounded hard wait decide between a ready candidate and
+        # the synchronous fallback.
+        hard = soft
+    _cap_raw = getattr(compressor, "threshold_tokens_cap", None)
+    try:
+        _cap = int(_cap_raw) if _cap_raw else None
+    except (TypeError, ValueError):
+        _cap = None
+    if _cap and _cap > 0:
+        soft = min(soft, _cap)
+        hard = min(hard, _cap)
+        if hard < soft:
+            hard = soft
+    _live_threshold_raw = getattr(compressor, "threshold_tokens", None)
+    try:
+        _live_threshold = int(_live_threshold_raw) if _live_threshold_raw else None
+    except (TypeError, ValueError):
+        _live_threshold = None
+    if _live_threshold and _live_threshold > 0:
+        soft = min(soft, _live_threshold)
+        hard = min(hard, _live_threshold)
+        if hard < soft:
+            hard = soft
+    return soft, hard
+
+
+def compressor_settings_fingerprint(compressor: Any) -> str:
+    """Fingerprint the compressor settings a candidate was built under.
+
+    A model/context-window/summary-budget change with an unchanged
+    transcript must not reuse a candidate produced by the old compressor:
+    switching from a large to a small context model could install an
+    oversized old-tail candidate that overflows the new window. The
+    snapshot captures this fingerprint and install-time validation
+    rejects any mismatch against the live compressor.
+    """
+
+    return fingerprint_messages([
+        {
+            "model": getattr(compressor, "model", ""),
+            "context_length": (
+                getattr(compressor, "_resolved_context_length", None)
+                or getattr(compressor, "context_length", None)
+            ),
+            "max_tokens": getattr(compressor, "max_tokens", None),
+            "threshold_percent": getattr(compressor, "threshold_percent", None),
+            "summary_target_ratio": getattr(compressor, "summary_target_ratio", None),
+            "protect_first_n": getattr(compressor, "protect_first_n", None),
+            "protect_last_n": getattr(compressor, "protect_last_n", None),
+            "model_thresholds": getattr(compressor, "model_thresholds", None),
+            "threshold_tokens_cap": getattr(compressor, "threshold_tokens_cap", None),
+            "threshold_tokens": getattr(compressor, "threshold_tokens", None),
+        }
+    ])
+
+
+def schedule_tool_wait_candidate(
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    request_tokens: int,
+) -> str:
+    """Capture and schedule one candidate immediately before tool execution."""
+
+    settings = getattr(agent, "speculative_compression_settings", None)
+    manager = getattr(agent, "_speculative_compression_manager", None)
+    compressor = getattr(agent, "context_compressor", None)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    if (
+        not getattr(agent, "speculative_compression_enabled", False)
+        or not isinstance(settings, SpeculativeCompressionSettings)
+        or not settings.during_tool_wait
+        or manager is None
+        or not session_id
+        or not is_builtin_compression_eligible(
+            api_mode=getattr(agent, "api_mode", None),
+            context_engine=compressor,
+        )
+    ):
+        return "disabled"
+    if (
+        getattr(agent, "compression_enabled", False)
+        and not getattr(agent, "_compression_feasibility_checked", False)
+    ):
+        from agent.conversation_compression import check_compression_model_feasibility
+
+        check_compression_model_feasibility(agent)
+        agent._compression_feasibility_checked = True
+    _epoch_before = getattr(agent, "_speculative_epoch", 0)
+    _enabled_before = bool(getattr(agent, "speculative_compression_enabled", False))
+    soft_trigger, _hard_trigger = speculative_thresholds(compressor, settings)
+    if int(request_tokens or 0) < soft_trigger:
+        return "below_soft_trigger"
+    # Do not start NEW worker work while the summary LLM is in failure
+    # cooldown or the anti-thrash breaker has backed off: every worker call
+    # would exercise the exact backend/strategy under backoff. A candidate
+    _cooldown_fn = getattr(
+        compressor, "get_active_compression_failure_cooldown", None
+    )
+    if callable(_cooldown_fn):
+        try:
+            if _cooldown_fn():
+                logger.info(
+                    "speculative compression session=%s disposition=blocked_cooldown",
+                    session_id,
+                )
+                return "blocked_cooldown"
+        except Exception:
+            pass
+    # Gate on the breaker DIRECTLY (not should_compress_info, which reports
+    # no block below the normal compression threshold — with a configured
+    # threshold above start_ratio, an already-tripped ineffective breaker
+    # would still launch workers between the speculative soft trigger and
+    # the normal threshold).
+    _blocked_fn = getattr(compressor, "_automatic_compression_blocked", None)
+    if callable(_blocked_fn):
+        try:
+            if _blocked_fn():
+                logger.info(
+                    "speculative compression session=%s disposition=blocked_ineffective",
+                    session_id,
+                )
+                return "blocked_ineffective"
+        except Exception:
+            pass
+    memory_context = ""
+    memory_manager = getattr(agent, "_memory_manager", None)
+    if memory_manager is not None:
+        try:
+            _maybe_ctx = memory_manager.on_pre_compress(messages)
+            if isinstance(_maybe_ctx, str):
+                try:
+                    from agent.context_engine import sanitize_memory_context
+
+                    memory_context = sanitize_memory_context(_maybe_ctx)
+                except Exception:
+                    memory_context = _maybe_ctx
+        except Exception:
+            pass
+    try:
+        snapshot = capture_snapshot(
+            messages,
+            compressor,
+            int(request_tokens),
+            session_id,
+            memory_context=memory_context,
+        )
+        # The runtime switch must serialize the final epoch check with
+        # maybe_start(). Without this, /speculative off can return after the
+        # check but before the worker is launched; a later on could then accept
+        # that old-generation candidate. Snapshot capture remains outside this
+        # narrow lock because it is pure and potentially expensive.
+        with _get_speculative_state_lock(agent):
+            if (
+                not getattr(agent, "speculative_compression_enabled", False)
+                or bool(getattr(agent, "speculative_compression_enabled", False))
+                != _enabled_before
+                or getattr(agent, "_speculative_epoch", 0) != _epoch_before
+            ):
+                return "blocked_off"
+            _emit_speculative_status(
+                agent,
+                "queued",
+                "Speculative compaction queued — "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+            disposition = manager.maybe_start(
+                session_id,
+                snapshot,
+                lambda source=compressor: clone_builtin_compressor(source),
+                max_age_seconds=settings.max_age_seconds,
+            )
+        if disposition in {"started", "coalesced"}:
+            _emit_speculative_status(
+                agent,
+                "preparing",
+                "Speculative compaction preparing during tool wait — "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+        elif disposition == "ready":
+            _emit_speculative_status(
+                agent,
+                "preparing",
+                "Speculative compaction prepared — candidate is ready for the next "
+                "foreground pressure check; "
+                + _pressure_status(
+                    settings, int(request_tokens), soft_trigger, _hard_trigger
+                ),
+            )
+        return disposition
+    except Exception:
+        logger.debug(
+            "speculative compression snapshot unavailable for session=%s",
+            session_id,
+            exc_info=True,
+        )
+        return "unavailable"
+
+
+@dataclass
+class _Job:
+    snapshot: SpeculativeSnapshot | None
+    future: Future
+    cancel_event: threading.Event
+    started_at: float
+    max_age_seconds: float
+    published: threading.Event = field(default_factory=threading.Event)
+    generation: object = field(default_factory=object)
+    start_event: threading.Event = field(default_factory=threading.Event)
+    rerun_snapshot: SpeculativeSnapshot | None = None
+    rerun_factory: Callable[[], Any] | None = None
+    rerun_context: contextvars.Context | None = None
+    candidate: SpeculativeCandidate | None = None
+    error: BaseException | None = None
+
+
+class _DaemonExecutor:
+    """Small daemon-only executor for disposable speculative work."""
+
+    def __init__(self, max_workers: int, thread_name_prefix: str):
+        self._queue: Queue[tuple[Future, Callable[..., Any], tuple, dict] | None] = (
+            Queue()
+        )
+        self._lock = threading.Lock()
+        self._shutdown = False
+        self._threads = [
+            threading.Thread(
+                target=self._worker,
+                name=f"{thread_name_prefix}_{index}",
+                daemon=True,
+            )
+            for index in range(max_workers)
+        ]
+
+    def start(self) -> None:
+        for thread in self._threads:
+            thread.start()
+
+    def submit(self, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> Future:
+        future: Future = Future()
+        with self._lock:
+            if self._shutdown:
+                raise RuntimeError("speculative executor has been shut down")
+            self._queue.put((future, fn, args, kwargs))
+        return future
+
+    def _worker(self) -> None:
+        while True:
+            item = self._queue.get()
+            try:
+                if item is None:
+                    return
+                future, fn, args, kwargs = item
+                if future.set_running_or_notify_cancel():
+                    try:
+                        future.set_result(fn(*args, **kwargs))
+                    except BaseException as exc:
+                        future.set_exception(exc)
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, *, wait: bool = True, cancel_futures: bool = True) -> None:
+        with self._lock:
+            self._shutdown = True
+            if cancel_futures:
+                while True:
+                    try:
+                        item = self._queue.get_nowait()
+                    except Empty:
+                        break
+                    if item is not None:
+                        item[0].cancel()
+                    self._queue.task_done()
+            for _thread in self._threads:
+                self._queue.put(None)
+        if wait:
+            for thread in self._threads:
+                thread.join()
+
+
+class SpeculativeCompressionManager:
+    """Single-flight process-local candidate manager keyed by session id."""
+
+    def __init__(
+        self, *, max_workers: int = 2, clock: Callable[[], float] = time.monotonic
+    ):
+        self._lock = threading.Lock()
+        self._entries: Dict[str, _Job] = {}
+        self._executor: _DaemonExecutor | None = None
+        self._max_workers = max(1, int(max_workers))
+        self._clock = clock
+        self._shutdown = False
+
+    def _get_executor(self) -> _DaemonExecutor:
+        if self._executor is None:
+            self._executor = _DaemonExecutor(
+                self._max_workers, "hermes-speculative-compression"
+            )
+            self._executor.start()
+        return self._executor
+
+    def _prune_completed_entries(self, now: float) -> None:
+        """Drop completed entries with no pending rerun and no live candidate.
+
+        One-shot gateway sessions otherwise retain full snapshots, candidates,
+        and exception-bearing futures/tracebacks indefinitely in the
+        process-global manager. Called on every manager access point.
+        """
+        for sid, job in list(self._entries.items()):
+            if (
+                job.future.done()
+                and job.published.is_set()
+                and job.rerun_snapshot is None
+                and (
+                    job.candidate is None
+                    or job.candidate.is_expired(job.max_age_seconds, now=now)
+                )
+            ):
+                self._entries.pop(sid, None)
+
+    def _submit_job(
+        self,
+        session_id: str,
+        snapshot: SpeculativeSnapshot,
+        compressor_factory: Callable[[], Any],
+        *,
+        max_age_seconds: float,
+        published: threading.Event | None = None,
+        execution_context: contextvars.Context | None = None,
+    ) -> _Job:
+        cancel_event = threading.Event()
+        start_event = threading.Event()
+        generation = object()
+        if execution_context is None:
+            execution_context = contextvars.Context()
+        future = self._get_executor().submit(
+            execution_context.run,
+            self._run_job,
+            str(session_id),
+            generation,
+            snapshot,
+            compressor_factory,
+            cancel_event,
+            start_event,
+        )
+        job = _Job(
+            snapshot=snapshot,
+            future=future,
+            cancel_event=cancel_event,
+            started_at=self._clock(),
+            max_age_seconds=max_age_seconds,
+            published=published if published is not None else threading.Event(),
+            generation=generation,
+            start_event=start_event,
+        )
+        self._entries[str(session_id)] = job
+        start_event.set()
+        return job
+
+    def maybe_start(
+        self,
+        session_id: str,
+        snapshot: SpeculativeSnapshot,
+        compressor_factory: Callable[[], Any],
+        *,
+        max_age_seconds: float = 180.0,
+    ) -> str:
+        if not session_id or snapshot.session_id != str(session_id):
+            return "rejected"
+        with self._lock:
+            if self._shutdown:
+                return "shutdown"
+            self._prune_completed_entries(self._clock())
+            existing = self._entries.get(str(session_id))
+            if existing is not None and not existing.future.done():
+                existing.rerun_snapshot = snapshot
+                existing.rerun_factory = compressor_factory
+                existing.rerun_context = contextvars.copy_context()
+                logger.info(
+                    "speculative compression session=%s disposition=coalesced fingerprint=%s",
+                    session_id,
+                    snapshot.source_fingerprint[:12],
+                )
+                return "coalesced"
+            if existing is not None and existing.candidate is not None:
+                if not existing.candidate.is_expired(
+                    max_age_seconds, now=self._clock()
+                ):
+                    if (
+                        existing.candidate.source_fingerprint
+                        == snapshot.source_fingerprint
+                        and existing.candidate.boundary_fingerprint
+                        == snapshot.boundary_fingerprint
+                        and existing.candidate.cut_index == snapshot.cut_index
+                        and (
+                            snapshot.memory_context_fingerprint is None
+                            or existing.candidate.memory_context_fingerprint
+                            == snapshot.memory_context_fingerprint
+                        )
+                        and (
+                            snapshot.compressor_fingerprint is None
+                            or existing.candidate.compressor_fingerprint
+                            == snapshot.compressor_fingerprint
+                        )
+                    ):
+                        return "ready"
+                    # A completed candidate for a changed prefix cannot be
+                    # reused. Drop it so this newer snapshot gets a fresh job.
+                self._entries.pop(str(session_id), None)
+            job = self._submit_job(
+                str(session_id),
+                snapshot,
+                compressor_factory,
+                max_age_seconds=max_age_seconds,
+                execution_context=contextvars.copy_context(),
+            )
+            future = job.future
+            logger.info(
+                "speculative compression session=%s disposition=started fingerprint=%s source_tokens=%s",
+                session_id,
+                snapshot.source_fingerprint[:12],
+                snapshot.request_tokens,
+            )
+        # Register OUTSIDE the lock: if the future already completed, the
+        # callback runs synchronously on this thread and _finish_job() needs
+        # the lock — registering while holding it would deadlock the global
+        # manager (verified: a fast no-op/error froze every session sharing
+        # the default manager).
+        future.add_done_callback(
+            lambda done, sid=str(session_id): self._finish_job(sid, done)
+        )
+        return "started"
+
+    def _run_job(
+        self,
+        session_id: str,
+        generation: object,
+        snapshot: SpeculativeSnapshot,
+        compressor_factory: Callable[[], Any],
+        cancel_event: threading.Event,
+        start_event: threading.Event,
+    ) -> SpeculativeCandidate:
+        start_event.wait()
+        worker = compressor_factory()
+        with self._lock:
+            current = self._entries.get(str(session_id))
+            if (
+                current is None
+                or current.generation is not generation
+                or cancel_event.is_set()
+            ):
+                raise CancelledError()
+            # Linearization point for the kill switch: from here the job is
+            # committed to run to completion. invalidate_session() serializes
+            # on the same lock — an invalidation that returns after this check
+            # has already popped the entry, so the candidate can never be
+            # published; an invalidation that ran before it has set
+            # cancel_event, which build_candidate() observes again immediately
+            # before provider egress. No provider work begins after
+            # invalidate_session() returns.
+        candidate = build_candidate(
+            snapshot,
+            lambda: worker,
+            cancel_event=cancel_event,
+        )
+        if cancel_event.is_set():
+            raise CancelledError()
+        return candidate
+
+    def _finish_job(self, session_id: str, future: Future) -> None:
+        next_future = None
+        rerun_snapshot = None
+        with self._lock:
+            job = self._entries.get(session_id)
+            if job is None or job.future is not future:
+                return
+            try:
+                job.candidate = future.result()
+                job.error = None
+                logger.info(
+                    "speculative compression session=%s disposition=ready fingerprint=%s",
+                    session_id,
+                    job.candidate.source_fingerprint[:12],
+                )
+            except CancelledError:
+                job.error = None
+                logger.info(
+                    "speculative compression session=%s disposition=cancelled",
+                    session_id,
+                )
+            except BaseException as exc:
+                job.error = exc
+                logger.info(
+                    "speculative compression session=%s disposition=failed (%s: %s)",
+                    session_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+            pending = job.rerun_snapshot
+            factory = job.rerun_factory
+            if pending is not None and factory is not None:
+                if job.candidate is not None and (
+                    pending.source_fingerprint == job.candidate.source_fingerprint
+                    and pending.boundary_fingerprint == job.candidate.boundary_fingerprint
+                    and pending.cut_index == job.candidate.cut_index
+                    and pending.compressor_fingerprint == job.candidate.compressor_fingerprint
+                    and (
+                        pending.memory_context_fingerprint is None
+                        or pending.memory_context_fingerprint
+                        == job.candidate.memory_context_fingerprint
+                    )
+                ):
+                    # Rerun dedup compares the complete snapshot identity.
+                    job.rerun_snapshot = None
+                    job.rerun_factory = None
+                    job.rerun_context = None
+                    job.published.set()
+                    self._prune_completed_entries(self._clock())
+                    return
+                if not self._shutdown:
+                    rerun_snapshot = pending
+                    next_job = self._submit_job(
+                        session_id,
+                        pending,
+                        factory,
+                        max_age_seconds=job.max_age_seconds,
+                        published=job.published,
+                        execution_context=job.rerun_context,
+                    )
+                    next_future = next_job.future
+                    job.rerun_snapshot = None
+                    job.rerun_factory = None
+                    job.rerun_context = None
+
+            if next_future is None:
+                # Publish AFTER the future completes so waiters can distinguish
+                # a ready/errored result from an in-flight one. A replacement
+                # job owns the shared publication event when a rerun is queued.
+                job.published.set()
+            self._prune_completed_entries(self._clock())
+
+        if next_future is not None:
+            # Register outside the lock: a fast rerun may already be complete.
+            next_future.add_done_callback(
+                lambda done, sid=session_id: self._finish_job(sid, done)
+            )
+            logger.info(
+                "speculative compression session=%s disposition=rerun fingerprint=%s",
+                session_id,
+                rerun_snapshot.source_fingerprint[:12],
+            )
+
+    def take_matching_candidate(
+        self,
+        session_id: str,
+        messages: List[Dict[str, Any]],
+        *,
+        wait_seconds: float = 0.0,
+        max_age_seconds: float = 180.0,
+    ) -> SpeculativeCandidate | None:
+        sid = str(session_id or "")
+        with self._lock:
+            self._prune_completed_entries(self._clock())
+            job = self._entries.get(sid)
+            future = job.future if job is not None and not job.future.done() else None
+            published = job.published if job is not None else None
+        if wait_seconds > 0:
+            if published is not None:
+                # Wait for the manager-owned publication, which _finish_job
+                # sets AFTER the future completes and the candidate is
+                # stored. Waiting on the future alone races the callback and
+                # can miss a ready candidate (observed flake in the rerun
+                # test).
+                published.wait(timeout=max(0.0, float(wait_seconds)))
+            elif future is not None:
+                try:
+                    future.result(timeout=max(0.0, float(wait_seconds)))
+                except BaseException:
+                    pass
+
+        with self._lock:
+            job = self._entries.get(sid)
+            if job is None:
+                return None
+            candidate = job.candidate
+            if candidate is None:
+                return None
+            if candidate.is_expired(max_age_seconds, now=self._clock()):
+                self._entries.pop(sid, None)
+                logger.info(
+                    "speculative compression session=%s disposition=stale", sid
+                )
+                return None
+            if not candidate.matches(messages, sid):
+                self._entries.pop(sid, None)
+                logger.info(
+                    "speculative compression session=%s disposition=stale", sid
+                )
+                return None
+            job.candidate = None
+            self._entries.pop(sid, None)
+            return candidate
+
+    def invalidate_session(self, session_id: str) -> None:
+        sid = str(session_id or "")
+        with self._lock:
+            job = self._entries.pop(sid, None)
+            if job is None:
+                return
+            job.cancel_event.set()
+            job.future.cancel()
+            logger.info(
+                "speculative compression session=%s disposition=cancelled", sid
+            )
+
+    def restore_candidate(
+        self, session_id: str, candidate: SpeculativeCandidate
+    ) -> None:
+        """Requeue a claimed candidate whose install was deferred.
+
+        ``take_matching_candidate`` consumes destructively so a candidate is
+        never double-installed; when the foreground install path loses the
+        compression lock (or is otherwise deferred), the candidate is still
+        valid and must not be discarded. Re-insert it as a completed entry so
+        a later take can reclaim it. A running job or a newer candidate for
+        the same session wins over the restore.
+        """
+        sid = str(session_id or "")
+        with self._lock:
+            if self._shutdown:
+                return
+            self._prune_completed_entries(self._clock())
+            existing = self._entries.get(sid)
+            if existing is not None:
+                if existing.candidate is not None or not existing.future.done():
+                    return
+            done = Future()
+            done.set_result(candidate)
+            restored_job = _Job(
+                snapshot=None,
+                future=done,
+                cancel_event=threading.Event(),
+                started_at=self._clock(),
+                max_age_seconds=180.0,
+                candidate=candidate,
+            )
+            restored_job.published.set()
+            self._entries[sid] = restored_job
+            logger.info(
+                "speculative compression session=%s disposition=restored fingerprint=%s",
+                sid,
+                candidate.source_fingerprint[:12],
+            )
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        with self._lock:
+            if self._shutdown:
+                return
+            self._shutdown = True
+            jobs = list(self._entries.values())
+            self._entries.clear()
+            executor = self._executor
+            for job in jobs:
+                job.cancel_event.set()
+                job.future.cancel()
+        if executor is not None:
+            executor.shutdown(wait=wait, cancel_futures=True)
+
+
+_DEFAULT_MANAGER: SpeculativeCompressionManager | None = None
+_DEFAULT_MANAGER_LOCK = threading.Lock()
+
+
+def get_default_manager() -> SpeculativeCompressionManager:
+    global _DEFAULT_MANAGER
+    with _DEFAULT_MANAGER_LOCK:
+        if _DEFAULT_MANAGER is None:
+            _DEFAULT_MANAGER = SpeculativeCompressionManager(max_workers=2)
+        return _DEFAULT_MANAGER
+
+
+def shutdown_default_manager() -> None:
+    global _DEFAULT_MANAGER
+    with _DEFAULT_MANAGER_LOCK:
+        manager = _DEFAULT_MANAGER
+        _DEFAULT_MANAGER = None
+    if manager is not None:
+        manager.shutdown()
+
+
+__all__ = [
+    "DEFAULT_SPECULATIVE_COMPRESSION_SETTINGS",
+    "SpeculativeCandidate",
+    "SpeculativeCompressionManager",
+    "SpeculativeCompressionSettings",
+    "SpeculativeSnapshot",
+    "build_candidate",
+    "capture_snapshot",
+    "clone_builtin_compressor",
+    "configure_speculative_compression",
+    "fingerprint_messages",
+    "memory_context_fingerprint",
+    "get_default_manager",
+    "is_builtin_compression_eligible",
+    "normalize_speculative_compression_settings",
+    "reset_speculative_compression_to_config",
+    "schedule_tool_wait_candidate",
+    "speculative_compression_status",
+    "shutdown_default_manager",
+    "speculative_thresholds",
+]

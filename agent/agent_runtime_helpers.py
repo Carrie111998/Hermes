@@ -2693,6 +2693,24 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             api_mode=agent.api_mode,
         )
 
+        # /speculative is session-runtime state. A model switch re-derives the
+        # compressor and must return speculative wiring to config control.
+        try:
+            from agent.speculative_compression import reset_speculative_compression_to_config
+
+            reset_speculative_compression_to_config(agent)
+        except Exception:
+            agent._speculative_runtime_override = None
+            agent.speculative_compression_enabled = False
+            agent._speculative_compression_manager = None
+    else:
+        # A disabled/ineligible agent can still carry a stale runtime marker
+        # across an in-place model update. There is no compressor to rewire,
+        # so explicitly return it to config-driven disabled state.
+        agent._speculative_runtime_override = None
+        agent.speculative_compression_enabled = False
+        agent._speculative_compression_manager = None
+
     # ── Re-resolve reasoning_config from per-model override ──
     # The new model may have a different reasoning_effort override. Re-read
     # config so the override takes effect immediately on /model switch —

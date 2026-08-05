@@ -2580,6 +2580,47 @@ class TestHandleMaxIterations:
         assert messages[1]["codex_reasoning_items"] == [{"id": "rs_1"}]
 
 
+    def test_summary_strips_display_timeline_fields(self, agent):
+        """Regression: the max-iterations summary request must NOT carry
+        display-only timeline metadata — display_kind (compaction references
+        marked "hidden", model_switch, skill_invocation, async_delegation_complete),
+        display_metadata, or effect_disposition. These reach the live message
+        list on TUI/gateway sessions and interrupt checkpoints; the main loop's
+        api_messages build strips them (agent/conversation_loop.py) and the
+        transport strips effect_disposition, but this hand-built summary path
+        bypasses both. Strict backends (Fireworks) reject them with 400
+        'Extra inputs are not permitted, field: messages[N].display_kind'."""
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        messages = [
+            {"role": "user", "content": "do stuff"},
+            {
+                "role": "assistant",
+                "tool_calls": [{"id": "call_1", "function": {"name": "execute_code", "arguments": "{}"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "result", "effect_disposition": "none"},
+            {
+                "role": "assistant",
+                "content": "[This response was interrupted by a user correction.]",
+                "display_kind": "hidden",
+                "display_metadata": {"kind": "checkpoint"},
+            },
+            {"role": "user", "content": "more stuff"},
+        ]
+
+        result = agent._handle_max_iterations(messages, 60)
+
+        assert result == "Summary"
+        sent_msgs = agent.client.chat.completions.create.call_args.kwargs.get("messages", [])
+        for m in sent_msgs:
+            assert "display_kind" not in m, m
+            assert "display_metadata" not in m, m
+            assert "effect_disposition" not in m, m
+        # Internal history is untouched — the path copies each message.
+        assert messages[2]["effect_disposition"] == "none"
+        assert messages[3]["display_kind"] == "hidden"
+
+
 
 
 
@@ -2912,6 +2953,185 @@ class TestRunConversation:
         assert result["api_calls"] == 2
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
+
+    def test_post_tool_loop_installs_ready_speculative_candidate(self, agent):
+        from agent.speculative_compression import SpeculativeCompressionSettings
+
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.speculative_compression_enabled = True
+        agent.speculative_compression_settings = SpeculativeCompressionSettings(
+            enabled=True,
+            start_ratio=0.01,
+            hard_ratio=0.02,
+        )
+        candidate = object()
+
+        class CandidateManager:
+            def __init__(self):
+                self.take_calls = []
+
+            def maybe_start(self, *_args, **_kwargs):
+                return "started"
+
+            def take_matching_candidate(self, session_id, messages, **kwargs):
+                self.take_calls.append((session_id, messages, kwargs))
+                return candidate if len(messages) >= 3 else None
+
+        manager = CandidateManager()
+        agent._speculative_compression_manager = manager
+        agent.context_compressor.last_prompt_tokens = 0
+        tool_complete = False
+
+        def execute_tool(*_args, **_kwargs):
+            nonlocal tool_complete
+            tool_complete = True
+            return "tool result"
+
+        def should_compress(_tokens):
+            return tool_complete
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        def install_candidate(messages, _system_message, **kwargs):
+            nonlocal tool_complete
+            assert kwargs["speculative_candidate"] is candidate
+            agent._speculative_install_status = "installed"
+            agent._last_compression_attempt_recorded = True
+            agent._last_compression_attempt_in_place = True
+            agent._last_compaction_in_place = True
+            tool_complete = False
+            return (
+                [
+                    {"role": "user", "content": "prepared summary"},
+                    *messages[1:],
+                ],
+                "prepared system prompt",
+            )
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=execute_tool),
+            patch.object(
+                agent.context_compressor,
+                "should_compress",
+                side_effect=should_compress,
+            ),
+            patch.object(
+                agent, "_compress_context", side_effect=install_candidate
+            ) as compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == "Done searching"
+        assert compress.call_count == 1
+        assert manager.take_calls
+        assert len(manager.take_calls[-1][1]) >= 3
+        assert result["messages"][0]["content"] == "prepared summary"
+        assert result["messages"][-1]["content"] == "Done searching"
+        assert any(
+            message.get("role") == "system"
+            and message.get("content") == "prepared system prompt"
+            for message in agent.client.chat.completions.create.call_args_list[-1].kwargs[
+                "messages"
+            ]
+        )
+        assert agent._empty_content_retries == 0
+        assert agent._thinking_prefill_retries == 0
+        assert agent._mute_post_response is False
+
+    def test_post_tool_loop_schedules_and_installs_real_candidate(
+        self, agent, monkeypatch
+    ):
+        from agent.speculative_compression import (
+            SpeculativeCompressionManager,
+            SpeculativeCompressionSettings,
+        )
+
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent.speculative_compression_enabled = True
+        agent.speculative_compression_settings = SpeculativeCompressionSettings(
+            enabled=True,
+            start_ratio=0.01,
+            hard_ratio=0.02,
+            hard_wait_seconds=0.5,
+        )
+        manager = SpeculativeCompressionManager(max_workers=1)
+        agent._speculative_compression_manager = manager
+        agent.context_compressor.last_prompt_tokens = 0
+        agent.context_compressor._protect_head_size = lambda _messages: 0
+        agent.context_compressor._find_tail_cut_by_tokens = (
+            lambda _messages, _head_end: 1
+        )
+        agent.context_compressor._align_boundary_forward = (
+            lambda _messages, cut: cut
+        )
+        statuses = []
+        agent.status_callback = lambda kind, text: statuses.append((kind, text))
+        compression_pressure = False
+
+        class DeterministicWorker:
+            _last_summary_fallback_used = False
+
+            def compress(self, messages, **_kwargs):
+                marker_index = next(
+                    index
+                    for index, message in enumerate(messages)
+                    if message.get("_speculative_tail_marker")
+                )
+                return [
+                    {"role": "user", "content": "worker-prepared summary"},
+                    *messages[marker_index:],
+                ]
+
+        monkeypatch.setattr(
+            "agent.speculative_compression.clone_builtin_compressor",
+            lambda _source: DeterministicWorker(),
+        )
+        monkeypatch.setattr(
+            "agent.speculative_compression.speculative_thresholds",
+            lambda _compressor, _settings: (1, 2),
+        )
+        def should_compress(_tokens):
+            return compression_pressure and agent._speculative_install_status != "installed"
+
+        def execute_tool(**_kwargs):
+            nonlocal compression_pressure
+            compression_pressure = True
+            return "search result"
+
+        tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done searching", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+
+        try:
+            with (
+                patch(
+                    "run_agent.handle_function_call",
+                    side_effect=execute_tool,
+                ),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("search something")
+        finally:
+            manager.shutdown()
+
+        assert result["final_response"] == "Done searching"
+        assert result["messages"][0]["content"] == "worker-prepared summary"
+        assert agent._speculative_install_status == "installed"
+        assert any(kind == "speculative" and "queued" in text for kind, text in statuses)
+        assert any(
+            kind == "speculative" and "installed" in text for kind, text in statuses
+        )
 
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
@@ -6141,4 +6361,5 @@ class TestMemoryContextSanitization:
         assert "memory-context" not in result.lower()
         assert "stale observation" not in result
         assert "how is the honcho working" in result
+
 

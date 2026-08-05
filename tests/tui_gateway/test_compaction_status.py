@@ -65,3 +65,20 @@ def test_manual_compressing_kind_is_preserved(server, monkeypatch):
     assert events[0]["kind"] == "compressing"
 
 
+def test_speculative_status_exposes_state_without_leaking_transport_marker(
+    server, monkeypatch
+):
+    events = _capture(server, monkeypatch)
+    server._status_update(
+        "sid",
+        "speculative",
+        "[speculative:preparing] Speculative compaction preparing during tool wait",
+    )
+
+    assert events == [
+        {
+            "kind": "speculative",
+            "state": "preparing",
+            "text": "Speculative compaction preparing during tool wait",
+        }
+    ]

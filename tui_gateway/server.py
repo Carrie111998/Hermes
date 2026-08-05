@@ -1816,6 +1816,13 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     if not body:
         return
     out_kind = kind if text is not None else "status"
+    state = None
+    if out_kind == "speculative" and body.startswith("[speculative:"):
+        state_start = len("[speculative:")
+        state_end = body.find("] ", state_start)
+        if state_end > state_start:
+            state = body[state_start:state_end]
+            body = body[state_end + 2 :].strip()
     # Auto-compaction reaches us as a generic "lifecycle" status. Re-tag it so
     # drivers (desktop app) can show an explicit "Summarizing…" indicator —
     # otherwise a mid-turn compaction looks like the transcript reset itself.
@@ -1824,7 +1831,10 @@ def _status_update(sid: str, kind: str, text: str | None = None):
 
         if COMPACTION_STATUS_MARKER in body:
             out_kind = "compacting"
-    _emit("status.update", sid, {"kind": out_kind, "text": body})
+    payload = {"kind": out_kind, "text": body}
+    if state is not None:
+        payload["state"] = state
+    _emit("status.update", sid, payload)
 
 
 def _estimate_image_tokens(width: int, height: int) -> int:
@@ -5014,7 +5024,8 @@ def _session_info(agent, session: dict | None = None) -> dict:
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
-    cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
+    display_cfg = _load_cfg().get("display") or {}
+    cfg_personality = display_cfg.get("personality") or ""
     personality = (session or {}).get("personality", cfg_personality)
     reasoning_config = getattr(agent, "reasoning_config", None)
     reasoning_effort = ""
@@ -5085,6 +5096,20 @@ def _session_info(agent, session: dict | None = None) -> dict:
         )
         if isinstance(session, dict) and session.get("profile_home")
         else _current_profile_name(),
+
+        # Speculative compression observability for the TUI status bar:
+        # None = feature off; "enabled" = armed; "installed" = a speculative
+        # candidate was committed during this session.
+        "speculative_compression": (
+            "installed"
+            if bool(getattr(agent, "speculative_compression_enabled", False))
+            and getattr(agent, "_speculative_install_status", None) == "installed"
+            else (
+                "enabled"
+                if bool(getattr(agent, "speculative_compression_enabled", False))
+                else None
+            )
+        ),
     }
     try:
         from hermes_cli import __version__, __release_date__
