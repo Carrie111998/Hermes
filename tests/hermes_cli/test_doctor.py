@@ -51,6 +51,35 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+class TestProfileAliasDetection:
+    def test_detects_generated_posix_and_windows_wrappers(self):
+        assert (
+            doctor._profile_alias_target_from_wrapper(
+                '#!/bin/sh\nexec /usr/local/bin/hermes -p papabank "$@"\n'
+            )
+            == "papabank"
+        )
+        assert (
+            doctor._profile_alias_target_from_wrapper(
+                "@echo off\r\nhermes -p papabank %*\r\n"
+            )
+            == "papabank"
+        )
+
+    def test_ignores_health_utilities_that_loop_over_profiles(self):
+        utility = """#!/bin/zsh
+profiles=(default eva doc)
+for p in $profiles; do
+  cmd=(hermes -p "$p")
+done
+"""
+        assert doctor._profile_alias_target_from_wrapper(utility) is None
+
+    def test_ignores_two_line_wrapper_for_an_unrelated_executable(self):
+        unrelated = '#!/bin/sh\nexec /usr/local/bin/tool -p archived "$@"\n'
+        assert doctor._profile_alias_target_from_wrapper(unrelated) is None
+
+
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):
         unavailable = [

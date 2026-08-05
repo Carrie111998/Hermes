@@ -2158,6 +2158,10 @@ DEFAULT_CONFIG = {
     },
 
     "cron": {
+        # Maximum terminal execution attempts retained in each profile-local
+        # cron/executions.db. In-flight rows are always preserved. High-rate
+        # profiles can raise this without changing global scheduler behavior.
+        "max_terminal_executions": 1000,
         # Fail closed when an unpinned job's current global model/provider
         # differs from its creation-time snapshot. This prevents unattended
         # jobs from silently inheriting a paid default. Set to false only when

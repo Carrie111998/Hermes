@@ -65,6 +65,113 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     assert executions.latest_execution("live")["status"] == "running"
 
 
+def test_retention_limit_can_be_set_per_profile_config(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"cron": {"max_terminal_executions": 4321}},
+    )
+
+    assert executions._get_max_terminal_executions() == 4321
+
+    from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+    assert DEFAULT_CONFIG["cron"]["max_terminal_executions"] == 1000
+
+
+def test_retention_env_override_wins_and_invalid_value_uses_profile_config(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "7654")
+    assert executions._get_max_terminal_executions() == 7654
+
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "not-a-number")
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"cron": {"max_terminal_executions": 4321}},
+    )
+    assert executions._get_max_terminal_executions() == 4321
+
+
+def test_managed_retention_wins_over_environment(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    user_config = tmp_path / "user-config.yaml"
+    user_config.write_text(
+        "cron:\n  max_terminal_executions: 5000\n", encoding="utf-8"
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text(
+        "cron:\n  max_terminal_executions: 9000\n", encoding="utf-8"
+    )
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: user_config)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "0")
+
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    assert executions._get_max_terminal_executions() == 9000
+
+
+def test_malformed_managed_retention_config_fails_closed(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    user_config = tmp_path / "user-config.yaml"
+    user_config.write_text(
+        "cron:\n  max_terminal_executions: 5000\n", encoding="utf-8"
+    )
+    managed_dir = tmp_path / "managed"
+    managed_dir.mkdir()
+    (managed_dir / "config.yaml").write_text("cron: [\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: user_config)
+    monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+    monkeypatch.setenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "0")
+
+    from hermes_cli import managed_scope
+
+    managed_scope.invalidate_managed_cache()
+    assert executions._get_max_terminal_executions() is None
+
+
+def test_retention_skips_pruning_when_config_is_unreadable(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", raising=False)
+
+    def fail_to_load():
+        raise OSError("temporary config read failure")
+
+    monkeypatch.setattr("hermes_cli.config.load_config", fail_to_load)
+    assert executions._get_max_terminal_executions() is None
+
+    executions.EXECUTIONS_FILE.parent.mkdir(parents=True)
+    with sqlite3.connect(executions.EXECUTIONS_FILE) as conn:
+        executions._initialize_schema(conn)
+        for index in range(3):
+            conn.execute(
+                """INSERT INTO executions
+                   (id, job_id, source, process_id, pid, status, claimed_at,
+                    finished_at)
+                   VALUES (?, 'job', 'test', 'process', 1, 'completed', ?, ?)""",
+                (f"row-{index}", f"2026-01-01T00:00:0{index}+00:00", f"2026-01-01T00:00:0{index}+00:00"),
+            )
+        executions._prune_unlocked(conn)
+        remaining = conn.execute("SELECT count(*) FROM executions").fetchone()[0]
+
+    assert remaining == 3
+
+
+def test_retention_skips_pruning_on_fresh_process_malformed_yaml(
+    monkeypatch, tmp_path
+):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    monkeypatch.delenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", raising=False)
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text("cron: [\n", encoding="utf-8")
+    monkeypatch.setattr("hermes_cli.config.get_config_path", lambda: config_path)
+
+    assert executions._get_max_terminal_executions() is None
+
+
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     executions.EXECUTIONS_FILE.parent.mkdir(parents=True)

@@ -5,6 +5,7 @@ Diagnoses issues with Hermes Agent setup.
 """
 
 import os
+import shlex
 import sys
 import subprocess
 import shutil
@@ -103,6 +104,39 @@ def _safe_which(cmd: str) -> str | None:
         return shutil.which(cmd)
     except Exception:
         return None
+
+
+def _profile_alias_target_from_wrapper(content: str) -> str | None:
+    """Return the profile only for an exact Hermes-generated alias wrapper."""
+    lines = content.splitlines()
+    if len(lines) != 2:
+        return None
+
+    if lines[0].startswith("#!"):
+        try:
+            parts = shlex.split(lines[1])
+        except ValueError:
+            return None
+        if (
+            len(parts) == 5
+            and parts[0] == "exec"
+            and Path(parts[1]).name == "hermes"
+            and parts[2] == "-p"
+            and parts[4] == "$@"
+        ):
+            return parts[3]
+        return None
+
+    if lines[0].lower() == "@echo off":
+        parts = lines[1].split()
+        if (
+            len(parts) == 4
+            and parts[0].lower() == "hermes"
+            and parts[1] == "-p"
+            and parts[3] == "%*"
+        ):
+            return parts[2]
+    return None
 
 
 def _termux_browser_setup_steps(node_installed: bool) -> list[str]:
@@ -2704,8 +2738,6 @@ def run_doctor(args):
 
     try:
         from hermes_cli.profiles import list_profiles, _get_wrapper_dir, profile_exists
-        import re as _re
-
         named_profiles = [p for p in list_profiles() if not p.is_default]
         if named_profiles:
             _section("Profiles")
@@ -2734,10 +2766,12 @@ def run_doctor(args):
                         continue
                     try:
                         content = wrapper.read_text(encoding="utf-8")
-                        if "hermes -p" in content:
-                            _m = _re.search(r"hermes -p (\S+)", content)
-                            if _m and not profile_exists(_m.group(1)):
-                                check_warn(f"Orphan alias: {wrapper.name} → profile '{_m.group(1)}' no longer exists")
+                        target = _profile_alias_target_from_wrapper(content)
+                        if target and not profile_exists(target):
+                            check_warn(
+                                f"Orphan alias: {wrapper.name} → profile "
+                                f"'{target}' no longer exists"
+                            )
                     except Exception:
                         pass
     except ImportError:
