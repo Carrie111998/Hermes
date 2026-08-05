@@ -33,6 +33,8 @@ must never skip one a change could break:
   or a frontend-only package; an unrecognized path keeps it on.
 * ``skills/`` (incl. ``SKILL.md``) is python-relevant — the skill-doc tests
   read that tree, so a doc-looking edit can still break Python.
+* ``AGENTS.md`` files are python-relevant — the context-budget contract test
+  reads them, while ``python_prod`` remains false for those non-product inputs.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ _DOCKER_META = ("docker/", ".hadolint.yml", "Dockerfile") # docker setup
 _SITE = ("website/", "skills/", "optional-skills/")  # docs site + skill pages
 # Prose/frontend trees that can't touch Python. skills/ is excluded on purpose.
 _PY_SKIP = ("docs/", "website/") + _FRONTEND
+_PROJECT_CONTEXT_NAMES = {"agents.md"}
 
 # CI-sensitive files: eslint config, workflow files, composite actions.
 # Changes here can influence what code the autofix job executes and pushes to
@@ -80,20 +83,28 @@ def _is_docs(p: str) -> bool:
     return p.endswith((".md", ".mdx")) or p.startswith("docs/") or p.startswith("LICENSE")
 
 
+def _is_project_context(p: str) -> bool:
+    return p.rsplit("/", 1)[-1].lower() in _PROJECT_CONTEXT_NAMES
+
+
 def _py_irrelevant(p: str) -> bool:
-    return _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    return not _is_project_context(p) and (
+        _is_docs(p) or p in _ROOT_NPM or p.startswith(_PY_SKIP) or p.startswith(_DOCKER_META)
+    )
 
 
 def _py_test_only(p: str) -> bool:
-    """Is ``p`` inside the test suite (never shipped / imported by the product)?
+    """Is ``p`` a test-only input (never shipped/imported by the product)?
 
     Product jobs (Desktop E2E's ``hermes serve`` backend, the Docker image)
     run installed code — nothing under ``tests/`` is packaged or importable
-    there. scripts/run_tests.sh and run_tests_parallel.py are deliberately
-    NOT test-only: they are runner infrastructure, and a bad edit there can
-    mask real failures, so they stay conservative (python_prod=true).
+    there. ``AGENTS.md`` is exercised by the repository-context budget test but
+    is likewise not product code for ``python_prod``. scripts/run_tests.sh and
+    run_tests_parallel.py are deliberately NOT test-only: they are runner
+    infrastructure, and a bad edit there can mask real failures, so they stay
+    conservative (python_prod=true).
     """
-    return p.startswith("tests/")
+    return p.startswith("tests/") or _is_project_context(p)
 
 
 def _is_scan(p: str) -> bool:

@@ -88,12 +88,14 @@ runs:
           # die with "cannot iterate over: null", which fails every retry
           # and forces the fail-open path (seen on stacked PRs). The full
           # file list (up to the API's 300-file cap) is on page one.
+          # Include previous_filename so renaming a policy file still classifies
+          # the removed path instead of silently bypassing its test lane.
           CHANGED=""
           for i in 1 2 3; do
             if CHANGED="$(gh api \
               --paginate \
               "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-              --jq '.files[]?.filename')"; then
+              --jq '.files[]? | (.filename, .previous_filename) | select(. != null)')"; then
               break
             fi
             if [ "$i" = 3 ]; then
