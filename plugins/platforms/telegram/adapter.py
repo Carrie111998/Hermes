@@ -6467,7 +6467,10 @@ class TelegramAdapter(BasePlatformAdapter):
         # and the handler's answer is bounded before it reaches Telegram.
         plugin_match = None
         try:
-            from hermes_cli.plugins import get_plugin_callback_prefix
+            from hermes_cli.plugins import (
+                get_plugin_callback_prefix,
+                run_plugin_callback_handler,
+            )
             plugin_match = get_plugin_callback_prefix(data)
         except Exception as exc:
             logger.warning("[%s] plugin callback lookup failed: %s", self.name, exc)
@@ -6484,9 +6487,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 await query.answer(text="⛔ You are not authorized to use this button.")
                 return
             try:
-                plugin_result = plugin_entry["handler"](data)
-                if inspect.isawaitable(plugin_result):
-                    plugin_result = await plugin_result
+                plugin_result = await run_plugin_callback_handler(
+                    plugin_entry["handler"], data
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "[%s] plugin '%s' callback handler for %r timed out",
+                    self.name, plugin_entry.get("plugin"), plugin_prefix,
+                )
+                await query.answer(text="⏳ Action timed out.")
+                return
             except Exception as exc:
                 logger.warning(
                     "[%s] plugin '%s' callback handler for %r failed: %s",
