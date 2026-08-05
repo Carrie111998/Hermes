@@ -523,6 +523,31 @@ _CONTAINER_OPENERS = {"}": "{", "]": "["}
 _ITEM_SEPARATOR = ","
 
 
+def _escapes_the_quote_at(text: str, quote_pos: int) -> bool:
+    """True if the quote at ``quote_pos`` in ``text`` is backslash-escaped.
+
+    The one rule behind every escape-aware branch in this module: inside a
+    serialized document the quote that closes the *enclosing* string appears as
+    ``\\"``, and a value class that admits ``\\`` captures the backslash with
+    the secret. Masking then destroys the escape and re-emits — or leaves — a
+    BARE quote, which terminates the string early. The document no longer
+    parses, which is the same failure the delimiter split exists to prevent,
+    reached through the escape byte instead of the delimiter byte.
+
+    Parity, not presence, decides it: ``json.dumps`` doubles a literal
+    backslash, so a value genuinely ending in ``\\`` is serialized ``\\\\`` and
+    leaves an EVEN run before the quote (that quote is the real delimiter). Only
+    an ODD run means the last backslash introduces an escape, making the quote
+    content rather than a closer.
+    """
+    run = 0
+    i = quote_pos - 1
+    while i >= 0 and text[i] == "\\":
+        run += 1
+        i -= 1
+    return run % 2 == 1
+
+
 class _DocumentStateScanner:
     """Tracks the quote and containers open at a position in one ``sub()`` pass.
 
@@ -655,6 +680,15 @@ def _split_trailing_delimiter(
     survives whole; ``MY_TOKEN=a'}}}}`` under a single open ``{`` keeps ``'}``
     and loses the rest.
 
+    Disclosure bound: the suffix is delimiter-only and at most ``1 + depth``
+    bytes (one quote plus the closers actually open). Splitting also SHORTENS
+    the token handed to the masker, which shifts ``_mask_token``'s tail window
+    left, so total disclosure may shift by up to ``tail`` bytes relative to
+    masking the capture whole — those bytes are the true secret's own last
+    ``tail`` bytes, i.e. head6/tail4 applied to the correct token rather than to
+    secret+delimiter. Not a new disclosure class, but the suffix bound alone
+    does not describe it.
+
     Residual: quote parity is a *syntactic* test, so a lone apostrophe in prose
     ("it's", "couldn't") leaves a quote nominally open. A following
     ``MY_TOKEN=a'}}}`` in a document with containers open therefore re-emits
@@ -681,6 +715,20 @@ def _split_trailing_delimiter(
     if match.group(1) != open_quote:
         return value, ""
     run = match.group(2)
+    # An ESCAPED quote is string *content*, not the delimiter that closes the
+    # document. Inside a serialized JSON string the enclosing quote appears as
+    # ``\"`` and a ``(\S+)`` capture absorbs both bytes, so splitting between
+    # them leaves the backslash inside the secret handed to the masker and
+    # re-emits the quote BARE — terminating the string early, at a shape that
+    # reparsed before the split existed. Parity is unaffected upstream (the
+    # scanner already skips escaped quotes, so ``open_quote`` is legitimately
+    # the enclosing one); what must not happen is consuming the escape while
+    # republishing its quote. Reached when the capture ends exactly at ``\"``,
+    # i.e. whitespace and more content follow it inside the same string.
+    if _escapes_the_quote_at(value, match.start()):
+        # Nothing after an escaped quote can close a container — it is all
+        # still inside the string — so no structural run is justified here.
+        return value[: match.start() - 1], f"\\{match.group(1)}"
     keep = _justified_delimiter_len(run, stack or [])
     return value[: match.start()], f"{open_quote}{run[:keep]}"
 

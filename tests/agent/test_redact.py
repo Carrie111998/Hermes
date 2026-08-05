@@ -1498,3 +1498,235 @@ class TestRedactThenReparseConsumers:
             pass  # the real handler
 
         assert metadata != original, "redaction silently bypassed"
+
+
+class TestEscapedQuoteSurvivesRedaction:
+    """Masking must not destroy the backslash that escapes a quote.
+
+    The delimiter-preserving half of this module answers "don't consume the
+    quote that closes the document." This class answers its twin: inside a
+    serialized JSON string that quote appears as ``\\"``, and a value class that
+    admits ``\\`` captures the ESCAPE with the secret. Destroy the escape and
+    the quote left behind is bare, so the string ends one byte early — the same
+    unparseable document, reached through the escape byte instead of the
+    delimiter byte.
+
+    The affected site:
+
+    * ``_ENV_ASSIGN_RE`` / ``_CFG_DOTTED_RE`` / ``_SECRET_HEADER_RE`` — the
+      ``(\\S+)`` capture ends exactly at ``\\"`` when whitespace and more
+      content follow it inside the same string, and the delimiter split then
+      cut between the backslash and the quote, masking the escape away while
+      re-emitting its quote bare.
+    * ``_AUTH_HEADER_RE`` — its class excludes the quote (#43083) but not the
+      backslash, so the capture ends ``…secret\\``. Above the 18-char mask floor
+      the 4-char tail happened to re-emit that backslash; below it the bare
+      ``***`` deleted it. Only short credentials corrupted, which made this look
+      like a floor bug rather than an escape bug.
+
+    Parametrized across the mask floor because the floor is what decides bare
+    ``***`` versus a head/tail window, and that choice is exactly what decided
+    whether the escape survived by accident.
+    """
+
+    # Secret lengths sweep 1..40 inside each test rather than as pytest params:
+    # the contract is uniform in n, and 40 ids per template would triple this
+    # file's case count for no extra signal. The failing n is reported in the
+    # assertion message.
+    LENGTHS = range(1, 41)
+
+    # Drawn only from characters absent from every template below, so a short
+    # secret can never coincide with the surrounding text ("k" appearing in
+    # "x-api-key", "z" in "Authorization"). That keeps the assertion the strong,
+    # unqualified ``secret not in value`` at every n — including n=1 — instead of
+    # a minimum-length carve-out, which would stop testing the lower half of the
+    # mask floor, i.e. exactly the band where the escape was destroyed.
+    # ``_assert_no_incidental_overlap`` enforces the disjointness, so a template
+    # added later that breaks it fails loudly rather than silently weakening the
+    # sweep.
+    SECRET_ALPHABET = "fgjmq0234567890"
+
+    def _secret(self, n):
+        alphabet = self.SECRET_ALPHABET
+        return (alphabet * (n // len(alphabet) + 1))[:n]
+
+    def _assert_no_incidental_overlap(self, template):
+        """No character of a generated secret may occur in the literal text.
+
+        Cheaper and stricter than checking substrings: if the template shares no
+        character with the alphabet, no substring of any secret can appear in it.
+        """
+        literal = template.replace("{q}", "").replace("{s}", "")
+        shared = set(literal) & set(self.SECRET_ALPHABET)
+        assert not shared, (template, sorted(shared))
+
+    # Content follows the escaped quote, so the value capture terminates *at*
+    # ``\"`` — the shape that makes the escape reachable. One template per
+    # affected pattern.
+    ESCAPED_QUOTE_TEMPLATES = [
+        pytest.param("sh -c {q}export MY_TOKEN={s}{q} && echo done", id="env-assign"),
+        pytest.param("curl -H {q}x-api-key: {s}{q} --verbose", id="secret-header"),
+        pytest.param("run {q}app.api.key={s}{q} now", id="cfg-dotted"),
+    ]
+
+    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    @pytest.mark.parametrize("indent", [None, 2])
+    def test_escaped_quote_in_json_string_keeps_document_parseable(
+        self, template, quote, indent
+    ):
+        """The document parses, the secret is gone, and the quote is still there.
+
+        All three, because any one alone is satisfiable the wrong way: a
+        document can parse because the secret survived unmasked, and a secret
+        can be masked into an unparseable document. The third assertion is the
+        one this fix adds — the inner quote must still be in the *decoded*
+        value, which is only true if its escape survived masking.
+        """
+        for n in self.LENGTHS:
+            secret = self._secret(n)
+            inner = template.format(q=quote, s=secret)
+            serialized = json.dumps(
+                {"content": inner}, ensure_ascii=False, indent=indent
+            )
+
+            redacted = redact_sensitive_text(serialized, force=True)
+
+            ctx = (n, quote, indent, serialized, redacted)
+            value = json.loads(redacted)["content"]  # raises if corrupted
+            assert secret not in value, ctx
+            if quote == '"':
+                # json.dumps only escapes ``"``. A single-quoted inner string
+                # carries no escape, and the quote left open at the match is the
+                # JSON string's own, so the redactor cannot tell that ``'`` from
+                # content — it is masked with the value on every tree. Asserting
+                # its survival would pin a promise the redactor never made.
+                assert value.count('"') == inner.count('"'), ctx
+        self._assert_no_incidental_overlap(template)
+
+    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    @pytest.mark.parametrize("indent", [None, 2])
+    def test_escaped_quote_when_secret_is_not_the_last_field(self, template, indent):
+        """A following field is a different path through the split.
+
+        When the secret's string is the document's last value, the capture runs
+        past the escaped quote to the document's real closing ``"}``, and the
+        ``$``-anchored trailing-delimiter search lands on that genuine
+        delimiter. With a field after it, the capture stops at the escaped quote
+        instead and the search lands on ``\\"`` — the corrupting case. Both
+        shapes must hold, so both are asserted.
+        """
+        self._assert_no_incidental_overlap(template)
+        for n in self.LENGTHS:
+            secret = self._secret(n)
+            inner = template.format(q='"', s=secret)
+            serialized = json.dumps(
+                {"a": inner, "b": 1}, ensure_ascii=False, indent=indent
+            )
+
+            redacted = redact_sensitive_text(serialized, force=True)
+
+            ctx = (n, indent, serialized, redacted)
+            reparsed = json.loads(redacted)
+            assert reparsed["b"] == 1, ctx
+            assert secret not in reparsed["a"], ctx
+            assert reparsed["a"].count('"') == inner.count('"'), ctx
+
+    # Characters whose count carries JSON/shell structure. A redactor may drop
+    # them (they were the secret's own) but may never emit more than it received.
+    STRUCTURAL_CHARS = "\"'{}[],"
+
+    @staticmethod
+    def _bare_quotes(text):
+        """Count unescaped ``"`` — the ones JSON syntax actually owns."""
+        count = index = 0
+        while index < len(text):
+            if text[index] == "\\":
+                index += 2  # the escaped character is content, not syntax
+                continue
+            if text[index] == '"':
+                count += 1
+            index += 1
+        return count
+
+    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    def test_redaction_never_manufactures_delimiters(self, template, quote):
+        """Redaction may delete structure bytes, never invent them.
+
+        The mechanism-level guard, stated over the text so it binds any future
+        pattern rather than the three fixed here. Turning a source ``\\"`` into a
+        bare ``"`` is precisely "manufacturing a delimiter": the byte count is
+        unchanged but a content quote became a syntax quote, which is what ended
+        the JSON string early. Counting *unescaped* quotes is what detects that;
+        counting quotes alone does not.
+
+        The trailing run is bounded by the input's own run rather than by
+        ``1 + depth``: a document whose last string *content* ends in quotes or
+        braces has a longer trailing run than its nesting depth, and that is the
+        input's business, not the redactor's. ``1 + depth`` bounds the suffix the
+        split re-emits (asserted in TestDelimiterSplitNeverDisclosesSecretBytes),
+        not the document's tail.
+        """
+        for n in self.LENGTHS:
+            inner = template.format(q=quote, s=self._secret(n))
+            for indent in (None, 2):
+                serialized = json.dumps(
+                    {"content": inner}, ensure_ascii=False, indent=indent
+                )
+
+                redacted = redact_sensitive_text(serialized, force=True)
+
+                ctx = (n, quote, indent, serialized, redacted)
+                for char in self.STRUCTURAL_CHARS:
+                    assert redacted.count(char) <= serialized.count(char), (char, ctx)
+                assert self._bare_quotes(redacted) <= self._bare_quotes(serialized), ctx
+                trailing = re.search(r"[\"'}\],]*$", redacted).group(0)
+                original_trailing = re.search(r"[\"'}\],]*$", serialized).group(0)
+                assert len(trailing) <= len(original_trailing), ctx
+
+    # The shapes the reparsing consumers actually hand us, now carrying an
+    # escaped quote. ``nested`` matters because the delimiter run the split may
+    # re-emit is bounded by open-container depth, and depth > 1 is where a
+    # too-generous bound would show up.
+    CONSUMER_SHAPES = [
+        pytest.param(lambda inner: {"content": inner}, ("content",), id="flat"),
+        pytest.param(
+            lambda inner: {"a": {"b": [{"content": inner}]}},
+            ("a", "b", 0, "content"),
+            id="nested-3-deep",
+        ),
+    ]
+
+    @pytest.mark.parametrize("build,path", CONSUMER_SHAPES)
+    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    def test_redacted_json_dump_round_trips_for_reparsing_consumers(
+        self, build, path, template
+    ):
+        """kanban_tools' handler, driven by the escaped-quote shape.
+
+        ``except json.JSONDecodeError: pass`` leaves ``metadata`` bound to the
+        ORIGINAL unredacted dict, so a document this module corrupts is not a
+        cosmetic failure — it is a redaction bypass that persists the secret
+        verbatim. Asserted the way the consumer experiences it: the object it
+        ends up storing must not be the raw one.
+        """
+        self._assert_no_incidental_overlap(template)
+        for n in self.LENGTHS:
+            secret = self._secret(n)
+            inner = template.format(q='"', s=secret)
+            metadata = build(inner)
+            original = json.loads(json.dumps(metadata))  # deep copy
+
+            meta_json = redact_sensitive_text(json.dumps(metadata), force=True)
+            try:
+                metadata = json.loads(meta_json)
+            except json.JSONDecodeError:
+                pass  # the real handler in tools/kanban_tools.py
+
+            ctx = (n, template, meta_json)
+            assert metadata != original, ("redaction silently bypassed", ctx)
+            value = metadata
+            for step in path:
+                value = value[step]
+            assert secret not in value, ctx
