@@ -36,10 +36,11 @@ class TestQuietModeCacheIsolation:
         otherwise a caller mutating the returned list mutates the cache."""
         first = model_tools.get_tool_definitions(quiet_mode=True)
         assert isinstance(first, list)
-        # Find the cached value to compare identity.
+        # Find the cached value to compare identity. The cache stores
+        # (final_list, pre_assembly_names); unwrap the list for comparison.
         assert len(model_tools._tool_defs_cache) == 1
-        cached = next(iter(model_tools._tool_defs_cache.values()))
-        assert first is not cached, (
+        cached_list = next(iter(model_tools._tool_defs_cache.values()))[0]
+        assert first is not cached_list, (
             "issue #17335: first quiet_mode call returned the cached list "
             "by reference \u2014 mutations will leak into subsequent calls."
         )
@@ -49,8 +50,8 @@ class TestQuietModeCacheIsolation:
         first = model_tools.get_tool_definitions(quiet_mode=True)
         second = model_tools.get_tool_definitions(quiet_mode=True)
         assert first is not second
-        cached = next(iter(model_tools._tool_defs_cache.values()))
-        assert second is not cached
+        cached_list = next(iter(model_tools._tool_defs_cache.values()))[0]
+        assert second is not cached_list
 
 
 

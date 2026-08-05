@@ -616,3 +616,615 @@ class TestDeferredCallSchemaProbe:
         ))
         assert result.get("ok") is True
         assert result.get("doc") == "abc"
+
+
+# ---------------------------------------------------------------------------
+# Description-only mode — tests for PR #66826 description_only tool_injection
+# ---------------------------------------------------------------------------
+
+
+class TestDescriptionOnly:
+    """Tests for description-only tool marking, classification, and assembly."""
+
+    @staticmethod
+    def _register(name: str, toolset: str):
+        from tools.registry import registry
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True, "tool": name})
+
+        registry.register(
+            name=name,
+            handler=_handler,
+            schema=_td(name, f"desc for {name}", {"q": {"type": "string"}}),
+            toolset=toolset,
+        )
+
+    @staticmethod
+    def _inventory_agent(valid_tools, pre_assembly):
+        """Minimal agent-shaped object for build_system_prompt_parts,
+        mirroring what agent_init produces (valid_tool_names = post-assembly
+        visible set, _pre_assembly_tool_names = full granted set)."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            valid_tool_names=list(valid_tools),
+            _pre_assembly_tool_names=set(pre_assembly),
+            load_soul_identity=False,
+            skip_context_files=False,
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+        )
+
+    # ------------------------------------------------------------------
+    # mark / is round-trip
+    # ------------------------------------------------------------------
+
+    def test_mark_and_is_round_trip(self):
+        """mark_description_only_tool → is_description_only_tool round-trip."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            is_description_only_tool,
+            get_description_only_tool_names,
+        )
+        mark_description_only_tool("test_desc_only_roundtrip")
+        assert is_description_only_tool("test_desc_only_roundtrip")
+        assert "test_desc_only_roundtrip" in get_description_only_tool_names()
+        assert not is_description_only_tool("unmarked_tool")
+
+    def test_get_description_only_returns_copy(self):
+        """get_description_only_tool_names returns a copy, not a live ref."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            get_description_only_tool_names,
+        )
+        mark_description_only_tool("test_copy_tool")
+        copy1 = get_description_only_tool_names()
+        copy1.add("not_real")
+        copy2 = get_description_only_tool_names()
+        assert "not_real" not in copy2
+
+    # ------------------------------------------------------------------
+    # Classification: description_only tools are always deferrable
+    # ------------------------------------------------------------------
+
+    def test_description_only_tool_is_deferrable(self):
+        """A tool marked description_only is always deferrable regardless
+        of its toolset or core-tool status."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            is_deferrable_tool_name,
+        )
+        mark_description_only_tool("do_classify_me")
+        assert is_deferrable_tool_name("do_classify_me")
+
+    def test_classify_tools_splits_description_only_correctly(self):
+        """classify_tools puts description-only tools in deferrable."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            classify_tools,
+        )
+        mark_description_only_tool("do_classify_split")
+        # Build a mixed list: one core tool + one description-only tool.
+        defs = [
+            _td("terminal", "Run shell commands"),
+            _td("do_classify_split", "A description-only tool"),
+        ]
+        visible, deferrable = classify_tools(defs)
+        visible_names = {(td.get("function") or {}).get("name") for td in visible}
+        deferrable_names = {(td.get("function") or {}).get("name") for td in deferrable}
+        assert "terminal" in visible_names
+        assert "terminal" not in deferrable_names
+        assert "do_classify_split" in deferrable_names
+
+    # ------------------------------------------------------------------
+    # Assembly: description_only tools force bridge activation
+    # ------------------------------------------------------------------
+
+    def test_assemble_forces_bridge_with_description_only_below_threshold(self):
+        """Even below the threshold, description_only tools force bridge."""
+        from tools.tool_search import (
+            assemble_tool_defs,
+            mark_description_only_tool,
+            ToolSearchConfig,
+            BRIDGE_TOOL_NAMES,
+        )
+        mark_description_only_tool("do_force_bridge")
+        # A single description_only tool — way below any reasonable threshold.
+        defs = [_td("do_force_bridge", "Tiny tool")]
+        result = assemble_tool_defs(
+            defs,
+            context_length=200_000,
+            config=ToolSearchConfig.from_raw({"enabled": "auto", "threshold_pct": 10}),
+        )
+        assert result.activated
+        names = {(t.get("function") or {}).get("name") for t in result.tool_defs}
+        assert "tool_search" in names
+        assert "do_force_bridge" not in names  # deferred behind bridge
+
+    def test_assemble_with_description_only_off_skips_in_model_tools_layer(self):
+        """REAL model_tools path (P3): with tool_search disabled in config,
+        ``get_tool_definitions`` must not run assembly — the description_only
+        tool stays visible in the returned list (no bridge injected), so the
+        session can still use it directly. Previously this test re-implemented
+        the production gate on its own copy of the config, which stayed green
+        even if model_tools.py stopped honoring ``enabled == "off"``."""
+        from unittest.mock import patch
+        import model_tools
+        from tools.tool_search import (
+            mark_description_only_tool,
+            ToolSearchConfig,
+            BRIDGE_TOOL_NAMES,
+        )
+
+        tool_name = "do_gate_realpath"
+        self._register(tool_name, "mcp-gate-realpath")
+        mark_description_only_tool(tool_name)
+        model_tools._clear_tool_defs_cache()
+
+        with patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({"enabled": "off"}),
+        ):
+            defs = model_tools.get_tool_definitions(
+                enabled_toolsets=["mcp-gate-realpath"],
+                quiet_mode=True,
+            )
+        names = {(t.get("function") or {}).get("name") for t in defs}
+        assert tool_name in names, (
+            "tool_search off must leave description_only tools visible, "
+            "not defer them behind a bridge"
+        )
+        assert not (BRIDGE_TOOL_NAMES & names), (
+            "tool_search off must not inject bridge tools"
+        )
+
+    # ------------------------------------------------------------------
+    # Session scoping: description_only tools filtered by valid_tool_names
+    # ------------------------------------------------------------------
+
+    def test_session_scoped_inventory_only_sees_in_scope_tools(self):
+        """description_only tools from out-of-scope servers are not listed.
+
+        Goes through the REAL ``build_system_prompt_parts`` path — the same
+        ``get_description_only_tool_names() & _pre_assembly_tool_names``
+        intersection the production system prompt performs — instead of
+        re-implementing that intersection on a hand-picked set.
+        """
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.tool_search import (
+            mark_description_only_tool,
+            ToolSearchConfig,
+        )
+
+        in_scope = "mcp_scope_gh_do"
+        out_of_scope = "mcp_other_do"
+        self._register(in_scope, "mcp-scope-gh")
+        self._register(out_of_scope, "mcp-other")
+        mark_description_only_tool(in_scope)
+        mark_description_only_tool(out_of_scope)
+
+        # A session granted ONLY the mcp-scope-gh server.
+        agent = self._inventory_agent(
+            valid_tools=[in_scope],
+            pre_assembly={in_scope},
+        )
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"enabled": "auto"}),
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            from agent.system_prompt import build_system_prompt_parts
+
+            parts = build_system_prompt_parts(agent)
+            stable = parts["stable"]
+
+        assert "Available MCP Tools" in stable
+        assert in_scope in stable
+        assert out_of_scope not in stable, (
+            "out-of-scope description_only tool leaked into the session "
+            "inventory"
+        )
+
+    # ------------------------------------------------------------------
+    # P1 regression: quiet_mode cache hit must not collapse the
+    # pre-assembly snapshot (the gateway's 2nd+ session inventory)
+    # ------------------------------------------------------------------
+
+    def test_quiet_mode_cache_hit_keeps_pre_assembly_inventory(self):
+        """P1 regression (#66826): a second ``get_tool_definitions`` call with
+        the same args hits the quiet_mode memoized cache. The pre-assembly
+        snapshot must STILL include the description_only tool after the cache
+        hit — agent_init captures it into ``agent._pre_assembly_tool_names``,
+        so a collapsed snapshot would silently empty the system-prompt
+        inventory for every session after the first with the same toolset key
+        (gateway/TUI/cron all construct agents with quiet_mode=True)."""
+        import model_tools
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.tool_search import (
+            mark_description_only_tool,
+            ToolSearchConfig,
+        )
+
+        tool_name = "do_cache_collapse_test"
+        self._register(tool_name, "mcp-cache-collapse")
+        mark_description_only_tool(tool_name)
+        model_tools._clear_tool_defs_cache()
+
+        kwargs = dict(enabled_toolsets=["mcp-cache-collapse"], quiet_mode=True)
+        with patch(
+            "tools.tool_search.load_config",
+            return_value=ToolSearchConfig.from_raw({"enabled": "on"}),
+        ):
+            model_tools.get_tool_definitions(**kwargs)  # miss → fresh compute
+            pre_first = set(model_tools._last_pre_assembly_tool_names)
+            defs_second = model_tools.get_tool_definitions(**kwargs)  # cache hit
+            pre_second = set(model_tools._last_pre_assembly_tool_names)
+
+        # Sanity: assembly DID run on the cache-hit call — the returned list
+        # is the post-assembly view (bridge present, tool deferred). This is
+        # exactly the divergence that used to corrupt the capture source.
+        returned_names = {(t.get("function") or {}).get("name") for t in defs_second}
+        assert "tool_search" in returned_names, "assembly should have activated"
+        assert tool_name not in returned_names
+
+        assert tool_name in pre_first
+        assert tool_name in pre_second, (
+            "cache hit collapsed the pre-assembly snapshot — the inventory "
+            "would be empty on the 2nd+ session (P1 cache-collapse)"
+        )
+        assert pre_first == pre_second
+
+        # The system-prompt inventory built AFTER the cache hit still lists it.
+        agent = self._inventory_agent(
+            valid_tools=[tool_name],
+            pre_assembly=pre_second,
+        )
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"enabled": "on"}),
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            from agent.system_prompt import build_system_prompt_parts
+
+            parts = build_system_prompt_parts(agent)
+            stable = parts["stable"]
+
+        assert "Available MCP Tools" in stable
+        assert tool_name in stable
+
+    def test_tool_search_off_no_inventory_in_system_prompt(self):
+        """P3 contract on the REAL path: with tool_search disabled, the
+        system prompt must contain NO description_only inventory block and NO
+        tool_search mention — advertising the bridge would mislead the model
+        into calling a tool that is turned off."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.tool_search import (
+            mark_description_only_tool,
+            ToolSearchConfig,
+        )
+
+        tool_name = "do_off_inventory_test"
+        self._register(tool_name, "mcp-off-inventory")
+        mark_description_only_tool(tool_name)
+
+        agent = self._inventory_agent(
+            valid_tools=[tool_name],
+            pre_assembly={tool_name},
+        )
+        with (
+            patch(
+                "tools.tool_search.load_config",
+                return_value=ToolSearchConfig.from_raw({"enabled": "off"}),
+            ),
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            from agent.system_prompt import build_system_prompt_parts
+
+            parts = build_system_prompt_parts(agent)
+            stable = parts["stable"]
+
+        assert "Available MCP Tools" not in stable
+        assert "description-only" not in stable
+        assert "tool_search" not in stable
+
+    # ------------------------------------------------------------------
+    # Error handling: mark non-existent or duplicate tools
+    # ------------------------------------------------------------------
+
+    def test_mark_duplicate_does_not_raise(self):
+        """Marking the same tool twice is a no-op, not an error."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            is_description_only_tool,
+        )
+        mark_description_only_tool("do_duplicate")
+        mark_description_only_tool("do_duplicate")  # should not raise
+        assert is_description_only_tool("do_duplicate")
+
+    # ------------------------------------------------------------------
+    # System prompt inventory: description_only tools listed by name+description
+    # ------------------------------------------------------------------
+
+    def test_description_only_inventory_in_system_prompt(self):
+        """description_only tools appear as name+description in the system
+        prompt inventory block (full JSON schemas are not included)."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools.registry import registry
+        from tools.tool_search import mark_description_only_tool
+
+        tool_name = "do_inv_sysprompt_test"
+        tool_desc = "Searches the project documentation for a given query"
+
+        def _handler(args, task_id=None, **kw):
+            return json.dumps({"ok": True, "tool": tool_name})
+
+        registry.register(
+            name=tool_name,
+            handler=_handler,
+            schema=_td(tool_name, tool_desc, {"q": {"type": "string"}}),
+            toolset="mcp-inv-test",
+            description=tool_desc,
+        )
+        mark_description_only_tool(tool_name)
+
+        agent = SimpleNamespace(
+            valid_tool_names=[tool_name],
+            _pre_assembly_tool_names={tool_name},
+            load_soul_identity=False,
+            skip_context_files=False,
+            _task_completion_guidance=False,
+            _tool_use_enforcement=False,
+            _environment_probe=False,
+            _kanban_worker_guidance="",
+            _memory_store=None,
+            _memory_manager=None,
+            model="",
+            provider="",
+            platform="",
+            pass_session_id=False,
+            session_id="",
+        )
+
+        with (
+            patch("run_agent.load_soul_md", return_value=""),
+            patch("run_agent.build_nous_subscription_prompt", return_value=""),
+            patch("run_agent.build_environment_hints", return_value=""),
+            patch("run_agent.build_context_files_prompt", return_value=""),
+        ):
+            from agent.system_prompt import build_system_prompt_parts
+
+            parts = build_system_prompt_parts(agent)
+            stable = parts["stable"]
+
+        assert "Available MCP Tools" in stable, (
+            "description_only inventory block missing"
+        )
+        assert "description-only" in stable
+        assert tool_name in stable
+        assert tool_desc[:50] in stable
+        assert "tool_search" in stable
+        assert "tool_describe" in stable
+        # The full JSON parameter schema must not appear in the inventory
+        # block — only the tool name and description.
+        assert '"parameters"' not in stable, (
+            "Full JSON schema leaked into system prompt inventory"
+        )
+
+    # ------------------------------------------------------------------
+    # Lazy MCP registration: description_only marking persists correctly
+    # ------------------------------------------------------------------
+
+    def test_lazy_mcp_registration_marking_persists(self):
+        """REAL registration/refresh/deregister path (P4 scenario 3):
+        a server registered AFTER agent init has its tools marked
+        description_only by ``_register_server_tools``, a
+        ``refresh_agent_mcp_tools`` rebuild publishes them into the agent's
+        pre-assembly inventory (so the system prompt can list them), and
+        deregistering the server unmarks them (no stale marks)."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import mcp_tool
+        from tools.registry import registry
+        from tools.tool_search import (
+            is_description_only_tool,
+            is_deferrable_tool_name,
+            get_description_only_tool_names,
+        )
+
+        server_name = "lazy_server"
+        tool_name = "mcp__lazy_server__search_docs"
+
+        fake_tool = SimpleNamespace(
+            name="search_docs",
+            description="Search documentation",
+            inputSchema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        fake_server = SimpleNamespace(
+            name=server_name,
+            _tools=[fake_tool],
+            tool_timeout=30.0,
+            # Non-None session → check_fn passes (server alive); an object()
+            # advertises no resource/prompt methods → no utility schemas.
+            session=object(),
+            initialize_result=None,
+        )
+
+        with patch.dict(mcp_tool._servers, {server_name: fake_server}):
+            registered = mcp_tool._register_server_tools(
+                server_name, fake_server, {"tool_injection": "description_only"}
+            )
+            assert tool_name in registered
+            assert is_description_only_tool(tool_name)
+            assert is_deferrable_tool_name(tool_name)
+            assert tool_name in get_description_only_tool_names()
+
+            # Real refresh path: the late-registered server's tool must reach
+            # the agent's pre-assembly inventory after a snapshot rebuild.
+            agent = SimpleNamespace(
+                enabled_toolsets=None,
+                disabled_toolsets=None,
+                tools=[],
+                valid_tool_names=set(),
+                _tool_snapshot_generation=0,
+                _memory_manager=None,
+                context_compressor=None,
+                _context_engine_tool_names=set(),
+            )
+            mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            assert tool_name in agent._pre_assembly_tool_names
+
+        # Real deregister path: unloading the server drops both the registry
+        # entry and the description_only mark.
+        task = mcp_tool.MCPServerTask(server_name)
+        task._registered_tool_names = [tool_name]
+        task._deregister_tools()
+        assert registry.get_entry(tool_name) is None
+        assert not is_description_only_tool(tool_name)
+        assert tool_name not in get_description_only_tool_names()
+
+    # ------------------------------------------------------------------
+    # Bridge dispatch: tool_search finds and tool_call invokes description_only tools
+    # ------------------------------------------------------------------
+
+    def test_refresh_publishes_pre_assembly_on_no_post_change(self):
+        """P2 regression: when tool_search assembly is ALREADY active, a
+        late-registered description_only server leaves the POST-assembly name
+        set unchanged (its tools were bridged away), so
+        ``refresh_agent_mcp_tools`` early-returns without publishing. The
+        pre-assembly view must still be published, or the system-prompt
+        inventory silently misses the new server's tools. (#66826 P2)"""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        from tools import mcp_tool
+
+        server_name = "late_bridge_server"
+        tool_name = "mcp__late_bridge_server__lookup"
+
+        fake_tool = SimpleNamespace(
+            name="lookup",
+            description="Late-registered description_only tool",
+            inputSchema={"type": "object", "properties": {"q": {"type": "string"}}},
+        )
+        fake_server = SimpleNamespace(
+            name=server_name,
+            _tools=[fake_tool],
+            tool_timeout=30.0,
+            session=object(),
+            initialize_result=None,
+        )
+
+        # Baseline refresh BEFORE the server exists: assembly is already
+        # active (bridge tools present in the live POST-assembly set) and the
+        # published pre-assembly view does NOT include the future server.
+        agent = SimpleNamespace(
+            enabled_toolsets=None,
+            disabled_toolsets=None,
+            tools=[],
+            valid_tool_names=set(),
+            _tool_snapshot_generation=0,
+            _memory_manager=None,
+            context_compressor=None,
+            _context_engine_tool_names=set(),
+        )
+        with patch.dict(mcp_tool._servers, {}):
+            mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            assert "tool_search" in agent.valid_tool_names  # assembly active
+            assert tool_name not in agent._pre_assembly_tool_names
+
+        # Register a description_only server AFTER the baseline: its tool is
+        # bridged away, so the POST-assembly name set is unchanged from the
+        # baseline (modulo the new deferred name), and a naive refresh would
+        # early-return without publishing the widened pre-assembly view.
+        with patch.dict(mcp_tool._servers, {server_name: fake_server}):
+            mcp_tool._register_server_tools(
+                server_name, fake_server, {"tool_injection": "description_only"}
+            )
+            added = mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            # The description_only tool is deferred (bridged away) in the live
+            # POST-assembly snapshot, but the pre-assembly inventory tracks it.
+            assert tool_name not in agent.valid_tool_names
+            assert tool_name in agent._pre_assembly_tool_names
+
+            # Repeat refresh with the SAME published POST-assembly snapshot:
+            # early return (added == set()) must still republish the
+            # pre-assembly view so the system-prompt inventory stays correct.
+            added2 = mcp_tool.refresh_agent_mcp_tools(agent, quiet_mode=True)
+            assert added2 == set()
+            assert tool_name in agent._pre_assembly_tool_names
+
+        # Deregister to avoid leaking marks into later tests.
+        task = mcp_tool.MCPServerTask(server_name)
+        task._registered_tool_names = [tool_name]
+        task._deregister_tools()
+
+    # ------------------------------------------------------------------
+    # Bridge dispatch: tool_search finds and tool_call invokes description_only tools
+    # ------------------------------------------------------------------
+
+    def test_bridge_dispatch_finds_description_only_tool(self):
+        """tool_search returns description_only tools in the catalog and
+        tool_describe returns their full schema."""
+        from tools.tool_search import (
+            mark_description_only_tool,
+            dispatch_tool_search,
+            dispatch_tool_describe,
+            ToolSearchConfig,
+        )
+
+        do_tool = "do_bridge_dispatch_test"
+        self._register(do_tool, "mcp-bridge-test")
+        mark_description_only_tool(do_tool)
+
+        # Build a defs list that simulates post-classification output:
+        # the description_only tool is in the deferrable set.
+        defs = [
+            _td("terminal", "Run shell commands"),
+            _td(do_tool, "Bridge dispatch test tool", {"param": {"type": "string"}}),
+        ]
+
+        # tool_search should find it.
+        result = dispatch_tool_search(
+            {"query": "bridge dispatch"},
+            current_tool_defs=defs,
+            config=ToolSearchConfig.from_raw({"enabled": "on"}),
+        )
+        parsed = json.loads(result)
+        assert "matches" in parsed
+        match_names = [m["name"] for m in parsed["matches"]]
+        assert do_tool in match_names
+
+        # tool_describe should return its full schema.
+        desc_result = dispatch_tool_describe(
+            {"name": do_tool},
+            current_tool_defs=defs,
+        )
+        desc_parsed = json.loads(desc_result)
+        assert desc_parsed.get("name") == do_tool
+        assert "parameters" in desc_parsed

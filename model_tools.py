@@ -235,6 +235,17 @@ TOOLSET_REQUIREMENTS: Dict[str, dict] = registry.get_toolset_requirements()
 # Used by code_execution_tool to know which tools are available in this session.
 _last_resolved_tool_names: List[str] = []
 
+# PRE-assembly tool names from the last get_tool_definitions() call — the full
+# set of tool schemas BEFORE tool_search assembly collapses deferrable
+# (MCP/plugin/description_only) tools behind the bridge tools. Unlike
+# ``_last_resolved_tool_names``, whose semantics flip with cache state (fresh
+# compute stores pre-assembly names at model_tools._compute_tool_definitions,
+# a cache hit overwrites it with the cached POST-assembly list), this global is
+# restored consistently on BOTH paths, so callers deriving the session's
+# granted tool set (agent_init's description_only inventory capture) never
+# depend on whether the call hit the quiet_mode cache. (#66826)
+_last_pre_assembly_tool_names: List[str] = []
+
 
 # =============================================================================
 # Legacy toolset name mapping  (old _tools-suffixed names -> tool name lists)
@@ -273,7 +284,7 @@ _LEGACY_TOOLSET_MAP = {
 # which bumps on register() / deregister() / register_toolset_alias(). The
 # inner check_fn TTL cache in registry.py handles environment drift (Docker
 # daemon start/stop, env var changes, etc.) on a 30 s horizon.
-_tool_defs_cache: Dict[tuple, List[Dict[str, Any]]] = {}
+_tool_defs_cache: Dict[tuple, Tuple[List[Dict[str, Any]], List[str]]] = {}
 
 # Hard cap on memoized get_tool_definitions() results. A long-lived Gateway
 # process sees many distinct toolset/config fingerprints over its lifetime
@@ -347,12 +358,18 @@ def get_tool_definitions(
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see
-            # consistent state even on a cache hit.
-            global _last_resolved_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+            # consistent state even on a cache hit. The cached value carries
+            # the PRE-assembly names alongside the post-assembly list, so
+            # _last_pre_assembly_tool_names is restored identically on the
+            # cache-hit path — callers that derive the session's granted
+            # tool set (agent_init's description_only inventory) never see
+            # the post-assembly collapse. (#66826)
+            global _last_resolved_tool_names, _last_pre_assembly_tool_names
+            _last_resolved_tool_names = [t["function"]["name"] for t in cached[0]]
+            _last_pre_assembly_tool_names = list(cached[1])
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
-            return list(cached)
+            return list(cached[0])
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
@@ -369,7 +386,10 @@ def get_tool_definitions(
         # toolset/config fingerprints it sees over its lifetime (#19251).
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
-        _tool_defs_cache[cache_key] = result
+        # Store the PRE-assembly names alongside the final (post-assembly) list
+        # so a later cache hit can restore _last_pre_assembly_tool_names to the
+        # same pre-assembly view this fresh compute produced. (#66826)
+        _tool_defs_cache[cache_key] = (result, _last_pre_assembly_tool_names)
         return list(result)
     if quiet_mode:
         return list(result)
@@ -545,8 +565,13 @@ def _compute_tool_definitions(
         else:
             print("🛠️  No tools selected (all filtered out or unavailable)")
 
-    global _last_resolved_tool_names
+    global _last_resolved_tool_names, _last_pre_assembly_tool_names
     _last_resolved_tool_names = [t["function"]["name"] for t in filtered_tools]
+    # Snapshot the PRE-assembly names (before tool_search assembly may swap
+    # deferrable tools for the bridge) so the description_only inventory can
+    # always derive the session's granted tool set regardless of whether the
+    # caller later hits the quiet_mode cache. (#66826)
+    _last_pre_assembly_tool_names = list(_last_resolved_tool_names)
 
     # Sanitize schemas for broad backend compatibility. llama.cpp's
     # json-schema-to-grammar converter (used by its OAI server to build
