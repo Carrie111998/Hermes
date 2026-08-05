@@ -8,7 +8,7 @@ def test_providers_grid_order_and_modes():
     keys = [p[0] for p in PROVIDERS]
     assert keys == ["anthropic", "openai-codex", "kimi", "gemini", "xai"]
     modes = {p[0]: p[2] for p in PROVIDERS}
-    assert modes["anthropic"] == "budget" and modes["kimi"] == "tokens"
+    assert modes["anthropic"] == "budget" and modes["kimi"] == "budget"
 
 
 def test_window_label_map_covers_both_providers():

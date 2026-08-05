@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 PROVIDERS: list[tuple[str, str, str]] = [
     ("anthropic", "Claude", "budget"),
     ("openai-codex", "Codex", "budget"),
-    ("kimi", "Kimi K3", "tokens"),
+    ("kimi", "Kimi K3", "budget"),
     ("gemini", "Gemini", "tokens"),
     ("xai", "Grok", "tokens"),
 ]

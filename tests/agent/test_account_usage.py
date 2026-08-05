@@ -78,6 +78,72 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     assert calls[0]["headers"]["Authorization"] == "Bearer live-agent-token"
 
 
+@pytest.fixture
+def kimi_usage_payload():
+    # Live shape from GET https://api.kimi.com/coding/v1/usages (verified
+    # 2026-08-05): values are STRINGS; top-level `usage` is the weekly window;
+    # `limits[]` carry the shorter windows and their `detail` often omits
+    # `used` (derive it as limit - remaining).
+    return {
+        "user": {"membership": {"level": "LEVEL_ADVANCED"}},
+        "usage": {
+            "limit": "100",
+            "used": "70",
+            "remaining": "30",
+            "resetTime": "2026-08-10T16:59:20.280907Z",
+        },
+        "limits": [
+            {
+                "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                "detail": {
+                    "limit": "100",
+                    "remaining": "40",
+                    "resetTime": "2026-08-05T08:59:20.280907Z",
+                },
+            }
+        ],
+    }
+
+
+def test_kimi_usage_maps_session_and_weekly_windows(monkeypatch, kimi_usage_payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx, "Client", lambda timeout: _FakeClient(calls, kimi_usage_payload)
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "kimi",
+        base_url="https://api.kimi.com/coding",
+        api_key="live-kimi-key",
+    )
+
+    assert snapshot is not None
+    assert snapshot.provider == "kimi"
+    assert snapshot.plan == "Advanced"
+    # 300-minute window (< 1 day) is the Session; top-level usage is Weekly.
+    assert [w.label for w in snapshot.windows] == ["Session", "Weekly"]
+    # detail has no `used` → derived from limit - remaining = 100 - 40 = 60.
+    assert snapshot.windows[0].used_percent == 60
+    # weekly: used=70, limit=100 → 70% (string coercion).
+    assert snapshot.windows[1].used_percent == 70
+
+
+def test_kimi_usage_hits_usages_endpoint_with_bearer(monkeypatch, kimi_usage_payload):
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx, "Client", lambda timeout: _FakeClient(calls, kimi_usage_payload)
+    )
+
+    account_usage.fetch_account_usage(
+        "kimi",
+        base_url="https://api.kimi.com/coding",
+        api_key="live-kimi-key",
+    )
+
+    assert calls[0]["url"] == "https://api.kimi.com/coding/v1/usages"
+    assert calls[0]["headers"]["Authorization"] == "Bearer live-kimi-key"
+
+
 def test_codex_weekly_limit_in_primary_slot_labels_weekly(monkeypatch):
     # When the weekly cap is reached, Codex's /usage puts the 7-day window in
     # primary_window (limit_window_seconds=604800) and nulls secondary_window.

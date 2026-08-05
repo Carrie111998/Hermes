@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -884,6 +885,132 @@ def _fetch_openrouter_account_usage(base_url: Optional[str], api_key: Optional[s
     )
 
 
+def _kimi_usage_url(base_url: Optional[str]) -> str:
+    base = str(base_url or "https://api.kimi.com/coding").strip().rstrip("/")
+    return f"{base}/usages" if base.endswith("/v1") else f"{base}/v1/usages"
+
+
+def _resolve_kimi_usage_credentials(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> tuple[str, str]:
+    """Resolve Kimi Code quota credentials: explicit → env → credential pool.
+
+    Kimi Code has no OAuth singleton; the collector runs headless, so fall
+    back to ``KIMI_API_KEY`` and finally the ``kimi-coding`` credential pool
+    (auth.json) the way the Codex resolver falls back to its pool.
+    """
+    explicit = str(api_key or "").strip()
+    if explicit:
+        return explicit, str(base_url or "").strip()
+    env_key = str(os.environ.get("KIMI_API_KEY", "") or "").strip()
+    if env_key:
+        return env_key, str(base_url or "").strip()
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("kimi-coding")
+    entry = pool.select()
+    if entry is None:
+        raise RuntimeError("No available kimi-coding credential in credential pool")
+    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip()
+
+
+def _kimi_int(value: Any) -> Optional[int]:
+    # /coding/v1/usages returns quota counts as strings ("100", "70").
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _kimi_window_seconds(window: Any) -> Optional[int]:
+    if not isinstance(window, dict):
+        return None
+    duration = _kimi_int(window.get("duration"))
+    if not duration or duration <= 0:
+        return None
+    unit = str(window.get("timeUnit") or window.get("time_unit") or "").upper()
+    if "HOUR" in unit:
+        return duration * 3600
+    if "MINUTE" in unit:
+        return duration * 60
+    if "DAY" in unit:
+        return duration * 86400
+    if "SECOND" in unit:
+        return duration
+    return None
+
+
+def _kimi_window(record: Any, *, label: str) -> Optional[AccountUsageWindow]:
+    if not isinstance(record, dict):
+        return None
+    limit = _kimi_int(record.get("limit"))
+    used = _kimi_int(record.get("used"))
+    if used is None:
+        remaining = _kimi_int(record.get("remaining"))
+        if limit is not None and remaining is not None:
+            used = limit - remaining
+    if not limit or used is None:
+        return None
+    used_percent = round(max(0, min(used, limit)) / limit * 100)
+    return AccountUsageWindow(
+        label=label,
+        used_percent=used_percent,
+        reset_at=_parse_dt(record.get("resetTime")),
+    )
+
+
+def _kimi_plan(payload: dict) -> Optional[str]:
+    level = ((payload.get("user") or {}).get("membership") or {}).get("level")
+    text = str(level or "").strip()
+    if text.upper().startswith("LEVEL_"):
+        text = text[len("LEVEL_") :]
+    return _title_case_slug(text)
+
+
+def _fetch_kimi_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    token, resolved_base_url = _resolve_kimi_usage_credentials(base_url, api_key)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "kimi-code",
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_kimi_usage_url(resolved_base_url), headers=headers)
+        response.raise_for_status()
+    payload = response.json() or {}
+
+    windows: list[AccountUsageWindow] = []
+    # Shorter rolling windows (5h "Session") live in limits[]; a >=1-day window
+    # would read "Weekly" — the label comes from the window's own duration.
+    for item in payload.get("limits") or []:
+        if not isinstance(item, dict):
+            continue
+        detail = item.get("detail") if isinstance(item.get("detail"), dict) else item
+        secs = _kimi_window_seconds(item.get("window"))
+        label = "Weekly" if (secs is not None and secs >= _CODEX_SESSION_MAX_SECONDS) else "Session"
+        window = _kimi_window(detail, label=label)
+        if window is not None:
+            windows.append(window)
+    # Top-level `usage` is the weekly window.
+    weekly = _kimi_window(payload.get("usage"), label="Weekly")
+    if weekly is not None:
+        windows.append(weekly)
+
+    if not windows:
+        return None
+    return AccountUsageSnapshot(
+        provider="kimi",
+        source="usages_api",
+        fetched_at=_utc_now(),
+        plan=_kimi_plan(payload),
+        windows=tuple(windows),
+    )
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -896,6 +1023,8 @@ def fetch_account_usage(
     try:
         if normalized == "openai-codex":
             return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
+        if normalized == "kimi":
+            return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":

@@ -47,7 +47,8 @@ def test_collect_builds_five_providers(tmp_path):
     def fetch(provider):
         if provider == "anthropic":
             return FakeSnap(True, (FakeWin("Current session", 62.0, None),))
-        return FakeSnap(False, (), unavailable_reason="no token")  # codex unconfigured
+        # codex + kimi are both budget-mode; unavailable fetch → unconfigured
+        return FakeSnap(False, (), unavailable_reason="no token")
 
     data = collect(db_path=str(db), prev=None, fetch_usage=fetch, now=NOW)
     assert data["generated_at"] == "2026-08-04T15:00:00Z"
@@ -55,7 +56,9 @@ def test_collect_builds_five_providers(tmp_path):
     assert list(by.keys()) == ["anthropic", "openai-codex", "kimi", "gemini", "xai"]
     assert by["anthropic"]["state"] == "ok"
     assert by["openai-codex"]["state"] == "unconfigured"
-    assert by["kimi"]["windows"][0]["tokens"] == 150
+    # kimi is budget-mode now: routed through fetch, not the state.db token-sum
+    assert by["kimi"]["mode"] == "budget"
+    assert by["kimi"]["state"] == "unconfigured"
     assert by["gemini"]["state"] == "unconfigured"
 
 
