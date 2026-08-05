@@ -465,6 +465,12 @@ Desktop/TUI, use the slash command below to route through the existing
 The Desktop/TUI command stores through the same secure environment writer and
 falls back to no action when no interactive secret-capture surface is present.
 
+When Hermes itself needs a credential during an interactive Desktop/TUI
+session, it can call the `request_secret` Skills tool directly. This uses the
+same masked `secret.request` popup without requiring the user to type a slash
+command. The tool returns status metadata only; the credential value is never
+returned to the model.
+
 The remaining subcommands pull API keys from external secret managers at
 process startup instead of storing them in `~/.hermes/.env`. Currently they
 support **Bitwarden Secrets Manager** and **1Password**. See the full guide:
