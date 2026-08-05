@@ -6215,7 +6215,10 @@ def decompose_triage_task(
                 conn, new_id, "created",
                 {"by": author or "decomposer", "from_decompose_of": task_id},
             )
-            _inherit_notify_subs(conn, new_id, (task_id,), created_at=now)
+            # Decomposition children are internal implementation stages. The
+            # subscribed root waits on every child and emits the consolidated
+            # terminal notification; copying its subscriptions here leaks each
+            # gather/build/review handoff to the user's chat.
             child_ids.append(new_id)
 
         # Link children to their sibling parents (within the decomposed graph).

@@ -88,5 +88,28 @@ def test_decompose_records_audit_comment_and_event(kanban_home):
     assert any(ev.kind == "decomposed" for ev in events)
 
 
+def test_decompose_keeps_root_subscription_without_notifying_internal_children(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="prepare one consolidated briefing")
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="8531920232",
+            notifier_profile="donna",
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="donna",
+            children=[
+                {"title": "gather inputs", "assignee": "donna"},
+                {"title": "assess inputs", "assignee": "marcus", "parents": [0]},
+            ],
+            author="auto-decomposer",
+        )
 
+        subscriptions = kb.list_notify_subs(conn)
 
+    assert child_ids is not None
+    assert {sub["task_id"] for sub in subscriptions} == {tid}

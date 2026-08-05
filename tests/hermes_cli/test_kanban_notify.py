@@ -35,6 +35,39 @@ def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert subs[0]["notifier_profile"] == "default"
 
 
+def _subscribe_parent(conn, task_id: str) -> None:
+    kb.add_notify_sub(
+        conn,
+        task_id=task_id,
+        platform="telegram",
+        chat_id="chat1",
+        thread_id="topic1",
+        user_id="user1",
+        notifier_profile="default",
+    )
+
+
+def test_create_task_with_parent_keeps_explicit_subscription_inheritance(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="subscribed parent")
+        _subscribe_parent(conn, parent_id)
+
+        child_id = kb.create_task(conn, title="manual child", parents=[parent_id])
+
+        _assert_inherited_notify_sub(kb.list_notify_subs(conn, child_id))
+
+
+def test_link_tasks_keeps_explicit_subscription_inheritance(kanban_home):
+    with kb.connect() as conn:
+        parent_id = kb.create_task(conn, title="subscribed parent")
+        child_id = kb.create_task(conn, title="existing manual child")
+        _subscribe_parent(conn, parent_id)
+
+        kb.link_tasks(conn, parent_id, child_id)
+
+        _assert_inherited_notify_sub(kb.list_notify_subs(conn, child_id))
+
+
 
 
 
