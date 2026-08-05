@@ -412,6 +412,26 @@ class TestBlockedReviewerRecovery:
             "same-card violation: blocked card != completed card "
             f"({driver.blocks['[qa-review]'][0][0]} vs {driver.completions['[qa-review]'][0][0]})"
         )
+        # Regression (live 2026-08-05): the same-card reuse path must append
+        # a 'status' event (old=done, new=ready) on the reviewer card.
+        # Without it, the real dispatcher's respawn guard sees a completed
+        # run inside _RESPAWN_GUARD_SUCCESS_WINDOW with no requeue event and
+        # refuses to re-spawn ("respawn_guarded: recent_success" xN) — round
+        # 2 silently stalls until the engine's layer poll times out. The e2e
+        # CardDriver bypasses the dispatcher, so this assertion is the only
+        # guard that catches the missing event.
+        qa_card = driver.completions["[qa-review]"][0][0]
+        conn = sqlite3.connect(review_env["db_path"])
+        conn.row_factory = sqlite3.Row
+        status_events = conn.execute(
+            "SELECT kind, payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'status' ORDER BY id",
+            (qa_card,),
+        ).fetchall()
+        conn.close()
+        assert any(
+            "ready" in (e["payload"] or "") for e in status_events
+        ), f"no status→ready requeue event on reused reviewer card: {status_events}"
         # The re-armed reviewer card must carry the done-based verdict contract
         conn = sqlite3.connect(review_env["db_path"])
         conn.row_factory = sqlite3.Row

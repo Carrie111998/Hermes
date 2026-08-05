@@ -3318,6 +3318,21 @@ class WorkflowEngine:
                                 "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
                                 (state.kanban_card_id,)
                             )
+                            # CRITICAL: append a 'status' event so the
+                            # dispatcher's respawn guard treats this as a
+                            # DELIBERATE requeue. Without it, the guard sees
+                            # a completed run inside _RESPAWN_GUARD_SUCCESS_
+                            # WINDOW (1h) with no requeue event and refuses
+                            # to re-spawn ("respawn_guarded: recent_success"
+                            # ×N), so same-card review rounds 2+ silently
+                            # stall until the engine's layer poll times out
+                            # (found live 2026-08-05 on review-loop-fail-test:
+                            # verify round 2 reused the card, dispatcher
+                            # skipped it 9 ticks, run ended 1 done/1 failed).
+                            kanban_db._append_event(
+                                _conn, state.kanban_card_id, "status",
+                                {"old": "done", "new": "ready"},
+                            )
                             _conn.commit()
                             kanban_db.heartbeat_worker(_conn, state.kanban_card_id)
                     except Exception:
