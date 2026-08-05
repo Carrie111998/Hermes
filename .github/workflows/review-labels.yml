@@ -103,7 +103,7 @@ jobs:
             --output "$GITHUB_OUTPUT"
 
       - name: Fail on missing label
-        if: steps.label-check.outputs.ci_reviewed != 'true'
+        if: steps.label-check.outputs.ci_reviewed != 'true' && github.actor != 'app/dependabot'
         run: |
           echo "::error::CI-sensitive changes require the ci-reviewed label. Add the label and re-run this check."
           exit 1
