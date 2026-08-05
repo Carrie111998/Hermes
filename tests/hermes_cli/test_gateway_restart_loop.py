@@ -823,6 +823,69 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
         assert "referenced script" in result["error"]
         assert any("cat" in c for c in calls)
 
+    def test_remote_read_of_binary_does_not_crash_the_guard(self, tmp_path):
+        """A binary read through the remote callback is 'nothing to scan'.
+
+        _read_referenced_script skips binaries locally (NUL byte in the first
+        chunk) and returns None. That None falls through to the remote
+        callback, which reads via ``cat`` and decodes with errors="replace" —
+        NUL bytes survive. The decoded machine code is then tokenized as a
+        command line, linker paths produce NUL-bearing candidates, and os.open
+        raises ValueError: embedded null byte. The guard must not crash (#76762).
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        binary = tmp_path / "chrome"
+        binary.write_bytes(
+            b"\x7fELF\x02\x01\x01\x00"
+            + b"\x00" * 32
+            + b"/lib64/ld-linux-x86-64.so.2\x00libc.so.6\x00"
+        )
+        binary.chmod(0o755)
+
+        def read_remote(path):
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(200_000).decode("utf-8", errors="replace")
+            except OSError:
+                return None
+
+        assert guard(f"{binary} --version", read_remote_script=read_remote) is False
+
+    def test_shell_script_referencing_system_binary_does_not_crash_guard(
+        self, tmp_path
+    ):
+        """Regression for godmode-bus scripts that invoke /usr/bin/flock etc.
+
+        A shell script referencing a system binary must not crash the gateway
+        lifecycle guard when the remote-read callback is active (the path
+        terminal_tool.py uses inside _HERMES_GATEWAY sessions).
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script as guard,
+        )
+
+        script = tmp_path / "watchdog.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "exec 9>\"$LOCK\"\n"
+            "/usr/bin/flock -n 9 || exit 0\n"
+        )
+        script.chmod(0o755)
+
+        def read_remote(path):
+            try:
+                with open(path, "rb") as handle:
+                    return handle.read(200_000).decode("utf-8", errors="replace")
+            except OSError:
+                return None
+
+        assert (
+            guard(f"bash {script}", read_remote_script=read_remote) is False
+        )
+
 
 class TestCronCreateLifecycleBlockExtra:
     """Additional cron create lifecycle guard coverage."""

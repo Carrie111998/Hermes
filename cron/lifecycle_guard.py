@@ -114,7 +114,11 @@ _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
-    normalized = command.replace("\\\n", "")
+    # NUL bytes can leak into tokens when a scanned script's binary contents
+    # are decoded and tokenized as paths (see #76762). They are never valid
+    # shell characters; stripping them here keeps every downstream Path()
+    # construction crash-free (`ValueError: embedded null byte`).
+    normalized = command.replace("\\\n", "").replace("\x00", "")
     for line in normalized.splitlines() or [normalized]:
         try:
             lexer = shlex.shlex(
@@ -258,7 +262,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte in path when decoded binary content
+        # is tokenized as a command line. A guarded path must never crash
+        # the guard (#76762).
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -325,8 +332,18 @@ def _contains_unsafe_gateway_action(
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
-            # Local path missing; try the remote backend if one is available.
+            # Local path missing or deliberately skipped as binary; try the
+            # remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            # The callback has no binary detection: it reads via `cat` and
+            # decodes with errors="replace". NUL bytes survive decoding, so
+            # without this check the remote branch undoes the protection
+            # _read_referenced_script established above — machine code gets
+            # tokenized, linker paths yield NUL-bearing candidates, and
+            # os.open raises. Same rule as the local read (#76762): a binary
+            # is "nothing to scan", not a suspicion.
+            if script_text and "\x00" in script_text[:_MAX_REFERENCED_SCRIPT_BYTES]:
+                script_text = None
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
@@ -374,7 +391,7 @@ def _resolve_script_path(script_path: str) -> Path:
     """
     from hermes_constants import get_hermes_home
 
-    raw = Path(script_path).expanduser()
+    raw = Path(script_path.replace("\x00", "")).expanduser()
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw
