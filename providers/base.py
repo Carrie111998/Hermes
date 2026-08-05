@@ -101,6 +101,27 @@ class ProviderProfile:
 
     # ── Hooks (override in subclass for complex providers) ───
 
+    def prompt_cache_policy(
+        self,
+        *,
+        model: str | None = None,
+        api_mode: str | None = None,
+        base_url: str | None = None,
+    ) -> tuple[bool, bool] | None:
+        """Return ``(enabled, native_layout)`` or ``None`` for core fallback.
+
+        ``enabled`` controls explicit ``cache_control`` marker injection.
+        ``native_layout`` selects inner content-block markers when true and
+        the OpenAI-wire envelope layout when false. Provider plugins override
+        this to declare model- and transport-scoped support without adding
+        provider IDs to shared allowlists.
+
+        Implementations must return exactly a two-boolean tuple or ``None``.
+        Invalid values and exceptions are logged and delegated to core fallback
+        so a plugin cannot abort a model call while resolving cache policy.
+        """
+        return None
+
     def get_hostname(self) -> str:
         """Return the provider's base hostname for URL-based detection.
 

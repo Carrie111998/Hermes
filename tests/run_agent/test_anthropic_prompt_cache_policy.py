@@ -8,6 +8,7 @@ the native layout on OpenRouter) surfaces loudly.
 
 from __future__ import annotations
 
+import logging
 from unittest.mock import MagicMock
 
 import pytest
@@ -31,6 +32,118 @@ def _make_agent(
     agent.client = MagicMock()
     agent.quiet_mode = True
     return agent
+
+
+class TestPluginDeclaredPolicy:
+    @staticmethod
+    def _register(monkeypatch, profile):
+        import providers
+
+        # Trigger normal discovery before installing the test profile so the
+        # test exercises the real registry lookup without leaking state.
+        providers.get_provider_profile("__discovery_probe__")
+        monkeypatch.setitem(providers._REGISTRY, profile.name, profile)
+
+    def test_profile_can_enable_transport_scoped_prompt_cache(self, monkeypatch):
+        from providers.base import ProviderProfile
+
+        observed = {}
+
+        class Profile(ProviderProfile):
+            def prompt_cache_policy(self, *, model=None, api_mode=None, base_url=None):
+                observed.update(model=model, api_mode=api_mode, base_url=base_url)
+                return True, False
+
+        profile = Profile(name="external-provider")
+        self._register(monkeypatch, profile)
+        agent = _make_agent(
+            provider="external-provider",
+            base_url="https://external.example/v1",
+            api_mode="chat_completions",
+            model="cache-model-v1",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, False)
+        assert observed == {
+            "model": "cache-model-v1",
+            "api_mode": "chat_completions",
+            "base_url": "https://external.example/v1",
+        }
+
+    def test_none_preserves_core_fallback(self, monkeypatch):
+        from providers.base import ProviderProfile
+
+        profile = ProviderProfile(name="external-provider")
+        self._register(monkeypatch, profile)
+        agent = _make_agent(
+            provider="external-provider",
+            base_url="https://gateway.example/anthropic",
+            api_mode="anthropic_messages",
+            model="claude-sonnet-4-6",
+        )
+        assert agent._anthropic_prompt_cache_policy() == (True, True)
+
+    @pytest.mark.parametrize(
+        "declared",
+        ([True, False], (True,), ("enabled", False)),
+    )
+    def test_invalid_return_warns_and_preserves_core_fallback(
+        self, monkeypatch, caplog, declared
+    ):
+        from providers.base import ProviderProfile
+
+        class Profile(ProviderProfile):
+            def prompt_cache_policy(self, **_kwargs):
+                return declared
+
+        self._register(monkeypatch, Profile(name="external-provider"))
+        agent = _make_agent(
+            provider="external-provider",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="anthropic/claude-sonnet-4.6",
+        )
+        with caplog.at_level(logging.WARNING):
+            assert agent._anthropic_prompt_cache_policy() == (True, False)
+        assert "Provider prompt-cache policy failed" in caplog.text
+
+    def test_hook_exception_warns_and_preserves_core_fallback(
+        self, monkeypatch, caplog
+    ):
+        from providers.base import ProviderProfile
+
+        class Profile(ProviderProfile):
+            def prompt_cache_policy(self, **_kwargs):
+                raise RuntimeError("profile unavailable")
+
+        self._register(monkeypatch, Profile(name="external-provider"))
+        agent = _make_agent(
+            provider="external-provider",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+            model="anthropic/claude-sonnet-4.6",
+        )
+        with caplog.at_level(logging.WARNING):
+            assert agent._anthropic_prompt_cache_policy() == (True, False)
+        assert "Provider prompt-cache policy failed" in caplog.text
+        assert "profile unavailable" in caplog.text
+
+    def test_operator_disable_takes_precedence_over_profile(self, monkeypatch):
+        from providers.base import ProviderProfile
+
+        called = False
+
+        class Profile(ProviderProfile):
+            def prompt_cache_policy(self, **_kwargs):
+                nonlocal called
+                called = True
+                return True, False
+
+        self._register(monkeypatch, Profile(name="external-provider"))
+        agent = _make_agent(provider="external-provider", model="cache-model-v1")
+        setattr(agent, "_cache_disabled", True)
+
+        assert agent._anthropic_prompt_cache_policy() == (False, False)
+        assert called is False
 
 
 class TestNativeAnthropic:
