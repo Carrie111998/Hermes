@@ -810,18 +810,27 @@ class TestAnsiCQuotingBypass:
         assert is_hardline is True
 
     def test_ansi_c_wrappers_still_hit_hardline_floor(self):
-        r"""`command` / `builtin` must resolve to the real executable for the
-        hardline command-position prefix (plain and ANSI-C-encoded)."""
+        r"""Executable `command` forms must expose their real utility."""
         for cmd in (
             "command rm -rf /",
-            "builtin rm -rf /",
             "command $'\\x72\\x6d' -rf /",
-            "builtin $'\\x72\\x6d' -rf /",
             "command $'\\x72\\x6d' -rf $'\\x2f'",
             "command -p $'\\x72\\x6d' -rf /",
+            "builtin exec rm -rf /",
+            "builtin command rm -rf /",
         ):
             is_hardline, desc = detect_hardline_command(cmd)
             assert is_hardline is True, f"wrapper/ANSI-C spelling escaped hardline: {cmd!r}"
+
+    def test_nonexecuting_command_and_builtin_forms_are_not_hardline(self):
+        for cmd in (
+            "command -v rm -rf /",
+            "command -V reboot",
+            "builtin rm -rf /",
+            "builtin reboot",
+        ):
+            is_hardline, _ = detect_hardline_command(cmd)
+            assert is_hardline is False, f"nonexecuting wrapper form blocked: {cmd!r}"
 
     def test_env_option_prefixes_still_hit_hardline_floor(self):
         r"""GNU env options / `--` must stay inside the hardline command-position
@@ -834,7 +843,10 @@ class TestAnsiCQuotingBypass:
             "env -i -- rm -rf /",
             "env -iv rm -rf /",
             "env -u HOME rm -rf /",
+            "env --un HOME rm -rf /",
+            "env --u HOME rm -rf /",
             "env -C /tmp rm -rf /",
+            "env --ch /tmp rm -rf /",
             "env -i PATH=/usr/bin rm -rf /",
             "sudo env -i rm -rf /",
             "env -i $'\\x72\\x6d' -rf /",
@@ -896,9 +908,42 @@ class TestAnsiCQuotingBypass:
             "sudo env -S 'sh -c \"rm -rf /\"'",
             "env -S 'command sh -c \"rm -rf /\"'",
             "env -S \"env -S 'rm -rf /'\"",
+            "env -S 'env --unset HOME rm -rf /'",
+            "env -S 'env -u HOME rm -rf /'",
+            "env -S 'sh -c \"env --unset HOME rm -rf /\"'",
         ):
             is_hardline, _ = detect_hardline_command(cmd)
             assert is_hardline is True, f"nested env payload escaped: {cmd!r}"
+
+    def test_dynamic_env_option_position_fails_closed(self, monkeypatch):
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        commands = (
+            'OPT=-S; env "$OPT" \'rm -rf /\'',
+            "env $(printf -- -S) 'rm -rf /'",
+            "env `$OPTION_COMMAND` 'rm -rf /'",
+        )
+        for cmd in commands:
+            result = approval_module.check_dangerous_command(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            result = approval_module.check_all_command_guards(cmd, "local")
+            assert result["approved"] is False, cmd
+            assert result["hardline"] is True, cmd
+
+    def test_deep_execution_payload_traversal_fails_closed(self):
+        commands = [f"sh -c 'printf safe{index}'" for index in range(31)]
+
+        is_hardline, desc = detect_hardline_command("; ".join(commands))
+        assert is_hardline is True
+        assert "parser limit" in desc
+
+    def test_env_assignment_ends_option_parsing(self):
+        is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")
+        assert is_hardline is False
 
     def test_safe_env_split_string_payloads_are_not_hardline(self):
         for cmd in (

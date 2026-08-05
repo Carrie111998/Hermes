@@ -397,11 +397,10 @@ _CMDPOS = (
     r'(?:-[^\s-]+\s+)|'                         # -i, -iv, -uNAME (glued)
     r'(?:\w+=\S*\s+)'                           # VAR=VAL
     r')*)?'
-    # optional wrapper commands — includes bash `command` / `builtin`, which
-    # _COMMAND_WRAPPER_WORDS already treats as executable-prefix skip words.
-    # Without them here, `command rm -rf /` (and ANSI-C spellings that decode
-    # to it) never anchors the hardline rm floor.
-    r'(?:(?:exec|nohup|setsid|time|command|builtin)\s+(?:-[^\s]+\s+)*)*'
+    # Optional wrappers with unconditional execution semantics. `command` and
+    # `builtin` are parsed structurally by `_mark_unwrapped_executables` because
+    # query mode (`command -v`) and non-builtin operands do not execute argv.
+    r'(?:(?:exec|nohup|setsid|time)\s+(?:-[^\s]+\s+)*)*'
     r'\s*'
 )
 
@@ -551,6 +550,8 @@ def detect_hardline_command(command: str) -> tuple:
         if malformed_split:
             return (True, _MALFORMED_EXEC_DESCRIPTION)
     for command_variant in _command_detection_variants(command):
+        if command_variant == _PARSER_LIMIT_VARIANT:
+            return (True, _PARSER_LIMIT_DESCRIPTION)
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
@@ -1290,8 +1291,6 @@ _COMMAND_WRAPPER_WORDS = {
     "nohup",
     "setsid",
     "time",
-    "command",
-    "builtin",
 }
 _SUDO_OPTIONS_WITH_ARG = {
     "-c", "--close-from",
@@ -1310,6 +1309,12 @@ _ENV_OPTIONS_WITH_ARG = {
     "-s", "--split-string",
     "-a", "--argv0",
 }
+_ENV_LONG_OPTIONS = frozenset({
+    "--argv0", "--block-signal", "--chdir", "--debug", "--default-signal",
+    "--help", "--ignore-environment", "--ignore-signal",
+    "--list-signal-handling", "--null", "--split-string", "--unset",
+    "--version",
+})
 _ENV_SHORT_OPTIONS_WITH_ARG = frozenset("ucsa")
 # Short flag alphabet for env clusters like `-iv` / `-iu` (last char may take
 # an arg). Unknown letters mean a glued value (`-uHOME`) already in-token.
@@ -1382,6 +1387,7 @@ _MAX_SEPARATOR_FREE_COMMAND_CHARS = 4_096
 _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
+_PARSER_LIMIT_VARIANT = "__hermes_internal_detection_traversal_limit__"
 
 
 
@@ -1888,10 +1894,18 @@ def _raw_shell_words(command: str, start: int) -> list[str]:
         position = word_end
 
 
+def _resolve_env_long_option(option: str) -> str | None:
+    """Resolve a unique GNU env long-option prefix to its canonical spelling."""
+    if not option.startswith("--") or option == "--":
+        return None
+    matches = [candidate for candidate in _ENV_LONG_OPTIONS if candidate.startswith(option)]
+    return matches[0] if len(matches) == 1 else None
+
+
 def _env_option_owns_split_value(token: str) -> bool:
     """Return whether *token* requires a following GNU env split string."""
     option, separator, _ = token.partition("=")
-    if len(option) > 2 and "--split-string".startswith(option):
+    if _resolve_env_long_option(option) == "--split-string":
         return not separator
     has_short_split, value, consumed = _env_short_split_value(token, None)
     return has_short_split and value is None and consumed == 2
@@ -1900,7 +1914,7 @@ def _env_option_owns_split_value(token: str) -> bool:
 def _env_option_contains_split(token: str) -> bool:
     """Return whether a fully or partially resolved option selects ``-S``."""
     option = token.partition("=")[0]
-    if len(option) > 2 and "--split-string".startswith(option):
+    if _resolve_env_long_option(option) == "--split-string":
         return True
     return _env_short_split_value(token, None)[0]
 
@@ -1955,15 +1969,13 @@ def _env_split_string_payload(args: list[str]) -> tuple[str | None, bool]:
             index += 1
             break
         if _ENV_ASSIGNMENT_RE.fullmatch(token):
-            index += 1
-            continue
+            break
 
         split_value: str | None = None
         consumed = 1
         long_option, separator, attached_value = token.partition("=")
         is_split_long_option = (
-            len(long_option) > 2
-            and "--split-string".startswith(long_option)
+            _resolve_env_long_option(long_option) == "--split-string"
         )
         if is_split_long_option:
             if separator:
@@ -2023,6 +2035,8 @@ def _env_split_string_findings(command: str):
                     continue
                 args: list[str] = []
                 split_value_expected = False
+                option_arg_expected = False
+                option_phase = True
                 malformed_outer_split = False
                 for raw_arg in raw_words[1:]:
                     resolved, unsupported = _resolve_env_split_outer_word(raw_arg)
@@ -2033,12 +2047,33 @@ def _env_split_string_findings(command: str):
                         ):
                             malformed_outer_split = True
                             break
+                        if option_arg_expected:
+                            args.append("__dynamic_env_option_value__")
+                            option_arg_expected = False
+                            continue
+                        if option_phase:
+                            malformed_outer_split = True
+                            break
                         args.append("__dynamic_shell_value__")
-                        split_value_expected = False
                         continue
                     assert resolved is not None
                     args.append(resolved)
-                    split_value_expected = _env_option_owns_split_value(resolved)
+                    if option_arg_expected:
+                        option_arg_expected = False
+                        split_value_expected = False
+                        continue
+                    if option_phase and _ENV_ASSIGNMENT_RE.fullmatch(resolved):
+                        option_phase = False
+                        continue
+                    if option_phase and resolved == "--":
+                        option_phase = False
+                        continue
+                    if option_phase and resolved.startswith("-"):
+                        split_value_expected = _env_option_owns_split_value(resolved)
+                        option_arg_expected = _env_option_consumes_next_arg(resolved)
+                        continue
+                    option_phase = False
+                    split_value_expected = False
                 if malformed_outer_split:
                     yield None, True
                     continue
@@ -2501,7 +2536,8 @@ def _env_option_consumes_next_arg(option_token: str) -> bool:
     if "=" in lower or lower in {"-", "--"}:
         return False
     if lower.startswith("--"):
-        return lower in _ENV_OPTIONS_WITH_ARG
+        canonical = _resolve_env_long_option(lower)
+        return canonical in _ENV_OPTIONS_WITH_ARG
     if not lower.startswith("-") or lower.startswith("--"):
         return False
     body = lower[1:]
@@ -2544,6 +2580,38 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             return None
         deobfuscated = _deobfuscate_shell_word_for_detection(word)
         lower_word = deobfuscated.lower()
+        if lower_word == "command":
+            current = word_end
+            prefix_words += 1
+            while prefix_words < 12:
+                opt_start, opt_end, opt_word = _read_shell_word(command, current)
+                if opt_start == opt_end:
+                    return None
+                opt_lower = _deobfuscate_shell_word_for_detection(opt_word).lower()
+                if opt_lower == "--":
+                    current = opt_end
+                    prefix_words += 1
+                    break
+                if opt_lower.startswith("-"):
+                    if "v" in opt_lower[1:].lower():
+                        return None
+                    if set(opt_lower[1:]) <= {"p"}:
+                        current = opt_end
+                        prefix_words += 1
+                        continue
+                    return None
+                return opt_start
+            continue
+        if lower_word == "builtin":
+            builtin_start, _, builtin_word = _read_shell_word(command, word_end)
+            if builtin_start == word_end:
+                return None
+            builtin_name = _deobfuscate_shell_word_for_detection(builtin_word).lower()
+            if builtin_name not in {"command", "exec"}:
+                return None
+            current = builtin_start
+            prefix_words += 1
+            continue
         if lower_word in _COMMAND_WRAPPER_WORDS:
             wrapper = lower_word
             current = word_end
@@ -2563,7 +2631,7 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
                 if wrapper == "env" and _ENV_ASSIGNMENT_RE.fullmatch(opt_deob):
                     current = opt_end
                     prefix_words += 1
-                    continue
+                    break
                 if opt_lower == "--" and wrapper in {"env", "sudo"}:
                     current = opt_end
                     prefix_words += 1
@@ -2734,19 +2802,41 @@ def _command_detection_variants(command: str):
     # Program-bearing options are parsed in their owning command's context.
     # Surfacing only their payload lets the hardline floor inspect the command
     # that will actually run without promoting similar flags or quoted prose.
+    payload_count = 0
     while pending:
         variant = pending.pop()
-        for _, payload in _execution_flag_findings(variant):
-            if payload and payload not in seen:
+        payload_count += 1
+        if payload_count > 24:
+            yield _PARSER_LIMIT_VARIANT
+            break
+
+        payload_variants = [variant]
+        marked_payload = _mark_command_starts(variant)
+        if marked_payload != variant:
+            payload_variants.append(marked_payload)
+        decoded_payload = _deobfuscate_shell_words_preserving_boundaries(variant)
+        if decoded_payload not in payload_variants:
+            payload_variants.append(decoded_payload)
+        for base in tuple(payload_variants):
+            unwrapped = _mark_unwrapped_executables(base)
+            if unwrapped != base and unwrapped not in payload_variants:
+                payload_variants.append(unwrapped)
+
+        for payload_variant in payload_variants:
+            if payload_variant not in seen:
+                seen.add(payload_variant)
+                yield payload_variant
+
+        for nested_payload, malformed in _env_split_string_findings(variant):
+            if not malformed and nested_payload and nested_payload not in seen:
+                pending.append(nested_payload)
+
+        for payload_variant in payload_variants:
+            for _, payload in _execution_flag_findings(payload_variant):
+                if not payload or payload in seen:
+                    continue
                 seen.add(payload)
                 yield payload
-                # A payload can begin with an option-looking program and then
-                # invoke a hardline command after a separator. Mark its real
-                # command starts just as we do for the outer command.
-                marked_payload = _mark_command_starts(payload)
-                if marked_payload != payload and marked_payload not in seen:
-                    seen.add(marked_payload)
-                    yield marked_payload
                 pending.append(payload)
     # Subshell `(cmd)` and brace-group `{ cmd; }` openers put `cmd` at a real
     # command position, but the flat `_CMDPOS`-anchored patterns can't see it:
