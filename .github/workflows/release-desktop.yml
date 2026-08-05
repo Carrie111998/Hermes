@@ -124,26 +124,34 @@ jobs:
       # (`0.19.1`, and it even drifts — main currently says 0.17.0). Passing
       # the semver alone would publish to a nonexistent `v0.19.1` tag.
       #
-      # The single contract that resolves it: force the publish tag to equal
-      # the triggering release's tag via `tagNamePrefix` + version. For a
-      # `v2026.7.30` release we set tagNamePrefix="" and version=2026.7.30, so
-      # the computed tag is exactly the release that fired the workflow —
-      # independent of any package.json semver drift.
+      # The single contract that resolves it: split the triggering tag into
+      # (prefix, version) and feed both back, so the tag electron-publish
+      # reconstructs is byte-identical to the release that fired the
+      # workflow — independent of any package.json semver drift.
       - name: Resolve release tag for publishing
         id: version
         env:
           RELEASE_TAG: ${{ github.event.release.tag_name || github.ref_name }}
         run: |
-          # Strip a leading "v" from the triggering tag to get the version
-          # electron-publish should append after our (empty) tagNamePrefix.
+          # Split the triggering tag into (prefix, version) so the tag
+          # electron-publish computes — `tagNamePrefix + version`
+          # (gitHubPublisher.js:38) — reconstructs the EXACT triggering tag.
+          # `v2026.7.30` → prefix "v", version "2026.7.30"; a prefix-less
+          # `2026.7.30` → prefix "", version "2026.7.30". Hardcoding either
+          # half would publish to a sibling tag instead of the release that
+          # fired the workflow (cross-PR triage catch on #76240).
           TAG="$RELEASE_TAG"
-          VER="${TAG#v}"
+          case "$TAG" in
+            v*) PREFIX="v"; VER="${TAG#v}" ;;
+            *)  PREFIX="";  VER="$TAG" ;;
+          esac
           if [ -z "$VER" ]; then
             echo "::error::could not derive a publish version from tag '$TAG'"
             exit 1
           fi
-          echo "Publishing to triggering release tag: $TAG (version: $VER)"
+          echo "Publishing to triggering release tag: $TAG (prefix: '$PREFIX', version: $VER)"
           echo "semver=$VER" >> "$GITHUB_OUTPUT"
+          echo "tagprefix=$PREFIX" >> "$GITHUB_OUTPUT"
 
       - name: Build + publish desktop app
         working-directory: apps/desktop
@@ -157,15 +165,23 @@ jobs:
           APPLE_API_KEY: ${{ secrets.APPLE_API_KEY }}
           APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
           APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          # Teknium review (#76240): only the release-event path may publish.
+          # A workflow_dispatch run is a VERIFICATION build — with
+          # `--publish always` electron-publish would create a draft release
+          # for the resolved tag as a side effect (gitHubPublisher.js
+          # releaseType resolution). `--publish never` keeps dispatch runs
+          # side-effect-free; their artifacts ship via the upload-artifact
+          # step below instead.
+          PUBLISH_MODE: ${{ github.event_name == 'release' && 'always' || 'never' }}
         run: |
           # `dist` = `npm run build` (vite + bundle) then electron-builder.
-          # `--publish always` attaches the artifacts + latest-*.yml to the
-          # triggering GitHub Release. On workflow_dispatch (no triggering
-          # release) electron-publish creates a DRAFT release for that tag —
-          # see the artifact step below for the no-publish verification path.
-          npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }} --publish always \
+          # On the release event, `--publish always` attaches the artifacts +
+          # latest-*.yml to the triggering GitHub Release. On
+          # workflow_dispatch this resolves to `--publish never` (see env
+          # comment) and the build only produces local artifacts.
+          npm run dist -- --${{ matrix.platform }} --${{ matrix.arch }} --publish "$PUBLISH_MODE" \
             -c.extraMetadata.version=${{ steps.version.outputs.semver }} \
-            -c.publish.tagNamePrefix=""
+            -c.publish.tagNamePrefix="${{ steps.version.outputs.tagprefix }}"
 
       - name: Upload artifacts (workflow_dispatch / verification runs)
         if: github.event_name == 'workflow_dispatch'
