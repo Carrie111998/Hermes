@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Any, Mapping
 
+from gateway.canonical_boot_identity import current_boot_id
 
 PRE_PHASE_B_START_PERMIT_SCHEMA = "muncho-writer-pre-phase-b-start-permit.v1"
 DEFAULT_PRE_PHASE_B_START_PERMIT_PATH = Path(
@@ -95,19 +96,9 @@ def _absolute_path(value: Any) -> Path:
 
 def _boot_id_sha256() -> str:
     try:
-        raw = Path("/proc/sys/kernel/random/boot_id").read_bytes()
-        value = raw.decode("ascii", errors="strict").strip()
-    except (OSError, UnicodeDecodeError):
+        value = current_boot_id()
+    except RuntimeError:
         raise PrePhaseBStartPermitError("pre_phase_b_start_permit_invalid") from None
-    if (
-        len(raw) > 128
-        or re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            value,
-        )
-        is None
-    ):
-        raise PrePhaseBStartPermitError("pre_phase_b_start_permit_invalid")
     return _sha256(value.encode("ascii"))
 
 

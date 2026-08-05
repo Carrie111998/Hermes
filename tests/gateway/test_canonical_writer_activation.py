@@ -1755,9 +1755,15 @@ def test_host_identity_convergence_remains_bounded(monkeypatch):
 def test_systemd_bundle_rejects_installable_temporary_exporter():
     value = {
         "schema": activation.SYSTEMD_BUNDLE_SCHEMA,
-        "writer_service": "[Service]\nType=notify\n",
+        "writer_service": (
+            "[Service]\nType=notify\n"
+            f"{activation.SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n"
+        ),
         "phase_b_readiness_service": "[Service]\nType=oneshot\n",
-        "gateway_service": "[Service]\nType=notify\n",
+        "gateway_service": (
+            "[Service]\nType=notify\n"
+            f"{activation.SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n"
+        ),
         "exporter_service": "[Service]\nType=oneshot\n[Install]\n",
         "tmpfiles": "d /run/x 0700 root root - -\n",
         "contract": {"revision": "a" * 40},

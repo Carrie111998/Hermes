@@ -28,6 +28,7 @@ from gateway import canonical_writer_bootstrap
 from gateway import canonical_writer_production_cutover as cutover
 from gateway import production_model_sovereignty_runtime as gateway_runtime
 from gateway import production_secret_stager
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 from gateway.mac_ops_edge_client import DEFAULT_SERVICE_UNIT
 from gateway.mac_ops_edge_service import (
     DEFAULT_PROJECT_ID as MAC_OPS_PROJECT_ID,
@@ -694,6 +695,7 @@ def _render_writer_unit(
         "TimeoutStopSec=60s",
         "KillMode=mixed",
         "LimitCORE=0",
+        SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE,
         "UMask=0077",
         "NoNewPrivileges=yes",
         "CapabilityBoundingSet=",

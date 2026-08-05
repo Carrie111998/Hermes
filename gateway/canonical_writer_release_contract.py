@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
+
 
 RELEASE_SCHEMA = "muncho-writer-only-release.v1"
 UNIT_BUNDLE_SCHEMA = "muncho-writer-only-systemd-bundle.v3"
@@ -447,6 +449,7 @@ def render_systemd_units(
         "TimeoutStopSec=30s",
         "KillMode=mixed",
         "LimitCORE=0",
+        SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE,
         *_fixed_service_environment(user=spec.writer_user, home="/nonexistent"),
         *_common_hardening(address_families="AF_UNIX AF_INET AF_INET6"),
         "IPAddressDeny=any",
@@ -486,6 +489,7 @@ def render_systemd_units(
         "TimeoutStopSec=30s",
         "KillMode=mixed",
         "LimitCORE=0",
+        SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE,
         *_fixed_service_environment(
             user=spec.gateway_user,
             home=str(spec.gateway_home),
@@ -572,14 +576,20 @@ def render_systemd_units(
     gateway = "\n".join(gateway_lines) + "\n"
     exporter = "\n".join(exporter_lines) + "\n"
     tmpfiles = "\n".join(tmpfiles_lines) + "\n"
-    forbidden = re.compile(
-        r"(?im)^(?:EnvironmentFile|PassEnvironment|LoadCredential)="
+    forbidden = re.compile(r"(?im)^(?:EnvironmentFile|PassEnvironment)=")
+    load_credential = re.compile(r"(?m)^LoadCredential=(.+)$")
+    expected_boot_credential = SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE.removeprefix(
+        "LoadCredential="
     )
     if (
         forbidden.search(writer)
         or forbidden.search(phase_b_readiness)
         or forbidden.search(gateway)
         or forbidden.search(exporter)
+        or load_credential.findall(writer) != [expected_boot_credential]
+        or load_credential.findall(gateway) != [expected_boot_credential]
+        or load_credential.findall(phase_b_readiness)
+        or load_credential.findall(exporter)
     ):
         raise RuntimeError("writer-only units cannot inject environment or credentials")
     payload = {

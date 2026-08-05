@@ -31,6 +31,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable, Mapping, Sequence
 
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 from gateway.canonical_writer_root_collector import (
     DEFAULT_ROOT_EVIDENCE_ROOT,
     TrustedDeploymentManifest,
@@ -879,8 +880,10 @@ class SystemdBundle:
         digest = _digest(raw["sha256"], "systemd bundle sha256")
         if _sha256_json(unsigned) != digest:
             raise ValueError("systemd bundle self-digest is invalid")
-        forbidden = re.compile(
-            r"(?im)^(?:EnvironmentFile|PassEnvironment|LoadCredential)="
+        forbidden = re.compile(r"(?im)^(?:EnvironmentFile|PassEnvironment)=")
+        load_credential = re.compile(r"(?m)^LoadCredential=(.+)$")
+        expected_boot_credential = (
+            SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE.removeprefix("LoadCredential=")
         )
         if any(
             forbidden.search(raw[name])
@@ -890,6 +893,13 @@ class SystemdBundle:
                 "gateway_service",
                 "exporter_service",
             )
+        ) or (
+            load_credential.findall(raw["writer_service"])
+            != [expected_boot_credential]
+            or load_credential.findall(raw["gateway_service"])
+            != [expected_boot_credential]
+            or load_credential.findall(raw["phase_b_readiness_service"])
+            or load_credential.findall(raw["exporter_service"])
         ):
             raise ValueError("systemd bundle contains credential injection")
         if (

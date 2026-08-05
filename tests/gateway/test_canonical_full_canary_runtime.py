@@ -24,6 +24,7 @@ import pytest
 import yaml
 
 import gateway.canonical_full_canary_runtime as runtime
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 
 from gateway.canonical_full_canary_runtime import (
     API_SERVER_CREDENTIAL_NAME,
@@ -104,6 +105,7 @@ WorkingDirectory=/opt/muncho-canary-releases/{REVISION}
 ExecStart={interpreter} -B -I -m gateway.canonical_writer_bootstrap --config {runtime.DEFAULT_WRITER_CONFIG}
 Restart=on-failure
 RestartSec=5s
+{SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}
 NoNewPrivileges=yes
 CapabilityBoundingSet=
 AmbientCapabilities=
@@ -773,8 +775,12 @@ def test_systemd_bundle_keeps_writer_credential_free_and_services_bounded() -> N
         f"{DEFAULT_API_SERVER_CONTROL_KEY}"
     )
     assert bundle.gateway_service.count(gateway_credential) == 1
-    assert "LoadCredential=" not in bundle.edge_service
-    assert "LoadCredential=" not in bundle.writer_service
+    assert bundle.edge_service.count(SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE) == 1
+    assert bundle.writer_service.count(SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE) == 1
+    assert bundle.gateway_service.count(SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE) == 1
+    assert bundle.edge_service.count("LoadCredential=") == 1
+    assert bundle.writer_service.count("LoadCredential=") == 1
+    assert bundle.gateway_service.count("LoadCredential=") == 2
     assert "ExecStartPre=" not in bundle.writer_service
     assert "ExecStopPost=" not in bundle.writer_service
     assert "EnvironmentFile=" not in "".join(
@@ -809,16 +815,18 @@ def test_systemd_bundle_keeps_writer_credential_free_and_services_bounded() -> N
         f"{_identities().gateway_group} - -"
     ) in bundle.tmpfiles
 
-def test_writer_stays_credential_free_across_full_transition() -> None:
+def test_writer_accepts_only_public_boot_identity_across_full_transition() -> None:
     writer_only = _writer_only_service()
 
-    assert "LoadCredential=" not in writer_only
+    assert writer_only.count(SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE) == 1
+    assert writer_only.count("LoadCredential=") == 1
     assert "ExecStartPre=" not in writer_only
     assert "CapabilityBoundingSet=\n" in writer_only
     assert "Restart=on-failure\n" in writer_only
 
     transitioned = _bundle().writer_service
-    assert "LoadCredential=" not in transitioned
+    assert transitioned.count(SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE) == 1
+    assert transitioned.count("LoadCredential=") == 1
     assert "ExecStartPre=" not in transitioned
     assert "ExecStopPost=" not in transitioned
     assert "CapabilityBoundingSet=\n" in transitioned

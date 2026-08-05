@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway import canonical_writer_foundation
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 from scripts.canary import writer_release
 from scripts.canary.writer_release import (
     GATEWAY_MODULE,
@@ -2011,12 +2012,15 @@ def test_hardened_writer_only_units_pin_identity_config_and_readiness():
     for rendered in (bundle.writer_service, bundle.gateway_service):
         assert "EnvironmentFile=" not in rendered
         assert "PassEnvironment=" not in rendered
-        assert "LoadCredential=" not in rendered
+        assert rendered.count(f"{SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n") == 1
+        assert rendered.count("LoadCredential=") == 1
         assert "/bin/sh" not in rendered
         assert "discord" not in rendered.casefold()
         assert "openai" not in rendered.casefold()
         assert "api_key" not in rendered.casefold()
         assert "token" not in rendered.casefold()
+    assert "LoadCredential=" not in bundle.phase_b_readiness_service
+    assert "LoadCredential=" not in bundle.exporter_service
 
 
 def test_unit_spec_rejects_config_inside_mutable_gateway_home():
