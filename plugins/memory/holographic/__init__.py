@@ -371,11 +371,14 @@ class HolographicMemoryProvider(MemoryProvider):
             retriever = self._retriever
 
             if action == "add":
-                fact_id = store.add_fact(
+                result = store.add_fact(
                     args["content"],
                     category=args.get("category", "general"),
                     tags=args.get("tags", ""),
                 )
+                # add_fact returns a dict {fact_id, status} since the
+                # initial_trust/semantic-dedup change; extract fact_id.
+                fact_id = result.get("fact_id") if isinstance(result, dict) else result
                 return json.dumps({"fact_id": fact_id, "status": "added"})
 
             elif action == "search":
