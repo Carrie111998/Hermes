@@ -1929,6 +1929,20 @@ class PluginManager:
         persisted to session DB.
         """
         kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        try:
+            from gateway.session_context import get_session_env
+
+            kwargs.setdefault("ui_session_id", get_session_env("HERMES_UI_SESSION_ID"))
+            kwargs.setdefault("session_profile", get_session_env("HERMES_SESSION_PROFILE"))
+        except Exception:
+            kwargs.setdefault("ui_session_id", "")
+            kwargs.setdefault("session_profile", "")
+        try:
+            from agent.runtime_cwd import get_session_cwd
+
+            kwargs.setdefault("session_cwd", str(get_session_cwd() or ""))
+        except Exception:
+            kwargs.setdefault("session_cwd", "")
         callbacks = self._hooks.get(hook_name, [])
         results: List[Any] = []
         for cb in callbacks:

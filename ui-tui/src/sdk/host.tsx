@@ -3,11 +3,30 @@ import { useStore } from '@nanostores/react'
 import { Component, type ReactNode } from 'react'
 
 import { $overlayState, patchOverlayState } from '../app/overlayStore.js'
-import { $uiTheme } from '../app/uiStore.js'
+import { $uiState, $uiTheme } from '../app/uiStore.js'
 import { recordParentLifecycle } from '../lib/parentLog.js'
 
-import { getWidgetApp } from './registry.js'
+import { $widgetRegistryRevision, getWidgetApp, getWidgetAppRevision } from './registry.js'
 import type { ActiveWidget, AmbientZone, WidgetApp, WidgetInput } from './types.js'
+
+export interface WidgetSessionIdentity {
+  durableSessionId: string
+  profileId: string
+  uiSessionId: string
+  workspace: string
+}
+
+/** Reactive identity for the TUI session currently rendering a user widget. */
+export function useSessionIdentity(): WidgetSessionIdentity {
+  const ui = useStore($uiState)
+
+  return {
+    durableSessionId: String(ui.info?.stored_session_id || ''),
+    profileId: String(ui.info?.profile_name || ''),
+    uiSessionId: String(ui.sid || ''),
+    workspace: String(ui.info?.cwd || '')
+  }
+}
 
 /**
  * The widget-app host. Core integrates through exactly four touchpoints:
@@ -178,7 +197,7 @@ const useRenderCtx = (): RenderCtx => {
   return { cols: stdout?.columns ?? 80, rows: stdout?.rows ?? 24, t: t as never }
 }
 
-const renderApp = (active: ActiveWidget, ctx: RenderCtx) => {
+const WidgetAppRenderer = ({ active, ctx }: { active: ActiveWidget; ctx: RenderCtx }) => {
   const app = getWidgetApp(active.appId)
 
   if (!app) {
@@ -196,10 +215,18 @@ const renderApp = (active: ActiveWidget, ctx: RenderCtx) => {
   )
 }
 
+const WidgetAppMount = ({ active, ctx }: { active: ActiveWidget; ctx: RenderCtx }) => {
+  useStore($widgetRegistryRevision)
+
+  return <WidgetAppRenderer active={active} ctx={ctx} key={`${active.appId}:${getWidgetAppRevision(active.appId)}`} />
+}
+
 const CardStack = ({ apps, ctx }: { apps: ActiveWidget[]; ctx: RenderCtx }) => (
   <Box flexDirection="column" rowGap={1}>
     {apps.map(active => (
-      <Box key={active.appId}>{renderApp(active, ctx)}</Box>
+      <Box key={active.appId}>
+        <WidgetAppMount active={active} ctx={ctx} />
+      </Box>
     ))}
   </Box>
 )
@@ -210,7 +237,7 @@ export function ActiveWidgetSlot(): ReactNode {
   const overlay = useStore($overlayState)
   const ctx = useRenderCtx()
 
-  return overlay.widget ? renderApp(overlay.widget, ctx) : null
+  return overlay.widget ? <WidgetAppMount active={overlay.widget} ctx={ctx} /> : null
 }
 
 /** An in-FLOW dock row: reserves real rows in the chrome (never covers
@@ -230,7 +257,9 @@ export function AmbientDock({ placement }: { placement: 'dock-bottom' | 'dock-to
   return (
     <Box columnGap={1} flexDirection="row" justifyContent="flex-end" paddingRight={2} width="100%">
       {docked.map(active => (
-        <Box key={active.appId}>{renderApp(active, ctx)}</Box>
+        <Box key={active.appId}>
+          <WidgetAppMount active={active} ctx={ctx} />
+        </Box>
       ))}
     </Box>
   )

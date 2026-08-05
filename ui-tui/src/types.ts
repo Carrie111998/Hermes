@@ -169,6 +169,7 @@ export interface SessionInfo {
   mcp_servers?: McpServerStatus[]
   model: string
   profile_name?: string
+  stored_session_id?: string
   project?: null | ProjectInfo
   reasoning_effort?: string
   release_date?: string

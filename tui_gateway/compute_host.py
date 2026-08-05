@@ -551,16 +551,30 @@ class ComputeHost:
                 home_token = set_hermes_home_override(profile_home)
                 secret_token = set_secret_scope(build_profile_secret_scope(Path(profile_home)))
                 session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-            agent = server._make_agent(
-                sid,
+            provisional_session = {
+                "session_key": key,
+                "cwd": str(frame.get("cwd") or ""),
+                "profile_home": profile_home or None,
+                "source": frame.get("source"),
+            }
+            context_tokens = server._set_session_context(
                 key,
-                session_id=key,
-                model_override=frame.get("model_override"),
-                reasoning_config_override=frame.get("reasoning_config_override"),
-                service_tier_override=frame.get("service_tier_override"),
-                platform_override=frame.get("source"),
-                session_db=session_db,
+                ui_session_id=sid,
+                session=provisional_session,
             )
+            try:
+                agent = server._make_agent(
+                    sid,
+                    key,
+                    session_id=key,
+                    model_override=frame.get("model_override"),
+                    reasoning_config_override=frame.get("reasoning_config_override"),
+                    service_tier_override=frame.get("service_tier_override"),
+                    platform_override=frame.get("source"),
+                    session_db=session_db,
+                )
+            finally:
+                server._clear_session_context(context_tokens)
         finally:
             if home_token is not None:
                 try:
@@ -585,6 +599,7 @@ class ComputeHost:
                     cwd=str(frame.get("cwd") or "") or None,
                     session_db=session_db,
                     source=frame.get("source"),
+                    profile_home=profile_home or None,
                 )
             finally:
                 reset_transport(token)

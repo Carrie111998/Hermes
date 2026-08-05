@@ -90,6 +90,64 @@ def test_session_slot_is_claimed_on_first_turn_not_on_create(monkeypatch, tmp_pa
         reset_hermes_home_override(token)
 
 
+def test_session_create_initial_info_includes_known_durable_id(monkeypatch):
+    monkeypatch.setattr(server, "_schedule_agent_build", lambda _sid: None)
+    monkeypatch.setattr(server, "_schedule_session_cap_enforcement", lambda: None)
+
+    response = server._methods["session.create"]("create-id", {"cols": 80})
+    sid = response["result"]["session_id"]
+    try:
+        durable_id = response["result"]["stored_session_id"]
+        assert durable_id
+        assert response["result"]["info"]["stored_session_id"] == durable_id
+    finally:
+        server._sessions.pop(sid, None)
+
+
+def test_lazy_resume_and_fallback_info_include_exact_known_identity(monkeypatch, tmp_path):
+    lazy = server._lazy_resume_info(
+        "/work/project",
+        stored_session_id="resume-durable",
+    )
+    assert lazy["stored_session_id"] == "resume-durable"
+
+    project = tmp_path / "project"
+    project.mkdir()
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    session = {
+        "session_key": "fallback-durable",
+        "agent": None,
+        "cwd": str(project),
+        "profile_home": str(profile_home),
+    }
+    monkeypatch.setattr(server, "_completion_cwd", lambda: "/wrong/workspace")
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda name: profile_home if name == "work" else None,
+    )
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "wrong-profile")
+    fallback = server._fallback_session_info(session)
+    assert fallback["stored_session_id"] == "fallback-durable"
+    assert fallback["cwd"] == str(project)
+    assert fallback["profile_name"] == "work"
+
+    agent = object()
+    session["agent"] = agent
+    seen = []
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda actual_agent, actual_session=None: seen.append(
+            (actual_agent, actual_session)
+        )
+        or {"stored_session_id": "live-durable"},
+    )
+    assert server._fallback_session_info(session)["stored_session_id"] == "live-durable"
+    assert seen == [(agent, session)]
+
+
 def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     """Desktop/TUI sessions must pin the agent cwd per session.
 
@@ -117,6 +175,158 @@ def test_session_context_uses_session_cwd(monkeypatch, tmp_path):
     finally:
         server._clear_session_context(tokens)
         server._sessions.pop(sid, None)
+
+
+def test_session_context_binds_profile_and_ui_identity(monkeypatch, tmp_path):
+    from gateway.session_context import get_session_env
+    from hermes_cli.plugins import PluginManager
+
+    sid = "ui-sid"
+    session_key = "durable-key"
+    project = tmp_path / "project"
+    project.mkdir()
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    session = {
+        "session_key": session_key,
+        "cwd": str(project),
+        "profile_home": str(profile_home),
+    }
+    monkeypatch.setattr(server, "_response_profile_name", lambda profile=None: profile or "default")
+    decoy_home = tmp_path / "profiles" / "other"
+    decoy_home.mkdir(parents=True)
+    server._sessions["decoy-ui"] = {
+        "session_key": session_key,
+        "cwd": str(project),
+        "profile_home": str(decoy_home),
+    }
+    server._sessions[sid] = session
+
+    tokens = server._set_session_context(session_key, ui_session_id=sid)
+    try:
+        assert get_session_env("HERMES_UI_SESSION_ID") == sid
+        assert get_session_env("HERMES_SESSION_PROFILE") == "work"
+        manager = PluginManager()
+        seen = []
+        manager._hooks["post_tool_call"] = [lambda **kwargs: seen.append(kwargs)]
+        manager.invoke_hook("post_tool_call", session_id=session_key, tool_name="todo")
+        assert seen[0]["ui_session_id"] == sid
+        assert seen[0]["session_profile"] == "work"
+        assert seen[0]["session_cwd"] == str(project)
+    finally:
+        server._clear_session_context(tokens)
+        server._sessions.pop("decoy-ui", None)
+        server._sessions.pop(sid, None)
+
+
+def test_session_context_binds_detached_record_before_registry_insert(monkeypatch, tmp_path):
+    from gateway.session_context import get_session_env
+    from agent.runtime_cwd import get_session_cwd
+
+    project = tmp_path / "project"
+    project.mkdir()
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    session = {
+        "session_key": "durable-detached",
+        "cwd": str(project),
+        "profile_home": str(profile_home),
+        "source": "tui",
+    }
+    monkeypatch.setattr(
+        server,
+        "_response_profile_name",
+        lambda profile=None: profile or "default",
+    )
+
+    tokens = server._set_session_context(
+        "durable-detached",
+        ui_session_id="ui-detached",
+        session=session,
+    )
+    try:
+        assert "ui-detached" not in server._sessions
+        assert get_session_env("HERMES_UI_SESSION_ID") == "ui-detached"
+        assert get_session_env("HERMES_SESSION_PROFILE") == "work"
+        assert get_session_cwd() == str(project)
+        assert get_session_env("HERMES_SESSION_ID") == "durable-detached"
+    finally:
+        server._clear_session_context(tokens)
+
+
+def test_session_boundary_forwards_exact_tui_scope(monkeypatch, tmp_path):
+    from hermes_cli import lifecycle
+
+    sid = "ui-sid"
+    project = tmp_path / "project"
+    project.mkdir()
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    session = {
+        "session_key": "durable-key",
+        "cwd": str(project),
+        "profile_home": str(profile_home),
+    }
+    monkeypatch.setattr(server, "_response_profile_name", lambda profile=None: profile or "default")
+    reset_calls = []
+    finalize_calls = []
+    monkeypatch.setattr(lifecycle, "invoke_hook", lambda hook, **kwargs: reset_calls.append((hook, kwargs)))
+    monkeypatch.setattr(lifecycle, "finalize_session", lambda **kwargs: finalize_calls.append(kwargs))
+
+    server._notify_session_boundary(
+        "on_session_reset",
+        "durable-key",
+        "tui",
+        ui_session_id=sid,
+        session=session,
+    )
+    server._notify_session_boundary(
+        "on_session_finalize",
+        "durable-key",
+        "tui",
+        ui_session_id=sid,
+        session=session,
+    )
+
+    expected = {
+        "session_id": "durable-key",
+        "platform": "tui",
+        "ui_session_id": sid,
+        "session_profile": "work",
+        "session_cwd": str(project),
+    }
+    assert reset_calls == [("on_session_reset", expected)]
+    assert finalize_calls == [expected]
+
+
+def test_popped_session_uses_stamped_ui_identity_for_finalize(monkeypatch, tmp_path):
+    from hermes_cli import lifecycle
+
+    sid = "ui-popped"
+    project = tmp_path / "project"
+    project.mkdir()
+    session = {
+        "session_key": "durable-popped",
+        "cwd": str(project),
+    }
+    server._sessions[sid] = session
+    popped = server._pop_session_by_id(sid)
+    assert popped is session
+    assert sid not in server._sessions
+    assert server._ui_session_id_for_session(popped) == sid
+
+    calls = []
+    monkeypatch.setattr(lifecycle, "finalize_session", lambda **kwargs: calls.append(kwargs))
+    server._notify_session_boundary(
+        "on_session_finalize",
+        "durable-popped",
+        "tui",
+        ui_session_id=server._ui_session_id_for_session(popped),
+        session=popped,
+    )
+
+    assert calls[0]["ui_session_id"] == sid
+    assert calls[0]["session_cwd"] == str(project)
 
 
 def test_handoff_fail_marks_only_inflight_rows(monkeypatch):
@@ -2449,7 +2659,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(
         server,
@@ -2719,6 +2929,7 @@ def test_lazy_child_watch_resume_serves_candidate_inclusive_display(monkeypatch,
     texts = [m.get("text") for m in resp["result"]["messages"]]
     assert "child substantive answer" in texts
     assert texts == ["child prompt", "child substantive answer", "child terse reply"]
+    assert resp["result"]["info"]["stored_session_id"] == "child1"
 
 
 def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
@@ -2766,7 +2977,7 @@ def test_session_resume_follows_compression_tip(monkeypatch, tmp_path):
 
     monkeypatch.setattr(server, "_get_db", lambda: db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(
@@ -2827,7 +3038,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
 
     monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_session_info", lambda agent, *a: {"model": agent.model, "provider": agent.provider})
@@ -2914,17 +3125,27 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         captured["agent_db"] = session_db
         return types.SimpleNamespace(model="test/model")
 
+    def capture_session_context(target, **kwargs):
+        captured["context_target"] = target
+        captured["context_kwargs"] = kwargs
+        return []
+
+    def capture_boundary(hook_name, *_args, **kwargs):
+        if hook_name == "on_session_reset":
+            captured["reset_session"] = dict(kwargs["session"])
+
     monkeypatch.setenv("TERMINAL_CWD", str(launch_cwd))
     monkeypatch.setattr(server, "_profile_home", lambda _profile: profile_home)
     monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: profile_db)
     monkeypatch.setattr(server, "_get_db", lambda: launch_db)
     monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", capture_session_context)
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
     monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", capture_boundary)
     monkeypatch.setattr(
         server,
         "_session_info",
@@ -2952,6 +3173,15 @@ def test_session_resume_profile_uses_profile_db_cwd(monkeypatch, tmp_path):
         assert captured["agent_db"] is profile_db
         assert server._sessions[sid]["cwd"] == str(profile_cwd)
         assert resp["result"]["info"]["cwd"] == str(profile_cwd)
+        assert captured["context_target"] == target
+        assert captured["context_kwargs"]["ui_session_id"] == sid
+        assert captured["context_kwargs"]["session"] == {
+            "session_key": target,
+            "cwd": str(profile_cwd),
+            "profile_home": str(profile_home),
+            "source": "tui",
+        }
+        assert captured["reset_session"]["profile_home"] == str(profile_home)
         assert "launch_update" not in captured
     finally:
         server._sessions.clear()
@@ -2992,6 +3222,92 @@ def test_session_cwd_set_profile_session_updates_profile_db(monkeypatch, tmp_pat
     assert captured["profile_update"] == (target, str(new_cwd))
     assert captured["profile_closed"] is True
     assert "launch_update" not in captured
+
+
+def test_lazy_session_info_preserves_identity_across_cwd_and_workspace_moves(
+    monkeypatch, tmp_path
+):
+    target = "lazy-durable"
+    profile_home = tmp_path / "profiles" / "worker"
+    profile_home.mkdir(parents=True)
+    first = tmp_path / "first"
+    second = tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    emitted = []
+    session = {
+        "agent": None,
+        "cwd": str(first),
+        "profile_home": str(profile_home),
+        "running": False,
+        "session_key": target,
+    }
+    server._sessions["ui-lazy"] = session
+
+    def set_cwd(actual_session, raw):
+        actual_session["cwd"] = str(raw)
+        return str(raw)
+
+    class FakeDB:
+        def get_session(self, session_id):
+            assert session_id == target
+            return {"id": target}
+
+        def update_session_cwd(self, *_args, **_kwargs):
+            return None
+
+    class DBContext:
+        def __enter__(self):
+            return FakeDB()
+
+        def __exit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(server, "_set_session_cwd", set_cwd)
+    monkeypatch.setattr(server, "_profile_db", lambda _params: DBContext())
+    monkeypatch.setattr(server, "_session_db", lambda _session: DBContext())
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_persist_session_git_meta", lambda *_args: None)
+    monkeypatch.setattr(
+        server,
+        "_profile_home",
+        lambda name: profile_home if name == "worker" else None,
+    )
+    monkeypatch.setattr(server, "_current_profile_name", lambda: "wrong-profile")
+    monkeypatch.setattr(server, "_git_branch_for_cwd", lambda _cwd: "branch")
+    monkeypatch.setattr(server, "_git_common_repo_root_for_cwd", lambda _cwd: "")
+    monkeypatch.setattr(server, "_project_info_for_cwd", lambda _cwd: None)
+    monkeypatch.setattr(
+        server, "_emit", lambda event, sid, payload=None: emitted.append((event, sid, payload))
+    )
+
+    try:
+        cwd_response = server.handle_request(
+            {
+                "id": "cwd",
+                "method": "session.cwd.set",
+                "params": {"session_id": "ui-lazy", "cwd": str(second)},
+            }
+        )
+        assert cwd_response["result"]["stored_session_id"] == target
+        assert cwd_response["result"]["profile_name"] == "worker"
+
+        workspace_response = server.handle_request(
+            {
+                "id": "workspace",
+                "method": "session.workspace.move",
+                "params": {"session_key": target, "cwd": str(first)},
+            }
+        )
+        assert "error" not in workspace_response
+        assert emitted[-1][2]["stored_session_id"] == target
+        assert emitted[-1][2]["profile_name"] == "worker"
+
+        server._apply_project_workspace(target, str(second))
+        assert emitted[-1][2]["stored_session_id"] == target
+        assert emitted[-1][2]["profile_name"] == "worker"
+    finally:
+        server._sessions.pop("ui-lazy", None)
 
 
 def test_stored_session_runtime_overrides_skips_bare_billing_provider():
@@ -3593,7 +3909,7 @@ def test_session_close_commits_memory_and_fires_finalize_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: calls["hooks"].append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: calls["hooks"].append((event, session_id)),
     )
 
     try:
@@ -3857,6 +4173,47 @@ def test_finalize_session_closes_slash_worker(monkeypatch):
     assert closed["count"] == 1
 
 
+def test_finalize_session_end_hook_receives_exact_public_scope(monkeypatch, tmp_path):
+    import hermes_cli.lifecycle as lifecycle
+
+    captured = {}
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+    agent = types.SimpleNamespace(
+        session_id="continuation-session",
+        model="test/model",
+        platform="tui",
+    )
+    session = _session(
+        agent=agent,
+        session_key="parent-session",
+        cwd="/work/project",
+        profile_home=str(profile_home),
+        _sid="ui-finalize",
+    )
+
+    monkeypatch.setattr(
+        lifecycle,
+        "invoke_hook",
+        lambda name, **kwargs: captured.update(name=name, **kwargs),
+    )
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *a, **k: None)
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    monkeypatch.setattr(
+        server,
+        "_response_profile_name",
+        lambda profile=None: profile or "default",
+    )
+
+    server._finalize_session(session)
+
+    assert captured["name"] == "on_session_end"
+    assert captured["session_id"] == "continuation-session"
+    assert captured["ui_session_id"] == "ui-finalize"
+    assert captured["session_profile"] == "work"
+    assert captured["session_cwd"] == "/work/project"
+
+
 def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
     """A session that rebinds a live transport is NOT considered orphaned."""
 
@@ -3994,7 +4351,7 @@ def test_init_session_fires_reset_hook(monkeypatch):
     monkeypatch.setattr(
         server,
         "_notify_session_boundary",
-        lambda event, session_id, *_args: hooks.append((event, session_id)),
+        lambda event, session_id, *_args, **_kwargs: hooks.append((event, session_id)),
     )
 
     import tools.approval as _approval
@@ -8748,6 +9105,22 @@ def test_session_info_includes_session_title(monkeypatch):
     assert info["title"] == "Dashboard title"
 
 
+def test_session_info_prefers_live_agent_durable_id_after_compression():
+    agent = types.SimpleNamespace(
+        session_id="continuation-session",
+        tools=[],
+        model="test/model",
+        provider="openai-codex",
+    )
+
+    info = server._session_info(
+        agent,
+        {"session_key": "parent-session", "history": []},
+    )
+
+    assert info["stored_session_id"] == "continuation-session"
+
+
 def test_session_info_reports_pending_model_switch(monkeypatch):
     """A model queued mid-turn shows as the session's model in session.info, so
     the end-of-turn settle doesn't blip the UI back to the still-live old model
@@ -11483,8 +11856,13 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         seen["agent_session_db"] = k.get("session_db")
         return FakeAgent()
 
+    def capture_session_context(target, **kwargs):
+        seen["context_target"] = target
+        seen["context_kwargs"] = kwargs
+        return {}
+
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
-    monkeypatch.setattr(server, "_set_session_context", lambda *a, **k: {})
+    monkeypatch.setattr(server, "_set_session_context", capture_session_context)
     monkeypatch.setattr(server, "_clear_session_context", lambda *a, **k: None)
     monkeypatch.setattr(server, "_resolve_model", lambda: "test-model")
     monkeypatch.setattr(server, "_session_cwd", lambda s: str(tmp_path))
@@ -11510,6 +11888,14 @@ def test_session_branch_writes_to_parent_profile_db(monkeypatch, tmp_path):
         assert seen.get("launch_create") is None
         child_sid = resp["result"]["session_id"]
         assert server._sessions[child_sid]["profile_home"] == str(profile_home)
+        assert seen["context_target"] == seen["created"]
+        assert seen["context_kwargs"]["ui_session_id"] == child_sid
+        assert seen["context_kwargs"]["session"] == {
+            "session_key": seen["created"],
+            "cwd": str(tmp_path),
+            "profile_home": str(profile_home),
+            "source": "tui",
+        }
         # The branched AGENT must be bound to the parent profile's state.db —
         # not just the row. Otherwise its own flushes (and a later compression
         # rotation) land on the launch db, splitting the lineage again.
@@ -12286,7 +12672,11 @@ def test_session_activate_returns_inflight_stream_before_completion(monkeypatch)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, session=None: {"model": agent.model},
+    )
 
     def _emit(event, sid, payload=None):
         if event == "message.complete":
@@ -12349,7 +12739,11 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
     that copy without leaking the transport object.
     """
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, session=None: {"model": agent.model},
+    )
     agent = types.SimpleNamespace(model="model-live")
     session = _session(
         agent=agent,
@@ -12382,7 +12776,11 @@ def test_session_activate_returns_prompt_queued_during_busy_turn(monkeypatch):
 
 
 def test_session_activate_switches_live_session_without_closing_siblings(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, session=None: {"model": agent.model},
+    )
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
         history=[{"role": "user", "content": "old"}],
@@ -12419,7 +12817,11 @@ def test_session_activate_switches_live_session_without_closing_siblings(monkeyp
 
 
 def test_session_activate_can_omit_duplicate_desktop_transcript(monkeypatch):
-    monkeypatch.setattr(server, "_session_info", lambda agent: {"model": agent.model})
+    monkeypatch.setattr(
+        server,
+        "_session_info",
+        lambda agent, session=None: {"model": agent.model},
+    )
     server._sessions["sid-large"] = _session(
         agent=types.SimpleNamespace(model="model-large"),
         history=[
@@ -14794,7 +15196,7 @@ def test_start_agent_build_passes_session_model_override(
         captured.update(kwargs)
         return types.SimpleNamespace(model="claude-sonnet-4.6")
 
-    monkeypatch.setattr(server, "_set_session_context", lambda target: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda target, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda tokens: None)
     monkeypatch.setattr(server, "_make_agent", fake_make_agent)
     monkeypatch.setattr(server, "_SlashWorker", FakeWorker)
@@ -14854,7 +15256,7 @@ def test_reset_session_agent_clears_session_overrides(monkeypatch):
         captured.update(kwargs)
         return new_agent
 
-    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_set_session_context", lambda _key, **_kwargs: [])
     monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
     monkeypatch.setattr(server, "_make_agent", make_agent)
     monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))

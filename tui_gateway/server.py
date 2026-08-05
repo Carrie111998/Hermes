@@ -482,22 +482,36 @@ def _load_interim_assistant_messages() -> bool:
 
 
 def _notify_session_boundary(
-    event_type: str, session_id: str | None, platform: str | None = None
+    event_type: str,
+    session_id: str | None,
+    platform: str | None = None,
+    *,
+    ui_session_id: str = "",
+    session: dict | None = None,
 ) -> None:
     """Fire session lifecycle hooks with CLI parity."""
     try:
         from hermes_cli.lifecycle import finalize_session, invoke_hook
 
+        session_profile = _profile_name_for_session(session)
+        session_cwd = _session_cwd(session) if session is not None else ""
+        scope = {
+            "ui_session_id": str(ui_session_id or ""),
+            "session_profile": session_profile,
+            "session_cwd": session_cwd,
+        }
         if event_type == "on_session_finalize":
             finalize_session(
                 session_id=session_id,
                 platform=_resolve_agent_platform(platform),
+                **scope,
             )
         else:
             invoke_hook(
                 event_type,
                 session_id=session_id,
                 platform=_resolve_agent_platform(platform),
+                **scope,
             )
     except Exception:
         pass
@@ -714,6 +728,9 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
                 interrupted=True,
                 model=getattr(agent, "model", "unknown"),
                 platform=getattr(agent, "platform", None) or "tui",
+                ui_session_id=_ui_session_id_for_session(session),
+                session_profile=_profile_name_for_session(session),
+                session_cwd=_session_cwd(session),
             )
         except Exception:
             pass
@@ -726,7 +743,13 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
 
     session_key = session.get("session_key")
     session_id = getattr(agent, "session_id", None) or session_key
-    _notify_session_boundary("on_session_finalize", session_id, _session_source(session))
+    _notify_session_boundary(
+        "on_session_finalize",
+        session_id,
+        _session_source(session),
+        ui_session_id=_ui_session_id_for_session(session),
+        session=session,
+    )
 
     # Mark session ended in DB so it doesn't linger as a ghost row in /resume.
     # Use session_id (from agent.session_id) not session_key — after compression,
@@ -2110,7 +2133,9 @@ def _start_agent_build(sid: str, session: dict) -> None:
         secret_token = None
         profile_home = current.get("profile_home")
         try:
-            tokens = _set_session_context(key)
+            tokens = _set_session_context(
+                key, ui_session_id=sid, session=current
+            )
             # Build against the session's profile (global-remote): bind its
             # HERMES_HOME so config/skills/model resolve to it, and hand the
             # agent that profile's db so turns persist to the right state.db.
@@ -2224,7 +2249,13 @@ def _start_agent_build(sid: str, session: dict) -> None:
             with _sessions_lock:
                 if sid in _sessions:
                     _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-            _notify_session_boundary("on_session_reset", key, _session_source(current))
+            _notify_session_boundary(
+                "on_session_reset",
+                key,
+                _session_source(current),
+                ui_session_id=sid,
+                session=current,
+            )
 
             info = _session_info(agent, current)
             cfg_warn = _probe_config_health(_load_cfg())
@@ -3037,11 +3068,30 @@ def _cwd_for_session_key(session_key: str) -> str:
     return ""
 
 
+def _profile_name_for_session(session: dict | None) -> str:
+    if not isinstance(session, dict):
+        return ""
+    profile_home = str(session.get("profile_home") or "").strip()
+    return _response_profile_name(Path(profile_home).name if profile_home else None)
+
+
+def _ui_session_id_for_session(session: dict | None) -> str:
+    if not isinstance(session, dict):
+        return ""
+    stamped = str(session.get("_sid") or "").strip()
+    if stamped:
+        return stamped
+    with _sessions_lock:
+        matches = [sid for sid, candidate in _sessions.items() if candidate is session]
+    return str(matches[0]) if len(matches) == 1 else ""
+
+
 def _set_session_context(
     session_key: str,
     cwd: str | None = None,
     *,
     ui_session_id: str = "",
+    session: dict | None = None,
 ) -> list:
     try:
         from gateway.session_context import set_session_vars
@@ -3050,7 +3100,6 @@ def _set_session_context(
         # reverse-map returns "" and would clear the cwd override. Callers that
         # know the parent workspace pass it explicitly so spawned agents inherit
         # it instead of falling back to the gateway launch dir.
-        resolved = cwd if cwd is not None else _cwd_for_session_key(session_key)
         source = _resolve_session_platform()
         # Derive the live conversation id so terminal/execute_code subprocesses
         # can read HERMES_SESSION_ID. Without this, set_session_vars leaves the
@@ -3062,19 +3111,44 @@ def _set_session_context(
         # fall back to the session_key (matching the id derivation used at
         # session-finalize), so an identified session is never left blank.
         session_id = session_key
+        profile = ""
         with _sessions_lock:
-            for sess in list(_sessions.values()):
-                if sess.get("session_key") == session_key:
-                    source = _session_source(sess)
-                    session_id = (
-                        getattr(sess.get("agent"), "session_id", None) or session_key
-                    )
-                    break
+            selected = None
+            matches = [
+                sess for sess in _sessions.values()
+                if sess.get("session_key") == session_key
+            ]
+            if isinstance(session, dict) and session.get("session_key") == session_key:
+                selected = session
+            elif ui_session_id:
+                candidate = _sessions.get(ui_session_id)
+                if isinstance(candidate, dict) and candidate.get("session_key") == session_key:
+                    selected = candidate
+            elif len(matches) == 1:
+                selected = matches[0]
+            if selected is not None:
+                source = _session_source(selected)
+                profile = _profile_name_for_session(selected)
+            id_source = selected or (matches[0] if len(matches) == 1 else None)
+            if id_source is not None:
+                session_id = (
+                    getattr(id_source.get("agent"), "session_id", None) or session_key
+                )
+        resolved = (
+            cwd
+            if cwd is not None
+            else _session_cwd(selected)
+            if selected is not None
+            else ""
+            if ui_session_id
+            else _cwd_for_session_key(session_key)
+        )
         return set_session_vars(
             session_key=session_key,
             session_id=session_id,
             source=source,
             cwd=resolved,
+            profile=profile,
             ui_session_id=ui_session_id,
             cron_session="",
         )
@@ -5014,6 +5088,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     session_key = str(
         (session or {}).get("session_key") or getattr(agent, "session_id", "") or ""
     )
+    durable_session_id = str(getattr(agent, "session_id", "") or session_key)
     cfg_personality = ((_load_cfg().get("display") or {}).get("personality") or "")
     personality = (session or {}).get("personality", cfg_personality)
     reasoning_config = getattr(agent, "reasoning_config", None)
@@ -5071,7 +5146,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
         "personality": str(personality or ""),
         "running": bool((session or {}).get("running")),
         "title": _session_live_title(session or {}, session_key) if session_key else "",
-        "stored_session_id": session_key or "",
+        "stored_session_id": durable_session_id,
         "desktop_contract": DESKTOP_BACKEND_CONTRACT,
         "version": "",
         "release_date": "",
@@ -5742,12 +5817,11 @@ def _apply_project_workspace(task_id: str, path: str, _name: str = "") -> None:
         info = (
             _session_info(agent, session)
             if agent is not None
-            else {
-                "cwd": resolved,
-                "branch": _git_branch_for_cwd(resolved),
-                "project": _project_info_for_cwd(resolved),
-                "lazy": True,
-            }
+            else _lazy_resume_info(
+                resolved,
+                profile=_profile_name_for_session(session),
+                stored_session_id=_session_lookup_key(session),
+            )
         )
         _emit("session.info", sid, info)
     except Exception:
@@ -6101,7 +6175,9 @@ def _preview_restart_callbacks(parent: str, task_id: str) -> dict:
 
 
 def _reset_session_agent(sid: str, session: dict) -> dict:
-    tokens = _set_session_context(session["session_key"])
+    tokens = _set_session_context(
+        session["session_key"], ui_session_id=sid, session=session
+    )
     try:
         # /new is a full conversation boundary: session-scoped runtime
         # overrides (/model, /reasoning, /fast) do NOT carry forward — the
@@ -6581,7 +6657,13 @@ def _init_session(
     with _sessions_lock:
         if sid in _sessions:
             _sessions[sid]["_notif_stop"] = _start_notification_poller(sid, _sessions[sid])
-    _notify_session_boundary("on_session_reset", key, _session_source(_sessions.get(sid, {})))
+    _notify_session_boundary(
+        "on_session_reset",
+        key,
+        _session_source(_sessions.get(sid, {})),
+        ui_session_id=sid,
+        session=_sessions.get(sid, {}),
+    )
     _emit("session.info", sid, _session_info(agent, _sessions.get(sid, {})))
     _schedule_mcp_late_refresh(sid, agent)
 
@@ -7639,6 +7721,7 @@ def _lazy_resume_info(
     model: str = "",
     provider: str = "",
     profile: str | None = None,
+    stored_session_id: str = "",
 ) -> dict:
     """session.info for a not-yet-built session (the shape session.create
     returns). tools/skills land later when the deferred build emits session.info."""
@@ -7646,6 +7729,7 @@ def _lazy_resume_info(
         "cwd": cwd,
         "branch": _git_branch_for_cwd(cwd),
         "project": _project_info_for_cwd(cwd),
+        "stored_session_id": stored_session_id,
         "model": model or _resolve_model(),
         "tools": {},
         "skills": {},
@@ -7836,11 +7920,16 @@ def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
 def _fallback_session_info(session: dict) -> dict:
     agent = session.get("agent")
     if agent is not None:
-        return _session_info(agent)
-    cwd = _default_session_cwd()
+        return _session_info(agent, session)
+    cwd = _display_session_cwd(session)
+    profile_home = str(session.get("profile_home") or "").strip()
     return {
         "cwd": cwd,
         "project": _project_info_for_cwd(cwd),
+        "profile_name": _response_profile_name(Path(profile_home).name)
+        if profile_home
+        else _current_profile_name(),
+        "stored_session_id": _session_lookup_key(session),
         "lazy": True,
         "model": _resolve_model(),
         "skills": {},
@@ -9409,6 +9498,7 @@ def _run_prompt_submit(
             session_tokens = _set_session_context(
                 session["session_key"],
                 ui_session_id=sid,
+                session=session,
             )
             _profile_home_str = session.get("profile_home")
             if _profile_home_str:

@@ -46,6 +46,13 @@ The plugin manager injects this field into every hook payload:
 telemetry_schema_version = "hermes.observer.v1"
 ```
 
+When a hook runs inside a live UI session, the plugin manager also supplies
+the current `ui_session_id`, `session_profile`, and `session_cwd`. These
+fields are empty outside a scoped UI turn. `ui_session_id` identifies the
+frontend tab/window and is intentionally distinct from the durable
+conversation `session_id`. Plugins that publish UI-scoped state must require
+both identities instead of guessing the active session.
+
 Hook callbacks are fail-open. Hermes catches callback exceptions, logs a
 warning, and keeps the agent loop running.
 

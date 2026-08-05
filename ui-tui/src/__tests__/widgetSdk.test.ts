@@ -1,9 +1,11 @@
-import { beforeEach, describe, expect, it } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { getOverlayState, resetOverlayState } from '../app/overlayStore.js'
+import { patchUiState, resetUiState } from '../app/uiStore.js'
 import { dialogTestApp, gridTestApp } from '../sdk/apps/index.js'
 import { closeWidget, dispatchWidgetInput, launchWidget, openWidget } from '../sdk/host.js'
 import { getWidgetApp, listWidgetApps } from '../sdk/registry.js'
+import { widgetSdk } from '../sdk/userWidgets.js'
 import type { WidgetInput } from '../sdk/types.js'
 
 const key = (overrides: Partial<WidgetInput['key']> = {}, ch = ''): WidgetInput =>
@@ -12,9 +14,203 @@ const key = (overrides: Partial<WidgetInput['key']> = {}, ch = ''): WidgetInput 
     key: { ctrl: false, escape: false, leftArrow: false, return: false, rightArrow: false, ...overrides }
   }) as WidgetInput
 
-beforeEach(() => resetOverlayState())
+beforeEach(() => {
+  resetOverlayState()
+  resetUiState()
+})
 
 describe('widget SDK host', () => {
+  it('exposes reactive UI and durable session identity to user widgets', async () => {
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+    const { AmbientDock } = await import('../sdk/host.js')
+    const { renderToScreen } = await import('../../packages/hermes-ink/src/ink/render-to-screen.js')
+    const { cellAtIndex } = await import('../../packages/hermes-ink/src/ink/screen.js')
+    const { createElement } = await import('react')
+    const textOf = () => {
+      const { screen, height } = renderToScreen(createElement(AmbientDock, { placement: 'dock-bottom' }), 100)
+
+      return Array.from({ length: height * 100 }, (_, index) => cellAtIndex(screen, index).char).join('')
+    }
+
+    defineWidgetApp({
+      help: 'identity test',
+      id: 'identity-test',
+      mode: 'ambient',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => {
+        const identity = widgetSdk.useSessionIdentity()
+
+        return widgetSdk.h(
+          widgetSdk.Text,
+          null,
+          `${identity.uiSessionId}|${identity.durableSessionId}|${identity.profileId}|${identity.workspace}`
+        )
+      }
+    })
+
+    patchUiState({
+      sid: 'ui-a',
+      info: {
+        cwd: '/work/a',
+        model: 'm',
+        profile_name: 'default',
+        skills: {},
+        stored_session_id: 'durable-a',
+        tools: {}
+      }
+    })
+    launchWidget('identity-test', '')
+    expect(textOf().replace(/\s+/g, '')).toContain('ui-a|durable-a|default|/work/a')
+
+    patchUiState({
+      sid: 'ui-b',
+      info: { cwd: '/work/b', model: 'm', profile_name: 'work', skills: {}, stored_session_id: 'durable-b', tools: {} }
+    })
+    expect(textOf().replace(/\s+/g, '')).toContain('ui-b|durable-b|work|/work/b')
+  })
+
+  it('isolates widget hooks across dynamic add and remove', async () => {
+    const { PassThrough } = await import('stream')
+    const { renderSync } = await import('@hermes/ink')
+    const { createElement } = await import('react')
+    const { AmbientDock } = await import('../sdk/host.js')
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+
+    defineWidgetApp({
+      help: 'hook order test',
+      id: 'hook-order-test',
+      mode: 'ambient',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => {
+        const identity = widgetSdk.useSessionIdentity()
+
+        return widgetSdk.h(widgetSdk.Text, null, identity.uiSessionId || 'no-session')
+      }
+    })
+
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    Object.assign(stdout, { columns: 100, isTTY: false, rows: 40 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const element = createElement(AmbientDock, { placement: 'dock-bottom' })
+    const instance = renderSync(element, {
+      patchConsole: false,
+      stderr: stderr as unknown as NodeJS.WriteStream,
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream
+    })
+
+    try {
+      expect(() => {
+        launchWidget('hook-order-test', '')
+        instance.rerender(element)
+      }).not.toThrow()
+      expect(() => {
+        launchWidget('hook-order-test', '')
+        instance.rerender(element)
+      }).not.toThrow()
+      expect(consoleError.mock.calls.flat().join(' ')).not.toMatch(/change in the order of Hooks|Rendered more hooks/)
+    } finally {
+      instance.unmount()
+      instance.cleanup()
+      consoleError.mockRestore()
+    }
+  })
+
+  it('remounts modal renderers across app switches and same-id hot reloads', async () => {
+    const { PassThrough } = await import('stream')
+    const { renderSync } = await import('@hermes/ink')
+    const { createElement, useRef } = await import('react')
+    const { ActiveWidgetSlot } = await import('../sdk/host.js')
+    const { defineWidgetApp } = await import('../sdk/registry.js')
+
+    const seenRefs: string[] = []
+    defineWidgetApp({
+      help: 'modal hook a',
+      id: 'modal-hook-a',
+      mode: 'modal',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => {
+        const ref = useRef('a')
+        seenRefs.push(`a:${ref.current}`)
+
+        return widgetSdk.h(widgetSdk.Text, null, 'modal-a')
+      }
+    })
+    defineWidgetApp({
+      help: 'modal hook b',
+      id: 'modal-hook-b',
+      mode: 'modal',
+      init: () => ({}),
+      reduce: state => state,
+      render: () => {
+        const ref = useRef('b')
+        seenRefs.push(`b:${ref.current}`)
+
+        return widgetSdk.h(widgetSdk.Text, null, 'modal-b')
+      }
+    })
+
+    const stdout = new PassThrough()
+    const stdin = new PassThrough()
+    const stderr = new PassThrough()
+    Object.assign(stdout, { columns: 100, isTTY: false, rows: 40 })
+    Object.assign(stdin, { isTTY: false })
+    Object.assign(stderr, { isTTY: false })
+
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const element = createElement(ActiveWidgetSlot)
+    const instance = renderSync(element, {
+      patchConsole: false,
+      stderr: stderr as unknown as NodeJS.WriteStream,
+      stdin: stdin as unknown as NodeJS.ReadStream,
+      stdout: stdout as unknown as NodeJS.WriteStream
+    })
+
+    try {
+      expect(() => {
+        launchWidget('modal-hook-a', '')
+        instance.rerender(element)
+      }).not.toThrow()
+      expect(() => {
+        launchWidget('modal-hook-b', '')
+        instance.rerender(element)
+      }).not.toThrow()
+      expect(seenRefs.at(-1)).toBe('b:b')
+
+      defineWidgetApp({
+        help: 'modal hook b reloaded',
+        id: 'modal-hook-b',
+        mode: 'modal',
+        init: () => ({}),
+        reduce: state => state,
+        render: () => {
+          const ref = useRef('reloaded')
+          seenRefs.push(`reload:${ref.current}`)
+
+          return widgetSdk.h(widgetSdk.Text, null, 'modal-b-reloaded')
+        }
+      })
+      expect(() => instance.rerender(element)).not.toThrow()
+      expect(seenRefs.at(-1)).toBe('reload:reloaded')
+      expect(consoleError.mock.calls.flat().join(' ')).not.toMatch(
+        /change in the order of Hooks|Rendered (fewer|more) hooks/
+      )
+    } finally {
+      closeWidget()
+      instance.unmount()
+      instance.cleanup()
+      consoleError.mockRestore()
+    }
+  })
+
   it('registers the reference apps', () => {
     expect(listWidgetApps().map(app => app.id)).toEqual(
       expect.arrayContaining(['dialog-test', 'grid-test', 'ticker', 'weather'])
