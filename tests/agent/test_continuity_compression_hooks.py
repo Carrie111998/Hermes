@@ -91,3 +91,35 @@ def test_compression_hook_failure_is_nonfatal(monkeypatch):
     monkeypatch.setattr(compression.subprocess, "run", fail)
 
     compression._run_compression_hook(SimpleNamespace(), "post")
+
+
+def test_handoff_marker_not_real_user():
+    from agent.conversation_compression import _is_real_user_message
+
+    msg = {"role": "user", "content": "handoff context", "_handoff_marker_synthetic": True}
+    assert not _is_real_user_message(msg)
+
+
+def test_ensure_compressed_restores_real_user_when_only_handoff_marker_present():
+    from agent.conversation_compression import (
+        _ensure_compressed_has_user_turn,
+        _is_real_user_message,
+    )
+
+    # compressed contains only a synthetic handoff-marker user turn — no real user content
+    compressed = [
+        {"role": "user", "content": "handoff context", "_handoff_marker_synthetic": True},
+        {"role": "assistant", "content": "Sure, continuing from the handoff."},
+    ]
+
+    # original_messages has a genuine user turn
+    original_messages = [
+        {"role": "user", "content": "What is the capital of France?"},
+        {"role": "assistant", "content": "Paris."},
+    ]
+
+    _ensure_compressed_has_user_turn(original_messages, compressed)
+
+    assert any(_is_real_user_message(m) for m in compressed), (
+        "compressed must contain at least one real user message after restoration"
+    )
