@@ -275,7 +275,34 @@ class TestCodexBuildKwargs:
             assert scope["session_id"].startswith("pck_")
             assert scope["session_id"] != session_id
 
+    def test_codex_cache_scope_headers_normalize_cron_session_id(self, transport):
+        """Cache-routing headers strip the cron per-fire timestamp, same as prompt_cache_key."""
+        first_run = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="cron_job42_20260801_090000",
+            is_codex_backend=True,
+        )["extra_headers"]
+        second_run = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="cron_job42_20260802_090000",
+            is_codex_backend=True,
+        )["extra_headers"]
+        other_job = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            session_id="cron_job99_20260801_090000",
+            is_codex_backend=True,
+        )["extra_headers"]
 
+        assert first_run["session_id"] == "cron_job42"
+        assert first_run["session_id"] == second_run["session_id"]
+        assert first_run["x-client-request-id"] == second_run["x-client-request-id"]
+        assert first_run["session_id"] != other_job["session_id"]
 
 
 
