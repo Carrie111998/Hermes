@@ -2533,6 +2533,12 @@ def terminal_tool(
                 For local backends the script path is on the host filesystem. For
                 SSH/Modal/Daytona the same path is remote; the local read misses, so we
                 fall back to ``env.execute('cat ...')``.
+
+                A local file that is a binary (ELF/Mach-O/PE) is never a referenced
+                *shell script*: reading it back through ``cat`` would decode machine
+                code into junk text whose tokenized "paths" can contain NUL bytes,
+                crashing the guard with ``ValueError: embedded null byte`` (#76762).
+                Detect binaries by their leading NUL bytes and skip them entirely.
                 """
                 if env is None:
                     return None
@@ -2545,6 +2551,10 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Skip binaries: NUL in the first chunk means the
+                                # file is not a text script (see lifecycle_guard).
+                                if b"\x00" in data[:4096]:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass

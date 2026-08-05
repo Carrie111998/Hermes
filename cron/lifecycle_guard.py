@@ -258,7 +258,9 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: embedded NUL byte in the path — a guarded path must
+        # never crash the guard (#76762, same class of bug).
         return None, False
     try:
         metadata = os.fstat(descriptor)
