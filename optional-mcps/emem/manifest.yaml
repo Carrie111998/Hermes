@@ -3,38 +3,49 @@
 manifest_version: 1
 
 name: emem
-description: Signed geospatial facts and verifiable citations for real-world locations.
-source: https://github.com/Vortx-AI/emem
+description: Recall signed, citeable facts about real-world locations.
+source: https://emem.dev
 
-# emem is a public remote MCP server over Streamable HTTP. It needs no local
-# install, API key, or account for the selected public tools.
+# emem is an open protocol (Apache 2.0) serving cryptographically signed,
+# content-addressed geospatial facts over a remote Streamable HTTP MCP
+# server. Stateless, no session negotiation, nothing to install locally.
+# Every fact carries an ed25519 signature and a content address; receipts
+# verify offline against the responder's public key and an append-only
+# transparency log (RFC 6962 inclusion/consistency proofs).
 transport:
   type: http
-  url: https://emem.dev/mcp
+  url: https://emem.dev/mcp/full
 
-auth:
-  type: none
+# No auth: the public responder is open-read. Writes to /memories/* are
+# key-scoped server-side; no credentials are held by Hermes.
 
-# emem's public endpoint advertises a 15-tool core and has a broader advanced
-# surface available on demand. Keep the initial Hermes default focused on the
-# main place-based workflow. Users can opt into additional tools with
-# `hermes mcp configure emem`.
+# Tool selection at install time:
+# The full surface is ~105 tools. The curated default below covers the
+# working loop (locate a place, recall facts, cite them, verify a claim)
+# plus the common one-shot recalls. Everything else stays available but
+# unchecked; users opt in via `hermes mcp configure emem`.
 tools:
   default_enabled:
-    - emem_ask
-    - emem_locate
-    - emem_recall
-    - emem_memory_token
-    - emem_verify_receipt
+    - emem_tools            # map of the surface, start here
+    - emem_locate           # canonical cell64 address for a place
+    - emem_at               # one-shot signed facts at a place
+    - emem_ask              # free-text answer backed by signed receipts
+    - emem_recall           # signed facts at a cell64, auto-materializing
+    - emem_ndvi
+    - emem_forest
+    - emem_water
+    - emem_weather
+    - emem_elevation
+    - emem_verify           # claim -> verdict + evidence + signed receipt
+    - emem_memory_token     # mint a resolvable citation handle
+    - emem_memory_token_resolve
+    - emem_echo_verify      # grade a value against the fact it cites
+    - emem_verify_receipt   # offline receipt verification
 
 post_install: |
-  emem is ready to use without authentication. Start a new Hermes session
-  after installation, then ask a place-based question such as:
-
-    Is Helsinki-Vantaa Airport low-lying? Show the signed evidence.
-
-  The selected default tools resolve locations, retrieve signed geospatial
-  facts, create citation tokens, and verify receipts. To enable additional
-  emem tools, run:
-
+  No authentication needed. Try:
+    "Locate JSCA Stadium Ranchi and recall the signed NDVI fact there."
+  Facts return with a fact_cid and an emem:fact: citation token any agent
+  can resolve to the byte-identical signed object. Re-run the tool
+  checklist any time with:
     hermes mcp configure emem
