@@ -320,6 +320,7 @@ async def test_payload_less_split_does_not_suppress_complete_response(
 
     adapter = FinalizeCaptureAdapter()
     runner = _make_runner(adapter)
+    install_frozen_profile_authority(runner, tmp_path)
     source = SessionSource(
         platform=Platform.TELEGRAM,
         chat_id="-1004492624436",
