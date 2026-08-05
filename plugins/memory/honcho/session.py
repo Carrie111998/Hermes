@@ -1167,6 +1167,7 @@ class HonchoSessionManager:
         char_budget = max(200, int(max_tokens) * 4)
         limit = max(3, min(20, char_budget // 300))
 
+        messages: list = []
         try:
             messages = self.honcho.search(
                 q,
@@ -1175,8 +1176,11 @@ class HonchoSessionManager:
             )
         except Exception as e:
             logger.debug("Honcho message search failed (peer_perspective=%s): %s", peer_id, e)
-            # Fall back to peer-authored search if the perspective filter is
-            # unsupported by the running Honcho version.
+
+        if not messages:
+            # Fall back to peer-authored search when the perspective filter is
+            # unsupported by the running Honcho version OR returns nothing
+            # (observed on self-hosted v3.0.11: filter accepted, HTTP 200, []).
             try:
                 peer_obj = self._get_or_create_peer(peer_id)
                 messages = peer_obj.search(q, limit=limit)
