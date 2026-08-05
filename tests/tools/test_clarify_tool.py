@@ -52,6 +52,38 @@ class TestClarifyToolChoicesValidation:
 
         assert len(choices_passed) == MAX_CHOICES
 
+    def test_all_empty_choices_returns_error(self):
+        """All-empty choices must return a tool error, not silently degrade.
+
+        LLMs sometimes emit choices as placeholder empty strings
+        (["", "", "", ""]). Degrading to an open-ended question makes the
+        options disappear on every surface; the model should be told to
+        retry with real option text instead.
+        """
+        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+            raise AssertionError("callback must not run for empty choices")
+
+        result = json.loads(clarify_tool(
+            "Pick one",
+            choices=["", "", "", ""],
+            callback=mock_callback,
+        ))
+        assert "error" in result
+        assert "every entry is empty" in result["error"]
+
+    def test_empty_string_choices_returns_error(self):
+        """A single empty-string choice is also rejected."""
+        def mock_callback(question: str, choices: Optional[List[str]]) -> str:
+            raise AssertionError("callback must not run for empty choices")
+
+        result = json.loads(clarify_tool(
+            "Pick one",
+            choices=[""],
+            callback=mock_callback,
+        ))
+        assert "error" in result
+        assert "every entry is empty" in result["error"]
+
 
     def test_choices_converted_to_strings(self):
         """Non-string choices should be converted to strings."""

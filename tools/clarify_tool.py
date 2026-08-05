@@ -154,7 +154,20 @@ def clarify_tool(
         if len(choices) > MAX_CHOICES:
             choices = choices[:MAX_CHOICES]
         if not choices:
-            choices = None  # empty list → open-ended
+            # The model explicitly passed a choices array but every entry
+            # flattened to empty (common failure mode: ["", "", "", ""] or
+            # [{"description": ""}]). Silently degrading to an open-ended
+            # question makes the options disappear on every surface (CLI
+            # panel, desktop app, messaging platforms) — the user sees a
+            # bare question with no selectable choices and no way to know
+            # options were intended. Returning an error makes the model
+            # retry the call with real option text (or omit choices
+            # entirely for a genuine open-ended question).
+            return tool_error(
+                "choices was provided but every entry is empty. "
+                "Provide 1-4 non-empty option strings, or omit the "
+                "choices parameter for an open-ended question."
+            )
 
     if callback is None:
         return tool_error("Clarify tool is not available in this execution context.")
