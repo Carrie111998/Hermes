@@ -13,6 +13,7 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
@@ -21,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
+from .experience import EbbinghausExperienceLedger, normalize_query_hash
+from .models import RecallAttemptResult, RetrievalOutcome
 from .policies import (
     CapacityPolicy,
     DreamPolicy,
@@ -323,11 +326,18 @@ class EbbinghausMemoryStore:
         # In-process cache of dream previews; durable copy lives in dream_previews.
         self._preview_registry: dict[str, dict[str, Any]] = {}
         self._negative_prefetch_suppressed_count = 0
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, timeout=10.0
         )
         self._conn.row_factory = sqlite3.Row
         self._init_db()
+        self.experience = EbbinghausExperienceLedger(
+            self._conn,
+            now_fn=self._now,
+            policies=self.policies,
+            lock=self._lock,
+        )
         self._hydrate_preview_registry()
 
     # ------------------------------------------------------------------
@@ -658,6 +668,19 @@ class EbbinghausMemoryStore:
             )
             self._conn.commit()
             memory_id = int(cur.lastrowid)
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET belief_id = ?,
+                    belief_version = 1,
+                    belief_status = 'current',
+                    access_state = 'accessible'
+                WHERE memory_id = ?
+                  AND (belief_id IS NULL OR belief_id = '')
+                """,
+                (f"memory-{memory_id}", memory_id),
+            )
+            self._conn.commit()
             return {"memory_id": memory_id, "status": "remembered", **self.get(memory_id)}
         except sqlite3.IntegrityError:
             row = self._conn.execute(
@@ -779,21 +802,76 @@ class EbbinghausMemoryStore:
         reinforce: bool = False,
         include_archived: bool = False,
     ) -> list[dict]:
+        result = self.recall_with_experience(
+            query,
+            limit=limit,
+            min_score=min_score,
+            reinforce=reinforce,
+            include_archived=include_archived,
+            include_history=False,
+            allow_rescue=None,
+            track=True,
+        )
+        return result.results
+
+    def recall_with_experience(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        min_score: float = 0.12,
+        reinforce: bool = False,
+        include_archived: bool = False,
+        include_history: bool = False,
+        allow_rescue: bool | None = None,
+        track: bool = True,
+    ) -> RecallAttemptResult:
+        """Cue recall with optional miss tracking and historical belief access."""
+        del allow_rescue  # Rescue path lands in Task 5.
         query = _normalize_text(query)
         if not query:
-            return []
+            return RecallAttemptResult(
+                query=query,
+                outcome=RetrievalOutcome.MISS,
+                results=[],
+            )
+
         query_counts = _cue_counts(query)
         query_lower = query.lower()
+        query_cues = _top_cues(query_counts, limit=32)
+        query_hash = normalize_query_hash(query)
+        excerpt = (
+            query[:240]
+            if self.policies.experience.record_query_excerpt
+            else ""
+        )
 
-        if include_archived:
-            rows = self._conn.execute("SELECT * FROM memories").fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM memories WHERE state = 'active'"
-            ).fetchall()
-
+        rows = self._conn.execute("SELECT * FROM memories").fetchall()
         scored: list[dict] = []
+        best_score = 0.0
         for row in rows:
+            state = str(row["state"] or "active")
+            access_state = str(row["access_state"] or "accessible")
+            belief_status = str(row["belief_status"] or "current")
+
+            historical = False
+            if include_history and belief_status in {
+                "superseded",
+                "retracted",
+                "contested",
+                "unverified",
+            }:
+                historical = True
+            else:
+                if state != "active" and not include_archived:
+                    continue
+                if include_archived and state not in {"active", "archived"}:
+                    continue
+                if access_state not in {"accessible", "reactivated"}:
+                    continue
+                if belief_status not in {"current", "context_dependent"}:
+                    continue
+
             encoded = self._decode(row["encoded"])
             memory_counts = Counter(encoded.get("cue_vector") or {})
             tags = _split_tags(row["tags"])
@@ -816,26 +894,66 @@ class EbbinghausMemoryStore:
                 + tag_bonus
                 + rehearsal_bonus
             )
+            best_score = max(best_score, float(score))
             if score < min_score:
                 continue
-            scored.append(
-                self._row_to_result(row, query_score=score, retention=retention)
-            )
+            item = self._row_to_result(row, query_score=score, retention=retention)
+            if historical:
+                item["historical"] = True
+            scored.append(item)
 
         scored.sort(
             key=lambda item: (item["score"], item["retention"], item["salience"]),
             reverse=True,
         )
-        results = scored[: max(1, int(limit))]
+        results = scored[: max(1, int(limit))] if scored else []
 
-        if reinforce:
+        if results and reinforce and not any(r.get("historical") for r in results):
             for result in results:
                 self._reinforce_retrieval(result["memory_id"])
             results = [
                 self.get(r["memory_id"]) | {"score": r["score"]}
                 for r in results
             ]
-        return results
+
+        if results:
+            if (
+                track
+                and self.policies.experience.enabled
+                and self.policies.experience.record_hits
+            ):
+                # Hit persistence is opt-in; miss/rescue always record when enabled.
+                self.experience.record_event(
+                    "retrieval_hit",
+                    memory_id=int(results[0]["memory_id"]),
+                    payload={
+                        "query_hash": query_hash,
+                        "direct_best_score": best_score,
+                        "result_count": len(results),
+                    },
+                )
+            return RecallAttemptResult(
+                query=query,
+                outcome=RetrievalOutcome.HIT,
+                results=results,
+                direct_best_score=best_score,
+            )
+
+        attempt_id = None
+        if track and self.policies.experience.enabled:
+            attempt_id = self.experience.record_retrieval_miss(
+                query_hash=query_hash,
+                query_excerpt=excerpt,
+                query_cues=query_cues,
+                direct_best_score=best_score,
+            )
+        return RecallAttemptResult(
+            query=query,
+            outcome=RetrievalOutcome.MISS,
+            results=[],
+            attempt_id=attempt_id,
+            direct_best_score=best_score,
+        )
 
     # ------------------------------------------------------------------
     # rehearse

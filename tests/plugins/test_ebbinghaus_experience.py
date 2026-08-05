@@ -18,7 +18,11 @@ from plugins.memory.ebbinghaus.models import (
     InsightStatus,
     RetrievalOutcome,
 )
-from plugins.memory.ebbinghaus.policies import EbbinghausPolicies, PolicyConfigError
+from plugins.memory.ebbinghaus.policies import (
+    EbbinghausPolicies,
+    ExperiencePolicy,
+    PolicyConfigError,
+)
 from plugins.memory.ebbinghaus.store import EbbinghausMemoryStore
 
 
@@ -165,4 +169,51 @@ def test_experience_migration_backfills_stable_belief_ids(tmp_path):
     assert rows[0]["belief_version"] == 1
     assert rows[0]["belief_status"] == "current"
     assert rows[0]["access_state"] == "accessible"
+    store.close()
+
+
+def test_recall_miss_is_recorded_without_query_excerpt_by_default(tmp_path):
+    policies = EbbinghausPolicies(
+        experience=ExperiencePolicy(enabled=True, record_query_excerpt=False)
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+
+    outcome = store.recall_with_experience("unknown private query", reinforce=False)
+
+    assert outcome.outcome is RetrievalOutcome.MISS
+    row = store._conn.execute(
+        "SELECT query_hash, query_excerpt, outcome FROM retrieval_attempts"
+    ).fetchone()
+    assert len(row["query_hash"]) == 64
+    assert row["query_excerpt"] == ""
+    assert row["outcome"] == "miss"
+    store.close()
+
+
+def test_legacy_recall_still_returns_a_list(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    remembered = store.remember("The current board is ASRock A320.")
+    results = store.recall("ASRock A320", reinforce=False)
+    assert isinstance(results, list)
+    assert results[0]["memory_id"] == remembered["memory_id"]
+    store.close()
+
+
+def test_normal_recall_excludes_historical_belief_statuses(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    memory = store.remember("Old claim.")
+    store._conn.execute(
+        "UPDATE memories SET belief_status = 'superseded' WHERE memory_id = ?",
+        (memory["memory_id"],),
+    )
+    store._conn.commit()
+    assert store.recall("Old claim", reinforce=False) == []
+    historical = store.recall_with_experience(
+        "Old claim",
+        reinforce=False,
+        include_history=True,
+        allow_rescue=False,
+        track=False,
+    )
+    assert historical.results[0]["historical"] is True
     store.close()
