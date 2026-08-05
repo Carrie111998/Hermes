@@ -463,6 +463,15 @@ def _logical_parent(
                         "hermes.call_role": str(
                             (metadata or {}).get("call_role") or "primary"
                         ),
+                        "hermes.provider": str(
+                            (metadata or {}).get("provider") or "unknown"
+                        ),
+                        "hermes.model": str(
+                            (metadata or {}).get("model") or "unknown"
+                        ),
+                        "hermes.api_mode": str(
+                            (metadata or {}).get("api_mode") or "unknown"
+                        ),
                     },
                 )
                 turn.logical_llm_calls[request_id] = handle

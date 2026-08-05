@@ -43,8 +43,11 @@ class _Pool:
         status_code,
         error_context=None,
         api_key_hint=None,
+        failure_reason=None,
     ):
-        self.mark_calls.append((status_code, error_context, api_key_hint))
+        self.mark_calls.append(
+            (status_code, error_context, api_key_hint, failure_reason)
+        )
         if api_key_hint is None:
             return None
         return next(
@@ -166,7 +169,7 @@ def test_existing_agent_adopts_credential_added_to_auth_store(monkeypatch):
     assert agent.swapped_to is fresh
     assert cached_pool.refresh_calls == 0
     assert disk_pool.mark_calls == [
-        (401, {"reason": "invalid_token"}, "stale-token")
+        (401, {"reason": "invalid_token"}, "stale-token", None)
     ]
 
 
