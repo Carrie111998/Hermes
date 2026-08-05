@@ -10,7 +10,9 @@ mocking git would just test the mock.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -24,6 +26,7 @@ from hermes_cli.profile_distribution import (
     _env_template_from_manifest,
     _looks_like_git_url,
     _parse_semver,
+    _replace_directory_atomic,
     check_hermes_requires,
     describe_distribution,
     install_distribution,
@@ -671,4 +674,91 @@ class TestErrorSurfaces:
         staged = _make_staging_dir(profile_env, "bad", manifest=mf)
         with pytest.raises((ValueError, DistributionError)):
             plan_install(str(staged), tmp_path / "work")
+
+    def test_path_traversal_name_rejected(self, profile_env, tmp_path):
+        mf = DistributionManifest(name="../../etc/passwd", version="0.1.0")
+        staged = _make_staging_dir(profile_env, "bad", manifest=mf)
+        with pytest.raises((ValueError, DistributionError)):
+            plan_install(str(staged), tmp_path / "work")
+
+
+# ===========================================================================
+# _replace_directory_atomic — bounded retry on the dest -> backup move
+# ===========================================================================
+
+
+class TestReplaceDirectoryAtomic:
+
+    def _run_with_retried_rename(self, tmp_path, side_effect_sequence):
+        """Run _replace_directory_atomic where the dest->backup move fails
+        transiently (per *side_effect_sequence*) and then succeeds.
+
+        Returns (staged, dest, os_replace_calls).
+        """
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        (staged / "new.md").write_text("new content")
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "old.md").write_text("old content")
+
+        real_replace = os.replace
+        calls = []
+
+        def flaky_replace(src, dst):
+            calls.append((str(src), str(dst)))
+            # First N calls raise, as configured by the side_effect_sequence.
+            if len(calls) <= len(side_effect_sequence):
+                exc = side_effect_sequence[len(calls) - 1]
+                if exc is not None:
+                    raise exc
+            return real_replace(src, dst)
+
+        with patch("hermes_cli.profile_distribution.os.replace", flaky_replace):
+            _replace_directory_atomic(dest, staged, staged)
+
+        return staged, dest, calls
+
+    def test_retries_transient_error_on_dest_to_backup_move(self, tmp_path):
+        """A transient WinError on the dest->backup move must be retried, not
+        fail immediately."""
+        staged, dest, calls = self._run_with_retried_rename(
+            tmp_path,
+            side_effect_sequence=[OSError(13, "Permission denied")],
+        )
+
+        # dest->backup attempted twice (first transient, then success), plus
+        # the tmp->dest rename.
+        assert len(calls) == 3
+        # The new content ended up in place.
+        assert dest.is_dir()
+        assert (dest / "new.md").read_text() == "new content"
+        # The old content was moved aside then cleaned up.
+        assert not (dest / "old.md").exists()
+
+    def test_exhausted_retries_raise_on_dest_to_backup_move(self, tmp_path):
+        """Persistent failures on the dest->backup move must surface and leave
+        the destination intact."""
+        staged = tmp_path / "staged"
+        staged.mkdir()
+        (staged / "new.md").write_text("new content")
+
+        dest = tmp_path / "dest"
+        dest.mkdir()
+        (dest / "old.md").write_text("old content")
+
+        real_replace = os.replace
+
+        def always_fail(src, dst):
+            raise OSError(13, "Permission denied")
+
+        with (
+            patch("hermes_cli.profile_distribution.os.replace", always_fail),
+            pytest.raises(OSError),
+        ):
+            _replace_directory_atomic(dest, staged, staged)
+
+        # Destination was never touched (still the old content).
+        assert (dest / "old.md").read_text() == "old content"
 
