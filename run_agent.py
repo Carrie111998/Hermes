@@ -7598,10 +7598,13 @@ class AIAgent:
             "task_id": effective_task_id,
             "platform": getattr(self, "platform", None) or "",
         }
-        relay_turn_id = (
-            f"{session_id or 'session'}:{effective_task_id}:{uuid.uuid4().hex[:8]}"
-        )
+        # Relay, lifecycle hooks, auxiliary accounting, and durable telemetry all
+        # share one opaque full UUID. Caller/session text is never part of this
+        # correlation identity; task_id remains unchanged for task execution.
+        relay_turn_id = f"turn-{uuid.uuid4().hex}"
         self._relay_pending_turn_id = relay_turn_id
+        turn_telemetry = None
+        telemetry_binding = None
         relay_parent_session_id = (
             str(getattr(self, "_parent_session_id", None) or "")
             if task_context["platform"] == "subagent"
@@ -7614,7 +7617,23 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        result = None
+        turn_error = None
         try:
+            # Observation setup is inside the caller unwind boundary. Ordinary
+            # faults are isolated; cancellation/interrupt signals propagate and
+            # still run every cleanup layer below.
+            try:
+                from hermes_cli.observability import turn_telemetry as _turn_telemetry
+
+                turn_telemetry = _turn_telemetry
+                relay_turn_id = turn_telemetry.new_turn_id()
+                self._relay_pending_turn_id = relay_turn_id
+                telemetry_binding = turn_telemetry.begin_turn(self, relay_turn_id)
+            except Exception as exc:
+                logger.debug(
+                    "Turn telemetry binding failed (%s)", type(exc).__name__
+                )
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
                 session_id=task_context["session_id"],
@@ -7681,6 +7700,7 @@ class AIAgent:
             finish_task_run(**task_context, result=result)
             return result
         except BaseException as exc:
+            turn_error = exc
             if isinstance(exc, (KeyboardInterrupt, InterruptedError)) or (
                 type(exc).__name__ == "CancelledError"
             ):
@@ -7698,30 +7718,59 @@ class AIAgent:
             raise
         finally:
             try:
-                if relay_turn is not None:
-                    relay_runtime.SESSION_COORDINATOR.end_turn(
-                        relay_turn,
-                        outcome=relay_outcome,
-                    )
-            finally:
                 try:
+                    if relay_turn is not None:
+                        relay_runtime.SESSION_COORDINATOR.end_turn(
+                            relay_turn,
+                            outcome=relay_outcome,
+                        )
+                finally:
                     if relay_lease is not None:
                         relay_runtime.SESSION_COORDINATOR.release_conversation(
                             relay_lease
                         )
+            finally:
+                try:
+                    if turn_telemetry is not None and telemetry_binding is not None:
+                        try:
+                            turn_telemetry.finish_turn(
+                                telemetry_binding,
+                                result=result,
+                                error=turn_error,
+                            )
+                        except Exception as exc:
+                            logger.debug(
+                                "Turn telemetry finalizer failed (%s)",
+                                type(exc).__name__,
+                            )
+                        finally:
+                            try:
+                                turn_telemetry.reset_turn(telemetry_binding)
+                            except Exception as exc:
+                                logger.debug(
+                                    "Turn telemetry cleanup failed (%s)",
+                                    type(exc).__name__,
+                                )
                 finally:
-                    # Always clear mid-turn labels when the turn exits — including
-                    # interrupted early returns that skip finalize_turn. Keep ts.
+                    # Every context cleanup is nested so a newly delivered
+                    # BaseException from observation/activity/accounting cannot
+                    # strand any later ContextVar or relay identity.
                     try:
-                        self._reset_activity_labels_after_turn()
-                    except Exception:
-                        pass
-                    if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
-                        self._relay_pending_turn_id = None
-                    if acct_token is not None:
-                        reset_accounting_context(acct_token)
-                    if token is not None:
-                        reset_conversation_context(token)
+                        try:
+                            self._reset_activity_labels_after_turn()
+                        except Exception:
+                            pass
+                    finally:
+                        try:
+                            if getattr(self, "_relay_pending_turn_id", None) == relay_turn_id:
+                                self._relay_pending_turn_id = None
+                        finally:
+                            try:
+                                if acct_token is not None:
+                                    reset_accounting_context(acct_token)
+                            finally:
+                                if token is not None:
+                                    reset_conversation_context(token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

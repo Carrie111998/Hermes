@@ -152,7 +152,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     )
 
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 # FTS storage-layout version, tracked INDEPENDENTLY of SCHEMA_VERSION in the
@@ -297,6 +297,56 @@ CREATE TABLE IF NOT EXISTS session_model_usage (
     PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
 );
 
+-- Content-free operational accounting for one logical agent turn.  This
+-- deliberately has no transcript/content/request/response columns: callers
+-- can persist only bounded route identifiers, counters, and fixed terminal
+-- classifications.  session_id is not a foreign key because gateway
+-- preflight failures can terminate before a sessions row exists.
+CREATE TABLE IF NOT EXISTS turn_telemetry (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    turn_id TEXT NOT NULL,
+    event_type TEXT NOT NULL DEFAULT 'turn_terminal',
+    correlation_id TEXT NOT NULL DEFAULT '',
+    session_id TEXT NOT NULL,
+    parent_session_id TEXT NOT NULL DEFAULT '',
+    parent_turn_id TEXT NOT NULL DEFAULT '',
+    profile_name TEXT NOT NULL DEFAULT '',
+    requested_profile TEXT NOT NULL DEFAULT '',
+    effective_profile TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    platform TEXT NOT NULL DEFAULT '',
+    task_class TEXT NOT NULL DEFAULT 'agent_turn',
+    route_type TEXT NOT NULL DEFAULT 'primary',
+    disposition TEXT NOT NULL DEFAULT 'completed',
+    is_delegated INTEGER NOT NULL DEFAULT 0 CHECK (is_delegated IN (0, 1)),
+    started_at REAL NOT NULL,
+    ended_at REAL NOT NULL,
+    duration_ms INTEGER NOT NULL DEFAULT 0 CHECK (duration_ms >= 0),
+    requested_provider TEXT NOT NULL DEFAULT '',
+    requested_model TEXT NOT NULL DEFAULT '',
+    effective_provider TEXT NOT NULL DEFAULT '',
+    effective_model TEXT NOT NULL DEFAULT '',
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+    retry_count INTEGER NOT NULL DEFAULT 0 CHECK (retry_count >= 0),
+    fallback_count INTEGER NOT NULL DEFAULT 0 CHECK (fallback_count >= 0),
+    auxiliary_attempt_count INTEGER NOT NULL DEFAULT 0
+        CHECK (auxiliary_attempt_count >= 0),
+    input_tokens INTEGER NOT NULL DEFAULT 0 CHECK (input_tokens >= 0),
+    output_tokens INTEGER NOT NULL DEFAULT 0 CHECK (output_tokens >= 0),
+    cache_read_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_read_tokens >= 0),
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0 CHECK (cache_write_tokens >= 0),
+    reasoning_tokens INTEGER NOT NULL DEFAULT 0 CHECK (reasoning_tokens >= 0),
+    total_tokens INTEGER NOT NULL DEFAULT 0 CHECK (total_tokens >= 0),
+    estimated_cost_usd REAL NOT NULL DEFAULT 0 CHECK (estimated_cost_usd >= 0),
+    cost_status TEXT NOT NULL DEFAULT 'unknown',
+    outcome TEXT NOT NULL
+        CHECK (outcome IN ('success', 'held', 'refused', 'failed', 'cancelled')),
+    failure_class TEXT NOT NULL DEFAULT '',
+    record_version INTEGER NOT NULL DEFAULT 1,
+    recorded_at REAL NOT NULL,
+    UNIQUE (session_id, turn_id)
+);
+
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -355,6 +405,18 @@ CREATE INDEX IF NOT EXISTS idx_messages_assistant_calls_by_session
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usage(session_id);
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
+CREATE INDEX IF NOT EXISTS idx_turn_telemetry_session_started
+    ON turn_telemetry(session_id, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_turn_telemetry_profile_started
+    ON turn_telemetry(profile_name, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_turn_telemetry_outcome_started
+    ON turn_telemetry(outcome, started_at DESC);
+CREATE INDEX IF NOT EXISTS idx_turn_telemetry_started
+    ON turn_telemetry(started_at DESC);
+-- Covers the bounded per-write retention walk exactly; id is the deterministic
+-- tie-breaker used by ORDER BY and keeps the prune free of a temporary sort.
+CREATE INDEX IF NOT EXISTS idx_turn_telemetry_recorded_id
+    ON turn_telemetry(recorded_at DESC, id DESC);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
 """

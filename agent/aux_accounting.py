@@ -92,10 +92,6 @@ def record_aux_usage(
     try:
         if not task or task in _EXCLUDED_TASKS:
             return
-        ctx = _accounting.get()
-        if ctx is None:
-            return
-        session_db, session_id = ctx
         raw_usage = getattr(response, "usage", None)
         if raw_usage is None:
             return
@@ -110,16 +106,45 @@ def record_aux_usage(
         ):
             return
 
+        ctx = _accounting.get()
+        if ctx is None:
+            return
+        session_db, session_id = ctx
+
         model = str(getattr(response, "model", "") or "") or "unknown"
         estimated_cost = None
+        cost_status = "unknown"
         try:
             cost = estimate_usage_cost(
                 model, usage, provider=provider, base_url=base_url
             )
+            cost_status = cost.status
             if cost.amount_usd is not None:
                 estimated_cost = float(cost.amount_usd)
         except Exception:
             logger.debug("Aux usage cost estimation failed", exc_info=True)
+
+        # The durable turn row totals main and auxiliary model work. Feed the
+        # ambient content-free collector from the same normalized usage/cost
+        # seam; never let its absence/failure affect existing accounting.
+        try:
+            from hermes_cli.observability.turn_telemetry import (
+                record_auxiliary_usage,
+            )
+
+            record_auxiliary_usage(
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+                cache_read_tokens=usage.cache_read_tokens,
+                cache_write_tokens=usage.cache_write_tokens,
+                reasoning_tokens=usage.reasoning_tokens,
+                estimated_cost_usd=estimated_cost,
+                cost_status=cost_status,
+            )
+        except Exception as exc:
+            logger.debug(
+                "Aux turn telemetry usage failed (%s)", type(exc).__name__
+            )
 
         session_db.record_auxiliary_usage(
             session_id,

@@ -20,6 +20,7 @@ import errno
 import hashlib
 import json
 import logging
+import math
 import os
 import random
 import re
@@ -1832,6 +1833,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # wait out the full routine patience under contention. Sub-second budget;
     # a skipped write is retried naturally at the next heartbeat window.
     _ACTIVITY_WRITE_PATIENCE_S = 0.5
+    # Turn telemetry is observation-only and finalizes on the response path.
+    # It must give up quickly under state.db contention rather than delaying or
+    # changing the user turn it observes.
+    _TURN_TELEMETRY_WRITE_PATIENCE_S = 0.5
+    _TURN_TELEMETRY_MAX_ROWS = 50_000
+    _TURN_TELEMETRY_RETENTION_S = 30 * 24 * 60 * 60
     # A live compression lock gets its own, much shorter budget than the write
     # lock. Compression publishes in a couple of seconds, so a brief wait saves
     # the overwhelming majority of concurrent turns (#75083). It deliberately
@@ -5002,6 +5009,342 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 task=task,
             )
         self._execute_write(_do)
+
+    _TURN_TELEMETRY_EVENT_TYPES = frozenset({"turn_terminal", "gateway_terminal"})
+    _TURN_TELEMETRY_TASK_CLASSES = frozenset(
+        {"interactive", "scheduled", "delegated", "agent_turn", "gateway_preflight"}
+    )
+    _TURN_TELEMETRY_ROUTE_TYPES = frozenset(
+        {
+            "primary",
+            "explicit_override",
+            "delegated_specialist",
+            "fallback",
+            "auxiliary",
+            "local_triage",
+        }
+    )
+    _TURN_TELEMETRY_DISPOSITIONS = frozenset(
+        {
+            "completed",
+            "retried",
+            "fell_back",
+            "triaged",
+            "held",
+            "refused",
+            "failed",
+            "cancelled",
+        }
+    )
+    _TURN_TELEMETRY_OUTCOMES = frozenset(
+        {"success", "held", "refused", "failed", "cancelled"}
+    )
+    _TURN_TELEMETRY_COST_STATUSES = frozenset(
+        {"actual", "estimated", "included", "unknown"}
+    )
+    _TURN_TELEMETRY_FAILURE_CLASSES = frozenset(
+        {
+            "",
+            "auth",
+            "billing",
+            "cancelled",
+            "connection",
+            "content_filter",
+            "gateway_preflight",
+            "gateway_refused",
+            "triage_held",
+            "refused",
+            "incomplete",
+            "internal_error",
+            "interrupted",
+            "max_iterations",
+            "provider",
+            "rate_limit",
+            "timeout",
+            "unknown",
+        }
+    )
+
+    @staticmethod
+    def _turn_telemetry_text(value: Any, limit: int) -> str:
+        """Return bounded single-line identifier metadata, never payload text."""
+        text = str(value or "").replace("\x00", "").replace("\r", " ").replace("\n", " ")
+        return text.strip()[:limit]
+
+    @staticmethod
+    def _turn_telemetry_count(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError, OverflowError):
+            return 0
+
+    @staticmethod
+    def _turn_telemetry_timestamp(value: Any, fallback: float) -> float:
+        try:
+            result = float(value)
+        except (TypeError, ValueError, OverflowError):
+            return fallback
+        return result if math.isfinite(result) else fallback
+
+    def record_turn_telemetry(
+        self,
+        *,
+        event_type: str = "turn_terminal",
+        turn_id: str,
+        correlation_id: str = "",
+        session_id: str,
+        parent_session_id: str = "",
+        parent_turn_id: str = "",
+        profile_name: str = "",
+        requested_profile: str = "",
+        effective_profile: str = "",
+        source: str = "",
+        platform: str = "",
+        task_class: str = "agent_turn",
+        route_type: str = "primary",
+        disposition: str = "completed",
+        is_delegated: bool = False,
+        started_at: float,
+        ended_at: float,
+        duration_ms: int = 0,
+        requested_provider: str = "",
+        requested_model: str = "",
+        effective_provider: str = "",
+        effective_model: str = "",
+        attempt_count: int = 0,
+        retry_count: int = 0,
+        fallback_count: int = 0,
+        auxiliary_attempt_count: int = 0,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        cache_read_tokens: int = 0,
+        cache_write_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        total_tokens: int = 0,
+        estimated_cost_usd: float = 0.0,
+        cost_status: str = "unknown",
+        outcome: str,
+        failure_class: str = "",
+        recorded_at: Optional[float] = None,
+        record_version: int = 1,
+    ) -> None:
+        """Upsert one bounded, content-free logical-turn accounting record.
+
+        The explicit signature is a privacy boundary: transcript/request/
+        response/error-message fields cannot be accepted accidentally.  Route
+        names are bounded identifiers, counters are clamped non-negative, and
+        terminal values are fixed taxonomies.  Callers that observe a user turn
+        must catch failures; the short write patience prevents this
+        observation-only path from stalling response delivery.
+        """
+        safe_turn_id = self._turn_telemetry_text(turn_id, 512)
+        safe_session_id = self._turn_telemetry_text(session_id, 512)
+        if not safe_turn_id or not safe_session_id:
+            raise ValueError("turn_id and session_id are required for turn telemetry")
+
+        safe_event_type = self._turn_telemetry_text(event_type, 32).lower()
+        if safe_event_type not in self._TURN_TELEMETRY_EVENT_TYPES:
+            raise ValueError("invalid turn telemetry event type")
+        safe_task_class = self._turn_telemetry_text(task_class, 32).lower()
+        if safe_task_class not in self._TURN_TELEMETRY_TASK_CLASSES:
+            raise ValueError("invalid turn telemetry task class")
+        safe_route_type = self._turn_telemetry_text(route_type, 32).lower()
+        if safe_route_type not in self._TURN_TELEMETRY_ROUTE_TYPES:
+            raise ValueError("invalid turn telemetry route type")
+        safe_disposition = self._turn_telemetry_text(disposition, 32).lower()
+        if safe_disposition not in self._TURN_TELEMETRY_DISPOSITIONS:
+            raise ValueError("invalid turn telemetry disposition")
+        safe_outcome = self._turn_telemetry_text(outcome, 32).lower()
+        if safe_outcome not in self._TURN_TELEMETRY_OUTCOMES:
+            raise ValueError("invalid turn telemetry outcome")
+        safe_failure = self._turn_telemetry_text(failure_class, 64).lower()
+        if safe_outcome == "success":
+            safe_failure = ""
+        elif safe_outcome == "cancelled":
+            safe_failure = "cancelled"
+        elif safe_failure not in self._TURN_TELEMETRY_FAILURE_CLASSES:
+            safe_failure = "unknown"
+        safe_cost_status = self._turn_telemetry_text(cost_status, 32).lower()
+        if safe_cost_status not in self._TURN_TELEMETRY_COST_STATUSES:
+            raise ValueError("invalid turn telemetry cost status")
+        if int(record_version) != 1:
+            raise ValueError("unsupported turn telemetry record version")
+
+        now = time.time()
+        safe_started = self._turn_telemetry_timestamp(started_at, now)
+        safe_ended = self._turn_telemetry_timestamp(ended_at, safe_started)
+        if safe_ended < safe_started:
+            safe_ended = safe_started
+        safe_recorded = self._turn_telemetry_timestamp(recorded_at, now)
+        safe_cost = max(
+            0.0,
+            self._turn_telemetry_timestamp(estimated_cost_usd, 0.0),
+        )
+        safe_profile = self._turn_telemetry_text(profile_name, 128)
+        values = (
+            safe_turn_id,
+            safe_event_type,
+            self._turn_telemetry_text(correlation_id, 512) or safe_turn_id,
+            safe_session_id,
+            self._turn_telemetry_text(parent_session_id, 512),
+            self._turn_telemetry_text(parent_turn_id, 512),
+            safe_profile,
+            self._turn_telemetry_text(requested_profile, 128) or safe_profile,
+            self._turn_telemetry_text(effective_profile, 128) or safe_profile,
+            self._turn_telemetry_text(source, 128),
+            self._turn_telemetry_text(platform, 128),
+            safe_task_class,
+            safe_route_type,
+            safe_disposition,
+            1 if is_delegated else 0,
+            safe_started,
+            safe_ended,
+            self._turn_telemetry_count(duration_ms),
+            self._turn_telemetry_text(requested_provider, 256),
+            self._turn_telemetry_text(requested_model, 256),
+            self._turn_telemetry_text(effective_provider, 256),
+            self._turn_telemetry_text(effective_model, 256),
+            self._turn_telemetry_count(attempt_count),
+            self._turn_telemetry_count(retry_count),
+            self._turn_telemetry_count(fallback_count),
+            self._turn_telemetry_count(auxiliary_attempt_count),
+            self._turn_telemetry_count(input_tokens),
+            self._turn_telemetry_count(output_tokens),
+            self._turn_telemetry_count(cache_read_tokens),
+            self._turn_telemetry_count(cache_write_tokens),
+            self._turn_telemetry_count(reasoning_tokens),
+            self._turn_telemetry_count(total_tokens),
+            safe_cost,
+            safe_cost_status,
+            safe_outcome,
+            safe_failure,
+            1,
+            safe_recorded,
+        )
+
+        columns = (
+            "turn_id",
+            "event_type",
+            "correlation_id",
+            "session_id",
+            "parent_session_id",
+            "parent_turn_id",
+            "profile_name",
+            "requested_profile",
+            "effective_profile",
+            "source",
+            "platform",
+            "task_class",
+            "route_type",
+            "disposition",
+            "is_delegated",
+            "started_at",
+            "ended_at",
+            "duration_ms",
+            "requested_provider",
+            "requested_model",
+            "effective_provider",
+            "effective_model",
+            "attempt_count",
+            "retry_count",
+            "fallback_count",
+            "auxiliary_attempt_count",
+            "input_tokens",
+            "output_tokens",
+            "cache_read_tokens",
+            "cache_write_tokens",
+            "reasoning_tokens",
+            "total_tokens",
+            "estimated_cost_usd",
+            "cost_status",
+            "outcome",
+            "failure_class",
+            "record_version",
+            "recorded_at",
+        )
+        update_columns = tuple(
+            column for column in columns if column not in {"turn_id", "session_id"}
+        )
+        sql = (
+            f"INSERT INTO turn_telemetry ({', '.join(columns)}) "
+            f"VALUES ({', '.join('?' for _ in columns)}) "
+            "ON CONFLICT(session_id, turn_id) DO UPDATE SET "
+            + ", ".join(
+                f"{column} = excluded.{column}" for column in update_columns
+            )
+        )
+
+        def _do(conn):
+            conn.execute(sql, values)
+            cutoff = time.time() - max(0, float(self._TURN_TELEMETRY_RETENTION_S))
+            conn.execute("DELETE FROM turn_telemetry WHERE recorded_at < ?", (cutoff,))
+            max_rows = max(1, int(self._TURN_TELEMETRY_MAX_ROWS))
+            conn.execute(
+                """DELETE FROM turn_telemetry WHERE id IN (
+                       SELECT id FROM turn_telemetry
+                       ORDER BY recorded_at DESC, id DESC
+                       LIMIT -1 OFFSET ?
+                   )""",
+                (max_rows,),
+            )
+
+        self._execute_write(
+            _do,
+            patience_s=self._TURN_TELEMETRY_WRITE_PATIENCE_S,
+        )
+
+    def list_turn_telemetry(
+        self,
+        *,
+        session_id: Optional[str] = None,
+        profile_name: Optional[str] = None,
+        outcome: Optional[str] = None,
+        since: Optional[float] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """Read recent content-free turn rows, newest first.
+
+        This works on ``SessionDB(read_only=True)`` and performs no schema or
+        metadata writes.  Older read-only databases that predate schema v26
+        return an empty list rather than failing cross-profile aggregation.
+        """
+        clauses: List[str] = []
+        params: List[Any] = []
+        if session_id is not None:
+            clauses.append("session_id = ?")
+            params.append(self._turn_telemetry_text(session_id, 512))
+        if profile_name is not None:
+            clauses.append("profile_name = ?")
+            params.append(self._turn_telemetry_text(profile_name, 128))
+        if outcome is not None:
+            safe_outcome = self._turn_telemetry_text(outcome, 32).lower()
+            if safe_outcome not in self._TURN_TELEMETRY_OUTCOMES:
+                return []
+            clauses.append("outcome = ?")
+            params.append(safe_outcome)
+        if since is not None:
+            safe_since = self._turn_telemetry_timestamp(since, 0.0)
+            clauses.append("started_at >= ?")
+            params.append(safe_since)
+        try:
+            safe_limit = min(1000, max(1, int(limit)))
+        except (TypeError, ValueError, OverflowError):
+            safe_limit = 100
+        where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(safe_limit)
+        try:
+            with self._read_ctx() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM turn_telemetry"
+                    + where
+                    + " ORDER BY started_at DESC, id DESC LIMIT ?",
+                    params,
+                ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return []
+            raise
+        return [dict(row) for row in rows]
 
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""

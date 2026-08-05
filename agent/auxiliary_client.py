@@ -2839,6 +2839,31 @@ _RELAY_AUX_CALL_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = (
 )
 
 
+def _observe_turn_auxiliary_terminal(
+    context: Optional[Dict[str, Any]],
+    *,
+    outcome: str,
+    error: Optional[BaseException] = None,
+) -> None:
+    """Best-effort bridge to content-free per-turn telemetry."""
+    if context is None:
+        return
+    try:
+        from hermes_cli.observability.turn_telemetry import (
+            record_auxiliary_terminal,
+        )
+
+        record_auxiliary_terminal(
+            request_id=str(context.get("request_id") or ""),
+            outcome=outcome,
+            error=error,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Auxiliary terminal telemetry failed (%s)", type(exc).__name__
+        )
+
+
 def _relay_auxiliary_call(callback):
     """Give every physical retry in one auxiliary call a shared Relay identity."""
 
@@ -2853,11 +2878,20 @@ def _relay_auxiliary_call(callback):
             "model": "",
             "api_mode": "chat_completions",
         })
+        context = _RELAY_AUX_CALL_CONTEXT.get()
         try:
-            return callback(*args, **kwargs)
-        except BaseException:
-            _fail_relay_auxiliary_call()
-            raise
+            try:
+                result = callback(*args, **kwargs)
+            except BaseException as exc:
+                _observe_turn_auxiliary_terminal(context, outcome="failure", error=exc)
+                _fail_relay_auxiliary_call()
+                raise
+            else:
+                # Keep observer signals outside the primary callback except arm:
+                # an interrupt delivered here is not a provider failure and must
+                # propagate exactly once.
+                _observe_turn_auxiliary_terminal(context, outcome="success")
+                return result
         finally:
             _RELAY_AUX_CALL_CONTEXT.reset(token)
 
@@ -2878,11 +2912,17 @@ def _relay_auxiliary_call_async(callback):
             "model": "",
             "api_mode": "chat_completions",
         })
+        context = _RELAY_AUX_CALL_CONTEXT.get()
         try:
-            return await callback(*args, **kwargs)
-        except BaseException:
-            _fail_relay_auxiliary_call()
-            raise
+            try:
+                result = await callback(*args, **kwargs)
+            except BaseException as exc:
+                _observe_turn_auxiliary_terminal(context, outcome="failure", error=exc)
+                _fail_relay_auxiliary_call()
+                raise
+            else:
+                _observe_turn_auxiliary_terminal(context, outcome="success")
+                return result
         finally:
             _RELAY_AUX_CALL_CONTEXT.reset(token)
 
@@ -2914,6 +2954,20 @@ def _relay_auxiliary_metadata(
     context["attempt_count"] = attempt_count + 1
     provider_name = str(provider or context.get("provider") or "auxiliary")
     model_name = str(context.get("model") or "unknown")
+    try:
+        from hermes_cli.observability.turn_telemetry import record_auxiliary_attempt
+
+        record_auxiliary_attempt(
+            request_id=str(context["request_id"]),
+            task=str(context["task"]),
+            provider=provider_name,
+            model=model_name,
+            retry_count=attempt_count,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Auxiliary attempt telemetry failed (%s)", type(exc).__name__
+        )
     return provider_name, model_name, {
         "api_mode": str(api_mode or context.get("api_mode") or "chat_completions"),
         "api_request_id": str(context["request_id"]),

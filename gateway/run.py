@@ -2297,6 +2297,30 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _record_gateway_terminal_telemetry(
+    session_store,
+    *,
+    session_id: str,
+    source: str,
+    failure_class: str,
+) -> None:
+    """Best-effort accounting for refusals before an AIAgent turn exists."""
+    try:
+        from hermes_cli.observability.turn_telemetry import record_gateway_terminal
+
+        db = getattr(session_store, "_db", session_store)
+        record_gateway_terminal(
+            db,
+            session_id=session_id,
+            source=source,
+            failure_class=failure_class,
+        )
+    except Exception as exc:
+        logger.debug(
+            "Gateway terminal telemetry failed (%s)", type(exc).__name__
+        )
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -4359,6 +4383,12 @@ class TurnRunner:
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
+            _record_gateway_terminal_telemetry(
+                getattr(self._runner, "_session_db", None),
+                session_id=str(ctx.session_id or ctx.session_key or ""),
+                source=platform_key,
+                failure_class="gateway_preflight",
+            )
             return {
                 "final_response": f"⚠️ Provider authentication failed: {exc}",
                 "messages": [],
@@ -15299,6 +15329,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_voice_command(event)
 
         if self._draining:
+            _record_gateway_terminal_telemetry(
+                getattr(self, "_session_db", None),
+                session_id=str(_quick_key or ""),
+                source=source.platform.value,
+                failure_class="gateway_refused",
+            )
             return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
 
         # User-defined quick commands (bypass agent loop, no LLM call)
@@ -15555,6 +15591,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
+            _record_gateway_terminal_telemetry(
+                getattr(self, "_session_db", None),
+                session_id=str(_quick_key or ""),
+                source=source.platform.value,
+                failure_class="gateway_refused",
+            )
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "
@@ -15576,6 +15618,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.info(
                 "Rejecting new active session %s: max_concurrent_sessions reached",
                 _quick_key,
+            )
+            _record_gateway_terminal_telemetry(
+                getattr(self, "_session_db", None),
+                session_id=str(_quick_key or ""),
+                source=source.platform.value,
+                failure_class="gateway_refused",
             )
             return _limit_message
         _claim_state = self._session_state(_quick_key)
