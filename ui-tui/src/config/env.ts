@@ -36,8 +36,8 @@ let startupQuery = (process.env.HERMES_TUI_QUERY ?? '').trim()
 if (startupQueryFile) {
   try {
     startupQuery = readFileSync(startupQueryFile, 'utf8').trim()
-  } catch {
-    // Unreadable file: fall back to the env-carried query.
+  } catch (err) {
+    console.error(`hermes-tui: cannot read HERMES_TUI_QUERY_FILE ${startupQueryFile}: ${String(err)}`)
   }
 }
 export const STARTUP_QUERY = startupQuery

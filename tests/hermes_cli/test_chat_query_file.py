@@ -163,6 +163,34 @@ class TestCmdChatQueryFile:
         assert exc_info.value.code == 2
         assert "is empty" in capsys.readouterr().out
 
+    def test_oversized_query_file_rejected(self, monkeypatch, capsys, tmp_path):
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(main_mod, "_MAX_QUERY_FILE_BYTES", 100)
+        query_file = tmp_path / "huge.txt"
+        query_file.write_text("x" * 150, encoding="utf-8")
+        args = _build_chat_args(["chat", "--query-file", str(query_file)])
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cmd_chat(monkeypatch, args, {})
+        assert exc_info.value.code == 2
+        assert "exceeds" in capsys.readouterr().out
+
+    def test_multibyte_query_file_checked_in_bytes(
+        self, monkeypatch, capsys, tmp_path
+    ):
+        # 60 x "é" is 120 bytes but only 60 characters: the byte cap must
+        # reject it even though the character count is under the limit.
+        import hermes_cli.main as main_mod
+
+        monkeypatch.setattr(main_mod, "_MAX_QUERY_FILE_BYTES", 100)
+        query_file = tmp_path / "wide.txt"
+        query_file.write_text("é" * 60, encoding="utf-8")
+        args = _build_chat_args(["chat", "--query-file", str(query_file)])
+        with pytest.raises(SystemExit) as exc_info:
+            _run_cmd_chat(monkeypatch, args, {})
+        assert exc_info.value.code == 2
+        assert "exceeds" in capsys.readouterr().out
+
     def test_query_file_with_resume(self, monkeypatch, tmp_path):
         # Query normalization runs before resume resolution; both must land.
         import hermes_cli.main as main_mod
@@ -235,6 +263,30 @@ class TestTuiQueryEnv:
         import hermes_cli.main as main_mod
 
         env = {}
+        ret = main_mod._apply_tui_query_env(env, None, None)
+        assert ret is None
+        assert env == {}
+
+    def test_stale_query_env_cleared(self):
+        # A stale exported value must not win over the current invocation.
+        import hermes_cli.main as main_mod
+
+        env = {
+            "HERMES_TUI_QUERY": "stale inline",
+            "HERMES_TUI_QUERY_FILE": "/stale/path.txt",
+        }
+        ret = main_mod._apply_tui_query_env(env, "fresh", None)
+        assert ret is None
+        assert env.get("HERMES_TUI_QUERY") == "fresh"
+        assert "HERMES_TUI_QUERY_FILE" not in env
+
+    def test_stale_query_env_cleared_without_query(self):
+        import hermes_cli.main as main_mod
+
+        env = {
+            "HERMES_TUI_QUERY": "stale inline",
+            "HERMES_TUI_QUERY_FILE": "/stale/path.txt",
+        }
         ret = main_mod._apply_tui_query_env(env, None, None)
         assert ret is None
         assert env == {}

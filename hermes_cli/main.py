@@ -2269,7 +2269,15 @@ def _apply_tui_query_env(
     size limits. Small queries ride HERMES_TUI_QUERY; large queries and
     explicit query files ride HERMES_TUI_QUERY_FILE (the TUI reads the
     file itself). Returns a temp file path the caller must unlink, or None.
+
+    Query env vars are cleared first so a stale exported value from an
+    earlier launch can't leak into this one (same rationale as the
+    HERMES_TUI_RESUME clear in _launch_tui). Note: for an explicit
+    --query-file the TUI re-reads the file itself; the classic CLI path
+    uses the already-validated content in args.query.
     """
+    env.pop("HERMES_TUI_QUERY", None)
+    env.pop("HERMES_TUI_QUERY_FILE", None)
     if not query:
         return None
     if query_file and os.path.isfile(query_file):
@@ -2587,16 +2595,18 @@ def cmd_chat(args):
             print("Error: use either -q/--query or --query-file, not both.")
             sys.exit(2)
         try:
-            with open(query_file, "r", encoding="utf-8") as _qf:
-                args.query = _qf.read(_MAX_QUERY_FILE_BYTES + 1)
-        except UnicodeDecodeError as exc:
-            print(f"Error: --query-file {query_file!r} is not valid UTF-8: {exc}")
-            sys.exit(2)
+            with open(query_file, "rb") as _qf:
+                raw = _qf.read(_MAX_QUERY_FILE_BYTES + 1)
         except OSError as exc:
             print(f"Error: cannot read --query-file {query_file!r}: {exc}")
             sys.exit(2)
-        if len(args.query) > _MAX_QUERY_FILE_BYTES:
+        if len(raw) > _MAX_QUERY_FILE_BYTES:
             print(f"Error: --query-file {query_file!r} exceeds {_MAX_QUERY_FILE_BYTES} bytes")
+            sys.exit(2)
+        try:
+            args.query = raw.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            print(f"Error: --query-file {query_file!r} is not valid UTF-8: {exc}")
             sys.exit(2)
         if not args.query.strip():
             print(f"Error: --query-file {query_file!r} is empty")
