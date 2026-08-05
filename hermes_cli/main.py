@@ -9036,12 +9036,32 @@ def _size_delta_label(saved_mb: float) -> str:
     return f"grew by {-saved_mb:.1f} MB"
 
 
-def cmd_update(args):
+def _emit_approval_event(subsystem: str, outcome: str, action_id: str, detail: str) -> None:
+    """Best-effort event-log emit for an approval-gate decision.
+
+    Never lets a logging failure affect the actual approval flow.
+    """
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(f"approval.{outcome}", subsystem=subsystem, outcome=outcome,
+                   action_id=action_id, detail=detail)
+    except Exception:
+        pass
+
+
+def cmd_update(args, *, approved: bool = False):
     """Update Hermes Agent to the latest version.
 
     Thin wrapper around ``_cmd_update_impl``: installs hangup protection,
     runs the update, then restores stdio on the way out (even on
     ``sys.exit`` or unhandled exceptions).
+
+    ``approved`` is set by the approve-replay path below when re-invoking
+    this function for an already-approved pending update — it's the
+    explicit, non-leaking counterpart to ``update_approval.approval_bypass()``
+    / ``BYPASS_ENV``. See tools/update_approval.py's BYPASS_ENV comment for
+    why the explicit param exists.
     """
     from hermes_cli.config import (
         detect_install_method,
@@ -9100,19 +9120,21 @@ def cmd_update(args):
             update_action=None,
             update_value=None,
         )
-        prior = os.environ.get(ua.BYPASS_ENV)
-        os.environ[ua.BYPASS_ENV] = "1"
-        try:
-            cmd_update(replay_args)
-        except BaseException:
-            raise
-        else:
-            ua.discard_pending(target)
-        finally:
-            if prior is None:
-                os.environ.pop(ua.BYPASS_ENV, None)
+        with ua.approval_bypass():
+            try:
+                cmd_update(replay_args, approved=True)
+            except BaseException:
+                raise
             else:
-                os.environ[ua.BYPASS_ENV] = prior
+                try:
+                    ua.discard_pending(target)
+                    _emit_approval_event("updates", "approved", target, "applied and cleared")
+                except RuntimeError as e:
+                    print(
+                        f"Warning: update applied, but could not clear pending record "
+                        f"'{target}' ({e}). It may still appear under 'hermes update pending'."
+                    )
+                    _emit_approval_event("updates", "approved", target, f"applied but cleanup failed: {e}")
         return
 
     if is_managed():
@@ -9144,11 +9166,16 @@ def cmd_update(args):
         )
         return
 
-    if ua.apply_approval_enabled() and not ua.approval_bypass_active():
-        record = ua.stage_update(
-            ua.payload_from_args(args),
-            summary=ua.update_summary(ua.payload_from_args(args)),
-        )
+    if ua.apply_approval_enabled() and not approved and not ua.approval_bypass_active():
+        try:
+            record = ua.stage_update(
+                ua.payload_from_args(args),
+                summary=ua.update_summary(ua.payload_from_args(args)),
+            )
+        except Exception as e:
+            print(f"Could not stage the update for approval ({e}). No changes were applied.")
+            sys.exit(1)
+        _emit_approval_event("updates", "staged", record["id"], record.get("summary", ""))
         print("⚕ Update staged for approval.")
         print(f"  Pending id: {record['id']}")
         print("  Review:     /update pending")
@@ -9156,7 +9183,24 @@ def cmd_update(args):
         print(f"  Reject:     /update reject {record['id']}")
         print()
         print("No changes were applied yet.")
+        # Distinct exit code so nothing that only checks "did this exit 0"
+        # (dashboard status poll, gateway chat notification) mistakes a
+        # staged-for-approval request for a completed update.
+        from hermes_cli.update_lock import UPDATE_EXIT_STAGED_FOR_APPROVAL
+        sys.exit(UPDATE_EXIT_STAGED_FOR_APPROVAL)
+        # Defense-in-depth: a real sys.exit() always raises SystemExit, so
+        # this return never runs in production. It exists so that if
+        # anything ever stops sys.exit() from propagating — e.g. code under
+        # test wholesale-mocking `hermes_cli.main.sys`, which turns the call
+        # above into a no-op — execution still cannot fall through into
+        # applying an update the approval gate was supposed to block.
         return
+
+    if not ua.apply_approval_enabled():
+        # Gate is off entirely — no pending record exists for this attempt,
+        # so mint a correlation id rather than leaving it unset.
+        import uuid as _uuid
+        _emit_approval_event("updates", "bypassed", _uuid.uuid4().hex[:8], "apply_approval is off")
 
     gateway_mode = getattr(args, "gateway", False)
 
@@ -10581,6 +10625,7 @@ def cmd_logs(args):
         session=getattr(args, "session", None),
         since=getattr(args, "since", None),
         component=getattr(args, "component", None),
+        subsystem=getattr(args, "subsystem", None),
     )
 
 

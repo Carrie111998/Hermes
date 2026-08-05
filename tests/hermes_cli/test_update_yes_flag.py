@@ -73,8 +73,10 @@ class TestUpdateYesConfigMigration:
 
         args = SimpleNamespace(yes=True)
 
+        # Bypass the update-approval staging gate — this test exercises the
+        # real --yes auto-migration path, not the staging path.
         with patch("builtins.input") as mock_input:
-            cmd_update(args)
+            cmd_update(args, approved=True)
             # Never prompted the user.
             mock_input.assert_not_called()
 
@@ -122,10 +124,12 @@ class TestUpdateYesConfigMigration:
         # "Non-interactive session" branch instead of prompting.
         import sys as _sys
 
+        # Bypass the update-approval staging gate — this test exercises the
+        # real TTY-prompt path, not the staging path.
         with patch("builtins.input", return_value="n") as mock_input, patch.object(
             _sys.stdin, "isatty", return_value=True
         ), patch.object(_sys.stdout, "isatty", return_value=True):
-            cmd_update(args)
+            cmd_update(args, approved=True)
             # The user was actually prompted.
             assert mock_input.called
             prompts = [c.args[0] if c.args else "" for c in mock_input.call_args_list]

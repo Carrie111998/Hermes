@@ -15,6 +15,17 @@ from typing import List, Optional
 from tools import update_approval as ua
 
 
+def _emit(outcome: str, action_id: str, detail: str) -> None:
+    """Best-effort event-log emit — never lets logging affect the approval flow."""
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(f"approval.{outcome}", subsystem="updates", outcome=outcome,
+                   action_id=action_id, detail=detail)
+    except Exception:
+        pass
+
+
 
 def _fmt_state() -> str:
     return f"updates.apply_approval = {'on' if ua.apply_approval_enabled() else 'off'}"
@@ -67,11 +78,24 @@ def _reject(rest: List[str]) -> str:
         return err or "Usage: /update reject <id>"
     if target.lower() == "all":
         n = 0
+        failed = 0
         for rec in ua.list_pending():
-            if ua.discard_pending(rec["id"]):
-                n += 1
-        return f"Rejected {n} pending update(s)."
-    if ua.discard_pending(target):
+            try:
+                if ua.discard_pending(rec["id"]):
+                    n += 1
+                    _emit("rejected", rec["id"], rec.get("summary", ""))
+            except RuntimeError:
+                failed += 1
+        msg = f"Rejected {n} pending update(s)."
+        if failed:
+            msg += f" {failed} failed to reject — see logs."
+        return msg
+    try:
+        rejected = ua.discard_pending(target)
+    except RuntimeError as e:
+        return f"Could not reject pending update '{target}': {e}"
+    if rejected:
+        _emit("rejected", target, "")
         return f"Rejected pending update '{target}'."
     return f"No pending update with id '{target}'."
 

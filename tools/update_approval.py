@@ -19,8 +19,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -33,7 +35,36 @@ CONFIG_KEY = "apply_approval"
 
 # Internal env toggle used only while replaying an already-approved pending
 # update. Public users never need to set this by hand.
+#
+# This is process-global, which is unsafe in a long-lived multi-session
+# process: child processes inherit it (a spawned `hermes update` re-entering
+# the gate sees it disabled), and concurrent gateway sessions would see it
+# too. The in-process replay path (hermes_cli.main.cmd_update) uses the
+# thread-local approval_bypass() context manager below instead, and passes
+# an explicit approved=True down the recursive call — BYPASS_ENV stays
+# supported only as a backward-compatible fallback for external callers and
+# tests. See GHSA-qg5c-hvr5-hjgr for the same bug class, already fixed for
+# the approval/sudo callbacks in tools/terminal_tool.py.
 BYPASS_ENV = "HERMES_UPDATE_APPROVAL_BYPASS"
+
+_bypass_tls = threading.local()
+
+
+@contextmanager
+def approval_bypass():
+    """Mark the update-approval gate as bypassed for the current thread only.
+
+    Use as ``with approval_bypass(): cmd_update(replay_args, approved=True)``
+    when replaying an already-approved pending update. Scoped to the calling
+    thread so it can never leak into child processes or other concurrent
+    sessions — see the BYPASS_ENV comment above.
+    """
+    prior = getattr(_bypass_tls, "active", False)
+    _bypass_tls.active = True
+    try:
+        yield
+    finally:
+        _bypass_tls.active = prior
 
 
 def apply_approval_enabled() -> bool:
@@ -67,6 +98,15 @@ def _normalize_enabled(value: Any) -> bool:
 
 
 def approval_bypass_active() -> bool:
+    """True if the update-approval gate is bypassed for the current thread.
+
+    Checks the thread-local flag first (set by approval_bypass()), then
+    falls back to the process-global BYPASS_ENV for backward compatibility
+    with external callers/tests. The thread-local check is what makes this
+    safe in a multi-session process — see the BYPASS_ENV comment above.
+    """
+    if getattr(_bypass_tls, "active", False):
+        return True
     return os.environ.get(BYPASS_ENV, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
@@ -87,15 +127,22 @@ def stage_update(payload: Dict[str, Any], *, summary: str, origin: str = "foregr
         "created_at": time.time(),
         "payload": payload,
     }
+    d = _pending_dir()
+    path = d / f"{pid}.json"
     try:
-        d = _pending_dir()
         d.mkdir(parents=True, exist_ok=True)
-        path = d / f"{pid}.json"
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(tmp, path)
-    except Exception as e:  # pragma: no cover
+    except Exception as e:
         logger.error("Failed to stage pending update: %s", e, exc_info=True)
+        raise RuntimeError(f"Could not write pending update record to {path}: {e}") from e
+
+    if not path.exists():
+        raise RuntimeError(
+            f"Pending update record write reported success but {path} does not exist"
+        )
+
     return record
 
 
@@ -127,14 +174,26 @@ def get_pending(pending_id: str) -> Optional[Dict[str, Any]]:
 
 
 def discard_pending(pending_id: str) -> bool:
+    """Remove a pending update record.
+
+    Returns ``False`` only when no record for ``pending_id`` exists. A real
+    I/O failure while removing an existing record raises ``RuntimeError``
+    instead, so callers can distinguish "nothing to reject" from "rejection
+    itself failed" rather than treating both as the same silent no-op.
+    """
     path = _pending_dir() / f"{pending_id}.json"
+    if not path.exists():
+        return False
     try:
-        if path.exists():
-            path.unlink()
-            return True
-    except Exception as e:  # pragma: no cover
+        path.unlink()
+    except Exception as e:
         logger.error("Failed to discard pending update %s: %s", pending_id, e)
-    return False
+        raise RuntimeError(f"Could not remove pending update record {path}: {e}") from e
+
+    if path.exists():
+        raise RuntimeError(f"Unlink reported success but {path} still exists")
+
+    return True
 
 
 

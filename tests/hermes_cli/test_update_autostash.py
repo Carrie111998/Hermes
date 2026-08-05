@@ -183,8 +183,10 @@ def test_cmd_update_skips_stash_restore_when_reset_fails(monkeypatch, tmp_path, 
     side_effect, _ = _make_update_side_effect(ff_only_fails=True, reset_fails=True)
     monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
 
+    # Bypass the update-approval staging gate — this test exercises the real
+    # reset-failure/stash-restore-skip path, not the staging path.
     with pytest.raises(SystemExit, match="1"):
-        hermes_main.cmd_update(SimpleNamespace())
+        hermes_main.cmd_update(SimpleNamespace(), approved=True)
 
     # Stash restore should NOT have been called
     assert len(restore_calls) == 0
