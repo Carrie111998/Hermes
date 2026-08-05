@@ -474,6 +474,27 @@ class TestMessageStorage:
 
 
 
+    def test_limit_never_orphans_tool_calls(self, db):
+        """The ``--recent N`` limit must never begin the window on a ``tool``
+        response whose owning assistant ``tool_calls`` row was sliced off.
+        Replay requires the assistant tool_calls → tool adjacency, so the
+        window is backed up to include the whole group (HTTP 400 otherwise).
+        """
+        db.create_session(session_id="s1", source="cli")
+        tool_calls = [
+            {"id": "call_1", "function": {"name": "web_search", "arguments": "{}"}},
+        ]
+        # A long earlier prefix, then a tool round-trip, then a closing turn.
+        for i in range(20):
+            db.append_message("s1", role="user", content=f"prefix {i}")
+            db.append_message("s1", role="assistant", content=f"reply {i}")
+        db.append_message("s1", role="assistant", content="", tool_calls=tool_calls)
+        db.append_message(
+            "s1", role="tool", content="result", tool_name="web_search",
+            tool_call_id="call_1",
+        )
+        db.append_message("s1", role="user", content="thanks")
+
 
     def test_get_messages_as_conversation_strips_leaked_memory_context(self, db):
         db.create_session(session_id="s1", source="cli")

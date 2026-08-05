@@ -7226,8 +7226,18 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # the entire merged lineage, not per-session. This is intentional —
         # the caller wants the last N messages of the conversation, regardless
         # of which session in the compression chain they belong to.
+        #
+        # The slice must never BEGIN on a ``tool`` response whose owning
+        # assistant ``tool_calls`` row fell outside the window: replay would
+        # then orphan the tool call and trigger an HTTP 400. Back the window
+        # start up over any leading tool rows so it always includes the
+        # assistant ``tool_calls`` message that owns them (the whole group is
+        # kept, so the result may exceed ``limit`` by at most one group).
         if limit is not None and limit > 0 and len(rows) > limit:
-            rows = rows[-limit:]
+            start = len(rows) - limit
+            while start > 0 and rows[start]["role"] == "tool":
+                start -= 1
+            rows = rows[start:]
 
         return self._rows_to_conversation(
             rows,
