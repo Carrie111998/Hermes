@@ -58,7 +58,7 @@ def test_call_tool_handler_returns_needs_reauth_on_unrecoverable_401(monkeypatch
     # Force handle_401 to return False (no recovery available)
     mgr = get_manager()
 
-    async def _h401(name, token=None):
+    async def _h401(name, token=None, user_key=""):
         return False
 
     monkeypatch.setattr(mgr, "handle_401", _h401)

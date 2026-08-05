@@ -357,7 +357,7 @@ def test_circuit_breaker_cleared_on_reconnect(monkeypatch, tmp_path):
     # Force handle_401 to claim recovery succeeded.
     mgr = get_manager()
 
-    async def _h401(name, token=None):
+    async def _h401(name, token=None, user_key=""):
         return True
 
     monkeypatch.setattr(mgr, "handle_401", _h401)
