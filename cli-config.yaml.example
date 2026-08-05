@@ -1022,12 +1022,6 @@ platform_toolsets:
 #         priority_mode: prepend
 #         priority:
 #           - my_plugin_command
-#   slack:
-#     extra:
-#       # Thread replies in these channels require an explicit @mention even
-#       # when the thread would otherwise auto-engage. Top-level messages are
-#       # unaffected. Env fallback: SLACK_REQUIRE_MENTION_CHANNEL_THREADS.
-#       require_mention_channel_threads: ["C0123456789"]
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
