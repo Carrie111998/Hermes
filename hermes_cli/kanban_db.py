@@ -10054,7 +10054,10 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
 
 def board_stats(conn: sqlite3.Connection) -> dict:
     """Per-status + per-assignee counts, plus the oldest ``ready`` age in
-    seconds (the clearest staleness signal for a router or HUD).
+    seconds (the clearest staleness signal for a router or HUD), plus a list
+    of cards currently flagged with an active protocol-violation streak so
+    operators and the unified-health probe can see rc=0-no-signal crash
+    streaks at a glance.
     """
     by_status: dict[str, int] = {}
     for row in conn.execute(
@@ -10080,11 +10083,45 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    # Protocol-violation streak counter — surfaces any task whose trailing
+    # run history contains one or more clean-exit violations but has not yet
+    # been tripped.  Cards currently blocked by the breaker also appear here
+    # so the counter is visible even after the trip (useful for post-mortem
+    # dashboards).
+    violation_rows = conn.execute(
+        "SELECT id, title, status, last_failure_error, worker_pid "
+        "FROM tasks WHERE status IN ('ready', 'blocked') AND worker_pid IS NULL"
+    ).fetchall()
+
+    protocol_violations: list[dict] = []
+    for vrow in violation_rows:
+        tid = vrow["id"]
+        streak = _protocol_violation_streak(conn, tid)
+        if streak > 0:
+            # Check if already blocked by the breaker by looking for gave_up
+            # events with protocol_violation payload.
+            event_rows = conn.execute(
+                "SELECT kind FROM task_events WHERE task_id = ? "
+                "AND kind = 'gave_up' ORDER BY id DESC LIMIT 1",
+                (tid,),
+            ).fetchall()
+            breached = bool(event_rows and event_rows[0]["kind"] == "gave_up")
+            protocol_violations.append({
+                "task_id": tid,
+                "title": vrow["title"],
+                "status": vrow["status"],
+                "streak": streak,
+                "limit": _PROTOCOL_VIOLATION_FAILURE_LIMIT,
+                "breached": breached,
+                "last_failure_error": vrow["last_failure_error"],
+            })
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
         "now": now,
+        "protocol_violations": protocol_violations,
     }
 
 

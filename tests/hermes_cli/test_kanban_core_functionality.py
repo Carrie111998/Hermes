@@ -4599,6 +4599,36 @@ def test_detect_crashed_workers_protocol_violation_streak_trips_at_limit(kanban_
         # Side channel consumed by dispatch_once — read through the same
         # (current) module object the reaper ran in, see _drive_worker_exit.
         assert tid in _kb.detect_crashed_workers._last_auto_blocked
+
+        # ACCEPTANCE: the stats surface must show the violation counter so
+        # operators and the unified-health probe can see rc=0-no-signal crash
+        # streaks per card.  Also verify the card is held — it MUST NOT be
+        # picked up again even when detect_crashed_workers is called multiple
+        # times (three consecutive dispatcher sweeps).
+        stats = kb.board_stats(conn)
+        violation_entries = [v for v in stats["protocol_violations"]
+                             if v["task_id"] == tid]
+        assert len(violation_entries) == 1, (\
+            f"stats must surface the blocked card in protocol_violations, " \
+            f"got {[v['task_id'] for v in stats['protocol_violations']]}" \
+        )
+        assert violation_entries[0]["streak"] == limit
+        assert violation_entries[0]["breached"] is True
+        assert violation_entries[0]["limit"] == limit
+        # Verify the card stays BLOCKED across additional reaper passes —
+        # a breached card must not be re-picked.
+        for sweep in range(3):
+            original_alive = _kb._pid_alive
+            _kb._pid_alive = lambda _p: False
+            try:
+                result = _kb.detect_crashed_workers(conn)
+            finally:
+                _kb._pid_alive = original_alive
+            refreshed = kb.get_task(conn, tid)
+            assert refreshed.status == "blocked", (
+                f"sweep {sweep + 1}: card must stay blocked after breach, "
+                f"got {refreshed.status}"
+            )
     finally:
         conn.close()
 
