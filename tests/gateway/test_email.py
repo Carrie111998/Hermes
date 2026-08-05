@@ -1146,6 +1146,9 @@ class TestThreadContext(unittest.TestCase):
                 adapter.send("user@test.com", "Done.", metadata={"thread_id": "Invoice"})
             )
             self.assertTrue(result.success)
+            # send() buffers so attachments for the same turn land in ONE email;
+            # flush to inspect the message that actually goes on the wire.
+            adapter._flush_all_pending()
             sent = mock_server.send_message.call_args[0][0]
             self.assertEqual(sent["To"], "user@test.com")
             self.assertEqual(sent["Subject"], "Re: Invoice")
@@ -1165,9 +1168,141 @@ class TestThreadContext(unittest.TestCase):
                 adapter.send("user@test.com", "Body", metadata={"thread_id": "Weird Subject"})
             )
             self.assertTrue(result.success)
+            adapter._flush_all_pending()
             sent = mock_server.send_message.call_args[0][0]
             self.assertIn("@", sent["To"])
             self.assertNotIn("Subject", sent["To"])
+
+    def test_one_turn_body_plus_files_is_a_single_email(self):
+        """A turn's body and every attachment must arrive as ONE email.
+
+        The gateway dispatches one answer as send() for the body plus
+        send_document() once PER file. Sent straight through that is 1+N
+        emails; the fold must collapse them into a single MIME message that
+        still carries the thread's Subject/Cc/In-Reply-To.
+        """
+        import asyncio
+        import tempfile
+        adapter = self._make_adapter()
+        adapter._thread_context["user@test.com::Creative"] = {
+            "subject": "Creative",
+            "message_id": "<parent@test.com>",
+            "references": "",
+            "sender_addr": "user@test.com",
+            "recipients": ["cc@test.com"],
+            "ctx_key": "user@test.com::Creative",
+        }
+        paths = []
+        for i in range(3):
+            with tempfile.NamedTemporaryFile(suffix=f"-{i}.txt", delete=False) as f:
+                f.write(f"headline {i}".encode())
+                paths.append(f.name)
+        try:
+            with patch("smtplib.SMTP") as mock_smtp:
+                mock_server = MagicMock()
+                mock_smtp.return_value = mock_server
+
+                async def _turn():
+                    await adapter.send(
+                        "user@test.com", "Here they are.",
+                        metadata={"thread_id": "Creative"},
+                    )
+                    for p in paths:
+                        await adapter.send_document(
+                            "user@test.com", p, metadata={"thread_id": "Creative"}
+                        )
+
+                asyncio.run(_turn())
+                # Nothing on the wire yet — the turn is still buffering.
+                self.assertEqual(mock_server.send_message.call_count, 0)
+                adapter._flush_all_pending()
+
+                self.assertEqual(mock_server.send_message.call_count, 1)
+                sent = mock_server.send_message.call_args[0][0]
+                self.assertEqual(sent["Subject"], "Re: Creative")
+                self.assertEqual(sent["In-Reply-To"], "<parent@test.com>")
+                self.assertEqual(sent["Cc"], "cc@test.com")
+                names = sorted(
+                    p.get_filename() for p in sent.walk() if p.get_filename()
+                )
+                self.assertEqual(len(names), 3)
+                body = "".join(
+                    p.get_payload(decode=True).decode()
+                    for p in sent.walk()
+                    if p.get_content_type() == "text/plain" and not p.get_filename()
+                )
+                self.assertIn("Here they are.", body)
+        finally:
+            for p in paths:
+                os.unlink(p)
+
+    def test_reply_to_own_message_resolves_original_thread(self):
+        """A reply to the agent's OWN mail must not cross to another thread.
+
+        Outbound Message-IDs used to be absent from _msgid_context (only
+        inbound ids were indexed), so a reply carrying
+        In-Reply-To=<hermes-...> missed and fell through to the
+        most-recent-thread scan — answering on the wrong thread with the wrong
+        Cc list.
+        """
+        adapter = self._make_adapter()
+        old = {
+            "subject": "Creative",
+            "message_id": "<parent@test.com>",
+            "references": "",
+            "sender_addr": "user@test.com",
+            "recipients": ["cc@test.com"],
+            "ctx_key": "user@test.com::Creative",
+        }
+        adapter._thread_context["user@test.com::Creative"] = old
+        # A NEWER, unrelated thread for the same person: what the fallback scan
+        # would wrongly latch onto.
+        adapter._thread_context["user@test.com::Newer"] = {
+            "subject": "Newer",
+            "message_id": "<newer@test.com>",
+            "references": "",
+            "sender_addr": "user@test.com",
+            "recipients": [],
+            "ctx_key": "user@test.com::Newer",
+        }
+
+        adapter._register_outbound_msgid("<hermes-abc123@test.com>", "user@test.com", old)
+
+        _, ctx = adapter._resolve_recipient(
+            "user@test.com", reply_to="<hermes-abc123@test.com>"
+        )
+        self.assertEqual(ctx["subject"], "Creative")
+        self.assertEqual(ctx["recipients"], ["cc@test.com"])
+
+    def test_thread_state_survives_restart(self):
+        """Thread state must reload, or post-restart replies lose their thread."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as d:
+            path = os.path.join(d, "state.json")
+            first = self._make_adapter()
+            first._state_path = path
+            first._thread_context["user@test.com::Creative"] = {
+                "subject": "Creative",
+                "message_id": "<parent@test.com>",
+                "references": "",
+                "sender_addr": "user@test.com",
+                "recipients": ["cc@test.com"],
+                "ctx_key": "user@test.com::Creative",
+            }
+            first._msgid_context["<parent@test.com>"] = "user@test.com::Creative"
+            first._save_state()
+
+            second = self._make_adapter()
+            second._thread_context.clear()
+            second._msgid_context.clear()
+            second._state_path = path
+            second._load_state()
+
+            _, ctx = second._resolve_recipient(
+                "user@test.com", reply_to="<parent@test.com>"
+            )
+            self.assertEqual(ctx["subject"], "Creative")
+            self.assertEqual(ctx["recipients"], ["cc@test.com"])
 
 
 class TestSendMethods(unittest.TestCase):
@@ -1206,6 +1341,9 @@ class TestSendMethods(unittest.TestCase):
                 )
 
                 self.assertTrue(result.success)
+                # send_document buffers (the gateway calls it once per file, and
+                # they must share one email) — flush to get the wire message.
+                adapter._flush_all_pending()
                 mock_server.send_message.assert_called_once()
                 sent_msg = mock_server.send_message.call_args[0][0]
                 # Should be multipart with attachment
