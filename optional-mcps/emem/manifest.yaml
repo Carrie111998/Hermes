@@ -1,0 +1,40 @@
+# Nous-approved MCP catalog entry.
+# Presence in this directory = approval. Merged via PR review.
+manifest_version: 1
+
+name: emem
+description: Signed geospatial facts and verifiable citations for real-world locations.
+source: https://github.com/Vortx-AI/emem
+
+# emem is a public remote MCP server over Streamable HTTP. It needs no local
+# install, API key, or account for the selected public tools.
+transport:
+  type: http
+  url: https://emem.dev/mcp
+
+auth:
+  type: none
+
+# emem's public endpoint advertises a 15-tool core and has a broader advanced
+# surface available on demand. Keep the initial Hermes default focused on the
+# main place-based workflow. Users can opt into additional tools with
+# `hermes mcp configure emem`.
+tools:
+  default_enabled:
+    - emem_ask
+    - emem_locate
+    - emem_recall
+    - emem_memory_token
+    - emem_verify_receipt
+
+post_install: |
+  emem is ready to use without authentication. Start a new Hermes session
+  after installation, then ask a place-based question such as:
+
+    Is Helsinki-Vantaa Airport low-lying? Show the signed evidence.
+
+  The selected default tools resolve locations, retrieve signed geospatial
+  facts, create citation tokens, and verify receipts. To enable additional
+  emem tools, run:
+
+    hermes mcp configure emem
