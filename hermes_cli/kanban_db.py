@@ -101,6 +101,14 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+# A frozen-plan binding is carried in task bodies by the admitted decomposition
+# bridge. Keep the parser deliberately line-oriented: accepting an arbitrary
+# 64-character substring would let a body carry two competing roots without
+# making the conflict visible to the transaction that records the receipt.
+FROZEN_PLAN_DIGEST_RE = re.compile(
+    r"(?m)^\s*(?:Frozen artifact|Frozen plan digest|Root frozen-plan digest):\s*"
+    r"([0-9a-f]{64})\s*$"
+)
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -2761,6 +2769,23 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _frozen_plan_digest_from_body(body: Optional[str]) -> Optional[str]:
+    """Return the one frozen-plan digest carried by ``body``.
+
+    ``None`` is the legacy/flat shape. A recursive decomposition opts into
+    strict binding by passing ``root_frozen_plan_digest``; in that mode a body
+    with multiple bindings is rejected rather than choosing one by accident.
+    """
+    if not isinstance(body, str):
+        return None
+    matches = FROZEN_PLAN_DIGEST_RE.findall(body)
+    if not matches:
+        return None
+    if len(matches) != 1:
+        raise ValueError("frozen-plan digest mismatch: body has multiple bindings")
+    return matches[0]
 
 
 def create_task(
@@ -5717,6 +5742,7 @@ def decompose_triage_task(
     children: list[dict],
     author: Optional[str] = None,
     auto_promote: bool = True,
+    root_frozen_plan_digest: Optional[str] = None,
 ) -> Optional[list[str]]:
     """Fan a triage task out into child tasks and promote the root to ``todo``.
 
@@ -5732,6 +5758,8 @@ def decompose_triage_task(
             "body": "...",                     # optional
             "assignee": "profile-name",        # optional, None -> default fallback
             "parents": [0, 2],                 # indices into this same children list
+            "depth": 2,                         # recursive descendants are triage
+            "plan_item_index": 0,               # inherited frozen-plan partition
         }
 
     Returns the list of created child task ids (in input order) on
@@ -5742,12 +5770,35 @@ def decompose_triage_task(
 
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
-    cleanly (no orphan children).
+    cleanly (no orphan children). When ``root_frozen_plan_digest`` is supplied,
+    every child body is bound to that digest and the binding is included in the
+    creation/decomposition receipts.
     """
     if not children:
         return None
     if root_assignee is not None:
         root_assignee = _canonical_assignee(root_assignee)
+
+    child_digest_values = {
+        str(child.get("root_frozen_plan_digest"))
+        for child in children
+        if isinstance(child, dict)
+        and child.get("root_frozen_plan_digest") is not None
+    }
+    if len(child_digest_values) > 1:
+        raise ValueError("frozen-plan digest mismatch across children")
+    recursive_requested = bool(child_digest_values) or any(
+        isinstance(child, dict)
+        and (
+            child.get("recursive") is True
+            or (
+                isinstance(child.get("depth"), int)
+                and not isinstance(child.get("depth"), bool)
+                and child["depth"] > 1
+            )
+        )
+        for child in children
+    )
 
     # Pre-validate the children list shape outside the txn. Cheap checks
     # that don't need DB access. Bad input aborts before we touch the DB.
@@ -5798,11 +5849,16 @@ def decompose_triage_task(
     # add_comment) from inside this block — see architecture.md
     # write_txn pitfalls. Instead we inline the INSERTs and
     # _append_event calls.
+    if root_frozen_plan_digest is not None:
+        if re.fullmatch(r"[0-9a-f]{64}", root_frozen_plan_digest) is None:
+            raise ValueError("root frozen-plan digest is malformed")
+
     now = int(time.time())
     child_ids: list[str] = []
+    recursive_inserted = False
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, body, tenant, workspace_kind, workspace_path "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5811,6 +5867,17 @@ def decompose_triage_task(
         if root_row["status"] != "triage":
             return None
         tenant = root_row["tenant"]
+        bound_digest = root_frozen_plan_digest
+        if bound_digest is None and recursive_requested:
+            bound_digest = _frozen_plan_digest_from_body(root_row["body"])
+            if bound_digest is None:
+                raise ValueError("root frozen-plan digest is missing")
+        if bound_digest is not None:
+            if re.fullmatch(r"[0-9a-f]{64}", bound_digest) is None:
+                raise ValueError("root frozen-plan digest is malformed")
+            root_body_digest = _frozen_plan_digest_from_body(root_row["body"])
+            if root_body_digest != bound_digest:
+                raise ValueError("root frozen-plan digest mismatch")
         # Children inherit the root's workspace by default so a fan-out
         # of a code-gen task lands in the parent's project dir/worktree
         # rather than throwaway scratch tmp dirs. A child dict can still
@@ -5818,10 +5885,10 @@ def decompose_triage_task(
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
 
-        # Create children. Status is 'todo' regardless of parents — we
-        # link them under the root AFTER creation so the dispatcher
-        # sees a coherent state, and recompute_ready() at the end
-        # promotes parent-free children to 'ready'.
+        # Create children. Flat children keep their historical 'todo' status
+        # until the post-commit recompute promotes parent-free work to 'ready'.
+        # A depth-two recursive child is deliberately 'triage' so it cannot be
+        # claimed while the next fresh envelope is being prepared.
         for idx, child in enumerate(children):
             new_id = _new_task_id()
             title = child["title"].strip()
@@ -5843,17 +5910,54 @@ def decompose_triage_task(
             plan_item_index = child.get("plan_item_index")
             recursion_enabled = child.get("recursion_enabled")
             recursion_trigger_chars = child.get("recursion_trigger_chars")
+            recursive_child = (
+                isinstance(depth, int)
+                and not isinstance(depth, bool)
+                and depth > 1
+            )
+            recursive_child = recursive_child or child.get("recursive") is True
+            recursive_inserted = recursive_inserted or recursive_child
+            child_body = body if isinstance(body, str) else None
+            if bound_digest is not None:
+                child_body_digest = _frozen_plan_digest_from_body(child_body)
+                if (
+                    child_body_digest is not None
+                    and child_body_digest != bound_digest
+                ):
+                    raise ValueError("frozen-plan digest mismatch")
+                if child_body_digest is None:
+                    binding = f"Frozen artifact: {bound_digest}"
+                    child_body = (
+                        f"{child_body}\n{binding}"
+                        if child_body
+                        else binding
+                    )
+                if (
+                    recursive_child
+                    and bound_digest is not None
+                    and child_body is not None
+                    and "Recursive decomposition metadata:" not in child_body
+                ):
+                    child_body = (
+                        f"{child_body.rstrip()}\n"
+                        "Recursive decomposition metadata: "
+                        f"depth={depth if depth is not None else 'none'}; "
+                        f"plan_item_index={plan_item_index if plan_item_index is not None else 'none'}; "
+                        f"root_frozen_plan_digest={bound_digest}"
+                    )
+            child_status = "triage" if recursive_child else "todo"
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by, depth, "
                 " plan_item_index, recursion_enabled, recursion_trigger_chars) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ",
                 (
                     new_id,
                     title,
-                    body if isinstance(body, str) else None,
+                    child_body,
                     assignee,
+                    child_status,
                     child_ws_kind,
                     child_ws_path,
                     tenant,
@@ -5871,7 +5975,24 @@ def decompose_triage_task(
             )
             _append_event(
                 conn, new_id, "created",
-                {"by": author or "decomposer", "from_decompose_of": task_id},
+                {
+                    "by": author or "decomposer",
+                    "from_decompose_of": task_id,
+                    **(
+                        {
+                            "depth": (
+                                int(depth) if depth is not None else None
+                            ),
+                            "plan_item_index": (
+                                int(plan_item_index)
+                                if plan_item_index is not None else None
+                            ),
+                            "root_frozen_plan_digest": bound_digest,
+                        }
+                        if bound_digest is not None
+                        else {}
+                    ),
+                },
             )
             child_ids.append(new_id)
 
@@ -5887,7 +6008,15 @@ def decompose_triage_task(
                 )
                 _append_event(
                     conn, child_id, "linked",
-                    {"parent": parent_id, "child": child_id},
+                    {
+                        "parent": parent_id,
+                        "child": child_id,
+                        **(
+                            {"root_frozen_plan_digest": bound_digest}
+                            if bound_digest is not None
+                            else {}
+                        ),
+                    },
                 )
 
         # Link the ROOT task as a child of every leaf child — i.e. the
@@ -5927,20 +6056,25 @@ def decompose_triage_task(
                     now,
                 ),
             )
-        _append_event(
-            conn, task_id, "decomposed",
-            {
-                "child_ids": child_ids,
-                "root_assignee": root_assignee,
-            },
-        )
+        decomposed_payload = {
+            "child_ids": child_ids,
+            "root_assignee": root_assignee,
+        }
+        if bound_digest is not None:
+            decomposed_payload["root_frozen_plan_digest"] = bound_digest
+        _append_event(conn, task_id, "decomposed", decomposed_payload)
 
     # Outside the write_txn: promote parent-free children to 'ready'
     # so the dispatcher picks them up on its next tick. Same pattern
     # specify_triage_task uses.  When auto_promote is False children
     # stay in 'todo' until the user manually promotes them — useful
     # for manual-review-first workflows.
-    if auto_promote:
+    # Recursive children deliberately remain in triage. The old flat path
+    # promotes parent-free todo children after commit, but doing that for a
+    # recursive node creates a claimable interval before its next decomposition
+    # call can bind the child to the same frozen root. Flat mode retains the
+    # historical post-commit recompute byte-for-byte.
+    if auto_promote and not recursive_inserted:
         recompute_ready(conn)
     return child_ids
 

@@ -4,6 +4,7 @@ from the triage column. LLM-free by design.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pytest
@@ -228,3 +229,183 @@ def test_decompose_per_child_workspace_override(kanban_home):
         inh = kb.get_task(conn, child_ids[1])
     assert over.workspace_path == "/other/repo"
     assert inh.workspace_path == proj
+
+
+def test_recursive_children_are_triage_and_receipt_bound_to_root_digest(kanban_home):
+    digest = "a" * 64
+    root_body = f"Frozen artifact: {digest}\nR=1;T=400;"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=root_body,
+            triage=True,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            root_frozen_plan_digest=digest,
+            children=[
+                {
+                    "title": "recursive child",
+                    "body": f"Frozen artifact: {digest}\nchild body",
+                    "assignee": "engineer",
+                    "depth": 2,
+                    "plan_item_index": 0,
+                },
+            ],
+            author="decomposer",
+        )
+        assert child_ids
+        child = kb.get_task(conn, child_ids[0])
+        assert child is not None
+        assert child.status == "triage"
+        assert kb.claim_task(conn, child.id) is None
+        created = [event for event in kb.list_events(conn, child.id) if event.kind == "created"]
+        decomposed = [event for event in kb.list_events(conn, tid) if event.kind == "decomposed"]
+
+    assert created[-1].payload == {
+        "by": "decomposer",
+        "from_decompose_of": tid,
+        "depth": 2,
+        "plan_item_index": 0,
+        "root_frozen_plan_digest": digest,
+    }
+    assert decomposed[-1].payload["root_frozen_plan_digest"] == digest
+
+
+def test_recursive_digest_mismatch_rolls_back_all_inserts(kanban_home):
+    root_digest = "b" * 64
+    wrong_digest = "c" * 64
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=f"Frozen artifact: {root_digest}\nR=1;T=400;",
+            triage=True,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+        with pytest.raises(ValueError, match="digest mismatch"):
+            kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                root_frozen_plan_digest=root_digest,
+                children=[
+                    {
+                        "title": "wrong binding",
+                        "body": f"Frozen artifact: {wrong_digest}",
+                        "depth": 2,
+                        "plan_item_index": 0,
+                    },
+                ],
+                author="decomposer",
+            )
+        assert kb.get_task(conn, tid).status == "triage"
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id != ?", (tid,)).fetchone()[0] == 0
+
+
+def test_recursive_decomposition_skips_post_commit_ready_update(kanban_home, monkeypatch):
+    digest = "d" * 64
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=f"Frozen artifact: {digest}\nR=1;T=400;",
+            triage=True,
+        )
+
+        def fail_recompute(_conn):
+            raise AssertionError("recursive decomposition must not recompute ready after commit")
+
+        monkeypatch.setattr(kb, "recompute_ready", fail_recompute)
+        child_ids = kb.decompose_triage_task(
+            conn,
+            tid,
+            root_assignee="orchestrator",
+            root_frozen_plan_digest=digest,
+            children=[
+                {
+                    "title": "recursive child",
+                    "body": f"Frozen artifact: {digest}",
+                    "depth": 2,
+                    "plan_item_index": 0,
+                },
+            ],
+            author="decomposer",
+        )
+        assert child_ids
+
+
+def test_recursive_child_is_not_claimable_until_commit_and_stays_triage(
+    kanban_home,
+    monkeypatch,
+):
+    digest = "1" * 64
+    known_child_id = "t_recursive_race"
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=f"Frozen artifact: {digest}\nR=1;T=400;",
+            triage=True,
+        )
+
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    original_boundary = kb._execute_boundary_with_retry
+
+    def hold_recursive_commit(conn, sql):
+        if sql == "COMMIT" and threading.current_thread().name == "decomposer":
+            commit_entered.set()
+            assert release_commit.wait(timeout=5)
+        return original_boundary(conn, sql)
+
+    monkeypatch.setattr(kb, "_new_task_id", lambda: known_child_id)
+    monkeypatch.setattr(kb, "_execute_boundary_with_retry", hold_recursive_commit)
+    result: dict[str, object] = {}
+
+    def decompose():
+        with kb.connect() as conn:
+            result["ids"] = kb.decompose_triage_task(
+                conn,
+                tid,
+                root_assignee="orchestrator",
+                root_frozen_plan_digest=digest,
+                children=[
+                    {
+                        "title": "recursive child",
+                        "body": f"Frozen artifact: {digest}",
+                        "depth": 2,
+                        "plan_item_index": 0,
+                    },
+                ],
+                author="decomposer",
+            )
+
+    worker = threading.Thread(target=decompose, name="decomposer")
+    worker.start()
+    assert commit_entered.wait(timeout=5)
+
+    claim_result: dict[str, object] = {}
+
+    def claim():
+        with kb.connect() as conn:
+            claim_result["task"] = kb.claim_task(conn, known_child_id)
+
+    claimer = threading.Thread(target=claim, name="claimer")
+    claimer.start()
+    # The claimer is blocked behind the uncommitted write, never observing a
+    # partially inserted ready child. Releasing the commit lets it read the
+    # final triage status and complete its CAS attempt.
+    release_commit.set()
+    worker.join(timeout=5)
+    claimer.join(timeout=5)
+    assert not worker.is_alive()
+    assert not claimer.is_alive()
+    assert result["ids"] == [known_child_id]
+    assert claim_result["task"] is None

@@ -349,3 +349,135 @@ def test_decompose_no_aux_client_configured(kanban_home):
     assert outcome.ok is False
     # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
     assert "LLM error" in outcome.reason
+
+
+def test_recursive_child_metadata_and_root_digest_are_threaded(kanban_home):
+    digest = "e" * 64
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=f"Frozen artifact: {digest}\nR=1;T=400;",
+            triage=True,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "recursive metadata",
+        "tasks": [
+            {
+                "title": "partition",
+                "body": "Implement the partition.",
+                "assignee": "engineer",
+                "parents": [],
+                "depth": 2,
+                "plan_item_index": 3,
+            },
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    assert outcome.child_ids
+    with kb.connect() as conn:
+        child = kb.get_task(conn, outcome.child_ids[0])
+        events = kb.list_events(conn, outcome.child_ids[0])
+    assert child is not None
+    assert child.status == "triage"
+    assert child.depth == 2
+    assert child.plan_item_index == 3
+    assert f"Frozen artifact: {digest}" in child.body
+    created = next(event for event in events if event.kind == "created")
+    assert created.payload["root_frozen_plan_digest"] == digest
+
+
+def test_recursive_child_rejects_a_different_root_digest(kanban_home):
+    digest = "f" * 64
+    wrong_digest = "0" * 64
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive root",
+            body=f"Frozen artifact: {digest}\nR=1;T=400;",
+            triage=True,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": True,
+        "rationale": "bad binding",
+        "tasks": [
+            {
+                "title": "wrong partition",
+                "body": f"Frozen artifact: {wrong_digest}\nDo not accept.",
+                "assignee": "engineer",
+                "parents": [],
+                "depth": 2,
+                "plan_item_index": 0,
+            },
+        ],
+    })
+    patches = _patch_list_profiles(["orchestrator", "engineer"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload), _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok is False
+    assert "digest mismatch" in outcome.reason
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "triage"
+
+
+def test_recursive_call_uses_a_fresh_4k_envelope(kanban_home):
+    digest = "1" * 64
+    long_body = f"Frozen artifact: {digest}\n" + ("parent allocation exhausted " * 400)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="recursive child",
+            body=long_body,
+            triage=True,
+            depth=1,
+            plan_item_index=0,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+
+    llm_payload = jsonlib.dumps({
+        "fanout": False,
+        "rationale": "fresh envelope",
+        "title": "freshly specified",
+        "body": "The recursive call gets its own budget.",
+    })
+    patches = _patch_list_profiles(["orchestrator", "fallback"])
+    for p in patches:
+        p.start()
+    try:
+        with _patch_aux_client(llm_payload) as call_llm, _patch_extra_body():
+            outcome = decomp.decompose_task(tid, author="me")
+    finally:
+        for p in patches:
+            p.stop()
+
+    assert outcome.ok, outcome.reason
+    call = call_llm.call_args
+    assert call.kwargs["max_tokens"] == 4000
+    user_message = call.kwargs["messages"][1]["content"]
+    assert "parent allocation exhausted" in user_message
+    assert user_message.count("parent allocation exhausted") < 400
