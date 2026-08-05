@@ -119,16 +119,21 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 #
 # ``needs_input`` and ``capability`` are "truly blocked": they go to ``blocked``
 # for a human, and the unblock-loop breaker (see ``block_task`` /
-# ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
+# ``BLOCK_RECURRENCE_LIMIT``) escalates them to a *sticky* block if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
-# unblocker (usually a cron) and routes the task to ``triage`` instead of back
-# to ``blocked`` — breaking the infinite unblock↔re-block loop and forcing a
-# human-in-the-loop decision. Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
+# unblocker (usually a cron): the task stays ``blocked`` and the emitted
+# ``block_loop_detected`` event makes that block *sticky* (see
+# ``_has_sticky_block``), so nothing short of an explicit operator ``unblock``
+# advances it — breaking the infinite unblock↔re-block loop and forcing a
+# human-in-the-loop decision. It is deliberately NOT parked in ``triage``: that
+# column is the auto-decomposer's input queue, which promoted escalated cards
+# straight back into the work pool.
+# Mirrors the dispatcher's ``DEFAULT_FAILURE_LIMIT``
 # spirit (default 2) but counts a different signal: manual unblock recurrences,
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
@@ -1324,8 +1329,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     block_kind           TEXT,
     -- Unblock-loop counter. Incremented each time a task is re-blocked for the
     -- same truly-blocked reason after having been unblocked. When it reaches
-    -- BLOCK_RECURRENCE_LIMIT the task is routed to ``triage`` instead of
-    -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
+    -- BLOCK_RECURRENCE_LIMIT the block becomes sticky (``block_loop_detected``)
+    -- so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
     block_recurrences    INTEGER NOT NULL DEFAULT 0
@@ -2700,7 +2705,56 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
+    _migrate_block_loop_escalations_out_of_triage(conn)
+
     _rebuild_drifted_tables(conn)
+
+
+def _migrate_block_loop_escalations_out_of_triage(
+    conn: sqlite3.Connection,
+) -> None:
+    """Move pre-fix unblock-loop escalations from ``triage`` to ``blocked``.
+
+    Until this fix ``block_task`` routed a loop escalation to ``triage``. With
+    ``kanban.auto_decompose`` on (the default) the dispatcher then treated that
+    card as a decompose candidate and walked it ``triage -> todo -> ready``
+    without a lifecycle event, handing a task that needs a human straight back
+    to a worker. Boards written before the fix still have those rows, so
+    activation must lift them into the sticky ``blocked`` state the escalation
+    always meant — otherwise the first tick after upgrading resurrects them.
+
+    Deliberately narrow: only rows sitting in ``triage`` that carry a
+    ``block_kind`` *and* whose most recent block-lifecycle event is
+    ``block_loop_detected``. An ordinary triage card (no block history) and an
+    escalation an operator already unblocked (latest event ``unblocked``) are
+    both left exactly where they are.
+    """
+    cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "block_kind" not in cols or "status" not in cols:
+        return
+    candidates = [
+        row["id"] for row in conn.execute(
+            "SELECT id FROM tasks WHERE status = 'triage' AND block_kind IS NOT NULL"
+        )
+    ]
+    stuck = [tid for tid in candidates if has_block_loop_escalation(conn, tid)]
+    if not stuck:
+        return
+    with write_txn(conn):
+        for tid in stuck:
+            # Re-check status inside the txn: a racing operator may have moved
+            # the card out of triage between the scan and here.
+            conn.execute(
+                "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, worker_pgid = NULL, "
+                "worker_identity = NULL "
+                "WHERE id = ? AND status = 'triage'",
+                (tid,),
+            )
+    _log.info(
+        "kanban: moved %d block-loop escalation(s) out of triage into the "
+        "sticky blocked state", len(stuck),
+    )
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -4229,14 +4283,54 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     was set to ``status='blocked'`` by the circuit breaker or by direct
     DB manipulation) — preserves the pre-#28712 auto-recover semantics
     for that path.
+
+    ``block_loop_detected`` counts as sticky too: it is the unblock-loop
+    breaker's escalation, i.e. the *strongest* possible "stop automating
+    this, a human must decide" signal. It used to park the task in
+    ``triage`` where the auto-decomposer promoted it straight back into
+    the work pool; now it stays ``blocked`` and this predicate is what
+    keeps it there.
     """
+    return _latest_block_event_kind(conn, task_id) in (
+        "blocked", "block_loop_detected",
+    )
+
+
+_BLOCK_LIFECYCLE_KINDS = ("blocked", "unblocked", "block_loop_detected")
+
+
+def _latest_block_event_kind(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    """Return the most recent block-lifecycle event kind for ``task_id``.
+
+    One of :data:`_BLOCK_LIFECYCLE_KINDS`, or ``None`` when the task has
+    never been blocked or unblocked.
+    """
+    placeholders = ", ".join("?" for _ in _BLOCK_LIFECYCLE_KINDS)
     row = conn.execute(
-        "SELECT kind FROM task_events "
-        "WHERE task_id = ? AND kind IN ('blocked', 'unblocked') "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
+        f"SELECT kind FROM task_events "
+        f"WHERE task_id = ? AND kind IN ({placeholders}) "
+        f"ORDER BY id DESC LIMIT 1",
+        (task_id, *_BLOCK_LIFECYCLE_KINDS),
     ).fetchone()
-    return bool(row) and row["kind"] == "blocked"
+    return str(row["kind"]) if row else None
+
+
+def has_block_loop_escalation(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    """Return True when ``task_id`` currently carries an unescaped
+    unblock-loop escalation.
+
+    Defense in depth for the orchestration paths: a row whose latest
+    block-lifecycle event is ``block_loop_detected`` is waiting on a human,
+    no matter which column it happens to sit in — including a legacy row
+    still parked in ``triage`` by the pre-fix routing, or one an operator
+    dragged there by hand. Auto-decompose / specify must never advance it.
+    An explicit ``unblock_task`` (which emits ``"unblocked"``) clears this.
+    """
+    return _latest_block_event_kind(conn, task_id) == "block_loop_detected"
 
 
 def _breaker_limit_from_events(
@@ -6025,16 +6119,19 @@ def block_task(
       "Type 1"). Lands in ``blocked`` for a human. BUT: each time such a task
       is re-blocked for the SAME kind after having been unblocked, the
       unblock-loop counter (``block_recurrences``) increments. When it reaches
-      :data:`BLOCK_RECURRENCE_LIMIT`, the task is routed to ``triage`` instead
-      of ``blocked`` — breaking the cron-unblock ↔ worker-re-block loop and
-      forcing a human-in-the-loop triage decision.
+      :data:`BLOCK_RECURRENCE_LIMIT`, the block is escalated: the task stays in
+      ``blocked`` but a ``block_loop_detected`` event makes it *sticky*, so
+      ``recompute_ready`` / claim / auto-decompose / a dispatcher tick can no
+      longer advance it and only an explicit ``unblock_task`` resumes it —
+      breaking the cron-unblock ↔ worker-re-block loop and forcing a
+      human-in-the-loop decision.
 
     * ``transient`` — treated like a generic block for routing, but a worker
       can use it to signal "this might clear on its own"; it still participates
       in the loop breaker so a forever-flaky task eventually escalates.
 
-    Returns True on any successful transition (to ``blocked``, ``todo``, or
-    ``triage``), False when the task wasn't in a blockable state.
+    Returns True on any successful transition (to ``blocked`` — plain or
+    sticky — or ``todo``), False when the task wasn't in a blockable state.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -6113,12 +6210,23 @@ def block_task(
         recurrences = prev_recurrences + 1 if same_cause else 1
 
         if recurrences >= BLOCK_RECURRENCE_LIMIT:
-            # Loop detected — stop letting the unblocker spin this task. Route
-            # to triage for a human-in-the-loop decision instead of blocked.
+            # Loop detected — stop letting the unblocker spin this task. It
+            # stays in ``blocked``, but the ``block_loop_detected`` event makes
+            # that block *sticky* (see ``_has_sticky_block``): recompute_ready,
+            # claim, restart/migration and the dispatcher tick all refuse to
+            # advance it, and only an explicit ``unblock_task`` resumes it.
+            #
+            # This deliberately does NOT route to ``triage`` any more. Triage
+            # is an automation queue, not a human hold: with the default
+            # ``kanban.auto_decompose: true`` the dispatcher treats every
+            # triage row as a decompose/specify candidate and silently walked
+            # escalated cards triage -> todo -> ready on the next tick
+            # (observed live on ``t_bdf1001a`` and ``t_80a3542a``), which is
+            # exactly the blocked-task resurrection the breaker exists to stop.
             cur = conn.execute(
                 """
                 UPDATE tasks
-                   SET status        = 'triage',
+                   SET status        = 'blocked',
                        claim_lock    = NULL,
                        claim_expires = NULL,
                        worker_pid    = NULL,
@@ -6344,8 +6452,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
         # unbounded (Dale's report). The counter survives the unblock so that a
-        # subsequent same-cause ``block_task`` can detect the loop and route to
-        # triage at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
+        # subsequent same-cause ``block_task`` can detect the loop and escalate
+        # to a sticky block at ``BLOCK_RECURRENCE_LIMIT``. It is reset to 0 only on a
         # successful completion (see ``complete_task``). ``consecutive_failures``
         # (the *dispatcher* spawn/crash/timeout counter — a different signal) is
         # still reset here, which is correct: a deliberate unblock is a fresh
@@ -6404,6 +6512,11 @@ def specify_triage_task(
             (task_id,),
         ).fetchone()
         if existing is None:
+            return False
+        if has_block_loop_escalation(conn, task_id):
+            # A row carrying an unblock-loop escalation is a human hold, even
+            # if something parked it in ``triage``. Promoting it here is the
+            # resurrection path the breaker exists to prevent.
             return False
         sets: list[str] = ["status = 'todo'"]
         params: list[Any] = []
@@ -6561,6 +6674,10 @@ def decompose_triage_task(
         if root_row is None:
             return None
         if root_row["status"] != "triage":
+            return None
+        if has_block_loop_escalation(conn, task_id):
+            # Same human-hold guard as ``specify_triage_task``: never fan out
+            # a card that the unblock-loop breaker escalated.
             return None
         tenant = root_row["tenant"]
         # Children inherit the root's workspace by default so a fan-out

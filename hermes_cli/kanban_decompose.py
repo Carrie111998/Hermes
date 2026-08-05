@@ -283,11 +283,18 @@ def decompose_task(
     """
     with kb.connect_closing() as conn:
         task = kb.get_task(conn, task_id)
+        escalated = task is not None and kb.has_block_loop_escalation(conn, task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, "unknown task id")
     if task.status != "triage":
         return DecomposeOutcome(
             task_id, False, f"task is not in triage (status={task.status!r})"
+        )
+    if escalated:
+        # The unblock-loop breaker escalated this task; it needs an operator
+        # decision, not another LLM fan-out. ``hermes kanban unblock`` resumes.
+        return DecomposeOutcome(
+            task_id, False, "task is block-loop escalated — unblock it first",
         )
 
     cfg = _load_config()
@@ -457,7 +464,14 @@ def decompose_task(
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column."""
+    """Return task ids currently in the triage column that are safe to
+    auto-decompose.
+
+    Rows carrying an unblock-loop escalation are excluded: they are a human
+    hold that only ``kanban unblock`` clears. Before this filter the
+    gateway's auto-decompose tick picked such a card up and silently promoted
+    it back into the work pool.
+    """
     with kb.connect_closing() as conn:
         rows = kb.list_tasks(
             conn,
@@ -465,4 +479,7 @@ def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
             tenant=tenant,
             limit=1000,
         )
-    return [row.id for row in rows]
+        return [
+            row.id for row in rows
+            if not kb.has_block_loop_escalation(conn, row.id)
+        ]
