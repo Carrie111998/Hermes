@@ -11344,14 +11344,6 @@ def main():
     _secrets_cli.register_cli(secrets_bw)
     _op_secrets_cli.register_cli(secrets_op)
 
-    secrets_op = secrets_subparsers.add_parser(
-        "onepassword",
-        aliases=["op"],
-        help="1Password Secrets Manager integration",
-    )
-
-    _secrets_cli.register_op_cli(secrets_op)
-
     def _dispatch_secrets(args):  # noqa: ANN001
         sub = getattr(args, "secrets_command", None)
         bw_sub = getattr(args, "secrets_bw_command", None)
