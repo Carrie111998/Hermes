@@ -1042,15 +1042,33 @@ def redact_sensitive_text(
 
         # JSON fields: "apiKey": "***"  (skip for code files — false positives)
         if ":" in text and '"' in text:
-            def _redact_json(m):
-                key, value = m.group(1), m.group(2)
-                # Same programmatic-env-lookup exception as _redact_env above
-                # (issue #2852): "apiKey": "os.getenv('X')" is a code snippet,
-                # not a leaked secret value.
-                if _ENV_LOOKUP_VALUE_RE.match(value):
-                    return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
-            text = _JSON_FIELD_RE.sub(_redact_json, text)
+            # Built per pass around its own subject, like _make_redact_env: the
+            # escape check below reads the byte after the value capture, which
+            # only means anything in the string this pass is running over.
+            def _make_redact_json(subject):
+                def _redact_json(m):
+                    key, value = m.group(1), m.group(2)
+                    # Same programmatic-env-lookup exception as _redact_env
+                    # above (issue #2852): "apiKey": "os.getenv('X')" is a code
+                    # snippet, not a leaked secret value.
+                    if _ENV_LOOKUP_VALUE_RE.match(value):
+                        return m.group(0)
+                    # ``[^"]+`` stops at the first ``"`` even when that quote is
+                    # ESCAPED, so a field value legitimately containing one
+                    # (``{"password": "abc\""}``) hands the trailing backslash
+                    # to the masker, which deletes it — and the closing quote
+                    # this pass re-emits then lands bare, closing the string one
+                    # byte early. Split the escape off and re-emit it with the
+                    # quote. Pre-existing (not introduced by the delimiter
+                    # split), same escape-destruction mechanism.
+                    escape = ""
+                    if _escapes_the_quote_at(subject, m.end(2)):
+                        value, escape = value[:-1], "\\"
+                    return f'{key}: "{_mask_token(value)}{escape}"'
+
+                return _redact_json
+
+            text = _JSON_FIELD_RE.sub(_make_redact_json(text), text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
         # values are handled there; the lookahead in _YAML_ASSIGN_RE skips

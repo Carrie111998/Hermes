@@ -1770,3 +1770,73 @@ class TestEscapedQuoteSurvivesRedaction:
             for step in path:
                 value = value[step]
             assert secret not in value, ctx
+
+    # A JSON field whose VALUE legitimately contains a quote or a backslash —
+    # not a serialized document nested in a string, an ordinary one-level
+    # document. Reaches ``_JSON_FIELD_RE`` rather than the ``(\S+)`` patterns
+    # above, so it needs its own shapes. Trailing backslash runs are swept
+    # because parity is what decides whether the trailing quote is a real
+    # delimiter or an escaped one.
+    QUOTE_BEARING_VALUES = [
+        pytest.param('{s}"', id="trailing-quote"),
+        pytest.param('{s}\\', id="trailing-backslash"),
+        pytest.param('{s}\\\\', id="trailing-double-backslash"),
+        pytest.param('{s}"\\', id="quote-then-backslash"),
+    ]
+
+    @pytest.mark.parametrize("raw", QUOTE_BEARING_VALUES)
+    @pytest.mark.parametrize("field", ["password", "token", "api_key"])
+    @pytest.mark.parametrize("indent", [None, 2])
+    def test_json_field_value_containing_a_quote_stays_parseable(
+        self, raw, field, indent
+    ):
+        """``_JSON_FIELD_RE``'s ``[^"]+`` stops at an ESCAPED quote too.
+
+        The third site of the same mechanism, and the only one reachable without
+        a serialized document nested inside a string: a password that genuinely
+        contains a ``"`` is escaped by ``json.dumps``, the value class stops at
+        the backslash, and the pass re-emits its own closing quote — so the
+        backslash is masked away and the quote it was escaping lands bare.
+
+        The secret sits before the quote in every shape here, which is what makes
+        the "secret is gone" half assertable; see
+        ``test_json_field_interior_quote_parses_but_still_truncates`` for the
+        case where it does not.
+        """
+        for n in self.LENGTHS:
+            secret = self._secret(n)
+            value = raw.format(s=secret)
+            serialized = json.dumps({field: value}, ensure_ascii=False, indent=indent)
+
+            redacted = redact_sensitive_text(serialized, force=True)
+
+            ctx = (n, field, indent, serialized, redacted)
+            reparsed = json.loads(redacted)  # raises if the escape was destroyed
+            assert list(reparsed) == [field], ctx
+            assert secret not in reparsed[field], ctx
+
+    @pytest.mark.parametrize("indent", [None, 2])
+    def test_json_field_interior_quote_parses_but_still_truncates(self, indent):
+        """Scopes the fix: the escape survives, the value class still truncates.
+
+        ``[^"]+`` ends the value at the first quote, so bytes AFTER an interior
+        quote were never inside the masked span — they are re-emitted verbatim on
+        every tree. Preserving the escape does not change that; it changes the
+        document from unparseable (where ``kanban_tools`` discards the redaction
+        entirely and persists the raw dict, i.e. the whole value leaks) to
+        parseable with the post-quote bytes still exposed. Pinned so the residual
+        is a recorded limit of ``_JSON_FIELD_RE``'s value class rather than
+        something a later reader mistakes this fix for having handled.
+        """
+        head, tail = self._secret(12), "trailingpart"
+        serialized = json.dumps(
+            {"password": f'{head}"{tail}'}, ensure_ascii=False, indent=indent
+        )
+
+        redacted = redact_sensitive_text(serialized, force=True)
+
+        # The half this fix owns: the escape survived, so the document parses.
+        value = json.loads(redacted)["password"]
+        # The half it does not: only the span before the quote was masked.
+        assert head not in value, redacted
+        assert tail in value, ("known limit of [^\"]+ — see docstring", redacted)
