@@ -13210,8 +13210,19 @@ def _(rid, params: dict) -> dict:
             "owner_surface": existing_surface or None,
         })
     except Exception as e:
-        logger.warning("wake.start(%s): failed to start listener: %s", surface, e)
-        return _err(rid, 5026, str(e))
+        # Surface actionable remediation with the failure — a bare WinError 1114
+        # from the System32 ONNX Runtime shadow says nothing to the user about
+        # what to do. The engine's own message may already carry it.
+        detail = str(e)
+        try:
+            from tools.wake_word import preflight_onnx_runtime
+            _hint = preflight_onnx_runtime()
+        except Exception:
+            _hint = ""
+        if _hint and _hint not in detail:
+            detail = f"{detail} — {_hint}"
+        logger.warning("wake.start(%s): failed to start listener: %s", surface, detail)
+        return _err(rid, 5026, detail)
     global _wake_owner_transport, _wake_owner_surface
     with _wake_lock:
         _wake_owner_transport = transport

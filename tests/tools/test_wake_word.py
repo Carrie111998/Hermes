@@ -265,6 +265,74 @@ def test_empty_framework_falls_back_to_platform_default(monkeypatch):
     assert ww.resolve_inference_framework({}) == "onnx"
 
 
+# ── Windows 25H2 System32 ONNX Runtime shadow (WinError 1114) ──────────────
+
+_SYS32_ONNX = Path(r"C:\Windows\System32\onnxruntime.dll")
+
+
+def test_preflight_noop_off_windows(monkeypatch):
+    monkeypatch.setattr(ww.sys, "platform", "linux")
+    assert ww.preflight_onnx_runtime() == ""
+
+
+def test_preflight_noop_without_system32_onnx(monkeypatch):
+    monkeypatch.setattr(ww.sys, "platform", "win32")
+    monkeypatch.setattr(ww, "_win32_system32_onnx", lambda: None)
+    assert ww.preflight_onnx_runtime() == ""
+
+
+def test_preflight_hint_when_system32_shadows_wheel(monkeypatch, caplog):
+    # The Windows 25H2 component DLL is present AND the PyPI wheel import
+    # fails (WinError 1114 class) → actionable remediation, not silence.
+    monkeypatch.setattr(ww.sys, "platform", "win32")
+    monkeypatch.setattr(ww, "_win32_system32_onnx", lambda: _SYS32_ONNX)
+    monkeypatch.setattr(ww, "_onnx_import_ok", lambda: False)
+    hint = ww.preflight_onnx_runtime()
+    assert hint == ww._WIN32_ONNX_SHADOW_HINT
+    assert "WinError 1114" in hint
+    assert "msvcp140.dll" in hint
+    assert any("wake word:" in r.message for r in caplog.records)
+
+
+def test_preflight_warns_once_when_wheel_still_imports(monkeypatch, caplog):
+    # DLL present but the wheel still imports → one informational warning
+    # (the component can break the wheel after a Windows update), no hint.
+    monkeypatch.setattr(ww.sys, "platform", "win32")
+    monkeypatch.setattr(ww, "_win32_system32_onnx", lambda: _SYS32_ONNX)
+    monkeypatch.setattr(ww, "_onnx_import_ok", lambda: True)
+    ww._warned_system32_onnx = False
+    assert ww.preflight_onnx_runtime() == ""
+    assert any("System32" in r.message for r in caplog.records)
+    # Second call keeps the log quiet (one-time warning).
+    caplog.clear()
+    assert ww.preflight_onnx_runtime() == ""
+    assert not any("System32" in r.message for r in caplog.records)
+
+
+def test_requirements_unavailable_with_win32_shadow(monkeypatch):
+    # A real System32 shadow makes the wake word report unavailable with the
+    # remediation hint instead of "available" + silent death at arm time.
+    _voice_loop_ready(monkeypatch)
+    monkeypatch.setattr(ww, "_audio_available", lambda: True)
+    monkeypatch.setattr("tools.lazy_deps.is_available", lambda f: True)
+    monkeypatch.setattr("tools.lazy_deps._allow_lazy_installs", lambda: True)
+    monkeypatch.setattr(ww, "preflight_onnx_runtime", lambda: ww._WIN32_ONNX_SHADOW_HINT)
+    r = ww.check_wake_word_requirements({"provider": "openwakeword"})
+    assert r["available"] is False
+    assert r["hint"] == ww._WIN32_ONNX_SHADOW_HINT
+
+
+def test_openwakeword_engine_raises_with_win32_shadow(monkeypatch):
+    # The engine constructor fails loudly with the remediation instead of
+    # importing openwakeword and dying on a WinError 1114 that looks like a
+    # successful arm in status surfaces.
+    _install_fake_openwakeword(monkeypatch)
+    monkeypatch.setattr(ww, "preflight_onnx_runtime", lambda: ww._WIN32_ONNX_SHADOW_HINT)
+    with pytest.raises(RuntimeError) as exc:
+        ww._OpenWakeWordEngine({"provider": "openwakeword"})
+    assert "WinError 1114" in str(exc.value)
+
+
 # ── ambient-speech rejection: consecutive-frame confirmation ──────────────────
 
 def _openwakeword_engine_with_scores(monkeypatch, cfg_wake, scores):
