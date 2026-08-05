@@ -28,9 +28,7 @@ logger = logging.getLogger(__name__)
 # Same filenames as prompt_builder.py but we load ALL found (not first-wins)
 # since different subdirectories may use different conventions.
 _HINT_FILENAMES = [
-    "AGENTS.md", "agents.md",
-    "CLAUDE.md", "claude.md",
-    ".cursorrules",
+    "Project.md",
 ]
 
 # Maximum chars per hint file to prevent context bloat

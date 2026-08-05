@@ -4869,11 +4869,18 @@ def _get_usage(agent) -> dict:
         last_prompt = getattr(comp, "last_prompt_tokens", 0) or 0
         if last_prompt < 0:
             last_prompt = 0
+        if last_prompt == 0:
+            # 2026-08-03 修复：last_prompt_tokens=0 只发生在「首次 API 调用前」或「压缩后
+            # 等待真实用量」的过渡态——此时上下文实际占用并未变化。回退到最近一次实测
+            # (last_real_prompt_tokens) 保持状态栏稳定，避免「实测 420k ↔ 无 gauge 乱跳」。
+            last_prompt = getattr(comp, "last_real_prompt_tokens", 0) or 0
         ctx_max = getattr(comp, "context_length", 0) or 0
         if ctx_max and last_prompt:
             usage["context_used"] = last_prompt
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(last_prompt / ctx_max * 100)))
+            # 本轮增量（2026-08-05，与 cli.py 状态栏同步）：API 实测 vs 上次的差
+            usage["context_delta"] = getattr(comp, "last_prompt_delta", 0) or 0
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
     # Live count of background/async subagents still running (delegate_task
     # batches + background single delegations). Mirrors the classic CLI status

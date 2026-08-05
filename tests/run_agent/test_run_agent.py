@@ -898,7 +898,7 @@ class TestBuildSystemPrompt:
                 base_url="https://openrouter.ai/api/v1",
                 quiet_mode=True,
                 skip_context_files=True,
-                load_soul_identity=True,
+                load_hermes_identity=True,
                 skip_memory=True,
             )
             prompt = agent._build_system_prompt()

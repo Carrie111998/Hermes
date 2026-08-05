@@ -699,6 +699,26 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead."
         )
+    # Prevent agents (including L0 review fork) from modifying the
+    # constitution registry.  It contains structured config that only
+    # the human user should edit; LLM-driven changes to this file would
+    # create a recursive self-modification feedback loop.
+    from hermes_constants import get_hermes_home as _gethome
+    _registry = str(_gethome().resolve() / "constitution-registry.md")
+    if resolved == _registry or normalized == _registry:
+        _reg_err = (
+            f"Refusing to write to constitution-registry.md: {filepath}\n"
+            "This file is the L0 constitution registry \u2014 it can only be "
+            "edited manually by the user. If the registry content needs "
+            "updating, report the suggested change to the user.\n"
+        )
+        # Log the blocked attempt so the background_review callback
+        # can surface it as a self-change alert.
+        logger.warning(
+            "Blocked write attempt to constitution-registry.md (%s)",
+            filepath,
+        )
+        return _reg_err
     return None
 
 
@@ -1788,10 +1808,30 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             _resolved = None
 
         if _resolved is None:
+            # Read old content for diff before write (so L0 review can show changes).
+            _old = ""
+            try:
+                _abs = os.path.abspath(path)
+                if os.path.exists(_abs):
+                    with open(_abs, "r", encoding="utf-8") as _f:
+                        _old = _f.read()
+            except Exception:
+                pass
             stale_warning = _check_file_staleness(path, task_id)
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(path, content)
             result_dict = result.to_dict()
+            # Compute unified diff when old content exists.
+            if _old and not result_dict.get("error"):
+                import difflib as _difflib
+                _diff = "".join(_difflib.unified_diff(
+                    _old.splitlines(keepends=True),
+                    content.splitlines(keepends=True),
+                    fromfile=f"a/{path}",
+                    tofile=f"b/{path}",
+                ))
+                if _diff:
+                    result_dict["diff"] = _diff
             if stale_warning:
                 result_dict["_warning"] = stale_warning
             if not result_dict.get("error"):
@@ -1803,6 +1843,14 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         # subagents can't interleave on the same file.  Different paths
         # remain fully parallel.
         with file_state.lock_path(_resolved):
+            # Read old content for diff before write (so L0 review can show changes).
+            _old = ""
+            try:
+                if os.path.exists(_resolved):
+                    with open(_resolved, "r", encoding="utf-8") as _f:
+                        _old = _f.read()
+            except Exception:
+                pass
             # Cross-agent staleness wins over per-task warning when both
             # fire — its message names the sibling subagent.
             cross_warning = file_state.check_stale(task_id, _resolved)
@@ -1813,6 +1861,17 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             file_ops = _get_file_ops(task_id)
             result = file_ops.write_file(_resolved, content)
             result_dict = result.to_dict()
+            # Compute unified diff when old content exists (for L0 review visibility).
+            if _old and not result_dict.get("error"):
+                import difflib as _difflib
+                _diff = "".join(_difflib.unified_diff(
+                    _old.splitlines(keepends=True),
+                    content.splitlines(keepends=True),
+                    fromfile=f"a/{_resolved}",
+                    tofile=f"b/{_resolved}",
+                ))
+                if _diff:
+                    result_dict["diff"] = _diff
             effective_warning = cross_warning or stale_warning or cwd_warning
             if effective_warning:
                 result_dict["_warning"] = effective_warning

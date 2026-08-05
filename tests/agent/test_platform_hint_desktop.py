@@ -36,7 +36,7 @@ def _stable_prompt(agent):
 
 def _make_agent(platform="", **overrides):
     base = dict(
-        load_soul_identity=False,
+        load_hermes_identity=False,
         skip_context_files=False,
         valid_tool_names=[],
         _task_completion_guidance=False,

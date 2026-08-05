@@ -590,6 +590,15 @@ def build_turn_context(
         if agent._turns_since_memory >= agent._memory_nudge_interval:
             should_review_memory = True
             agent._turns_since_memory = 0
+        # L0 background review trigger (local, registry-configurable)
+        if getattr(agent, "_turns_since_l0", None) is not None:
+            agent._turns_since_l0 += 1
+            from agent.background_review import _load_l0_registry_config
+            _l0_cfg = _load_l0_registry_config()
+            _trigger_turns = _l0_cfg.get("trigger_turns", 10)
+            if agent._turns_since_l0 >= _trigger_turns:
+                agent._turns_since_l0 = 0
+                should_review_memory = True
 
     # Cosmetic side-signal: detect an affection "reaction" (ily / <3 / good bot)
     # and notify the host so it can play hearts. Token-free, never touches the

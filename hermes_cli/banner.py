@@ -214,6 +214,19 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
             return 1
         return checked
 
+    # Fork-aware (2026-08-05, fixes upstream issue #72789): origin is not the
+    # official repo (fork/private). If an `upstream` remote points at the
+    # official repo, compare against upstream/main so the "N commits behind"
+    # banner still shows instead of being silently blind.
+    compare_remote = "origin"
+    upstream_url = _git_stdout(["remote", "get-url", "upstream"], cwd=repo_dir)
+    if upstream_url:
+        try:
+            if _canonical_github_remote(upstream_url) == _OFFICIAL_REPO_CANONICAL:
+                compare_remote = "upstream"
+        except Exception:
+            pass
+
     # Installer checkouts are shallow (`git clone --depth 1`). On a shallow
     # clone the history stops at a single commit, so a plain `git fetch` would
     # unshallow the repo (dragging in the whole history) and
@@ -234,7 +247,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         # ref on a scoped fetch, so the ``HEAD..origin/main`` count below is
         # unaffected; the shallow path compares against FETCH_HEAD, which a
         # scoped fetch also updates.
-        fetch_args = ["git", "fetch", "origin", "main"]
+        fetch_args = ["git", "fetch", compare_remote, "main"]
         if is_shallow:
             fetch_args += ["--depth", "1"]
         fetch_args.append("--quiet")
@@ -253,7 +266,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", f"{compare_remote}/main"], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -261,7 +274,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{compare_remote}/main"],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=5,
             cwd=str(repo_dir),

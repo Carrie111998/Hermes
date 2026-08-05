@@ -194,6 +194,7 @@ from agent.codex_responses_adapter import (
     _split_responses_tool_id as _codex_split_responses_tool_id,
     _summarize_user_message_for_log,  # also used by _sync_external_memory_for_turn (memory boundary)
 )
+from agent.error_auto_research import ErrorAutoResearch
 from agent.tool_guardrails import (
     ToolGuardrailDecision,
     append_toolguard_guidance,
@@ -493,7 +494,7 @@ class AIAgent:
         thread_id: str = None,
         gateway_session_key: str = None,
         skip_context_files: bool = False,
-        load_soul_identity: bool = False,
+        load_hermes_identity: bool = False,
         skip_memory: bool = False,
         session_db=None,
         parent_session_id: str = None,
@@ -577,7 +578,7 @@ class AIAgent:
             thread_id=thread_id,
             gateway_session_key=gateway_session_key,
             skip_context_files=skip_context_files,
-            load_soul_identity=load_soul_identity,
+            load_hermes_identity=load_hermes_identity,
             skip_memory=skip_memory,
             session_db=session_db,
             parent_session_id=parent_session_id,
@@ -7574,9 +7575,23 @@ class AIAgent:
         )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
+        # 失败自动查证管道（2026-08-02 范式）：错误 1-2 次 → 自动搜 GitHub issues → 注入结果
+        # 不依赖 LLM 自觉——管道在错误处理时自动执行（消费者优先）
+        if failed:
+            function_result = self._maybe_auto_research(tool_name, function_result)
         if decision.should_halt:
             self._set_tool_guardrail_halt(decision)
         return function_result
+
+    def _maybe_auto_research(self, tool_name: str, result: str) -> str:
+        """失败自动查证：第 1 次失败即搜（错误核心 → GitHub issues），结果附加到工具结果。
+        瞬时错误（超时/连接）跳过（重试即可）；同错误核心会话缓存去重；上限防滥用。"""
+        try:
+            if not hasattr(self, "_auto_research"):
+                self._auto_research = ErrorAutoResearch()
+            return self._auto_research.process(tool_name, result)
+        except Exception:
+            return result
 
     def _guardrail_block_result(self, decision: ToolGuardrailDecision) -> str:
         self._set_tool_guardrail_halt(decision)

@@ -4708,7 +4708,7 @@ class TurnRunner:
                 skip_context_files=skip_context_files,
                 # Keep the persona even with minimal context: soul identity is
                 # a single small file, not part of the expensive walk.
-                load_soul_identity=True,
+                load_hermes_identity=True,
             )
             if _cache_lock and _cache is not None:
                 with _cache_lock:

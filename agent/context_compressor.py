@@ -2061,6 +2061,7 @@ class ContextCompressor(ContextEngine):
         # rather than skipping compression. -1 is a different sentinel
         # (#36718, "compression just ran, await real usage") and must not be set here.
         self.last_prompt_tokens = 0
+        self.last_prompt_delta = 0  # 状态栏增量显示（update_from_response 更新）
         self.last_completion_tokens = 0
         self.last_total_tokens = 0
         self.last_real_prompt_tokens = 0
@@ -2344,6 +2345,7 @@ class ContextCompressor(ContextEngine):
         self._context_probed = False  # True after a step-down from context error
 
         self.last_prompt_tokens = 0
+        self.last_prompt_delta = 0  # 状态栏增量显示（update_from_response 更新）
         self.last_completion_tokens = 0
         self.last_real_prompt_tokens = 0
         self.last_compression_rough_tokens = 0
@@ -2428,7 +2430,10 @@ class ContextCompressor(ContextEngine):
 
     def update_from_response(self, usage: Dict[str, Any]):
         """Update tracked token usage from API response."""
+        _prev_prompt = self.last_prompt_tokens
         self.last_prompt_tokens = usage.get("prompt_tokens", 0)
+        # 本轮增量（状态栏显示）：新实测 - 上次实测。压缩后 prompt 骤降 → delta 为负
+        self.last_prompt_delta = self.last_prompt_tokens - _prev_prompt
         self.last_completion_tokens = usage.get("completion_tokens", 0)
         self.last_total_tokens = usage.get("total_tokens", self.last_prompt_tokens + self.last_completion_tokens)
         if self.last_prompt_tokens > 0:

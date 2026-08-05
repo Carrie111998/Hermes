@@ -515,6 +515,19 @@ MAX_SKILL_FILE_BYTES = 1_048_576    # 1 MiB per supporting file
 
 # Characters allowed in skill names (filesystem-safe, URL-friendly)
 VALID_NAME_RE = re.compile(r'^[a-z0-9][a-z0-9._-]*$')
+# Skill names that look like session artifacts (PR numbers, dates, error codes)
+# are rejected at creation time.  This is the code-layer enforcement of the
+# class-level naming rule — no LLM judgement needed.
+_SESSION_ARTIFACT_PATTERNS = [
+    re.compile(r'#?\d{4,}'),                       # PR/issue numbers (e.g. fix-#42405)
+    re.compile(r'[a-z]+\d{6,}'),                   # hash-like suffixes
+    re.compile(r'\d{4}-\d{2}-\d{2}'),              # ISO dates (2026-07-13)
+    re.compile(r'^\d{6,8}[_-]'),                   # date prefix (20260713-fix)
+    re.compile(r'[_-]\d{6,8}$'),                   # date suffix (fix-20260713)
+    re.compile(r'^fix-[\w-]*-error$'),              # fix-X-error pattern
+    re.compile(r'^debug-[\w-]*-today$'),            # debug-X-today pattern
+    re.compile(r'^audit-[\w-]*-today$'),            # audit-X-today pattern
+]
 
 # Subdirectories allowed for write_file/remove_file
 ALLOWED_SUBDIRS = {"references", "templates", "scripts", "assets"}
@@ -535,6 +548,19 @@ def _validate_name(name: str) -> Optional[str]:
             f"Invalid skill name '{name}'. Use lowercase letters, numbers, "
             f"hyphens, dots, and underscores. Must start with a letter or digit."
         )
+    # Reject session-artifact names (PR numbers, dates, error codes) —
+    # these are session-specific, not class-level.  Code-layer enforcement
+    # of the "class-level naming" rule — no LLM judgement needed.
+    for _pat in _SESSION_ARTIFACT_PATTERNS:
+        if _pat.search(name):
+            return (
+                f"Skill name '{name}' looks like a session artifact "
+                f"(PR number, date, error code, or task ID). "
+                f"Skills must have class-level names — "
+                f"e.g. 'wechat-miniprogram' not 'fix-#42405-error'. "
+                f"If this is a small trick, patch it into an existing "
+                f"umbrella skill's pitfalls section instead."
+            )
     return None
 
 

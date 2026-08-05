@@ -2188,9 +2188,6 @@ def build_context_files_prompt(
         # Priority-based project context: first match wins
         project_context = (
             _load_hermes_md(cwd_path, context_length)
-            or _load_agents_md(cwd_path, context_length)
-            or _load_claude_md(cwd_path, context_length)
-            or _load_cursorrules(cwd_path, context_length)
         )
     if project_context:
         sections.append(project_context)

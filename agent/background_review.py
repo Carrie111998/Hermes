@@ -28,6 +28,101 @@ from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
 
+from pathlib import Path
+
+
+# ── L0 state persistence (survives /new and process restart) ──
+
+_L0_STATE_PATH = Path(os.path.expanduser("~/.hermes/l0-state.json"))
+
+
+def load_l0_state() -> Dict[str, Any]:
+    """Load L0 state from disk.  Returns defaults if file missing/corrupt."""
+    try:
+        if _L0_STATE_PATH.is_file():
+            return json.loads(_L0_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        pass
+    return {"turns_since_review": 0, "last_review_at": None, "last_review_status": None}
+
+
+def save_l0_state(state: Dict[str, Any]) -> None:
+    """Write L0 state to disk."""
+    try:
+        _L0_STATE_PATH.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.debug("Failed to save l0-state.json: %s", e)
+
+
+def _load_l0_review_prompt() -> str:
+    """Load the L0 review prompt from the constitution registry file."""
+    from hermes_cli.config import get_hermes_home
+
+    _FALLBACK = (
+        "Review the conversation and save important facts to memory. "
+        "If nothing is worth saving, say 'Nothing to save.' and stop."
+    )
+    registry_path = get_hermes_home() / "constitution-registry.md"
+    if not registry_path.exists():
+        return _FALLBACK
+    try:
+        content = registry_path.read_text(encoding="utf-8")
+        marker = "## L0_REVIEW_PROMPT"
+        idx = content.find(marker)
+        if idx == -1:
+            return _FALLBACK
+        prompt = content[idx + len(marker):].strip()
+        return prompt if prompt else _FALLBACK
+    except Exception as e:
+        logger.warning("Failed to load L0 review prompt from registry: %s", e)
+        return _FALLBACK
+
+
+def _load_l0_registry_config() -> Dict[str, Any]:
+    """Parse structured config from the constitution registry YAML frontmatter.
+
+    Returns a dict with key ``trigger_turns``.  Falls back to hardcoded
+    default (10) when the registry is missing or the YAML is unparseable.
+    """
+    _DEFAULTS = {
+        "trigger_turns": 10,
+    }
+    from hermes_cli.config import get_hermes_home
+
+    registry_path = get_hermes_home() / "constitution-registry.md"
+    if not registry_path.exists():
+        return dict(_DEFAULTS)
+    try:
+        content = registry_path.read_text(encoding="utf-8")
+        if not content.startswith("---"):
+            return dict(_DEFAULTS)
+        # Extract YAML between first two --- markers
+        end_marker = content.index("
+---", 3)
+        yaml_str = content[3:end_marker].strip()
+        result = dict(_DEFAULTS)
+        for line in yaml_str.split("
+"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                key, _, val = line.partition(":")
+                key = key.strip()
+                val = val.split("#")[0].strip()  # strip inline comments
+                if key in _DEFAULTS and val:
+                    try:
+                        parsed = int(val)
+                        if key == "trigger_turns":
+                            parsed = max(1, parsed)  # minimum 1 turn
+                        result[key] = parsed
+                    except ValueError:
+                        pass
+        return result
+    except Exception as e:
+        logger.debug("Failed to parse registry config: %s", e)
+        return dict(_DEFAULTS)
+
 
 # ---------------------------------------------------------------------------
 # Background-review aux-model selector + routed digest.
@@ -986,16 +1081,20 @@ def _run_review_in_thread(
         if actions:
             summary = " · ".join(dict.fromkeys(actions))
             agent._safe_print(
-                f"  💾 Self-improvement review: {summary}"
+                f"  💾 L0 review: {summary}"
             )
             _bg_cb = agent.background_review_callback
             if _bg_cb:
                 try:
                     _bg_cb(
-                        f"💾 Self-improvement review: {summary}"
+                        f"💾 L0 review: {summary}"
                     )
                 except Exception:
                     pass
+        else:
+            agent._safe_print(
+                f"  💾 L0 review: no changes needed"
+            )
 
     except Exception as e:
         logger.warning("Background memory/skill review failed: %s", e)

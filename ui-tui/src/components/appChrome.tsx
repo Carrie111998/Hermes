@@ -180,21 +180,9 @@ function FaceTicker({ color, startedAt, style }: { color: string; startedAt?: nu
 }
 
 function ctxBarColor(pct: number | undefined, t: Theme) {
-  if (pct == null) {
-    return t.color.muted
-  }
-
-  if (pct >= 95) {
-    return t.color.statusCritical
-  }
-
-  if (pct > 80) {
-    return t.color.statusBad
-  }
-
-  if (pct >= 50) {
-    return t.color.statusWarn
-  }
+  // 固定同色——不随用量变浓（用户 2026-07-31：不需要超过 500K 变浓提示）
+  // 原逻辑：pct>=95 critical / >80 bad / >=50 warn / else good
+  void pct
 
   return t.color.statusGood
 }

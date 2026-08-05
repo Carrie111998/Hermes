@@ -5076,25 +5076,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._recover_after_resize(app, original_on_resize)
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
-        if percent_used is None:
-            return "class:status-bar-dim"
-        if percent_used >= 95:
-            return "class:status-bar-critical"
-        if percent_used > 80:
-            return "class:status-bar-bad"
-        if percent_used >= 50:
-            return "class:status-bar-warn"
+        # 2026-08-01 用户定制：状态栏颜色统一绿色——上下文数字本身已足够提醒，
+        # 不需要红/黄/深红分级（percent 数字实时可见）
         return "class:status-bar-good"
 
     @staticmethod
     def _battery_status_style(category: str) -> str:
-        """Map a battery colour category to a status-bar style class."""
-        return {
-            "good": "class:status-bar-good",
-            "warn": "class:status-bar-warn",
-            "bad": "class:status-bar-bad",
-            "critical": "class:status-bar-critical",
-        }.get(category, "class:status-bar-dim")
+        # 2026-08-01 用户定制：状态栏颜色统一绿色（与上下文一致）
+        return "class:status-bar-good"
 
     def _handle_battery_command(self, cmd_original: str) -> None:
         """Toggle the status-bar battery read-out.
@@ -5155,12 +5144,8 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
     @staticmethod
     def _compression_count_style(count: int) -> str:
-        """Return a style class reflecting context compression pressure."""
-        if count >= 10:
-            return "class:status-bar-bad"
-        if count >= 5:
-            return "class:status-bar-warn"
-        return "class:status-bar-dim"
+        # 2026-08-01 用户定制：状态栏颜色统一绿色（压缩次数数字可见即可）
+        return "class:status-bar-good"
 
     def _build_context_bar(self, percent_used: Optional[int], width: int = 10) -> str:
         safe_percent = max(0, min(100, percent_used or 0))
@@ -5371,10 +5356,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             context_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
             if context_tokens < 0:
                 context_tokens = 0
+            if context_tokens == 0:
+                # 2026-08-03 修复（与 tui_gateway/server.py _get_usage 同步）：
+                # 无本轮实测时回退最近一次实测，状态栏不回落乱跳。
+                context_tokens = getattr(compressor, "last_real_prompt_tokens", 0) or 0
             context_length = getattr(compressor, "context_length", 0) or 0
             if context_length < 0:
                 context_length = 0
             snapshot["context_tokens"] = context_tokens
+            snapshot["context_delta"] = getattr(compressor, "last_prompt_delta", 0) or 0
             snapshot["context_length"] = context_length or None
             snapshot["compressions"] = getattr(compressor, "compression_count", 0) or 0
             if context_length:
@@ -5950,6 +5940,12 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 ctx_total = _format_context_length(snapshot["context_length"])
                 ctx_used = format_token_count_compact(snapshot["context_tokens"])
                 context_label = f"{ctx_used}/{ctx_total}"
+                # 本轮增量（2026-08-05）：API 实测 vs 上次的差——让"回车跳一段"变成可读的
+                # "+32K"（真实消耗：历史+输入+上轮工具结果）；压缩后骤降显示 "-180K"（压缩生效）。
+                ctx_delta = snapshot.get("context_delta", 0) or 0
+                if ctx_delta:
+                    delta_label = f"{ctx_delta//1000:+d}K" if abs(ctx_delta) >= 1000 else f"{ctx_delta:+d}"
+                    context_label += f" ({delta_label})"
             else:
                 context_label = "ctx --"
 

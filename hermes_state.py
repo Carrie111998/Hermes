@@ -5026,6 +5026,66 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             ),
         )
 
+    def set_files_changed(
+        self, session_id: str, file_list: list, cwd: str = None
+    ) -> None:
+        """Set files_changed JSON on a session row and populate session_files."""
+        if not session_id or not file_list:
+            return
+        import json as _json
+
+        files_json = _json.dumps(file_list, ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET files_changed = ? WHERE id = ?",
+                (files_json, session_id),
+            )
+            for f in file_list:
+                path = f.get("path", "")
+                if cwd and not path.startswith("/"):
+                    path = str(Path(cwd) / path)
+                conn.execute(
+                    """INSERT OR REPLACE INTO session_files
+                       (session_id, file_path, change_type, lines_added, lines_removed)
+                       VALUES (?, ?, 'modified', ?, ?)""",
+                    (session_id, path, f.get("added", 0), f.get("removed", 0)),
+                )
+
+        self._execute_write(_do)
+
+    def insert_l0_review(
+        self,
+        session_id: str,
+        actions: list = None,
+        hermes_before: str = None,
+        hermes_after: str = None,
+        memory_before: str = None,
+        memory_after: str = None,
+        skill_changes: list = None,
+        rationale: str = None,
+    ) -> None:
+        """Record an L0 constitution review in the l0_reviews table."""
+        if not session_id:
+            return
+        import json as _json
+
+        actions_summary = _json.dumps(actions or [], ensure_ascii=False)
+        hermes_delta = _json.dumps({"before": hermes_before, "after": hermes_after} if hermes_before else {}, ensure_ascii=False)
+        memory_delta = _json.dumps({"before": memory_before, "after": memory_after} if memory_before else {}, ensure_ascii=False)
+        skill_delta = _json.dumps(skill_changes or [], ensure_ascii=False)
+
+        def _do(conn):
+            conn.execute(
+                """INSERT INTO l0_reviews
+                   (session_id, actions_summary, hermes_delta, memory_delta, skill_delta, rationale, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, actions_summary, hermes_delta, memory_delta, skill_delta, rationale or "", time.time()),
+            )
+
+        self._execute_write(_do)
+
+
     def ensure_session(
         self,
         session_id: str,

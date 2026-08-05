@@ -10,7 +10,7 @@ from agent.system_prompt import build_system_prompt, build_system_prompt_parts
 
 def _make_agent(**overrides):
     base = dict(
-        load_soul_identity=False,
+        load_hermes_identity=False,
         skip_context_files=False,
         valid_tool_names=[],
         _task_completion_guidance=False,

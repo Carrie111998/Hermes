@@ -167,7 +167,7 @@ class TestRunJobTerminalCwd:
         class FakeAgent:
             def __init__(self, **kwargs):
                 observed["skip_context_files"] = kwargs.get("skip_context_files")
-                observed["load_soul_identity"] = kwargs.get("load_soul_identity")
+                observed["load_hermes_identity"] = kwargs.get("load_hermes_identity")
                 observed["terminal_cwd_during_init"] = os.environ.get(
                     "TERMINAL_CWD", "_UNSET_"
                 )
@@ -245,7 +245,7 @@ class TestRunJobTerminalCwd:
         # Feature is OFF — skip_context_files stays True.
         assert observed["skip_context_files"] is True
         # Cron still forces SOUL.md identity even when cwd context files stay off.
-        assert observed["load_soul_identity"] is True
+        assert observed["load_hermes_identity"] is True
         # TERMINAL_CWD saw the same value during init as it had before.
         assert observed["terminal_cwd_during_init"] == before
         # And after run_job completes, it's still the sentinel (nothing

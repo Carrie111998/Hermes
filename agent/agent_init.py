@@ -516,7 +516,7 @@ def init_agent(
     thread_id: str = None,
     gateway_session_key: str = None,
     skip_context_files: bool = False,
-    load_soul_identity: bool = False,
+    load_hermes_identity: bool = False,
     skip_memory: bool = False,
     session_db=None,
     parent_session_id: str = None,
@@ -575,7 +575,7 @@ def init_agent(
             (SOUL.md, .hermes.md, AGENTS.md, CLAUDE.md, .cursorrules) from the cwd / HERMES_HOME
             into the system prompt. Use this for batch processing and data generation to avoid
             polluting trajectories with user-specific persona or project instructions.
-        load_soul_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
+        load_hermes_identity (bool): If True, still use ~/.hermes/SOUL.md as the primary
             identity even when skip_context_files=True. Project context files from the cwd
             remain skipped.
     """
@@ -608,7 +608,7 @@ def init_agent(
     agent.background_review_callback = None  # Optional sync callback for gateway delivery
     agent.memory_notifications = "on"  # Memory update notifications: "off", "on", "verbose"
     agent.skip_context_files = skip_context_files
-    agent.load_soul_identity = load_soul_identity
+    agent.load_hermes_identity = load_hermes_identity
     agent.pass_session_id = pass_session_id
     agent.log_prefix_chars = log_prefix_chars
     agent.log_prefix = f"{log_prefix} " if log_prefix else ""
