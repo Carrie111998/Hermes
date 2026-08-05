@@ -161,6 +161,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                args_hint="[text | remove N | clear]", busy_policy="dispatch"),
     CommandDef("status", "Show session, model, token, and context info", "Session",
                busy_policy="dispatch"),
+    CommandDef("timeline", "Show the live step-by-step tool-call timeline for this session", "Session",
+               busy_policy="dispatch"),
     CommandDef("egress", "Show Docker egress proxy status", "Session",
                args_hint="[status]", subcommands=("status",),
                busy_policy="dispatch", busy_handler="egress",
@@ -1257,7 +1259,14 @@ _SLACK_PRIORITY_ALIASES = ("btw", "bg")
 #     /hermes update on Slack. Demoted to free the native slot /approvals now
 #     claims — without this entry /approvals tips the registry past the 50-cap
 #     and silently clamps /update off, breaking Telegram parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update"})
+#   - timeline: new live step-timeline diagnostic command; reached via
+#     /hermes timeline on Slack. Without this entry, adding /timeline as a
+#     native canonical command tips the registry past the 50-cap and
+#     silently clamps /platform off, breaking Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({
+    "topup", "moa", "debug", "egress", "init", "version", "diff", "update",
+    "timeline",
+})
 
 
 def _sanitize_slack_name(raw: str) -> str:

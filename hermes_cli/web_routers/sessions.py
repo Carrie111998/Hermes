@@ -703,6 +703,26 @@ async def export_session_endpoint(session_id: str, profile: Optional[str] = None
     return data
 
 
+@manage_router.get("/api/sessions/{session_id}/timeline")
+async def get_session_timeline(session_id: str, limit: int = Query(200, ge=1, le=200)):
+    """Return the live, in-progress step timeline for a session.
+
+    Ephemeral and session-scoped — NOT the persisted message history (see
+    ``get_session_messages`` above) and NOT ``events.jsonl``. Backed by
+    ``tools/session_timeline.py``'s bounded, file-backed ring buffer, so
+    this reflects gateway/CLI/desktop sessions running in a process other
+    than this API server, including a step that is still mid-flight
+    (``status: "running"``, ``duration: null``).
+    """
+    from tools.session_timeline import read_timeline
+
+    data = await asyncio.to_thread(read_timeline, session_id)
+    steps = data.get("steps", [])
+    if limit and len(steps) > limit:
+        steps = steps[-limit:]
+    return {"session_id": session_id, "steps": steps, "running": bool(data.get("running", False))}
+
+
 @manage_router.post("/api/sessions/prune")
 async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
