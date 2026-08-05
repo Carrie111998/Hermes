@@ -999,6 +999,113 @@ def _notify_workflow_complete(task_id: str, state=None):
         print(f"   ⚠  Failed to write completion marker: {e}")
 
 
+def _notify_workflow_blocked(state: dict):
+    """Write a BLOCKED marker to /tmp for the watcher thread to inject.
+
+    Called when a workflow run ends with blocked nodes — the run needs
+    intervention, and the calling agent must be told so it can surface
+    options (unblock a card, retry a node) instead of discovering the
+    stall by polling. Mirrors ``_notify_workflow_complete``: same marker
+    format, same dedup by (run_id, round), different status + message.
+    """
+    try:
+        session_info = state.get("session_info", {})
+        if not session_info.get("platform") or not session_info.get("chat_id"):
+            return
+
+        workflow_name = state.get("workflow_name", "unknown")
+        board = state.get("kanban_board", "")
+        run_id = state.get("run_id", "unknown")
+        round_no = state.get("round", 0)
+        states = state.get("states", {})
+        layers = state.get("layers", [])
+
+        # Identify what's stuck and why
+        blocked_nodes = []
+        failed_nodes = []
+        for nid, ns in states.items():
+            status = ns.get("status", "")
+            if status == "blocked":
+                blocked_nodes.append({
+                    "node": nid,
+                    "status": status,
+                    "error": ns.get("error", ""),
+                })
+            elif status in ("failed", "timed_out"):
+                failed_nodes.append({
+                    "node": nid,
+                    "status": status,
+                    "error": ns.get("error", ""),
+                })
+
+        done_count = sum(1 for ns in states.values() if ns.get("status") == "done")
+        total = len(states)
+        heading = f"Workflow '{workflow_name}' BLOCKED on board '{board}' — {done_count}/{total} nodes done"
+        lines = [heading, ""]
+
+        if blocked_nodes:
+            lines.append("Blocked nodes (need intervention):")
+            for bn in blocked_nodes:
+                err = (bn.get("error") or "unknown reason")[:300]
+                lines.append(f"  🚫 {bn['node']}: {err}")
+            lines.append("")
+        if failed_nodes:
+            lines.append("Failed nodes:")
+            for fn in failed_nodes:
+                err = (fn.get("error") or "unknown")[:300]
+                lines.append(f"  ❌ {fn['node']}: {err}")
+            lines.append("")
+
+        lines.append("Unblock the stuck card(s) or reset the upstream to ready, then "
+                     "resume the run (workflow_start resume=True) to continue.")
+
+        # Dedup: one delivery per (run_id, round) — same guard as completion.
+        delivery_key = f"blocked:{run_id}:{round_no}"
+        wf_marker_dir = _COMPLETIONS_DIR / workflow_name
+        wf_marker_dir.mkdir(parents=True, exist_ok=True)
+        for existing in _glob.glob(str(wf_marker_dir / f"*_{run_id}.json")):
+            try:
+                existing_data = json.loads(Path(existing).read_text())
+                if existing_data.get("delivery_key") == delivery_key:
+                    print(
+                        f"   ℹ  Blocked delivery already sent for {delivery_key} — skipping duplicate marker"
+                    )
+                    return
+            except Exception:
+                continue
+
+        marker = {
+            "session_key": session_info.get("session_key", ""),
+            "platform": session_info.get("platform", ""),
+            "chat_id": session_info.get("chat_id", ""),
+            "thread_id": session_info.get("thread_id"),
+            "user_id": session_info.get("user_id"),
+            "profile": session_info.get("profile"),
+            "workflow_name": workflow_name,
+            "board": board,
+            "status": "blocked",
+            "message": "\n".join(lines),
+            "nodes": list(states.values()),
+            "run_id": run_id,
+            "delivery_key": delivery_key,
+            "round": round_no,
+        }
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%f")
+        marker_path = wf_marker_dir / f"{ts}_{run_id}.json"
+        # Atomic write: temp file → rename (prevents TOCTOU reads of partial JSON)
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".json")
+        try:
+            with os.fdopen(tmp_fd, "w") as tmp_f:
+                json.dump(marker, tmp_f, indent=2, default=str)
+            os.rename(tmp_path, str(marker_path))
+        except Exception:
+            os.unlink(tmp_path)
+            raise
+        print(f"   Workflow BLOCKED marker written: {marker_path.relative_to(_COMPLETIONS_DIR)}")
+    except Exception as e:
+        print(f"   ⚠  Failed to write blocked marker: {e}")
+
+
 # Module-level gateway reference, captured via pre_gateway_dispatch hook
 _gateway_ref = None
 _watcher_started = False

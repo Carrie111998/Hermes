@@ -645,3 +645,96 @@ class TestSimplifyCodeFixes:
         data = json.loads(Path(markers[-1]).read_text())
         assert "node-a" in data["message"]
         os.unlink(markers[-1])
+
+
+# ── Tests: _notify_workflow_blocked ──────────────────────────────────
+
+
+class TestNotifyWorkflowBlocked:
+    """BLOCKED runs must notify the calling session (intervention needed).
+
+    Regression: a run that ended with qa-review blocked and spec-author
+    ready was marked 'completed', so nobody was ever notified (ideation
+    2026-08-04). Blocked is a real terminal status with its own delivery.
+    """
+
+    def _make_blocked_state(self, *, run_id="blocked-run", round_no=0):
+        state = _make_state(run_id=run_id)
+        state["round"] = round_no
+        state["states"] = {
+            "implement": {
+                "status": "ready",
+                "agent": "agent-implement",
+                "kanban_card_id": "t_impl",
+            },
+            "qa-review": {
+                "status": "blocked",
+                "agent": "agent-qa",
+                "kanban_card_id": "t_qa",
+                "error": "Review limit reached (2/1) for implement",
+            },
+            "security-review": {
+                "status": "blocked",
+                "agent": "agent-sec",
+                "kanban_card_id": "t_sec",
+                "error": "Waiting: qa-review is blocked",
+            },
+        }
+        return state
+
+    def test_writes_blocked_marker_with_stuck_nodes(self, tmp_path):
+        """Marker is written with status=blocked and the stuck node listed."""
+        from plugins.workflow import _notify_workflow_blocked
+
+        state = self._make_blocked_state()
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            _notify_workflow_blocked(state)
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert len(markers) == 1, f"expected 1 blocked marker, got {len(markers)}"
+        data = json.loads(markers[0].read_text())
+        assert data["status"] == "blocked"
+        assert data["run_id"] == "blocked-run"
+        assert "BLOCKED" in data["message"]
+        assert "qa-review" in data["message"]
+        assert data["delivery_key"] == "blocked:blocked-run:0"
+        assert data["session_key"]  # routable to the calling session
+
+    def test_blocked_marker_dedup_per_round(self, tmp_path):
+        """Same (run_id, round) never writes a second blocked marker."""
+        from plugins.workflow import _notify_workflow_blocked
+
+        state = self._make_blocked_state()
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            _notify_workflow_blocked(state)
+            _notify_workflow_blocked(state)
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert len(markers) == 1, f"expected dedup, got {len(markers)}"
+
+    def test_blocked_marker_new_round_delivers_again(self, tmp_path):
+        """Bumping 'round' produces a fresh blocked delivery."""
+        from plugins.workflow import _notify_workflow_blocked
+
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            _notify_workflow_blocked(self._make_blocked_state(round_no=0))
+            _notify_workflow_blocked(self._make_blocked_state(round_no=1))
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert len(markers) == 2, f"expected 2 markers for 2 rounds, got {len(markers)}"
+
+    def test_no_marker_without_session_info(self, tmp_path):
+        """Without platform/chat_id there is no routable session — skip."""
+        from plugins.workflow import _notify_workflow_blocked
+
+        state = self._make_blocked_state()
+        state["session_info"] = {}
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            _notify_workflow_blocked(state)
+
+        markers = list((fake_completions / "test-workflow").glob("*.json"))
+        assert markers == [], "no marker expected without session info"

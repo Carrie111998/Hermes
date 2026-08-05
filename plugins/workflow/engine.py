@@ -461,6 +461,29 @@ class WorkflowEngine:
         except Exception as _notify_exc:
             print(f"   ⚠  Completion notification failed: {_notify_exc}")
 
+    def _fire_blocked_notification(self, workflow_name, workflow, states, layers, layer_idx, context=None, session_info=None):
+        """Fire a BLOCKED notification after the run ends with blocked nodes.
+
+        Mirrors ``_fire_completion_notification`` — blocked runs need
+        intervention, and the calling agent must be told (it was never
+        notified when a run deadlocked mid-review and got mislabeled
+        'completed'; ideation 2026-08-04).
+        """
+        try:
+            from plugins.workflow import _notify_workflow_blocked
+            _notif_state = {
+                "workflow_name": workflow_name,
+                "kanban_board": self.kanban_board,
+                "run_id": workflow.run_id,
+                "session_info": session_info or (context or {}).get("_session_info", {}),
+                "states": {nid: {"status": s.status, "kanban_card_id": s.kanban_card_id, "error": s.error} for nid, s in states.items()},
+                "layers": layers,
+                "current_layer": layer_idx,
+            }
+            _notify_workflow_blocked(_notif_state)
+        except Exception as _notify_exc:
+            print(f"   ⚠  Blocked notification failed: {_notify_exc}")
+
     def _find_loop_zones(self, workflow: Workflow, layers: list[list[str]]) -> list[int]:
         """Return layer indices that contain nodes with reviews (need a supervisor)."""
         review_layers: list[int] = []
@@ -962,6 +985,125 @@ class WorkflowEngine:
                                           card.get("reason",
                                                    card.get("description", "")))))
 
+    def _reviewer_is_terminal(self, workflow, upstream_node,
+                              upstream_state, rev_id: str,
+                              rev_state) -> bool:
+        """True when a reviewer will never dispatch again.
+
+        Terminal: done/skipped/failed/timed_out; a blocked reviewer whose
+        rework budget is exhausted (rounds > limit — the quality handler
+        already bumped the count past the limit before leaving it
+        blocked); or a blocked reviewer that is only waiting on a
+        dependency (error starts with 'Waiting:') — it will be
+        re-dispatched by the blocked-nodes recheck when its dependency
+        clears, so the review waiting loop must not spin on it.
+        """
+        if rev_state.status in ("done", "skipped", "failed", "timed_out"):
+            return True
+        if rev_state.status == "blocked":
+            rounds = upstream_state.review_counts.get(rev_id, 0)
+            limit = self._review_retry_limit(upstream_node, rev_id, workflow)
+            if rounds > limit:
+                return True
+            err = (rev_state.error or "").lower()
+            if err.startswith("waiting:"):
+                return True
+        return False
+
+    def _find_upstream_for_reviewer(self, workflow, states, rev_id: str):
+        """Return (upstream_node, upstream_state) for a reviewer, or None."""
+        for up_nid, up_state in states.items():
+            up_node = workflow.nodes.get(up_nid)
+            if up_node and rev_id in (up_node.reviews or []):
+                return up_node, up_state
+        return None
+
+    def _review_retry_limit(self, upstream_node, rev_id: str,
+                            workflow: "Workflow") -> int:
+        """Resolve a reviewer's rework budget.
+
+        Precedence: per-review entry (reviews: [{review: qa, max_retries: N}])
+        > reviewer node's max_retries > workflow.max_retries > engine default (3).
+        """
+        _l = None
+        for _rentry in (getattr(upstream_node, "reviews", None) or []):
+            if isinstance(_rentry, dict) and _rentry.get("review") == rev_id:
+                _l = _rentry.get("max_retries")
+                break
+        if _l is None:
+            _rev_node = workflow.nodes.get(rev_id)
+            if _rev_node is not None:
+                _l = getattr(_rev_node, "max_retries", None)
+        if _l is None:
+            _l = getattr(workflow, "max_retries", None)
+        if _l is None:
+            _l = 3
+        return _l
+
+    def _rearm_blocked_reviewer(self, workflow, states, layers,
+                               reviewer_nid: str, upstream_nid: str,
+                               upstream_state) -> bool:
+        """Re-arm a quality-blocked reviewer for the next review round.
+
+        Called after a quality block has enriched the upstream and reset
+        it to ready. The reviewer must NOT stay 'blocked' forever — nothing
+        would re-dispatch it (the ideation YAML never re-blocks 'pending
+        review', so the legacy waiting loop spins to timeout and the run
+        gets declared 'completed' with a live review loop). Reset the
+        reviewer to 'pending' with no card; the reviewers' layer creates a
+        FRESH card (now carrying the done-based verdict contract) once the
+        upstream re-completes. Bounded by the retry limit — on exhaustion
+        the reviewer stays blocked and the caller should notify.
+
+        Returns True when re-armed, False when the budget is exhausted.
+        """
+        rounds = upstream_state.review_counts.get(reviewer_nid, 0) + 1
+        upstream_node = workflow.nodes.get(upstream_nid)
+        limit = self._review_retry_limit(upstream_node, reviewer_nid, workflow) if upstream_node else 3
+        upstream_state.review_counts[reviewer_nid] = rounds
+        if rounds > limit:
+            print(f"   ⛔ {reviewer_nid} review limit reached ({rounds}/{limit}) — leaving blocked")
+            return False
+        rev_state = states[reviewer_nid]
+        rev_state.status = "pending"
+        rev_state.kanban_card_id = None
+        rev_state.completed_at = None
+        rev_state.result = None
+        # Rewind so the upstream's layer re-dispatches; the reviewers'
+        # layer re-creates a fresh card once the upstream completes.
+        for li, ln in enumerate(layers):
+            if upstream_nid in ln:
+                self._rewind_to_layer = li
+                break
+        print(f"   🔄 {reviewer_nid} re-armed for round {rounds}/{limit}")
+        return True
+
+    def _review_verdict_instruction(self) -> str:
+        """The done-based review contract prepended to every reviewer card.
+
+        Reviewers signal their verdict by COMPLETING the card with a
+        verdict-marked summary — never by blocking. The engine reads the
+        first line of the completion summary: PASS/PASSED/APPROVED/OK = accept,
+        FAIL/FAILED/FAILS/CHANGES REQUIRED/BLOCKED/REJECTED = send the work
+        back for rework. Blocking a card deadlocks the loop (ideation
+        2026-08-04: qa-review blocked with findings, spec-author re-did the
+        work, nothing re-dispatched the reviewer, run declared 'completed'
+        with a live review loop).
+        """
+        return (
+            "\n\n---\nREVIEW VERDICT CONTRACT:\n"
+            "Complete this review by marking the card DONE with your findings "
+            "in the completion summary. The FIRST LINE of the summary MUST be "
+            "your verdict:\n"
+            "  PASS: <brief accept statement> — the work is approved as-is.\n"
+            "  FAIL: <brief reject statement> — the work needs changes; your "
+            "full findings below are sent back to the author as feedback.\n"
+            "Use FAIL for any blocking issues (CHANGES REQUIRED / BLOCKED / "
+            "REJECTED all map to FAIL).\n"
+            "NEVER block this card. Blocking stalls the workflow; the engine "
+            "can only act on completed verdicts.\n"
+        )
+
     def _classify_review_verdict(self, reviewer_body: str) -> str:
         """Classify a reviewer's completion summary as pass / fail / unknown.
 
@@ -1054,6 +1196,30 @@ class WorkflowEngine:
         except Exception:
             pass
         return False
+
+    def _get_block_reason(self, card_id: str) -> str:
+        """Read the most recent ``blocked`` event's reason payload.
+
+        A blocked card's agent output lives in the block event reason —
+        NOT in the task body (which still holds the input prompt). The
+        quality-block handler was reading ``get_card_body()`` and got the
+        prompt back, producing a 28-char "Review Feedback (qa-review):"
+        comment with no findings (ideation 2026-08-04, t_dcfaca52).
+        """
+        try:
+            with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                row = _conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' ORDER BY rowid DESC LIMIT 1",
+                    (card_id,),
+                ).fetchone()
+                if row and row[0]:
+                    import json as _json
+                    payload = _json.loads(row[0])
+                    reason = payload.get("reason", "") or ""
+                    return reason.strip()
+        except Exception:
+            pass
+        return ""
 
     def _check_pending_review(self, card_id: str) -> bool:
         """Check if a card is blocked with reason "pending review".
@@ -1974,6 +2140,11 @@ class WorkflowEngine:
             "review", "feedback", "failed", "issue", "bug", "error",
             "incorrect", "wrong", "fix", "improve", "quality",
             "does not", "should", "expected", "actual",
+            # Verdict vocabulary from the review contract — terse block
+            # reasons like "CHANGES REQUIRED: missing tests" or
+            # "BLOCKED: auth gap" must classify as quality, not technical.
+            "changes required", "blocked", "reject", "fail", "approve",
+            "missing",
         ]
         return any(kw in body_lower for kw in quality_keywords)
 
@@ -2550,7 +2721,10 @@ class WorkflowEngine:
             for rev_entry in workflow.nodes[implement_nid].reviews:
                 rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
                 if rev_id and rev_id in states:
-                    if states[rev_id].status not in ("done", "skipped", "failed", "timed_out"):
+                    if not self._reviewer_is_terminal(
+                        workflow, workflow.nodes[implement_nid],
+                        implement_state, rev_id, states[rev_id],
+                    ):
                         all_reviewers_done = False
                         break
             if all_reviewers_done:
@@ -2642,6 +2816,13 @@ class WorkflowEngine:
                 if not rev_id or rev_id not in states:
                     continue
                 rev_state = states[rev_id]
+                # A blocked reviewer that is terminal (budget exhausted or
+                # dependency-waiting) must not keep the layer loop alive —
+                # ideation 2026-08-04: the waiting loop spun to timeout on
+                # a stuck reviewer, then the run was declared 'completed'
+                # mid-review.
+                if self._reviewer_is_terminal(workflow, node, state, rev_id, rev_state):
+                    continue
                 if rev_state.status in ("running", "blocked", "ready"):
                     return True
                 if rev_state.kanban_card_id:
@@ -3110,6 +3291,7 @@ class WorkflowEngine:
                             f"You are reviewing the output of node '{_up_nid}' "
                             f"(task {_up_card}). Read the card body and "
                             f"completion summary of that task to find the work.\n\n"
+                            + self._review_verdict_instruction()
                         )
                         break
 
@@ -3234,6 +3416,20 @@ class WorkflowEngine:
             ]
             for nid in blocked_nodes:
                 node = workflow.nodes[nid]
+                # A budget-exhausted reviewer stays blocked — re-dispatching
+                # it would mint a fresh card for a reviewer that can never
+                # pass (ideation 2026-08-04 regression).
+                _exhausted_reviewer = False
+                for _up_nid, _up_state in states.items():
+                    _up_node = workflow.nodes.get(_up_nid)
+                    if _up_node and nid in (_up_node.reviews or []):
+                        _rounds = _up_state.review_counts.get(nid, 0)
+                        _lim = self._review_retry_limit(_up_node, nid, workflow)
+                        if _rounds > _lim:
+                            _exhausted_reviewer = True
+                            break
+                if _exhausted_reviewer:
+                    continue
                 deps_still_blocked = any(
                     states[d].status == "blocked"
                     for d in node.depends_on
@@ -3412,14 +3608,38 @@ class WorkflowEngine:
         print(f"Workflow complete: {completed} done, {failed} failed, "
               f"{skipped} skipped, {blocked} blocked")
 
-        # Update job log
-        final_status = "failed" if failed > 0 else "completed"
+        # Update job log. Blocked nodes mean the run needs intervention —
+        # it must NOT masquerade as "completed" (ideation 2026-08-04: a run
+        # with qa-review blocked and spec-author ready was marked completed,
+        # so nobody was ever notified). Precedence: failed > blocked >
+        # completed.
+        final_status = "failed" if failed > 0 else (
+            "blocked" if blocked > 0 else "completed"
+        )
         self._update_execution(workflow.run_id, status=final_status,
                               current_layer=layer_idx)
 
-        # Fire completion notification BEFORE clearing state
+        # Fire terminal notification BEFORE clearing state — completed gets
+        # the success report; blocked gets the intervention alert (the
+        # calling agent's session is the same one that started the run).
         if final_status == "completed":
             self._fire_completion_notification(workflow_name, workflow, states, layers, layer_idx, context, session_info=(context or {}).get("_session_info"))
+        elif final_status == "blocked":
+            self._fire_blocked_notification(workflow_name, workflow, states, layers, layer_idx, context, session_info=(context or {}).get("_session_info"))
+
+        # Final state save BEFORE clearing: the retained file is what
+        # auto-resume reads, so it must carry the ACTUAL terminal statuses
+        # (ideation 2026-08-04: the retained file showed security-review
+        # 'running' even though the run completed — a stale checkpoint was
+        # stamped 'completed' and a resume would have re-dispatched the
+        # reviewer).
+        try:
+            self._save_state(
+                workflow_name, states, results, layer_idx, layers,
+                run_id=workflow.run_id, context=context,
+            )
+        except Exception as _save_exc:
+            print(f"   ⚠  Final state save failed: {_save_exc}")
 
         self._clear_state(workflow_name, run_id=workflow.run_id,
                           final_status=final_status)
@@ -3502,6 +3722,18 @@ class WorkflowEngine:
 
                 # ── Blocked state ──
                 if state.status == "blocked":
+                    # A blocked reviewer whose rework budget is exhausted
+                    # is terminal — it will never transition again. Drop
+                    # it from pending so the monitor exits (ideation
+                    # 2026-08-04: the re-monitor rebuilt pending from the
+                    # layer list and spun to max_polls on an exhausted
+                    # blocked reviewer).
+                    _up = self._find_upstream_for_reviewer(workflow, states, nid)
+                    if _up and self._reviewer_is_terminal(
+                        workflow, _up[0], _up[1], nid, state,
+                    ):
+                        pending.discard(nid)
+                        continue
                     # Check if this is a reviewer waiting for implement
                     # to re-block "pending review", or a genuine blocker.
                     # We keep it in pending so we detect when it transitions.
@@ -3874,6 +4106,7 @@ class WorkflowEngine:
                                                 f"You are reviewing the output of node '{nid}' "
                                                 f"(task {_upstream_card}). Read the card body and "
                                                 f"completion summary of that task to find the work.\n\n"
+                                                + self._review_verdict_instruction()
                                             )
                                             _rev_ws_kind = ""
                                             _rev_ws_path = ""
@@ -3911,6 +4144,7 @@ class WorkflowEngine:
                                             f"You are reviewing the output of node '{nid}' "
                                             f"(task {_upstream_card}). Read the card body and "
                                             f"completion summary of that task to find the work.\n\n"
+                                            + self._review_verdict_instruction()
                                         )
                                         # Check if reviewer inherits the work node's workspace.
                                         # Blind reviews (default): reviewer runs in scratch.
@@ -3956,12 +4190,25 @@ class WorkflowEngine:
                                     # Reviewer blocked with "pending review" — treat
                                     # as a quality review block.
                                     upstream_state = states[reviewer_for]
+                                    # The block REASON carries the reviewer's
+                                    # findings — the task body holds only the
+                                    # input prompt.
+                                    _block_reason = self._get_block_reason(state.kanban_card_id)
+                                    if _block_reason:
+                                        body = _block_reason
                                     is_quality_block = self._classify_block_reason(
                                         nid, body, workflow, context
                                     )
                                     if is_quality_block:
                                         print(f"   📋 {nid} BLOCKED (quality review) — enriching {reviewer_for}")
-                                        if upstream_state.kanban_card_id:
+                                        # Enrich only while rework budget remains —
+                                        # an exhausted reviewer must not keep
+                                        # resetting the author (ideation 2026-08-04).
+                                        _up_node = workflow.nodes.get(reviewer_for)
+                                        _next_round = upstream_state.review_counts.get(nid, 0) + 1
+                                        _limit = self._review_retry_limit(_up_node, nid, workflow) if _up_node else 3
+                                        _exhausted = _next_round > _limit
+                                        if not _exhausted and upstream_state.kanban_card_id:
                                             try:
                                                 with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                                     kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Feedback ({nid}):\n{body}")
@@ -3981,10 +4228,21 @@ class WorkflowEngine:
                                         pending.discard(nid)
                                         if upstream_state.kanban_card_id:
                                             pending.discard(reviewer_for)
-                                        print(f"   ⏸  {nid} stays blocked — waiting for {reviewer_for} to re-block pending review")
-                                        # Go back to layer 0 so the review
-                                        # waiting loop can re-engage.
-                                        layer_idx = 0
+                                        # Re-arm the reviewer for the next round
+                                        # (bounded) — see _rearm_blocked_reviewer.
+                                        if not self._rearm_blocked_reviewer(
+                                            workflow, states, layers,
+                                            nid, reviewer_for, upstream_state,
+                                        ):
+                                            print(f"   ⏸  {nid} stays blocked — review budget exhausted for {reviewer_for}")
+                                            state.error = f"Review limit reached ({_next_round}/{_limit}) for {reviewer_for}"
+                                            results[nid] = "blocked"
+                                            self._try_block_notify(workflow, nid, state, body, context)
+                                            # Terminal: drop from pending so the
+                                            # monitor exits and the layer loop
+                                            # advances — an exhausted reviewer
+                                            # will never transition again.
+                                            pending.discard(nid)
                                     else:
                                         state.status = "blocked"
                                         state.error = f"Reviewer blocked (technical): {body[:100]}"
@@ -4013,17 +4271,29 @@ class WorkflowEngine:
                             if reviewer_for:
                                 # Reviewer blocked — use auxiliary to classify the reason
                                 upstream_state = states[reviewer_for]
+                                # The block REASON carries the reviewer's
+                                # findings — the task body holds only the
+                                # input prompt.
+                                _block_reason = self._get_block_reason(state.kanban_card_id)
+                                if _block_reason:
+                                    body = _block_reason
                                 is_quality_block = self._classify_block_reason(
                                     nid, body, workflow, context
                                 )
 
                                 if is_quality_block:
-                                    # Quality review results — enrich upstream, reset to ready.
-                                    # The reviewer stays blocked until implement re-blocks
-                                    # "pending review", at which point the pending-review
-                                    # handler unblocks it.
+                                    # Quality review results. Enrich the upstream with
+                                    # feedback + reset to ready — but ONLY while the
+                                    # reviewer still has rework budget. An exhausted
+                                    # reviewer is terminal; re-enriching every monitor
+                                    # pass would spin the author forever (ideation
+                                    # 2026-08-04 hang).
                                     print(f"   📋 {nid} BLOCKED (quality review) — enriching {reviewer_for}")
-                                    if upstream_state.kanban_card_id:
+                                    _up_node = workflow.nodes.get(reviewer_for)
+                                    _next_round = upstream_state.review_counts.get(nid, 0) + 1
+                                    _limit = self._review_retry_limit(_up_node, nid, workflow) if _up_node else 3
+                                    _exhausted = _next_round > _limit
+                                    if not _exhausted and upstream_state.kanban_card_id:
                                         try:
                                             with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                                 kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Feedback ({nid}):\n{body}")
@@ -4046,7 +4316,25 @@ class WorkflowEngine:
                                     pending.discard(nid)
                                     if upstream_state.kanban_card_id:
                                         pending.discard(reviewer_for)
-                                    print(f"   ⏸  {nid} stays blocked — waiting for {reviewer_for} to re-block pending review")
+                                    # Re-arm the reviewer for the next round (bounded):
+                                    # reset to pending + rewind so the upstream's
+                                    # re-completion dispatches a FRESH reviewer card.
+                                    # Without this the loop deadlocks — the reviewer
+                                    # stays blocked, the waiting loop times out, and
+                                    # the run is declared completed mid-review.
+                                    if not self._rearm_blocked_reviewer(
+                                        workflow, states, layers,
+                                        nid, reviewer_for, upstream_state,
+                                    ):
+                                        print(f"   ⏸  {nid} stays blocked — review budget exhausted for {reviewer_for}")
+                                        state.error = f"Review limit reached ({_next_round}/{_limit}) for {reviewer_for}"
+                                        results[nid] = "blocked"
+                                        self._try_block_notify(workflow, nid, state, body, context)
+                                        # Terminal: drop from pending so the
+                                        # monitor exits and the layer loop
+                                        # advances — an exhausted reviewer
+                                        # will never transition again.
+                                        pending.discard(nid)
                                 else:
                                     # Technical block — notify calling agent
                                     state.status = "blocked"

@@ -88,11 +88,14 @@ class CardDriver:
     the engine's pass/fail classification.
     """
 
-    def __init__(self, db_path, scripts):
+    def __init__(self, db_path, scripts, block_scripts=None):
         self.db_path = db_path
         self.scripts = scripts  # {title_prefix: [summary, ...]}
+        self.block_scripts = block_scripts or {}  # {title_prefix: [reason, ...]}
         self.counters = {p: 0 for p in scripts}
+        self.block_counters = {p: 0 for p in self.block_scripts}
         self.completions = {p: [] for p in scripts}  # [(card_id, summary)]
+        self.blocks = {p: [] for p in self.block_scripts}  # [(card_id, reason)]
         self.stop = threading.Event()
 
     def run(self):
@@ -110,17 +113,31 @@ class CardDriver:
                     conn.close()
                     conn = None
                     for row in rows:
-                        prefix = next(
-                            (p for p in self.scripts if row["title"].startswith(p)),
+                        block_prefix = next(
+                            (p for p in self.block_scripts if row["title"].startswith(p)),
                             None,
                         )
-                        if prefix is None:
+                        prefix = None
+                        if block_prefix is not None:
+                            bidx = self.block_counters[block_prefix]
+                            if bidx >= len(self.block_scripts[block_prefix]):
+                                # Block script exhausted — fall through to
+                                # completion scripts (fresh reviewer cards
+                                # after a re-arm complete with verdicts).
+                                block_prefix = None
+                        if block_prefix is None:
+                            prefix = next(
+                                (p for p in self.scripts if row["title"].startswith(p)),
+                                None,
+                            )
+                        if prefix is None and block_prefix is None:
                             continue
-                        idx = self.counters[prefix]
-                        if idx >= len(self.scripts[prefix]):
-                            continue
-                        summary = self.scripts[prefix][idx]
-                        self.counters[prefix] += 1
+                        if prefix is not None:
+                            idx = self.counters[prefix]
+                            if idx >= len(self.scripts[prefix]):
+                                continue
+                            summary = self.scripts[prefix][idx]
+                            self.counters[prefix] += 1
                         # Engine-created cards are born 'running' (kanban
                         # create_task default); a claimed card is also
                         # 'running'. complete_task accepts running|ready,
@@ -128,12 +145,25 @@ class CardDriver:
                         # monitor polls for the done transition.
                         conn = sqlite3.connect(self.db_path, timeout=10)
                         conn.row_factory = sqlite3.Row  # kanban_db expects Row
-                        kanban_db.complete_task(
-                            conn, row["id"], summary=summary, result=summary
-                        )
-                        conn.close()
-                        conn = None
-                        self.completions[prefix].append((row["id"], summary))
+                        if block_prefix is not None:
+                            bidx = self.block_counters[block_prefix]
+                            if bidx >= len(self.block_scripts[block_prefix]):
+                                continue
+                            reason = self.block_scripts[block_prefix][bidx]
+                            self.block_counters[block_prefix] += 1
+                            kanban_db.block_task(
+                                conn, row["id"], reason=reason, kind="needs_input"
+                            )
+                            conn.close()
+                            conn = None
+                            self.blocks[block_prefix].append((row["id"], reason))
+                        else:
+                            kanban_db.complete_task(
+                                conn, row["id"], summary=summary, result=summary
+                            )
+                            conn.close()
+                            conn = None
+                            self.completions[prefix].append((row["id"], summary))
                         time.sleep(0.4)
                 except Exception:
                     # DB may be mid-write (locked) — retry next tick.
@@ -152,7 +182,8 @@ class CardDriver:
                     pass
 
 
-def _run_engine(review_env, qa_retries, sec_retries, scripts):
+def _run_engine(review_env, qa_retries, sec_retries, scripts, block_scripts=None,
+               patch_analyst=False):
     """Write the dummy YAML and run execute() to completion."""
     wf_dir = review_env["wf_dir"]
     yaml_content = YAML_TMPL.format(qa_retries=qa_retries, sec_retries=sec_retries)
@@ -164,11 +195,32 @@ def _run_engine(review_env, qa_retries, sec_retries, scripts):
     engine = WorkflowEngine(workflows_dir=str(wf_dir))
     engine.POLL_INTERVAL = 0.15  # type: ignore[assignment]
 
-    driver = CardDriver(review_env["db_path"], scripts)
+    driver = CardDriver(review_env["db_path"], scripts, block_scripts=block_scripts)
     t = threading.Thread(target=driver.run, daemon=True)
     t.start()
     try:
-        results = engine.execute("dummy-review", board=review_env["board"])
+        if patch_analyst:
+            # Replace LLM auxiliary calls with fast stubs — these tests
+            # exercise ENGINE mechanics, not the analyst.
+            from unittest.mock import MagicMock
+            import plugins.workflow.analyst as analyst_mod
+            _fast = MagicMock()
+            _fast.success = True
+            _fast.result = {"decision": "loop", "block_type": "quality",
+                            "layer_summary": [], "attention_needed": []}
+            _orig = {n: getattr(analyst_mod, n) for n in (
+                "analyze_block_notification", "analyze_status",
+                "analyze_loop_decision", "analyze_escalation",
+                "analyze_failure") if hasattr(analyst_mod, n)}
+            for n in _orig:
+                setattr(analyst_mod, n, lambda *a, _r=_fast, **k: _r)
+            try:
+                results = engine.execute("dummy-review", board=review_env["board"])
+            finally:
+                for n, f in _orig.items():
+                    setattr(analyst_mod, n, f)
+        else:
+            results = engine.execute("dummy-review", board=review_env["board"])
         return engine, results, driver
     finally:
         driver.stop.set()
@@ -316,3 +368,150 @@ class TestGetCardStatus:
         assert status["result"] == "FAIL: blockers found"
         # The prompt itself must NOT be the summary.
         assert status["latest_summary"] != status["body"]
+
+
+class TestBlockedReviewerRecovery:
+    """Regression tests for the ideation 2026-08-04 deadlock.
+
+    Scenario that broke: qa-review BLOCKED with findings (legacy YAML
+    convention: "if blocking, include issues"), the engine enriched the
+    spec card and reset it to ready, but nothing ever re-dispatched the
+    blocked reviewer — the run was declared 'completed' with a live
+    review loop and nobody was notified.
+    """
+
+    def test_blocked_reviewer_rearms_loop(self, review_env):
+        """Reviewer blocks with findings → upstream reset → reviewer
+        re-armed → upstream re-completes → FRESH reviewer card carries
+        the verdict contract → PASS → workflow finishes."""
+        scripts = {
+            "[implement]": ["v1", "v2"],
+            "[qa-review]": ["PASS: ok"],
+            "[security-review]": ["PASS: ok"],
+        }
+        block_scripts = {
+            "[qa-review]": [
+                "CHANGES REQUIRED: missing tests and wrong config",
+            ],
+        }
+        engine, results, driver = _run_engine(
+            review_env, qa_retries=3, sec_retries=3,
+            scripts=scripts, block_scripts=block_scripts,
+        )
+
+        # The block was a quality verdict → upstream reset + reviewer re-armed
+        assert len(driver.blocks["[qa-review]"]) == 1
+        # Fresh reviewer card created after re-arm — and it completed PASS
+        assert len(driver.completions["[qa-review]"]) == 1
+        assert "PASS" in driver.completions["[qa-review]"][0][1]
+        # The re-armed reviewer card must carry the done-based verdict contract
+        conn = sqlite3.connect(review_env["db_path"])
+        conn.row_factory = sqlite3.Row
+        qa_card_ids = [cid for cid, _ in driver.completions["[qa-review]"]]
+        for cid in qa_card_ids:
+            body = conn.execute("SELECT body FROM tasks WHERE id=?", (cid,)).fetchone()["body"]
+            assert "REVIEW VERDICT CONTRACT" in body
+            assert "NEVER block" in body
+            assert "PASS:" in body and "FAIL:" in body
+        conn.close()
+
+        # Workflow finished cleanly
+        state = json.loads(_state_files(review_env["wf_dir"])[-1].read_text())
+        assert state["states"]["implement"]["status"] == "done"
+        assert state["states"]["qa-review"]["status"] == "done"
+        assert state["states"]["security-review"]["status"] == "done"
+
+    def test_block_feedback_body_has_findings(self, review_env):
+        """Regression: quality-block handler read get_card_body() (the
+        INPUT PROMPT) for blocked cards, producing an empty
+        'Review Feedback (qa-review):' comment. It must read the block
+        event's reason payload — the reviewer's actual findings."""
+        scripts = {
+            "[implement]": ["v1"],
+            "[security-review]": ["PASS: ok"],
+        }
+        block_scripts = {
+            "[qa-review]": [
+                "CHANGES REQUIRED: RB1 missing await, RB2 phantom path",
+            ],
+        }
+        engine, results, driver = _run_engine(
+            review_env, qa_retries=3, sec_retries=3,
+            scripts=scripts, block_scripts=block_scripts,
+        )
+
+        # Find the implement card's workflow-engine comments
+        conn = sqlite3.connect(review_env["db_path"])
+        conn.row_factory = sqlite3.Row
+        imp_card = conn.execute(
+            "SELECT id FROM tasks WHERE title LIKE '[implement]%' ORDER BY created_at LIMIT 1"
+        ).fetchone()
+        comments = _comments(review_env["db_path"], imp_card["id"])
+        conn.close()
+        feedback = [c for c in comments if c.startswith("Review Feedback")]
+        assert feedback, f"expected Review Feedback comment, got {comments}"
+        # The findings from the block REASON must be in the comment
+        assert "RB1 missing await" in feedback[0]
+        assert "RB2 phantom path" in feedback[0]
+        # The input prompt must NOT be the feedback
+        assert "Write the spec" not in feedback[0]
+
+    def test_exhausted_blocked_reviewer_ends_blocked_with_notification(self, review_env):
+        """Budget exhaustion (max_retries: 1) on a BLOCKED reviewer ends
+        the run with final_status=blocked (not 'completed'), and a
+        BLOCKED delivery marker is written for the calling session."""
+        scripts = {
+            "[implement]": ["v1", "v2", "v3"],
+            "[security-review]": ["PASS: ok"],
+        }
+        block_scripts = {
+            "[qa-review]": ["CHANGES REQUIRED: still broken", "CHANGES REQUIRED: still broken"],
+        }
+        engine, results, driver = _run_engine(
+            review_env, qa_retries=1, sec_retries=3,
+            scripts=scripts, block_scripts=block_scripts,
+            patch_analyst=True,
+        )
+
+        # The reviewer blocked once, was re-armed, blocked again, then
+        # hit its budget — a THIRD re-arm must not happen.
+        assert len(driver.blocks["[qa-review]"]) == 2
+
+        # Executions DB records 'blocked', not 'completed'
+        from hermes_cli.kanban_db import kanban_home
+        db_path = kanban_home() / "workflows" / "executions.db"
+        assert db_path.exists()
+        conn = sqlite3.connect(str(db_path))
+        row = conn.execute(
+            "SELECT status FROM workflow_executions WHERE run_id LIKE 'dummy-review%' ORDER BY started_at DESC LIMIT 1"
+        ).fetchone()
+        conn.close()
+        assert row is not None and row[0] == "blocked", f"expected blocked, got {row}"
+
+        # The engine result records the blocked node (session delivery of
+        # the BLOCKED marker is unit-tested in test_workflow_notification.py
+        # — the e2e harness has no session routing).
+        assert results.get("qa-review") == "blocked", results
+
+    def test_verdict_contract_prepended_to_first_reviewer_card(self, review_env):
+        """Even the FIRST reviewer dispatch (no prior block) carries the
+        done-based verdict contract, so reviewers know to complete with
+        PASS/FAIL instead of blocking."""
+        scripts = {
+            "[implement]": ["v1"],
+            "[qa-review]": ["PASS: ok"],
+            "[security-review]": ["PASS: ok"],
+        }
+        engine, results, driver = _run_engine(
+            review_env, qa_retries=3, sec_retries=3, scripts=scripts
+        )
+
+        conn = sqlite3.connect(review_env["db_path"])
+        conn.row_factory = sqlite3.Row
+        for cid, _summary in driver.completions["[qa-review]"]:
+            body = conn.execute("SELECT body FROM tasks WHERE id=?", (cid,)).fetchone()["body"]
+            assert "REVIEW VERDICT CONTRACT" in body
+            assert "NEVER block this card" in body
+        conn.close()
+        assert results["implement"] == "done"
+        assert results["qa-review"] == "done"
