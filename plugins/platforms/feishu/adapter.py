@@ -1536,6 +1536,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Update prompt button state (prompt_id → {session_key, message_id, chat_id})
         self._update_prompt_state: Dict[int, Dict[str, str]] = {}
         self._update_prompt_counter = itertools.count(1)
+        # Clarify button state (clarify_id → {choices, session_key, message_id, chat_id})
+        self._clarify_state: Dict[str, Dict[str, Any]] = {}
         # Feishu reaction deletion requires the opaque reaction_id returned
         # by create, so we cache it per message_id.
         self._pending_processing_reactions: "OrderedDict[str, str]" = OrderedDict()
@@ -2175,6 +2177,177 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.warning("[Feishu] send_update_prompt failed: %s", exc)
             return SendResult(success=False, error=str(exc))
 
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[list],
+        clarify_id: str,
+        session_key: str,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a clarify prompt as an interactive card with one button per choice.
+
+        Multi-choice mode (``choices`` non-empty): renders an interactive card
+        with one button per option plus a final "✏️ Other (type answer)"
+        button.  Button callbacks resolve the pending clarify via
+        ``tools.clarify_gateway.resolve_gateway_clarify``; picking "Other"
+        flips the entry into text-capture mode so the next message becomes
+        the response.
+
+        Open-ended mode (``choices`` empty): falls through to the base
+        plain-text render — the question is sent as a text message and the
+        gateway's text-intercept resolves it.
+
+        If sending the interactive card fails (e.g. the Feishu app lacks the
+        interactive-card capability), we fall back to a plain text numbered
+        list (base behavior) so the user can still reply with a number.  The
+        card body deliberately uses plain text lines instead of markdown
+        ordered-list syntax (``1. ...``): Feishu's ``md`` renderer does not
+        support list syntax and swallows the option lines, which is exactly
+        the "选项内容消失" bug this override fixes (see GitHub issue #9816).
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+
+        try:
+            if choices:
+                # Multi-select clarifies are NOT button-friendly on Feishu
+                # (buttons resolve immediately, one pick at a time), so keep
+                # the base text-fallback behavior for them.
+                _is_multi = False
+                try:
+                    from tools import clarify_gateway as _cg
+                    with _cg._lock:
+                        _entry = _cg._entries.get(clarify_id)
+                    _is_multi = bool(_entry and getattr(_entry, "multi_select", False))
+                except Exception:
+                    _is_multi = False
+
+                if _is_multi:
+                    return await super().send_clarify(
+                        chat_id=chat_id,
+                        question=question,
+                        choices=choices,
+                        clarify_id=clarify_id,
+                        session_key=session_key,
+                        metadata=metadata,
+                    )
+
+                card = self._build_clarify_card(
+                    question=question,
+                    choices=list(choices),
+                    clarify_id=clarify_id,
+                )
+                payload = json.dumps(card, ensure_ascii=False)
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=payload,
+                    reply_to=None,
+                    metadata=metadata,
+                )
+                result = self._finalize_send_result(response, "clarify card send failed")
+                if result.success:
+                    self._clarify_state[clarify_id] = {
+                        "session_key": session_key,
+                        "message_id": result.message_id or "",
+                        "chat_id": chat_id,
+                        "choices": list(choices),
+                    }
+                    return result
+                logger.warning(
+                    "[Feishu] clarify card send failed (%s); falling back to plain text list",
+                    result.error,
+                )
+
+            # Fallback / open-ended: plain-text numbered list.  Send as a
+            # ``text`` message (not ``post``/md) so Feishu renders the option
+            # lines verbatim — the md renderer swallows list syntax.
+            text = f"❓ {question}"
+            if choices:
+                lines = [text, ""]
+                for i, choice in enumerate(choices, start=1):
+                    lines.append(f"  {i}. {choice}")
+                lines.append("")
+                lines.append(
+                    "Reply with the number, the option text, or your own answer."
+                )
+                text = "\n".join(lines)
+            from tools.clarify_gateway import mark_awaiting_text
+            mark_awaiting_text(clarify_id)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id,
+                msg_type="text",
+                payload=json.dumps({"text": text}, ensure_ascii=False),
+                reply_to=None,
+                metadata=metadata,
+            )
+            return self._finalize_send_result(response, "clarify text send failed")
+        except Exception as exc:
+            logger.warning("[Feishu] send_clarify failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+
+    @staticmethod
+    def _build_clarify_card(*, question: str, choices: List[str], clarify_id: str) -> Dict[str, Any]:
+        """Build a Feishu interactive card for a multi-choice clarify prompt.
+
+        The body renders each option as a plain text line (NOT markdown
+        ordered-list syntax — Feishu's md renderer swallows ``1. ...`` lines,
+        see GitHub issue #9816).  Buttons carry short numeric labels (1, 2,
+        3, …, Other) so long option text stays readable in the body and the
+        button row stays compact on mobile.
+        """
+        def _btn(label: str, value: dict, btn_type: str = "default") -> dict:
+            return {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": label},
+                "type": btn_type,
+                "value": value,
+            }
+
+        actions = [
+            _btn(str(idx), {
+                "hermes_clarify_action": clarify_id,
+                "choice_index": idx - 1,
+            })
+            for idx in range(1, len(choices) + 1)
+        ]
+        actions.append(_btn("✏️ Other", {
+            "hermes_clarify_action": clarify_id,
+            "choice_index": -1,
+        }))
+
+        option_lines = "\n".join(
+            f"{idx}. {choice}" for idx, choice in enumerate(choices, start=1)
+        )
+
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": "❓ Please choose", "tag": "plain_text"},
+                "template": "blue",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"**{question}**\n\n{option_lines}"},
+                {"tag": "action", "actions": actions},
+            ],
+        }
+
+    @staticmethod
+    def _build_resolved_clarify_card(*, choice: str, user_name: str) -> Dict[str, Any]:
+        """Build raw card JSON for a resolved clarify action."""
+        return {
+            "config": {"wide_screen_mode": True},
+            "header": {
+                "title": {"content": f"✅ Answered: {choice}", "tag": "plain_text"},
+                "template": "green",
+            },
+            "elements": [
+                {"tag": "markdown", "content": f"Answered by **{user_name}**"},
+            ],
+        }
+
     @staticmethod
     def _build_resolved_approval_card(*, choice: str, user_name: str) -> Dict[str, Any]:
         """Build raw card JSON for a resolved approval action."""
@@ -2714,11 +2887,21 @@ class FeishuAdapter(BasePlatformAdapter):
             action_value.get("hermes_update_prompt_action")
             if isinstance(action_value, dict) else None
         )
+        clarify_action = (
+            action_value.get("hermes_clarify_action")
+            if isinstance(action_value, dict) else None
+        )
 
         if hermes_action:
             return self._handle_approval_card_action(event=event, action_value=action_value, loop=loop)
         if update_prompt_action:
             return self._handle_update_prompt_card_action(
+                event=event,
+                action_value=action_value,
+                loop=loop,
+            )
+        if clarify_action:
+            return self._handle_clarify_card_action(
                 event=event,
                 action_value=action_value,
                 loop=loop,
@@ -2870,6 +3053,117 @@ class FeishuAdapter(BasePlatformAdapter):
             card.data = self._build_resolved_update_prompt_card(answer=answer, user_name=user_name)
             response.card = card
         return response
+
+    def _handle_clarify_card_action(self, *, event: Any, action_value: Dict[str, Any], loop: Any) -> Any:
+        """Handle a clarify card button click: resolve the pending clarify.
+
+        Mirrors the update-prompt flow: validates the operator and chat,
+        schedules the resolve on the event loop, and returns a synchronous
+        callback response that swaps the card to an "Answered: <choice>" state.
+        Picking the "Other" button (``choice_index == -1``) flips the entry
+        into text-capture mode so the next message resolves it instead.
+        """
+        clarify_id = str(action_value.get("hermes_clarify_action", "") or "")
+        choice_index = action_value.get("choice_index")
+        if not clarify_id or choice_index is None:
+            logger.debug("[Feishu] Clarify card action missing clarify_id/choice_index, ignoring")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        state = self._clarify_state.get(clarify_id)
+        if not state:
+            logger.debug("[Feishu] Clarify %s already resolved or unknown", clarify_id)
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        sender_id = SimpleNamespace(open_id=open_id, user_id=str(getattr(operator, "user_id", "") or ""))
+        if not self._allow_group_message(sender_id, state.get("chat_id", ""), is_bot=False):
+            logger.warning("[Feishu] Unauthorized clarify click by %s", open_id or "<unknown>")
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        expected_chat_id = str(state.get("chat_id", "") or "")
+        if callback_chat_id and expected_chat_id and callback_chat_id != expected_chat_id:
+            logger.warning(
+                "[Feishu] Clarify callback chat mismatch for %s (expected=%s, got=%s)",
+                clarify_id,
+                expected_chat_id,
+                callback_chat_id,
+            )
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        user_name = self._get_cached_sender_name(open_id) or open_id
+        choices = state.get("choices") or []
+
+        try:
+            idx = int(choice_index)
+        except (TypeError, ValueError):
+            idx = -1
+
+        if 0 <= idx < len(choices):
+            choice_text = str(choices[idx])
+        else:
+            choice_text = None  # "Other" (or out-of-range) → text capture
+
+        if not self._submit_on_loop(
+            loop,
+            self._resolve_clarify(
+                clarify_id=clarify_id,
+                choice_text=choice_text,
+                user_name=user_name,
+                open_id=open_id,
+                chat_id=callback_chat_id,
+            ),
+        ):
+            return P2CardActionTriggerResponse() if P2CardActionTriggerResponse else None
+
+        if P2CardActionTriggerResponse is None:
+            return None
+        response = P2CardActionTriggerResponse()
+        if CallBackCard is not None:
+            card = CallBackCard()
+            card.type = "raw"
+            card.data = self._build_resolved_clarify_card(
+                choice=choice_text or "Other (type answer)",
+                user_name=user_name,
+            )
+            response.card = card
+        return response
+
+    async def _resolve_clarify(
+        self,
+        *,
+        clarify_id: str,
+        choice_text: Optional[str],
+        user_name: str,
+        open_id: str = "",
+        chat_id: str = "",
+    ) -> None:
+        """Resolve a pending clarify from a card button click.
+
+        ``choice_text`` of None means the user picked "Other" — flip the entry
+        into text-capture mode so the next typed message becomes the response.
+        """
+        from tools.clarify_gateway import mark_awaiting_text, resolve_gateway_clarify
+
+        state = self._clarify_state.pop(clarify_id, None)
+        if not state:
+            logger.debug("[Feishu] Clarify %s already resolved or unknown", clarify_id)
+            return
+
+        if choice_text is None:
+            mark_awaiting_text(clarify_id)
+            logger.info("[Feishu] Clarify %s: user chose 'Other', awaiting text", clarify_id)
+            return
+
+        ok = resolve_gateway_clarify(clarify_id, choice_text)
+        logger.info(
+            "[Feishu] Clarify %s resolved by %s -> %r (ok=%s)",
+            clarify_id,
+            open_id or user_name or "<unknown>",
+            choice_text,
+            ok,
+        )
 
     async def _resolve_approval(
         self,
