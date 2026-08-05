@@ -21,6 +21,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     base_url: "",
     script: "",
     reasoning_effort: null,
+    preserve_reasoning_on_save: false,
     no_agent: false,
     context_from: "",
     enabled_toolsets: [],
@@ -79,17 +80,33 @@ describe("buildCronJobPayload", () => {
       buildCronJobPayload(form({ reasoning_effort: "" })).reasoning_effort,
     ).toBeNull();
   });
-  it("canonicalizes malformed legacy reasoning before unrelated edits", () => {
+  it("preserves a malformed legacy reasoning value on a name-only edit", () => {
     const hydrated = cronJobFormFromJob({
       id: "legacy-invalid",
       enabled: true,
       reasoning_effort: " turbo ",
     });
 
-    expect(hydrated.reasoning_effort).toBeNull();
-    expect(
-      buildCronJobPayload({ ...hydrated, name: "renamed" }).reasoning_effort,
-    ).toBeNull();
+    expect(hydrated).toMatchObject({
+      reasoning_effort: "turbo",
+      preserve_reasoning_on_save: true,
+    });
+    const payload = buildCronJobPayload({ ...hydrated, name: "renamed" });
+    expect("reasoning_effort" in payload).toBe(false);
+  });
+  it("clears a malformed legacy value once the selector is changed", () => {
+    const hydrated = cronJobFormFromJob({
+      id: "legacy-invalid",
+      enabled: true,
+      reasoning_effort: " turbo ",
+    });
+
+    const payload = buildCronJobPayload({
+      ...hydrated,
+      reasoning_effort: null,
+      preserve_reasoning_on_save: false,
+    });
+    expect(payload.reasoning_effort).toBeNull();
   });
 });
 

@@ -141,6 +141,7 @@ function emptyCronJobForm(): CronJobEditorState {
     base_url: "",
     script: "",
     reasoning_effort: null,
+    preserve_reasoning_on_save: false,
     no_agent: false,
     context_from: "",
     enabled_toolsets: [],
@@ -252,7 +253,13 @@ function CronAdvancedFields({
           <Select
             id={`${idPrefix}-reasoning-effort`}
             value={form.reasoning_effort ?? ""}
-            onValueChange={(v) => update("reasoning_effort", v || null)}
+            onValueChange={(v) =>
+              onChange({
+                ...form,
+                reasoning_effort: v || null,
+                preserve_reasoning_on_save: false,
+              })
+            }
           >
             <SelectOption value="">Inherit / default</SelectOption>
             {EFFORT_OPTIONS.map((option) => (

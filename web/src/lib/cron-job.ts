@@ -13,6 +13,9 @@ export interface CronJobFormState {
   script: string;
   no_agent: boolean;
   reasoning_effort: string | null;
+  /** Preserve a malformed legacy stored value when the reasoning selector was
+   *  not changed, instead of rewriting it to null on an unrelated edit. */
+  preserve_reasoning_on_save: boolean;
   context_from: string;
   enabled_toolsets: string[];
   workdir: string;
@@ -52,15 +55,34 @@ function normalizeReasoningEffort(value: unknown): string | null {
   const effort = value.trim().toLowerCase();
   return VALID_EFFORTS.has(effort) ? effort : null;
 }
-/** Build the create/update payload. Optional fields collapse to null so an
- * update explicitly clears them rather than leaving stale values. */
-function optionalReasoningEffort(value: string | null): string | null {
-  return normalizeReasoningEffort(value);
+
+/** True when a stored value is present but not canonical: legacy/hand-edited
+ *  values the backend keeps readable but should not be rewritten on read. */
+function hasMalformedReasoning(value: unknown): boolean {
+  if (value === false) return false;
+  if (typeof value !== "string") return value !== null && value !== undefined;
+  return normalizeReasoningEffort(value) === null;
+}
+
+/** Build the create/update payload. A valid effort is always emitted; an
+ *  explicit null clears the override; a malformed legacy value that was not
+ *  touched is omitted so an unrelated dashboard edit preserves it. */
+function optionalReasoningEffort(
+  value: string | null,
+  preserve: boolean,
+): string | null | undefined {
+  const normalized = normalizeReasoningEffort(value);
+  if (normalized !== null) return normalized;
+  return preserve ? undefined : null;
 }
 export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
   const contextFrom = splitCronList(form.context_from);
   const enabledToolsets = form.enabled_toolsets.filter(Boolean);
-  return {
+  const reasoningEffort = optionalReasoningEffort(
+    form.reasoning_effort,
+    form.preserve_reasoning_on_save,
+  );
+  const payload: CronJobMutation = {
     name: form.name.trim(),
     prompt: form.prompt.trim(),
     schedule: form.schedule.trim(),
@@ -71,11 +93,12 @@ export function buildCronJobPayload(form: CronJobFormState): CronJobMutation {
     base_url: optionalText(form.base_url, true),
     script: optionalText(form.script),
     no_agent: Boolean(form.no_agent),
-    reasoning_effort: optionalReasoningEffort(form.reasoning_effort),
     context_from: contextFrom.length > 0 ? contextFrom : null,
     enabled_toolsets: enabledToolsets.length > 0 ? enabledToolsets : null,
     workdir: optionalText(form.workdir),
   };
+  if (reasoningEffort !== undefined) payload.reasoning_effort = reasoningEffort;
+  return payload;
 }
 
 export function cronJobHasExecutionContent(
@@ -86,6 +109,8 @@ export function cronJobHasExecutionContent(
 }
 
 export function cronJobFormFromJob(job: CronJob): CronJobFormState {
+  const reasoningEffort = normalizeReasoningEffort(job.reasoning_effort);
+  const malformedReasoning = hasMalformedReasoning(job.reasoning_effort);
   return {
     name: asString(job.name),
     prompt: asString(job.prompt),
@@ -100,7 +125,12 @@ export function cronJobFormFromJob(job: CronJob): CronJobFormState {
     base_url: asString(job.base_url),
     script: asString(job.script),
     no_agent: Boolean(job.no_agent),
-    reasoning_effort: normalizeReasoningEffort(job.reasoning_effort),
+    reasoning_effort:
+      reasoningEffort ??
+      (malformedReasoning && typeof job.reasoning_effort === "string"
+        ? job.reasoning_effort.trim().toLowerCase()
+        : null),
+    preserve_reasoning_on_save: malformedReasoning,
     context_from: listToText(job.context_from),
     enabled_toolsets: splitCronList(job.enabled_toolsets),
     workdir: asString(job.workdir),
