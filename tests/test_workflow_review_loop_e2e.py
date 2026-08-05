@@ -401,9 +401,17 @@ class TestBlockedReviewerRecovery:
 
         # The block was a quality verdict → upstream reset + reviewer re-armed
         assert len(driver.blocks["[qa-review]"]) == 1
-        # Fresh reviewer card created after re-arm — and it completed PASS
+        # SAME-CARD semantics (Randy 2026-08-05): the SAME reviewer card
+        # completes each round — its comment history (prior verdicts) is
+        # the round context. No fresh card is minted per round. The card
+        # that was blocked with round-1 findings is the card that PASSes
+        # in round 2.
         assert len(driver.completions["[qa-review]"]) == 1
         assert "PASS" in driver.completions["[qa-review]"][0][1]
+        assert driver.blocks["[qa-review]"][0][0] == driver.completions["[qa-review]"][0][0], (
+            "same-card violation: blocked card != completed card "
+            f"({driver.blocks['[qa-review]'][0][0]} vs {driver.completions['[qa-review]'][0][0]})"
+        )
         # The re-armed reviewer card must carry the done-based verdict contract
         conn = sqlite3.connect(review_env["db_path"])
         conn.row_factory = sqlite3.Row

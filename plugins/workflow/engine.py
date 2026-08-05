@@ -1040,6 +1040,31 @@ class WorkflowEngine:
             _l = 3
         return _l
 
+    def _clear_block_recurrence(self, card_id: str) -> None:
+        """Clear kanban's unblock-loop breaker on a reviewer card.
+
+        Same-card review rounds re-block the SAME card with the same kind
+        (needs_input). kanban_db's BLOCK_RECURRENCE_LIMIT=2 interprets that
+        as an unblock-loop and routes the card to 'triage' — which the
+        engine never polls, so the quality handler never fires and the
+        card times out (saw exactly that: run ended 'failed' instead of
+        'blocked' on round-2 same-card re-block). The engine's max_retries
+        is the real loop breaker for review loops, so when the engine
+        deliberately starts a new round it must reset the recurrence
+        fields.
+        """
+        if not card_id:
+            return
+        try:
+            with kanban_db.connect_closing(board=self.kanban_board) as _conn:
+                _conn.execute(
+                    "UPDATE tasks SET block_kind = NULL, block_recurrences = 0 WHERE id = ?",
+                    (card_id,)
+                )
+                _conn.commit()
+        except Exception as _e:
+            print(f"   ⚠  Failed to clear block recurrence on {card_id}: {_e}")
+
     def _rearm_blocked_reviewer(self, workflow, states, layers,
                                reviewer_nid: str, upstream_nid: str,
                                upstream_state) -> bool:
@@ -1049,11 +1074,16 @@ class WorkflowEngine:
         it to ready. The reviewer must NOT stay 'blocked' forever — nothing
         would re-dispatch it (the ideation YAML never re-blocks 'pending
         review', so the legacy waiting loop spins to timeout and the run
-        gets declared 'completed' with a live review loop). Reset the
-        reviewer to 'pending' with no card; the reviewers' layer creates a
-        FRESH card (now carrying the done-based verdict contract) once the
-        upstream re-completes. Bounded by the retry limit — on exhaustion
-        the reviewer stays blocked and the caller should notify.
+        gets declared 'completed' with a live review loop).
+
+        SAME-CARD semantics (Randy 2026-08-05): the reviewer's card is
+        REUSED, not recreated. Its prior review comments stay on the card,
+        so the next round loads the previous verdict + the corrected work
+        as context. The engine keeps kanban_card_id, resets the card to
+        ready, and the layer re-dispatch path (state.kanban_card_id set)
+        reuses it instead of minting a fresh card. Bounded by the retry
+        limit — on exhaustion the reviewer stays blocked and the caller
+        should notify.
 
         Returns True when re-armed, False when the budget is exhausted.
         """
@@ -1066,16 +1096,24 @@ class WorkflowEngine:
             return False
         rev_state = states[reviewer_nid]
         rev_state.status = "pending"
-        rev_state.kanban_card_id = None
+        # SAME-CARD: keep kanban_card_id so the re-dispatch reuses the
+        # existing card (with its comment history) instead of minting a
+        # fresh one. The dispatch loop resets the card to ready when the
+        # reviewer's layer re-dispatches (AFTER the upstream re-completes),
+        # so the reviewer never claims stale work early.
+        # Reset kanban's recurrence loop-breaker — the next round re-blocks
+        # the same card with the same kind and must land in 'blocked', not
+        # 'triage' (BLOCK_RECURRENCE_LIMIT=2).
+        self._clear_block_recurrence(rev_state.kanban_card_id)
         rev_state.completed_at = None
         rev_state.result = None
         # Rewind so the upstream's layer re-dispatches; the reviewers'
-        # layer re-creates a fresh card once the upstream completes.
+        # layer reuses the existing card once the upstream completes.
         for li, ln in enumerate(layers):
             if upstream_nid in ln:
                 self._rewind_to_layer = li
                 break
-        print(f"   🔄 {reviewer_nid} re-armed for round {rounds}/{limit}")
+        print(f"   🔄 {reviewer_nid} re-armed for round {rounds}/{limit} (same card)")
         return True
 
     def _review_verdict_instruction(self) -> str:
@@ -2825,6 +2863,15 @@ class WorkflowEngine:
                     continue
                 if rev_state.status in ("running", "blocked", "ready"):
                     return True
+                # Pending reviewers are HELD by the supervisor — they will
+                # be re-dispatched (same card, reset to ready) when the
+                # layer loop reaches their layer after the upstream
+                # re-completes. Their kanban card may still read 'blocked'
+                # from the previous round, so the card-status fallback must
+                # NOT treat them as active — otherwise the legacy waiting
+                # loop spins to timeout (saw 60s+ stall on same-card rearm).
+                if rev_state.status == "pending":
+                    continue
                 if rev_state.kanban_card_id:
                     try:
                         card = self.get_card_status(rev_state.kanban_card_id)
@@ -3964,14 +4011,20 @@ class WorkflowEngine:
                                         upstream_state.review_counts[_rev] = 1
                                         _rounds = 1
                                     states[_rev].status = "pending"
-                                    states[_rev].kanban_card_id = None
+                                    # SAME-CARD (Randy 2026-08-05): keep the
+                                    # reviewer's card so its comment history
+                                    # (prior verdicts) loads as context for
+                                    # the next round. The dispatch loop
+                                    # resets it to ready when the layer
+                                    # re-dispatches.
+                                    self._clear_block_recurrence(states[_rev].kanban_card_id)
                                     states[_rev].completed_at = None
                                     states[_rev].result = None
                                     _any_reset = True
-                                    print(f"   🔄 {_rev} reset for re-review (round {_rounds}/{_lim})")
+                                    print(f"   🔄 {_rev} reset for re-review (round {_rounds}/{_lim}, same card)")
                                 # 5) Rewind the layer loop to the upstream's
-                                #    layer so the revised work re-dispatches
-                                #    and the reviewers get fresh cards.
+                                #    layer so the revised work re-dispatches;
+                                #    reviewers reuse their existing cards.
                                 if _any_reset:
                                     for _li, _ln in enumerate(layers):
                                         if reviewer_for in _ln:
