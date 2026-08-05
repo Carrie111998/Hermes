@@ -76,6 +76,23 @@ def test_ccg_credentials_remain_optional_setup_entries():
         assert entry["category"] == "skill"
         assert entry["password"] is is_secret
 
+    assert "App User runtime" in OPTIONAL_ENV_VARS["BOX_CLIENT_ID"]["description"]
+    assert "App User runtime" in OPTIONAL_ENV_VARS["BOX_CLIENT_SECRET"]["description"]
+    assert "CCG App User runtime" in OPTIONAL_ENV_VARS["BOX_ENTERPRISE_ID"]["description"]
+
+
+def test_box_env_example_matches_the_agent_led_ccg_workflow():
+    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+
+    assert "CCG guide: skills/productivity/box/references/ccg-setup.md" in env_example
+    assert "The App User—not the Service Account—is Hermes's normal runtime identity." in (
+        env_example
+    )
+    assert "Hermes can use computer control" in env_example
+    assert "auth-and-setup.md" not in env_example
+    assert "npm install -g @box/cli" not in env_example
+    assert "box configure:environments:add" not in env_example
+
 
 def test_all_local_links_resolve_inside_the_skill():
     markdown_files = list(SKILL_DIR.rglob("*.md"))
