@@ -9,6 +9,8 @@ fetches for every authenticated provider (#72021).
 These tests pin the entrypoint wiring itself (the helper's own worker/once
 guard is covered in ``tests/hermes_cli/test_picker_prewarm.py``):
 
+- ``main()`` discovers enabled plugins before ``gateway.ready`` and preserves
+  startup when an optional plugin fails to load.
 - ``main()`` invokes ``hermes_cli.model_switch.prewarm_picker_cache_async``
   exactly once, AFTER the ``gateway.ready`` event is written (banner shown,
   user about to type — the idle window the prewarm is meant to fill).
@@ -27,16 +29,23 @@ from __future__ import annotations
 import io
 
 import hermes_cli.model_switch as ms
+import hermes_cli.plugins as plugins
 from tui_gateway import entry
 
 
-def _run_main(monkeypatch, events, *, prewarm=None):
+def _run_main(monkeypatch, events, *, discover_fn=None, prewarm_fn=None):
     """Run entry.main() with stubbed collaborators, recording ordering.
 
     ``events`` receives ``("write", <event type>)`` for every write_json call
     and ``("prewarm",)`` when the spy fires, in call order.
     """
     monkeypatch.setattr(entry, "_install_sidecar_publisher", lambda: None)
+    if discover_fn is None:
+        def discover():
+            events.append(("plugins",))
+        discover_fn = discover
+
+    monkeypatch.setattr(plugins, "discover_plugins", discover_fn)
     monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
     monkeypatch.setattr(entry, "resolve_skin", lambda: "default")
     monkeypatch.setattr(entry.server, "_ensure_skin_watcher", lambda: None)
@@ -53,17 +62,39 @@ def _run_main(monkeypatch, events, *, prewarm=None):
 
     # entry.main() imports the helper lazily from hermes_cli.model_switch,
     # so the spy must live on that module, not on entry.
-    if prewarm is None:
+    if prewarm_fn is None:
         def prewarm():
             events.append(("prewarm",))
             return None  # fire-and-forget handle; never blocks
+        prewarm_fn = prewarm
 
-    monkeypatch.setattr(ms, "prewarm_picker_cache_async", prewarm)
+    monkeypatch.setattr(ms, "prewarm_picker_cache_async", prewarm_fn)
 
     # Empty stdin -> immediate EOF -> main() returns after entering the loop.
     monkeypatch.setattr(entry.sys, "stdin", io.StringIO(""))
 
     entry.main()
+
+
+def test_main_discovers_plugins_before_gateway_ready(monkeypatch):
+    """Enabled lifecycle hooks must be registered before the first TUI event."""
+    events: list[tuple] = []
+
+    _run_main(monkeypatch, events)
+
+    assert events.index(("plugins",)) < events.index(("write", "gateway.ready"))
+
+
+def test_main_survives_plugin_discovery_failure(monkeypatch):
+    """An optional broken plugin must not prevent the TUI from starting."""
+    events: list[tuple] = []
+
+    def _boom():
+        raise RuntimeError("broken plugin")
+
+    _run_main(monkeypatch, events, discover_fn=_boom)
+
+    assert ("write", "gateway.ready") in events
 
 
 def test_main_prewarms_picker_cache_after_gateway_ready(monkeypatch):
@@ -95,7 +126,7 @@ def test_main_survives_prewarm_failure(monkeypatch):
         events.append(("prewarm",))
         raise RuntimeError("provider registry exploded")
 
-    _run_main(monkeypatch, events, prewarm=_boom)  # must not raise
+    _run_main(monkeypatch, events, prewarm_fn=_boom)  # must not raise
 
     assert ("prewarm",) in events
     assert ("write", "gateway.ready") in events
