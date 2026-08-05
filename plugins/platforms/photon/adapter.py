@@ -1268,24 +1268,49 @@ class PhotonAdapter(BasePlatformAdapter):
             )
 
         ctype = content.get("type")
-        reply_to_message_id = None
-        reply_to_text = None
-        reply_to_is_own_message = False
+        # Spectrum 8.2 can expose reply context either as a normalized
+        # ``content.type == reply`` wrapper or as envelope fields hydrated by
+        # the sidecar from iMessage's reply GUID. Accept both shapes: outbound
+        # targets commonly need the envelope lookup because they were never in
+        # the sidecar's inbound-only message cache.
+        reply_to_message_id = event.get("replyToMessageId") or None
+        reply_to_text = event.get("replyToText") or None
+        reply_to_is_own_message = event.get("replyToIsOwnMessage") is True
+        target_direction = None
 
         if ctype == "reply":
-            reply_to_message_id = content.get("targetMessageId") or None
-            reply_to_text = content.get("targetText") or None
+            reply_to_message_id = (
+                content.get("targetMessageId") or reply_to_message_id
+            )
+            reply_to_text = content.get("targetText") or reply_to_text
             target_direction = content.get("targetDirection")
             if target_direction == "outbound":
                 reply_to_is_own_message = True
             elif target_direction == "inbound":
                 reply_to_is_own_message = False
-            if not reply_to_text and reply_to_message_id:
-                reply_to_text = self._lookup_sent_message_text(
-                    space_id, reply_to_message_id
-                )
             content = content.get("content") or {}
             ctype = content.get("type")
+
+        sent_text_fallback = None
+        if not reply_to_text and reply_to_message_id:
+            sent_text_fallback = self._lookup_sent_message_text(
+                space_id, reply_to_message_id
+            )
+            reply_to_text = sent_text_fallback
+
+        # Spectrum's unresolved reply target is a stub with an id but no
+        # direction. The id/text caches are the durable signal that this was
+        # one of our outbound messages; do not let the sidecar's envelope
+        # ``false`` for an unknown direction hide that fallback.
+        if (
+            reply_to_message_id
+            and target_direction not in {"outbound", "inbound"}
+            and (
+                reply_to_message_id in self._sent_message_ids
+                or sent_text_fallback is not None
+            )
+        ):
+            reply_to_is_own_message = True
 
         if ctype == "reaction":
             # Route only tapbacks on messages WE sent — those are implicitly
@@ -2540,8 +2565,10 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        self._record_sent_message(message_id)
+        self._record_sent_message_text(space_id, message_id, url)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_send(
         self,
@@ -2586,8 +2613,10 @@ class PhotonAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        self._record_sent_message(message_id)
+        self._record_sent_message_text(space_id, message_id, text)
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_send_poll(
         self, space_id: str, title: str, options: list,
@@ -2612,9 +2641,10 @@ class PhotonAdapter(BasePlatformAdapter):
             data = await self._sidecar_call("/send-poll", body)
         except Exception as e:
             return SendResult(success=False, error=str(e))
-        self._record_sent_message(data.get("messageId"))
-        self._record_sent_message_text(space_id, data.get("messageId"), text)
-        return SendResult(success=True, message_id=data.get("messageId"))
+        message_id = data.get("messageId")
+        self._record_sent_message(message_id)
+        self._record_sent_message_text(space_id, message_id, body["title"])
+        return SendResult(success=True, message_id=message_id)
 
     async def _sidecar_send_attachment(
         self,
@@ -2901,6 +2931,23 @@ async def _standalone_send(
                     if not data.get("ok"):
                         return _standalone_error(resp)
                     last_message_id = data.get("messageId")
+
+                # `hermes send` talks to the running sidecar directly rather
+                # than through PhotonAdapter.send(), so persist the same
+                # reply-hydration fallback here as the in-gateway send path.
+                if last_message_id:
+                    try:
+                        from gateway import rich_sent_store
+
+                        preview = message[: PhotonAdapter._SENT_TEXT_CHARS]
+                        rich_sent_store.record(chat_id, last_message_id, preview)
+                        normalized = PhotonAdapter._normalize_chat_key(str(chat_id))
+                        if normalized != str(chat_id):
+                            rich_sent_store.record(
+                                normalized, last_message_id, preview
+                            )
+                    except Exception:
+                        pass
 
             # 2. Each attachment as a separate /send-attachment call.
             #    media_files is List[Tuple[path, is_voice]] (see

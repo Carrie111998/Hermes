@@ -493,6 +493,10 @@ function messagePreviewText(target) {
   let text = null;
   if (c.type === "text") {
     text = c.text;
+  } else if (c.type === "markdown") {
+    // Spectrum caches outbound markdown in its authored form. A reply can hit
+    // that cache before iMessage rehydrates the bubble as inbound `text`.
+    text = c.markdown;
   } else if (c.type === "richlink") {
     text = c.url;
   } else if (c.type === "group") {
@@ -500,6 +504,10 @@ function messagePreviewText(target) {
       const ic = item && typeof item === "object" ? item.content : null;
       if (ic && ic.type === "text" && ic.text) {
         text = ic.text;
+        break;
+      }
+      if (ic && ic.type === "markdown" && ic.markdown) {
+        text = ic.markdown;
         break;
       }
       if (ic && ic.type === "richlink" && ic.url) {
@@ -599,8 +607,49 @@ async function normalizeEvent(space, message) {
   try {
     const msgSpace = message.space || {};
     const ts = message.timestamp;
+    const normalizedContent = await normalizeContent(message.content);
+    const replyTargetId =
+      message.replyTargetGuid ?? message.reply_to_guid ??
+      message.threadOriginatorGuid ?? message.threadRootMessageId ??
+      (normalizedContent.type === "reply"
+        ? normalizedContent.targetMessageId
+        : null);
+    // Reply targets are often Hermes' outbound messages, so they are not in
+    // knownMessages (which is populated from inbound events only). Hydrate a
+    // cache miss through Spectrum so the adapter can preserve quoted context.
+    let replyTarget = replyTargetId
+      ? knownMessages.get(replyTargetId)
+      : null;
+    if (replyTargetId && !replyTarget && typeof space.getMessage === "function") {
+      try {
+        replyTarget = await space.getMessage(replyTargetId);
+        if (replyTarget) rememberKnownMessage(replyTarget);
+      } catch (e) {
+        console.error(
+          `photon-sidecar: failed to hydrate reply target ${replyTargetId}: ` +
+            (e && e.message ? e.message : String(e))
+        );
+      }
+    }
+    const replyTargetText =
+      (normalizedContent.type === "reply"
+        ? normalizedContent.targetText
+        : null) ?? messagePreviewText(replyTarget);
+    const replyTargetDirection =
+      (normalizedContent.type === "reply"
+        ? normalizedContent.targetDirection
+        : null) ?? replyTarget?.direction ??
+      (replyTarget?.isFromMe === true ? "outbound" : null);
+    if (normalizedContent.type === "reply") {
+      normalizedContent.targetMessageId = replyTargetId;
+      normalizedContent.targetText = replyTargetText;
+      normalizedContent.targetDirection = replyTargetDirection;
+    }
     return {
       messageId: message.id ?? null,
+      replyToMessageId: replyTargetId,
+      replyToText: replyTargetText,
+      replyToIsOwnMessage: replyTargetDirection === "outbound",
       platform: message.platform || space.__platform || "iMessage",
       space: {
         id: space.id ?? msgSpace.id ?? null,
@@ -609,7 +658,7 @@ async function normalizeEvent(space, message) {
         phone: space.phone ?? msgSpace.phone ?? null,
       },
       sender: { id: message.sender ? message.sender.id : null },
-      content: await normalizeContent(message.content),
+      content: normalizedContent,
       timestamp:
         ts instanceof Date ? ts.toISOString() : ts ? String(ts) : null,
     };

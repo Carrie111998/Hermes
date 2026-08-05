@@ -245,6 +245,33 @@ async def test_dispatch_reply_context(monkeypatch: pytest.MonkeyPatch) -> None:
     assert message.reply_to_text == "DHL parcel notification"
     assert message.reply_to_is_own_message is True
 
+
+@pytest.mark.asyncio
+async def test_dispatch_reply_context_from_hydrated_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = _make_adapter(monkeypatch)
+    captured = _capture(adapter, monkeypatch)
+
+    event = _dm_event("this is the reply", msg_id="spc-envelope-reply")
+    event.update(
+        {
+            "replyToMessageId": "bot-msg-hydrated",
+            "replyToText": "Hydrated bot response text",
+            "replyToIsOwnMessage": True,
+        }
+    )
+
+    await adapter._dispatch_inbound(event)
+
+    assert len(captured) == 1
+    message = captured[0]
+    assert message.text == "this is the reply"
+    assert message.reply_to_message_id == "bot-msg-hydrated"
+    assert message.reply_to_text == "Hydrated bot response text"
+    assert message.reply_to_is_own_message is True
+
+
 @pytest.mark.asyncio
 async def test_dispatch_reply_context_falls_back_to_sent_text_cache(
     monkeypatch: pytest.MonkeyPatch,
@@ -260,7 +287,10 @@ async def test_dispatch_reply_context_falls_back_to_sent_text_cache(
         "type": "reply",
         "content": {"type": "text", "text": "this is the reply"},
         "targetMessageId": "bot-msg-blank-target",
-        "targetDirection": "outbound",
+        # Spectrum 8.2.2 emits an unresolved outbound target as a stub, so its
+        # direction and preview are both blank. The adapter must recover both
+        # ownership and text from its sent-message caches.
+        "targetDirection": None,
         "targetText": None,
     }
 
