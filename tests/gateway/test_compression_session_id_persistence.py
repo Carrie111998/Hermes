@@ -24,7 +24,7 @@ import inspect
 import textwrap
 from unittest.mock import MagicMock, call
 
-from gateway import run as gateway_run
+from gateway import dispatch_mixin as gateway_dispatch
 from gateway.session_context import set_current_session_id, get_session_env
 
 
@@ -108,15 +108,15 @@ def test_every_post_compression_session_id_assignment_persists():
     would compress correctly, the gateway would update its in-memory
     session_id, then drop it on next gateway restart.
     """
-    source = inspect.getsource(gateway_run)
+    source = inspect.getsource(gateway_dispatch)
     assignments = _session_id_assignments_followed_by_save(source)
     assert assignments, (
-        "No ``session_entry.session_id = ...`` assignments found in gateway/run.py — "
+        "No ``session_entry.session_id = ...`` assignments found in gateway/dispatch_mixin.py — "
         "either the structure changed or the AST walker is broken."
     )
     missing = [lineno for lineno, saved in assignments if not saved]
     assert not missing, (
-        f"{len(missing)} ``session_entry.session_id = ...`` site(s) in gateway/run.py "
+        f"{len(missing)} ``session_entry.session_id = ...`` site(s) in gateway/dispatch_mixin.py "
         f"are not followed by ``session_store._save()`` within the same block "
         f"(lines: {missing}). Every post-compression session_id update must persist "
         f"or the next turn loads the pre-compression transcript and triggers an "

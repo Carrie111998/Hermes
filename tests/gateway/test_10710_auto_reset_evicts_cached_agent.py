@@ -21,6 +21,7 @@ import ast
 import inspect
 
 from gateway import run as gateway_run
+from gateway import dispatch_mixin as gateway_dispatch
 
 
 def _calls(node: ast.AST) -> set[str]:
@@ -53,7 +54,7 @@ def test_auto_reset_cleanup_evicts_cached_agent():
     conversation's cached agent (and its leaked
     ``context_compressor._previous_summary``) — the cache is keyed on the
     stable ``session_key`` (#10710)."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(inspect.getsource(gateway_dispatch))
 
     # Fingerprint the cleanup branch: the `if <was_auto_reset>:` block that
     # clears the conversation scope via the funnel (post-#64934 refactor:
@@ -71,7 +72,7 @@ def test_auto_reset_cleanup_evicts_cached_agent():
             and _assigns_false(node, "was_auto_reset")
         ):
             assert "_evict_cached_agent" in calls, (
-                "gateway/run.py auto-reset cleanup block must call "
+                "gateway/dispatch_mixin.py auto-reset cleanup block must call "
                 "`_evict_cached_agent(session_key)` so the auto-reset session "
                 "does not reuse the previous cached agent and leak its "
                 "context_compressor._previous_summary into new compaction "
@@ -81,7 +82,7 @@ def test_auto_reset_cleanup_evicts_cached_agent():
             break
     assert found, (
         "could not locate the auto-reset transient-state cleanup block in "
-        "gateway/run.py (fingerprint: _clear_conversation_scope + "
+        "gateway/dispatch_mixin.py (fingerprint: _clear_conversation_scope + "
         "was_auto_reset = False)."
     )
 

@@ -36,7 +36,7 @@ from __future__ import annotations
 import ast
 import inspect
 
-from gateway import run as gateway_run
+from gateway import dispatch_mixin as gateway_dispatch
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
 from hermes_state import SessionDB
@@ -47,7 +47,7 @@ from hermes_state import SessionDB
 # ---------------------------------------------------------------------------
 def _find_compression_exhausted_reset_block() -> ast.If:
     """Return the ``if agent_result.get('compression_exhausted') ...`` block."""
-    tree = ast.parse(inspect.getsource(gateway_run))
+    tree = ast.parse(inspect.getsource(gateway_dispatch))
 
     for node in ast.walk(tree):
         if not isinstance(node, ast.If):
@@ -71,7 +71,7 @@ def _find_compression_exhausted_reset_block() -> ast.If:
     raise AssertionError(
         "Could not locate the compression-exhausted auto-reset block "
         "(if agent_result.get('compression_exhausted') ... reset_session) "
-        "in gateway/run.py — the structure changed or the AST walker is stale."
+        "in gateway/dispatch_mixin.py — the structure changed or the AST walker is stale."
     )
 
 
