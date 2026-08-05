@@ -288,3 +288,28 @@ def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
     assert persisted["access_token"] == "sk-new"
     assert persisted.get("last_status") != "exhausted"
     assert persisted.get("last_error_code") is None
+
+
+def test_explicit_pool_reset_clears_newer_disk_cooldown(classic_env):
+    from agent.credential_pool import CredentialPool, PooledCredential
+
+    exhausted = _pool_entry(
+        last_status="exhausted",
+        last_status_at=time.time(),
+        last_error_code=429,
+    )
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openrouter": [exhausted],
+    }))
+    pool = CredentialPool(
+        "openrouter",
+        [PooledCredential.from_dict("openrouter", exhausted)],
+    )
+
+    assert pool.reset_statuses() == 1
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    persisted = data["credential_pool"]["openrouter"][0]
+    assert persisted.get("last_status") is None
+    assert persisted.get("last_status_at") is None
+    assert persisted.get("last_error_code") is None

@@ -757,7 +757,12 @@ class CredentialPool:
                     self._entries[idx] = new
                     return
 
-    def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
+    def _persist(
+        self,
+        *,
+        removed_ids: Optional[List[str]] = None,
+        cleared_status_ids: Optional[List[str]] = None,
+    ) -> None:
         # Self-locking (RLock): snapshotting self._entries must not race a
         # concurrent rotation when called from the deferred refresh path.
         with self._lock:
@@ -765,6 +770,7 @@ class CredentialPool:
                 self.provider,
                 [entry.to_dict() for entry in self._entries],
                 removed_ids=removed_ids,
+                cleared_status_ids=cleared_status_ids,
             )
 
     def _is_terminal_auth_failure(
@@ -2302,7 +2308,9 @@ class CredentialPool:
                     new_entries.append(entry)
             if count:
                 self._entries = new_entries
-                self._persist()
+                self._persist(
+                    cleared_status_ids=[entry.id for entry in new_entries]
+                )
             return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
