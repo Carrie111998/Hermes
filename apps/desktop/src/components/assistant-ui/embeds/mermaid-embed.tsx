@@ -92,7 +92,9 @@ export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
 
   // Click to open the diagram full-screen with pan/zoom + copy-as-PNG. The
   // overlay keeps the diagram's natural width (capped to the viewport) so it
-  // renders before any zoom; the inline version stays capped at 33dvh.
+  // renders before any zoom; the inline version stays capped at 60dvh so
+  // diagrams are legible without opening the viewer (was 33dvh — too small
+  // for anything wider than a single column).
   return (
     <Zoomable
       label="Open diagram"
@@ -105,7 +107,7 @@ export default function MermaidRenderer({ code, streaming }: RichFenceProps) {
       }
     >
       <div
-        className="overflow-hidden p-3 [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-h-[33dvh] [&_svg]:max-w-full"
+        className="overflow-hidden p-3 [&_svg]:mx-auto [&_svg]:h-auto [&_svg]:max-h-[60dvh] [&_svg]:max-w-full"
         dangerouslySetInnerHTML={{ __html: svg }}
       />
     </Zoomable>
