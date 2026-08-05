@@ -1462,6 +1462,20 @@ Subcommands:
 | `archive` | Bulk-archive (soft-hide, no deletion) sessions matching the same filters as `prune`. Requires at least one filter. |
 | `stats` | Show session-store statistics. |
 | `rename <session-id> <title>` | Set or change a session title. |
+| `import <format> <path> [--host name] [--dry-run] [--db path] [--include-subagents]` | Import external coding-agent session transcripts as native Hermes sessions. Currently supports `claude-code` (`~/.claude/projects`). |
+
+`hermes sessions import` brings Claude Code transcripts into Hermes as
+native sessions (`source=claude_code`), so they show up in
+`hermes sessions list` and are searchable via FTS immediately:
+
+```bash
+hermes sessions import claude-code ~/.claude/projects --host homelab
+```
+
+Session ids are deterministic, so re-running is idempotent — safe from
+cron. `--host` labels the store so sessions from several machines coexist
+without id collisions. `--dry-run` previews the import without writing.
+See [Sessions → Importing External Sessions](../user-guide/sessions.md#importing-external-sessions) for details.
 
 ## `hermes insights`
 

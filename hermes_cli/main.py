@@ -437,6 +437,7 @@ from typing import Optional
 import functools as _functools
 
 from hermes_cli.sessions_cmd import cmd_sessions  # noqa: F401
+from hermes_cli.session_import import cmd_sessions_import, build_import_session_parser
 from hermes_cli.subcommands._shared import add_accept_hooks_flag as _add_accept_hooks_flag
 from hermes_cli.subcommands.cron import build_cron_parser
 from hermes_cli.subcommands.sync import build_sync_parser
@@ -12334,6 +12335,10 @@ def main():
     sessions_browse.add_argument(
         "--limit", type=int, default=500, help="Max sessions to load (default: 500)"
     )
+
+    # `hermes sessions import <format> <dir>` — import external agent
+    # sessions (Claude Code) as native Hermes sessions.
+    build_import_session_parser(sessions_subparsers)
 
 
     # cmd_sessions lives in hermes_cli/sessions_cmd.py (main.py decomposition).
