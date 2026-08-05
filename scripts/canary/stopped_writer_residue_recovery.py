@@ -987,6 +987,15 @@ def _validate_native_failure_value(
             iam=iam,
             require_current_host_state=require_current_host_state,
         )
+    elif value.get("stage") == "start_writer":
+        _validate_native_install_failure(
+            value,
+            source_revision=source_revision,
+            native=native,
+            owner=owner,
+            iam=iam,
+            require_current_host_state=require_current_host_state,
+        )
     else:
         raise ValueError("native failure quarantine binding is invalid")
     return failure_path
@@ -1000,7 +1009,7 @@ def _native_failure_binding(
     native: NativeObservationPlan,
     owner: OwnerApprovalReceipt,
     iam: ExternalIAMReceipt,
-) -> dict[str, str]:
+) -> tuple[dict[str, str], str]:
     raw = _trusted_publication(
         DEFAULT_QUARANTINE_PATH,
         maximum=_MAX_RECEIPT_BYTES,
@@ -1020,19 +1029,22 @@ def _native_failure_binding(
     )
     if failure_raw != raw:
         raise ValueError("native failure receipt differs from quarantine")
-    return {
-        "source_path": str(DEFAULT_QUARANTINE_PATH),
-        "sha256": _sha256_bytes(raw),
-        "archive_path": str(
-            _quarantine_archive_path(
-                target_revision,
-                source_revision,
-                collector_receipt_sha256,
-            )
-        ),
-        "failure_receipt_path": str(failure_path),
-        "failure_receipt_sha256": _sha256_bytes(failure_raw),
-    }
+    return (
+        {
+            "source_path": str(DEFAULT_QUARANTINE_PATH),
+            "sha256": _sha256_bytes(raw),
+            "archive_path": str(
+                _quarantine_archive_path(
+                    target_revision,
+                    source_revision,
+                    collector_receipt_sha256,
+                )
+            ),
+            "failure_receipt_path": str(failure_path),
+            "failure_receipt_sha256": _sha256_bytes(failure_raw),
+        },
+        str(value["stage"]),
+    )
 
 
 def _validate_planner_bundle_bindings(
@@ -1533,6 +1545,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
     ):
         raise RuntimeError("installed native plan archive collides")
     failed_native: Mapping[str, str] | None = None
+    failed_native_stage = ""
     installed_native_artifacts: list[dict[str, Any]] = []
     if frozenset(staged_artifacts) == _failed_native_bundle_names():
         if installed_native is None:
@@ -1547,7 +1560,7 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             root=STAGING_ROOT,
             native=native,
         )
-        failed_native = _native_failure_binding(
+        failed_native, failed_native_stage = _native_failure_binding(
             target_revision=target_revision,
             source_revision=source_revision,
             collector_receipt_sha256=collector.sha256,
@@ -1561,6 +1574,13 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
             native,
             base_archive=archive,
         )
+        if (
+            failed_native_stage == "start_writer"
+            and not installed_native_artifacts
+        ):
+            raise RuntimeError(
+                "post-install native failure lacks installed artifacts"
+            )
     inventory = _activation_inventory(
         tuple(staged_artifacts),
         installed_native_plan=installed_native is not None,
