@@ -217,3 +217,203 @@ def test_normal_recall_excludes_historical_belief_statuses(tmp_path):
     )
     assert historical.results[0]["historical"] is True
     store.close()
+
+
+def test_functional_forgetting_marks_memories_latent_before_archive(tmp_path):
+    clock = {"now": 1_700_000_000.0}
+
+    def now_fn() -> float:
+        return clock["now"]
+
+    policies = EbbinghausPolicies.from_config(
+        {
+            "experience": {
+                "enabled": True,
+                "functional_forgetting": True,
+                "latent_retention_threshold": 0.50,
+                "archive_retention_threshold": 0.05,
+                "latent_archive_after_days": 30,
+            },
+            "sleep": {
+                "forget_threshold": 0.50,
+                "rehearse_threshold": 0.90,
+                "salience_keep_threshold": 0.95,
+                "prune_mode": "archive",
+                "limit": 50,
+            },
+        }
+    )
+    store = EbbinghausMemoryStore(
+        tmp_path / "memory.db", policies=policies, time_fn=now_fn
+    )
+    remembered = store.remember(
+        "Temporary scratch note about ASRock motherboard firmware.",
+        salience=0.2,
+    )
+    mid = remembered["memory_id"]
+    # Retention should sit between archive_threshold and latent_threshold.
+    store._conn.execute(
+        "UPDATE memories SET strength = 0.35, last_anchor_at = ? WHERE memory_id = ?",
+        (clock["now"] - 86400.0 * 10.0, mid),
+    )
+    store._conn.commit()
+
+    report = store.sleep_cycle(prune_mode="archive")
+    row = store.get(mid)
+
+    assert mid in report["forgotten"]
+    assert mid in report["latent"]
+    assert mid not in report["archived"]
+    assert row["state"] == "active"
+    assert row["access_state"] == "latent"
+    event = store._conn.execute(
+        "SELECT event_type FROM memory_events WHERE memory_id = ? "
+        "AND event_type = 'memory_became_latent'",
+        (mid,),
+    ).fetchone()
+    assert event is not None
+    store.close()
+
+
+def test_protected_memory_is_not_auto_latentized(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {
+            "experience": {
+                "enabled": True,
+                "functional_forgetting": True,
+                "latent_retention_threshold": 0.99,
+            },
+            "sleep": {
+                "forget_threshold": 0.99,
+                "rehearse_threshold": 1.0,
+                "salience_keep_threshold": 0.95,
+                "limit": 20,
+            },
+            "capacity": {"protected_tags": ["protected"]},
+        }
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    remembered = store.remember(
+        "Never auto-forget this user preference.",
+        tags=["protected"],
+        salience=0.2,
+    )
+    mid = remembered["memory_id"]
+    store._conn.execute(
+        "UPDATE memories SET strength = 0.01, last_anchor_at = ? WHERE memory_id = ?",
+        (store._now() - 86400.0 * 60.0, mid),
+    )
+    store._conn.commit()
+
+    report = store.sleep_cycle()
+    row = store.get(mid)
+    assert mid not in report.get("latent", [])
+    assert row["access_state"] == "accessible"
+    assert row["state"] == "active"
+    store.close()
+
+
+def test_rescue_reactivates_latent_memory_after_prior_miss(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {
+            "experience": {
+                "enabled": True,
+                "rescue_enabled": True,
+                "rescue_min_score": 0.12,
+                "record_query_excerpt": False,
+            }
+        }
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    remembered = store.remember(
+        "The current motherboard is ASRock A320M-HDV.",
+        tags=["hardware", "board"],
+    )
+    mid = remembered["memory_id"]
+    store._conn.execute(
+        """
+        UPDATE memories
+        SET access_state = 'latent', latent_at = ?
+        WHERE memory_id = ?
+        """,
+        (store._now(), mid),
+    )
+    store._conn.commit()
+
+    miss = store.recall_with_experience(
+        "ASRock motherboard model",
+        reinforce=False,
+        allow_rescue=False,
+    )
+    assert miss.outcome is RetrievalOutcome.MISS
+
+    rescued = store.recall_with_experience(
+        "ASRock motherboard model",
+        reinforce=True,
+        allow_rescue=True,
+    )
+    assert rescued.outcome is RetrievalOutcome.RESCUED
+    assert rescued.rescued_memory_id == mid
+    assert rescued.results[0]["memory_id"] == mid
+    assert "previously inaccessible" in rescued.state_note.lower()
+    row = store.get(mid)
+    assert row["access_state"] == "reactivated"
+    assert row["state"] == "active"
+    assert int(row.get("reactivation_count") or 0) >= 1
+    store.close()
+
+
+def test_rescue_never_revives_superseded_or_retracted(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {"experience": {"enabled": True, "rescue_enabled": True, "rescue_min_score": 0.01}}
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    memory = store.remember("Superseded board claim ASRock B450.")
+    mid = memory["memory_id"]
+    store._conn.execute(
+        """
+        UPDATE memories
+        SET access_state = 'latent', belief_status = 'superseded', latent_at = ?
+        WHERE memory_id = ?
+        """,
+        (store._now(), mid),
+    )
+    store._conn.commit()
+
+    outcome = store.recall_with_experience(
+        "ASRock B450 board",
+        reinforce=False,
+        allow_rescue=True,
+    )
+    assert outcome.outcome is RetrievalOutcome.MISS
+    assert store.get(mid)["access_state"] == "latent"
+    store.close()
+
+
+def test_experience_disabled_sleep_keeps_legacy_archive_path(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {
+            "experience": {"enabled": False, "functional_forgetting": True},
+            "sleep": {
+                "forget_threshold": 0.99,
+                "rehearse_threshold": 1.0,
+                "salience_keep_threshold": 0.95,
+                "prune_mode": "archive",
+                "limit": 20,
+            },
+        }
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    remembered = store.remember("Legacy forget path scratch note.", salience=0.2)
+    mid = remembered["memory_id"]
+    store._conn.execute(
+        "UPDATE memories SET strength = 0.01, last_anchor_at = ? WHERE memory_id = ?",
+        (store._now() - 86400.0 * 40.0, mid),
+    )
+    store._conn.commit()
+    report = store.sleep_cycle(prune_mode="archive")
+    assert mid in report["forgotten"]
+    assert mid in report["archived"]
+    assert report.get("latent", []) == []
+    assert store.get(mid)["state"] == "archived"
+    store.close()

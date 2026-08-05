@@ -167,20 +167,50 @@ class EbbinghausExperienceLedger:
         direct_best_score: float,
         session_id: str = "",
     ) -> dict[str, Any] | None:
-        del current_query_hash, current_cues, session_id  # used by later tasks
+        current_cue_set = {str(c).strip().lower() for c in current_cues if str(c).strip()}
+        cutoff = float(self._now_fn()) - (
+            float(self.policies.experience.miss_resolution_days) * 86400.0
+        )
         with self._lock:
-            row = self._conn.execute(
+            rows = self._conn.execute(
                 """
-                SELECT attempt_id FROM retrieval_attempts
-                WHERE outcome = 'miss' AND resolved_at IS NULL
-                ORDER BY created_at ASC
-                LIMIT 1
-                """
-            ).fetchone()
-            if row is None:
+                SELECT attempt_id, query_hash, query_cues, created_at
+                FROM retrieval_attempts
+                WHERE outcome = 'miss'
+                  AND resolved_at IS NULL
+                  AND created_at >= ?
+                ORDER BY created_at DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+            best: tuple[float, float, int] | None = None  # overlap, created_at, id
+            for row in rows:
+                attempt_id = int(row["attempt_id"] if isinstance(row, sqlite3.Row) else row[0])
+                old_hash = str(row["query_hash"] if isinstance(row, sqlite3.Row) else row[1])
+                raw_cues = row["query_cues"] if isinstance(row, sqlite3.Row) else row[2]
+                created_at = float(row["created_at"] if isinstance(row, sqlite3.Row) else row[3])
+                try:
+                    old_cues = {str(c).strip().lower() for c in json.loads(raw_cues or "[]")}
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    old_cues = set()
+                same_hash = old_hash == str(current_query_hash)
+                union = current_cue_set | old_cues
+                overlap = (
+                    len(current_cue_set & old_cues) / max(1, len(union))
+                    if union
+                    else 0.0
+                )
+                if not (same_hash or overlap >= 0.45):
+                    continue
+                rank = (overlap if not same_hash else 1.0, created_at, attempt_id)
+                if best is None or rank > best:
+                    best = rank
+            if best is None:
                 return None
-            attempt_id = int(row["attempt_id"] if isinstance(row, sqlite3.Row) else row[0])
-            surprise = max(0.0, float(rescue_score) - float(direct_best_score))
+            attempt_id = best[2]
+            resolution_gain = max(0.0, float(rescue_score) - float(direct_best_score))
+            surprise = max(0.0, min(1.0, resolution_gain))
+            now = float(self._now_fn())
             self._conn.execute(
                 """
                 UPDATE retrieval_attempts
@@ -198,8 +228,28 @@ class EbbinghausExperienceLedger:
                     json.dumps([int(rescued_memory_id)], ensure_ascii=False),
                     float(rescue_score),
                     float(surprise),
-                    float(self._now_fn()),
+                    now,
                     attempt_id,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(
+                    event_type, memory_id, related_memory_id, belief_id,
+                    session_id, payload, created_at
+                ) VALUES ('retrieval_rescued', ?, NULL, '', ?, ?, ?)
+                """,
+                (
+                    int(rescued_memory_id),
+                    str(session_id or ""),
+                    _safe_json_payload(
+                        {
+                            "attempt_id": attempt_id,
+                            "rescue_score": float(rescue_score),
+                            "surprise": float(surprise),
+                        }
+                    ),
+                    now,
                 ),
             )
             self._conn.commit()
