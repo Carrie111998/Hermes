@@ -321,7 +321,8 @@ def _mask_url_credentials(value: str) -> str:
     delimiters), so a policy that stopped at ``?`` would just be a hole with a
     good excuse.
     """
-    from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+    import re
+    from urllib.parse import unquote_plus, urlsplit, urlunsplit
 
     try:
         parts = urlsplit(value)
@@ -339,21 +340,38 @@ def _mask_url_credentials(value: str) -> str:
         return value
 
     def _mask_params(component: str) -> tuple[str, bool]:
-        """Redact credential-named pairs in one parameter component."""
+        """Redact credential-named pairs in one parameter component.
+
+        Split on ``&`` *and* ``;``. ``parse_qsl`` stopped honouring ``;`` in
+        CPython 3.9.2 (bpo-42967) because a *request parser* that accepts both
+        separators can be induced to disagree with the proxy in front of it.
+        A masker carries no such exposure — reading both can only mask more,
+        never less, and its output never re-enters request handling — and
+        ``agent/redact.py`` already calls ``;`` a separator
+        (``_STRICT_URL_PARAM_RE``). Left to ``parse_qsl``,
+        ``?region=eu;signature=<secret>`` is one pair named ``region`` and the
+        secret ships whole.
+
+        Separators and untouched pairs are copied through verbatim rather than
+        re-encoded, so the endpoint stays the URL the user typed.
+        """
         if not component:
             return component, False
-        pairs = parse_qsl(component, keep_blank_values=True)
-        if not any(_is_sensitive_query_param(name) for name, _ in pairs):
+        out: list[str] = []
+        changed = False
+        for token in re.split(r"([&;])", component):
+            if token in ("&", ";"):
+                out.append(token)
+                continue
+            name, sep, val = token.partition("=")
+            if sep and val and _is_sensitive_query_param(unquote_plus(name)):
+                out.append(f"{name}={_redact(val)}")
+                changed = True
+            else:
+                out.append(token)
+        if not changed:
             return component, False
-        return (
-            urlencode(
-                [
-                    (name, _redact(val) if val and _is_sensitive_query_param(name) else val)
-                    for name, val in pairs
-                ]
-            ),
-            True,
-        )
+        return "".join(out), True
 
     netloc = parts.netloc
     changed = False

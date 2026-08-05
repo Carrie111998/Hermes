@@ -376,6 +376,80 @@ def test_debug_share_upload_never_carries_a_fragment_credential(monkeypatch, tmp
     assert any("state=public-xyz" in payload for payload in uploaded)
 
 
+def test_debug_share_upload_never_carries_a_semicolon_delimited_credential(
+    monkeypatch, tmp_path
+):
+    """Same boundary, for a secret introduced by ``;`` instead of ``&``.
+
+    ``parse_qsl`` splits on ``&`` only since CPython 3.9.2 (bpo-42967), so
+    ``?region=eu;signature=<secret>`` used to parse as the single pair
+    ``region`` — a name nobody classifies as sensitive — and the credential
+    reached the paste intact.
+    """
+    from hermes_cli import debug
+    from hermes_cli.config import get_hermes_home
+
+    monkeypatch.setattr(dump, "get_project_root", lambda: tmp_path / "noproject")
+
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "model: gpt-4o\n"
+        "provider: openai\n"
+        "fallback_providers:\n"
+        "  - name: my-backup\n"
+        "    provider: openai\n"
+        "    model: gpt-4o\n"
+        f"    base_url: https://api.example.com/v1?region=eu;signature={_SK_KEY}\n",
+        encoding="utf-8",
+    )
+
+    uploaded: list[str] = []
+
+    def _capture(content: str, expiry_days: int = 7) -> str:
+        uploaded.append(content)
+        return f"https://paste.example/{len(uploaded)}"
+
+    monkeypatch.setattr(debug, "upload_to_pastebin", _capture)
+    monkeypatch.setattr(debug, "_best_effort_sweep_expired_pastes", lambda: None)
+    monkeypatch.setattr(debug, "_schedule_auto_delete", lambda urls: None)
+
+    debug.build_debug_share(log_lines=5, redact=True)
+
+    assert uploaded, "nothing was uploaded — the boundary was never reached"
+    for payload in uploaded:
+        assert _SK_KEY not in payload
+    # Non-vacuous on both sides, and the separator itself survives: a masked
+    # endpoint the user cannot read back is a worse diagnostic than none.
+    assert any("signature=sk-l...SHIP" in payload for payload in uploaded)
+    assert any("region=eu;signature=" in payload for payload in uploaded)
+
+
+def test_semicolon_delimited_fragment_credential_is_masked():
+    """The ``;`` policy holds in the fragment too, not only after ``?``."""
+    out = dump._config_overrides(
+        {
+            "fallback_providers": [
+                _fallback_entry(
+                    base_url=f"https://api.example.com/cb#state=public-xyz;access_token={_SK_KEY}"
+                )
+            ]
+        }
+    )
+
+    assert _SK_KEY not in out["fallback_providers"]
+    assert "access_token=sk-l...SHIP" in out["fallback_providers"]
+    assert "state=public-xyz;" in out["fallback_providers"]
+
+
+def test_ordinary_semicolon_parameters_are_left_alone():
+    """Splitting on ``;`` must not rewrite URLs that carry no credential."""
+    url = "https://api.example.com/v1?a=1;b=2&c=3"
+    out = dump._config_overrides({"fallback_providers": [_fallback_entry(base_url=url)]})
+
+    assert url in out["fallback_providers"]
+
+
 def test_numeric_token_budgets_are_not_mistaken_for_secrets():
     # The name-marker rule fails closed, so the few known-safe fields that
     # contain a marker word must stay readable or the dump loses diagnostics.
