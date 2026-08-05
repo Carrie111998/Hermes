@@ -731,3 +731,104 @@ class TestPromptCacheKeyCapability:
         assert first == second
         assert first != key("cron_job_2026-07-15T10:05:00Z", instructions="You are different.")
         assert first != key("cron_job_2026-07-15T10:05:00Z", tool_name="search")
+
+
+class TestChatCompletionsSilentReasoningDropWarning:
+    """Regression tests for the systemic warning requested in issue #77818:
+    a thin-shell ProviderProfile that doesn't override
+    build_api_kwargs_extras() inherits the base class's no-op default
+    (({}, {})), so a configured reasoning_config used to be silently
+    discarded with no error or warning anywhere in the pipeline. This is
+    a general-purpose safety net for ANY such profile, not specific to
+    the alibaba-coding-plan profile that #77818 itself fixed.
+    """
+
+    @staticmethod
+    def _thin_shell_profile(name: str):
+        """A plain ProviderProfile instance with no
+        build_api_kwargs_extras() override -- exactly the shape
+        alibaba-coding-plan had before issue #77818's fix, and the shape
+        any FUTURE thin-shell profile would have if it forgot to
+        implement reasoning support."""
+        from providers.base import ProviderProfile
+
+        return ProviderProfile(
+            name=name,
+            aliases=(),
+            display_name=name,
+            description="test-only thin-shell profile",
+            signup_url="",
+            env_vars=(),
+            base_url="https://example.test/v1",
+            auth_type="api_key",
+        )
+
+    def test_warns_once_when_profile_silently_drops_reasoning_config(
+        self, transport, caplog
+    ):
+        import logging
+
+        profile = self._thin_shell_profile("test-thin-shell-warns-once")
+        msgs = [{"role": "user", "content": "Hi"}]
+
+        with caplog.at_level(logging.WARNING, logger="agent.transports.chat_completions"):
+            transport.build_kwargs(
+                model="test-model", messages=msgs,
+                provider_profile=profile,
+                reasoning_config={"enabled": True, "effort": "low"},
+            )
+            transport.build_kwargs(
+                model="test-model", messages=msgs,
+                provider_profile=profile,
+                reasoning_config={"enabled": True, "effort": "low"},
+            )
+
+        drop_warnings = [
+            r for r in caplog.records
+            if "reasoning_config" in r.message and "no reasoning-related field" in r.message
+        ]
+        assert len(drop_warnings) == 1, (
+            "must warn exactly once per profile, not once per request "
+            f"(hot path, would spam logs): {[r.message for r in caplog.records]}"
+        )
+        assert "test-thin-shell-warns-once" in drop_warnings[0].message
+
+    def test_no_warning_when_no_reasoning_config_passed(self, transport, caplog):
+        import logging
+
+        profile = self._thin_shell_profile("test-thin-shell-no-config")
+        msgs = [{"role": "user", "content": "Hi"}]
+
+        with caplog.at_level(logging.WARNING, logger="agent.transports.chat_completions"):
+            transport.build_kwargs(
+                model="test-model", messages=msgs,
+                provider_profile=profile,
+                reasoning_config=None,
+            )
+
+        assert not any(
+            "no reasoning-related field" in r.message for r in caplog.records
+        )
+
+    def test_no_warning_when_profile_correctly_forwards_reasoning(self, transport, caplog):
+        """Sanity: a profile that DOES override build_api_kwargs_extras()
+        and correctly forwards the setting must never trigger this
+        warning -- e.g. the now-fixed alibaba-coding-plan profile itself."""
+        import logging
+
+        import model_tools  # noqa: F401
+        import providers
+
+        profile = providers.get_provider_profile("alibaba-coding-plan")
+        msgs = [{"role": "user", "content": "Hi"}]
+
+        with caplog.at_level(logging.WARNING, logger="agent.transports.chat_completions"):
+            transport.build_kwargs(
+                model="qwen3.8-max-preview", messages=msgs,
+                provider_profile=profile,
+                reasoning_config={"enabled": True, "effort": "low"},
+            )
+
+        assert not any(
+            "no reasoning-related field" in r.message for r in caplog.records
+        )
