@@ -89,7 +89,9 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from tools.budget_config import budget_for_context_window
 from tools.skill_provenance import set_current_write_origin
+from tools.tool_result_storage import enforce_recent_tool_tail_budget
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -2040,6 +2042,42 @@ def run_conversation(
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
+        if (
+            len(messages) > 1
+            and _preflight_threshold > 0
+            and request_pressure_tokens >= _preflight_threshold
+        ):
+            _context_length = int(getattr(_compressor, "context_length", 0) or 0)
+            _tail_budget_config = budget_for_context_window(_context_length)
+            try:
+                from tools.terminal_tool import get_active_env
+                _tail_budget_env = get_active_env(effective_task_id)
+            except Exception:
+                _tail_budget_env = None
+            try:
+                _tool_tail_reduced = enforce_recent_tool_tail_budget(
+                    messages,
+                    env=_tail_budget_env,
+                    config=_tail_budget_config,
+                )
+            except Exception:
+                logger.exception("recent tool-tail budget enforcement failed")
+                _tool_tail_reduced = False
+            if _tool_tail_reduced:
+                logger.info(
+                    "Pre-API tool-tail budget enforcement reduced recent tool output before provider call: ~%s request tokens >= %s threshold",
+                    f"{request_pressure_tokens:,}",
+                    f"{_preflight_threshold:,}",
+                )
+                pending_moa_prepared_request = None
+                _last_preflight_pressure = None
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                continue
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
         # fully assembled request with the fully assembled request that caused

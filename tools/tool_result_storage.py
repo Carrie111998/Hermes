@@ -200,6 +200,86 @@ def maybe_persist_tool_result(
     )
 
 
+def enforce_recent_tool_tail_budget(
+    messages: list[dict],
+    env=None,
+    config: BudgetConfig = DEFAULT_BUDGET,
+) -> bool:
+    """Enforce a cumulative tool-output budget after the latest user message.
+
+    LCM and other compressors must protect the latest user request.  In long
+    same-user turns, many individually acceptable medium tool outputs can pile
+    up after that anchor, leaving no compressible backlog and causing provider
+    context overflow.  This guard rewrites the largest non-persisted tool
+    results in that protected tail to persisted-output references until the
+    tail's aggregate tool content fits the configured budget.
+
+    Older tool messages before the latest user are intentionally left untouched;
+    they are the context engine's normal compaction territory.
+    """
+    if not messages:
+        return False
+
+    tail_start = 0
+    for idx in range(len(messages) - 1, -1, -1):
+        msg = messages[idx]
+        if msg.get("role") != "user":
+            continue
+        content = msg.get("content")
+        if isinstance(content, str) and not content.strip():
+            continue
+        if content:
+            tail_start = idx + 1
+            break
+
+    candidates: list[tuple[int, int]] = []
+    total_size = 0
+    for idx, msg in enumerate(messages[tail_start:], start=tail_start):
+        if msg.get("role") != "tool":
+            continue
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        size = len(content)
+        total_size += size
+        if PERSISTED_OUTPUT_TAG not in content:
+            candidates.append((idx, size))
+
+    if total_size <= config.turn_budget:
+        return False
+
+    changed = False
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    for idx, size in candidates:
+        if total_size <= config.turn_budget:
+            break
+        msg = messages[idx]
+        content = msg.get("content", "")
+        if not isinstance(content, str) or not content:
+            continue
+        tool_use_id = msg.get("tool_call_id", f"tail_budget_{idx}")
+        replacement = maybe_persist_tool_result(
+            content=content,
+            tool_name=_BUDGET_TOOL_NAME,
+            tool_use_id=tool_use_id,
+            env=env,
+            config=config,
+            threshold=0,
+        )
+        if replacement != content:
+            msg["content"] = replacement
+            total_size -= size
+            total_size += len(replacement)
+            changed = True
+            logger.info(
+                "Recent tool-tail budget enforcement: persisted tool result %s (%d chars)",
+                tool_use_id,
+                size,
+            )
+
+    return changed
+
+
 def enforce_turn_budget(
     tool_messages: list[dict],
     env=None,

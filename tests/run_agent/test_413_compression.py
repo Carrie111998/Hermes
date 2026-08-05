@@ -625,6 +625,48 @@ class TestPreflightCompression:
             "Pre-API compression" in msg for _ev, msg in status_messages
         )
 
+    def test_pre_api_pressure_spills_recent_tool_tail_before_compressing(self, agent):
+        """High request pressure first externalizes cumulative fresh-tail tool output.
+
+        This is the guard for the WebUI/LCM incident shape: when the same user
+        turn accumulates too much recent tool output, shrink that tail and
+        rebuild the request before spending a compression attempt.
+        """
+        agent.compression_enabled = True
+        agent.context_compressor.context_length = 200_000
+        agent.context_compressor.threshold_tokens = 100_000
+
+        ok_resp = _mock_response(content="After tail spill", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [ok_resp]
+
+        with (
+            patch("agent.turn_context.estimate_request_tokens_rough", return_value=10_000),
+            patch(
+                "agent.conversation_loop.estimate_messages_tokens_rough",
+                side_effect=[140_000, 10_000],
+            ),
+            patch(
+                "agent.conversation_loop.enforce_recent_tool_tail_budget",
+                return_value=True,
+            ) as tail_budget,
+            patch.object(agent, "_compress_context") as mock_compress,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation(
+                "continue",
+                conversation_history=[
+                    {"role": "user", "content": "earlier"},
+                    {"role": "assistant", "content": "earlier answer"},
+                ],
+            )
+
+        assert result["completed"] is True
+        tail_budget.assert_called_once()
+        mock_compress.assert_not_called()
+        agent.client.chat.completions.create.assert_called_once()
+
     def test_pre_api_pressure_uses_context_engine_message_aware_hook(self, agent):
         """Engines can decline no-op pressure compaction for protected tails."""
         agent.compression_enabled = True
