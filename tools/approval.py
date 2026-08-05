@@ -1794,7 +1794,10 @@ def _execution_flag_findings(command: str):
                 if found:
                     yield ("shell command via -c/-lc flag", payload)
             if executable_name == "eval" and len(tokens) > 1:
-                payload = " ".join(tokens[1:])
+                eval_args = tokens[1:]
+                if eval_args[:1] == ["--"]:
+                    eval_args = eval_args[1:]
+                payload = " ".join(eval_args)
                 if "$" in payload or "`" in payload:
                     yield (_MALFORMED_EXEC_DESCRIPTION, None)
                 else:
@@ -2002,6 +2005,13 @@ def _env_split_string_payload(args: list[str]) -> tuple[str | None, bool]:
         if _ENV_ASSIGNMENT_RE.fullmatch(token):
             break
 
+        option_status = "continue"
+        option_consumes_next = False
+        if token.startswith("-"):
+            option_status, option_consumes_next = _classify_env_option(token)
+            if option_status != "continue":
+                return None, False
+
         split_value: str | None = None
         consumed = 1
         long_option, separator, attached_value = token.partition("=")
@@ -2039,7 +2049,7 @@ def _env_split_string_payload(args: list[str]) -> tuple[str | None, bool]:
 
         if token.startswith("-"):
             index += 1
-            if _env_option_consumes_next_arg(token) and index < len(expanded):
+            if option_consumes_next and index < len(expanded):
                 index += 1
             continue
         break
@@ -2716,7 +2726,11 @@ def _mark_unwrapped_executables(command: str) -> str:
     offsets: list[int] = []
     for start in _iter_shell_command_starts(command):
         exec_start = _offset_after_command_wrappers(command, start)
-        if exec_start is not None and exec_start > start:
+        if (
+            exec_start is not None
+            and exec_start > start
+            and "\n" not in command[start:exec_start]
+        ):
             offsets.append(exec_start)
     if not offsets:
         return command
@@ -2878,6 +2892,8 @@ def _command_detection_variants(command: str):
                     added_unwrapped = True
             if not added_unwrapped:
                 break
+        else:
+            yield _PARSER_LIMIT_VARIANT
 
         for payload_variant in payload_variants:
             if payload_variant not in seen:
