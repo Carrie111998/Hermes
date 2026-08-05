@@ -84,8 +84,6 @@ dependencies = [
   "urllib3>=2.7.0,<3",
   # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
   # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
-  # cryptography is pulled in transitively by PyJWT[crypto]; pin it explicitly
-  # so the WeCom/Weixin crypto paths can't drift below the CVE-fixed floor.
   # Floor: 48.0.1 (CVE-2026-39892, CVE-2026-34073, GHSA-537c-gmf6-5ccf). Open
   # upper range so installs without [dingtalk] resolve to the patched releases
   # (GHSA-jwv3-5hgf-82ww / GHSA-m2h6-j472-r4p4 fixed in 49.0.0, GHSA-g6cj-pr64-35w5
