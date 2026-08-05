@@ -1421,7 +1421,9 @@ class WeixinAdapter(BasePlatformAdapter):
                     if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
                             or ret == DEAD_SESSION_RET
                             or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
-                        logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
+                        logger.error("[%s] Session expired (ret=%s errcode=%s); clearing sync buffer and pausing for 10 minutes", self.name, ret, errcode)
+                        sync_buf = ""
+                        _save_sync_buf(self._hermes_home, self._account_id, sync_buf)
                         if self._alert_script:
                             _fire_alert("stale_session", f"ret={ret} errcode={errcode}", self._alert_script)
                         await asyncio.sleep(600)
@@ -1886,11 +1888,28 @@ class WeixinAdapter(BasePlatformAdapter):
                             await asyncio.sleep(wait)
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
+                        if (ret == SESSION_EXPIRED_ERRCODE
+                                or errcode == SESSION_EXPIRED_ERRCODE
+                                or _is_stale_session_ret(ret, errcode, errmsg)
+                                or ret == DEAD_SESSION_RET):
+                            raise SessionExpiredError(
+                                f"iLink session expired: ret={ret} errcode={errcode} errmsg={errmsg}"
+                            )
                         raise RuntimeError(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
                 self._reset_rate_limit_circuit()
                 return
+            except SessionExpiredError:
+                logger.critical(
+                    "[%s] iLink session expired sending to=%s; "
+                    "not retrying (same session will fail again)",
+                    self.name,
+                    _safe_id(chat_id),
+                )
+                if self._alert_script:
+                    _fire_alert("session_expired", f"to={_safe_id(chat_id)}", self._alert_script)
+                raise
             except Exception as exc:
                 last_error = exc
                 if attempt >= self._send_chunk_retries:
