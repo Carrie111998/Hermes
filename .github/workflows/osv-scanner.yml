@@ -4,54 +4,72 @@ name: OSV-Scanner
 # database. Runs on every PR/push (via the ci.yml orchestrator's workflow_call)
 # and on a weekly schedule against main.
 #
-# This is detection-only — OSV-Scanner does NOT open PRs or modify pins.
-# It reports known CVEs in currently-pinned dependency versions so we can
-# decide when and how to patch on our own schedule. Our pinning strategy
-# (full SHA / exact version) is preserved; only the notification signal
-# is added.
+# This is detection-only for the baseline scan — OSV-Scanner does NOT open PRs
+# or modify pins. It reports known CVEs in currently-pinned dependency versions
+# so we can decide when and how to patch on our own schedule.
 #
-# Complements the supply-chain-audit.yml workflow (which scans for malicious
-# code patterns in PR diffs) by covering the orthogonal "currently-pinned
-# dep became known-vulnerable" case.
+# Baseline scan is report-only so old vulnerabilities do not break unrelated
+# changes. A second gate below compares base/head OSV findings whenever a PR
+# or push changes dependency lockfiles, so only newly introduced vulnerable
+# resolutions block the change.
+#
+# Complements the supply-chain-audit.yml workflow by covering the orthogonal
+# "currently-pinned dep became known-vulnerable" case.
 #
 # Uses Google's officially-recommended reusable workflow, pinned by SHA.
 # Findings land in the repo's Security tab (Code Scanning > OSV-Scanner).
-# fail-on-vuln is disabled so the job does not block merges on pre-existing
-# vulnerabilities in pinned deps that we may need to patch deliberately.
-#
-# The reusable workflow can't emit custom outputs, so a wrapper job
-# downloads the SARIF result and summarizes the vulnerability count into
-# a review_status for the unified PR comment.
+# The reusable workflow can't emit custom outputs, so a wrapper job downloads
+# the SARIF result and summarizes the vulnerability count into a review_status
+# for the unified PR comment.
 
 on:
   workflow_call:
   schedule:
-    # Weekly scan against main — catches CVEs published after merge for
-    # deps that haven't changed since.
     - cron: '0 9 * * 1'
   workflow_dispatch:
 
 permissions:
-  # Required to upload SARIF file to CodeQL. See: https://github.com/github/codeql-action/issues/2117
   actions: read
   contents: read
   security-events: write
 
 jobs:
+  detect-lockfile-changes:
+    name: Detect dependency lockfile changes
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed lockfiles
+        id: diff
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+          else
+            BASE_REF="HEAD~1"
+          fi
+          if git diff --quiet "$BASE_REF...HEAD" -- uv.lock package-lock.json website/package-lock.json plugins/platforms/photon/sidecar/package-lock.json scripts/whatsapp-bridge/package-lock.json; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   scan:
     name: Scan lockfiles
     uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
     with:
-      # Scan explicit lockfiles rather than recursing, so we only look at
-      # the five sources of truth and skip vendored / test / worktree dirs.
       scan-args: |-
         --lockfile=uv.lock
         --lockfile=package-lock.json
         --lockfile=website/package-lock.json
         --lockfile=plugins/platforms/photon/sidecar/package-lock.json
         --lockfile=scripts/whatsapp-bridge/package-lock.json
-      # The upstream reusable workflow uploads this exact file under its
-      # fixed artifact name, which the wrapper downloads below.
       results-file-name: osv-results.sarif
       fail-on-vuln: false
 
@@ -80,7 +98,6 @@ jobs:
           STATUS="[]"
 
           if [ -f /tmp/osv-results/osv-results.sarif ]; then
-            # Count vulnerabilities from the SARIF file
             VULN_COUNT=$(python3 -c "
           import json, sys
           try:
@@ -120,10 +137,71 @@ jobs:
           except Exception:
               print(json.dumps(''))
           ")
-              STATUS="[{\"source\":\"osv scan\",\"results\":[{\"kind\":\"warning\",\"title\":\"OSV vulnerability scan\",\"summary\":\"${VULN_COUNT} known vulnerabilit${VULN_PLURAL} found in pinned dependencies.\",\"detail\":${VULN_DETAIL},\"how_to_fix\":\"Review the findings in the [Security tab](../../security/code-scanning). Update the affected dependencies if a patched version is available.\"}]}]"
+              STATUS="[{\"source\":\"osv scan\",\"results\":[{\"kind\":\"warning\",\"title\":\"OSV vulnerability scan\",\"summary\":\"${VULN_COUNT} known vulnerabilit${VULN_PLURAL} found in pinned dependencies.\",\"detail\":${VULN_DETAIL},\"how_to_fix\":\"Review the findings in the repository Security tab. Update affected dependencies if a patched version is available.\"}]}]"
             else
               STATUS="[]"
             fi
           fi
 
           echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+
+  new-lockfile-vuln-gate:
+    name: Block newly introduced lockfile vulnerabilities
+    needs: detect-lockfile-changes
+    if: needs.detect-lockfile-changes.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install OSV Scanner
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/osv-scanner https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_linux_amd64
+          echo "bc98e15319ed0d515e3f9235287ba53cdc5535d576d24fd573978ecfe9ab92dc  /tmp/osv-scanner" | sha256sum -c -
+          chmod +x /tmp/osv-scanner
+          echo /tmp >> "$GITHUB_PATH"
+
+      - name: Compare base and head OSV findings
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+          else
+            BASE_REF="HEAD~1"
+          fi
+          BASE_DIR="$(mktemp -d)"
+          git worktree add --detach "$BASE_DIR" "$BASE_REF"
+
+          scan_lockfiles() {
+            local root="$1"
+            local output="$2"
+            shift 2
+            local args=()
+            for lockfile in "$@"; do
+              if [ -f "$root/$lockfile" ]; then
+                args+=("--lockfile=$lockfile")
+              fi
+            done
+            if [ "${#args[@]}" -eq 0 ]; then
+              printf '{"runs":[]}' > "$output"
+              return 0
+            fi
+            (cd "$root" && osv-scanner --format sarif --output "$output" "${args[@]}") || true
+            if [ ! -s "$output" ]; then
+              printf '{"runs":[]}' > "$output"
+            fi
+          }
+
+          LOCKFILES=(
+            uv.lock
+            package-lock.json
+            website/package-lock.json
+            plugins/platforms/photon/sidecar/package-lock.json
+            scripts/whatsapp-bridge/package-lock.json
+          )
+          scan_lockfiles "$BASE_DIR" /tmp/osv-base.sarif "${LOCKFILES[@]}"
+          scan_lockfiles "$PWD" /tmp/osv-head.sarif "${LOCKFILES[@]}"
+          python3 scripts/ci/osv_new_vuln_gate.py --base /tmp/osv-base.sarif --head /tmp/osv-head.sarif

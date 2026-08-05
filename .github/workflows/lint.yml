@@ -178,3 +178,26 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+  engineering-quality-audit:
+    # Report-only governance audit: surfaces whether the repo still has
+    # enforceable signals for testing, CI parity, coverage, lint, AppSec and
+    # supply-chain hygiene. It intentionally does not fail on gaps yet; the
+    # output is a stable PR summary reviewers can use before deciding which
+    # controls should become blocking.
+    name: Engineering quality audit (report)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Run engineering quality audit
+        run: |
+          python scripts/ci/engineering_quality_audit.py | tee engineering-quality-audit.md
+          cat engineering-quality-audit.md >> "$GITHUB_STEP_SUMMARY"

@@ -129,12 +129,20 @@ jobs:
         # re-ran LPT independently — redundant N times.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh --files '${{ matrix.slice.files }}'
+          scripts/run_tests.sh --coverage --files '${{ matrix.slice.files }}'
         env:
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
           NOUS_API_KEY: ""
+
+      - name: Upload per-slice coverage data
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: coverage-data-slice-${{ matrix.slice.index }}
+          path: .coverage.*
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Upload per-slice durations
         # Advisory artifact (feeds slice balancing) — a transient artifact-
@@ -145,6 +153,59 @@ jobs:
           name: test-durations-slice-${{ matrix.slice.index }}
           path: test_durations.json
           retention-days: 1
+
+  coverage:
+    name: Combine coverage + changed-line gate
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install dependencies
+        uses: ./.github/actions/retry
+        with:
+          command: uv sync --locked --python 3.11 --extra dev
+
+      - name: Download coverage data
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: coverage-data-slice-*
+          path: coverage-data
+          merge-multiple: true
+
+      - name: Combine coverage and enforce changed-line coverage
+        run: |
+          set -euo pipefail
+          source .venv/bin/activate
+          coverage combine coverage-data
+          coverage json -o coverage.json
+          coverage report --fail-under=0
+          if [ -n "${{ github.base_ref }}" ]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+          else
+            BASE_REF="HEAD~1"
+          fi
+          python scripts/ci/changed_line_coverage_gate.py \
+            --coverage-json coverage.json \
+            --base-ref "$BASE_REF" \
+            --fail-under 100 \
+            | tee changed-line-coverage.md
+          cat changed-line-coverage.md >> "$GITHUB_STEP_SUMMARY"
 
   # Merge per-slice duration data into a single cache, so future runs
   # (including PRs) get balanced slicing.

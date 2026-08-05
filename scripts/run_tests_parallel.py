@@ -228,12 +228,31 @@ def _kill_tree(proc: "subprocess.Popen", pgid: int | None = None) -> None:
         pass
 
 
+def _pytest_subprocess_cmd(file: Path, pytest_args: List[str], coverage: bool) -> list[str]:
+    """Build the isolated subprocess command for one test file."""
+    if coverage:
+        return [
+            sys.executable,
+            "-m",
+            "coverage",
+            "run",
+            "--parallel-mode",
+            "--branch",
+            "-m",
+            "pytest",
+            str(file),
+            *pytest_args,
+        ]
+    return [sys.executable, "-m", "pytest", str(file), *pytest_args]
+
+
 def _run_one_file(
     file: Path,
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
     retries: int = 0,
+    coverage: bool = False,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Run ``python -m pytest <file> <pytest_args>`` in a fresh subprocess.
 
@@ -268,14 +287,14 @@ def _run_one_file(
     bound a pathologically slow or hung file as a whole.
     """
     file, rc, output, summary, subproc_wall = _run_one_file_once(
-        file, pytest_args, repo_root, file_timeout
+        file, pytest_args, repo_root, file_timeout, coverage
     )
     attempt = 0
     while rc != 0 and attempt < retries:
         attempt += 1
         first_output = output
         file, rc, output, summary, subproc_wall2 = _run_one_file_once(
-            file, pytest_args, repo_root, file_timeout
+            file, pytest_args, repo_root, file_timeout, coverage
         )
         subproc_wall += subproc_wall2
         if rc == 0:
@@ -303,9 +322,10 @@ def _run_one_file_once(
     pytest_args: List[str],
     repo_root: Path,
     file_timeout: float,
+    coverage: bool = False,
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
-    cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
+    cmd = _pytest_subprocess_cmd(file, pytest_args, coverage)
     
     subproc_start = time.monotonic()
     # launch the pytest process
@@ -754,6 +774,14 @@ def main() -> int:
         ),
     )
     parser.add_argument(
+        "--coverage",
+        action="store_true",
+        help=(
+            "Run each isolated pytest subprocess under `coverage run --parallel-mode --branch`. "
+            "CI combines the resulting .coverage.* files in a downstream job."
+        ),
+    )
+    parser.add_argument(
         "paths_positional",
         nargs="*",
         metavar="PATH",
@@ -782,6 +810,7 @@ def main() -> int:
     OUR_FLAGS = {
         "-j", "--jobs", "--paths", "--include-integration",
         "--file-timeout", "--file-retries", "--slice", "--generate-slices", "--files",
+        "--coverage",
     }
     # pytest short flags that consume the NEXT token as their value.
     PYTEST_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-c", "-r", "-W"}
@@ -1022,8 +1051,13 @@ def main() -> int:
         for file in files:
             t0 = time.monotonic()
             fut = pool.submit(
-                _run_one_file, file, pytest_passthrough, repo_root,
-                args.file_timeout, args.file_retries,
+                _run_one_file,
+                file,
+                pytest_passthrough,
+                repo_root,
+                args.file_timeout,
+                args.file_retries,
+                args.coverage,
             )
             fut.add_done_callback(lambda f, file=file, t0=t0: _on_done(file, t0, f))
             futures.append(fut)
