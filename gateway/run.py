@@ -5068,6 +5068,32 @@ class TurnRunner:
                     )
                 return
 
+            if approval_data.get("kind") == "mcp_oauth_consent_result":
+                ctx._status_adapter.pause_typing_for_chat(ctx._status_chat_id)
+                msg = (
+                    approval_data.get("description")
+                    or approval_data.get("command")
+                    or "MCP OAuth did not complete."
+                )
+                try:
+                    _oauth_fut = safe_schedule_threadsafe(
+                        ctx._status_adapter.send(
+                            ctx._status_chat_id,
+                            msg,
+                            metadata=ctx._status_thread_metadata,
+                        ),
+                        ctx._loop_for_step,
+                        logger=logger,
+                        log_message="mcp oauth consent result send scheduling error",
+                    )
+                    if _oauth_fut is not None:
+                        _oauth_fut.result(timeout=15)
+                except Exception as _e:
+                    logger.warning(
+                        "Failed to deliver MCP OAuth consent result: %s", _e
+                    )
+                return
+
             # Pause the typing indicator while the agent waits for
             # user approval.  Critical for Slack's Assistant API where
             # assistant_threads_setStatus disables the compose box — the

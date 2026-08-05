@@ -139,3 +139,42 @@ def oauth_connection_registry_key(server_name: str, user_key: str = "") -> str:
     if not user_key:
         return server_name
     return f"{server_name}@@{user_key}"
+
+
+# Model-supplied tool args must never select which OAuth credentials to use.
+# Identity comes only from session ContextVars / force_oauth_user_key.
+_CREDENTIAL_SELECTOR_ARG_KEYS = frozenset(
+    {
+        "user_key",
+        "user_id",
+        "hermes_user",
+        "oauth_user",
+        "oauth_user_key",
+        "mcp_user",
+        "mcp_user_key",
+    }
+)
+
+
+def strip_credential_selector_args(args: dict | None) -> dict:
+    """Return a copy of *args* without credential-selector keys.
+
+    MCP tool/resource/prompt handlers must call this before using
+    arguments so a model cannot request ``user_key=telegram:OTHER``.
+    Nested ``arguments`` dicts (e.g. prompts/get) are scrubbed too.
+    """
+    if not args:
+        return {}
+    cleaned: dict = {}
+    for key, value in args.items():
+        if key in _CREDENTIAL_SELECTOR_ARG_KEYS:
+            continue
+        if key == "arguments" and isinstance(value, dict):
+            cleaned[key] = {
+                nested_key: nested_value
+                for nested_key, nested_value in value.items()
+                if nested_key not in _CREDENTIAL_SELECTOR_ARG_KEYS
+            }
+        else:
+            cleaned[key] = value
+    return cleaned

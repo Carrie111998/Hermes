@@ -249,14 +249,17 @@ mcp:
 
 In `per_user` mode:
 
-- Tokens are stored at `~/.hermes/mcp-tokens/by-user/<platform:user_id>/<server>.json`
-- The gateway session user (`HERMES_SESSION_USER_ID` + platform) selects which authorization is used
+- Tokens are stored at `~/.hermes/mcp-tokens/by-user/<sanitized-key>/<server>.json`. The logical key is `platform:user_id` (e.g. `telegram:12345`); on disk `:` and other unsafe characters are normalized (e.g. `telegram_12345`).
+- The gateway session user (`HERMES_SESSION_USER_ID` + platform) selects which authorization is used — never a tool argument
 - Missing identity fails closed — Hermes will not silently reuse another user's credentials
 - Operators can seed a user's tokens with `hermes mcp login <server> --user telegram:12345`
-- When a messaging user hits an OAuth MCP without tokens, Hermes sends the authorize URL **into that chat** (not only the host terminal). After authorizing, if the browser lands on a connection error, paste the full redirect URL back as a reply to complete the flow. Prefer configuring `oauth.redirect_uri` to a public HTTPS callback that reaches the Hermes host when possible.
+- When a messaging user hits an OAuth MCP without tokens (or tokens are rejected), Hermes sends the authorize URL **into that chat** (not only the host terminal). After authorizing, if the browser lands on a connection error, paste the full redirect URL back as a reply to complete the flow.
+- **Recommended for messaging users:** set `oauth.redirect_uri` to a public HTTPS callback that reaches the Hermes host so the browser redirect completes without paste-back.
+- **Fallback:** paste the redirect URL in the same chat. Pastes are correlated to the pending flow for that session — another user's paste cannot complete yours.
+- Consent delivery uses the gateway notify path (same mechanism as approvals). Messaging gateway sessions and TUI/`tui_gateway` sessions that register notify get the authorize URL in-chat. There is no separate Electron OAuth modal; a desktop path that never registers notify will not surface the URL in the app UI.
+- `hermes mcp logout <server>` clears the shared token file **and** every `by-user/*/ <server>.*` identity. Pass `--user <key>` to revoke only one identity. `hermes mcp remove <server>` performs the same wipe-all token cleanup when deleting the server from config. Dashboard/`hermes mcp login` re-auth clears only the identity being re-authorized, not every by-user tree.
 
-
-**Remote / headless hosts.** When Hermes runs on a different machine than your browser, the loopback callback can't reach your laptop. Two ways to complete the flow:
+**Remote / headless hosts.** When Hermes runs on a different machine than your browser, the loopback callback can't reach your laptop. Ways to complete the flow:
 
 - **Paste-back (no setup):** on an interactive terminal Hermes prints "Or paste the redirect URL here…" alongside the authorize URL. Open the URL in your browser, approve, copy the full URL the browser ends up on (the redirect will show a connection error — that's expected), paste it at the prompt. Bare `?code=…&state=…` query strings work too.
 - **SSH port forward:** `ssh -N -L <port>:127.0.0.1:<port> user@host` in a separate terminal, then let the redirect flow normally.

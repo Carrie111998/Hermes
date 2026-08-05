@@ -3936,16 +3936,103 @@ def _handle_auth_error_and_retry(
 
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops
-    # retrying the tool.
+    # retrying the tool. In a gateway session, kick off in-chat OAuth so
+    # the user gets an authorize URL (#78169 / #78174).
     _bump_server_error(server_name)
-    return tool_error(
-        f"MCP server '{server_name}' requires re-authentication. "
-        f"Run `hermes mcp login {server_name}` (or delete the tokens "
-        f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
-        f"this tool — ask the user to re-authenticate.",
-        needs_reauth=True,
-        server=server_name,
-    )
+
+    authorization_url = None
+    user_key = ""
+    try:
+        from tools.mcp_oauth_identity import (
+            current_oauth_user_key,
+            is_per_user_oauth_identity,
+        )
+
+        user_key = current_oauth_user_key(require=False)
+    except Exception:
+        user_key = ""
+
+    try:
+        from tools.mcp_gateway_oauth import (
+            gateway_oauth_available,
+            start_gateway_reauth_and_wait_for_url,
+        )
+        from tools.mcp_oauth_manager import get_manager as _get_oauth_mgr
+
+        if gateway_oauth_available():
+            # Clear this identity's tokens so reconnect forces interactive OAuth.
+            _get_oauth_mgr().remove(
+                server_name, user_key=user_key or "", all_identities=False,
+            )
+
+            def _reconnect() -> None:
+                srv = _lookup_live_server(server_name)
+                if srv is not None and hasattr(srv, "_reconnect_event"):
+                    _signal_reconnect_and_wait(
+                        server_name,
+                        srv,
+                        op_description=f"{op_description} gateway OAuth reauth",
+                        timeout=320,
+                    )
+                else:
+                    # Lazy / parked: try on-demand connect under the flow.
+                    _ensure_lazy_server_connected(server_name)
+
+            authorization_url, user_key = start_gateway_reauth_and_wait_for_url(
+                server_name, reconnect_fn=_reconnect,
+            )
+    except Exception as reauth_exc:
+        logger.warning(
+            "MCP OAuth '%s': gateway reauth attempt failed: %s",
+            server_name, reauth_exc,
+        )
+
+    if authorization_url:
+        message = (
+            f"MCP server '{server_name}' requires re-authentication. "
+            f"An authorize link was sent in this chat — open it to "
+            f"continue, then paste the redirect URL back if needed. "
+            f"Do NOT invent alternate login steps. authorization_url is "
+            f"included in this error for restating to the user."
+        )
+    else:
+        try:
+            from tools.mcp_oauth_identity import is_per_user_oauth_identity
+
+            per_user = is_per_user_oauth_identity()
+        except Exception:
+            per_user = False
+        if user_key:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name} --user {user_key}` "
+                f"(or delete tokens under ~/.hermes/mcp-tokens/ and restart). "
+                f"Do NOT retry this tool — ask the user to re-authenticate."
+            )
+        elif per_user:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name} --user <platform:user_id>` "
+                f"(mcp.oauth.identity_mode is per_user). Do NOT retry this "
+                f"tool — ask the user to re-authenticate."
+            )
+        else:
+            message = (
+                f"MCP server '{server_name}' requires re-authentication. "
+                f"Run `hermes mcp login {server_name}` (or delete the tokens "
+                f"file under ~/.hermes/mcp-tokens/ and restart). Do NOT retry "
+                f"this tool — ask the user to re-authenticate."
+            )
+
+    extra = {
+        "needs_reauth": True,
+        "server": server_name,
+    }
+    if authorization_url:
+        extra["authorization_url"] = authorization_url
+    if user_key:
+        extra["user_key"] = user_key
+    return tool_error(message, **extra)
 
 
 # Substrings (lower-cased match) that indicate the MCP server rejected
@@ -4941,6 +5028,7 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
 
     from contextlib import ExitStack
 
+    owned_gateway_flow = False
     try:
         with ExitStack() as stack:
             # Headless messaging: surface the authorize URL in-chat (#78169).
@@ -4949,12 +5037,14 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
                     GatewayOAuthFlow,
                     gateway_oauth_available,
                     gateway_oauth_flow,
+                    get_gateway_oauth_flow,
                 )
                 from tools.mcp_oauth import force_interactive_oauth
                 from tools.approval import get_current_session_key
                 from tools.mcp_oauth_identity import current_oauth_user_key
 
-                if (
+                # Reuse an outer reauth flow when present (nested connect).
+                if get_gateway_oauth_flow() is None and (
                     gateway_oauth_available()
                     and _server_config_is_oauth(server_name, config)
                 ):
@@ -4967,12 +5057,27 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
                         )
                         stack.enter_context(gateway_oauth_flow(flow))
                         stack.enter_context(force_interactive_oauth())
+                        owned_gateway_flow = True
+                elif get_gateway_oauth_flow() is not None:
+                    stack.enter_context(force_interactive_oauth())
             except Exception as exc:
                 logger.debug(
                     "MCP gateway OAuth context not entered for '%s': %s",
                     server_name, exc,
                 )
-            _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
+            try:
+                _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
+            except BaseException as connect_exc:
+                if owned_gateway_flow:
+                    try:
+                        from tools.mcp_gateway_oauth import (
+                            notify_consent_failure_for_active_flow,
+                        )
+
+                        notify_consent_failure_for_active_flow(exc=connect_exc)
+                    except Exception:
+                        pass
+                raise
     except BaseException as exc:
         message = _format_connect_error(exc)
         with _lock:
@@ -5070,6 +5175,12 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Identity is session/ContextVar only — never let tool args pick
+        # which OAuth credentials to use (#78174).
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5284,6 +5395,9 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists resources from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5340,6 +5454,9 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that reads a resource by URI from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5401,6 +5518,9 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that lists prompts from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
@@ -5462,6 +5582,9 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     """Return a sync handler that gets a prompt by name from an MCP server."""
 
     def _handler(args: dict, **kwargs) -> str:
+        from tools.mcp_oauth_identity import strip_credential_selector_args
+
+        args = strip_credential_selector_args(args)
         server = _get_connected_server_for_call(server_name)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")

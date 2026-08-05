@@ -625,12 +625,45 @@ class MCPOAuthManager:
         *,
         hermes_home: str | Path | None = None,
         user_key: str = "",
+        all_identities: bool | None = None,
     ) -> _ProviderEntry | None:
-        """Evict the provider from cache AND delete tokens from disk.
+        """Evict provider cache entries AND delete tokens from disk.
 
-        Called by ``hermes mcp remove <name>`` and (indirectly) by
-        ``hermes mcp login <name>`` during forced re-auth.
+        Called by ``hermes mcp remove <name>``, ``hermes mcp logout``, and
+        (indirectly) by ``hermes mcp login <name>`` during forced re-auth.
+
+        When ``user_key`` is non-empty, only that identity is cleared.
+        When ``user_key`` is empty, defaults to wiping **all** identities
+        (shared + every ``by-user/*/`` tree) unless ``all_identities=False``.
         """
+        wipe_all = bool(user_key == "" and all_identities is not False) or bool(
+            all_identities
+        )
+        if user_key:
+            wipe_all = False
+
+        entry: _ProviderEntry | None = None
+        if wipe_all:
+            home_key = self._key(server_name, hermes_home, user_key="")[0]
+            with self._entries_lock:
+                doomed = [
+                    k for k in self._entries
+                    if k[0] == home_key and k[1] == server_name
+                ]
+                for k in doomed:
+                    popped = self._entries.pop(k, None)
+                    if entry is None:
+                        entry = popped
+            from tools.mcp_oauth import remove_all_oauth_tokens_for_server
+            remove_all_oauth_tokens_for_server(
+                server_name, hermes_home=hermes_home,
+            )
+            logger.info(
+                "MCP OAuth '%s': evicted all identities from cache and disk",
+                server_name,
+            )
+            return entry
+
         with self._entries_lock:
             entry = self._entries.pop(
                 self._key(server_name, hermes_home, user_key=user_key), None,

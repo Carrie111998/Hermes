@@ -641,12 +641,45 @@ def cmd_mcp_remove(args):
     # Clean up OAuth tokens if they exist — route through MCPOAuthManager so
     # any provider instance cached in the current process (e.g. from an
     # earlier `hermes mcp test` in the same session) is evicted too.
+    # Default wipe covers shared + every by-user identity for this server.
     try:
         from tools.mcp_oauth_manager import get_manager
         get_manager().remove(name)
-        _success("Cleaned up OAuth tokens")
+        _success("Cleaned up OAuth tokens (all identities)")
     except Exception:
         pass
+
+
+# ─── hermes mcp logout ────────────────────────────────────────────────────────
+
+def cmd_mcp_logout(args):
+    """Revoke stored OAuth tokens for a server without removing config.
+
+    ``hermes mcp logout <server>`` clears shared tokens and every
+    ``mcp-tokens/by-user/*/`` identity for that server.
+    ``hermes mcp logout <server> --user KEY`` clears only that identity.
+    """
+    name = getattr(args, "name", "") or ""
+    user_key = (getattr(args, "user", None) or "").strip()
+    if not name:
+        _error("Server name required.")
+        return
+
+    existing = _get_mcp_servers()
+    if name not in existing:
+        # Still allow logout for orphaned token files after config was edited
+        _warning(f"Server '{name}' not in config — clearing token files anyway.")
+
+    try:
+        from tools.mcp_oauth_manager import get_manager
+        if user_key:
+            get_manager().remove(name, user_key=user_key)
+            _success(f"Logged out '{name}' for user '{user_key}'")
+        else:
+            get_manager().remove(name, all_identities=True)
+            _success(f"Logged out '{name}' (all identities)")
+    except Exception as exc:
+        _error(f"Logout failed: {exc}")
 
 
 # ─── hermes mcp list ──────────────────────────────────────────────────────────
@@ -807,10 +840,13 @@ def _reauth_oauth_server(
         return False
 
     # Wipe both disk and in-memory cache so the next probe forces a fresh
-    # OAuth flow.
+    # OAuth flow. Limit to the login identity (shared or --user) — do not
+    # wipe every by-user tree when re-authing the shared profile.
     try:
         from tools.mcp_oauth_manager import get_manager
-        get_manager().remove(name, user_key=user_key or "")
+        get_manager().remove(
+            name, user_key=user_key or "", all_identities=False,
+        )
     except Exception as exc:
         _warning(f"Could not clear existing OAuth state: {exc}")
 
@@ -1117,6 +1153,7 @@ def mcp_command(args):
         "add": cmd_mcp_add,
         "remove": cmd_mcp_remove,
         "rm": cmd_mcp_remove,
+        "logout": cmd_mcp_logout,
         "list": cmd_mcp_list,
         "ls": cmd_mcp_list,
         "test": cmd_mcp_test,
@@ -1143,6 +1180,7 @@ def mcp_command(args):
         _info("hermes mcp add <name> --command <cmd>         Add a stdio server")
         _info("hermes mcp add <name> --preset <preset>       Add from a known preset")
         _info("hermes mcp remove <name>                      Remove a server")
+        _info("hermes mcp logout <name> [--user KEY]         Clear OAuth tokens")
         _info("hermes mcp list                               List configured servers")
         _info("hermes mcp test <name>                        Test connection")
         _info("hermes mcp configure <name>                   Toggle tools")

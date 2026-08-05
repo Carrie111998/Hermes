@@ -123,3 +123,190 @@ def test_shared_mode_ignores_session_user(monkeypatch):
         lambda name, default="": {"HERMES_SESSION_USER_ID": "999", "HERMES_SESSION_PLATFORM": "telegram"}.get(name, default),
     )
     assert identity.current_oauth_user_key(require=True) == ""
+
+
+def test_strip_credential_selector_args():
+    from tools.mcp_oauth_identity import strip_credential_selector_args
+
+    cleaned = strip_credential_selector_args(
+        {
+            "query": "hello",
+            "user_key": "telegram:OTHER",
+            "user_id": "999",
+            "hermes_user": "evil",
+            "limit": 3,
+            "arguments": {
+                "topic": "x",
+                "user_key": "telegram:OTHER",
+                "oauth_user": "nope",
+            },
+        }
+    )
+    assert cleaned == {
+        "query": "hello",
+        "limit": 3,
+        "arguments": {"topic": "x"},
+    }
+
+
+def test_tool_args_cannot_select_oauth_user(monkeypatch, tmp_path):
+    """Even if the model passes user_key in args, storage/registry use session identity."""
+    from unittest.mock import AsyncMock
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools import mcp_tool
+    from tools.mcp_oauth_identity import force_oauth_user_key
+    from tools.mcp_oauth_manager import reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setattr(
+        "tools.mcp_oauth_identity.get_oauth_identity_mode", lambda: "per_user"
+    )
+    monkeypatch.setattr(mcp_tool, "_server_config_is_oauth", lambda *a, **k: True)
+
+    captured = {}
+
+    server = MagicMock()
+    server.name = "srv"
+    session = MagicMock()
+
+    async def _call_tool(name, arguments=None, **kw):
+        from types import SimpleNamespace
+
+        captured["arguments"] = dict(arguments or {})
+        return SimpleNamespace(isError=False, content=[], structuredContent=None)
+
+    session.call_tool = _call_tool
+    server.session = session
+    server._rpc_lock = MagicMock()
+    server._rpc_lock.__aenter__ = AsyncMock(return_value=None)
+    server._rpc_lock.__aexit__ = AsyncMock(return_value=None)
+    server.mark_tool_call = MagicMock()
+
+    mcp_tool._servers["srv@@telegram:111"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+    mcp_tool._ensure_mcp_loop()
+
+    try:
+        handler = mcp_tool._make_tool_handler("srv", "tool1", 10.0)
+        with force_oauth_user_key("telegram:111"):
+            result = handler({"query": "x", "user_key": "telegram:OTHER"})
+        parsed = json.loads(result)
+        assert "error" not in parsed
+        assert "user_key" not in captured["arguments"]
+        assert captured["arguments"].get("query") == "x"
+        # Wrong-user registry key must not be used
+        assert "srv@@telegram:OTHER" not in mcp_tool._servers
+    finally:
+        mcp_tool._servers.pop("srv@@telegram:111", None)
+        mcp_tool._server_error_counts.pop("srv", None)
+
+
+def test_remove_all_oauth_tokens_for_server(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from tools.mcp_oauth import (
+        HermesTokenStorage,
+        remove_all_oauth_tokens_for_server,
+    )
+
+    shared = HermesTokenStorage("linear")
+    a = HermesTokenStorage("linear", user_key="telegram:111")
+    b = HermesTokenStorage("linear", user_key="telegram:222")
+    for storage, token in ((shared, "S"), (a, "A"), (b, "B")):
+        _write_token(storage._tokens_path(), token)
+
+    cleared = remove_all_oauth_tokens_for_server("linear")
+    assert "" in cleared
+    # Filenames sanitize ':' → '_'
+    assert "telegram_111" in cleared
+    assert "telegram_222" in cleared
+    assert not shared._tokens_path().exists()
+    assert not a._tokens_path().exists()
+    assert not b._tokens_path().exists()
+
+
+def test_manager_remove_all_identities_false_preserves_by_user(tmp_path, monkeypatch):
+    """Dashboard/login re-auth must not wipe every by-user token tree."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    shared = HermesTokenStorage("linear")
+    user_a = HermesTokenStorage("linear", user_key="telegram:111")
+    _write_token(shared._tokens_path(), "SHARED")
+    _write_token(user_a._tokens_path(), "TOKEN_A")
+
+    mgr = MCPOAuthManager()
+    mgr.get_or_build_provider("linear", "https://example.com/mcp", None)
+    mgr.remove("linear", all_identities=False)
+
+    assert not shared._tokens_path().exists()
+    assert user_a._tokens_path().exists()
+    assert json.loads(user_a._tokens_path().read_text())["access_token"] == "TOKEN_A"
+
+
+def test_two_users_separate_registry_and_tokens(monkeypatch, tmp_path):
+    """Hermetic multi-user isolation: distinct files + registry keys."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        "tools.mcp_oauth_identity.get_oauth_identity_mode", lambda: "per_user"
+    )
+    from tools import mcp_tool
+    from tools.mcp_oauth import HermesTokenStorage
+    from tools.mcp_oauth_identity import (
+        force_oauth_user_key,
+        oauth_connection_registry_key,
+    )
+    from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests
+
+    reset_manager_for_tests()
+    monkeypatch.setattr(mcp_tool, "_server_config_is_oauth", lambda *a, **k: True)
+    mock_stdin = MagicMock()
+    mock_stdin.isatty.return_value = True
+    monkeypatch.setattr("tools.mcp_oauth.sys.stdin", mock_stdin)
+
+    for key, token in (("telegram:111", "TOKEN_A"), ("telegram:222", "TOKEN_B")):
+        storage = HermesTokenStorage("linear", user_key=key)
+        _write_token(storage._tokens_path(), token)
+
+    mgr = MCPOAuthManager()
+    pa = mgr.get_or_build_provider(
+        "linear", "https://example.com/mcp", None, user_key="telegram:111",
+    )
+    pb = mgr.get_or_build_provider(
+        "linear", "https://example.com/mcp", None, user_key="telegram:222",
+    )
+    asyncio.run(pa._initialize())
+    asyncio.run(pb._initialize())
+    assert pa.context.current_tokens.access_token == "TOKEN_A"
+    assert pb.context.current_tokens.access_token == "TOKEN_B"
+    # User B must never see User A's token
+    assert pa.context.current_tokens.access_token != pb.context.current_tokens.access_token
+
+    key_a = oauth_connection_registry_key("linear", "telegram:111")
+    key_b = oauth_connection_registry_key("linear", "telegram:222")
+    assert key_a != key_b
+
+    srv_a = MagicMock()
+    srv_a.session = MagicMock()
+    srv_a.name = "linear"
+    srv_b = MagicMock()
+    srv_b.session = MagicMock()
+    srv_b.name = "linear"
+    mcp_tool._servers[key_a] = srv_a
+    mcp_tool._servers[key_b] = srv_b
+    try:
+        with force_oauth_user_key("telegram:111"):
+            got = mcp_tool._get_connected_server_for_call("linear")
+            assert got is srv_a
+        with force_oauth_user_key("telegram:222"):
+            got = mcp_tool._get_connected_server_for_call("linear")
+            assert got is srv_b
+    finally:
+        mcp_tool._servers.pop(key_a, None)
+        mcp_tool._servers.pop(key_b, None)

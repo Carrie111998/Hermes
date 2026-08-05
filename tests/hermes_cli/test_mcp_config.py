@@ -168,6 +168,94 @@ class TestMcpRemove:
         cmd_mcp_remove(_make_args(name="oauth-srv"))
         assert not token_file.exists()
 
+    def test_remove_wipes_all_by_user_tokens(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "oauth-srv": {"url": "https://example.com/mcp", "auth": "oauth"},
+        })
+        monkeypatch.setattr("builtins.input", lambda _: "y")
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
+        )
+
+        from tools.mcp_oauth import HermesTokenStorage
+
+        shared = HermesTokenStorage("oauth-srv", hermes_home=tmp_path)
+        user_a = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:111",
+        )
+        user_b = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:222",
+        )
+        for storage in (shared, user_a, user_b):
+            storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+            storage._tokens_path().write_text("{}")
+
+        from hermes_cli.mcp_config import cmd_mcp_remove
+
+        cmd_mcp_remove(_make_args(name="oauth-srv"))
+        assert not shared._tokens_path().exists()
+        assert not user_a._tokens_path().exists()
+        assert not user_b._tokens_path().exists()
+
+
+# ---------------------------------------------------------------------------
+# Tests: cmd_mcp_logout
+# ---------------------------------------------------------------------------
+
+class TestMcpLogout:
+    def test_logout_all_identities(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "oauth-srv": {"url": "https://example.com/mcp", "auth": "oauth"},
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
+        )
+        from tools.mcp_oauth import HermesTokenStorage
+
+        shared = HermesTokenStorage("oauth-srv", hermes_home=tmp_path)
+        user_a = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:111",
+        )
+        user_b = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:222",
+        )
+        for storage in (shared, user_a, user_b):
+            storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+            storage._tokens_path().write_text("{}")
+
+        from hermes_cli.mcp_config import cmd_mcp_logout
+
+        cmd_mcp_logout(_make_args(name="oauth-srv", user=""))
+        assert not shared._tokens_path().exists()
+        assert not user_a._tokens_path().exists()
+        assert not user_b._tokens_path().exists()
+        assert "all identities" in capsys.readouterr().out.lower()
+
+    def test_logout_one_user(self, tmp_path, capsys, monkeypatch):
+        _seed_config(tmp_path, {
+            "oauth-srv": {"url": "https://example.com/mcp", "auth": "oauth"},
+        })
+        monkeypatch.setattr(
+            "hermes_cli.mcp_config.get_hermes_home", lambda: tmp_path
+        )
+        from tools.mcp_oauth import HermesTokenStorage
+
+        user_a = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:111",
+        )
+        user_b = HermesTokenStorage(
+            "oauth-srv", hermes_home=tmp_path, user_key="telegram:222",
+        )
+        for storage in (user_a, user_b):
+            storage._tokens_path().parent.mkdir(parents=True, exist_ok=True)
+            storage._tokens_path().write_text("{}")
+
+        from hermes_cli.mcp_config import cmd_mcp_logout
+
+        cmd_mcp_logout(_make_args(name="oauth-srv", user="telegram:111"))
+        assert not user_a._tokens_path().exists()
+        assert user_b._tokens_path().exists()
+
 
 # ---------------------------------------------------------------------------
 # Tests: cmd_mcp_add

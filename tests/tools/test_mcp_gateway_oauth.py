@@ -117,3 +117,124 @@ def test_gateway_oauth_available_requires_notify(monkeypatch):
         assert mod.gateway_oauth_available() is True
     finally:
         approval.unregister_gateway_notify("telegram:42")
+
+
+def test_consent_failure_notify_timeout(gateway_notify):
+    from tools.mcp_gateway_oauth import (
+        GatewayOAuthFlow,
+        gateway_oauth_flow,
+        notify_gateway_consent_result,
+    )
+
+    flow, notify = _start_flow("telegram:1", gateway_notify=gateway_notify)
+    with gateway_oauth_flow(flow):
+        notify_gateway_consent_result(
+            session_key="telegram:1",
+            server_name="linear",
+            outcome="timeout",
+        )
+    kinds = [c.args[0]["kind"] for c in notify.call_args_list]
+    assert "mcp_oauth_consent_result" in kinds
+    result_payload = next(
+        c.args[0] for c in notify.call_args_list
+        if c.args[0]["kind"] == "mcp_oauth_consent_result"
+    )
+    assert "timed out" in result_payload["description"].lower()
+    assert "linear" in result_payload["description"]
+
+
+def test_consent_failure_notify_cancelled_and_state(gateway_notify):
+    from tools.mcp_gateway_oauth import (
+        classify_oauth_consent_failure,
+        notify_gateway_consent_result,
+    )
+
+    assert classify_oauth_consent_failure(TimeoutError("x")) == "timeout"
+    assert classify_oauth_consent_failure(RuntimeError("user_skipped")) == "cancelled"
+    assert classify_oauth_consent_failure(ValueError("state mismatch")) == "state_mismatch"
+
+    notify = MagicMock()
+    gateway_notify["telegram:9"] = notify
+    notify_gateway_consent_result(
+        session_key="telegram:9",
+        server_name="srv",
+        outcome="cancelled",
+    )
+    assert "cancelled" in notify.call_args[0][0]["description"].lower()
+
+
+def test_oauth_paste_wrong_session_rejected(gateway_notify):
+    """Paste on session B with A's state must not complete A's flow."""
+    from tools.mcp_gateway_oauth import gateway_oauth_flow, try_deliver_oauth_paste
+
+    flow_a, notify_a = _start_flow("telegram:111", gateway_notify=gateway_notify)
+    flow_b, _notify_b = _start_flow("telegram:222", gateway_notify=gateway_notify)
+    with gateway_oauth_flow(flow_a):
+        asyncio.run(
+            flow_a.publish_authorization_url(
+                "https://auth.example/authorize?state=stateA"
+            )
+        )
+        # Session B has its own flow with different state
+        with gateway_oauth_flow(flow_b):
+            asyncio.run(
+                flow_b.publish_authorization_url(
+                    "https://auth.example/authorize?state=stateB"
+                )
+            )
+            assert not try_deliver_oauth_paste(
+                "telegram:222",
+                "http://127.0.0.1:9/callback?code=tok&state=stateA",
+            )
+            assert not flow_a._callback_ready.is_set()
+            assert not flow_b._callback_ready.is_set()
+        # Completing on A still works
+        assert try_deliver_oauth_paste(
+            "telegram:111",
+            "http://127.0.0.1:9/callback?code=tok&state=stateA",
+        )
+        assert flow_a._callback == ("tok", "stateA")
+    # State-mismatch on B should have notified
+    assert any(
+        c.args[0].get("kind") == "mcp_oauth_consent_result"
+        and c.args[0].get("outcome") == "state_mismatch"
+        for c in gateway_notify["telegram:222"].call_args_list
+    )
+
+
+def test_start_gateway_reauth_publishes_url(monkeypatch, gateway_notify):
+    from tools import approval
+    from tools.mcp_gateway_oauth import (
+        GatewayOAuthFlow,
+        get_gateway_oauth_flow,
+        start_gateway_reauth_and_wait_for_url,
+    )
+
+    session_key = "telegram:42"
+    notify = MagicMock()
+    gateway_notify[session_key] = notify
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "get_current_session_key", lambda: session_key)
+    monkeypatch.setattr(
+        "tools.mcp_oauth_identity.current_oauth_user_key",
+        lambda require=False: "telegram:42",
+    )
+
+    def _reconnect():
+        flow = get_gateway_oauth_flow()
+        assert isinstance(flow, GatewayOAuthFlow)
+        asyncio.run(
+            flow.publish_authorization_url(
+                "https://auth.example/authorize?state=reauth1"
+            )
+        )
+        # Simulate user paste completing the wait inside reconnect.
+        flow.deliver_callback(code="c", state="reauth1")
+
+    url, user_key = start_gateway_reauth_and_wait_for_url(
+        "linear", reconnect_fn=_reconnect, wait_url_timeout=5.0,
+    )
+    assert url == "https://auth.example/authorize?state=reauth1"
+    assert user_key == "telegram:42"
+    assert notify.call_args_list
+    assert notify.call_args_list[0].args[0]["kind"] == "mcp_oauth_consent"

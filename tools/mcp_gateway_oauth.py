@@ -181,8 +181,124 @@ def try_deliver_oauth_paste(session_key: str, text: str) -> bool:
         logger.info(
             "MCP OAuth paste for session %s rejected: %s", session_key, exc
         )
+        notify_gateway_consent_result(
+            session_key=session_key,
+            server_name=flow.server_name,
+            outcome="state_mismatch",
+            detail=str(exc),
+        )
         return False
     return True
+
+
+# Consent failure / result copy delivered via the same notify path as the
+# authorize URL (kind: mcp_oauth_consent_result). Never include full URLs.
+_CONSENT_RESULT_MESSAGES = {
+    "timeout": (
+        "MCP OAuth timed out waiting for authorization for `{server}`. "
+        "Ask me to retry the MCP action when you are ready to authorize, "
+        "or paste the redirect URL sooner after approving in the browser."
+    ),
+    "cancelled": (
+        "MCP OAuth was cancelled for `{server}`. "
+        "Ask me to retry when you want to authorize again."
+    ),
+    "state_mismatch": (
+        "That paste did not match the pending MCP OAuth flow for `{server}` "
+        "(wrong or expired state). Open the authorize link from this chat "
+        "again, then paste the redirect URL from the same browser session."
+    ),
+    "failed": (
+        "MCP OAuth failed for `{server}`. "
+        "Ask me to retry the action, or have an operator run "
+        "`hermes mcp login {server}` on the host."
+    ),
+}
+
+
+def notify_gateway_consent_result(
+    *,
+    session_key: str,
+    server_name: str,
+    outcome: str,
+    detail: str = "",
+) -> None:
+    """Send an actionable in-chat message for a finished/failed consent flow."""
+    from tools.approval import _gateway_notify_cbs, _lock
+
+    template = _CONSENT_RESULT_MESSAGES.get(outcome) or _CONSENT_RESULT_MESSAGES["failed"]
+    message = template.format(server=server_name)
+    if detail and outcome == "failed":
+        # Keep detail short and URL-free for the chat surface.
+        cleaned = detail.replace("\n", " ").strip()
+        if "http://" in cleaned or "https://" in cleaned:
+            cleaned = cleaned.split("http", 1)[0].strip(" :")
+        if cleaned and len(cleaned) < 200:
+            message = f"{message} ({cleaned})"
+
+    with _lock:
+        notify_cb = _gateway_notify_cbs.get(session_key)
+    if notify_cb is None:
+        logger.debug(
+            "No gateway notify for MCP OAuth consent result (%s / %s)",
+            server_name, outcome,
+        )
+        return
+    try:
+        notify_cb(
+            {
+                "kind": "mcp_oauth_consent_result",
+                "server_name": server_name,
+                "outcome": outcome,
+                "command": message,
+                "description": message,
+                "pattern_key": "mcp_oauth_consent_result",
+                "pattern_keys": ["mcp_oauth_consent_result"],
+            }
+        )
+    except Exception as exc:
+        logger.warning(
+            "Failed to deliver MCP OAuth consent result for '%s': %s",
+            server_name, exc,
+        )
+
+
+def classify_oauth_consent_failure(exc: BaseException) -> str:
+    """Map an OAuth/connect exception to a consent-result outcome key."""
+    text = str(exc).lower()
+    name = type(exc).__name__.lower()
+    if isinstance(exc, TimeoutError) or "timed out" in text or "timeout" in name:
+        return "timeout"
+    if "user_skipped" in text or ("skip" in text and "oauth" in text):
+        return "cancelled"
+    if "access_denied" in text or "cancelled" in text or "canceled" in text:
+        return "cancelled"
+    if "state mismatch" in text or ("state" in text and "mismatch" in text):
+        return "state_mismatch"
+    return "failed"
+
+
+def notify_consent_failure_for_active_flow(
+    *,
+    session_key: str | None = None,
+    exc: BaseException | None = None,
+    outcome: str | None = None,
+) -> None:
+    """Notify the chat about a failed consent when a gateway flow is active."""
+    flow = get_gateway_oauth_flow()
+    if flow is None and session_key:
+        flow = get_active_gateway_oauth_flow(session_key)
+    if flow is None:
+        return
+    resolved = outcome or (
+        classify_oauth_consent_failure(exc) if exc is not None else "failed"
+    )
+    notify_gateway_consent_result(
+        session_key=flow.session_key,
+        server_name=flow.server_name,
+        outcome=resolved,
+        detail=str(exc) if exc is not None else "",
+    )
 
 
 def _parse_oauth_paste(text: str) -> tuple[str | None, str | None, str | None]:
@@ -204,6 +320,80 @@ def _parse_oauth_paste(text: str) -> tuple[str | None, str | None, str | None]:
     if code or error:
         return code, state, error
     return None, None, None
+
+
+def start_gateway_reauth_and_wait_for_url(
+    server_name: str,
+    *,
+    reconnect_fn,
+    wait_url_timeout: float = 45.0,
+) -> tuple[str | None, str]:
+    """Begin gateway OAuth reauth; return ``(authorization_url, user_key)``.
+
+    ``reconnect_fn`` is a zero-arg callable that rebuilds the MCP session
+    (tokens already cleared by the caller). It runs in a background thread
+    under :class:`GatewayOAuthFlow` so the redirect handler can publish the
+    URL while this function waits for ``_authorization_ready``.
+
+    The flow stays registered until ``reconnect_fn`` finishes (callback,
+    timeout, or failure) so paste-back still works after this returns.
+    """
+    from tools.approval import get_current_session_key
+    from tools.mcp_oauth import force_interactive_oauth
+    from tools.mcp_oauth_identity import current_oauth_user_key
+
+    if not gateway_oauth_available():
+        return None, current_oauth_user_key(require=False)
+
+    session_key = get_current_session_key()
+    if not session_key:
+        return None, current_oauth_user_key(require=False)
+
+    user_key = current_oauth_user_key(require=False)
+    flow = GatewayOAuthFlow(
+        server_name=server_name,
+        session_key=session_key,
+        user_key=user_key,
+    )
+
+    done = threading.Event()
+    worker_exc: list[BaseException] = []
+
+    def _worker() -> None:
+        try:
+            with gateway_oauth_flow(flow), force_interactive_oauth():
+                try:
+                    reconnect_fn()
+                except BaseException as exc:  # noqa: BLE001 — surface to chat
+                    # Notify while the flow is still bound so session lookup works.
+                    notify_gateway_consent_result(
+                        session_key=session_key,
+                        server_name=server_name,
+                        outcome=classify_oauth_consent_failure(exc),
+                        detail=str(exc),
+                    )
+                    raise
+        except BaseException as exc:  # noqa: BLE001
+            worker_exc.append(exc)
+        finally:
+            done.set()
+
+    thread = threading.Thread(
+        target=_worker,
+        name=f"mcp-oauth-reauth-{server_name}",
+        daemon=True,
+    )
+    thread.start()
+
+    # Wait until the authorize URL is published, or the worker ends early.
+    while not flow._authorization_ready.wait(timeout=0.25):
+        if done.is_set():
+            break
+        wait_url_timeout -= 0.25
+        if wait_url_timeout <= 0:
+            break
+
+    return flow.authorization_url, user_key
 
 
 def _deliver_consent_url_to_gateway(

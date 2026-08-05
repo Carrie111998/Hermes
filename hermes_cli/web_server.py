@@ -12164,9 +12164,12 @@ def _run_dashboard_mcp_oauth(flow, cfg: dict) -> None:
                 backup = storage.snapshot()
                 previous_entry = None
                 try:
+                    # Re-auth clears only the shared/dashboard identity —
+                    # never wipe every by-user token tree (#78174).
                     previous_entry = manager.remove(
                         flow.server_name,
                         hermes_home=flow.hermes_home,
+                        all_identities=False,
                     )
                     tools = _probe_single_server(
                         flow.server_name,

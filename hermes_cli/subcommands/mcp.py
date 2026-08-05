@@ -99,6 +99,20 @@ def build_mcp_parser(subparsers, *, cmd_mcp: Callable) -> None:
         ),
     )
 
+    mcp_logout_p = mcp_sub.add_parser(
+        "logout",
+        help="Clear stored OAuth tokens for an MCP server (keeps config)",
+    )
+    mcp_logout_p.add_argument("name", help="Server name to log out of")
+    mcp_logout_p.add_argument(
+        "--user",
+        default="",
+        help=(
+            "Clear only mcp-tokens/by-user/<key>/ for this server. "
+            "Omit to wipe shared + all by-user identities."
+        ),
+    )
+
     mcp_reauth_p = mcp_sub.add_parser(
         "reauth",
         help="Re-authenticate one OAuth MCP server, or all of them (--all)",

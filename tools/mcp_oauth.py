@@ -1088,7 +1088,7 @@ def remove_oauth_tokens(
     hermes_home: str | Path | None = None,
     user_key: str | None = None,
 ) -> None:
-    """Delete stored OAuth tokens and client info for a server."""
+    """Delete stored OAuth tokens and client info for a server identity."""
     storage = HermesTokenStorage(
         server_name, hermes_home=hermes_home, user_key=user_key,
     )
@@ -1099,6 +1099,61 @@ def remove_oauth_tokens(
         )
     else:
         logger.info("OAuth tokens removed for '%s'", server_name)
+
+
+def remove_all_oauth_tokens_for_server(
+    server_name: str,
+    *,
+    hermes_home: str | Path | None = None,
+) -> list[str]:
+    """Delete shared + every by-user OAuth state file for ``server_name``.
+
+    Returns the list of identity keys cleared: empty string for the shared
+    path, plus each ``by-user/<key>/`` directory name that had matching files.
+    """
+    safe = _safe_filename(server_name)
+    cleared: list[str] = []
+
+    # Shared profile path
+    shared = HermesTokenStorage(server_name, hermes_home=hermes_home)
+    had_shared = any(
+        p.exists()
+        for p in (shared._tokens_path(), shared._client_info_path(), shared._meta_path())
+    )
+    shared.remove()
+    if had_shared:
+        cleared.append("")
+
+    # Per-user trees: mcp-tokens/by-user/<user_key>/<server>.*
+    by_user_root = _get_token_dir(hermes_home) / "by-user"
+    if by_user_root.is_dir():
+        for user_dir in sorted(by_user_root.iterdir()):
+            if not user_dir.is_dir():
+                continue
+            paths = [
+                user_dir / f"{safe}.json",
+                user_dir / f"{safe}.client.json",
+                user_dir / f"{safe}.meta.json",
+            ]
+            if not any(p.exists() for p in paths):
+                continue
+            for p in paths:
+                p.unlink(missing_ok=True)
+            cleared.append(user_dir.name)
+            # Drop empty user dirs
+            try:
+                next(user_dir.iterdir())
+            except StopIteration:
+                try:
+                    user_dir.rmdir()
+                except OSError:
+                    pass
+
+    logger.info(
+        "OAuth tokens removed for '%s' across %d identity path(s)",
+        server_name, len(cleared),
+    )
+    return cleared
 
 
 # ---------------------------------------------------------------------------

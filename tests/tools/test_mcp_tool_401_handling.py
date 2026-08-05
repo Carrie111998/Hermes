@@ -104,3 +104,72 @@ def test_call_tool_handler_non_auth_error_still_generic(monkeypatch, tmp_path):
     finally:
         mcp_tool._servers.pop("srv", None)
         mcp_tool._server_error_counts.pop("srv", None)
+
+
+def test_needs_reauth_includes_authorization_url_when_gateway_publishes(
+    monkeypatch, tmp_path,
+):
+    """Unrecovered 401 in a gateway session returns authorization_url."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    from tools import mcp_tool
+    from tools import approval
+    from tools.mcp_oauth_manager import get_manager, reset_manager_for_tests
+    from mcp.client.auth import OAuthFlowError
+
+    reset_manager_for_tests()
+    mcp_tool._ensure_mcp_loop()
+
+    server = MagicMock()
+    server.name = "srv"
+    session = MagicMock()
+
+    async def _call_tool_raises(*a, **kw):
+        raise OAuthFlowError("token expired")
+
+    session.call_tool = _call_tool_raises
+    server.session = session
+    server._reconnect_event = MagicMock()
+    server._ready = MagicMock()
+    server._ready.is_set.return_value = True
+
+    mcp_tool._servers["srv"] = server
+    mcp_tool._server_error_counts.pop("srv", None)
+
+    mgr = get_manager()
+
+    async def _h401(name, token=None, user_key=""):
+        return False
+
+    monkeypatch.setattr(mgr, "handle_401", _h401)
+
+    notify = MagicMock()
+    monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: True)
+    monkeypatch.setattr(approval, "get_current_session_key", lambda: "telegram:7")
+    approval.register_gateway_notify("telegram:7", notify)
+
+    def _fake_start(server_name, *, reconnect_fn, wait_url_timeout=45.0):
+        return "https://auth.example/authorize?state=xyz", "telegram:7"
+
+    monkeypatch.setattr(
+        "tools.mcp_gateway_oauth.start_gateway_reauth_and_wait_for_url",
+        _fake_start,
+    )
+    monkeypatch.setattr(
+        "tools.mcp_gateway_oauth.gateway_oauth_available", lambda: True,
+    )
+
+    try:
+        handler = mcp_tool._make_tool_handler("srv", "tool1", 10.0)
+        result = handler({"arg": "v"})
+        parsed = json.loads(result)
+        assert parsed.get("needs_reauth") is True
+        assert parsed.get("authorization_url") == (
+            "https://auth.example/authorize?state=xyz"
+        )
+        assert "chat" in parsed.get("error", "").lower()
+        assert parsed.get("user_key") == "telegram:7"
+    finally:
+        approval.unregister_gateway_notify("telegram:7")
+        mcp_tool._servers.pop("srv", None)
+        mcp_tool._server_error_counts.pop("srv", None)
