@@ -181,8 +181,8 @@ def _iter_referenced_shell_scripts(
     command: str,
     *,
     cwd: Optional[str] = None,
-) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+) -> Iterator[tuple[Path, bool]]:
+    """Yield ``(script, shell_invoked)`` references from a command."""
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
@@ -192,7 +192,7 @@ def _iter_referenced_shell_scripts(
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                yield _resolve_terminal_script_path(segment[index + 1], cwd)
+                yield _resolve_terminal_script_path(segment[index + 1], cwd), True
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -216,7 +216,7 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                yield _resolve_terminal_script_path(arguments[arg_index], cwd)
+                yield _resolve_terminal_script_path(arguments[arg_index], cwd), True
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -226,7 +226,7 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                yield _resolve_terminal_script_path(executable, cwd), False
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -253,11 +253,15 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
     return None
 
 
-def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
+def _read_referenced_script(path: Path, *, shell_invoked: bool = False) -> tuple[Optional[str], bool]:
     """Return ``(text, unsafe)`` using bounded, regular-file-only reads."""
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
+    except ValueError:
+        # An embedded NUL path cannot be read safely and must not fall through
+        # to a remote callback.
+        return None, True
     except OSError:
         return None, False
     try:
@@ -272,14 +276,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         return None, False
     finally:
         os.close(descriptor)
-    # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
-    # PE), not a shell script — scanning its decoded contents would
-    # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
+    # A NUL-bearing shebang file (or a file passed to a shell) is still a
+    # shell script: bash/sh can execute its suffix. Native executables are not.
     if b"\x00" in data:
-        return None, False
+        return None, shell_invoked or data.startswith(b"#!")
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
@@ -310,7 +310,7 @@ def _contains_unsafe_gateway_action(
         ):
             return True
 
-    for script_path in _iter_referenced_shell_scripts(command, cwd=cwd):
+    for script_path, shell_invoked in _iter_referenced_shell_scripts(command, cwd=cwd):
         try:
             resolved = script_path.resolve(strict=False)
         except (OSError, ValueError):
@@ -321,12 +321,14 @@ def _contains_unsafe_gateway_action(
         if resolved in visited:
             continue
         visited.add(resolved)
-        script_text, unsafe = _read_referenced_script(script_path)
+        script_text, unsafe = _read_referenced_script(script_path, shell_invoked=shell_invoked)
         if unsafe:
             return True
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+            if script_text is not None and "\x00" in script_text:
+                return shell_invoked or script_text.startswith("#!")
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
@@ -387,7 +389,12 @@ def _read_script_for_scanning(script_path: str) -> str:
     sentinel, while missing/unreadable paths remain empty so ordinary scheduler
     path validation can report them.
     """
-    script_text, unsafe = _read_referenced_script(_resolve_script_path(script_path))
+    resolved_script = _resolve_script_path(script_path)
+    shell_invoked = resolved_script.suffix.lower() in {".sh", ".bash"}
+    script_text, unsafe = _read_referenced_script(
+        resolved_script,
+        shell_invoked=shell_invoked,
+    )
     if unsafe:
         return "hermes gateway restart"
     return script_text or ""

@@ -516,6 +516,27 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == [command]
 
+    def test_remote_nul_bearing_script_is_blocked(self, monkeypatch):
+        """Terminal remote fallback preserves NUL shell content for the guard."""
+        import tools.terminal_tool as tt
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            cwd = "/remote"
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "#!/bin/bash\n\x00printf safe\n", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        result = json.loads(tt.terminal_tool(command="/bin/bash remote-nul.sh"))
+
+        assert result["exit_code"] == 1
+        assert "referenced script" in result["error"]
+        assert calls == ["cat /remote/remote-nul.sh"]
+
     def test_safe_referenced_script_passes_through(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
 
@@ -694,6 +715,69 @@ class TestLifecycleGuardModule:
             '/usr/bin/python3 -c "print(1)"'
         )
         assert result is False
+
+    def test_nul_bearing_shell_script_fails_closed(self, tmp_path):
+        """bash/sh can execute content after a NUL byte."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        script = tmp_path / "nul-shell.sh"
+        script.write_bytes(b"#!/bin/bash\n\x00printf safe\n")
+        assert contains_gateway_lifecycle_command_or_referenced_script(str(script)) is True
+
+    def test_plain_shell_script_with_nul_fails_closed(self, tmp_path):
+        """Cron treats .sh/.bash as shell scripts even without a shebang."""
+        from cron.lifecycle_guard import GatewayLifecycleBlocked, check_gateway_lifecycle
+
+        script = tmp_path / "plain-nul.sh"
+        script.write_bytes(b"printf safe\n\x00hermes gateway restart\n")
+        with pytest.raises(GatewayLifecycleBlocked):
+            check_gateway_lifecycle("clean prompt", str(script))
+
+    def test_remote_plain_shell_script_with_nul_fails_closed(self):
+        """Remote reads must also fail closed for shell-invoked scripts."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/bin/bash /remote/plain-nul.sh",
+            read_remote_script=lambda _path: "printf safe\n\x00hermes gateway restart\n",
+        ) is True
+
+    def test_remote_nul_bearing_shell_script_fails_closed(self):
+        """Remote script reads follow the same NUL fail-closed rule."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/remote/nul-shell.sh",
+            read_remote_script=lambda _path: "#!/bin/bash\n\x00printf safe\n",
+        ) is True
+
+    def test_nul_path_blocks_without_remote_fallback(self):
+        """NUL paths must not crash or re-enter the remote callback."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        reads = []
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/remote/nul\x00shell.sh", read_remote_script=lambda path: reads.append(path)
+        ) is True
+        assert reads == []
+
+    def test_native_executable_with_nul_is_not_a_shell_script(self, tmp_path):
+        """A direct native executable remains allowed despite NUL bytes."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        binary = tmp_path / "tool"
+        binary.write_bytes(b"\x7fELF\x02\x01\x00\x00")
+        assert contains_gateway_lifecycle_command_or_referenced_script(str(binary)) is False
+
+    def test_remote_binary_fallback_remains_safe(self):
+        """#77729 regression: remote binary bytes do not crash or block."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        binary_blob = "\x7fELF\x01\x01\n/opt/bin/tool\x00\x01 --run\n"
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            "/home/zedi/venv/bin/python --version",
+            read_remote_script=lambda _path: binary_blob,
+        ) is False
 
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
