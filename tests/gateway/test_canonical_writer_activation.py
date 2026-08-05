@@ -1575,6 +1575,16 @@ def test_native_observation_uses_exact_pre_phase_b_writer_start(
 
     assert activation.PRE_PHASE_B_WRITER_START_ARGV in commands
     assert [path for path, _value in writes] == [failure, quarantine]
+    assert {value["stage"] for _path, value in writes} == {"start_writer"}
+    assert all(value["stage_preserved"] is False for _path, value in writes)
+    assert all(
+        value["host_preparation_evidence"]
+        == {
+            "receipt_path": str(tmp_path / "host.json"),
+            "receipt_sha256": "d" * 64,
+        }
+        for _path, value in writes
+    )
 
 
 def test_host_identity_convergence_retries_only_until_exact(monkeypatch):

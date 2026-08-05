@@ -925,10 +925,13 @@ def _write_failed_native_bundle(
     *,
     host_identity_convergence_failure: bool = False,
     install_failure: bool = False,
+    post_install_failure_stage: str | None = None,
     installed_live_artifacts: bool = False,
     current_native_schema: bool = False,
 ) -> tuple[dict[Path, bytes], bytes, bytes]:
-    if host_identity_convergence_failure and install_failure:
+    if (
+        host_identity_convergence_failure and install_failure
+    ) or (post_install_failure_stage is not None and not install_failure):
         raise ValueError("test failure shape must be exact")
     writer_unit = b"[Service]\nExecStart=/writer\n"
     gateway_unit = b"[Service]\nExecStart=/gateway\n"
@@ -1119,7 +1122,7 @@ def _write_failed_native_bundle(
                 "group_gid": 0,
                 "live_path": str(recovery.DEFAULT_EXTERNAL_IAM_LIVE_PATH),
             },
-            "stage": "install",
+            "stage": post_install_failure_stage or "install",
             "error_type": "ValueError",
             "error_sha256": recovery.hashlib.sha256(
                 b"ValueError:activation parent path is unavailable"
@@ -1285,6 +1288,66 @@ def test_apply_archives_exact_native_install_failure_chain(
     assert receipt["failure_receipt_preserved"] is True
 
 
+def test_post_install_failure_recovery_requires_exact_live_artifacts(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        post_install_failure_stage="start_writer",
+        current_native_schema=True,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="post-install native failure lacks installed artifacts",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+@pytest.mark.parametrize("failure_stage", ["start_gateway", "collect_native"])
+def test_later_native_failure_stages_remain_fail_closed(
+    recovery_tree: dict[str, Any],
+    failure_stage: str,
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        post_install_failure_stage=failure_stage,
+        installed_live_artifacts=True,
+        current_native_schema=True,
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="native failure quarantine binding is invalid",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_start_writer_failure_rejects_preserved_native_stage(
+    recovery_tree: dict[str, Any],
+) -> None:
+    _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        post_install_failure_stage="start_writer",
+        installed_live_artifacts=True,
+        current_native_schema=True,
+    )
+    failure = json.loads(recovery_tree["quarantine_path"].read_text())
+    failure["stage_preserved"] = True
+    failure_raw = recovery._canonical_bytes(failure)
+    Path(failure["failure_receipt_path"]).write_bytes(failure_raw)
+    recovery_tree["quarantine_path"].write_bytes(failure_raw)
+
+    with pytest.raises(
+        ValueError,
+        match="native failure quarantine binding is invalid",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
 def test_install_failure_recovery_archives_exact_live_artifacts_and_reloads(
     recovery_tree: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
@@ -1416,13 +1479,20 @@ def test_install_failure_recovery_archives_exact_live_artifacts_and_reloads(
     assert receipt["service_states_after"] == after
 
 
-def test_v3_install_crash_recovery_archives_static_readiness_and_resumes(
+@pytest.mark.parametrize(
+    "post_install_failure_stage",
+    [None, "start_writer"],
+    ids=["install", "start-writer"],
+)
+def test_v3_native_crash_recovery_archives_static_readiness_and_resumes(
     recovery_tree: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,
+    post_install_failure_stage: str | None,
 ) -> None:
     _write_failed_native_bundle(
         recovery_tree,
         install_failure=True,
+        post_install_failure_stage=post_install_failure_stage,
         installed_live_artifacts=True,
         current_native_schema=True,
     )
