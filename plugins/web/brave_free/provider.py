@@ -1,4 +1,4 @@
-"""Brave Search (free tier) — plugin form.
+"""Brave Search — plugin form.
 
 Subclasses :class:`agent.web_search_provider.WebSearchProvider` (the
 plugin-facing ABC). The legacy in-tree module
@@ -14,7 +14,7 @@ Config keys this provider responds to::
 
 Auth env var::
 
-    BRAVE_SEARCH_API_KEY=...    # https://brave.com/search/api/ (free tier)
+    BRAVE_SEARCH_API_KEY=...    # https://brave.com/search/api/ (paid API, card required)
 """
 
 from __future__ import annotations
@@ -31,10 +31,11 @@ _BRAVE_ENDPOINT = "https://api.search.brave.com/res/v1/web/search"
 
 
 class BraveFreeWebSearchProvider(WebSearchProvider):
-    """Search-only Brave provider using the free-tier Data-for-Search API.
+    """Search-only Brave provider using Brave's Data-for-Search API.
 
-    Free tier is 2,000 queries/month (1 qps). No content-extraction capability —
-    users pair this with Firecrawl/Tavily/Exa for ``web_extract``.
+    Brave's API is paid (USD $5 per 1,000 requests; the provider id
+    ``brave-free`` is legacy). No content-extraction capability — users
+    pair this with Firecrawl/Tavily/Exa for ``web_extract``.
     """
 
     @property
@@ -45,7 +46,7 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
 
     @property
     def display_name(self) -> str:
-        return "Brave Search (Free)"
+        return "Brave Search"
 
     def is_available(self) -> bool:
         """Return True when ``BRAVE_SEARCH_API_KEY`` is set to a non-empty value."""
@@ -128,13 +129,13 @@ class BraveFreeWebSearchProvider(WebSearchProvider):
 
     def get_setup_schema(self) -> Dict[str, Any]:
         return {
-            "name": "Brave Search (Free)",
-            "badge": "free",
-            "tag": "Free-tier API key — 2k queries/mo, search only.",
+            "name": "Brave Search",
+            "badge": "paid",
+            "tag": "Paid API — USD $5 per 1,000 requests; credit card required at signup. Search only.",
             "env_vars": [
                 {
                     "key": "BRAVE_SEARCH_API_KEY",
-                    "prompt": "Brave Search API key (free tier)",
+                    "prompt": "Brave Search API key",
                     "url": "https://brave.com/search/api/",
                 },
             ],
