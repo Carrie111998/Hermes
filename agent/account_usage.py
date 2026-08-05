@@ -507,6 +507,21 @@ def _resolve_codex_usage_credentials(
     return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip(), None
 
 
+# A day, in seconds — the split between Codex's 5h "Session" window and its
+# 7-day "Weekly" window. Codex reorders these across slots (when the weekly cap
+# is reached it moves the 7-day window into primary_window and nulls
+# secondary_window), so the label must come from the window's own duration, not
+# its slot position.
+_CODEX_SESSION_MAX_SECONDS = 86400
+
+
+def _codex_window_label(window: dict, fallback_label: str) -> str:
+    secs = window.get("limit_window_seconds")
+    if isinstance(secs, (int, float)):
+        return "Session" if secs < _CODEX_SESSION_MAX_SECONDS else "Weekly"
+    return fallback_label
+
+
 def _fetch_codex_account_usage(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
@@ -525,14 +540,14 @@ def _fetch_codex_account_usage(
     payload = response.json() or {}
     rate_limit = payload.get("rate_limit") or {}
     windows: list[AccountUsageWindow] = []
-    for key, label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
+    for key, fallback_label in (("primary_window", "Session"), ("secondary_window", "Weekly")):
         window = rate_limit.get(key) or {}
         used = window.get("used_percent")
         if used is None:
             continue
         windows.append(
             AccountUsageWindow(
-                label=label,
+                label=_codex_window_label(window, fallback_label),
                 used_percent=float(used),
                 reset_at=_parse_dt(window.get("reset_at")),
             )

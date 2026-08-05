@@ -78,6 +78,77 @@ def test_codex_usage_prefers_explicit_live_agent_credentials(monkeypatch, codex_
     assert calls[0]["headers"]["Authorization"] == "Bearer live-agent-token"
 
 
+def test_codex_weekly_limit_in_primary_slot_labels_weekly(monkeypatch):
+    # When the weekly cap is reached, Codex's /usage puts the 7-day window in
+    # primary_window (limit_window_seconds=604800) and nulls secondary_window.
+    # The label must come from the window's duration, so a maxed weekly window
+    # reads "Weekly" — not "Session" from its slot position.
+    payload = {
+        "plan_type": "pro",
+        "rate_limit": {
+            "allowed": False,
+            "limit_reached": True,
+            "primary_window": {
+                "used_percent": 100,
+                "limit_window_seconds": 604800,
+                "reset_at": 1786159971,
+            },
+            "secondary_window": None,
+        },
+        "credits": {"has_credits": False},
+    }
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx, "Client", lambda timeout: _FakeClient(calls, payload)
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert [w.label for w in snapshot.windows] == ["Weekly"]
+    assert snapshot.windows[0].used_percent == 100
+
+
+def test_codex_labels_windows_by_duration_not_slot(monkeypatch):
+    # Labels derive from limit_window_seconds, not slot order: a 5h window is
+    # "Session" and a 7d window is "Weekly" wherever Codex places them.
+    payload = {
+        "plan_type": "pro",
+        "rate_limit": {
+            "primary_window": {
+                "used_percent": 88,
+                "limit_window_seconds": 604800,
+                "reset_at": 1786159971,
+            },
+            "secondary_window": {
+                "used_percent": 12,
+                "limit_window_seconds": 18000,
+                "reset_at": 1779846359,
+            },
+        },
+        "credits": {"has_credits": False},
+    }
+    calls = []
+    monkeypatch.setattr(
+        account_usage.httpx, "Client", lambda timeout: _FakeClient(calls, payload)
+    )
+
+    snapshot = account_usage.fetch_account_usage(
+        "openai-codex",
+        base_url="https://chatgpt.com/backend-api/codex",
+        api_key="live-agent-token",
+    )
+
+    assert snapshot is not None
+    assert [w.label for w in snapshot.windows] == ["Weekly", "Session"]
+    assert snapshot.windows[0].used_percent == 88
+    assert snapshot.windows[1].used_percent == 12
+
+
 def test_codex_usage_falls_back_to_native_credential_pool(monkeypatch, codex_usage_payload):
     calls = []
     monkeypatch.setattr(
