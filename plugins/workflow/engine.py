@@ -3993,33 +3993,20 @@ class WorkflowEngine:
                                     if _l is None:
                                         _l = 3
                                     return _l
-                                # 3) Enrich upstream + reset to ready for
-                                #    re-work (FAIL comment stays — it is the
-                                #    feedback the author must address).
-                                if upstream_state.kanban_card_id:
-                                    try:
-                                        with kanban_db.connect_closing(board=self.kanban_board) as conn:
-                                            kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Failed ({nid}):\n{reviewer_body}")
-                                            conn.execute(
-                                                "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
-                                                (upstream_state.kanban_card_id,)
-                                            )
-                                            kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
-                                            conn.commit()
-                                        upstream_state.status = "ready"
-                                        upstream_state.completed_at = None
-                                        upstream_state.result = None
-                                        print(f"   ↩  {reviewer_for} enriched with FAIL results, reset to ready")
-                                    except Exception as e:
-                                        print(f"   ⚠  Failed to enrich upstream card: {e}")
-                                # 4) Reset every reviewer of the upstream
-                                #    (respecting each one's retry limit).
-                                #    Reviewers that NEVER reviewed (count 0)
-                                #    always get their chance — the limit
-                                #    only applies to reviewers with prior
-                                #    rounds.
+                                # 3) EXHAUSTION CHECK FIRST (before any
+                                #    upstream reset): resolve each reviewer's
+                                #    next round and detect whether the chain
+                                #    has budget. If ANY reviewer exhausts,
+                                #    the run is dead — the upstream must stay
+                                #    DONE (resetting it to ready would let the
+                                #    dispatcher re-run it, the completion hook
+                                #    re-spawn the supervisor, and the loop spin
+                                #    forever — seen live 2026-08-05: implement
+                                #    re-ran 6x after exhaustion, verify counts
+                                #    inflated 4/1).
                                 _any_reset = False
                                 _exhausted = False
+                                _exhausted_rev = None
                                 for _rentry in (upstream_node.reviews or []):
                                     _rev = _rentry if isinstance(_rentry, str) else _rentry.get("review", "")
                                     if not _rev or _rev not in states:
@@ -4030,56 +4017,89 @@ class WorkflowEngine:
                                         _rounds = _prior + 1
                                         upstream_state.review_counts[_rev] = _rounds
                                         if _rounds > _lim:
-                                            print(f"   ⛔ {_rev} review limit reached ({_rounds}/{_lim}) — leaving terminal")
-                                            # The reviewer is done-based exhausted: its card is
-                                            # DONE (with the FAIL verdict) but the workflow node
-                                            # is terminal. Mark the NODE state blocked so the run
-                                            # ends final_status='blocked' and the BLOCKED
-                                            # notification fires — otherwise the run is declared
-                                            # 'completed' with a live review loop (found live
-                                            # 2026-08-05 review-loop-exhaust-test: verify round 2
-                                            # exhausted, run ended '1 done, 0 blocked', state file
-                                            # showed verify 'running').
-                                            # Exhaustion STOPS the review chain: no other
-                                            # reviewer is reset and no rewind happens — the run
-                                            # terminates blocked (Randy's bounded-loop model).
-                                            states[_rev].status = "blocked"
-                                            states[_rev].error = (
-                                                f"Review limit reached ({_rounds}/{_lim}) — "
-                                                f"reviewer {_rev} exhausted; needs intervention"
-                                            )
                                             _exhausted = True
+                                            _exhausted_rev = _rev
                                             break
                                     else:
-                                        # Never reviewed — first round now.
                                         upstream_state.review_counts[_rev] = 1
                                         _rounds = 1
-                                    states[_rev].status = "pending"
-                                    # SAME-CARD (Randy 2026-08-05): keep the
-                                    # reviewer's card so its comment history
-                                    # (prior verdicts) loads as context for
-                                    # the next round. The dispatch loop
-                                    # resets it to ready when the layer
-                                    # re-dispatches. Done-based rounds never
-                                    # touched 'blocked', so kanban's
-                                    # BLOCK_RECURRENCE_LIMIT is irrelevant
-                                    # here (Randy 2026-08-05: "We don't move
-                                    # cards to blocked").
-                                    states[_rev].completed_at = None
-                                    states[_rev].result = None
-                                    _any_reset = True
-                                    print(f"   🔄 {_rev} reset for re-review (round {_rounds}/{_lim}, same card)")
-                                # 5) Rewind the layer loop to the upstream's
-                                #    layer so the revised work re-dispatches;
-                                #    reviewers reuse their existing cards.
-                                #    On exhaustion there is NO rewind — the
-                                #    chain is dead; the run ends blocked.
-                                if _any_reset and not _exhausted:
-                                    for _li, _ln in enumerate(layers):
-                                        if reviewer_for in _ln:
-                                            self._rewind_to_layer = _li
-                                            print(f"   ↩  Rewinding to layer {_li + 1} ({reviewer_for}) for re-review")
-                                            break
+                                if _exhausted:
+                                    print(f"   ⛔ {_exhausted_rev} review limit reached ({upstream_state.review_counts[_exhausted_rev]}/{_review_limit(_exhausted_rev)}) — leaving terminal")
+                                    # The reviewer is done-based exhausted: its card is
+                                    # DONE (with the FAIL verdict) but the workflow node
+                                    # is terminal. Mark the NODE state blocked so the run
+                                    # ends final_status='blocked' and the BLOCKED
+                                    # notification fires. Exhaustion STOPS the review
+                                    # chain: no other reviewer is reset, no upstream
+                                    # reset, no rewind — the run terminates blocked
+                                    # (Randy's bounded-loop model).
+                                    states[_exhausted_rev].status = "blocked"
+                                    states[_exhausted_rev].error = (
+                                        f"Review limit reached ({upstream_state.review_counts[_exhausted_rev]}/{_review_limit(_exhausted_rev)}) — "
+                                        f"reviewer {_exhausted_rev} exhausted; needs intervention"
+                                    )
+                                    # Leave upstream DONE — no ready reset, no rewind.
+                                else:
+                                    # 4) Chain continues: enrich upstream + reset to
+                                    #    ready for re-work (FAIL comment stays — it is
+                                    #    the feedback the author must address).
+                                    if upstream_state.kanban_card_id:
+                                        try:
+                                            with kanban_db.connect_closing(board=self.kanban_board) as conn:
+                                                kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Failed ({nid}):\n{reviewer_body}")
+                                                conn.execute(
+                                                    "UPDATE tasks SET status = 'ready', completed_at = NULL, block_recurrences = 0 WHERE id = ?",
+                                                    (upstream_state.kanban_card_id,)
+                                                )
+                                                kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
+                                                conn.commit()
+                                            upstream_state.status = "ready"
+                                            upstream_state.completed_at = None
+                                            upstream_state.result = None
+                                            print(f"   ↩  {reviewer_for} enriched with FAIL results, reset to ready")
+                                        except Exception as e:
+                                            print(f"   ⚠  Failed to enrich upstream card: {e}")
+                                    # 5) Reset every reviewer of the upstream
+                                    #    (respecting each one's retry limit).
+                                    #    Reviewers that NEVER reviewed (count 0)
+                                    #    always get their chance — the limit
+                                    #    only applies to reviewers with prior
+                                    #    rounds.
+                                    for _rentry2 in (upstream_node.reviews or []):
+                                        _rev = _rentry2 if isinstance(_rentry2, str) else _rentry2.get("review", "")
+                                        if not _rev or _rev not in states:
+                                            continue
+                                        # Round counts were ALREADY bumped by
+                                        # the step-3 exhaustion check — read,
+                                        # never re-bump (double-count bug).
+                                        _rounds = upstream_state.review_counts.get(_rev, 0)
+                                        _lim = _review_limit(_rev)
+                                        states[_rev].status = "pending"
+                                        # SAME-CARD (Randy 2026-08-05): keep the
+                                        # reviewer's card so its comment history
+                                        # (prior verdicts) loads as context for
+                                        # the next round. The dispatch loop
+                                        # resets it to ready when the layer
+                                        # re-dispatches. Done-based rounds never
+                                        # touched 'blocked', so kanban's
+                                        # BLOCK_RECURRENCE_LIMIT is irrelevant
+                                        # here (Randy 2026-08-05: "We don't move
+                                        # cards to blocked").
+                                        states[_rev].completed_at = None
+                                        states[_rev].result = None
+                                        _any_reset = True
+                                        print(f"   🔄 {_rev} reset for re-review (round {_rounds}/{_lim}, same card)")
+                                    # Rewind the layer loop to the upstream's
+                                    # layer so the revised work re-dispatches;
+                                    # reviewers reuse their existing cards.
+                                    # (Exhaustion already handled above — no
+                                    # rewind happens on a dead chain.)
+                                    if _any_reset:
+                                        for _li, _ln in enumerate(layers):
+                                            if reviewer_for in _ln:
+                                                self._rewind_to_layer = _li
+                                                print(f"   ↩  Rewinding to layer {_li + 1} ({reviewer_for}) for re-review")
+                                                break
                             elif passed:
                                 print(f"   ✅ {nid} PASSED — enriching {reviewer_for} with review results")
                                 if upstream_state.kanban_card_id:
