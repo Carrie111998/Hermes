@@ -126,6 +126,30 @@ def _is_stale_session_ret(
     return (errmsg or "").lower() == "unknown error"
 
 
+DEAD_SESSION_RET = -3  # iLink session permanently dead
+
+
+class SessionExpiredError(Exception):
+    """Raised when iLink session has expired (ret=-2 or ret=-3)."""
+
+
+def _fire_alert(event_type: str, detail: str, script_path: str = "") -> None:
+    """Fire an external alert script for session-expired events."""
+    if not script_path:
+        return
+    import subprocess
+    try:
+        subprocess.run(
+            [script_path, event_type, detail],
+            timeout=30,
+            capture_output=True,
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).warning(
+            "alert script failed: %s", exc,
+        )
+
+
 MEDIA_IMAGE = 1
 MEDIA_VIDEO = 2
 MEDIA_FILE = 3
@@ -1228,6 +1252,10 @@ class WeixinAdapter(BasePlatformAdapter):
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
+        self._alert_script = str(
+            extra.get("alert_script")
+            or os.getenv("HERMES_ALERT_SCRIPT", "")
+        ).strip()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
         if allow_from is None:
@@ -1391,8 +1419,11 @@ class WeixinAdapter(BasePlatformAdapter):
                 errcode = response.get("errcode", 0)
                 if ret not in {0, None} or errcode not in {0, None}:
                     if (ret == SESSION_EXPIRED_ERRCODE or errcode == SESSION_EXPIRED_ERRCODE
+                            or ret == DEAD_SESSION_RET
                             or _is_stale_session_ret(ret, errcode, response.get("errmsg"))):
                         logger.error("[%s] Session expired; pausing for 10 minutes", self.name)
+                        if self._alert_script:
+                            _fire_alert("stale_session", f"ret={ret} errcode={errcode}", self._alert_script)
                         await asyncio.sleep(600)
                         consecutive_failures = 0
                         continue
@@ -1812,8 +1843,11 @@ class WeixinAdapter(BasePlatformAdapter):
                         is_session_expired = (
                             ret == SESSION_EXPIRED_ERRCODE
                             or errcode == SESSION_EXPIRED_ERRCODE
+                            or ret == DEAD_SESSION_RET
                             or _is_stale_session_ret(ret, errcode, resp.get("errmsg"))
                         )
+                        if is_session_expired and self._alert_script:
+                            _fire_alert("session_expired", f"to={_safe_id(chat_id)}", self._alert_script)
                         # Session expired — strip token and retry once
                         if is_session_expired and not retried_without_token and context_token:
                             retried_without_token = True
