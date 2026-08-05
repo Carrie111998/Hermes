@@ -139,6 +139,28 @@ except Exception:
     pass
 
 from tui_gateway.render import make_stream_renderer, render_diff, render_message
+from tui_gateway import session_db, slash_worker_client  # noqa: E402
+
+# God-file slice R1 (epic #78647, target #78630): _SlashWorker client and the
+# db/profile/cwd cluster moved to sibling modules. Legacy aliases keep the
+# server namespace identical for handler rebinds (method_ctx.install), the
+# install-time _profile_scoped pin (method_ctx.py:52) and test string-patches
+# (tui_gateway.server._get_db etc.).
+_SlashWorker = slash_worker_client.SlashWorker  # noqa: E402,F401
+_SLASH_WORKER_TIMEOUT_S = slash_worker_client._SLASH_WORKER_TIMEOUT_S  # noqa: E402,F401
+_get_db = session_db._get_db  # noqa: E402,F401
+_db_for_profile = session_db._db_for_profile  # noqa: E402,F401
+_profile_db = session_db._profile_db  # noqa: E402,F401
+_response_profile_name = session_db._response_profile_name  # noqa: E402,F401
+_db_unavailable_error = session_db._db_unavailable_error  # noqa: E402,F401
+_profile_home = session_db._profile_home  # noqa: E402,F401
+_profile_scoped = session_db._profile_scoped  # noqa: E402,F401
+_CWD_PLACEHOLDERS = session_db._CWD_PLACEHOLDERS  # noqa: E402,F401
+_configured_cwd_from_cfg = session_db._configured_cwd_from_cfg  # noqa: E402,F401
+_profile_configured_cwd = session_db._profile_configured_cwd  # noqa: E402,F401
+_launch_configured_cwd = session_db._launch_configured_cwd  # noqa: E402,F401
+_default_session_cwd = session_db._default_session_cwd  # noqa: E402,F401
+
 
 _sessions: dict[str, dict] = {}
 _methods: dict[str, callable] = {}
@@ -155,11 +177,6 @@ _cfg_cache: dict | None = None
 _cfg_mtime: float | None = None
 _cfg_path = None
 _session_resume_lock = threading.Lock()
-try:
-    _slash_timeout = float(os.environ.get("HERMES_TUI_SLASH_TIMEOUT_S") or "45")
-except (ValueError, TypeError):
-    _slash_timeout = 45.0
-_SLASH_WORKER_TIMEOUT_S = max(5.0, _slash_timeout)
 
 # When a WebSocket client (the dashboard's embedded-chat tab / desktop app)
 # disconnects, ``tui_gateway.ws`` detaches the transport but intentionally
@@ -321,142 +338,6 @@ _stdio_transport = StdioTransport(lambda: _real_stdout, _stdout_lock)
 # the gateway in-process and captures stdout into logs, so stale JSON-RPC frames
 # must not fall through there while the session waits for resume or reap.
 _detached_ws_transport = _DropTransport()
-
-
-class _SlashWorker:
-    """Persistent HermesCLI subprocess for slash commands."""
-
-    def __init__(self, session_key: str, model: str, profile_home: str | None = None):
-        self._lock = threading.Lock()
-        self._seq = 0
-        self.stderr_tail: list[str] = []
-        self.stdout_queue: queue.Queue[dict | None] = queue.Queue()
-
-        argv = [
-            sys.executable,
-            "-m",
-            "tui_gateway.slash_worker",
-            "--session-key",
-            session_key,
-        ]
-        if model:
-            argv += ["--model", model]
-
-        self._closed = False
-        from hermes_cli._subprocess_compat import windows_hide_flags
-
-        # slash_worker runs the Hermes agent → needs provider credentials.
-        # Tier-1 secrets (gateway/GitHub/infra) are still stripped (#29157).
-        # Global-remote / multi-profile sessions: the worker must resolve
-        # config/skills/state against the session's profile home, not the
-        # gateway's launch HERMES_HOME (#40677). The override goes through the
-        # build_subprocess_env factory's `extra` (applied last, always wins)
-        # instead of a hand-rolled env["HERMES_HOME"] assignment.
-        from tools.environments.local import build_subprocess_env
-        env = build_subprocess_env(
-            hermes_subprocess_env(inherit_credentials=True),
-            scrub_secrets=False,
-            inherit_profile_home=False,  # base already carries the HOME contract
-            extra={"HERMES_HOME": str(profile_home)} if profile_home else None,
-        )
-
-        # start_new_session=True detaches the slash worker into its own
-        # process group / session. Without this, the worker inherits the
-        # gateway's pgid (= TUI parent PID). When mcp_tool's
-        # _kill_orphaned_mcp_children races with slash_worker spawn and sweeps
-        # the gateway's child set, it captures the worker PID, records the
-        # inherited pgid, and killpg() then kills the TUI parent itself.
-        # See agent/lsp/client.py for the symmetric LSP server fix and
-        # tools/mcp_tool.py _filter_mcp_children for defense-in-depth.
-        self.proc = subprocess.Popen(
-            argv,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            # Force UTF-8 with lossy decoding so child output containing bytes
-            # that are invalid in the system locale (e.g. GBK on Chinese
-            # Windows) can't raise UnicodeDecodeError inside the drain threads
-            # and crash the gateway. See #53137.
-            encoding="utf-8",
-            errors="replace",
-            bufsize=1,
-            cwd=os.getcwd(),
-            env=env,
-            creationflags=windows_hide_flags(),
-            start_new_session=True,
-        )
-        threading.Thread(target=self._drain_stdout, daemon=True).start()
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
-
-    def _drain_stdout(self):
-        for line in self.proc.stdout or []:
-            try:
-                self.stdout_queue.put(json.loads(line))
-            except json.JSONDecodeError:
-                continue
-        self.stdout_queue.put(None)
-
-    def _drain_stderr(self):
-        for line in self.proc.stderr or []:
-            if text := line.rstrip("\n"):
-                self.stderr_tail = (self.stderr_tail + [text])[-80:]
-
-    def run(self, command: str) -> str:
-        if self.proc.poll() is not None:
-            raise RuntimeError("slash worker exited")
-
-        with self._lock:
-            self._seq += 1
-            rid = self._seq
-            self.proc.stdin.write(json.dumps({"id": rid, "command": command}) + "\n")
-            self.proc.stdin.flush()
-
-            while True:
-                try:
-                    msg = self.stdout_queue.get(timeout=_SLASH_WORKER_TIMEOUT_S)
-                except queue.Empty:
-                    raise RuntimeError("slash worker timed out")
-                if msg is None:
-                    break
-                if msg.get("id") != rid:
-                    continue
-                if not msg.get("ok"):
-                    raise RuntimeError(msg.get("error", "slash worker failed"))
-                return str(msg.get("output", "")).rstrip()
-
-            raise RuntimeError(
-                f"slash worker closed pipe{': ' + chr(10).join(self.stderr_tail[-8:]) if self.stderr_tail else ''}"
-            )
-
-    def close(self):
-        if getattr(self, "_closed", False):
-            return
-        self._closed = True
-        proc = self.proc
-        try:
-            if proc.poll() is None:
-                proc.terminate()
-                try:
-                    proc.wait(timeout=1)
-                except Exception:
-                    proc.kill()
-                    try:
-                        proc.wait(timeout=1)  # reap the zombie SIGKILL leaves behind
-                    except Exception:
-                        pass
-        except Exception:
-            try:
-                proc.kill()
-                proc.wait(timeout=1)
-            except Exception:
-                pass
-        finally:
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                try:
-                    stream.close()
-                except Exception:
-                    pass
 
 
 def _load_busy_input_mode() -> str:
@@ -1296,216 +1177,6 @@ _start_idle_reaper()
 
 
 # ── Plumbing ──────────────────────────────────────────────────────────
-
-
-def _get_db():
-    global _db, _db_error
-    if _db is None:
-        from hermes_state import SessionDB
-
-        try:
-            _db = SessionDB()
-            _db_error = None
-        except Exception as exc:
-            _db_error = str(exc)
-            logger.warning(
-                "TUI session store unavailable — continuing without state.db features: %s",
-                exc,
-            )
-            return None
-    return _db
-
-
-def _db_for_profile(profile: str | None = None):
-    """Return SessionDB for ``params.profile`` when it differs from launch.
-
-    App-global remote mode passes ``profile`` on session.* RPCs so history/list/
-    create operate on that profile's ``state.db``. Launch/own profile → shared
-    ``_get_db()`` handle (left open). Non-launch profile → a dedicated handle
-    the caller should ``close()`` (see :func:`_profile_db` contextmanager).
-
-    Returns (db, owns_handle). ``db`` is None when unavailable.
-    """
-    profile_home = _profile_home(profile)
-    if profile_home is None:
-        return _get_db(), False
-    try:
-        from hermes_state import SessionDB
-
-        return SessionDB(db_path=Path(profile_home) / "state.db"), True
-    except Exception as exc:
-        logger.warning(
-            "TUI profile session store unavailable for %s: %s",
-            profile,
-            exc,
-        )
-        return None, False
-
-
-@contextlib.contextmanager
-def _profile_db(params: dict | None = None):
-    """Yield the SessionDB for ``params['profile']`` (app-global remote mode).
-
-    Closes dedicated profile handles; leaves the launch-profile shared handle open.
-    Yields None when the db is unavailable.
-    """
-    profile = None
-    if isinstance(params, dict):
-        profile = (params.get("profile") or "").strip() or None
-    db, owns = _db_for_profile(profile)
-    try:
-        yield db
-    finally:
-        if owns and db is not None:
-            with contextlib.suppress(Exception):
-                db.close()
-
-
-def _response_profile_name(profile: str | None = None) -> str:
-    """Profile name to report on session.* payloads.
-
-    Prefer the RPC's requested profile when it is a real non-launch profile;
-    otherwise the process launch profile.
-    """
-    name = (profile or "").strip()
-    if name and _profile_home(name) is not None:
-        return name
-    return _current_profile_name()
-
-
-def _db_unavailable_error(rid, *, code: int):
-    detail = _db_error or "state.db unavailable"
-    return _err(rid, code, f"state.db unavailable: {detail}")
-
-
-# ── per-session profile scoping (global remote mode) ───────────────────────────
-# One dashboard normally serves its launch profile. But the desktop's app-global
-# remote mode points every profile at this single backend, so resume/prompt must
-# be able to act on ANOTHER local profile's state.db + home. The desktop passes
-# ``profile`` on those calls; we open that profile's db and bind its HERMES_HOME
-# (a ContextVar override) for the duration of the call so config/skills/model and
-# message persistence all resolve to the right profile. Omitted/own profile → the
-# launch profile (unchanged for single-profile and per-profile-remote setups).
-def _profile_home(profile: str | None) -> Path | None:
-    """Resolve a named profile's home on THIS host, or None for the launch profile."""
-    name = (profile or "").strip()
-    if not name:
-        return None
-    try:
-        from hermes_cli import profiles as profiles_mod
-
-        home = Path(profiles_mod.get_profile_dir(name))
-    except Exception:
-        return None
-    # Already the launch profile? No override needed.
-    if home.resolve() == Path(_hermes_home).resolve():
-        return None
-    return home if (home / "state.db").exists() or home.exists() else None
-
-
-def _profile_scoped(handler):
-    """Bind ``params['profile']``'s HERMES_HOME around a pet RPC handler.
-
-    Pets are per-profile: ``display.pet.*`` lives in the profile's config.yaml and
-    sprites install under its ``pets/`` dir (both resolve via ``get_hermes_home``).
-    The desktop sends ``profile`` on pet calls so config + pets dir resolve to the
-    focused profile even in app-global remote mode, where one backend serves every
-    profile. No-op for the launch profile (own-profile backends already resolve it).
-    """
-
-    def wrapper(rid, params):
-        home = _profile_home(params.get("profile") if isinstance(params, dict) else None)
-        if home is None:
-            return handler(rid, params)
-        token = set_hermes_home_override(home)
-        try:
-            return handler(rid, params)
-        finally:
-            reset_hermes_home_override(token)
-
-    return wrapper
-
-
-# Placeholder ``terminal.cwd`` values that don't name a real directory — the
-# gateway resolves these to the home dir at runtime, so they must NOT be treated
-# as an explicit workspace (mirrors gateway/run.py's config bridge).
-_CWD_PLACEHOLDERS = {".", "auto", "cwd"}
-
-
-def _configured_cwd_from_cfg(cfg: dict | None) -> str | None:
-    """Return an absolute, existing ``terminal.cwd`` from a config mapping.
-
-    Returns None for placeholders (``.``/``auto``/``cwd``), missing values, or
-    paths that don't resolve to a real directory.
-    """
-    if not isinstance(cfg, dict):
-        return None
-    terminal_cfg = cfg.get("terminal")
-    if not isinstance(terminal_cfg, dict):
-        return None
-    raw = str(terminal_cfg.get("cwd") or "").strip()
-    if not raw or raw in _CWD_PLACEHOLDERS:
-        return None
-    resolved = os.path.abspath(os.path.expanduser(raw))
-    return resolved if os.path.isdir(resolved) else None
-
-
-def _profile_configured_cwd(profile_home: Path | None) -> str | None:
-    """Resolve a non-launch profile's ``terminal.cwd`` from its own config.yaml.
-
-    The desktop's app-global remote mode serves every profile from one backend,
-    so the process-global ``TERMINAL_CWD`` belongs to the *launch* profile. A new
-    session bound to another profile must take its workspace from THAT profile's
-    config, not the stale env var (issue #40334). Returns an absolute, existing
-    directory, or None for placeholders / missing / invalid paths.
-    """
-    if profile_home is None:
-        return None
-    try:
-        from hermes_cli.config import _expand_env_vars, read_user_config_raw
-
-        p = Path(profile_home) / "config.yaml"
-        if not p.exists():
-            return None
-        # Behavioral read of a NON-launch profile's config: load_config()
-        # would resolve the ACTIVE profile's path, so read this profile's
-        # file directly, then apply the same read-side pipeline as
-        # _load_cfg (managed overlay + ${VAR} expansion). Fail-open.
-        data = _apply_managed(read_user_config_raw(p))
-        expanded = _expand_env_vars(data)
-        if isinstance(expanded, dict):
-            data = expanded
-        return _configured_cwd_from_cfg(data)
-    except Exception:
-        return None
-
-
-def _launch_configured_cwd() -> str | None:
-    """Resolve the launch profile's ``terminal.cwd`` from config.yaml.
-
-    Dashboard ``/chat`` for the launch profile attaches to the dashboard
-    process's in-memory TUI gateway. The Node PTY child receives a bridged
-    ``TERMINAL_CWD`` env var, but this in-memory process does not — so reading
-    the process env alone leaves a fresh chat starting in ``os.getcwd()``
-    (wherever ``hermes dashboard`` was launched) instead of the configured
-    ``terminal.cwd``. Read config directly so changing ``terminal.cwd`` affects
-    new in-memory TUI sessions too.
-    """
-    try:
-        return _configured_cwd_from_cfg(_load_cfg())
-    except Exception:
-        return None
-
-
-def _default_session_cwd() -> str:
-    """Fallback cwd for a session with no explicit / stored / profile cwd.
-
-    Mirrors the launch-config-aware tail of :func:`_completion_cwd` so freshly
-    created AND resumed sessions land in the configured ``terminal.cwd`` rather
-    than ``os.getcwd()`` when the in-memory gateway's process env has no bridged
-    ``TERMINAL_CWD``.
-    """
-    return _launch_configured_cwd() or os.getenv("TERMINAL_CWD") or os.getcwd()
 
 
 def write_json(obj: dict) -> bool:
