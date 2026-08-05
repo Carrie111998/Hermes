@@ -3,12 +3,17 @@ from __future__ import annotations
 from datetime import datetime, timezone
 
 # Canonical provider grid order for the tray. (key, display label, mode)
+# mode ∈ {budget (rolling %-windows), tokens (log-summed counts),
+#         balance (pay-as-you-go outstanding-$),
+#         spend (month-to-date estimated-$ from token counts × rate card)}.
 PROVIDERS: list[tuple[str, str, str]] = [
     ("anthropic", "Claude", "budget"),
     ("openai-codex", "Codex", "budget"),
     ("kimi", "Kimi K3", "budget"),
-    ("gemini", "Gemini", "tokens"),
+    ("deepseek", "DeepSeek", "balance"),
+    ("gemini", "Gemini", "spend"),
     ("xai", "Grok", "tokens"),
+    ("opencode-go", "OpenCode Go", "tokens"),
 ]
 
 # Maps AccountUsageWindow.label (emitted by agent/account_usage.py fetchers)

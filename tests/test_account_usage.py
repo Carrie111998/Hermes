@@ -95,6 +95,64 @@ def test_fetch_account_usage_codex(monkeypatch):
     assert "Credits balance: $12.50" in snapshot.details
 
 
+def test_fetch_account_usage_deepseek_balance(monkeypatch):
+    captured = {}
+
+    class _CaptureClient(_Client):
+        def get(self, url, headers=None):
+            captured["url"] = url
+            return super().get(url, headers=headers)
+
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _CaptureClient(
+            {
+                "is_available": True,
+                "balance_infos": [
+                    {
+                        "currency": "USD",
+                        "total_balance": "9.74",
+                        "granted_balance": "0.00",
+                        "topped_up_balance": "9.74",
+                    }
+                ],
+            }
+        ),
+    )
+
+    # Explicit api_key short-circuits env / credential-pool resolution.
+    snapshot = fetch_account_usage("deepseek", api_key="sk-test")
+
+    assert snapshot is not None
+    assert snapshot.provider == "deepseek"
+    assert snapshot.balance_usd == 9.74
+    assert snapshot.balance_currency == "USD"
+    assert snapshot.available is True  # balance alone makes it available
+    # Balance endpoint sits at the API root, not under /v1.
+    assert captured["url"] == "https://api.deepseek.com/user/balance"
+
+
+def test_fetch_account_usage_deepseek_prefers_usd_row(monkeypatch):
+    monkeypatch.setattr(
+        "agent.account_usage.httpx.Client",
+        lambda timeout=15.0: _Client(
+            {
+                "is_available": True,
+                "balance_infos": [
+                    {"currency": "CNY", "total_balance": "70.00"},
+                    {"currency": "USD", "total_balance": "3.21"},
+                ],
+            }
+        ),
+    )
+
+    snapshot = fetch_account_usage("deepseek", api_key="sk-test")
+
+    assert snapshot is not None
+    assert snapshot.balance_usd == 3.21
+    assert snapshot.balance_currency == "USD"
+
+
 def test_render_account_usage_lines_includes_reset_and_provider():
     snapshot = AccountUsageSnapshot(
         provider="openai-codex",

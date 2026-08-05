@@ -6,9 +6,20 @@ from ai_usage.contract import (
 
 def test_providers_grid_order_and_modes():
     keys = [p[0] for p in PROVIDERS]
-    assert keys == ["anthropic", "openai-codex", "kimi", "gemini", "xai"]
+    assert keys == [
+        "anthropic", "openai-codex", "kimi", "deepseek", "gemini", "xai",
+        "opencode-go",
+    ]
     modes = {p[0]: p[2] for p in PROVIDERS}
     assert modes["anthropic"] == "budget" and modes["kimi"] == "budget"
+    assert modes["deepseek"] == "balance"  # pay-as-you-go outstanding-$
+    assert modes["gemini"] == "spend"  # month-to-date estimated-$ from tokens
+    assert modes["xai"] == "tokens"
+    # OpenCode Go: flat $10/mo subscription, no usage API (issue #31084) and no
+    # per-token billing → tokens mode (rolling counts), like Grok. billing_provider
+    # is the literal "opencode-go", so the default [key] alias matches it and does
+    # NOT collide with the sibling opencode-zen provider.
+    assert modes["opencode-go"] == "tokens"
 
 
 def test_window_label_map_covers_both_providers():

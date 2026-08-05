@@ -9,8 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
+from ai_usage.balance import balance_provider
 from ai_usage.budget import budget_provider
 from ai_usage.contract import PROVIDERS, iso
+from ai_usage.spend import spend_provider
 from ai_usage.tokensum import tokensum_provider
 
 
@@ -40,7 +42,10 @@ def collect(
     providers: list[dict] = []
     try:
         for key, label, mode in PROVIDERS:
-            if mode == "budget":
+            # budget (%-windows) and balance (outstanding-$) are both HTTP-fetched
+            # via fetch_usage and carry forward the last-known dict on failure.
+            if mode in ("budget", "balance"):
+                make = budget_provider if mode == "budget" else balance_provider
                 snap = None
                 try:
                     snap = fetch_usage(key)
@@ -48,20 +53,22 @@ def collect(
                     snap = None
                 if snap is None or not getattr(snap, "available", False):
                     providers.append(
-                        _carry_forward(prev, key) or budget_provider(key, label, snap)
+                        _carry_forward(prev, key) or make(key, label, snap)
                     )
                 else:
-                    providers.append(budget_provider(key, label, snap))
+                    providers.append(make(key, label, snap))
             else:
+                # spend + tokens are both derived from state.db (no HTTP fetch).
+                db_make = spend_provider if mode == "spend" else tokensum_provider
                 try:
-                    providers.append(tokensum_provider(key, label, conn, now))
+                    providers.append(db_make(key, label, conn, now))
                 except sqlite3.Error:
                     providers.append(
                         _carry_forward(prev, key)
                         or {
                             "key": key,
                             "label": label,
-                            "mode": "tokens",
+                            "mode": mode,
                             "state": "error",
                             "windows": [],
                             "detail": "db error",

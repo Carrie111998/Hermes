@@ -41,10 +41,17 @@ class AccountUsageSnapshot:
     windows: tuple[AccountUsageWindow, ...] = ()
     details: tuple[str, ...] = ()
     unavailable_reason: Optional[str] = None
+    # Pay-as-you-go providers (DeepSeek) report a single outstanding-$ balance
+    # instead of rolling %-windows. None for subscription/quota providers.
+    balance_usd: Optional[float] = None
+    balance_currency: Optional[str] = None
 
     @property
     def available(self) -> bool:
-        return bool(self.windows or self.details) and not self.unavailable_reason
+        return (
+            bool(self.windows or self.details or self.balance_usd is not None)
+            and not self.unavailable_reason
+        )
 
 
 def _title_case_slug(value: Optional[str]) -> Optional[str]:
@@ -1011,6 +1018,85 @@ def _fetch_kimi_account_usage(
     )
 
 
+def _deepseek_balance_url(base_url: Optional[str]) -> str:
+    """DeepSeek balance lives at the API ROOT (/user/balance), not under /v1."""
+    base = str(base_url or "https://api.deepseek.com").strip().rstrip("/")
+    if base.endswith("/v1"):
+        base = base[: -len("/v1")]
+    return f"{base}/user/balance"
+
+
+def _resolve_deepseek_balance_credentials(
+    base_url: Optional[str],
+    api_key: Optional[str],
+) -> tuple[str, str]:
+    """Resolve DeepSeek key: explicit → DEEPSEEK_API_KEY env → credential pool.
+
+    DeepSeek is a direct (non-OAuth) provider; the collector runner loads
+    ``profiles/main/.env`` so ``DEEPSEEK_API_KEY`` is normally present.
+    """
+    explicit = str(api_key or "").strip()
+    if explicit:
+        return explicit, str(base_url or "").strip()
+    env_key = str(os.environ.get("DEEPSEEK_API_KEY", "") or "").strip()
+    if env_key:
+        return env_key, str(base_url or "").strip()
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("deepseek")
+    entry = pool.select()
+    if entry is None:
+        raise RuntimeError("No available deepseek credential in credential pool")
+    return entry.runtime_api_key, str(entry.runtime_base_url or base_url or "").strip()
+
+
+def _fetch_deepseek_account_usage(
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> Optional[AccountUsageSnapshot]:
+    """DeepSeek pay-as-you-go balance from GET /user/balance.
+
+    Live shape (2026-08-05):
+      {"is_available": true,
+       "balance_infos": [{"currency":"USD","total_balance":"9.74", ...}]}
+    ``total_balance`` (a string) is the outstanding-$ figure the tray shows.
+    """
+    token, resolved_base_url = _resolve_deepseek_balance_credentials(base_url, api_key)
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "hermes-usage-collector",
+    }
+    with httpx.Client(timeout=15.0) as client:
+        response = client.get(_deepseek_balance_url(resolved_base_url), headers=headers)
+        response.raise_for_status()
+    payload = response.json() or {}
+
+    infos = payload.get("balance_infos") or []
+    chosen: Optional[dict] = None
+    for info in infos:
+        if isinstance(info, dict) and str(info.get("currency") or "").upper() == "USD":
+            chosen = info
+            break
+    if chosen is None and infos and isinstance(infos[0], dict):
+        chosen = infos[0]  # fall back to the first row if no USD line
+    if chosen is None:
+        return None
+
+    try:
+        balance = float(str(chosen.get("total_balance")).strip())
+    except (TypeError, ValueError):
+        return None
+
+    return AccountUsageSnapshot(
+        provider="deepseek",
+        source="balance_api",
+        fetched_at=_utc_now(),
+        balance_usd=balance,
+        balance_currency=str(chosen.get("currency") or "USD"),
+    )
+
+
 def fetch_account_usage(
     provider: Optional[str],
     *,
@@ -1025,6 +1111,8 @@ def fetch_account_usage(
             return _fetch_codex_account_usage(base_url=base_url, api_key=api_key)
         if normalized == "kimi":
             return _fetch_kimi_account_usage(base_url=base_url, api_key=api_key)
+        if normalized == "deepseek":
+            return _fetch_deepseek_account_usage(base_url=base_url, api_key=api_key)
         if normalized == "anthropic":
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
