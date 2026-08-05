@@ -12,7 +12,8 @@ def test_generation_and_tier_specific_rates_win():
 def test_flash_lite_precedes_flash_substring():
     # "flash" is a substring of "flash-lite"; the lite rate must still win.
     assert gemini_rate("some-future-flash-lite") == (0.10, 0.40)
-    assert gemini_rate("some-future-flash") == (0.30, 2.50)
+    # bare "flash" fallback tracks the current top flash generation (3.6-flash)
+    assert gemini_rate("some-future-flash") == (1.50, 7.50)
 
 
 def test_model_prefixes_and_case_are_tolerated():
@@ -20,9 +21,10 @@ def test_model_prefixes_and_case_are_tolerated():
 
 
 def test_unknown_gemini_model_falls_back_to_pro_tier():
-    # Deliberately the priciest common tier — never under-report.
-    assert gemini_rate("gemini-experimental-xyz") == (1.25, 10.00)
-    assert gemini_rate("") == (1.25, 10.00)
+    # Deliberately the priciest common tier (current top gen, 3.1-pro) — never
+    # under-report.
+    assert gemini_rate("gemini-experimental-xyz") == (2.00, 12.00)
+    assert gemini_rate("") == (2.00, 12.00)
 
 
 def test_cost_usd_prices_input_and_output_separately():

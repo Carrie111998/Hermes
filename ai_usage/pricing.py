@@ -19,15 +19,18 @@ GEMINI_PRICING: list[tuple[str, float, float]] = [
     ("2.5-pro", 1.25, 10.00),
     ("2.5-flash-lite", 0.10, 0.40),
     ("2.5-flash", 0.30, 2.50),
-    # generation-agnostic tier fallbacks (flash-lite before flash before pro)
+    # generation-agnostic tier fallbacks (flash-lite before flash before pro).
+    # Pinned to the CURRENT top generation per tier (flash=3.6, pro=3.1) so a
+    # versionless model string (e.g. "gemini-flash-latest", "gemini-pro") is
+    # never priced at a cheaper older-generation floor and can't under-report.
     ("flash-lite", 0.10, 0.40),
-    ("flash", 0.30, 2.50),
-    ("pro", 1.25, 10.00),
+    ("flash", 1.50, 7.50),
+    ("pro", 2.00, 12.00),
 ]
 
-# Unknown Gemini model -> Pro-tier rates: deliberately the priciest common tier
-# so an unrecognized model never silently UNDER-reports spend.
-GEMINI_DEFAULT: tuple[float, float] = (1.25, 10.00)
+# Unknown Gemini model -> current top Pro-tier rates (3.1-pro): deliberately the
+# priciest common tier so an unrecognized model never silently UNDER-reports.
+GEMINI_DEFAULT: tuple[float, float] = (2.00, 12.00)
 
 
 def gemini_rate(model: str) -> tuple[float, float]:
