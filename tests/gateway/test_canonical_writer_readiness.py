@@ -33,6 +33,7 @@ from gateway.canonical_writer_readiness import (
 def _valid_ping(request_id: str) -> dict[str, str]:
     return {
         "request_id": request_id,
+        "status": "ok",
         "service": "canonical_writer",
         "protocol": "v1",
         "database_identity": CANONICAL_WRITER_MIGRATION_OWNER,
@@ -107,6 +108,61 @@ def test_enabled_boundary_pings_before_writing_process_bound_receipt(
     assert stat.S_IMODE(receipt_path.stat().st_mode) == 0o600
 
 
+def test_boundary_ping_result_shape_is_accepted_by_startup_readiness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = boundary.CanonicalWriterBoundaryConfig(enabled=True)
+    request_id = str(uuid.uuid4())
+
+    class FakeClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def call(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                request_id=request_id,
+                status="ok",
+                result={
+                    "service": "canonical_writer",
+                    "protocol": "v1",
+                    "database_identity": CANONICAL_WRITER_MIGRATION_OWNER,
+                    "request_id": request_id,
+                },
+            )
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(boundary, "frozen_writer_boundary_config", lambda: config)
+    monkeypatch.setattr(
+        "gateway.canonical_writer_client.CanonicalWriterClient",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "pwd.getpwnam",
+        lambda _name: SimpleNamespace(pw_uid=os.getuid()),
+    )
+    boundary.close_canonical_writer_clients()
+    try:
+        receipt = attest_canonical_writer_startup_readiness(
+            receipt_path=tmp_path / "receipt.json",
+            _writer_call=boundary.canonical_writer_call,
+            _now_unix=lambda: 1_800_000_000,
+            _pid=4242,
+            _boot_identity_provider=lambda: ("b" * 64, 987654321),
+            _process_start_time=lambda _pid: 123456,
+            _module_identity_provider=lambda: ("/module.py", "a" * 64),
+            _process_hardening_provider=lambda: (False, 0, 0),
+            _python_runtime_provider=_runtime_identity,
+        )
+    finally:
+        boundary.close_canonical_writer_clients()
+
+    assert receipt is not None
+    assert receipt["writer_request_id"] == request_id
+
+
 def test_disabled_boundary_is_exact_noop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -136,6 +192,7 @@ def test_disabled_boundary_is_exact_noop(
     "mutate",
     [
         lambda value: value.update(service="other"),
+        lambda value: value.update(status="blocked"),
         lambda value: value.update(protocol="v2"),
         lambda value: value.update(database_identity="canonical_writer"),
         lambda value: value.update(request_id="not-a-uuid"),

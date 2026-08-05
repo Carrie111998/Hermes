@@ -40,7 +40,7 @@ DEFAULT_WRITER_LIVENESS_RECEIPT_PATH = Path(
 )
 _MAX_RECEIPT_BYTES = 256 * 1024
 _EXPECTED_PING_FIELDS = frozenset(
-    {"request_id", "service", "protocol", "database_identity"}
+    {"request_id", "status", "service", "protocol", "database_identity"}
 )
 
 
@@ -409,6 +409,7 @@ def write_runtime_attestation(
 def _validate_ping_response(response: Mapping[str, Any]) -> str:
     if (
         set(response) != _EXPECTED_PING_FIELDS
+        or response.get("status") != "ok"
         or response.get("service") != "canonical_writer"
         or response.get("protocol") != "v1"
         or response.get("database_identity") != CANONICAL_WRITER_MIGRATION_OWNER
