@@ -417,3 +417,58 @@ def test_experience_disabled_sleep_keeps_legacy_archive_path(tmp_path):
     assert report.get("latent", []) == []
     assert store.get(mid)["state"] == "archived"
     store.close()
+
+
+def test_revise_memory_supersedes_old_belief_and_queues_rehearsal(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    old = store.remember("The current board is ASRock A320.")
+    revised = store.revise_memory(
+        old["memory_id"],
+        "The current board is ASRock B450.",
+        reason="user correction",
+        evidence=[{"kind": "user", "note": "said B450"}],
+        test_query="current board ASRock",
+    )
+    assert revised["status"] == "revised"
+    assert revised["old_memory_id"] == old["memory_id"]
+    assert revised["new_memory_id"] != old["memory_id"]
+    assert revised["queued_rehearsal_id"]
+    old_row = store.get(old["memory_id"])
+    assert old_row["belief_status"] == "superseded"
+    assert old_row["state"] == "archived"
+    history = store.belief_history(memory_id=revised["new_memory_id"])
+    assert [h["belief_version"] for h in history] == [1, 2]
+    assert store.recall("ASRock B450", reinforce=False)[0]["memory_id"] == revised[
+        "new_memory_id"
+    ]
+    a320 = store.recall("ASRock A320", reinforce=False)
+    assert all(item["memory_id"] != old["memory_id"] for item in a320)
+    store.close()
+
+
+def test_remember_does_not_revive_superseded_content(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    old = store.remember("Legacy board ASRock A320.")
+    revised = store.revise_memory(
+        old["memory_id"],
+        "Legacy board ASRock B450.",
+        reason="corrected",
+    )
+    dup = store.remember("Legacy board ASRock A320.")
+    assert dup["status"] == "historical_duplicate"
+    assert dup["historical_memory_id"] == old["memory_id"]
+    assert dup["current_memory_id"] == revised["new_memory_id"]
+    store.close()
+
+
+def test_retract_memory_archives_without_delete(tmp_path):
+    store = EbbinghausMemoryStore(tmp_path / "memory.db")
+    memory = store.remember("Retract this belief about ASRock.")
+    result = store.retract_memory(memory["memory_id"], reason="no longer true")
+    assert result["status"] == "retracted"
+    row = store.get(memory["memory_id"])
+    assert row["belief_status"] == "retracted"
+    assert row["state"] == "archived"
+    assert row["access_state"] == "latent"
+    assert store.recall("ASRock", reinforce=False) == []
+    store.close()

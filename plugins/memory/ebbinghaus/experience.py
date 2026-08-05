@@ -271,8 +271,206 @@ class EbbinghausExperienceLedger:
         test_query: str,
         source: str,
         session_id: str,
-    ) -> RevisionResult:
-        raise NotImplementedError("revise_memory lands in a later AGIASI task")
+        tags: str = "",
+        salience: float = 0.65,
+        valence: float = 0.0,
+        memory_type: str = "episodic",
+    ) -> RevisionResult | dict[str, Any]:
+        if int(memory_id) < 1:
+            raise ValueError("memory_id must be >= 1")
+        content = str(normalized_content or "").strip()
+        if not content:
+            raise ValueError("new_content must not be empty")
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise ValueError("reason must not be empty")
+        conf = float(confidence)
+        if not 0.0 <= conf <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                old = self._conn.execute(
+                    "SELECT * FROM memories WHERE memory_id = ?",
+                    (int(memory_id),),
+                ).fetchone()
+                if old is None:
+                    raise ValueError(f"memory_id {memory_id} not found")
+
+                # Resolve superseded pointer to current tip when needed.
+                tip = old
+                tip_id = int(old["memory_id"])
+                if str(old["belief_status"] or "") == "superseded":
+                    belief_id = str(old["belief_id"] or f"memory-{tip_id}")
+                    current = self._conn.execute(
+                        """
+                        SELECT * FROM memories
+                        WHERE belief_id = ? AND belief_status = 'current'
+                        ORDER BY belief_version DESC, memory_id DESC
+                        LIMIT 1
+                        """,
+                        (belief_id,),
+                    ).fetchone()
+                    if current is not None:
+                        tip = current
+                        tip_id = int(current["memory_id"])
+
+                if str(tip["content"] or "").strip() == content:
+                    self._conn.execute("COMMIT")
+                    return {
+                        "status": "idempotent",
+                        "memory_id": tip_id,
+                        "belief_id": str(tip["belief_id"] or f"memory-{tip_id}"),
+                    }
+
+                now = float(self._now_fn())
+                belief_id = str(tip["belief_id"] or f"memory-{tip_id}")
+                old_version = int(tip["belief_version"] or 1)
+                new_version = old_version + 1
+                cues = " ".join(list(encoded.get("cues") or [])[:32])
+
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET access_state = 'labile', updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (now, tip_id),
+                )
+
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO memories (
+                        content, encoded, cues, tags, salience, valence, strength,
+                        source, session_id, created_at, updated_at,
+                        last_rehearsed_at, state, last_anchor_at, memory_type,
+                        belief_id, belief_version, belief_status, access_state,
+                        confidence, supersedes_memory_id
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?,
+                        ?, ?, 'current', 'accessible', ?, ?
+                    )
+                    """,
+                    (
+                        content,
+                        json.dumps(dict(encoded), ensure_ascii=False),
+                        cues,
+                        tags or str(tip["tags"] or ""),
+                        float(salience),
+                        float(valence),
+                        1.0 + float(salience),
+                        source or "explicit_correction",
+                        session_id or "",
+                        now,
+                        now,
+                        now,
+                        now,
+                        memory_type or str(tip["memory_type"] or "episodic"),
+                        belief_id,
+                        new_version,
+                        conf,
+                        tip_id,
+                    ),
+                )
+                new_id = int(cur.lastrowid)
+
+                auto_archive = bool(self.policies.revision.auto_archive_superseded)
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET belief_status = 'superseded',
+                        superseded_by_memory_id = ?,
+                        access_state = 'latent',
+                        state = CASE WHEN ? THEN 'archived' ELSE state END,
+                        archived_at = CASE WHEN ? THEN ? ELSE archived_at END,
+                        archive_reason = CASE WHEN ? THEN 'superseded' ELSE archive_reason END,
+                        updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (
+                        new_id,
+                        1 if auto_archive else 0,
+                        1 if auto_archive else 0,
+                        now,
+                        1 if auto_archive else 0,
+                        now,
+                        tip_id,
+                    ),
+                )
+
+                for relation_type in ("supersedes", "corrected_by"):
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_relations(
+                            source_memory_id, target_memory_id, relation_type,
+                            metadata, created_at
+                        ) VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (
+                            new_id if relation_type == "supersedes" else tip_id,
+                            tip_id if relation_type == "supersedes" else new_id,
+                            relation_type,
+                            _safe_json_payload({"reason": reason_text}),
+                            now,
+                        ),
+                    )
+
+                contested: list[int] = []
+                if self.policies.revision.contest_dependents:
+                    contested = self._contest_dependents_locked(
+                        source_memory_id=tip_id,
+                        reason=f"source_revised:{reason_text}",
+                        visited=set(),
+                    )
+
+                query = str(test_query or "").strip()
+                if not query:
+                    query = " ".join(list(encoded.get("cues") or [])[:8])
+                rehearsal_id = self._queue_correction_rehearsal_locked(
+                    belief_id=belief_id,
+                    old_memory_id=tip_id,
+                    new_memory_id=new_id,
+                    test_query=query,
+                )
+
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_events(
+                        event_type, memory_id, related_memory_id, belief_id,
+                        session_id, payload, created_at
+                    ) VALUES ('belief_revised', ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_id,
+                        tip_id,
+                        belief_id,
+                        session_id or "",
+                        _safe_json_payload(
+                            {
+                                "reason": reason_text,
+                                "evidence": list(evidence or [])[:20],
+                                "confidence": conf,
+                                "old_version": old_version,
+                                "new_version": new_version,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return RevisionResult(
+                    belief_id=belief_id,
+                    old_memory_id=tip_id,
+                    new_memory_id=new_id,
+                    old_version=old_version,
+                    new_version=new_version,
+                    contested_memory_ids=contested,
+                    queued_rehearsal_id=rehearsal_id,
+                )
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def retract_memory(
         self,
@@ -281,7 +479,65 @@ class EbbinghausExperienceLedger:
         reason: str,
         session_id: str = "",
     ) -> dict[str, Any]:
-        raise NotImplementedError("retract_memory lands in a later AGIASI task")
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise ValueError("reason must not be empty")
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT * FROM memories WHERE memory_id = ?",
+                    (int(memory_id),),
+                ).fetchone()
+                if row is None:
+                    raise ValueError(f"memory_id {memory_id} not found")
+                now = float(self._now_fn())
+                belief_id = str(row["belief_id"] or f"memory-{memory_id}")
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET belief_status = 'retracted',
+                        state = 'archived',
+                        access_state = 'latent',
+                        archive_reason = 'retracted',
+                        archived_at = ?,
+                        updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (now, now, int(memory_id)),
+                )
+                contested: list[int] = []
+                if self.policies.revision.contest_dependents:
+                    contested = self._contest_dependents_locked(
+                        source_memory_id=int(memory_id),
+                        reason=f"source_retracted:{reason_text}",
+                        visited=set(),
+                    )
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_events(
+                        event_type, memory_id, related_memory_id, belief_id,
+                        session_id, payload, created_at
+                    ) VALUES ('belief_retracted', ?, NULL, ?, ?, ?, ?)
+                    """,
+                    (
+                        int(memory_id),
+                        belief_id,
+                        session_id or "",
+                        _safe_json_payload({"reason": reason_text}),
+                        now,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+                return {
+                    "status": "retracted",
+                    "memory_id": int(memory_id),
+                    "belief_id": belief_id,
+                    "contested_memory_ids": contested,
+                }
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
 
     def belief_history(
         self,
@@ -289,7 +545,47 @@ class EbbinghausExperienceLedger:
         memory_id: int | None = None,
         belief_id: str = "",
     ) -> list[dict[str, Any]]:
-        raise NotImplementedError("belief_history lands in a later AGIASI task")
+        if memory_id is None and not belief_id:
+            raise ValueError("memory_id or belief_id is required")
+        with self._lock:
+            resolved_belief = str(belief_id or "")
+            if memory_id is not None:
+                row = self._conn.execute(
+                    "SELECT belief_id FROM memories WHERE memory_id = ?",
+                    (int(memory_id),),
+                ).fetchone()
+                if row is None:
+                    return []
+                resolved_belief = str(row["belief_id"] or f"memory-{int(memory_id)}")
+            rows = self._conn.execute(
+                """
+                SELECT memory_id, belief_id, belief_version, belief_status,
+                       content, confidence, state, access_state,
+                       supersedes_memory_id, superseded_by_memory_id,
+                       created_at, updated_at
+                FROM memories
+                WHERE belief_id = ?
+                ORDER BY belief_version ASC, memory_id ASC
+                """,
+                (resolved_belief,),
+            ).fetchall()
+            return [
+                {
+                    "memory_id": int(r["memory_id"]),
+                    "belief_id": str(r["belief_id"] or ""),
+                    "belief_version": int(r["belief_version"] or 1),
+                    "belief_status": str(r["belief_status"] or "current"),
+                    "content": str(r["content"] or ""),
+                    "confidence": float(r["confidence"] or 0.0),
+                    "state": str(r["state"] or "active"),
+                    "access_state": str(r["access_state"] or "accessible"),
+                    "supersedes_memory_id": r["supersedes_memory_id"],
+                    "superseded_by_memory_id": r["superseded_by_memory_id"],
+                    "created_at": float(r["created_at"] or 0.0),
+                    "updated_at": float(r["updated_at"] or 0.0),
+                }
+                for r in rows
+            ]
 
     def queue_correction_rehearsal(
         self,
@@ -299,7 +595,159 @@ class EbbinghausExperienceLedger:
         new_memory_id: int,
         test_query: str,
     ) -> int:
-        raise NotImplementedError("queue_correction_rehearsal lands in a later AGIASI task")
+        with self._lock:
+            return self._queue_correction_rehearsal_locked(
+                belief_id=belief_id,
+                old_memory_id=old_memory_id,
+                new_memory_id=new_memory_id,
+                test_query=test_query,
+            )
+
+    def contest_dependents(
+        self,
+        *,
+        source_memory_id: int,
+        reason: str,
+        visited: set[int] | None = None,
+    ) -> list[int]:
+        with self._lock:
+            return self._contest_dependents_locked(
+                source_memory_id=source_memory_id,
+                reason=reason,
+                visited=visited or set(),
+            )
+
+    def _queue_correction_rehearsal_locked(
+        self,
+        *,
+        belief_id: str,
+        old_memory_id: int,
+        new_memory_id: int,
+        test_query: str,
+    ) -> int:
+        now = float(self._now_fn())
+        cur = self._conn.execute(
+            """
+            INSERT INTO correction_rehearsals(
+                belief_id, old_memory_id, new_memory_id, test_query,
+                expected_memory_id, status, created_at
+            ) VALUES (?, ?, ?, ?, ?, 'pending', ?)
+            """,
+            (
+                str(belief_id),
+                int(old_memory_id),
+                int(new_memory_id),
+                str(test_query or ""),
+                int(new_memory_id),
+                now,
+            ),
+        )
+        return int(cur.lastrowid)
+
+    def _contest_dependents_locked(
+        self,
+        *,
+        source_memory_id: int,
+        reason: str,
+        visited: set[int],
+    ) -> list[int]:
+        if int(source_memory_id) in visited:
+            return []
+        visited.add(int(source_memory_id))
+        contested: list[int] = []
+        now = float(self._now_fn())
+
+        semantic_rows = self._conn.execute(
+            """
+            SELECT DISTINCT semantic_memory_id AS memory_id
+            FROM memory_provenance
+            WHERE source_memory_id = ?
+            """,
+            (int(source_memory_id),),
+        ).fetchall()
+        for row in semantic_rows:
+            mid = int(row["memory_id"])
+            if mid in visited:
+                continue
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET belief_status = 'contested',
+                    state = 'archived',
+                    access_state = 'latent',
+                    archive_reason = 'source_revised',
+                    archived_at = COALESCE(archived_at, ?),
+                    updated_at = ?
+                WHERE memory_id = ?
+                """,
+                (now, now, mid),
+            )
+            contested.append(mid)
+            contested.extend(
+                self._contest_dependents_locked(
+                    source_memory_id=mid, reason=reason, visited=visited
+                )
+            )
+
+        insight_rows = self._conn.execute(
+            """
+            SELECT DISTINCT candidate_id, promoted_memory_id
+            FROM insight_candidates
+            WHERE candidate_id IN (
+                SELECT candidate_id FROM insight_sources WHERE memory_id = ?
+            )
+            """,
+            (int(source_memory_id),),
+        ).fetchall()
+        for row in insight_rows:
+            candidate_id = str(row["candidate_id"])
+            self._conn.execute(
+                """
+                UPDATE insight_candidates
+                SET status = 'contested', updated_at = ?
+                WHERE candidate_id = ?
+                """,
+                (now, candidate_id),
+            )
+            promoted = row["promoted_memory_id"]
+            if promoted is not None:
+                pmid = int(promoted)
+                self._conn.execute(
+                    """
+                    UPDATE memories
+                    SET belief_status = 'contested',
+                        state = 'archived',
+                        access_state = 'latent',
+                        archive_reason = 'insight_contested',
+                        archived_at = COALESCE(archived_at, ?),
+                        updated_at = ?
+                    WHERE memory_id = ?
+                    """,
+                    (now, now, pmid),
+                )
+                contested.append(pmid)
+                contested.extend(
+                    self._contest_dependents_locked(
+                        source_memory_id=pmid, reason=reason, visited=visited
+                    )
+                )
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(
+                    event_type, memory_id, related_memory_id, belief_id,
+                    session_id, payload, created_at
+                ) VALUES ('insight_contested', ?, ?, '', '', ?, ?)
+                """,
+                (
+                    int(promoted) if promoted is not None else None,
+                    int(source_memory_id),
+                    _safe_json_payload(
+                        {"candidate_id": candidate_id, "reason": reason}
+                    ),
+                    now,
+                ),
+            )
+        return contested
 
     def association_preview(self, *, limit: int) -> dict[str, Any]:
         raise NotImplementedError("association_preview lands in a later AGIASI task")
@@ -327,15 +775,6 @@ class EbbinghausExperienceLedger:
 
     def reject_insight(self, *, candidate_id: str, reason: str) -> dict[str, Any]:
         raise NotImplementedError("reject_insight lands in a later AGIASI task")
-
-    def contest_dependents(
-        self,
-        *,
-        source_memory_id: int,
-        reason: str,
-        visited: set[int] | None = None,
-    ) -> list[int]:
-        raise NotImplementedError("contest_dependents lands in a later AGIASI task")
 
     def _trim_unresolved_misses_locked(self) -> None:
         limit = int(self.policies.experience.max_unresolved_misses)

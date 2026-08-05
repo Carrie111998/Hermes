@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
 from .experience import EbbinghausExperienceLedger, normalize_query_hash
-from .models import RecallAttemptResult, RetrievalOutcome
+from .models import RecallAttemptResult, RetrievalOutcome, RevisionResult
 from .policies import (
     CapacityPolicy,
     DreamPolicy,
@@ -693,6 +693,32 @@ class EbbinghausMemoryStore:
             ).fetchone()
             if not row:
                 raise
+            belief_status = str(row["belief_status"] or "current")
+            if belief_status == "superseded":
+                belief_id = str(row["belief_id"] or f"memory-{row['memory_id']}")
+                current = self._conn.execute(
+                    """
+                    SELECT memory_id FROM memories
+                    WHERE belief_id = ? AND belief_status = 'current'
+                    ORDER BY belief_version DESC, memory_id DESC
+                    LIMIT 1
+                    """,
+                    (belief_id,),
+                ).fetchone()
+                return {
+                    "status": "historical_duplicate",
+                    "historical_memory_id": int(row["memory_id"]),
+                    "current_memory_id": (
+                        int(current["memory_id"]) if current else None
+                    ),
+                    "belief_id": belief_id,
+                }
+            if belief_status == "retracted":
+                return {
+                    "status": "retracted_duplicate",
+                    "historical_memory_id": int(row["memory_id"]),
+                    "belief_id": str(row["belief_id"] or ""),
+                }
             gain = self._reinforcement_gain(row, kind="duplicate")
             merged_tags = sorted(set(_split_tags(row["tags"])) | set(tag_list))
             self._conn.execute(
@@ -705,7 +731,11 @@ class EbbinghausMemoryStore:
                     last_anchor_at = ?,
                     state = CASE WHEN state = 'archived' THEN 'active' ELSE state END,
                     archived_at = CASE WHEN state = 'archived' THEN NULL ELSE archived_at END,
-                    archive_reason = CASE WHEN state = 'archived' THEN '' ELSE archive_reason END
+                    archive_reason = CASE WHEN state = 'archived' THEN '' ELSE archive_reason END,
+                    access_state = CASE
+                        WHEN state = 'archived' THEN 'reactivated'
+                        ELSE COALESCE(access_state, 'accessible')
+                    END
                 WHERE memory_id = ?
                 """,
                 (
@@ -722,6 +752,77 @@ class EbbinghausMemoryStore:
             self._conn.commit()
             memory_id = int(row["memory_id"])
             return {"memory_id": memory_id, "status": "reinforced", **self.get(memory_id)}
+
+    def revise_memory(
+        self,
+        memory_id: int,
+        new_content: str,
+        *,
+        reason: str,
+        evidence: list[dict[str, Any]] | None = None,
+        confidence: float = 0.95,
+        test_query: str = "",
+        source: str = "explicit_correction",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        content = _normalize_text(new_content)
+        if not content:
+            raise ValueError("new_content must not be empty")
+        old = self.get(int(memory_id))
+        tags = old.get("tags") or []
+        encoded = _encode_memory(content, tags)
+        result = self.experience.revise_memory(
+            memory_id=int(memory_id),
+            normalized_content=content,
+            encoded=encoded,
+            reason=reason,
+            evidence=evidence or [],
+            confidence=float(confidence),
+            test_query=test_query,
+            source=source,
+            session_id=session_id,
+            tags=_join_tags(tags),
+            salience=float(old.get("salience") or 0.65),
+            valence=float(old.get("valence") or 0.0),
+            memory_type=str(old.get("memory_type") or "episodic"),
+        )
+        if isinstance(result, RevisionResult):
+            return {
+                "status": "revised",
+                "belief_id": result.belief_id,
+                "old_memory_id": result.old_memory_id,
+                "new_memory_id": result.new_memory_id,
+                "old_version": result.old_version,
+                "new_version": result.new_version,
+                "contested_memory_ids": list(result.contested_memory_ids),
+                "queued_rehearsal_id": result.queued_rehearsal_id,
+                **self.get(result.new_memory_id),
+            }
+        return dict(result)
+
+    def retract_memory(
+        self,
+        memory_id: int,
+        *,
+        reason: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        return self.experience.retract_memory(
+            memory_id=int(memory_id),
+            reason=reason,
+            session_id=session_id,
+        )
+
+    def belief_history(
+        self,
+        *,
+        memory_id: int | None = None,
+        belief_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.experience.belief_history(
+            memory_id=memory_id,
+            belief_id=belief_id,
+        )
 
     def _protected_category_breakdown(self) -> dict[str, int]:
         breakdown: dict[str, int] = {}
