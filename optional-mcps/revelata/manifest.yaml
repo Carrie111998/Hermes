@@ -38,9 +38,11 @@ post_install: |
   deepKPI access uses Revelata credits (free tier available). Account / plans:
     https://www.revelata.com/ai-credits
 
-  Pair with the optional finance skills from this same PR track
-  (`hermes skills install official/finance/<skill>`), or install from GitHub:
+  Companion skills (KPI pulls, filings, pressure-tests, etc.) install from
+  GitHub today:
     hermes skills install revelata/deepkpi-agents/kpi
+  Or, once merged, from the official optional catalog:
+    hermes skills install official/finance/kpi
 
   You can re-run the tool checklist any time with:
     hermes mcp configure revelata
