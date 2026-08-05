@@ -37,6 +37,10 @@ _MEMORY_CONTEXT_TAIL_CHARS = 1_500
 _MEMORY_CONTEXT_TRUNCATION_MARKER = "\n...[memory provider context truncated]...\n"
 
 
+class ContextEngineLifecycleError(RuntimeError):
+    """Raised when a context engine cannot provide an isolated runtime."""
+
+
 def sanitize_memory_context(memory_context: str) -> str:
     """Prepare provider context for a context-engine/LLM egress boundary."""
     sanitized = redact_sensitive_text(
@@ -98,21 +102,28 @@ def create_context_engine_runtime(
     and shared instances are unsafe for resource-owning engines.
     """
     if not isinstance(engine, ContextEngine):
-        raise TypeError(f"{name} must be a ContextEngine, got {type(engine).__name__}")
+        raise ContextEngineLifecycleError(
+            f"{name} must be a ContextEngine, got {type(engine).__name__}"
+        )
     factory = getattr(engine, "create_runtime", None)
     if not callable(factory) or type(engine).create_runtime is ContextEngine.create_runtime:
-        raise RuntimeError(
+        raise ContextEngineLifecycleError(
             f"{name} must implement create_runtime() to create an isolated "
             "per-agent runtime; shared prototypes and implicit copying are unsupported."
         )
-    runtime = factory()
+    try:
+        runtime = factory()
+    except Exception as exc:
+        raise ContextEngineLifecycleError(
+            f"{name} create_runtime() failed: {exc}"
+        ) from exc
     if runtime is engine:
-        raise RuntimeError(
+        raise ContextEngineLifecycleError(
             f"{name} create_runtime() returned its shared prototype; return a distinct "
             "runtime instance instead."
         )
     if not isinstance(runtime, ContextEngine):
-        raise TypeError(
+        raise ContextEngineLifecycleError(
             f"{name} create_runtime() returned {type(runtime).__name__}, "
             "not a ContextEngine runtime."
         )

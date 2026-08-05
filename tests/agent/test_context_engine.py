@@ -264,6 +264,90 @@ def register(ctx): ctx.register_context_engine(Engine())
     assert second.state == []
 
 
+def test_discovery_checks_prototype_without_creating_or_leaking_runtime(tmp_path, monkeypatch):
+    """Repeated lightweight discovery never creates a resource-owning runtime."""
+    import plugins.context_engine as loader
+
+    engine_dir = _write_engine_plugin(
+        tmp_path,
+        """
+from agent.context_engine import ContextEngine
+
+factory_calls = 0
+close_calls = 0
+
+class Engine(ContextEngine):
+    @property
+    def name(self): return 'test_discovery'
+    def update_from_response(self, usage): pass
+    def should_compress(self, prompt_tokens=None): return False
+    def compress(self, messages, current_tokens=None): return messages
+    def is_available(self): return True
+    def create_runtime(self):
+        global factory_calls
+        factory_calls += 1
+        return type(self)()
+    def close(self):
+        global close_calls
+        close_calls += 1
+
+def register(ctx): ctx.register_context_engine(Engine())
+""",
+        name="test_discovery",
+    )
+    monkeypatch.setattr(loader, "_CONTEXT_ENGINE_PLUGINS_DIR", tmp_path)
+    loader._ENGINE_PROTOTYPES.clear()
+
+    assert loader.discover_context_engines() == [("test_discovery", "", True)]
+    assert loader.discover_context_engines() == [("test_discovery", "", True)]
+    module = __import__("plugins.context_engine.test_discovery", fromlist=["*"])
+    assert module.factory_calls == 0
+    assert module.close_calls == 0
+
+
+def test_create_runtime_normalizes_factory_exception():
+    """A malformed plugin factory has one actionable lifecycle error shape."""
+    from agent.context_engine import (
+        ContextEngineLifecycleError,
+        create_context_engine_runtime,
+    )
+
+    class MalformedEngine(StubEngine):
+        def create_runtime(self):
+            raise ValueError("bad plugin state")
+
+    with pytest.raises(ContextEngineLifecycleError, match=r"create_runtime\(\) failed: bad plugin state"):
+        create_context_engine_runtime(MalformedEngine(), name="Context engine 'bad'")
+
+
+def test_repo_loader_preserves_normalized_factory_error(tmp_path, monkeypatch):
+    """The repo loader exposes the same lifecycle error for malformed factories."""
+    import plugins.context_engine as loader
+
+    engine_dir = _write_engine_plugin(
+        tmp_path,
+        """
+from agent.context_engine import ContextEngine
+
+class Engine(ContextEngine):
+    @property
+    def name(self): return 'test_bad_factory'
+    def update_from_response(self, usage): pass
+    def should_compress(self, prompt_tokens=None): return False
+    def compress(self, messages, current_tokens=None): return messages
+    def create_runtime(self): raise ValueError('factory exploded')
+
+def register(ctx): ctx.register_context_engine(Engine())
+""",
+        name="test_bad_factory",
+    )
+    monkeypatch.setattr(loader, "_CONTEXT_ENGINE_PLUGINS_DIR", tmp_path)
+    loader._ENGINE_PROTOTYPES.clear()
+
+    with pytest.raises(loader.ContextEngineLifecycleError, match="factory exploded"):
+        loader.load_context_engine(engine_dir.name)
+
+
 def test_context_engine_close_boundary_is_idempotent():
     engine = _RuntimeEngine()
     engine.close()
@@ -316,6 +400,39 @@ def test_agent_shutdown_closes_context_engine_after_session_end():
     agent.close()
 
     assert events == ["session_end", "session_end", "close"]
+
+
+def test_agent_shutdown_retries_context_engine_close_after_failure():
+    """A failed close is retried, while successful cleanup is not repeated."""
+    from run_agent import AIAgent
+
+    events = []
+    close_attempts = 0
+    engine = _RuntimeEngine()
+
+    def close():
+        nonlocal close_attempts
+        close_attempts += 1
+        if close_attempts == 1:
+            raise RuntimeError("transient close failure")
+        events.append("close")
+
+    engine.on_session_end = lambda session_id, messages: events.append("session_end")
+    engine.close = close
+    agent = AIAgent.__new__(AIAgent)
+    agent._memory_manager = None
+    agent.context_compressor = engine
+    agent.session_id = "session-1"
+
+    agent.shutdown_memory_provider([])
+    assert events == ["session_end"]
+    assert not getattr(agent, "_shutdown_memory_provider_done", False)
+
+    agent.shutdown_memory_provider([])
+    agent.shutdown_memory_provider([])
+    assert events == ["session_end", "close"]
+    assert close_attempts == 2
+    assert agent._shutdown_memory_provider_done is True
 
 
 def test_default_context_engine_behavior_remains_unchanged():

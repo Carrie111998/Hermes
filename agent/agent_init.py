@@ -2414,7 +2414,7 @@ def init_agent(
                         _candidate,
                         name=f"Context engine '{_engine_name}'",
                     )
-                except (RuntimeError, TypeError) as _factory_err:
+                except Exception as _factory_err:
                     _ra().logger.warning(
                         "Context engine '%s' does not provide a supported isolated "
                         "runtime factory (%s) — falling back to built-in compressor",

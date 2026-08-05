@@ -26,17 +26,17 @@ import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from agent.context_engine import ContextEngine, create_context_engine_runtime
+from agent.context_engine import (
+    ContextEngine,
+    ContextEngineLifecycleError,
+    create_context_engine_runtime,
+)
 
 logger = logging.getLogger(__name__)
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
 _ENGINE_PROTOTYPES = {}
 _ENGINE_PROTOTYPES_LOCK = threading.RLock()
-
-
-class ContextEngineLifecycleError(RuntimeError):
-    """Raised when a plugin does not provide an isolated runtime boundary."""
 
 
 def discover_context_engines() -> List[Tuple[str, str, bool]]:
@@ -69,10 +69,11 @@ def discover_context_engines() -> List[Tuple[str, str, bool]]:
             except Exception:
                 pass
 
-        # Quick availability check — try loading and calling is_available()
+        # Availability is a prototype check. Discovery may run repeatedly, so
+        # it must not create resource-owning per-agent runtimes.
         available = True
         try:
-            engine = _load_engine_from_dir(child)
+            engine = _load_engine_prototype_from_dir(child)
             if engine is None:
                 available = False
             elif hasattr(engine, "is_available"):
@@ -125,10 +126,7 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
                 return None
             _ENGINE_PROTOTYPES[prototype_key] = prototype
 
-        try:
-            return create_context_engine_runtime(prototype, name=f"Context engine '{name}'")
-        except (RuntimeError, TypeError) as exc:
-            raise ContextEngineLifecycleError(str(exc)) from exc
+        return create_context_engine_runtime(prototype, name=f"Context engine '{name}'")
 
 
 def _load_engine_prototype_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
