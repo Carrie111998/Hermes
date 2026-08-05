@@ -195,8 +195,11 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "Node.js and npm in the runtime where Hermes executes commands" in (
         SKILL_DIR / "references" / "cli-guide.md"
     ).read_text(encoding="utf-8")
-    assert "active Hermes home's `.env` file" in ccg
+    assert "active Hermes home" in ccg
     assert "~/.hermes/.env" not in ccg
+    assert "Do you want me to create or open" in ccg
+    assert "I added the credentials" in ccg
+    assert "Do not tell the user to manually run Box CLI commands" in skill
     assert "uses POSIX shell syntax" in rest
 
 
@@ -211,7 +214,7 @@ def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
     assert "one App User per Hermes deployment or isolation boundary" in ccg
     assert "current local computer user's signed-in Box browser session" in ccg
     assert "If they decline, give this path with clickable links" in ccg
-    assert "select **Create Platform App**" in ccg
+    assert "select **New App**" in ccg
     assert "https://app.box.com/developers/console/new" not in ccg
     assert "**App Details** sidebar" in ccg
     assert "**App Access Only**" in ccg
@@ -237,8 +240,9 @@ def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
     assert "do not retry with a broader identity" in ccg
     assert "box collaborations:create <FILE_ID> file" in ccg
     assert "box hubs:collaborations:create <HUB_ID>" in ccg
-    assert "write only the required assignments" in ccg
+    assert "write only these required assignments" in ccg
     assert "no prose, comments, code fences, placeholders, or other text" in ccg
+    assert "do not display them as user instructions" in ccg
 
 
 def test_ccg_app_user_box_ai_access_has_a_narrow_actor_fallback():

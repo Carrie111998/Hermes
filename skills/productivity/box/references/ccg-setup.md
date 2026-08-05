@@ -4,13 +4,23 @@ Use CCG when Hermes needs a separate, unattended Box identity. **Always configur
 
 A Service Account is automatically created when an administrator authorizes the CCG app. Use it only as the provisioning identity for the App User; it is not Hermes's runtime actor. Both are API-only and begin with empty roots. Store CCG credentials in the runtime's secret store; never print them or put them in chat.
 
+## Keep the setup interactive
+
+Guide the user through the Box Developer Console until they can obtain the Client ID, Client Secret, and Enterprise ID. Then ask: **“Do you want me to create or open the active Hermes home’s `.env` file so you can add the three credentials?”**
+
+If they agree, create the file if needed, preserve unrelated existing entries, restrict its permissions where the runtime supports it, and open it locally for the user. Do not prefill it with placeholders, echo it, read its secret values into chat, or create a user-facing CCG JSON file. Tell the user to save the three values and reply **“I added the credentials.”** If opening an editor is unavailable, state the active `.env` path and ask them to add the three values there; never give them CLI commands to do so.
+
+After that confirmation, validate locally without displaying values. Create the private CCG configuration from the `.env` values, run the Box CLI configuration and verification commands yourself, then continue with App User creation and runtime configuration. Do not show the user the commands, JSON template, or a manual command checklist. Pause only for a required sign-in or administrator approval, approval to create the App User, and approval for a collaboration change.
+
 ## Create and authorize the app
 
 First ask whether the user wants Hermes to use the current local computer user's signed-in Box browser session to create and configure the Platform App. If they approve, open the [Box Developer Console](https://app.box.com/developers/console) and complete all non-secret steps. Do not attempt browser-driven setup on a remote or headless runtime unless the user confirms that a usable browser session exists there.
 
-If they decline, give this path with clickable links and wait for the values to be stored locally: open the [Box Developer Console](https://app.box.com/developers/console), select **Create Platform App**, enter an app name, choose **Client Credentials Grant** and **App Access Only**, enable **Manage users**, **Make API calls using the as-user header**, and **Generate User Access Tokens**, choose the minimum additional scopes, then ask the administrator to [authorize the app](https://app.box.com/master/console). Link the user to the [official Platform App creation steps](https://developer.box.com/guides/applications/platform-apps/create/) if they need the Console flow. If on free developer account, the app is auto authorized. **Manage users is required to create the App User through this CCG app.** If the deployment will use Box AI, also enable **Configuration → Required Access Scopes → Content Actions → Manage AI** (`ai.readwrite`). Reauthorize the app after changing scopes.
+If they decline, give this path with clickable links and wait for the values to be stored locally: open the [Box Developer Console](https://app.box.com/developers/console), select **New App**, enter an app name, choose **Server** app type, **Client Credentials Grant** and **App Access Only**, enable **Manage users**, **Make API calls using the as-user header**, and **Generate User Access Tokens**, choose the minimum additional scopes, then ask the administrator to [authorize the app](https://app.box.com/master/console). Link the user to the [official Platform App creation steps](https://developer.box.com/guides/applications/platform-apps/create/) if they need the Console flow. If on free developer account, the app is auto authorized. **Manage users is required to create the App User through this CCG app.** If the deployment will use Box AI, also enable **Configuration → Required Access Scopes → Content Actions → Manage AI** (`ai.readwrite`). Reauthorize the app after changing scopes.
 
-Pause only when a Box administrator must approve the app or when the human must sign in. Find the Client ID, Client Secret, and Enterprise ID in the app's **App Details** sidebar. Never ask for a Client Secret in chat. Store the values directly in the active Hermes home's `.env` file, then resume after it is ready. When Hermes creates or updates that file, write only the required assignments—no prose, comments, code fences, placeholders, or other text:
+Pause only when a Box administrator must approve the app or when the human must sign in. Find the Client ID, Client Secret, and Enterprise ID in the app's **App Details** sidebar. Never ask for a Client Secret in chat. Follow the interactive credential-entry flow above; do not show a credentials-file template to the user.
+
+When Hermes creates or updates the active Hermes home's `.env`, write only these required assignments—no prose, comments, code fences, placeholders, or other text:
 
 ```text
 BOX_CLIENT_ID=your_client_id
@@ -20,7 +30,7 @@ BOX_ENTERPRISE_ID=your_enterprise_id
 
 ## Provision the Hermes App User
 
-After the credentials exist locally, copy [the CCG configuration template](../templates/ccg-config.json.example) and replace its placeholders without printing secrets. Add and verify the Service Account environment only for provisioning:
+After the user confirms that the credentials exist locally, generate the restricted CCG configuration from [the CCG configuration template](../templates/ccg-config.json.example) without printing secrets. Add and verify the Service Account environment only for provisioning. **Run these commands yourself; do not display them as user instructions:**
 
 ```bash
 box configure:environments:add /path/to/ccg-config.json --ccg-auth --name hermes-provisioner --set-as-current
@@ -29,7 +39,7 @@ box users:get me --json --fields id,name,login
 
 The returned `login` is the Service Account email. Do not routinely print environment configuration: it may contain sensitive information.
 
-Before creating the dedicated App User, explain its name and purpose and get approval: it creates a new Box identity. Then create and record the App User ID and email without printing credentials:
+Before creating the dedicated App User, propose its name and purpose and get approval: it creates a new Box identity. Then create and record the App User ID and email without printing credentials. **Run this command yourself; do not display it as a user instruction:**
 
 ```bash
 box users:create "Hermes Production Agent" --app-user --json --fields id,name,login
@@ -39,7 +49,7 @@ Do not assume an App User confirmation email is delivered or required. Configure
 
 ### Add the App User runtime environment
 
-Configure the persistent Hermes environment with the App User ID. `--ccg-user` makes the CCG token represent the App User instead of the Service Account:
+Configure the persistent Hermes environment with the App User ID. `--ccg-user` makes the CCG token represent the App User instead of the Service Account. **Run these commands yourself; do not display them as user instructions:**
 
 ```bash
 box configure:environments:add /path/to/ccg-config.json --ccg-auth --ccg-user <APP_USER_ID> --name hermes-agent --set-as-current
@@ -56,7 +66,7 @@ Ask which specific file, folder, or Hub the App User should access. Accept a Box
 
 If the user prefers a manual invite, report the App User's email and ID and ask the resource owner to invite it to that exact file, folder, or Hub in Box. If the user provides an ID, request approval for the exact resource and role, then create the collaboration only when the current actor is authorized to manage collaborators on that resource. If the current actor lacks that authority, do not retry with a broader identity or ask the user to change app scopes; provide the App User email and ID for a manual invite instead.
 
-Use ordinary collaboration for an exact file or folder, and Hub collaboration for an exact Hub:
+Use ordinary collaboration for an exact file or folder, and Hub collaboration for an exact Hub. **Run the approved command yourself; do not tell the user to run it:**
 
 ```bash
 box collaborations:create <FILE_ID> file --role viewer --login <APP_USER_EMAIL> --json
