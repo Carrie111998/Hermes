@@ -891,6 +891,77 @@ def test_recovered_followup_on_persistent_supervisor_sub_is_silent(
     assert adapter.received == []
 
 
+def test_first_transient_recovery_on_ordinary_subscription_is_silent(
+    tmp_path, monkeypatch
+):
+    """A recovered first failure must not fall through generic notifier copy."""
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn,
+            title="Ordinary subscriber recovery",
+            assignee="forge",
+            session_id="creator-session",
+        )
+        kb.add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform="discord",
+            chat_id="hermes-command-channel",
+            notifier_profile="default",
+            delivery_metadata={"ordinary": True},
+        )
+        assert kb.block_task(
+            conn, task_id, reason="temporary backend failure", kind="transient"
+        )
+        recovered = reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert recovered.recovered == [task_id]
+        assert task.status == "ready"
+        sub = kb.list_notify_subs(conn, task_id)[0]
+        assert sub["delivery_metadata"] == {"ordinary": True}
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"proactive_supervisor": {
+            "enabled": True,
+            "platform": "discord",
+            "chat_id": "hermes-command-channel",
+            "chat_type": "channel",
+            "recovery_limit": 1,
+        }}},
+    )
+    adapter = _RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert adapter.sent == []
+    assert adapter.received == []
+
+
 def test_gate_resolved_after_collection_before_send_is_silent(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
     kb.init_db()

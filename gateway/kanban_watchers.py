@@ -463,21 +463,14 @@ class GatewayKanbanWatchersMixin:
                         who = (task.assignee if task and task.assignee else None)
                         tag = f"@{who} " if who else ""
                         delivery_metadata = sub.get("delivery_metadata")
-                        _supervisor_delivery = bool(
-                            isinstance(delivery_metadata, dict)
-                            and delivery_metadata.get("_kanban_proactive_supervisor")
-                        )
                         _supervisor_msg = None
-                        if (
-                            _supervisor_delivery
-                            and render_supervisor_event is not None
-                            and kind in {"blocked", "gave_up", "block_loop_detected"}
-                        ):
+                        if kind in {"blocked", "gave_up", "block_loop_detected"}:
                             # Collection claims the cursor before platform I/O.
-                            # Re-read the subscription and task generation at
-                            # the final delivery boundary so a concurrent
-                            # dashboard transition, recovery, or replacement
-                            # gate cannot emit stale supervisor copy.
+                            # Re-read every blocking event at the final delivery
+                            # boundary, including ordinary subscriptions. A
+                            # successful supervisor recovery must not fall back
+                            # to generic "blocked" copy or a creator wake merely
+                            # because the subscription predates supervision.
                             _fresh_supervisor_state = await asyncio.to_thread(
                                 self._kanban_supervisor_delivery_state,
                                 sub,
@@ -494,13 +487,26 @@ class GatewayKanbanWatchersMixin:
                                 _supervisor_suppressed_event_ids.add(int(ev.id))
                                 continue
                             delivery_metadata = _fresh_sub.get("delivery_metadata")
-                            _supervisor_msg = render_supervisor_event(
-                                board=board_slug or _kb.DEFAULT_BOARD,
-                                task=task,
-                                event=ev,
-                                delivery_metadata=delivery_metadata,
-                                current_event_id=_fresh_state_event_id,
+                            if _fresh_state_event_id != int(ev.id):
+                                _supervisor_suppressed_event_ids.add(int(ev.id))
+                                continue
+                            _supervisor_delivery = bool(
+                                isinstance(delivery_metadata, dict)
+                                and delivery_metadata.get(
+                                    "_kanban_proactive_supervisor"
+                                )
                             )
+                            if (
+                                _supervisor_delivery
+                                and render_supervisor_event is not None
+                            ):
+                                _supervisor_msg = render_supervisor_event(
+                                    board=board_slug or _kb.DEFAULT_BOARD,
+                                    task=task,
+                                    event=ev,
+                                    delivery_metadata=delivery_metadata,
+                                    current_event_id=_fresh_state_event_id,
+                                )
                         if _supervisor_msg == "":
                             _supervisor_suppressed_event_ids.add(int(ev.id))
                             continue
