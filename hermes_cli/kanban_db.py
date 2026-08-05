@@ -107,7 +107,10 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked",
+    "completed_pending_review", "review", "done", "archived",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
@@ -5871,7 +5874,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'triage')
+                  AND status IN ('running', 'ready', 'blocked', 'triage', 'completed_pending_review')
                 """,
                 (result, now, task_id),
             )
@@ -5888,7 +5891,7 @@ def complete_task(
                        block_kind   = NULL,
                        block_recurrences = 0
                  WHERE id = ?
-                   AND status IN ('running', 'ready', 'blocked', 'triage')
+                  AND status IN ('running', 'ready', 'blocked', 'triage', 'completed_pending_review')
                    AND current_run_id = ?
                 """,
                 (result, now, task_id, int(expected_run_id)),
@@ -6732,7 +6735,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'completed_pending_review')
                     """,
                     (kind, recurrences, task_id),
                 )
@@ -6747,7 +6750,7 @@ def block_task(
                            block_kind    = ?,
                            block_recurrences = ?
                      WHERE id = ?
-                       AND status IN ('running', 'ready')
+                       AND status IN ('running', 'ready', 'completed_pending_review')
                        AND current_run_id = ?
                     """,
                     (kind, recurrences, task_id, int(expected_run_id)),
@@ -7919,6 +7922,9 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    missing_exit_signal: list[str] = field(default_factory=list)
+    """Task ids moved to ``completed_pending_review`` because repeated
+    rc=0 worker exits never called ``kanban_complete``/``kanban_block``."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -8862,6 +8868,48 @@ _PROTOCOL_VIOLATION_FAILURE_LIMIT = 3
 _PROTOCOL_VIOLATION_SCAN_LIMIT = 50
 
 
+def _reconcile_missing_exit_signal(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    protocol_violations: int,
+    protocol_violation_limit: int,
+    payload: Optional[dict] = None,
+) -> bool:
+    """Move a repeated clean-exit/no-terminal-signal task out of dispatch.
+
+    A worker that repeatedly exits rc=0 without calling ``kanban_complete`` or
+    ``kanban_block`` is not a normal task failure: the subprocess finished, but
+    the board is missing the required lifecycle signal.  Blocking it through
+    the generic crash breaker makes it look like transient product work and can
+    feed unblock/retry loops.  This terminal-but-unaccepted state is distinct,
+    visible in stats/dashboard columns, and still lets an operator/worker close
+    the card honestly via ``kanban_complete`` or ``kanban_block`` later.
+    """
+    event_payload = {
+        "error": error[:500],
+        "protocol_violations": int(protocol_violations),
+        "protocol_violation_limit": int(protocol_violation_limit),
+    }
+    if payload:
+        event_payload.update(payload)
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'completed_pending_review', "
+            "consecutive_failures = 0, last_failure_error = ? "
+            "WHERE id = ? AND status IN ('ready', 'running')",
+            (error[:500], task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "missing_exit_signal", event_payload,
+            run_id=_current_run_id(conn, task_id),
+        )
+    return True
+
+
 def _protocol_violation_streak(conn: sqlite3.Connection, task_id: str) -> int:
     """Count the task's trailing run of clean-exit protocol violations.
 
@@ -8927,9 +8975,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     When the reap registry shows the worker exited cleanly (rc=0) but
     the task was still ``running`` in the DB, treat it as a protocol
     violation (worker answered conversationally without calling
-    ``kanban_complete`` / ``kanban_block``) and trip the circuit breaker
-    on the first occurrence — retrying a worker whose CLI keeps
-    returning 0 without a terminal transition just loops forever.
+    ``kanban_complete`` / ``kanban_block``). Below the bounded violation
+    streak limit, retry without consuming the unified failure budget; at
+    the limit, move the task to ``completed_pending_review`` with a
+    ``missing_exit_signal`` event instead of conflating it with a generic
+    crash/block outcome.
 
     When the reap registry shows the worker exited with the rate-limit
     sentinel (``KANBAN_RATE_LIMIT_EXIT_CODE``), the worker bailed on a
@@ -9250,6 +9300,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # top precedence it has for every other failure kind. Systemic same-error
     # crashes still trip immediately.
     auto_blocked: list[str] = []
+    missing_exit_signal: list[str] = []
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
@@ -9279,16 +9330,15 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     # below-budget violation must not consume the unified
                     # failure budget, just as other failure kinds don't
                     # consume this one.
-                    #
                     # EXCEPT the ABSOLUTE catch-all (t_458ab8d6): when the
                     # unified consecutive_failures counter has already
-                    # reached DISPATCHER_MAX_CONSECUTIVE_FAILURES, fall
-                    # through to the force-trip below instead of
-                    # ``continue``. The violation streak only bounds
-                    # violations; the absolute max bounds ALL consecutive
-                    # failures, and a task parked at the absolute max must
-                    # not escape through a below-budget violation branch
-                    # (the ``max_retries=99`` bypass).
+                    # reached DISPATCHER_MAX_CONSECUTIVE_FAILURES, trip the
+                    # breaker right here instead of ``continue``. The
+                    # violation streak only bounds violations; the absolute
+                    # max bounds ALL consecutive failures, and a task parked
+                    # at the absolute max must not escape through a
+                    # below-budget violation branch (the ``max_retries=99``
+                    # bypass).
                     _cf_row = conn.execute(
                         "SELECT consecutive_failures FROM tasks WHERE id = ?",
                         (tid,),
@@ -9299,43 +9349,54 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                         DISPATCHER_MAX_CONSECUTIVE_FAILURES
                     ):
                         continue
-                # Streak reached the bound — or the unified counter reached
-                # the absolute max: trip the breaker. ``force_trip`` skips
-                # the threshold resolution inside ``_record_task_failure``
-                # because the decision — including the per-task
-                # ``max_retries`` override — was already made against the
-                # violation streak above (and the absolute-max provenance
-                # fix inside the recorder re-labels the trip when the
-                # counter is at the absolute max).
-                tripped = _record_task_failure(
+                    # Absolute max reached: trip the breaker. ``force_trip``
+                    # skips the threshold resolution inside
+                    # ``_record_task_failure`` because the decision —
+                    # including the per-task ``max_retries`` override — was
+                    # already made above.
+                    tripped = _record_task_failure(
+                        conn, tid,
+                        error=error_text,
+                        outcome="crashed",
+                        failure_limit=violation_limit,
+                        force_trip=True,
+                        release_claim=False,
+                        end_run=False,
+                        block_kind="capability",
+                        block_comment=(
+                            f"AUTO-BLOCK (capability): protocol_violation streak "
+                            f"reached the bound ({streak}/{violation_limit}). The "
+                            f"worker exited rc=0 without calling kanban_complete / "
+                            f"kanban_block on {streak} consecutive runs. The "
+                            f"harness now auto-blocks such exits (t_44cfa735), so "
+                            f"this residual block means the worker kept narrating "
+                            f"instead of terminating even after nudges. A human "
+                            f"must verify completion (artifacts/comments) and "
+                            f"unblock for retry or complete it."
+                        ),
+                        event_payload_extra={
+                            "pid": pid,
+                            "claimer": claimer,
+                            "protocol_violations": streak,
+                            "protocol_violation_limit": violation_limit,
+                        },
+                    )
+                    if tripped:
+                        auto_blocked.append(tid)
+                    continue
+                # Streak reached the bound: stop dispatching the card, but do
+                # not route it through the generic crash breaker.  This is a
+                # distinct missing end-of-run lifecycle signal, not a task-code
+                # failure, transient dependency, or normal blocked state.
+                reconciled = _reconcile_missing_exit_signal(
                     conn, tid,
                     error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    block_kind="capability",
-                    block_comment=(
-                        f"AUTO-BLOCK (capability): protocol_violation streak "
-                        f"reached the bound ({streak}/{violation_limit}). The "
-                        f"worker exited rc=0 without calling kanban_complete / "
-                        f"kanban_block on {streak} consecutive runs. The "
-                        f"harness now auto-blocks such exits (t_44cfa735), so "
-                        f"this residual block means the worker kept narrating "
-                        f"instead of terminating even after nudges. A human "
-                        f"must verify completion (artifacts/comments) and "
-                        f"unblock for retry or complete it."
-                    ),
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
+                    protocol_violations=streak,
+                    protocol_violation_limit=violation_limit,
+                    payload={"pid": pid, "claimer": claimer},
                 )
-                if tripped:
-                    auto_blocked.append(tid)
+                if reconciled:
+                    missing_exit_signal.append(tid)
                 continue
             fp = _error_fingerprint(error_text)
             is_systemic = _fp_counts.get(fp, 0) >= 3
@@ -9373,11 +9434,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             _maybe_fire_coalesced_deadpid_alert(
                 conn, _fp, _sample_err, _count, _sample_tid,
             )
-    # Stash auto-blocked ids on the function for the dispatch loop to pick up.
+    # Stash side-channel ids on the function for the dispatch loop to pick up.
     # Keeps the public return type (``list[str]``) stable for direct callers
     # and tests that destructure the result; ``dispatch_once`` reads this
-    # side-channel attribute to populate ``DispatchResult.auto_blocked``.
+    # side-channel attribute to populate ``DispatchResult`` diagnostics.
     detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
+    detect_crashed_workers._last_missing_exit_signal = missing_exit_signal  # type: ignore[attr-defined]
     # Same side-channel for rate-limited requeues — these did NOT count a
     # failure and are NOT crashes, so they stay out of the ``crashed`` return.
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
@@ -10019,9 +10081,15 @@ def _dispatch_once_locked(
         conn, stale_timeout_seconds=stale_timeout_seconds,
     )
     result.crashed = detect_crashed_workers(conn)
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
+    # detect_crashed_workers stashes repeated clean-exit/no-signal
+    # reconciliations on itself so the public list-return stays stable.
+    # Pull them into the DispatchResult here so telemetry / tests see the
+    # distinct missing-exit-signal diagnostic rather than a generic blocker.
+    _missing_exit_signal = getattr(
+        detect_crashed_workers, "_last_missing_exit_signal", []
+    )
+    if _missing_exit_signal:
+        result.missing_exit_signal.extend(_missing_exit_signal)
     _crash_auto_blocked = getattr(
         detect_crashed_workers, "_last_auto_blocked", []
     )
@@ -11300,10 +11368,27 @@ def board_stats(conn: sqlite3.Connection) -> dict:
         if oldest_row and oldest_row["ts"] is not None else None
     )
 
+    missing_cutoff = now - 24 * 60 * 60
+    missing_exit_signal_24h = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM task_events "
+        "WHERE kind = 'missing_exit_signal' AND created_at >= ?",
+        (missing_cutoff,),
+    ).fetchone()["n"])
+    ended_runs_24h = int(conn.execute(
+        "SELECT COUNT(*) AS n FROM task_runs WHERE ended_at >= ?",
+        (missing_cutoff,),
+    ).fetchone()["n"])
+    missing_exit_signal_rate_24h = (
+        missing_exit_signal_24h / ended_runs_24h if ended_runs_24h else 0.0
+    )
+
     return {
         "by_status": by_status,
         "by_assignee": by_assignee,
         "oldest_ready_age_seconds": oldest_ready_age,
+        "missing_exit_signal_24h": missing_exit_signal_24h,
+        "ended_runs_24h": ended_runs_24h,
+        "missing_exit_signal_rate_24h": missing_exit_signal_rate_24h,
         "now": now,
     }
 

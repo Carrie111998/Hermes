@@ -650,6 +650,59 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_missing_exit_signal(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Repeated rc=0/no-terminal-signal cards need review, not generic triage.
+
+    The dispatcher moves these tasks to ``completed_pending_review`` after the
+    clean-exit protocol-violation streak reaches its bound. This rule is
+    read-only: it makes the distinct terminal-review state searchable through
+    ``hermes kanban diagnostics`` and the dashboard without mutating the card.
+    """
+    if _task_field(task, "status") != "completed_pending_review":
+        return []
+
+    task_id = _task_field(task, "id")
+    missing_events = [ev for ev in events if _event_kind(ev) == "missing_exit_signal"]
+    latest = missing_events[-1] if missing_events else None
+    payload = _parse_payload(latest) if latest is not None else {}
+    last_err = (
+        payload.get("error")
+        or _task_field(task, "last_failure_error", "")
+        or "worker exited rc=0 without kanban_complete/kanban_block"
+    )
+
+    return [Diagnostic(
+        kind="missing_exit_signal",
+        severity="error",
+        title="Worker exited without terminal Kanban signal",
+        detail=(
+            "The dispatcher observed repeated worker rc=0 exits while the card "
+            "remained running, which means no kanban_complete or kanban_block "
+            "signal was recorded. Review the worker log/evidence, then close "
+            "the card with kanban_complete or kanban_block; do not treat this "
+            "as a generic crash, spawn failure, or iteration-budget condition."
+        ),
+        actions=[
+            DiagnosticAction(
+                kind="comment",
+                label="Add review finding before completing/blocking",
+                payload={"task_id": task_id} if task_id else {},
+                suggested=True,
+            ),
+            *_generic_recovery_actions(task, running=False),
+        ],
+        first_seen_at=_event_ts(latest) if latest is not None else now,
+        last_seen_at=_event_ts(latest) if latest is not None else now,
+        count=max(1, int(payload.get("protocol_violations") or len(missing_events) or 1)),
+        data={
+            "last_error": str(last_err),
+            "protocol_violations": payload.get("protocol_violations"),
+            "protocol_violation_limit": payload.get("protocol_violation_limit"),
+            "event_kind": "missing_exit_signal",
+        },
+    )]
+
+
 def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     """The worker spawns fine but keeps crashing mid-run. Check the last
     N runs' outcomes; N consecutive ``crashed`` without a successful
@@ -1049,6 +1102,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_missing_exit_signal,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
@@ -1064,6 +1118,7 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "missing_exit_signal",
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",
