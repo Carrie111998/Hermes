@@ -174,8 +174,11 @@ COMPUTER_USE_SCHEMA: Dict[str, Any] = {
                     "model and does not steal focus. `foreground` uses real "
                     "foreground input where supported, which can be more "
                     "reliable for Windows Explorer desktop icons and Qt apps "
-                    "such as Telegram/WeChat but may disrupt the user. `auto` "
-                    "asks the backend to choose or fall back when supported."
+                    "such as Telegram/WeChat but may disrupt the user. "
+                    "`auto` is passed through to the cua-driver, which "
+                    "chooses an input-delivery mode on the agent's behalf; "
+                    "the agent does not resolve it locally, so the resulting "
+                    "mode (and any fallback) is driver-dependent."
                 ),
             },
             # ── drag ───────────────────────────────────────────────
