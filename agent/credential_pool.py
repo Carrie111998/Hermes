@@ -1965,8 +1965,6 @@ class CredentialPool:
                 if refreshed is None:
                     continue
                 entry = refreshed
-            if model_lockouts_active:
-                continue
             available.append(entry)
         if entries_to_prune:
             pruned_ids = set(entries_to_prune)
