@@ -1,6 +1,8 @@
-import { defineLocale } from './define-locale'
+import { defineFieldCopy } from '@/app/settings/field-copy'
 
-export const vi = defineLocale({
+import type { Translations } from './types'
+
+export const vi: Translations = {
   common: {
     apply: 'Áp dụng',
     back: 'Quay lại',
@@ -42,6 +44,7 @@ export const vi = defineLocale({
     on: 'Bật',
     off: 'Tắt'
   },
+
   fileMenu: {
     revealFinder: 'Hiển thị trong Finder',
     revealExplorer: 'Hiển thị trong File Explorer',
@@ -57,6 +60,7 @@ export const vi = defineLocale({
     deleteBody: 'Mục này sẽ được chuyển vào Thùng rác và bạn có thể khôi phục từ đó.',
     pathCopied: 'Đã sao chép đường dẫn'
   },
+
   boot: {
     ready: 'Hermes Desktop đã sẵn sàng',
     desktopBootFailedWithMessage: message => `Không thể khởi động Desktop: ${message}`,
@@ -107,6 +111,7 @@ export const vi = defineLocale({
       identityProvider: 'nhà cung cấp danh tính của bạn'
     }
   },
+
   notifications: {
     region: 'Thông báo',
     hide: 'Ẩn',
@@ -125,6 +130,38 @@ export const vi = defineLocale({
     updateReadyTitle: 'Bản cập nhật đã sẵn sàng',
     updateReadyMessage: count => `Có ${count} thay đổi mới.`,
     seeWhatsNew: 'Xem nội dung mới',
+    errors: {
+      elevenLabsNeedsKey: 'ElevenLabs STT cần ELEVENLABS_API_KEY.',
+      elevenLabsRejectedKey: 'ElevenLabs đã từ chối khóa API (401).',
+      diskFull: 'Ổ đĩa đầy — giải phóng dung lượng rồi thử lại.',
+      gatewayAuthFailed: 'Xác thực cổng không thành công - hãy kiểm tra API_SERVER_KEY của bạn.',
+      methodNotAllowed:
+        'Phần phụ trợ của Desktop đã từ chối yêu cầu đó (Phương thức 405 không được phép). Hãy thử khởi động lại Hermes Desktop.',
+      microphonePermission: 'Quyền sử dụng micrô đã bị từ chối.',
+      openaiRejectedApiKey: 'OpenAI đã từ chối khóa API.',
+      openaiRejectedApiKeyWithStatus: status => `OpenAI đã từ chối khóa API (${status} không hợp lệ_api_key).`,
+      openaiTtsNeedsKey: 'OpenAI TTS cần VOICE_TOOLS_OPENAI_KEY hoặc OPENAI_API_KEY.'
+    },
+    voice: {
+      configureSpeechToText: 'Định cấu hình tính năng chuyển lời nói thành văn bản để sử dụng chế độ giọng nói.',
+      couldNotStartSession: 'Không thể bắt đầu phiên thoại',
+      microphoneAccessDenied: 'Quyền truy cập micrô bị từ chối.',
+      microphoneConstraintsUnsupported: 'Thiết bị này không hỗ trợ các hạn chế về micrô.',
+      microphoneFailed: 'Micrô không thành công',
+      microphoneInUse: 'Ứng dụng khác đã sử dụng micrô.',
+      microphonePermissionDenied: 'Quyền sử dụng micrô đã bị từ chối.',
+      microphoneStartFailed: 'Không thể bắt đầu ghi micrô.',
+      microphoneUnsupported: 'Thời gian chạy này không hỗ trợ ghi micrô.',
+      noMicrophone: 'Không tìm thấy micrô.',
+      noSpeechDetected: 'Không phát hiện thấy giọng nói nào',
+      playbackFailed: 'Phát lại giọng nói không thành công',
+      recordingFailed: 'Ghi âm giọng nói không thành công',
+      sayStopToEnd: phrase => `Nói "${phrase}" để kết thúc trò chuyện thoại.`,
+      transcriptionFailed: 'Phiên âm giọng nói không thành công',
+      transcriptionUnavailable: 'Phiên âm giọng nói chưa có sẵn.',
+      tryRecordingAgain: 'Hãy thử ghi lại.',
+      unavailable: 'Không có giọng nói'
+    },
     native: {
       approvalTitle: 'Cần phê duyệt',
       approveAction: 'Phê duyệt',
@@ -139,6 +176,21 @@ export const vi = defineLocale({
       creditsTitle: 'Tín dụng'
     }
   },
+
+  remoteDisplayBanner: {
+    message: reason =>
+      `Đang hoạt động hiển thị phần mềm - đã phát hiện thấy màn hình từ xa (${reason}). Khả năng tăng tốc GPU bị vô hiệu hóa để tránh hiện tượng nhấp nháy.`
+  },
+
+  billingBlock: {
+    titleNous: 'Hết tín dụng Nous',
+    titleProvider: provider => `Hết tín dụng — ${provider}`,
+    fallbackMessage: 'Tài khoản của bạn đã hết tín dụng. Thêm tín dụng để tiếp tục.',
+    openBilling: 'Mở trang thanh toán',
+    addCredits: 'Thêm tín dụng',
+    dismiss: 'Bỏ qua'
+  },
+
   titlebar: {
     hideSidebar: 'Ẩn thanh bên',
     showSidebar: 'Hiện thanh bên',
@@ -155,6 +207,7 @@ export const vi = defineLocale({
     layoutEditor: 'Trình chỉnh sửa bố cục',
     layoutEditorTitle: 'Trình chỉnh sửa bố cục — ⌘-click để đặt lại bố cục'
   },
+
   keybinds: {
     title: 'Phím tắt',
     subtitle: open => `Bấm vào phím tắt để gán lại · ${open} để mở lại bảng này.`,
@@ -188,6 +241,15 @@ export const vi = defineLocale({
       'session.newWindow': 'Cửa sổ mới',
       'session.next': 'Phiên tiếp theo',
       'session.prev': 'Phiên trước',
+      'session.slot.1': 'Chuyển sang phiên gần đây 1',
+      'session.slot.2': 'Chuyển sang phiên gần đây 2',
+      'session.slot.3': 'Chuyển sang phiên gần đây 3',
+      'session.slot.4': 'Chuyển sang phiên gần đây 4',
+      'session.slot.5': 'Chuyển sang phiên gần đây 5',
+      'session.slot.6': 'Chuyển sang phiên gần đây 6',
+      'session.slot.7': 'Chuyển sang phiên gần đây 7',
+      'session.slot.8': 'Chuyển sang phiên gần đây 8',
+      'session.slot.9': 'Chuyển sang phiên gần đây 9',
       'session.focusSearch': 'Tìm kiếm phiên',
       'session.togglePin': 'Ghim hoặc bỏ ghim phiên hiện tại',
       'workspace.newWorktree': 'Worktree mới',
@@ -195,6 +257,49 @@ export const vi = defineLocale({
       'composer.focus': 'Chuyển tiêu điểm đến khung soạn thảo',
       'composer.modelPicker': 'Mở bộ chọn mô hình',
       'composer.voice': 'Bắt đầu hoặc dừng trò chuyện thoại',
+      'view.toggleSidebar': 'Bật/tắt thanh phiên',
+      'view.toggleRightSidebar': 'Bật/tắt trình duyệt tệp',
+      'view.toggleReview': 'Bật/tắt ngăn xem lại',
+      'view.toggleStatusbar': 'Bật/tắt thanh trạng thái',
+      'view.showFiles': 'Hiện trình duyệt tệp',
+      'view.showTerminal': 'Bật/tắt terminal',
+      'view.newTerminal': 'Terminal mới',
+      'view.nextTerminal': 'Terminal tiếp theo',
+      'view.prevTerminal': 'Terminal trước',
+      'view.closeTerminal': 'Đóng terminal',
+      'view.terminalSelection': 'Gửi nội dung đã chọn trong terminal vào ô soạn thảo',
+      'view.terminalCopy': 'Sao chép nội dung đã chọn trong terminal',
+      'view.terminalPaste': 'Dán vào terminal',
+      'view.closeTab': 'Đóng tab',
+      'view.reopenTab': 'Mở lại tab đã đóng',
+      'view.flipPanes': 'Hoán đổi các bên của thanh bên',
+      'view.findInPage': 'Tìm trong trang',
+      'view.findNext': 'Kết quả tiếp theo',
+      'view.findPrevious': 'Kết quả trước',
+      'appearance.toggleMode': 'Chuyển sáng/tối',
+      'profile.default': 'Chuyển sang hồ sơ mặc định',
+      'profile.switch.1': 'Chuyển sang hồ sơ 1',
+      'profile.switch.2': 'Chuyển sang hồ sơ 2',
+      'profile.switch.3': 'Chuyển sang hồ sơ 3',
+      'profile.switch.4': 'Chuyển sang hồ sơ 4',
+      'profile.switch.5': 'Chuyển sang hồ sơ 5',
+      'profile.switch.6': 'Chuyển sang hồ sơ 6',
+      'profile.switch.7': 'Chuyển sang hồ sơ 7',
+      'profile.switch.8': 'Chuyển sang hồ sơ 8',
+      'profile.switch.9': 'Chuyển sang hồ sơ 9',
+      'profile.switch.10': 'Chuyển sang hồ sơ 10',
+      'profile.switch.11': 'Chuyển sang hồ sơ 11',
+      'profile.switch.12': 'Chuyển sang hồ sơ 12',
+      'profile.switch.13': 'Chuyển sang hồ sơ 13',
+      'profile.switch.14': 'Chuyển sang hồ sơ 14',
+      'profile.switch.15': 'Chuyển sang hồ sơ 15',
+      'profile.switch.16': 'Chuyển sang hồ sơ 16',
+      'profile.switch.17': 'Chuyển sang hồ sơ 17',
+      'profile.switch.18': 'Chuyển sang hồ sơ 18',
+      'profile.next': 'Hồ sơ tiếp theo',
+      'profile.prev': 'Hồ sơ trước',
+      'profile.toggleAll': 'Bật/tắt chế độ xem mọi hồ sơ',
+      'profile.create': 'Tạo hồ sơ',
       'composer.send': 'Gửi tin nhắn',
       'composer.newline': 'Chèn dòng mới',
       'composer.steer': 'Điều hướng lượt đang chạy',
@@ -204,29 +309,15 @@ export const vi = defineLocale({
       'composer.slash': 'Bảng lệnh gạch chéo',
       'composer.help': 'Trợ giúp nhanh',
       'composer.history': 'Duyệt cửa sổ nổi hoặc lịch sử',
-      'composer.cancel': 'Đóng cửa sổ nổi · hủy lượt chạy',
-      'view.toggleSidebar': 'Bật/tắt thanh phiên',
-      'view.toggleRightSidebar': 'Bật/tắt trình duyệt tệp',
-      'view.toggleReview': 'Bật/tắt ngăn xem xét',
-      'view.toggleStatusbar': 'Bật/tắt thanh trạng thái',
-      'view.showFiles': 'Hiện trình duyệt tệp',
-      'view.showTerminal': 'Bật/tắt terminal',
-      'view.newTerminal': 'Terminal mới',
-      'view.closeTerminal': 'Đóng terminal',
-      'view.closeTab': 'Đóng tab',
-      'view.reopenTab': 'Mở lại tab đã đóng',
-      'view.findInPage': 'Tìm trong trang',
-      'view.findNext': 'Kết quả tiếp theo',
-      'view.findPrevious': 'Kết quả trước',
-      'appearance.toggleMode': 'Chuyển sáng/tối',
-      'profile.default': 'Chuyển sang hồ sơ mặc định',
-      'profile.next': 'Hồ sơ tiếp theo',
-      'profile.prev': 'Hồ sơ trước',
-      'profile.toggleAll': 'Bật/tắt chế độ xem mọi hồ sơ',
-      'profile.create': 'Tạo hồ sơ'
+      'composer.cancel': 'Đóng cửa sổ nổi · hủy lượt chạy'
     }
   },
-  findInPage: { next: 'Kết quả tiếp theo', previous: 'Kết quả trước' },
+
+  findInPage: {
+    next: 'Kết quả tiếp theo',
+    previous: 'Kết quả trước'
+  },
+
   language: {
     label: 'Ngôn ngữ',
     description: 'Chọn ngôn ngữ cho giao diện Desktop.',
@@ -236,6 +327,7 @@ export const vi = defineLocale({
     searchPlaceholder: 'Tìm ngôn ngữ…',
     noResults: 'Không tìm thấy ngôn ngữ'
   },
+
   settings: {
     closeSettings: 'Đóng cài đặt',
     exportConfig: 'Xuất cấu hình',
@@ -260,6 +352,61 @@ export const vi = defineLocale({
       billing: 'Thanh toán',
       notifications: 'Thông báo',
       plugins: 'Plugin'
+    },
+    plugins: {
+      title: 'Các plugin Desktop',
+      blurb: 'Được gói hoặc thả vào thư mục plugin trên Desktop. Vô hiệu hóa để dỡ trực tiếp.',
+      count: n => `Đã cài đặt ${n}`,
+      openFolder: 'Mở thư mục plugin',
+      rescan: 'Quét lại',
+      reveal: 'Hiện trong trình quản lý tệp',
+      enable: 'Cho phép',
+      disable: 'Vô hiệu hóa',
+      failed: 'thất bại',
+      empty: 'Chưa có plugin Desktop nào được cài đặt.',
+      kinds: { bundled: 'đi kèm', disk: 'trên đĩa', runtime: 'thời gian chạy' }
+    },
+    notifications: {
+      title: 'Thông báo',
+      intro: 'Thông báo của hệ điều hành (không phải thông báo chúc mừng trong ứng dụng). Mỗi thiết bị.',
+      enableAll: 'Bật thông báo',
+      enableAllDesc: 'Tắt im lặng mọi thông báo bên dưới.',
+      focusedHint: 'Cảnh báo hoàn thành chỉ kích hoạt khi Hermes ở chế độ nền.',
+      kinds: {
+        approval: {
+          label: 'Cần phê duyệt',
+          description: 'Một lệnh đang chờ bạn phê duyệt hoặc từ chối nó.'
+        },
+        input: {
+          label: 'Cần đầu vào',
+          description: 'Hermes đã đặt câu hỏi hoặc cần mật khẩu hoặc bí mật.'
+        },
+        turnDone: {
+          label: 'Đã sẵn sàng phản hồi',
+          description: 'Một lượt kết thúc trong khi Hermes ở phía sau.'
+        },
+        turnError: {
+          label: 'Lượt xử lý thất bại',
+          description: 'Lỗi của lượt xử lý chạy nền.'
+        },
+        backgroundDone: {
+          label: 'Tác vụ nền đã hoàn tất',
+          description: 'Một lệnh đầu cuối nền đã hoàn thành.'
+        },
+        credits: {
+          label: 'Cảnh báo tín dụng',
+          description: 'Quyền truy cập tín dụng bị tạm dừng hoặc được khôi phục.'
+        }
+      },
+      test: 'Gửi thông báo kiểm tra',
+      testTitle: 'Hermes',
+      testBody: 'Thông báo đang hoạt động.',
+      testSent:
+        'Đã gửi bài kiểm tra. Nếu không có gì xuất hiện, hãy kiểm tra quyền thông báo hệ điều hành của bạn và Focus/Do Không làm phiền.',
+      testUnsupported: 'Hệ thống này không hỗ trợ thông báo gốc.',
+      completionSoundTitle: 'Âm thanh hoàn thành',
+      completionSoundDesc: 'Phát khi một lượt của tác nhân kết thúc. Chọn âm thanh đặt sẵn và nghe thử tại đây.',
+      completionSoundPreview: 'Xem trước'
     },
     sections: {
       model: 'Mô hình',
@@ -295,7 +442,8 @@ export const vi = defineLocale({
       uiScaleDesc: percent =>
         `Thay đổi tỷ lệ chữ và điều khiển trong toàn ứng dụng. Cũng có thể dùng Cmd/Ctrl với +, - và 0. Hiện tại: ${percent}%.`,
       terminalFontTitle: 'Phông chữ terminal',
-      terminalFontDesc: 'Chọn phông chữ đã cài đặt cho terminal Desktop. Để trống để dùng JetBrains Mono đi kèm.',
+      terminalFontDesc:
+        'Chọn phông chữ đã cài đặt cho terminal Desktop. Nerd Fonts hiển thị đúng Powerlevel10k và các biểu tượng shell; để trống để dùng JetBrains Mono đi kèm.',
       terminalFontPlaceholder: 'MesloLGS NF hoặc danh sách phông CSS',
       terminalFontPreview: 'Xem trước ký tự',
       terminalFontReset: 'Dùng mặc định',
@@ -304,7 +452,8 @@ export const vi = defineLocale({
       backdropTitle: 'Ảnh nền trò chuyện',
       backdropDesc: 'Hình tượng mờ phía sau cuộc trò chuyện.',
       reactionsTitle: 'Cảm xúc tin nhắn',
-      reactionsDesc: 'Thả biểu tượng cảm xúc cho tin nhắn theo kiểu iMessage.',
+      reactionsDesc:
+        'Thêm phản ứng emoji kiểu iMessage vào tin nhắn; Hermes cũng có thể phản ứng với tin nhắn của bạn.',
       embedsTitle: 'Nội dung nhúng',
       embedsDesc:
         'Bản xem trước phong phú được tải từ trang bên thứ ba. Hỏi sẽ chờ bạn cho phép; Luôn luôn sẽ tự động tải; Tắt chỉ giữ liên kết thuần.',
@@ -320,15 +469,304 @@ export const vi = defineLocale({
       themeDesc: 'Chỉ thay đổi bảng màu Desktop. Chế độ màu đã chọn vẫn được áp dụng.',
       themeProfileNote: profile => `Đã lưu cho hồ sơ ${profile} — mỗi hồ sơ giữ chủ đề riêng.`,
       installTitle: 'Cài từ VS Code',
-      installDesc: 'Dán mã tiện ích Marketplace để chuyển chủ đề màu thành bảng màu Desktop.',
+      installDesc:
+        'Dán ID tiện ích Marketplace (ví dụ: dracula-theme.theme-dracula) để chuyển chủ đề màu thành bảng màu Desktop.',
       installPlaceholder: 'publisher.extension',
       installButton: 'Cài đặt',
       installing: 'Đang cài…',
       installError: 'Không thể cài chủ đề đó.',
       installed: name => `Đã cài “${name}”.`,
       removeTheme: 'Gỡ chủ đề',
-      importedBadge: 'Đã nhập'
+      importedBadge: 'Đã nhập',
+      pet: {
+        title: 'Thú cưng',
+        intro:
+          'Sử dụng linh vật petdex hoạt hình nổi trên ứng dụng và phản ứng với những gì Hermes đang làm — chạy trong khi các công cụ thực thi, ăn mừng thành công, hờn dỗi khi mắc lỗi.',
+        restartHint:
+          'Thú cưng cần khởi động lại nhanh — ứng dụng đang chạy đã khởi động trước khi tính năng này được thêm vào. Thoát và mở lại Hermes rồi quay lại đây.',
+        on: 'bật',
+        off: 'Tắt',
+        scaleTitle: 'Kích cỡ',
+        scaleDesc: 'Thay đổi kích thước linh vật nổi. Áp dụng ở mọi nơi ngay lập tức.',
+        roamTitle: 'Đi lang thang',
+        roamDesc: 'Để thú cưng tự đi lang thang ngoài cửa sổ khi không hoạt động.',
+        chooseTitle: 'Chọn thú cưng',
+        chooseDesc: 'Chọn một cái sẽ cài đặt nó (nếu cần) và kích hoạt nó.',
+        searchPlaceholder: 'Tìm kiếm thú cưng…',
+        unreachable: 'Không thể truy cập thư viện petdex. Kiểm tra kết nối của bạn và mở lại trang này.',
+        noMatch: query => `Không có vật nuôi nào phù hợp với "${query}".`,
+        installedTag: 'đã cài đặt',
+        generatedTag: 'Đã tạo',
+        countCapped: (cap, total) => `Hiển thị ${cap} của ${total} - gõ để thu hẹp nó.`,
+        count: n => `${n} thú cưng.`,
+        uninstall: name => `Gỡ cài đặt ${name}`,
+        delete: name => `Xóa ${name}`,
+        deleteTitle: name => `Xóa ${name}?`,
+        deleteBody: 'Thao tác này sẽ xóa vĩnh viễn thú cưng — không thể cài đặt lại thú cưng.',
+        deleteConfirm: 'Xóa',
+        rename: name => `Đổi tên ${name}`,
+        renameTitle: 'Đổi tên thú cưng',
+        renamePlaceholder: 'Đặt tên cho thú cưng của bạn',
+        renameSave: 'Lưu',
+        exportPet: name => `Xuất ${name}`,
+        adoptFailed: slug => `Không thể áp dụng ${slug}`,
+        uninstallFailed: slug => `Không thể gỡ cài đặt ${slug}`,
+        renameFailed: slug => `Không thể đổi tên ${slug}`,
+        exportFailed: slug => `Không thể xuất ${slug}`,
+        noneAvailable: 'Không có vật nuôi nào có sẵn để bật ngay bây giờ.',
+        turnOnFailed: 'Không thể bật thú cưng.',
+        turnOffFailed: 'Không thể tắt thú cưng.'
+      }
     },
+    fieldLabels: defineFieldCopy({
+      model: 'Mô hình mặc định',
+      modelContextLength: 'Cửa sổ ngữ cảnh',
+      fallbackProviders: 'Mô hình dự phòng',
+      toolsets: 'Bộ công cụ đã bật',
+      timezone: 'Múi giờ',
+      display: {
+        personality: 'Nhân cách',
+        showReasoning: 'Khối suy luận'
+      },
+      desktop: {
+        repoScanEnabled: 'Tự động phát hiện kho Git',
+        repoScanRoots: 'Thư mục gốc để quét kho Git',
+        repoScanExcludePaths: 'Đường dẫn loại trừ khi quét kho Git'
+      },
+      agent: {
+        maxTurns: 'Số bước tác nhân tối đa',
+        imageInputMode: 'Tệp đính kèm hình ảnh',
+        apiMaxRetries: 'Số lần thử lại API',
+        serviceTier: 'Cấp dịch vụ',
+        toolUseEnforcement: 'Thực thi sử dụng công cụ'
+      },
+      terminal: {
+        cwd: 'Thư mục làm việc',
+        backend: 'Backend thực thi',
+        timeout: 'Thời gian chờ lệnh',
+        persistentShell: 'Shell liên tục',
+        envPassthrough: 'Truyền qua môi trường',
+        dockerImage: 'Image Docker',
+        singularityImage: 'Image Singularity',
+        modalImage: 'Image Modal',
+        daytonaImage: 'Image Daytona'
+      },
+      fileReadMaxChars: 'Giới hạn đọc tệp',
+      toolOutput: {
+        maxBytes: 'Giới hạn đầu ra của terminal',
+        maxLines: 'Giới hạn trang tệp',
+        maxLineLength: 'Giới hạn độ dài dòng'
+      },
+      codeExecution: {
+        mode: 'Chế độ thực thi mã'
+      },
+      approvals: {
+        mode: 'Chế độ phê duyệt',
+        timeout: 'Hết thời gian phê duyệt',
+        mcpReloadConfirm: 'Xác nhận tải lại MCP'
+      },
+      commandAllowlist: 'Danh sách cho phép lệnh',
+      security: {
+        redactSecrets: 'Biên tập lại bí mật',
+        allowPrivateUrls: 'Cho phép URL riêng tư'
+      },
+      browser: {
+        allowPrivateUrls: 'URL riêng tư trong trình duyệt',
+        autoLocalForPrivateUrls: 'Trình duyệt cục bộ dành cho URL riêng tư'
+      },
+      checkpoints: {
+        enabled: 'Điểm kiểm tra tệp',
+        maxSnapshots: 'Giới hạn điểm kiểm tra'
+      },
+      voice: {
+        recordKey: 'Phím tắt bằng giọng nói',
+        maxRecordingSeconds: 'Độ dài ghi tối đa',
+        autoTts: 'Đọc to câu trả lời'
+      },
+      stt: {
+        enabled: 'Lời nói thành văn bản',
+        echoTranscripts: 'Bản ghi tiếng vang',
+        provider: 'Nhà cung cấp dịch vụ chuyển giọng nói thành văn bản',
+        local: {
+          model: 'Mô hình phiên âm cục bộ',
+          language: 'Ngôn ngữ phiên âm'
+        },
+        openai: {
+          model: 'Mẫu OpenAI STT'
+        },
+        groq: {
+          model: 'Mẫu Groq STT'
+        },
+        mistral: {
+          model: 'Mẫu STT của Mistral'
+        },
+        elevenlabs: {
+          modelId: 'Mẫu ElevenLabs STT',
+          languageCode: 'Ngôn ngữ ElevenLabs',
+          tagAudioEvents: 'Gắn thẻ sự kiện âm thanh',
+          diarize: 'Nhật ký loa'
+        }
+      },
+      tts: {
+        provider: 'Nhà cung cấp dịch vụ chuyển văn bản thành giọng nói',
+        edge: {
+          voice: 'Giọng Edge'
+        },
+        openai: {
+          model: 'Mẫu OpenAI TTS',
+          voice: 'Giọng nói OpenAI'
+        },
+        elevenlabs: {
+          voiceId: 'Giọng nói ElevenLabs',
+          modelId: 'Mẫu ElevenLabs'
+        },
+        xai: {
+          voiceId: 'Giọng nói xAI (Grok)',
+          language: 'xAI Ngôn ngữ',
+          speed: 'Tốc độ phát lại xAI',
+          autoSpeechTags: 'Thẻ giọng nói tự động xAI',
+          optimizeStreamingLatency: 'Tối ưu hóa độ trễ phát trực tuyến xAI',
+          sampleRate: 'Tốc độ lấy mẫu xAI',
+          bitRate: 'Tốc độ bit xAI'
+        },
+        minimax: {
+          model: 'Mẫu MiniMax TTS',
+          voiceId: 'Giọng nói MiniMax'
+        },
+        mistral: {
+          model: 'Mẫu TTS của Mistral',
+          voiceId: 'Giọng nói Mistral'
+        },
+        gemini: {
+          model: 'Mô hình Gemini TTS',
+          voice: 'Giọng Gemini'
+        },
+        neutts: {
+          model: 'Mô hình NeuTTS',
+          device: 'Thiết bị NeuTTS'
+        },
+        kittentts: {
+          model: 'Mô hình KittenTTS',
+          voice: 'Giọng KittenTTS'
+        },
+        piper: {
+          voice: 'Giọng Piper'
+        },
+        deepinfra: {
+          model: 'Mô hình DeepInfra TTS',
+          voice: 'Giọng nói DeepInfra'
+        }
+      },
+      memory: {
+        memoryEnabled: 'Bộ nhớ liên tục',
+        userProfileEnabled: 'Hồ sơ người dùng',
+        memoryCharLimit: 'Ngân sách bộ nhớ',
+        userCharLimit: 'Hồ sơ ngân sách',
+        provider: 'Nhà cung cấp bộ nhớ'
+      },
+      context: {
+        engine: 'Công cụ ngữ cảnh'
+      },
+      compression: {
+        enabled: 'Tự động nén',
+        threshold: 'Ngưỡng nén',
+        targetRatio: 'Mục tiêu nén',
+        protectLastN: 'Tin nhắn gần đây được bảo vệ'
+      },
+      delegation: {
+        model: 'Mô hình tác nhân phụ',
+        provider: 'Nhà cung cấp tác nhân phụ',
+        maxIterations: 'Giới hạn lượt của tác nhân phụ',
+        maxConcurrentChildren: 'Số tác nhân con chạy song song',
+        childTimeoutSeconds: 'Hết thời gian chờ của tác nhân phụ',
+        reasoningEffort: 'Nỗ lực lý luận phụ'
+      },
+      updates: {
+        nonInteractiveLocalChanges: 'Cập nhật trong ứng dụng Thay đổi cục bộ'
+      }
+    }),
+    fieldDescriptions: defineFieldCopy({
+      model: 'Được sử dụng cho các cuộc trò chuyện mới trừ khi bạn chọn một mô hình khác trong trình soạn thảo.',
+      modelContextLength: 'Để ở mức 0 để sử dụng cửa sổ ngữ cảnh được phát hiện của mô hình đã chọn.',
+      fallbackProviders: 'Nhà cung cấp dự phòng: mục nhập mô hình để thử nếu mô hình mặc định bị lỗi.',
+      display: {
+        personality: 'Kiểu trợ lý mặc định cho các phiên mới.',
+        showReasoning: 'Hiển thị các phần lý luận khi backend cung cấp chúng.'
+      },
+      desktop: {
+        repoScanEnabled: 'Quét thư mục cục bộ để tìm các kho Git cần hiển thị trong Dự án.',
+        repoScanRoots: 'Các thư mục để quét. Để trống để quét thư mục chính của bạn.',
+        repoScanExcludePaths: 'Các thư mục và thư mục con cần bỏ qua khi quét kho Git.'
+      },
+      timezone: 'Mã định danh múi giờ IANA. Để trống để dùng múi giờ hệ thống.',
+      agent: {
+        imageInputMode: 'Kiểm soát cách gửi tệp đính kèm hình ảnh đến mô hình.',
+        maxTurns: 'Giới hạn trên cho các lượt gọi công cụ trước khi Hermes dừng chạy.'
+      },
+      terminal: {
+        cwd: 'Thư mục dự án mặc định cho công cụ và terminal.',
+        persistentShell: 'Giữ trạng thái shell giữa các lệnh khi backend hỗ trợ nó.',
+        envPassthrough: 'Các biến môi trường để chuyển vào thực thi công cụ.',
+        dockerImage: 'Hình ảnh vùng chứa được sử dụng khi backend thực thi là Docker.',
+        singularityImage: 'Hình ảnh được sử dụng khi backend thực thi là Singularity.',
+        modalImage: 'Hình ảnh được sử dụng khi backend thực thi là Modal.',
+        daytonaImage: 'Hình ảnh được sử dụng khi backend thực thi là Daytona.'
+      },
+      codeExecution: {
+        mode: 'Mức độ thực thi mã nghiêm ngặt trong phạm vi dự án hiện tại.'
+      },
+      fileReadMaxChars: 'Số ký tự tối đa Hermes có thể đọc từ một yêu cầu tệp.',
+      approvals: {
+        mode: 'Cách Hermes xử lý các lệnh cần phê duyệt rõ ràng.',
+        timeout: 'Thời gian chờ đợi prompt phê duyệt trước khi hết thời gian chờ.'
+      },
+      security: {
+        redactSecrets: 'Ẩn các bí mật được phát hiện khỏi nội dung hiển thị trên mô hình khi có thể.'
+      },
+      checkpoints: {
+        enabled: 'Tạo ảnh chụp nhanh khôi phục trước khi chỉnh sửa tệp.'
+      },
+      memory: {
+        memoryEnabled: 'Lưu giữ những kỷ niệm lâu bền có thể giúp ích cho các buổi học trong tương lai.',
+        userProfileEnabled: 'Duy trì một hồ sơ nhỏ gọn về sở thích của người dùng.'
+      },
+      context: {
+        engine: 'Chiến lược quản lý các cuộc hội thoại dài gần giới hạn ngữ cảnh.'
+      },
+      compression: {
+        enabled: 'Tóm tắt ngữ cảnh cũ khi cuộc trò chuyện trở nên lớn.'
+      },
+      voice: {
+        autoTts: 'Tự động nói câu trả lời của trợ lý.'
+      },
+      tts: {
+        xai: {
+          voiceId: 'ID giọng nói xAI (ví dụ: eve) hoặc ID giọng nói tùy chỉnh.',
+          language: 'Mã ngôn ngữ nói (ví dụ: en, pt-BR) hoặc "auto" để tự động phát hiện.',
+          speed: 'Tốc độ phát lại. 0,7 = chậm hơn, 1,0 = bình thường, 1,5 = nhanh hơn.',
+          autoSpeechTags:
+            'Hãy để LLM chèn các thẻ âm thanh biểu cảm ([cười], [thở dài]) vào tập lệnh trước khi tổng hợp.',
+          optimizeStreamingLatency:
+            'Độ trễ so với sự đánh đổi chất lượng. 0 = chất lượng tốt nhất, 2 = độ trễ thấp nhất.',
+          sampleRate: 'Tốc độ lấy mẫu âm thanh tính bằng Hz. Cao hơn = chất lượng tốt hơn, tệp lớn hơn.',
+          bitRate: 'Tốc độ bit MP3 tính bằng bps. Chỉ áp dụng khi codec là mp3.'
+        },
+        neutts: {
+          device: 'Thiết bị suy luận cục bộ cho NeuTTS.'
+        }
+      },
+      stt: {
+        enabled: 'Bật phiên âm giọng nói do địa phương hoặc nhà cung cấp hỗ trợ.',
+        echoTranscripts: 'Đăng bản ghi 🎙️ thô của tin nhắn thoại trở lại cuộc trò chuyện.',
+        elevenlabs: {
+          languageCode: 'Mã ngôn ngữ ISO-639-3 tùy chọn. Trống cho phép ElevenLabs tự động phát hiện.'
+        }
+      },
+      updates: {
+        nonInteractiveLocalChanges:
+          'Khi Hermes tự cập nhật từ ứng dụng (không có prompt của terminal), hãy giữ các chỉnh sửa nguồn cục bộ (lưu trữ) hoặc vứt chúng đi (loại bỏ). Cập nhật terminal luôn luôn yêu cầu.'
+      }
+    }),
     about: {
       heading: 'Hermes Desktop',
       version: value => `Phiên bản ${value}`,
@@ -376,9 +814,40 @@ export const vi = defineLocale({
       keepAwakeDesc:
         'Ngăn máy chuyển sang chế độ ngủ để các tác vụ dài hoặc qua đêm tiếp tục chạy. Màn hình vẫn có thể mờ đi.',
       attachmentSizeTitle: 'Kích thước tối đa để xem trước hoặc tải ảnh',
-      attachmentSizeDesc: 'Dung lượng tệp cục bộ tối đa mà Desktop sẽ tải để xem trước và đính kèm ảnh, tính bằng MB.',
+      attachmentSizeDesc:
+        'Dung lượng tối đa của tệp cục bộ mà Desktop sẽ tải để xem trước và đính kèm ảnh, tính bằng MB. Mặc định là 16. Tệp đính kèm từ xa không phải hình ảnh có giới hạn riêng là 256 MB. Đặt giá trị quá cao sẽ tải toàn bộ tệp vào bộ nhớ và có thể khiến ứng dụng treo hoặc gặp sự cố.',
       attachmentSizeUnit: 'MB',
       attachmentSizeLabel: 'Kích thước xem trước hoặc tải ảnh tối đa tính bằng megabyte'
+    },
+    quickEntry: {
+      enabledTitle: 'Nhập nhanh',
+      enabledDesc:
+        'Mở nhanh một ô soạn thảo nhỏ từ mọi nơi bằng phím tắt toàn hệ thống và gửi prompt mà không cần mở cửa sổ Hermes.',
+      shortcutTitle: 'Phím tắt Nhập nhanh',
+      shortcutDesc: 'Cần ít nhất một phím bổ trợ, ví dụ: CommandOrControl+Shift+Space.',
+      active: 'Phím tắt đang hoạt động.',
+      takenBy: 'Một ứng dụng khác đã sử dụng phím tắt này — hãy chọn một phím tắt khác.',
+      invalidShortcut: 'Không phải là một phím tắt hợp lệ. Bao gồm ít nhất một phím bổ trợ.'
+    },
+    credentials: {
+      pasteKey: 'Dán khóa',
+      pasteLabelKey: label => `Dán khóa ${label}`,
+      optional: 'Không bắt buộc',
+      enterValueFirst: 'Nhập một giá trị đầu tiên.',
+      couldNotSave: 'Không thể lưu thông tin xác thực.',
+      remove: 'Gỡ bỏ',
+      getKey: 'Nhận khóa',
+      saving: 'Đang lưu'
+    },
+    envActions: {
+      actions: 'hành động',
+      manageInKeys: 'Quản lý trong Khóa API',
+      docs: 'Tài liệu',
+      hideValue: 'Ẩn giá trị',
+      revealValue: 'Hiện giá trị',
+      replace: 'Thay thế',
+      set: 'Đặt',
+      clear: 'Xóa'
     },
     gateway: {
       loading: 'Đang tải cài đặt gateway...',
@@ -417,6 +886,11 @@ export const vi = defineLocale({
       cloudOrgChange: 'Đổi tổ chức',
       cloudOrgRole: role => `Vai trò: ${role}`,
       cloudLoadingAgents: 'Đang tải tác nhân…',
+      cloudNoAgents: {
+        before: 'Không tìm thấy tác nhân nào trên tài khoản này. Tạo một cái trong ',
+        linkText: 'Cổng Nous',
+        after: ', sau đó làm mới.'
+      },
       cloudRefresh: 'Làm mới',
       cloudConnect: 'Kết nối',
       cloudConnecting: 'Đang kết nối…',
@@ -431,7 +905,7 @@ export const vi = defineLocale({
       cloudAgentProvisioning: 'Đang cấp phát…',
       cloudStatusLabel: status => `Trạng thái: ${status}`,
       remoteUrlTitle: 'URL từ xa',
-      remoteUrlDesc: 'URL gốc của backend dashboard từ xa. Có hỗ trợ tiền tố đường dẫn.',
+      remoteUrlDesc: 'URL gốc của backend dashboard từ xa. Có hỗ trợ tiền tố đường dẫn, ví dụ: /hermes.',
       probing: 'Đang kiểm tra phương thức xác thực của gateway…',
       probeError: 'Chưa thể kết nối gateway. Hãy kiểm tra URL.',
       signedIn: 'Đã đăng nhập',
@@ -439,6 +913,11 @@ export const vi = defineLocale({
       signOut: 'Đăng xuất',
       signInWith: provider => `Đăng nhập bằng ${provider}`,
       authTitle: 'Xác thực',
+      authSignedInPassword: 'Cổng này sử dụng tên người dùng và mật khẩu. Bạn đã đăng nhập; phiên làm mới tự động.',
+      authSignedInOauth: 'Cổng này sử dụng OAuth. Bạn đã đăng nhập; phiên làm mới tự động.',
+      authNeedsPassword: 'Cổng này sử dụng tên người dùng và mật khẩu. Đăng nhập để ủy quyền cho ứng dụng Desktop này.',
+      authNeedsOauth: provider =>
+        `Cổng này sử dụng OAuth. Đăng nhập bằng ${provider} để cấp phép cho ứng dụng Desktop này.`,
       tokenTitle: 'Token phiên',
       tokenDesc: 'Token phiên dashboard dùng cho REST và WebSocket. Để trống để giữ token đã lưu.',
       existingToken: value => `Token hiện có ${value}`,
@@ -451,6 +930,10 @@ export const vi = defineLocale({
       diagnosticsDesc: 'Hiển thị desktop.log trong trình quản lý tệp.',
       openLogs: 'Mở nhật ký',
       incompleteTitle: 'Cấu hình gateway từ xa chưa hoàn tất',
+      incompleteSignIn: 'Nhập URL từ xa và đăng nhập trước khi chuyển sang điều khiển từ xa.',
+      incompleteToken: 'Nhập URL từ xa và token phiên trước khi chuyển sang chế độ từ xa.',
+      incompleteSignInTest: 'Nhập URL từ xa và đăng nhập trước khi kiểm tra.',
+      incompleteTokenTest: 'Nhập URL từ xa và token phiên trước khi kiểm tra.',
       enterUrlFirst: 'Trước tiên hãy nhập URL từ xa.',
       restartingTitle: 'Đang khởi động lại kết nối gateway',
       savedTitle: 'Đã lưu cài đặt gateway',
@@ -465,12 +948,186 @@ export const vi = defineLocale({
       signOutFailed: 'Đăng xuất thất bại',
       testFailed: 'Kiểm tra gateway từ xa thất bại',
       applyFailed: 'Không thể áp dụng cài đặt gateway',
-      saveFailed: 'Không thể lưu cài đặt gateway'
+      saveFailed: 'Không thể lưu cài đặt gateway',
+      sshTitle: 'Kết nối qua SSH',
+      sshDesc:
+        'Hermes được khởi chạy trên máy từ xa qua SSH và tạo đường hầm đến ứng dụng này — bạn không cần tự khởi động hay công khai dịch vụ nào. Yêu cầu quyền truy cập SSH bằng khóa đang hoạt động đến máy chủ.',
+      sshTrustHint:
+        'Khóa máy chủ được cung cấp lần đầu sẽ được tin cậy và ghim; nếu khóa thay đổi về sau, kết nối sẽ bị từ chối để bảo đảm an toàn.',
+      sshHostTitle: 'Máy chủ',
+      sshHostDesc: 'user@host hoặc bí danh Máy chủ từ ~/.ssh/config.',
+      sshHostPick: 'Chọn máy chủ…',
+      sshHostPickTitle: 'Máy chủ',
+      sshHostPickDesc: 'Bí danh máy chủ từ ~/.ssh/config hoặc Tùy chỉnh để nhập một bí danh.',
+      sshHostCustom: 'Tùy chỉnh (nhập thủ công)…',
+      sshUserTitle: 'người dùng',
+      sshUserDesc: 'Trống = ~/.ssh/config hoặc người dùng hiện tại của bạn.',
+      sshUserPlaceholder: 'từ ~/.ssh/config',
+      sshPortTitle: 'Cổng',
+      sshPortDesc: 'Trống = 22 hoặc cổng ~/.ssh/config.',
+      sshKeyTitle: 'Tệp nhận dạng',
+      sshKeyDesc: 'Đường dẫn khóa riêng. Trống = ssh-agent hoặc ~/.ssh/config.',
+      sshHermesPathTitle: 'Đường dẫn Hermes (tùy chọn)',
+      sshHermesPathDesc: 'Đường dẫn đầy đủ tới tệp nhị phân Hermes từ xa. Trống = tự động phát hiện.',
+      sshHermesPathPlaceholder: 'tự động phát hiện',
+      sshRemoteProfileTitle: 'Hồ sơ từ xa (tùy chọn)',
+      sshRemoteProfileDesc: 'Tên hồ sơ trên máy chủ từ xa. Để trống = sử dụng tên hồ sơ Desktop.',
+      sshTestConnection: 'Kiểm tra SSH',
+      sshConnect: 'Kết nối',
+      sshButtonsHint: 'Lưu áp dụng vào lần khởi chạy tiếp theo. Kết nối kết nối lại ngay bây giờ.',
+      sshReachable: (host, platform) => `Có thể truy cập: ${host} (${platform}) — Đã tìm thấy Hermes`,
+      sshIncompleteHost: 'Nhập máy chủ SSH trước khi kết nối.',
+      sshErrUnreachable: 'Không thể truy cập máy chủ đó qua SSH. Kiểm tra máy chủ, cổng và mạng của bạn.',
+      sshErrAuth:
+        'Xác thực SSH không thành công. Tải khóa của bạn vào ssh-agent (ssh-add) hoặc đặt IdentityFile trong ~/.ssh/config - Hermes chạy ssh không tương tác.',
+      sshErrHostKey:
+        'Khóa máy chủ có CHANGED kể từ lần cuối bạn kết nối. Xác minh điều này như mong đợi, sau đó chạy ssh-keygen -R <host> và kết nối lại.',
+      sshErrNotInstalled:
+        'Hermes chưa được cài đặt trên máy chủ từ xa. Cài đặt nó ở đó (curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sh) hoặc đặt đường dẫn Hermes.',
+      sshErrPlatform:
+        'Nền tảng từ xa không được hỗ trợ. Chế độ Hermes Desktop SSH hỗ trợ các máy chủ từ xa Linux, macOS và Windows.',
+      sshErrTimeout: 'Kết nối SSH đã hết thời gian chờ. Máy chủ có thể không truy cập được hoặc đang ngủ.',
+      sshErrUpdateRequired: 'Cập nhật Hermes trên máy chủ từ xa trước khi kết nối với Desktop SSH.',
+      sshErrUnknown: 'Kết nối SSH không thành công.'
+    },
+    keys: {
+      loading: 'Đang tải khóa và thông tin xác thực API...',
+      failedLoad: 'Không tải được khóa API',
+      empty: 'Chưa có cấu hình nào trong danh mục này.'
+    },
+    mcp: {
+      loading: 'Đang tải máy chủ MCP...',
+      failedLoad: 'Không tải được cấu hình MCP',
+      nameRequiredTitle: 'Yêu cầu tên',
+      nameRequiredMessage: 'Cung cấp cho máy chủ MCP này một khóa cấu hình.',
+      objectRequired: 'Cấu hình máy chủ phải là đối tượng JSON',
+      invalidJson: 'MCP JSON không hợp lệ',
+      saveFailed: 'Lưu không thành công',
+      removeFailed: 'Xóa không thành công',
+      gatewayUnavailableTitle: 'Cổng không khả dụng',
+      gatewayUnavailableMessage: 'Kết nối lại cổng trước khi tải lại MCP.',
+      reloadedTitle: 'Đã tải lại công cụ MCP',
+      reloadedMessage: 'Lược đồ công cụ mới áp dụng cho các lượt mới.',
+      reloadFailed: 'Tải lại MCP không thành công',
+      savedTitle: 'Đã lưu máy chủ MCP',
+      savedMessage: name => `${name} áp dụng sau khi tải lại MCP.`,
+      newServer: 'Máy chủ mới',
+      reload: 'Tải lại MCP',
+      reloading: 'Đang tải lại...',
+      emptyTitle: 'Không có máy chủ MCP',
+      emptyDesc: 'Thêm máy chủ stdio hoặc HTTP để hiển thị các công cụ MCP.',
+      disabled: 'đã tắt',
+      editServer: 'Chỉnh sửa máy chủ',
+      name: 'Tên',
+      serverJson: 'Máy chủ JSON',
+      remove: 'Gỡ bỏ',
+      saveServer: 'Lưu máy chủ',
+      test: 'Kiểm tra kết nối',
+      testing: 'Đang thử nghiệm...',
+      testOk: count => `Đã kết nối — có ${count} công cụ`,
+      testFailed: 'Kết nối không thành công',
+      enableServer: name => `Kích hoạt ${name}`,
+      disableServer: name => `Tắt ${name}`,
+      serverEnabled: name => `Đã bật ${name} - áp dụng cho các phiên mới.`,
+      serverDisabled: name => `${name} bị tắt - áp dụng cho các phiên mới.`,
+      toggleFailed: (name, enabled) => `Không thể ${enabled ? 'bật' : 'tắt'} ${name}`,
+      tabServers: 'Máy chủ',
+      tabCatalog: 'Danh mục',
+      catalogLoading: 'Đang tải danh mục MCP...',
+      catalogLoadFailed: 'Không tải được danh mục MCP',
+      catalogEmpty: 'Không có mục danh mục có sẵn.',
+      catalogInstalled: 'Đã cài đặt',
+      catalogEnabled: 'Đã bật',
+      catalogNeedsInstall: 'Cần xây dựng',
+      catalogInstall: 'Cài đặt',
+      catalogInstalling: 'Đang cài đặt...',
+      catalogInstallStarted: name => `Cài đặt ${name}... áp dụng cho các phiên mới khi hoàn tất.`,
+      catalogInstallFailed: name => `Không cài đặt được ${name}`,
+      catalogEnvPrompt: name => `${name} yêu cầu thông tin xác thực`,
+      catalogEnvRequired: 'Điền vào các giá trị cần thiết trước khi cài đặt.',
+      capabilitySummary: (tools, prompts, resources) =>
+        `Đã bật ${[`${tools} công cụ`, ...(prompts ? [`${prompts} prompt`] : []), ...(resources ? [`${resources} tài nguyên`] : [])].join(', ')}`,
+      statusConnecting: 'Đang kết nối…',
+      statusNeedsAuth: 'Cần xác thực',
+      statusError: 'Lỗi',
+      statusOff: 'Tắt',
+      allServers: 'Tất cả máy chủ',
+      authenticatedTitle: 'Đã xác thực',
+      authenticatedMessage: (server, count) => `${server}: Công cụ ${count}`,
+      waitingForBrowser: 'Đang chờ trình duyệt…',
+      authenticate: 'Xác thực',
+      unsavedConnect: 'Chưa lưu - lưu mcp.json để kết nối.',
+      enableTool: tool => `Kích hoạt ${tool}`,
+      disableTool: tool => `Tắt ${tool}`,
+      noOutput: 'Chưa có đầu ra.'
+    },
+    model: {
+      loading: 'Đang tải cấu hình mô hình...',
+      appliesDesc:
+        'Áp dụng cho phiên mới. Sử dụng bộ chọn mô hình trong trình soạn thảo để trao đổi nóng cuộc trò chuyện đang hoạt động.',
+      provider: 'nhà cung cấp',
+      model: 'Mô hình',
+      applying: 'Đang áp dụng...',
+      defaultsLabel: 'Mặc định',
+      reasoning: 'Lý luận',
+      reasoningOff: 'Tắt',
+      defaultsFailed: 'Không lưu được giá trị mặc định của mô hình',
+      auxiliaryTitle: 'Mô hình phụ trợ',
+      resetAllToMain: 'Đặt lại tất cả về chính',
+      auxiliaryDesc:
+        'Các tác vụ trợ giúp chạy trên mô hình chính theo mặc định. Chỉ định một mô hình chuyên dụng cho bất kỳ nhiệm vụ nào cần ghi đè.',
+      setToMain: 'Đặt thành chính',
+      change: 'Thay đổi',
+      autoUseMain: 'tự động · sử dụng mô hình chính',
+      providerDefault: '(mặc định của nhà cung cấp)',
+      fallbackAdd: 'Thêm dự phòng',
+      fallbackEmpty: 'Không có mô hình dự phòng - mô hình mặc định được sử dụng trừ khi nó bị lỗi.',
+      notInCatalog: 'không có trong danh sách mẫu của nhà cung cấp này — các cuộc gọi có thể quay trở lại bản sao lưu.',
+      tasks: {
+        vision: { label: 'Tầm nhìn', hint: 'Phân tích hình ảnh' },
+        web_extract: { label: 'Trích xuất web', hint: 'Tóm tắt trang' },
+        compression: { label: 'nén', hint: 'Nén ngữ cảnh' },
+        skills_hub: { label: 'Trung tâm kỹ năng', hint: 'Tìm kiếm kỹ năng' },
+        approval: { label: 'Sự chấp thuận', hint: 'Tự động phê duyệt thông minh' },
+        mcp: { label: 'MCP', hint: 'Định tuyến công cụ MCP' },
+        title_generation: { label: 'Thế hệ tiêu đề', hint: 'Tiêu đề phiên' },
+        curator: { label: 'Người phụ trách', hint: 'Đánh giá cách sử dụng kỹ năng' }
+      }
+    },
+    providers: {
+      connectAccount: 'Kết nối một tài khoản',
+      haveApiKey: 'Thay vào đó, bạn có khóa API không?',
+      intro:
+        'Đăng nhập bằng đăng ký — không cần sao chép khóa API. Hermes chạy tính năng đăng nhập vào trình duyệt cho bạn, ngay trong ứng dụng.',
+      connected: 'Đã kết nối',
+      collapse: 'Thu gọn',
+      connectAnother: 'Kết nối nhà cung cấp khác',
+      otherProviders: 'Các nhà cung cấp khác',
+      disconnect: 'Ngắt kết nối',
+      disconnectInTerminal: 'Ngắt kết nối (chạy lệnh gỡ bỏ trong terminal)',
+      removeConfirm: provider => `Xóa ${provider}?`,
+      removeExternalGeneric: provider => `${provider} được quản lý bởi CLI riêng của nó - hãy xóa nó ở đó.`,
+      removeKeyManaged: provider => `${provider} được định cấu hình từ khóa API. Xóa nó khỏi Khóa API.`,
+      removeTerminalConfirm: (provider, command) =>
+        `Ngắt kết nối ${provider}? Thao tác này chạy "${command}" trong terminal để xóa thông tin xác thực.`,
+      removeTerminalRunning: provider => `Đang chạy ${provider} ngắt kết nối trong terminal…`,
+      removedTitle: 'Đã xóa tài khoản',
+      removedMessage: provider => `${provider} đã bị xóa.`,
+      failedRemove: provider => `Không thể xóa ${provider}`,
+      noProviderKeys: 'Không có khóa API của nhà cung cấp nào.',
+      searchKeys: 'Tìm kiếm nhà cung cấp…',
+      noKeysMatch: 'Không có nhà cung cấp nào phù hợp với tìm kiếm của bạn.',
+      localEndpoint: {
+        title: 'Điểm cuối cục bộ/tùy chỉnh',
+        description: 'Trỏ Hermes vào bất kỳ điểm cuối tương thích OpenAI nào (Zyphra, vLLM, llama.cpp, Ollama, v.v.).'
+      },
+      loading: 'Đang tải nhà cung cấp...'
     },
     sessions: {
       loading: 'Đang tải các phiên đã lưu trữ…',
       archivedTitle: 'Phiên đã lưu trữ',
-      archivedIntro: 'Các cuộc trò chuyện đã lưu trữ bị ẩn khỏi thanh bên nhưng vẫn giữ toàn bộ tin nhắn.',
+      archivedIntro:
+        'Các cuộc trò chuyện đã lưu trữ bị ẩn khỏi thanh bên nhưng vẫn giữ toàn bộ tin nhắn. Ctrl/⌘-click một cuộc trò chuyện trong thanh bên để lưu trữ.',
       emptyArchivedTitle: 'Chưa có mục lưu trữ',
       emptyArchivedDesc: 'Lưu trữ một cuộc trò chuyện để ẩn tại đây.',
       unarchive: 'Bỏ lưu trữ',
@@ -485,8 +1142,9 @@ export const vi = defineLocale({
       autoArchiveDaysUnit: 'ngày không hoạt động',
       autoArchiveFailed: 'Không thể cập nhật tự động lưu trữ',
       defaultDirTitle: 'Thư mục dự án mặc định',
-      defaultDirDesc: 'Phiên mới bắt đầu trong thư mục này trừ khi bạn chọn thư mục khác.',
-      defaultDirUpdated: 'Đã cập nhật thư mục dự án mặc định — hãy bắt đầu cuộc trò chuyện mới để áp dụng',
+      defaultDirDesc:
+        'Phiên mới bắt đầu trong thư mục này trừ khi bạn chọn thư mục khác. Để trống để dùng thư mục home.',
+      defaultDirUpdated: 'Đã cập nhật thư mục dự án mặc định — hãy bắt đầu cuộc trò chuyện mới (Ctrl/⌘+N) để áp dụng',
       defaultsTo: label => `Mặc định là ${label}.`,
       change: 'Thay đổi',
       choose: 'Chọn',
@@ -497,8 +1155,88 @@ export const vi = defineLocale({
       deleteFailed: 'Xóa thất bại',
       updateDirFailed: 'Không thể cập nhật thư mục mặc định',
       clearDirFailed: 'Không thể xóa thư mục mặc định'
+    },
+    toolsets: {
+      loadingConfig: 'Đang tải cấu hình',
+      savedTitle: 'Đã lưu thông tin xác thực',
+      savedMessage: key => `Đã cập nhật ${key}.`,
+      removedTitle: 'Đã xóa thông tin xác thực',
+      removedMessage: key => `${key} đã bị xóa.`,
+      failedSave: key => `Không lưu được ${key}`,
+      failedRemove: key => `Không thể xóa ${key}`,
+      failedReveal: key => `Không thể hiện ${key}`,
+      removeConfirm: key => `Xóa ${key} khỏi .env?`,
+      set: 'Đặt',
+      notSet: 'Chưa đặt',
+      selectedTitle: 'Đã chọn nhà cung cấp',
+      selectedMessage: provider => `${provider} hiện đang hoạt động.`,
+      failedSelect: provider => `Không chọn được ${provider}`,
+      failedLoad: 'Không tải được cấu hình công cụ',
+      noProviderOptions:
+        'Bộ công cụ này không có tùy chọn nhà cung cấp — hãy bật nó và nó sẽ hoạt động với thiết lập hiện tại của bạn.',
+      noProviders: 'Hiện tại không có nhà cung cấp nào cho bộ công cụ này.',
+      ready: 'Sẵn sàng',
+      needsSignIn: 'Cần đăng nhập',
+      needsSetup: 'Yêu cầu thiết lập',
+      activeBackend: 'Đang hoạt động',
+      activeBackendHint: 'Đây là chương trình phụ trợ đang hoạt động của bạn',
+      useBackend: 'Sử dụng phụ trợ này',
+      nousIncluded: 'Đi kèm với đăng ký Nous - đăng nhập vào Nous Portal để kích hoạt.',
+      nousAuthNeededTitle: 'Đăng nhập vào Nous Portal',
+      nousAuthNeededMessage: provider =>
+        `${provider} được lưu nhưng sẽ không kích hoạt cho đến khi bạn đăng nhập vào Nous Portal.`,
+      nousAuthSignIn: 'Đăng nhập',
+      nousAuthDoneTitle: 'Nous Portal được kết nối',
+      nousAuthDoneMessage: 'Chương trình phụ trợ đăng ký của bạn hiện đang hoạt động.',
+      nousAuthFailed: 'Đăng nhập cổng Nous không hoàn tất',
+      noApiKeyRequired: 'Không cần khóa API.',
+      postSetupHint: step => `Phần phụ trợ này cần cài đặt một lần (${step}). Chạy trên máy này - có thể mất vài phút.`,
+      postSetupInstalledHint: 'Đã cài đặt. Chỉ chạy lại thiết lập nếu có gì đó bị hỏng.',
+      postSetupRun: 'Chạy thiết lập',
+      postSetupRerun: 'Chạy lại thiết lập',
+      postSetupInstalled: 'Đã cài đặt',
+      postSetupRunning: 'Đang cài đặt…',
+      postSetupStarting: 'Bắt đầu…',
+      postSetupCompleteTitle: 'Thiết lập hoàn tất',
+      postSetupCompleteMessage: step => `Đã cài đặt ${step}.`,
+      postSetupErrorTitle: 'Quá trình thiết lập kết thúc có lỗi',
+      postSetupErrorMessage: step => `Kiểm tra nhật ký ${step}.`,
+      postSetupFailed: step => `Không thể chạy thiết lập ${step}`,
+      webSearchActive: backend => `Tìm kiếm: ${backend}`,
+      webExtractActive: backend => `Trích xuất: ${backend}`,
+      webCapabilityUnset: 'chưa được đặt',
+      webUseForSearch: 'Sử dụng để tìm kiếm',
+      webUseForExtract: 'Sử dụng để chiết xuất',
+      webUsedForSearch: 'Tìm kiếm phụ trợ',
+      webUsedForExtract: 'Trích xuất phụ trợ',
+      webCapabilitySelectedMessage: (provider, capability) => `${provider} hiện xử lý web ${capability}.`,
+      failedSelectCapability: provider => `Không thể đặt ${provider}`,
+      loadingModels: 'Đang tải danh mục mô hình...',
+      modelSectionTitle: 'Mô hình',
+      modelCount: count => `${count} mô hình`,
+      modelInUse: 'Đang sử dụng',
+      modelDefault: 'mặc định',
+      modelInactiveHint: 'Chọn backend này trước để thay đổi mô hình của nó.',
+      modelSelectedTitle: 'Đã chọn mẫu',
+      modelSelectedMessage: model => `${model} áp dụng cho phiên mới.`,
+      failedSelectModel: model => `Không chọn được ${model}`,
+      terminalBackend: {
+        sectionTitle: 'Phần phụ trợ thực thi',
+        loading: 'Đang kiểm tra các chương trình phụ trợ thực thi…',
+        failedLoad: 'Không thể tải backend của terminal',
+        ready: 'Sẵn sàng',
+        needsSetup: 'Cần thiết lập',
+        unavailable: 'Không có sẵn',
+        inUse: 'Đang sử dụng',
+        selectedTitle: 'Đã chọn backend',
+        selectedMessage: backend => `Các lệnh đầu cuối hiện chạy qua ${backend}. Áp dụng cho phiên mới.`,
+        failedSelect: backend => `Không chọn được ${backend}`,
+        needsSetupHint:
+          'Bạn có thể chọn backend này ngay bây giờ - các lệnh sẽ không thành công cho đến khi quá trình thiết lập hoàn tất.'
+      }
     }
   },
+
   skills: {
     tabSkills: 'Kỹ năng',
     tabToolsets: 'Công cụ',
@@ -517,9 +1255,12 @@ export const vi = defineLocale({
     noDescription: 'Không có mô tả.',
     configured: 'Đã cấu hình',
     needsKeys: 'Cần khóa',
+    visionModelHint:
+      'Vision sử dụng cấu hình mô hình phụ trợ của bạn — mô hình có khả năng xử lý hình ảnh được chọn tại đó, không phải riêng cho từng nhà cung cấp ở đây.',
+    visionModelLink: 'Chọn mô hình tầm nhìn trong Cài đặt → Mô hình',
     toolsetsEnabled: (enabled, total) => `Đã bật ${enabled}/${total} bộ công cụ`,
     configureToolset: label => `Cấu hình ${label}`,
-    toggleToolset: (label, enabled) => `${enabled ? 'Tắt' : 'Bật'} bộ công cụ ${label}`,
+    toggleToolset: (label, enabled) => `${enabled ? 'Bật' : 'Tắt'} bộ công cụ ${label}`,
     skillsLoadFailed: 'Không thể tải kỹ năng',
     toolsetsRefreshFailed: 'Không thể làm mới bộ công cụ',
     skillEnabled: 'Đã bật kỹ năng',
@@ -538,7 +1279,11 @@ export const vi = defineLocale({
     bulkUpdated: count => `Đã cập nhật ${count} mục cho phiên mới.`,
     bulkNoChange: 'Không có gì cần thay đổi.',
     usageCount: count => `đã dùng ${count}×`,
-    provenance: { agent: 'Đã học', bundled: 'Tích hợp sẵn', hub: 'Hub' },
+    provenance: {
+      agent: 'Đã học',
+      bundled: 'Tích hợp sẵn',
+      hub: 'Hub'
+    },
     emptyNoneFound: noun => `Không tìm thấy ${noun}`,
     emptyNothingMatches: query => `Không có mục nào khớp “${query}”.`,
     emptyNoneAvailable: noun => `Chưa có ${noun}.`,
@@ -546,8 +1291,117 @@ export const vi = defineLocale({
     skillUpdated: 'Đã cập nhật kỹ năng',
     edit: 'Chỉnh sửa',
     archive: 'Lưu trữ',
-    skillArchivedTitle: 'Đã lưu trữ kỹ năng'
+    skillArchivedTitle: 'Đã lưu trữ kỹ năng',
+    skillArchivedMessage: 'Có thể khôi phục bằng hermes curator restore.',
+    hub: {
+      searchPlaceholder: 'Tìm kiếm trung tâm kỹ năng',
+      search: 'Tìm kiếm',
+      searching: 'Đang tìm kiếm...',
+      connectingHubs: 'Kết nối với các trung tâm kỹ năng...',
+      connectedHubs: 'Các trung tâm được kết nối:',
+      featured: 'Kỹ năng nổi bật',
+      landingHint:
+        'Tìm kiếm trung tâm để duyệt các kỹ năng có thể cài đặt từ chỉ mục chính thức, GitHub và các nguồn cộng đồng.',
+      noResults: 'Không tìm thấy kỹ năng phù hợp nào trong trung tâm.',
+      resultCount: (count, ms) => `${count} kết quả${ms !== null ? ` trong ${ms} ms` : ''}`,
+      timedOut: sources => `Đã hết thời gian: ${sources}`,
+      installed: 'Đã cài đặt',
+      install: 'Cài đặt',
+      installing: 'Đang cài đặt...',
+      uninstall: 'Gỡ cài đặt',
+      uninstalling: 'Đang gỡ cài đặt...',
+      updateAll: 'Cập nhật các kỹ năng đã cài đặt',
+      updating: 'Đang cập nhật...',
+      preview: 'Xem trước',
+      scan: 'Quét',
+      scanning: 'Đang quét...',
+      close: 'Đóng',
+      files: 'Tập tin',
+      noReadme: 'Kỹ năng này không có bản xem trước SKILL.md.',
+      trust: {
+        builtin: 'dựng sẵn',
+        trusted: 'đáng tin cậy',
+        community: 'cộng đồng'
+      },
+      verdictSafe: 'An toàn',
+      verdictCaution: 'Thận trọng',
+      verdictDangerous: 'Nguy hiểm',
+      policyAllow: 'Cho phép cài đặt',
+      policyAsk: 'Xem xét trước khi cài đặt',
+      policyBlock: 'Cài đặt bị chặn bởi chính sách',
+      findings: count => `${count} phát hiện`,
+      noFindings: 'Không có phát hiện bảo mật.',
+      installStarted: name => `Đang cài đặt ${name}...`,
+      uninstallStarted: name => `Đang gỡ cài đặt ${name}...`,
+      updateStarted: 'Đang cập nhật các kỹ năng đã cài đặt...',
+      actionFailed: 'Hành động kỹ năng không thành công',
+      actionLog: 'Nhật ký hành động',
+      loadFailed: 'Không tải được trung tâm kỹ năng',
+      previewFailed: 'Xem trước kỹ năng không thành công',
+      scanFailed: 'Quét bảo mật không thành công',
+      searchFailed: 'Tìm kiếm trung tâm không thành công'
+    }
   },
+
+  starmap: {
+    title: 'Đồ thị bộ nhớ',
+    subtitle: (nodes, clusters) => `${nodes} kỹ năng trên ${clusters} danh mục`,
+    close: 'Đóng đồ thị bộ nhớ',
+    refresh: 'Làm mới',
+    memory: 'Bộ nhớ',
+    filterAll: 'Tất cả',
+    filterUsed: 'Đã sử dụng',
+    filterLearned: 'Đã học',
+    viewGraph: 'Đồ thị',
+    loadFailed: 'Không thể tải đồ thị bộ nhớ',
+    loading: 'Đang tải…',
+    emptyTitle: 'Chưa học được gì',
+    emptyDesc: 'Khi Hermes xây dựng kỹ năng và bộ nhớ cho công việc của bạn, chúng sẽ xuất hiện ở đây.',
+    share: 'Chia sẻ bản đồ',
+    shareHint:
+      'Sao chép mã để chia sẻ bản đồ này, hoặc dán một mã để tải. Mã chỉ chứa bố cục, không chứa bộ nhớ hay nội dung kỹ năng của bạn.',
+    shareTitle: 'Nhập/xuất bản đồ',
+    sharePlaceholder: 'Dán mã bản đồ…',
+    copy: 'Sao chép mã bản đồ',
+    copied: 'Đã sao chép!',
+    importMap: 'Nhập bản đồ',
+    importBtn: 'Tải',
+    importEmpty: 'Dán mã bản đồ để tải nó.',
+    importSuccess: nodes => `Đã tải bản đồ với ${nodes} ${nodes === 1 ? 'nút' : 'nút'}.`,
+    importedBadge: 'bản đồ đã nhập',
+    resetToMine: 'Quay lại bản đồ của tôi'
+  },
+  agents: {
+    close: 'Đóng tác nhân',
+    title: 'Cây tác nhân',
+    subtitle: 'Hoạt động của tác nhân phụ trực tiếp cho lượt hiện tại.',
+    emptyTitle: 'Không có tác nhân phụ trực tiếp',
+    emptyDesc: 'Khi một lượt giao việc cho tác nhân khác, các tác nhân con sẽ truyền tiến trình của chúng tại đây.',
+    running: 'Đang chạy',
+    failed: 'Thất bại',
+    done: 'Xong',
+    streaming: 'Truyền phát',
+    files: 'Tệp',
+    moreFiles: count => `+${count} tệp nữa`,
+    delegation: index => `Uỷ quyền ${index}`,
+    workers: count => `${count} tiến trình`,
+    workersActive: count => `${count} đang hoạt động`,
+    agentsCount: count => `${count} tác nhân`,
+    activeCount: count => `${count} đang hoạt động`,
+    failedCount: count => `${count} thất bại`,
+    toolsCount: count => `${count} công cụ`,
+    filesCount: count => `${count} tệp`,
+    updatedAgo: age => `đã cập nhật ${age}`,
+    ageNow: 'vừa xong',
+    ageSeconds: seconds => `${seconds}s trước`,
+    ageMinutes: minutes => `${minutes}m trước`,
+    ageHours: hours => `${hours}h trước`,
+    ageDays: days => `${days}d trước`,
+    durationSeconds: seconds => `${seconds}s`,
+    durationMinutes: (minutes, seconds) => `${minutes}m ${seconds}s`,
+    tokens: value => `${value} tok`
+  },
+
   commandCenter: {
     close: 'Đóng Trung tâm lệnh',
     paletteTitle: 'Bảng lệnh',
@@ -567,6 +1421,63 @@ export const vi = defineLocale({
     settings: 'Cài đặt',
     changeTheme: 'Đổi chủ đề',
     changeColorMode: 'Đổi chế độ màu…',
+    pets: {
+      title: 'Thú cưng',
+      placeholder: 'Tìm kiếm thú cưng…',
+      loading: 'Đang tải thư viện petdex…',
+      error: 'Không thể truy cập thư viện petdex.',
+      staleBackend: 'Khởi động lại Hermes để sử dụng thú cưng - backend có trước tính năng này.',
+      empty: 'Không có vật nuôi phù hợp.',
+      turnOff: 'Tắt',
+      turnOn: 'Bật',
+      installed: 'Đã cài đặt',
+      generatedTag: 'Đã tạo',
+      adoptFailed: 'Không thể nhận nuôi con vật cưng đó.',
+      toggleFailed: enabled => `Không thể ${enabled ? 'bật' : 'tắt'} thú cưng.`,
+      noneAvailable: 'Không có vật nuôi nào — hãy chọn một vật nuôi bên dưới để cài đặt.'
+    },
+    generatePet: {
+      title: 'Tạo thú cưng',
+      placeholder: 'Hãy miêu tả một con vật cưng để tạo ra…',
+      promptHint: 'Nhập mô tả, sau đó nhấn Enter để phác thảo bốn giao diện.',
+      readyHint: 'Nhấn Enter để phác thảo bốn giao diện từ mô tả của bạn.',
+      generate: 'Tạo',
+      generating: 'Đang tạo…',
+      retry: 'Thử lại',
+      hatch: 'nở',
+      spawning: 'Sinh sản…',
+      hatching: 'Ấp nở thú cưng của bạn…',
+      hatchingSub: 'Đưa nó vào cuộc sống…',
+      hatched: 'Nó đã nở!',
+      hatchRow: (_state, done, total) => `Vẽ khung ${done} của ${total}…`,
+      hatchComposing: 'Ghép nó lại với nhau…',
+      hatchSaving: 'Sắp xong rồi…',
+      namePlaceholder: 'Đặt tên cho thú cưng của bạn',
+      staleBackend: 'Cập nhật Hermes để tạo thú cưng.',
+      backgroundHint: 'Bạn có thể đóng cái này - Hermes sẽ thông báo cho bạn khi hoàn tất.',
+      slowProviderHint: 'Việc này có thể mất vài phút',
+      remix: 'phối lại',
+      remixConfirmTitle: 'Phối lại diện mạo này?',
+      remixConfirmBody:
+        'Thao tác này tạo ra một tập hợp các bản nháp mới sử dụng tập hợp này làm điểm bắt đầu. Nó có thể mất vài phút.',
+      genericError: 'Tạo không thành công — hãy thử lại hoặc chọn một đề xuất.',
+      referenceImageTooLarge: 'Hình ảnh tham chiếu quá lớn. Sử dụng một dưới 16 MB.',
+      referenceImageInvalid: 'Không thể đọc được hình ảnh tham chiếu đó. Hãy thử PNG, JPG, WebP hoặc GIF.',
+      adopt: 'Nhận nuôi',
+      startOver: 'Bắt đầu lại'
+    },
+    installTheme: {
+      title: 'Cài đặt chủ đề…',
+      pageTitle: 'Cài đặt chủ đề',
+      placeholder: 'Tìm kiếm trên Thị trường Mã VS...',
+      loading: 'Tìm kiếm trên thị trường...',
+      error: 'Không thể tiếp cận Marketplace.',
+      empty: 'Không có chủ đề phù hợp.',
+      install: 'Cài đặt',
+      installing: 'Đang cài đặt...',
+      installed: 'Đã cài đặt',
+      installs: count => `Số lượt cài đặt ${count}`
+    },
     settingsFields: 'Trường cài đặt',
     mcpServers: 'Máy chủ MCP',
     archivedChats: 'Cuộc trò chuyện đã lưu trữ',
@@ -615,7 +1526,7 @@ export const vi = defineLocale({
     days: count => `${count} ngày`,
     statSessions: 'Phiên',
     statApiCalls: 'Lệnh gọi API',
-    statTokens: 'Token vào/ra',
+    statTokens: 'Token đầu vào/đầu ra',
     statCost: 'Chi phí ước tính',
     actualCost: cost => `thực tế ${cost}`,
     loadingUsage: 'Đang tải mức sử dụng...',
@@ -632,8 +1543,54 @@ export const vi = defineLocale({
     actions: count => `${count} thao tác`,
     logFile: 'Tệp nhật ký',
     logLevel: 'Mức',
-    logSearchPlaceholder: 'Lọc dòng nhật ký...'
+    logSearchPlaceholder: 'Lọc dòng nhật ký...',
+    maintenance: {
+      runOps: 'Chẩn đoán',
+      doctor: 'Chạy chẩn đoán',
+      doctorDesc: 'Kiểm tra tình trạng cài đặt, cấu hình và nhà cung cấp',
+      securityAudit: 'Kiểm tra an ninh',
+      securityAuditDesc: 'Quét cấu hình và kỹ năng để tìm cài đặt rủi ro',
+      backup: 'Tạo bản sao lưu',
+      backupDesc: 'Nén cấu hình, bộ nhớ, kỹ năng và phiên thành tệp zip',
+      debugShare: 'Chia sẻ gỡ lỗi',
+      debugShareDesc:
+        'Tải lên báo cáo và nhật ký đã che thông tin nhạy cảm, rồi nhận liên kết có thể chia sẻ (tự động xóa sau 6 giờ)',
+      debugShareRunning: 'Đang tải lên báo cáo gỡ lỗi...',
+      debugShareLinks: 'Chia sẻ liên kết',
+      debugShareFailed: 'Chia sẻ gỡ lỗi không thành công',
+      copyLink: 'Sao chép liên kết',
+      linkCopied: 'Đã sao chép liên kết',
+      curator: 'Người phụ trách kỹ năng',
+      curatorDesc: 'Tác vụ đánh giá chạy nền, lưu trữ các kỹ năng cũ do tác nhân tạo',
+      curatorPaused: 'Đã tạm dừng',
+      curatorActive: 'Đang hoạt động',
+      curatorDisabled: 'Đã tắt',
+      curatorLastRun: when => `Lần chạy cuối cùng ${when}`,
+      curatorNeverRan: 'Chưa bao giờ chạy',
+      pause: 'Tạm dừng',
+      resume: 'Tiếp tục',
+      runNow: 'Chạy ngay bây giờ',
+      memoryData: 'Dữ liệu bộ nhớ',
+      memoryDataDesc: 'Các tệp bộ nhớ tích hợp được đưa vào mỗi phiên',
+      memoryProvider: name => `Nhà cung cấp đang hoạt động: ${name}`,
+      builtinMemory: 'tích hợp sẵn',
+      memoryFile: 'Bộ nhớ tác nhân (MEMORY.md)',
+      userFile: 'Hồ sơ người dùng (USER.md)',
+      bytes: size => size,
+      empty: 'trống',
+      resetMemory: 'Đặt lại bộ nhớ',
+      resetUser: 'Đặt lại hồ sơ',
+      resetAll: 'Đặt lại cả hai',
+      resetConfirm: target => `Xóa ${target}? Điều này không thể hoàn tác được.`,
+      resetDone: files => `Đã xóa ${files}.`,
+      resetFailed: 'Thiết lập lại bộ nhớ không thành công',
+      actionStarted: name => `${name} đã bắt đầu - theo dõi nhật ký...`,
+      actionFailed: name => `${name} không khởi động được`,
+      running: 'Đang chạy...',
+      viewLog: 'Nhật ký hành động'
+    }
   },
+
   messaging: {
     search: 'Tìm nền tảng nhắn tin...',
     loading: 'Đang tải nền tảng nhắn tin...',
@@ -683,6 +1640,7 @@ export const vi = defineLocale({
     failedSave: name => `Không thể lưu ${name}`,
     failedClear: key => `Không thể xóa ${key}`,
     pendingRequests: count => `Yêu cầu đang chờ (${count})`,
+    pendingAria: count => `${count} đang chờ ghép nối ${count === 1 ? 'lời yêu cầu' : 'yêu cầu'}`,
     approvedUsers: count => `Người dùng đã duyệt (${count})`,
     approve: 'Phê duyệt',
     approving: 'Đang phê duyệt...',
@@ -697,8 +1655,164 @@ export const vi = defineLocale({
     failedApprove: name => `Không thể phê duyệt ${name}`,
     failedRevoke: name => `Không thể thu hồi quyền của ${name}`,
     pairingLockedOut: 'Có quá nhiều lần phê duyệt thất bại — nền tảng này tạm thời bị khóa.',
-    waitingSince: minutes => (minutes < 1 ? 'vừa xong' : `${minutes} phút trước`)
+    waitingSince: minutes => (minutes < 1 ? 'vừa xong' : `${minutes} phút trước`),
+    fieldCopy: {
+      TELEGRAM_BOT_TOKEN: {
+        label: 'Mã thông báo bot',
+        help: 'Tạo bot bằng @BotFather, sau đó dán token mà nó cung cấp cho bạn.',
+        placeholder: 'Dán token bot Telegram'
+      },
+      TELEGRAM_ALLOWED_USERS: {
+        label: 'ID người dùng Telegram được phép',
+        help: 'Khuyến khích. ID số được phân tách bằng dấu phẩy từ @userinfobot. Nếu không có điều này, bất kỳ ai cũng có thể DM bot của bạn.'
+      },
+      TELEGRAM_PROXY: { label: 'URL proxy', help: 'Chỉ cần thiết trên các mạng nơi Telegram bị chặn.' },
+      DISCORD_BOT_TOKEN: {
+        label: 'Mã thông báo bot',
+        help: 'Tạo một ứng dụng trong Discord Developer Portal, thêm bot, sau đó dán token của nó.'
+      },
+      DISCORD_ALLOWED_USERS: {
+        label: 'ID người dùng Discord được phép',
+        help: 'Khuyến khích. ID người dùng Discord được phân tách bằng dấu phẩy.'
+      },
+      DISCORD_REPLY_TO_MODE: { label: 'Kiểu trả lời', help: 'first, all hoặc off.' },
+      DISCORD_ALLOW_ALL_USERS: {
+        label: 'Cho phép tất cả người dùng Discord',
+        help: 'Chỉ phát triển. Khi đúng, bất kỳ ai cũng có thể nhắn tin trực tiếp cho bot mà không cần có danh sách cho phép.'
+      },
+      DISCORD_HOME_CHANNEL: {
+        label: 'Mã kênh chính',
+        help: 'Kênh nơi bot gửi tin nhắn chủ động (kết quả cron, lời nhắc).'
+      },
+      DISCORD_HOME_CHANNEL_NAME: {
+        label: 'Tên kênh trang chủ',
+        help: 'Hiển thị tên của kênh chính trong nhật ký và đầu ra trạng thái.'
+      },
+      BLUEBUBBLES_ALLOW_ALL_USERS: {
+        label: 'Cho phép tất cả người dùng iMessage',
+        help: 'Khi đúng, hãy bỏ qua danh sách cho phép BlueBubbles.'
+      },
+      MATTERMOST_ALLOW_ALL_USERS: { label: 'Cho phép tất cả người dùng Mattermost' },
+      MATTERMOST_HOME_CHANNEL: { label: 'kênh chủ' },
+      QQ_ALLOW_ALL_USERS: { label: 'Cho phép tất cả người dùng QQ' },
+      QQBOT_HOME_CHANNEL: { label: 'kênh chủ QQ', help: 'Kênh hoặc nhóm mặc định để phân phối định kỳ.' },
+      QQBOT_HOME_CHANNEL_NAME: { label: 'Tên kênh chính của QQ' },
+      SLACK_BOT_TOKEN: {
+        label: 'Mã thông báo bot Slack',
+        help: 'Dùng bot token trong mục OAuth & Permissions sau khi cài đặt ứng dụng Slack.',
+        placeholder: 'Dán bot token của Slack'
+      },
+      SLACK_APP_TOKEN: {
+        label: 'Mã thông báo ứng dụng Slack',
+        help: 'Dùng app-level token cần thiết cho Socket Mode.',
+        placeholder: 'Dán app token của Slack'
+      },
+      SLACK_ALLOWED_USERS: {
+        label: 'ID người dùng Slack được phép',
+        help: 'Khuyến khích. ID người dùng Slack được phân tách bằng dấu phẩy.'
+      },
+      MATTERMOST_URL: { label: 'Máy chủ URL', placeholder: 'https://mattermost.example.com' },
+      MATTERMOST_TOKEN: { label: 'Mã thông báo bot' },
+      MATTERMOST_ALLOWED_USERS: {
+        label: 'ID người dùng được phép',
+        help: 'Khuyến khích. ID người dùng Mattermost được phân tách bằng dấu phẩy.'
+      },
+      MATRIX_HOMESERVER: { label: 'Máy chủ gia đình URL', placeholder: 'https://matrix.org' },
+      MATRIX_ACCESS_TOKEN: { label: 'Mã thông báo truy cập' },
+      MATRIX_USER_ID: { label: 'ID người dùng bot', placeholder: '@hermes:example.org' },
+      MATRIX_ALLOWED_USERS: {
+        label: 'ID người dùng Matrix được phép',
+        help: 'Khuyến khích. ID người dùng được phân tách bằng dấu phẩy ở định dạng @user:server.'
+      },
+      SIGNAL_HTTP_URL: {
+        label: 'Cầu Signal URL',
+        placeholder: 'http://127.0.0.1:8080',
+        help: 'URL của một signal-cli REST bridge đang chạy.'
+      },
+      SIGNAL_ACCOUNT: { label: 'Số điện thoại', help: 'Số điện thoại đã đăng ký với signal-cli bridge của bạn.' },
+      SIGNAL_ALLOWED_USERS: {
+        label: 'Người dùng Signal được phép',
+        help: 'Khuyến khích. Giá trị nhận dạng Signal được phân tách bằng dấu phẩy.'
+      },
+      WHATSAPP_ENABLED: {
+        label: 'Kích hoạt cầu WhatsApp',
+        help: 'Đặt tự động bằng nút chuyển đổi bên dưới. Hãy để yên trừ khi bạn biết mình cần nó.'
+      },
+      WHATSAPP_MODE: { label: 'Chế độ cầu' },
+      WHATSAPP_ALLOWED_USERS: {
+        label: 'Người dùng WhatsApp được phép',
+        help: 'Khuyến khích. Số điện thoại được phân tách bằng dấu phẩy hoặc ID WhatsApp.'
+      }
+    },
+    platformIntro: {}
   },
+
+  webhooks: {
+    search: 'Tìm kiếm webhook...',
+    loading: 'Đang tải webhook...',
+    loadFailed: 'Webhooks không tải được',
+    subscriptions: (count: number) => `Đăng ký (${count})`,
+    hint: 'Đăng ký thay đổi tải lại nóng khi bộ thu đang chạy. Đăng ký bị vô hiệu hóa từ chối các sự kiện đến.',
+    empty: 'Chưa có đăng ký webhook nào.',
+    disabledTitle: 'Bộ thu Webhook bị vô hiệu hóa',
+    disabledBody:
+      'Webhook là một nền tảng riêng của gateway. Bật webhook tại đây để nhận các sự kiện HTTP đến; chỉ cần kênh trò chuyện khi subscription gửi kết quả tới Telegram, Discord, Slack hoặc một kênh khác.',
+    enable: 'Bật webhook',
+    enabling: 'Đang bật...',
+    enabled: (name: string) => `Đã bật: "${name}"`,
+    disabled: (name: string) => `Đã tắt: "${name}"`,
+    enableRow: 'Cho phép',
+    disableRow: 'Vô hiệu hóa',
+    delete: 'Xóa',
+    deleting: 'Đang xóa...',
+    deleted: 'Đã xóa webhook',
+    deleteTitle: 'Xóa webhook',
+    deleteDescPrefix: 'Điều này sẽ loại bỏ vĩnh viễn ',
+    deleteDescSuffix: '. Điều này không thể hoàn tác được.',
+    deleteFailed: (name: string) => `Không thể xóa "${name}"`,
+    toggleFailed: (name, enabled) => `Không thể ${enabled ? 'bật' : 'tắt'} "${name}"`,
+    newSubscription: 'Đăng ký mới',
+    restarting: 'Đang khởi động lại cổng...',
+    restartNeeded: 'Webhooks đã được bật nhưng cổng vẫn cần khởi động lại trước khi bộ thu có thể trực tuyến.',
+    restartGateway: 'Khởi động lại cổng',
+    restartingGateway: 'Đang khởi động lại...',
+    restartFailed: (detail: string) => `Không thể khởi động lại gateway: ${detail}`,
+    enabledRestarting: 'Đã bật Webhooks; cổng khởi động lại...',
+    all: '(tất cả)',
+    deliverOnly: 'chỉ gửi nội dung',
+    createdTitle: 'Đã tạo đăng ký',
+    createdSecretHint: 'Sao chép bí mật ngay bây giờ - nó chỉ được hiển thị một lần.',
+    webhookUrl: 'Webhook URL',
+    secretOnce: 'Bí mật (hiển thị một lần)',
+    done: 'Xong',
+    fieldName: 'Tên',
+    fieldNamePlaceholder: 'ví dụ: github-push',
+    fieldDescription: 'Mô tả',
+    fieldDescriptionPlaceholder: 'Webhook này làm gì (tùy chọn)',
+    fieldEvents: 'Sự kiện',
+    fieldEventsPlaceholder: 'phân tách bằng dấu phẩy; để trống để nhận tất cả sự kiện',
+    fieldSkills: 'Kỹ năng',
+    fieldSkillsPlaceholder: 'tên kỹ năng được phân tách bằng dấu phẩy (tùy chọn)',
+    fieldDeliver: 'Giao hàng tới',
+    fieldDeliverOnly: 'Chỉ gửi payload',
+    fieldPrompt: 'Lời nhắc',
+    fieldPromptPlaceholder: 'Hướng dẫn cho tác nhân khi webhook này được kích hoạt (tùy chọn)',
+    nameRequired: 'Yêu cầu tên',
+    create: 'Tạo nên',
+    creating: 'Đang tạo...',
+    created: 'Đã tạo',
+    createFailed: (detail: string) => `Không tạo được: ${detail}`,
+    copy: 'Sao chép',
+    deliverOptions: {
+      log: 'Nhật ký',
+      telegram: 'Telegram',
+      discord: 'Discord',
+      slack: 'Slack',
+      email: 'E-mail',
+      github_comment: 'Bình luận GitHub'
+    }
+  },
+
   profiles: {
     close: 'Đóng hồ sơ',
     nameHint: 'Chữ thường, chữ số, dấu gạch ngang và gạch dưới. Phải bắt đầu bằng chữ hoặc số.',
@@ -776,6 +1890,7 @@ export const vi = defineLocale({
     failedCreate: 'Không thể tạo hồ sơ',
     failedRename: 'Không thể đổi tên hồ sơ'
   },
+
   cron: {
     close: 'Đóng lịch',
     title: 'Tác vụ định kỳ',
@@ -791,7 +1906,13 @@ export const vi = defineLocale({
       error: 'lỗi',
       completed: 'đã hoàn tất'
     },
-    deliveryLabels: { local: 'Desktop này', telegram: 'Telegram', discord: 'Discord', slack: 'Slack', email: 'Email' },
+    deliveryLabels: {
+      local: 'Desktop này',
+      telegram: 'Telegram',
+      discord: 'Discord',
+      slack: 'Slack',
+      email: 'Email'
+    },
     scheduleLabels: {
       daily: 'Hằng ngày',
       weekdays: 'Ngày trong tuần',
@@ -881,10 +2002,29 @@ export const vi = defineLocale({
     promptRequired: 'Bắt buộc nhập prompt.',
     promptScheduleRequired: 'Bắt buộc nhập prompt và lịch.',
     scheduleRequired: 'Bắt buộc nhập lịch.',
+    scriptOnlyEditHint: 'Công việc chỉ có tập lệnh (không có prompt AI). Mã công việc:',
     saveChanges: 'Lưu thay đổi',
     createAction: 'Tạo lịch',
-    tabs: { jobs: 'Tác vụ', blueprints: 'Mẫu tự động hóa' }
+    tabs: {
+      jobs: 'Tác vụ',
+      blueprints: 'Mẫu tự động hóa'
+    },
+    blueprints: {
+      tab: 'bản thiết kế',
+      startFrom: 'Bắt đầu từ',
+      custom: 'Tùy chỉnh',
+      subtitle: 'Tự động hóa làm sẵn',
+      dialogDesc: 'Điền thông tin chi tiết và lên lịch.',
+      scheduleIt: 'Lên lịch cho nó',
+      scheduling: 'Đang lên lịch...',
+      scheduled: 'Đã lên lịch mẫu tự động hóa',
+      loading: 'Đang tải bản thiết kế...',
+      failedLoad: 'Không tải được bản thiết kế',
+      emptyTitle: 'Không có bản thiết kế nào có sẵn',
+      emptyDesc: 'Không có bản thiết kế tự động hóa nào có sẵn trên backend này.'
+    }
   },
+
   artifacts: {
     search: 'Tìm sản phẩm...',
     refresh: 'Làm mới sản phẩm',
@@ -919,8 +2059,34 @@ export const vi = defineLocale({
     copyUrl: 'Sao chép URL',
     copyPath: 'Sao chép đường dẫn'
   },
+
+  artifactCard: {
+    kind: { code: 'Mã số', html: 'Trang tương tác', svg: 'đồ họa' },
+    generating: lines => `Đang tạo… dòng ${lines}`,
+    versionBadge: count => `Các phiên bản ${count}`,
+    open: 'Mở'
+  },
+
+  artifactPreview: {
+    versionOf: (current, total) => `v${current} của ${total}`,
+    olderVersion: 'Phiên bản cũ hơn',
+    newerVersion: 'Phiên bản mới hơn',
+    latest: 'Mới nhất',
+    copyContent: 'Sao chép nội dung',
+    download: 'Tải xuống',
+    openInBrowser: 'Mở trong trình duyệt',
+    openInBrowserFailed: 'Không thể mở trong trình duyệt',
+    missingTitle: 'Hiện vật không có sẵn',
+    missingBody: 'Hiện vật này không còn trong sổ đăng ký cục bộ.'
+  },
+
   sidebar: {
-    nav: { 'new-session': 'Phiên mới', skills: 'Khả năng', messaging: 'Nhắn tin', artifacts: 'Sản phẩm' },
+    nav: {
+      'new-session': 'Phiên mới',
+      skills: 'Khả năng',
+      messaging: 'Nhắn tin',
+      artifacts: 'Sản phẩm'
+    },
     searchAria: 'Tìm kiếm phiên',
     searchPlaceholder: 'Tìm phiên…',
     clearSearch: 'Xóa tìm kiếm',
@@ -940,6 +2106,71 @@ export const vi = defineLocale({
     noWorkspace: 'Không có không gian làm việc',
     projectEmpty: 'Chưa có phiên',
     noSessions: 'Chưa có phiên',
+    projects: {
+      sectionLabel: 'Dự án',
+      home: 'Trang chủ',
+      newButton: 'Dự án mới',
+      createTitle: 'Dự án mới',
+      createDesc: 'Đặt tên cho không gian làm việc và thêm một hoặc nhiều thư mục.',
+      renameTitle: 'Đổi tên dự án',
+      addFolderTitle: 'Thêm thư mục',
+      namePlaceholder: 'ví dụ: Skunkworks',
+      foldersLabel: 'Thư mục',
+      ideaLabel: 'Ý tưởng',
+      ideaPlaceholder: 'Dự án này nói về cái gì? (đã lưu vào IDEA.md)',
+      ideaGenerate: 'Tạo ý tưởng',
+      ideaGenerating: 'Đang tạo…',
+      ideaShuffle: 'Trộn mẫu',
+      noFolders: 'Chưa có thư mục nào được thêm vào.',
+      addFolder: 'Thêm thư mục',
+      primaryBadge: 'chính',
+      removeFolder: 'Gỡ bỏ',
+      create: 'Tạo',
+      menu: 'Hành động',
+      menuRename: 'Đổi tên',
+      menuAppearance: 'Giao diện',
+      noColor: 'không màu',
+      menuAddFolder: 'Thêm thư mục',
+      menuSetActive: 'Đặt làm dự án đang hoạt động',
+      menuDelete: 'Xóa',
+      reveal: 'Hiển thị trong thư mục',
+      copyPath: 'Sao chép đường dẫn',
+      removeFromSidebar: 'Ẩn khỏi thanh bên',
+      createFailed: 'Không thể tạo dự án',
+      staleBackend:
+        'Cập nhật backend Hermes để tạo dự án — backend hiện tại cũ hơn ứng dụng Desktop này (Cài đặt → Cập nhật → Backend).',
+      deleteConfirm:
+        'Thao tác này sẽ xóa dự án đã lưu khỏi Hermes. Các tệp, kho Git và worktree vẫn không bị ảnh hưởng.',
+      startWork: 'Worktree mới',
+      newWorktreeTitle: 'Worktree mới',
+      newWorktreeDesc: 'Đặt tên nhánh cho worktree này.',
+      branchPlaceholder: 'ví dụ: my-feature',
+      branchOff: () => ({ after: '', before: 'tạo nhánh từ ' }),
+      baseBranchPlaceholder: 'Tìm nhánh…',
+      baseBranchNone: 'Không tìm thấy nhánh nào',
+      startWorkFailed: 'Không thể tạo worktree',
+      convertBranch: 'Chuyển đổi một nhánh…',
+      convertBranchTitle: 'Chuyển đổi một nhánh',
+      convertBranchDesc: 'Mở một nhánh đã checkout hoặc tạo worktree cho một nhánh đang rảnh.',
+      convertBranchPlaceholder: 'Tìm nhánh…',
+      convertBranchInstead: 'Chuyển đổi một nhánh hiện có',
+      branchOpenExisting: 'mở',
+      branchSwitchHome: 'chuyển thư mục chính',
+      branchCreateWorktree: 'worktree mới',
+      branchesLoading: 'Đang tải các nhánh…',
+      noBranches: 'Không tìm thấy nhánh nào',
+      removeWorktree: 'Xóa worktree',
+      removeWorktreeFailed: 'Không thể xóa worktree (có thay đổi chưa commit?)',
+      removeWorktreeConfirm:
+        'Xóa khỏi Git (xóa thư mục worktree; nhánh vẫn được giữ lại) hoặc chỉ ẩn mục này khỏi thanh bên và giữ worktree trên ổ đĩa.',
+      removeWorktreeDirty:
+        'Worktree này có thay đổi chưa commit. Bạn có thể buộc xóa (loại bỏ các thay đổi đó) hoặc chỉ ẩn mục này và giữ worktree trên ổ đĩa.',
+      forceRemove: 'Buộc xóa',
+      enter: label => `Mở ${label}`,
+      reorder: label => `Sắp xếp lại ${label}`,
+      toggle: (label, open) => `${open ? 'Hiện' : 'Ẩn'} phiên ${label}`,
+      back: 'Tất cả các dự án'
+    },
     newSessionIn: label => `Phiên mới trong ${label}`,
     showMoreIn: (count, label) => `Hiện thêm ${count} mục trong ${label}`,
     loading: 'Đang tải…',
@@ -985,6 +2216,7 @@ export const vi = defineLocale({
       thisMonth: 'Đầu tháng này'
     }
   },
+
   composer: {
     message: 'Tin nhắn',
     wakingProfile: profile => `Đang đánh thức ${profile}…`,
@@ -1041,6 +2273,24 @@ export const vi = defineLocale({
     commonCommands: 'Lệnh thường dùng',
     hotkeys: 'Phím nóng',
     helpFooter: 'mở bảng đầy đủ · backspace để đóng',
+    commandDescs: {
+      '/help': 'danh sách đầy đủ các lệnh + phím nóng',
+      '/clear': 'bắt đầu một phiên mới',
+      '/resume': 'tiếp tục phiên trước',
+      '/details': 'kiểm soát mức độ chi tiết của bản ghi',
+      '/copy': 'sao chép lựa chọn hoặc tin nhắn trợ lý cuối cùng',
+      '/quit': 'thoát khỏi Hermes'
+    },
+    hotkeyDescs: {
+      'composer.mention': 'tham chiếu tệp, thư mục, url, git',
+      'composer.slash': 'bảng lệnh gạch chéo',
+      'composer.help': 'trợ giúp nhanh này (xóa để loại bỏ)',
+      'composer.sendNewline': 'gửi · Shift+Enter cho dòng mới',
+      'composer.sendQueued': 'gửi lượt xếp hàng tiếp theo',
+      'keybinds.openPanel': 'tất cả các phím tắt',
+      'composer.cancel': 'đóng cửa sổ bật lên · hủy chạy',
+      'composer.history': 'chuyển vòng cửa sổ bật lên / lịch sử'
+    },
     attachUrlTitle: 'Đính kèm URL',
     attachUrlDesc: 'Hermes sẽ tải trang và đưa vào ngữ cảnh của lượt này.',
     urlPlaceholder: 'https://example.com/post',
@@ -1071,6 +2321,8 @@ export const vi = defineLocale({
     readingAloud: 'Đang đọc to',
     themeSuggestions: 'Gợi ý chủ đề Desktop',
     noMatchingThemes: 'Không có chủ đề phù hợp.',
+    themeTryPre: 'Thử ',
+    themeTryPost: '.',
     attachLabel: 'Đính kèm',
     files: 'Tệp…',
     folder: 'Thư mục…',
@@ -1078,11 +2330,31 @@ export const vi = defineLocale({
     pasteImage: 'Dán hình ảnh',
     url: 'URL…',
     promptSnippets: 'Mẫu prompt…',
+    tipPre: 'Mẹo: gõ ',
+    tipPost: ' để tham chiếu tệp ngay trong dòng.',
     snippetsTitle: 'Mẫu prompt',
     snippetsDesc: 'Chọn một prompt khởi đầu để đưa vào khung soạn thảo.',
     dropFiles: 'Thả tệp để đính kèm',
-    dropSession: 'Thả để liên kết cuộc trò chuyện này'
+    dropSession: 'Thả để liên kết cuộc trò chuyện này',
+    snippets: {
+      codeReview: {
+        label: 'Đánh giá mã',
+        description: 'Rà soát thay đổi hiện tại để tìm hồi quy, trường hợp biên bị bỏ sót và bài kiểm thử còn thiếu.',
+        text: 'Vui lòng xem lại phần này để tìm lỗi, hồi quy và bài kiểm thử còn thiếu.'
+      },
+      implementationPlan: {
+        label: 'Kế hoạch thực hiện',
+        description: 'Phác thảo hướng tiếp cận trước khi sửa mã để diff giữ được sự tập trung.',
+        text: 'Vui lòng lập kế hoạch triển khai ngắn gọn trước khi thay đổi mã.'
+      },
+      explainThis: {
+        label: 'Giải thích điều này',
+        description: 'Tìm hiểu cách hoạt động của mã đã chọn và liên kết đến các tệp chính.',
+        text: 'Vui lòng giải thích cách hoạt động của tính năng này và chỉ cho tôi các tệp chính.'
+      }
+    }
   },
+
   statusStack: {
     agents: 'Tác nhân',
     background: count => `${count} tác vụ nền`,
@@ -1097,7 +2369,7 @@ export const vi = defineLocale({
     dismiss: 'Bỏ qua',
     exit: code => `mã thoát ${code}`,
     coding: {
-      title: 'Cây làm việc',
+      title: 'Worktree',
       noBranch: 'Không có nhánh',
       detached: 'tách rời',
       clean: 'Sạch',
@@ -1133,6 +2405,8 @@ export const vi = defineLocale({
       openPr: 'Mở PR',
       ghMissing: 'Cài GitHub CLI (gh) và đăng nhập để mở PR',
       agentShip: 'Yêu cầu Hermes mở PR',
+      agentShipPrompt:
+        'Xem lại các thay đổi hiện tại, commit với thông điệp conventional commit rõ ràng, push nhánh và mở pull request.',
       newBranch: 'Nhánh mới',
       branchOffFrom: base => `Nhánh mới từ ${base}`,
       switchTo: branch => `Chuyển sang ${branch}`,
@@ -1140,6 +2414,7 @@ export const vi = defineLocale({
       worktrees: 'Worktree'
     }
   },
+
   updates: {
     stages: {
       idle: 'Đang chuẩn bị…',
@@ -1196,6 +2471,7 @@ export const vi = defineLocale({
       noReturn: 'Backend chưa trực tuyến trở lại. Hãy kiểm tra máy chủ backend.'
     }
   },
+
   install: {
     stageStates: {
       pending: 'Đang chờ',
@@ -1239,6 +2515,8 @@ export const vi = defineLocale({
     tokenTitle: 'Token phiên',
     tokenDesc: 'Dán token phiên từ tệp .env của gateway từ xa.',
     pasteSessionToken: 'Dán token phiên',
+    incompleteSignInTest: 'Hãy đăng nhập trước khi kiểm tra gateway yêu cầu OAuth này.',
+    incompleteTokenTest: 'Nhập token phiên trước khi kiểm tra gateway này.',
     testConnection: 'Kiểm tra kết nối',
     testSucceeded: (baseUrl, version) => `Đã kết nối với ${baseUrl}${version ? ` (${version})` : ''}.`,
     applyRemote: 'Áp dụng và kết nối lại',
@@ -1246,7 +2524,8 @@ export const vi = defineLocale({
     failedTitle: 'Cài đặt thất bại',
     settingUpTitle: 'Đang thiết lập Hermes Agent',
     finishingTitle: 'Đang hoàn tất',
-    failedDesc: 'Một bước cài đặt đã thất bại. Hãy kiểm tra chi tiết bên dưới hoặc nhật ký Desktop.',
+    failedDesc:
+      'Một bước cài đặt đã thất bại. Trên Windows, lỗi này có thể xảy ra nếu một phiên bản Hermes CLI hoặc Desktop khác đang chạy. Hãy dừng mọi phiên bản Hermes đang chạy rồi thử lại. Xem chi tiết bên dưới hoặc nhật ký Desktop để đọc toàn bộ bản ghi.',
     activeDesc: 'Đây là thiết lập một lần. Trình cài đặt Hermes đang tải các phụ thuộc và cấu hình máy.',
     progress: (completed, total) => `Đã hoàn tất ${completed}/${total} bước`,
     currentStage: stage => ` — hiện tại: ${stage}`,
@@ -1263,6 +2542,7 @@ export const vi = defineLocale({
     copyOutput: 'Sao chép đầu ra',
     reloadRetry: 'Tải lại và thử lại'
   },
+
   onboarding: {
     headerTitle: 'Thiết lập Hermes Agent',
     headerDesc: 'Kết nối một nhà cung cấp mô hình để bắt đầu trò chuyện. Hầu hết tùy chọn chỉ cần một lần bấm.',
@@ -1278,6 +2558,24 @@ export const vi = defineLocale({
     featuredPitch: 'Một gói đăng ký, hơn 300 mô hình tiên tiến — cách được khuyên dùng để chạy Hermes',
     fireworksPitch: 'API mô hình trực tiếp — các mô hình tiên tiến do Fireworks lưu trữ',
     openRouterPitch: 'Một khóa, hàng trăm mô hình — lựa chọn mặc định tốt',
+    apiKeyOptions: {
+      fireworks: {
+        short: 'mô hình trực tiếp API',
+        description: 'Truy cập trực tiếp vào các mô hình được lưu trữ bởi Fireworks AI.'
+      },
+      openrouter: {
+        short: 'một khóa, nhiều mô hình',
+        description: 'Lưu trữ hàng trăm mô hình đằng sau một khóa duy nhất. Mặc định tốt cho cài đặt mới.'
+      },
+      openai: { short: 'Mô hình dòng GPT', description: 'Truy cập trực tiếp vào các mô hình OpenAI.' },
+      gemini: { short: 'Mô hình Gemini', description: 'Truy cập trực tiếp vào các mô hình Google Gemini.' },
+      xai: { short: 'mô hình Grok', description: 'Truy cập trực tiếp vào các mô hình xAI Grok.' },
+      local: {
+        short: 'tự lưu trữ',
+        description:
+          'Trỏ Hermes vào điểm cuối tương thích OpenAI cục bộ hoặc tự lưu trữ (vLLM, llama.cpp, Ollama, v.v.).'
+      }
+    },
     backToSignIn: 'Quay lại đăng nhập',
     getKey: 'Lấy khóa',
     replaceCurrent: 'Thay giá trị hiện tại',
@@ -1286,6 +2584,11 @@ export const vi = defineLocale({
     couldNotSave: 'Không thể lưu thông tin xác thực.',
     connecting: 'Đang kết nối',
     update: 'Cập nhật',
+    flowSubtitles: {
+      pkce: 'Mở trình duyệt của bạn để đăng nhập, sau đó tiếp tục tại đây',
+      device_code: 'Mở trang xác minh trong trình duyệt của bạn - Hermes tự động kết nối',
+      external: 'Đăng nhập một lần vào terminal của bạn, sau đó quay lại trò chuyện'
+    },
     startingSignIn: provider => `Đang bắt đầu đăng nhập ${provider}...`,
     verifyingCode: provider => `Đang xác minh mã với ${provider}...`,
     connectedProvider: provider => `Đã kết nối ${provider}`,
@@ -1298,7 +2601,12 @@ export const vi = defineLocale({
     copyAuthCode: 'Sao chép mã cấp quyền rồi dán bên dưới.',
     pasteAuthCode: 'Dán mã cấp quyền',
     reopenAuthPage: 'Mở lại trang cấp quyền',
+    autoBrowser: provider =>
+      `Chúng tôi đã mở ${provider} trong trình duyệt của bạn. Cho phép Hermes ở đó và bạn sẽ được kết nối tự động — không cần sao chép hoặc dán.`,
+    reopenSignInPage: 'Mở lại trang đăng nhập',
     waitingAuthorize: 'Đang chờ bạn cấp quyền...',
+    externalPending: provider =>
+      `${provider} đăng nhập thông qua CLI của chính nó. Chạy lệnh này trong terminal, sau đó quay lại và chọn "Tôi đã đăng nhập":`,
     signedIn: 'Tôi đã đăng nhập',
     deviceCodeOpened: provider => `Đã mở ${provider} trong trình duyệt. Hãy nhập mã này tại đó:`,
     reopenVerification: 'Mở lại trang xác minh',
@@ -1312,6 +2620,7 @@ export const vi = defineLocale({
     startChatting: 'Bắt đầu',
     docs: provider => `Tài liệu ${provider}`
   },
+
   modelPicker: {
     title: 'Chuyển mô hình',
     current: 'hiện tại:',
@@ -1328,6 +2637,14 @@ export const vi = defineLocale({
     priceTitle: 'Giá đầu vào / đầu ra trên mỗi triệu token',
     wasPrice: 'trước đây'
   },
+
+  modelVisibility: {
+    title: 'Mô hình',
+    search: 'Tìm kiếm mô hình',
+    noAuthenticatedProviders: 'Không có nhà cung cấp đã xác thực.',
+    addProvider: 'Thêm nhà cung cấp…'
+  },
+
   shell: {
     windowControls: 'Điều khiển cửa sổ',
     paneControls: 'Điều khiển ngăn',
@@ -1435,6 +2752,23 @@ export const vi = defineLocale({
       openStarmap: 'Mở đồ thị bộ nhớ',
       turnRunning: 'Đang chạy',
       contextUsage: 'Mức dùng ngữ cảnh',
+      contextUsagePanel: {
+        categories: {
+          conversation: 'Cuộc hội thoại',
+          mcp: 'MCP',
+          memory: 'Bộ nhớ',
+          rules: 'Quy tắc',
+          skills: 'Kỹ năng',
+          subagent_definitions: 'Định nghĩa tác nhân phụ',
+          system_prompt: 'Prompt hệ thống',
+          tool_definitions: 'Định nghĩa công cụ'
+        },
+        empty: 'Chưa có dữ liệu ngữ cảnh',
+        loading: 'Đang tải thông tin chi tiết…',
+        percentFull: percent => `Đã dùng ${percent}%`,
+        title: 'Mức dùng ngữ cảnh',
+        tokenSummary: (used, max) => `${used} / ${max} token`
+      },
       session: 'Phiên',
       yoloOn: 'YOLO đang bật — tự động phê duyệt lệnh nguy hiểm. Shift+click để đổi toàn cục.',
       yoloOff: 'YOLO đang tắt. Shift+click để đổi toàn cục.',
@@ -1447,7 +2781,221 @@ export const vi = defineLocale({
       providerModelTitle: (provider, model) => `${provider} · ${model}`
     }
   },
+
+  rightSidebar: {
+    aria: 'Thanh bên phải',
+    panelsAria: 'Bảng điều khiển bên phải',
+    files: 'Hệ thống tệp',
+    terminal: 'Terminal',
+    noFolderSelected: 'Không có thư mục nào được chọn',
+    changeCwdTitle: 'Thay đổi thư mục làm việc',
+    remotePickerTitle: 'Chọn thư mục từ xa',
+    remotePickerDescription: 'Duyệt các thư mục trên backend được kết nối.',
+    remotePickerSelect: 'Chọn thư mục',
+    folderTip: cwd => cwd,
+    openFolder: 'Mở thư mục',
+    refreshTree: 'Làm mới cây',
+    collapseAll: 'Thu gọn tất cả các thư mục',
+    previewUnavailable: 'Xem trước không có sẵn',
+    couldNotPreview: path => `Không thể xem trước ${path}`,
+    noProjectTitle: 'Không có dự án',
+    noProjectBody: 'Mở một dự án để duyệt tệp và xem lại các thay đổi.',
+    noProjectOpen: 'Không có dự án nào mở',
+    noDiffs: 'Không có khác biệt',
+    unreadableTitle: 'Không thể đọc được',
+    unreadableBody: error => `Không thể đọc thư mục này (${error}).`,
+    emptyTitle: 'Trống',
+    emptyBody: 'Thư mục này trống.',
+    treeErrorTitle: 'Lỗi cây',
+    treeErrorBody: 'Cây tệp gặp lỗi khi hiển thị thư mục này.',
+    tryAgain: 'Thử lại',
+    loadingTree: 'Đang tải cây tệp',
+    loadingFiles: 'Đang tải tệp',
+    terminalHide: 'Ẩn terminal',
+    terminalsAria: 'Thiết bị đầu cuối',
+    terminalNew: 'Nhà ga mới',
+    terminalCloseOthers: 'Đóng người khác',
+    terminalCloseAll: 'Đóng tất cả',
+    addToChat: 'Thêm vào cuộc trò chuyện'
+  },
+
+  preview: {
+    tab: 'Xem trước',
+    closeTab: label => `Đóng ${label}`,
+    closeOthers: 'Đóng các tab khác',
+    closeToRight: 'Đóng các tab bên phải',
+    closeAll: 'Đóng tất cả',
+    closePane: 'Đóng khung xem trước',
+    loading: 'Đang tải bản xem trước',
+    unavailable: 'Xem trước không có sẵn',
+    opening: 'Khai mạc...',
+    hide: 'Ẩn',
+    openPreview: 'Mở bản xem trước',
+    openInBrowser: 'Mở trong trình duyệt',
+    linkHint: '⌘/Ctrl-click cho khung xem trước',
+    sourceLineTitle: 'Nhấn để chọn · shift-click để mở rộng · kéo tới trình soạn thảo',
+    source: 'SOURCE',
+    renderedPreview: 'PREVIEW',
+    diff: 'DIFF',
+    unknownSize: 'kích thước không xác định',
+    binaryTitle: 'Đây có vẻ là một tệp nhị phân',
+    binaryBody: label => `Xem trước ${label} có thể hiển thị văn bản không thể đọc được.`,
+    largeTitle: 'Tệp này lớn',
+    largeBody: (label, size) => `${label} là ${size}. Hermes sẽ chỉ hiển thị 512 KB đầu tiên.`,
+    previewAnyway: 'Vẫn xem trước',
+    truncated: 'Hiển thị 512 KB đầu tiên.',
+    noInlineTitle: 'Không có bản xem trước nội tuyến',
+    noInlineBody: mimeType => `${mimeType || 'Loại tệp này'} vẫn có thể được đính kèm làm ngữ cảnh.`,
+    edit: 'Biên tập',
+    editing: 'Chỉnh sửa',
+    unsavedChanges: 'Những thay đổi chưa được lưu',
+    saveFailed: message => `Không thể lưu: ${message}`,
+    diskChangedTitle: 'Tập tin đã thay đổi trên đĩa',
+    diskChangedBody:
+      'Tập tin này đã thay đổi kể từ khi bạn mở nó. Ghi đè lên bằng phiên bản của bạn hoặc hủy các chỉnh sửa của bạn và tải lại?',
+    overwrite: 'Ghi đè',
+    discardReload: 'Hủy và tải lại',
+    console: {
+      deselect: 'Bỏ chọn mục nhập',
+      select: 'Chọn mục nhập',
+      copyFailed: 'Không thể sao chép đầu ra của bảng điều khiển',
+      copyEntry: 'Sao chép mục này',
+      sendEntry: 'Gửi mục này để trò chuyện',
+      messages: count => `Thông báo trên bảng điều khiển ${count}`,
+      resize: 'Thay đổi kích thước bảng điều khiển xem trước',
+      title: 'Bảng điều khiển xem trước',
+      selected: count => `${count} đã chọn`,
+      sendToChat: 'Gửi để trò chuyện',
+      copySelected: 'Sao chép đã chọn vào clipboard',
+      copyAll: 'Sao chép tất cả vào clipboard',
+      copy: 'Sao chép',
+      clear: 'Thông thoáng',
+      empty: 'Chưa có tin nhắn bảng điều khiển nào.',
+      promptHeader: 'Bảng điều khiển xem trước:',
+      sentTitle: 'Đã gửi để trò chuyện',
+      sentMessage: count => `${count} mục nhật ký đã được thêm vào khung soạn thảo`
+    },
+    web: {
+      appFailedToBoot: 'Ứng dụng xem trước không khởi động được',
+      serverNotFound: 'Không tìm thấy máy chủ',
+      failedToLoad: 'Xem trước không tải được',
+      tryAgain: 'Thử lại',
+      restarting: 'Hermes đang khởi động lại...',
+      askRestart: 'Yêu cầu Hermes khởi động lại máy chủ',
+      lookingRestart: taskId => `Hermes đang tìm kiếm máy chủ xem trước để khởi động lại (${taskId})`,
+      restartingTitle: 'Khởi động lại máy chủ xem trước',
+      restartingMessage: 'Hermes đang hoạt động ở chế độ nền. Xem bảng điều khiển xem trước để biết tiến trình.',
+      startRestartFailed: message => `Không thể khởi động lại máy chủ: ${message}`,
+      restartFailed: 'Khởi động lại máy chủ không thành công',
+      hideConsole: 'Ẩn bảng điều khiển xem trước',
+      showConsole: 'Hiển thị bảng điều khiển xem trước',
+      hideDevTools: 'Ẩn bản xem trước DevTools',
+      openDevTools: 'Mở bản xem trước DevTools',
+      finishedRestarting: message => `Hermes đã khởi động lại xong máy chủ xem trước${message ? `: ${message}` : ''}`,
+      failedRestarting: message => `Khởi động lại máy chủ không thành công: ${message}`,
+      unknownError: 'lỗi không xác định',
+      restartedTitle: 'Máy chủ xem trước đã khởi động lại',
+      reloadingNow: 'Đang tải lại bản xem trước ngay bây giờ.',
+      restartFailedTitle: 'Xem trước khởi động lại không thành công',
+      restartFailedMessage: 'Hermes không thể khởi động lại máy chủ.',
+      stillWorking:
+        'Hermes vẫn hoạt động nhưng chưa có kết quả khởi động lại. Lệnh máy chủ có thể đang chạy ở nền trước.',
+      workspaceReloading: 'Không gian làm việc đã thay đổi, đang tải lại bản xem trước',
+      fileChanged: url => `Đã thay đổi tệp, tải lại bản xem trước: ${url}`,
+      filesChanged: (count, url) => `Thay đổi tệp ${count}, tải lại bản xem trước: ${url}`,
+      watchFailed: message => `Không thể xem tệp xem trước: ${message}`,
+      moduleMimeDescription:
+        'Các script dạng module đang được trả về với MIME type sai. Điều này thường có nghĩa là một máy chủ tệp tĩnh đang phục vụ ứng dụng Vite/React thay vì dev server của dự án.',
+      loadFailedConsole: (code, message) => `Tải không thành công${code ? ` (${code})` : ''}: ${message}`,
+      unreachableDescription: 'Không thể truy cập trang xem trước.',
+      openTarget: url => `Mở ${url}`,
+      fallbackTitle: 'Xem trước'
+    }
+  },
+
+  zones: {
+    showHeader: 'Hiển thị tiêu đề',
+    hideHeader: 'Ẩn tiêu đề',
+    minimize: 'Thu nhỏ',
+    restore: 'Khôi phục',
+    closeRunningTitle: 'Đóng tab đang chạy?',
+    closeRunningBody:
+      'Cuộc trò chuyện này vẫn đang chạy (hoặc đang chờ bạn nhập). Đóng tab chỉ ẩn nó đi — phiên vẫn giữ tiến trình và có thể mở lại từ thanh bên.',
+    closeRunningConfirm: 'Đóng tab',
+    reload: 'Tải lại',
+    closeOthers: 'Đóng các tab khác',
+    closeToRight: 'Đóng các tab bên phải',
+    closeAll: 'Đóng tất cả',
+    newSessionTab: 'Tab phiên mới',
+    pluginDisabled: pluginId => `Đã tắt plugin "${pluginId}"`,
+    pluginDisabledBody: 'Bật lại trong Cài đặt → Plugin để đưa ngăn này trở lại.',
+    missingPane: paneId => `thiếu ngăn: ${paneId}`,
+    editTitle: 'Bố cục',
+    editHint: 'Chọn bố cục hoặc kéo các ngăn giữa các vùng.',
+    reset: 'Đặt lại',
+    templates: 'Mẫu',
+    custom: 'Tùy chỉnh',
+    newGridLayout: 'Bố cục lưới mới',
+    saveCurrentAs: 'Lưu cách sắp xếp hiện tại thành mẫu',
+    nameLayoutPlaceholder: 'Đặt tên cho bố cục này…',
+    deletePreset: name => `Xóa ${name}`,
+    zoneEditorTitle: 'Trình chỉnh sửa vùng',
+    editorHintPre: 'bấm vào để tách · ',
+    editorHintPost: ' lật dòng · kéo qua các vùng để hợp nhất · kéo các cạnh dùng chung để thay đổi kích thước',
+    templateColumns: 'Cột',
+    templateRows: 'Hàng',
+    templateGrid: 'Lưới',
+    templatePriority: 'Ưu tiên',
+    zoneTag: index => `vùng ${index}`,
+    mergeZones: count => `Hợp nhất ${count} vùng`,
+    customZoneName: count => `Tùy chỉnh ${count} vùng`,
+    layoutNamePlaceholder: fallback => `Tên bố cục (${fallback})`,
+    saveApply: 'Lưu và áp dụng',
+    notExpressible:
+      'cách sắp xếp này khóa liên động (kiểu chong chóng) — chưa thể biểu diễn bằng các lần chia lồng nhau',
+    zoneCount: count => `${count} vùng`
+  },
+
   assistant: {
+    thread: {
+      loadingSession: 'Đang tải phiên',
+      showEarlier: 'Hiển thị tin nhắn trước đó',
+      loadingResponse: 'Hermes đang tải phản hồi',
+      resumeWhenBackgroundDone: count =>
+        count === 1 ? 'Sẽ tiếp tục khi tác vụ nền kết thúc' : `Sẽ tiếp tục khi tác vụ nền ${count} kết thúc`,
+      thinking: 'Đang suy nghĩ',
+      thought: 'Đã suy nghĩ',
+      thoughtBriefly: 'Suy nghĩ ngắn gọn',
+      thoughtFor: duration => `Đã suy nghĩ trong ${duration}`,
+      today: time => `Hôm nay, ${time}`,
+      yesterday: time => `Hôm qua, ${time}`,
+      copy: 'Sao chép',
+      refresh: 'Làm mới',
+      moreActions: 'Thêm hành động',
+      branchNewChat: 'Tách nhánh trong cuộc trò chuyện mới',
+      react: 'Phản ứng',
+      dismissError: 'Bỏ qua lỗi',
+      filesChanged: count => (count === 1 ? '1 tệp đã thay đổi' : `${count} tệp đã thay đổi`),
+      reviewChanges: 'Xem lại',
+      readAloudFailed: 'Đọc to không thành công',
+      preparingAudio: 'Đang chuẩn bị âm thanh...',
+      stopReading: 'Dừng đọc',
+      readAloud: 'Đọc to',
+      editMessage: 'Chỉnh sửa tin nhắn',
+      expandMessage: 'Mở rộng tin nhắn',
+      scrollToBottom: 'Cuộn xuống dưới cùng',
+      stop: 'Dừng lại',
+      restorePrevious: 'Khôi phục điểm kiểm tra trước đó',
+      restoreCheckpoint: 'Khôi phục điểm kiểm tra',
+      restoreFromHere: 'Khôi phục điểm kiểm tra - chạy lại từ prompt này',
+      restoreTitle: 'Khôi phục về điểm kiểm tra này?',
+      restoreBody: 'Mọi thứ sau prompt này sẽ bị xóa khỏi cuộc trò chuyện và prompt sẽ chạy lại từ đây.',
+      restoreConfirm: 'Khôi phục và chạy lại',
+      restoreNext: 'Khôi phục điểm kiểm tra tiếp theo',
+      goForward: 'Đi về phía trước',
+      sendEdited: 'Gửi tin nhắn đã chỉnh sửa',
+      attachingFile: 'Đang đính kèm…'
+    },
     approval: {
       gatewayDisconnected: 'Gateway Hermes chưa kết nối',
       sendFailed: 'Không thể gửi phản hồi phê duyệt',
@@ -1462,6 +3010,20 @@ export const vi = defineLocale({
       alwaysDescription: pattern =>
         `Mẫu “${pattern}” sẽ được thêm vào danh sách cho phép vĩnh viễn (~/.hermes/config.yaml). Hermes sẽ không hỏi lại với các lệnh tương tự trong phiên này hoặc các phiên sau.`,
       alwaysAllow: 'Luôn cho phép'
+    },
+    clarify: {
+      notReady: 'Yêu cầu làm rõ vẫn chưa sẵn sàng',
+      gatewayDisconnected: 'Gateway Hermes chưa kết nối',
+      sendFailed: 'Không thể gửi phản hồi làm rõ',
+      loadingQuestion: 'Đang tải câu hỏi…',
+      other: 'Khác (nhập câu trả lời của bạn)',
+      placeholder: 'Nhập câu trả lời của bạn…',
+      skip: 'Bỏ qua',
+      skipped: 'Đã bỏ qua',
+      continueLabel: 'Tiếp tục',
+      lateAnswer: (question, choice) => `Re: "${question}" — câu trả lời của tôi: ${choice}`,
+      lateAnswerTip: 'Soạn câu trả lời này thành tin nhắn tiếp theo',
+      lateAnswerHint: 'Prompt này không còn chờ trả lời. Chọn một tùy chọn để soạn nó thành tin nhắn tiếp theo.'
     },
     tool: {
       copyCode: 'Sao chép mã',
@@ -1499,7 +3061,10 @@ export const vi = defineLocale({
         ranCode: 'Đã chạy mã',
         runningCode: 'Đang chạy mã'
       },
-      prefixes: { browser: 'Trình duyệt', web: 'Web' },
+      prefixes: {
+        browser: 'Trình duyệt',
+        web: 'Web'
+      },
       titleTemplates: {
         actionCommand: (action, command) => `${action} ${command}`,
         actionQuoted: (action, value) => `${action} “${value}”`,
@@ -1562,5 +3127,116 @@ export const vi = defineLocale({
         write_file: { done: 'Đã sửa tệp', pending: 'Đang sửa tệp', pendingAction: 'Đang sửa' }
       }
     }
+  },
+
+  prompts: {
+    gatewayDisconnected: 'Gateway Hermes chưa kết nối',
+    sudoSendFailed: 'Không thể gửi mật khẩu sudo',
+    secretSendFailed: 'Không thể gửi bí mật',
+    sudoTitle: 'Mật khẩu quản trị viên',
+    sudoDesc:
+      'Hermes cần mật khẩu sudo của bạn để chạy lệnh đặc quyền. Mật khẩu chỉ được gửi tới tác nhân cục bộ của bạn.',
+    sudoPlaceholder: 'mật khẩu sudo',
+    secretTitle: 'Yêu cầu bí mật',
+    secretDesc: 'Hermes cần có thông tin xác thực để tiếp tục.',
+    secretPlaceholder: 'giá trị bí mật'
+  },
+
+  desktop: {
+    audioReadFailed: 'Không thể đọc âm thanh đã ghi',
+    sessionUnavailable: 'Phiên không có sẵn',
+    createSessionFailed: 'Không thể tạo phiên mới',
+    promptFailed: 'Gửi prompt thất bại',
+    providerCredentialRequired: 'Thêm thông tin xác thực của nhà cung cấp trước khi gửi tin nhắn đầu tiên.',
+    emptySlashCommand: 'lệnh gạch chéo trống',
+    desktopCommands: 'Các lệnh Desktop',
+    skillCommandsAvailable: count => `Có ${count} lệnh kỹ năng.`,
+    warningLine: message => `cảnh báo: ${message}`,
+    yoloArmed: 'YOLO đã bật cho cuộc trò chuyện này',
+    yoloOff: 'YOLO tắt',
+    yoloSystem: active => `YOLO ${active ? 'bật' : 'tắt'} cho phiên này`,
+    yoloTitle: 'YOLO',
+    yoloToggleFailed: 'Không thể chuyển đổi YOLO',
+    profileStatus: current =>
+      `Hồ sơ: ${current}. Dùng /profile <name> hoặc bộ chọn "Phiên mới" để bắt đầu trò chuyện trong hồ sơ khác.`,
+    unknownProfile: 'Hồ sơ không xác định',
+    noProfileNamed: (target, available) => `Không có hồ sơ nào tên "${target}". Hiện có: ${available}`,
+    newChatsProfile: name => `Các cuộc trò chuyện mới sẽ dùng hồ sơ ${name}.`,
+    setProfileFailed: 'Không đặt được hồ sơ',
+    sttDisabled: 'Tính năng chuyển giọng nói thành văn bản đang tắt trong cài đặt.',
+    stopFailed: 'Dừng thất bại',
+    regenerateFailed: 'Tạo lại thất bại',
+    editFailed: 'Chỉnh sửa thất bại',
+    resumeFailed: 'Tiếp tục thất bại',
+    resumeStrandedTitle: 'Không thể tải phiên này',
+    resumeStrandedBody:
+      'Không kết nối được tới phiên này và việc tự động thử lại đã dừng. Hãy kiểm tra gateway có đang chạy không, rồi thử lại.',
+    resumeRetry: 'Thử lại',
+    nothingToBranch: 'Không có gì để tách nhánh',
+    branchNeedsChat: 'Bắt đầu hoặc tiếp tục cuộc trò chuyện trước khi tách nhánh.',
+    sessionBusy: 'Phiên bận',
+    branchStopCurrent: 'Dừng lượt hiện tại trước khi tách nhánh cuộc trò chuyện này.',
+    branchNoText: 'Tin nhắn này không có văn bản để tách nhánh.',
+    branchTitle: n => `Bản nháp: Nhánh #${n}`,
+    branchFailed: 'Tách nhánh thất bại',
+    deleteFailed: 'Xóa thất bại',
+    archived: 'Đã lưu trữ',
+    archiveFailed: 'Lưu trữ thất bại',
+    cwdChangeFailed: 'Đổi thư mục làm việc thất bại',
+    cwdStagedTitle: 'Đã ghi nhận thư mục làm việc',
+    cwdStagedMessage: 'Khởi động lại backend của Desktop để áp dụng thay đổi cwd cho phiên đang hoạt động này.',
+    modelSwitchFailed: 'Chuyển mô hình thất bại',
+    sessionExported: 'Đã xuất phiên',
+    sessionExportFailed: 'Không thể xuất phiên',
+    imageSaved: 'Đã lưu hình ảnh',
+    downloadStarted: 'Đã bắt đầu tải xuống',
+    restartToUseSaveImage: 'Khởi động lại Hermes Desktop để sử dụng Lưu hình ảnh.',
+    restartToSaveImages: 'Khởi động lại Hermes Desktop để lưu hình ảnh',
+    imageDownloadFailed: 'Tải hình ảnh xuống thất bại',
+    openImage: 'Mở hình ảnh',
+    downloadImage: 'Tải hình ảnh xuống',
+    savingImage: 'Đang lưu hình ảnh',
+    imagePreviewFailed: 'Xem trước hình ảnh thất bại',
+    imageAttach: 'Đính kèm hình ảnh',
+    imageWriteFailed: 'Không thể ghi hình ảnh xuống ổ đĩa.',
+    imageAttachFailed: 'Đính kèm hình ảnh thất bại',
+    attachImages: 'Đính kèm hình ảnh',
+    clipboard: 'Bảng nhớ tạm',
+    noClipboardImage: 'Không tìm thấy hình ảnh nào trong clipboard',
+    clipboardPasteFailed: 'Dán từ bảng nhớ tạm thất bại',
+    dropFiles: 'Thả tệp',
+    handoff: {
+      pickPlatform: 'Chọn một điểm đến',
+      success: platform => `Đã chuyển giao sang ${platform}. Bạn có thể tiếp tục ở đây bất cứ lúc nào.`,
+      systemNote: platform => `↻ Đã chuyển giao sang ${platform} — tiếp tục tại đây bất cứ lúc nào.`,
+      failed: error => `Chuyển giao thất bại: ${error}`,
+      timedOut: 'Hết thời gian chờ gateway. `hermes gateway` có đang chạy không?'
+    }
+  },
+
+  errors: {
+    genericFailure: 'Đã xảy ra lỗi',
+    boundaryTitle: 'Có gì đó bị hỏng trong giao diện',
+    boundaryDesc: 'Khung hiển thị gặp lỗi không mong muốn. Cuộc trò chuyện và cài đặt của bạn vẫn an toàn.',
+    reloadWindow: 'Tải lại cửa sổ',
+    openLogs: 'Mở nhật ký'
+  },
+
+  ui: {
+    search: {
+      clear: 'Xóa tìm kiếm'
+    },
+    pagination: {
+      label: 'phân trang',
+      previous: 'Trước',
+      previousAria: 'Đi tới trang trước',
+      next: 'Sau',
+      nextAria: 'Chuyển đến trang tiếp theo'
+    },
+    sidebar: {
+      title: 'Thanh bên',
+      description: 'Hiển thị thanh bên dạng di động.',
+      toggle: open => `${open ? 'Hiện' : 'Ẩn'} thanh bên`
+    }
   }
-})
+}
