@@ -20,9 +20,12 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import atexit
 import os
+import shutil
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -31,6 +34,42 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
+# `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
+# `get_hermes_home()` and attaches rotating file handlers to the ROOT logger.
+# So merely importing it - which many test modules do, directly or
+# transitively - points the whole pytest session's logging at the operator's
+# real `~/.hermes/logs/agent.log` and `errors.log`.
+#
+# The `_isolate_env` fixture below also sandboxes HERMES_HOME, but fixtures run
+# AFTER collection imports test modules, by which point the handler already
+# holds an absolute path to the real log. Measured on a live install: 126
+# warnings in the operator's agent.log came from test runs, not the gateway -
+# enough noise to make genuine warnings hard to find.
+#
+# conftest is imported before any test module, so setting it here closes that
+# window. The per-test fixture still applies for everything after import.
+#
+# ORDER MATTERS: the kanban write guard's deny-list (further down) must know
+# the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
+# otherwise the deny-list would point at the throwaway tempdir and the guard
+# would silently stop protecting the operator's actual ~/.hermes (#69385).
+_PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+_PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+if not os.environ.get("HERMES_HOME"):
+    _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
+    os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
+    atexit.register(shutil.rmtree, _SESSION_HERMES_HOME, True)
+
+#: HERMES_HOME as it stood when conftest was imported - i.e. before any test
+#: module could import code that configures logging. Recorded so the guard in
+#: tests/test_log_isolation.py can assert the sandbox existed AT THAT MOMENT.
+#: Reading os.environ from inside a test is useless here: the per-test
+#: `_isolate_env` fixture has sandboxed it by then, so the check would pass
+#: even with this block removed.
+HERMES_HOME_AT_CONFTEST_IMPORT = os.environ.get("HERMES_HOME", "")
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -146,6 +185,7 @@ _CREDENTIAL_NAMES = frozenset({
     "TOOL_GATEWAY_USER_TOKEN",
     "TELEGRAM_WEBHOOK_SECRET",
     "WEBHOOK_SECRET",
+    "AI_GATEWAY_API_KEY",
     "VOICE_TOOLS_OPENAI_KEY",
     "BROWSER_USE_API_KEY",
     "CUSTOM_API_KEY",
@@ -156,6 +196,7 @@ _CREDENTIAL_NAMES = frozenset({
     "OLLAMA_BASE_URL",
     "GROQ_BASE_URL",
     "XAI_BASE_URL",
+    "AI_GATEWAY_BASE_URL",
     "ANTHROPIC_BASE_URL",
 })
 
@@ -244,6 +285,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_DASHBOARD_PORTAL_URL",
     "TERMINAL_CWD",
     "TERMINAL_ENV",
+    "TERMINAL_VERCEL_RUNTIME",
     "TERMINAL_CONTAINER_CPU",
     "TERMINAL_CONTAINER_DISK",
     "TERMINAL_CONTAINER_MEMORY",
@@ -398,6 +440,20 @@ def _hermetic_environment(tmp_path, monkeypatch):
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
 
+    # 3b. hermes_state computes ``DEFAULT_DB_PATH = get_hermes_home() / "state.db"``
+    #     at import time. When the module is first imported at collection (any
+    #     test file with a top-level ``from hermes_state import ...``) that
+    #     happens BEFORE this fixture ever runs, so every argless
+    #     ``SessionDB()`` in every test opens the developer's REAL state.db —
+    #     reading real sessions into assertions and writing test rows into the
+    #     real profile. Re-pin the constant to this test's home. (Several test
+    #     files already do this locally; this makes it an invariant.)
+    hermes_state_mod = sys.modules.get("hermes_state")
+    if hermes_state_mod is not None and hasattr(hermes_state_mod, "DEFAULT_DB_PATH"):
+        monkeypatch.setattr(
+            hermes_state_mod, "DEFAULT_DB_PATH", fake_hermes_home / "state.db"
+        )
+
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
     monkeypatch.setenv("TZ", "UTC")
@@ -513,16 +569,23 @@ def _neutralize_macos_keychain_creds(request, monkeypatch):
 def _capture_real_kanban_root() -> Path:
     """Resolve the REAL kanban root from the pre-test environment.
 
-    Runs at conftest import time, before any fixture rewires HERMES_HOME.
-    Mirrors ``kanban_db.kanban_home()`` resolution order:
+    Uses the pre-sandbox environment snapshot taken at the very top of this
+    file (before the session HERMES_HOME sandbox rewired the env), so the
+    deny-list keeps pointing at the operator's actual root. Mirrors
+    ``kanban_db.kanban_home()`` resolution order:
     1. ``HERMES_KANBAN_HOME`` env var when set and non-empty
-    2. ``get_default_hermes_root()`` otherwise
+    2. the real (pre-sandbox) Hermes root otherwise
     """
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    if override:
-        return Path(override).expanduser().resolve()
-    from hermes_constants import get_default_hermes_root
-    return get_default_hermes_root().resolve()
+    if _PRE_SANDBOX_KANBAN_OVERRIDE:
+        return Path(_PRE_SANDBOX_KANBAN_OVERRIDE).expanduser().resolve()
+    if _PRE_SANDBOX_HERMES_HOME:
+        # HERMES_HOME was genuinely set before the sandbox — honor it via the
+        # normal resolver (it may be a profile dir whose root matters).
+        from hermes_constants import get_default_hermes_root
+        return get_default_hermes_root().resolve()
+    # No pre-existing HERMES_HOME: the real root is the platform default,
+    # NOT the sandbox tempdir now sitting in the env.
+    return (Path.home() / ".hermes").resolve()
 
 
 _REAL_KANBAN_ROOT = _capture_real_kanban_root()
@@ -548,7 +611,15 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
     if _kdb is None:
         return
 
-    _orig_connect = _kdb.connect
+    # The sys.modules probe can observe the module MID-IMPORT: a fixture
+    # boundary firing while another test's lazy `import hermes_cli.kanban_db`
+    # is still executing sees a partially initialized module whose `connect`
+    # doesn't exist yet (AttributeError flake, caught in a full-suite run).
+    # A half-imported module has no callers yet either — nothing to guard
+    # this round; the next test's fixture will patch the completed module.
+    _orig_connect = getattr(_kdb, "connect", None)
+    if _orig_connect is None:
+        return
 
     def _guarded_connect(db_path=None, *args, **kwargs):
         if db_path is not None:
@@ -589,6 +660,105 @@ def _kanban_write_guard(_hermetic_environment, monkeypatch):
 # this replaces; the running example was ``test_command_guards`` failing
 # 12/15 CI runs because ``tools.approval._session_approved`` carried
 # approvals from one test's session into another's.
+
+
+# ── tui_gateway.server shared-module state isolation ───────────────────────
+#
+# ``tui_gateway.server`` registers its RPC handlers in a module-level
+# ``_methods`` dict at import time and keeps per-session state in module
+# globals (sessions, child-run registry, config cache, DB handle). The
+# canonical per-file process isolation above hides any leakage, but a direct
+# multi-file invocation (``pytest tests/tui_gateway/ tests/test_tui_gateway_server.py``,
+# or plain ``pytest tests/``) shares one interpreter: a test that stubs
+# ``_methods["slash.exec"]`` or leaves an active-session lease behind breaks
+# unrelated tests in later files. This fixture snapshots the cheap-to-copy
+# globals before each test and restores them after, so any file combination
+# is order-independent. It is a near no-op (one sys.modules lookup) while
+# the module has not been imported.
+#
+# The case this cannot cover — the module is first imported *during* a test
+# that also mutates ``_methods`` — is handled by the importing files' own
+# ``server`` fixtures (tests/tui_gateway/test_protocol.py and friends), which
+# snapshot immediately after the import.
+
+_TUI_SERVER_MODULE = "tui_gateway.server"
+
+
+def _teardown_tui_server_sessions(mod) -> None:
+    """Close leftover sessions through the production teardown boundary.
+
+    Besides returning active-session leases, this finalizes the session,
+    unregisters notification state, and closes its agent and slash worker.
+    """
+    sessions = getattr(mod, "_sessions", None)
+    if not isinstance(sessions, dict):
+        return
+    for sid in list(sessions):
+        mod._close_session_by_id(sid, end_reason="test_cleanup")
+
+
+@pytest.fixture(autouse=True)
+def _reset_tui_gateway_server_state():
+    mod = sys.modules.get(_TUI_SERVER_MODULE)
+    snapshot = None
+    if mod is not None:
+        snapshot = {
+            "methods": dict(mod._methods),
+            "cfg": (mod._cfg_cache, mod._cfg_mtime, mod._cfg_path),
+            "db": (mod._db, mod._db_error),
+            "real_stdout": mod._real_stdout,
+        }
+
+    yield
+
+    mod = sys.modules.get(_TUI_SERVER_MODULE)
+    if mod is None:
+        return
+
+    # This finalizer can run before the test's own monkeypatch undo, so a
+    # global may still be replaced with a non-dict test double — skip those
+    # (monkeypatch restores the real, pre-test object afterwards anyway).
+    sessions = mod._sessions
+    if isinstance(sessions, dict):
+        _teardown_tui_server_sessions(mod)
+    for name in (
+        "_pending",
+        "_pending_prompt_payloads",
+        "_answers",
+        "_child_mirrors",
+        "_active_child_runs",
+    ):
+        obj = getattr(mod, name, None)
+        if isinstance(obj, dict):
+            obj.clear()
+
+    if snapshot is not None:
+        mod._methods.clear()
+        mod._methods.update(snapshot["methods"])
+        mod._cfg_cache, mod._cfg_mtime, mod._cfg_path = snapshot["cfg"]
+        mod._db, mod._db_error = snapshot["db"]
+        mod._real_stdout = snapshot["real_stdout"]
+    else:
+        # First imported during this test — reset to import-time defaults
+        # for the globals we could not snapshot (``_methods`` is left to
+        # the importing file's fixture, see block comment above).
+        mod._cfg_cache = None
+        mod._cfg_mtime = None
+        mod._cfg_path = None
+        mod._db = None
+        mod._db_error = None
+
+    # A leaked context-local Hermes home override redirects every later
+    # ``get_hermes_home()`` call (active-session registry, config paths)
+    # to a stale per-test tmpdir. Force the main-thread ContextVar back
+    # to its default.
+    try:
+        from hermes_constants import get_hermes_home_override, set_hermes_home_override
+
+        if get_hermes_home_override() is not None:
+            set_hermes_home_override(None)
+    except Exception:
+        pass
 
 
 @pytest.fixture()
@@ -969,6 +1139,12 @@ def _live_system_guard(request, monkeypatch):
         "daemon-reload", "try-restart", "reload-or-restart",
     )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
+    # Shell/launcher executables whose arguments are themselves commands —
+    # argv[0]-only scanning must not exempt what they wrap.
+    _WRAPPER_COMMANDS = (
+        "sh", "bash", "zsh", "dash", "env", "nohup", "setsid",
+        "timeout", "sudo", "xargs", "nice", "ionice", "stdbuf", "flock",
+    )
 
     def _cmd_to_string(cmd) -> str:
         if cmd is None:
@@ -1011,7 +1187,17 @@ def _live_system_guard(request, monkeypatch):
             tokens = cmd_str.split()
         if not tokens:
             return False
-        for tok in tokens:
+
+        # For argv-style calls only argv[0] is the executable; scanning every
+        # argument blocked innocent commands like ``cat /tmp/.../skill``
+        # ("skill" is in _PROCESS_KILLERS).  Wrapper executables still get
+        # full-token scanning so ``["bash", "-c", "pkill ..."]`` stays caught.
+        if isinstance(cmd, (list, tuple)):
+            head0 = tokens[0].rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+            killer_tokens = tokens if head0 in _WRAPPER_COMMANDS else tokens[:1]
+        else:
+            killer_tokens = tokens
+        for tok in killer_tokens:
             head = tok.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
             if head in _PROCESS_KILLERS:
                 low = cmd_str.lower()
@@ -1263,3 +1449,22 @@ def _isolate_computer_use_approval_state():
             _cu_tool._session_auto_approve.clear()
     except Exception:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _moa_caches_isolated():
+    """Clear module-level MoA cold-start caches before each test.
+
+    ``agent.moa_loop`` caches the resolved preset and each slot's provider
+    runtime at module level (keyed on config mtime / provider+model) so the
+    tool loop doesn't re-resolve them serially on every iteration. Tests
+    monkeypatch resolvers and config paths, so a cache entry leaked from one
+    test would poison the next. Clear both around every test.
+    """
+    import agent.moa_loop as moa
+
+    moa._preset_cache.clear()
+    moa._runtime_cache.clear()
+    yield
+    moa._preset_cache.clear()
+    moa._runtime_cache.clear()

@@ -230,6 +230,21 @@ def _parse_manifest(path: Path) -> CatalogEntry:
         scopes=list(auth_raw.get("scopes") or []),
         env_var=auth_raw.get("env_var"),
     )
+    if t_type == "http" and a_type == "api_key":
+        # _build_server_config emits an Authorization header referencing
+        # ${MCP_<NAME>_API_KEY} (via _bearer_auth_headers), but install_entry
+        # only persists the env vars DECLARED in auth.env. Enforce the naming
+        # contract at parse time, or a manifest declaring e.g. N8N_API_KEY
+        # would install cleanly yet send a literal-placeholder header (401)
+        # at connect time.
+        from hermes_cli.mcp_config import _env_key_for_server
+
+        _required_key = _env_key_for_server(name)
+        if not any(spec.name == _required_key for spec in env_list):
+            raise CatalogError(
+                f"{path}: http + api_key auth requires auth.env to declare "
+                f"'{_required_key}' (the key the Authorization header references)"
+            )
 
     tools_raw = data.get("tools") or {}
     if not isinstance(tools_raw, dict):
@@ -490,20 +505,10 @@ def _prompt_env_vars(specs: List[EnvVarSpec]) -> Dict[str, str]:
 
 
 def _build_server_config(
-    entry: CatalogEntry,
-    install_dir: Optional[Path],
-    collected_env: Optional[Dict[str, str]] = None,
+    entry: CatalogEntry, install_dir: Optional[Path]
 ) -> dict:
     """Translate a manifest into the ``mcp_servers.<name>`` block format used
-    by hermes_cli/mcp_config.py.
-
-    ``collected_env`` is the dict returned by ``_prompt_env_vars()`` — it maps
-    env var names to the values the user provided (or that were already in
-    .env). When the bearer env var is absent from this dict (user skipped an
-    optional key, or the manifest has no env specs), no ``headers`` block is
-    emitted. This lets HTTP + api_key manifests support keyless / anonymous
-    access when the API key is optional.
-    """
+    by hermes_cli/mcp_config.py."""
     cfg: dict = {}
     t = entry.transport
     if t.type == "stdio":
@@ -517,38 +522,10 @@ def _build_server_config(
         if entry.auth.type == "oauth":
             cfg["auth"] = "oauth"
         elif entry.auth.type == "api_key":
-            # Emit a Bearer-token header so the HTTP MCP client authenticates.
-            # The env var name comes from the first secret (or first) entry in
-            # auth.env — it's saved to ~/.hermes/.env by _prompt_env_vars().
-            # The ${VAR} placeholder is resolved at connection time by
-            # _interpolate_env_vars() in tools/mcp_tool.py.
-            #
-            # If the bearer env var was not collected (user skipped an
-            # optional key, or the manifest has no env specs), we omit the
-            # headers block entirely — enabling keyless / anonymous access
-            # for servers that support it (e.g. Firecrawl's free tier).
-            bearer_var = _bearer_env_var(entry.auth)
-            if bearer_var and (collected_env is None or bearer_var in collected_env):
-                cfg["headers"] = {
-                    "Authorization": f"Bearer ${{{bearer_var}}}"
-                }
+            from hermes_cli.mcp_config import _bearer_auth_headers
+
+            cfg["headers"] = _bearer_auth_headers(entry.name)
     return cfg
-
-
-def _bearer_env_var(auth: AuthSpec) -> Optional[str]:
-    """Return the env var name to use for the Bearer token.
-
-    Prefers the first ``secret: True`` entry in ``auth.env``; falls back to
-    the first entry if none is marked secret. Returns ``None`` when
-    ``auth.env`` is empty (the caller should have prompted for the key, so
-    this only happens on a misconfigured manifest).
-    """
-    if not auth.env:
-        return None
-    for spec in auth.env:
-        if spec.secret:
-            return spec.name
-    return auth.env[0].name
 
 
 def _read_prior_tool_selection(name: str) -> Optional[List[str]]:
@@ -772,11 +749,10 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
         install_dir = _do_git_install(entry)
 
     # Auth
-    collected_env: Dict[str, str] = {}
     if entry.auth.type == "api_key":
         print()
         print(color("  Configure credentials:", Colors.CYAN))
-        collected_env = _prompt_env_vars(entry.auth.env)
+        _prompt_env_vars(entry.auth.env)
     elif entry.auth.type == "oauth":
         if entry.auth.provider:
             # Case 2: provider-mediated (Google, GitHub, etc.). We rely on
@@ -804,7 +780,7 @@ def install_entry(entry: CatalogEntry, *, enable: bool = True) -> None:
 
     # Build and write the mcp_servers entry (without tools filter yet;
     # _apply_tool_selection() finalizes it below).
-    server_cfg = _build_server_config(entry, install_dir, collected_env)
+    server_cfg = _build_server_config(entry, install_dir)
     server_cfg["enabled"] = enable
 
     from hermes_cli.mcp_config import _save_mcp_server
