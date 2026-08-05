@@ -9,17 +9,21 @@ from pathlib import Path
 import requests
 import yaml
 
+from hermes_cli.runtime import CommandRunner, LocalRunner, SSHRunner
 
 
-def _run_git_command(repository: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ("git", "-C", str(repository), *arguments),
-        check=False,
-        capture_output=True,
-        text=True,
+
+def _run_git_command(
+    runner: CommandRunner,
+    repository: Path,
+    *arguments: str,
+) -> str:
+    result = runner.run(
+        ("git", *arguments),
+        cwd=repository,
     )
 
-    if result.returncode != 0:
+    if not result.ok:
         message = result.stderr.strip() or result.stdout.strip()
         raise RuntimeError(
             "Git command failed: "
@@ -30,38 +34,58 @@ def _run_git_command(repository: Path, *arguments: str) -> str:
     return result.stdout.rstrip("\n")
 
 
-def _collect_git_information(repository: Path) -> dict[str, object]:
-    status_output = _run_git_command(repository, "status", "--short")
+def _collect_git_information(
+    repository: Path,
+    runner: CommandRunner,
+) -> dict[str, object]:
+    status_output = _run_git_command(
+        runner,
+        repository,
+        "status",
+        "--short",
+    )
     status_lines = tuple(
         line for line in status_output.splitlines() if line.strip()
     )
 
-    branch = _run_git_command(repository, "branch", "--show-current")
-    head = _run_git_command(repository, "rev-parse", "HEAD")
-    remote = _run_git_command(repository, "remote", "get-url", "origin")
+    branch = _run_git_command(
+        runner,
+        repository,
+        "branch",
+        "--show-current",
+    )
+    head = _run_git_command(
+        runner,
+        repository,
+        "rev-parse",
+        "HEAD",
+    )
+    remote = _run_git_command(
+        runner,
+        repository,
+        "remote",
+        "get-url",
+        "origin",
+    )
 
     default_branch = None
     upstream = None
     ahead = None
     behind = None
 
-    try:
-        text = subprocess.run(
-            ("git","-C",str(repository),"remote","show","origin"),
-            capture_output=True,
-            text=True,
-            check=True,
-        ).stdout
-
-        for row in text.splitlines():
+    remote_result = runner.run(
+        ("git", "remote", "show", "origin"),
+        cwd=repository,
+    )
+    if remote_result.ok:
+        for row in remote_result.stdout.splitlines():
             if "HEAD branch:" in row:
-                default_branch = row.split(":",1)[1].strip()
+                default_branch = row.split(":", 1)[1].strip()
                 break
-    except Exception:
-        pass
 
     try:
         upstream = _run_git_command(
+            runner,
             repository,
             "rev-parse",
             "--abbrev-ref",
@@ -70,6 +94,7 @@ def _collect_git_information(repository: Path) -> dict[str, object]:
         )
 
         counts = _run_git_command(
+            runner,
             repository,
             "rev-list",
             "--left-right",
@@ -80,8 +105,7 @@ def _collect_git_information(repository: Path) -> dict[str, object]:
         if len(counts) == 2:
             behind = int(counts[0])
             ahead = int(counts[1])
-
-    except Exception:
+    except RuntimeError:
         pass
 
     return {
@@ -96,17 +120,75 @@ def _collect_git_information(repository: Path) -> dict[str, object]:
         "status": status_lines,
     }
 
-def _collect_test_information(repository: Path) -> dict[str, object]:
-    pytest_ini = (repository / "pytest.ini").exists()
 
-    pyproject = repository / "pyproject.toml"
+def _collect_test_information(
+    repository: Path,
+    runner: CommandRunner,
+) -> dict[str, object]:
+    pytest_ini_result = runner.run(
+        ("test", "-f", "pytest.ini"),
+        cwd=repository,
+    )
+    pytest_ini = pytest_ini_result.ok
+
+    pyproject_result = runner.run(
+        ("test", "-f", "pyproject.toml"),
+        cwd=repository,
+    )
     has_pytest = False
 
-    if pyproject.exists():
-        data = pyproject.read_text(encoding="utf-8", errors="ignore")
-        has_pytest = "pytest" in data
+    if pyproject_result.ok:
+        pytest_reference_result = runner.run(
+            ("grep", "-q", "pytest", "pyproject.toml"),
+            cwd=repository,
+        )
+        has_pytest = pytest_reference_result.ok
 
-    test_count = sum(1 for _ in repository.rglob("test_*.py"))
+    test_files_result = runner.run(
+        (
+            "find",
+            ".",
+            "-type",
+            "d",
+            "(",
+            "-name",
+            ".git",
+            "-o",
+            "-name",
+            ".venv",
+            "-o",
+            "-name",
+            "venv",
+            "-o",
+            "-name",
+            "node_modules",
+            ")",
+            "-prune",
+            "-o",
+            "-type",
+            "f",
+            "-name",
+            "test_*.py",
+            "-print",
+        ),
+        cwd=repository,
+    )
+
+    if not test_files_result.ok:
+        message = (
+            test_files_result.stderr.strip()
+            or test_files_result.stdout.strip()
+        )
+        raise RuntimeError(
+            "Test inventory failed"
+            + (f": {message}" if message else "")
+        )
+
+    test_count = sum(
+        1
+        for line in test_files_result.stdout.splitlines()
+        if line.strip()
+    )
 
     return {
         "framework": "pytest" if (pytest_ini or has_pytest) else "unknown",
@@ -115,55 +197,150 @@ def _collect_test_information(repository: Path) -> dict[str, object]:
     }
 
 
-def _collect_module_information(repository: Path) -> dict[str, object]:
-    package_directories = sorted(
-        path.parent
-        for path in repository.rglob("__init__.py")
-        if ".git" not in path.parts
-        and "venv" not in path.parts
-        and "node_modules" not in path.parts
+def _collect_module_information(
+    repository: Path,
+    runner: CommandRunner,
+) -> dict[str, object]:
+    python_files_result = runner.run(
+        (
+            "find",
+            ".",
+            "-type",
+            "d",
+            "(",
+            "-name",
+            ".git",
+            "-o",
+            "-name",
+            ".venv",
+            "-o",
+            "-name",
+            "venv",
+            "-o",
+            "-name",
+            "node_modules",
+            ")",
+            "-prune",
+            "-o",
+            "-type",
+            "f",
+            "-name",
+            "*.py",
+            "-print",
+        ),
+        cwd=repository,
     )
 
-    python_files = sum(
+    if not python_files_result.ok:
+        message = (
+            python_files_result.stderr.strip()
+            or python_files_result.stdout.strip()
+        )
+        raise RuntimeError(
+            "Python module inventory failed"
+            + (f": {message}" if message else "")
+        )
+
+    python_files = tuple(
+        line.strip()
+        for line in python_files_result.stdout.splitlines()
+        if line.strip()
+    )
+
+    package_count = sum(
         1
-        for path in repository.rglob("*.py")
-        if ".git" not in path.parts
-        and "venv" not in path.parts
-        and "node_modules" not in path.parts
+        for path in python_files
+        if path.endswith("/__init__.py") or path == "./__init__.py"
     )
 
     return {
-        "package_count": len(package_directories),
-        "python_files": python_files,
+        "package_count": package_count,
+        "python_files": len(python_files),
     }
 
 
-def _collect_api_information(repository: Path) -> dict[str, object]:
-    python_files = tuple(repository.rglob("*.py"))
+def _collect_api_information(
+    repository: Path,
+    runner: CommandRunner,
+) -> dict[str, object]:
+    exclusions = (
+        "--exclude-dir=.git",
+        "--exclude-dir=.venv",
+        "--exclude-dir=venv",
+        "--exclude-dir=node_modules",
+    )
 
-    fastapi_routes = 0
-    flask_routes = 0
-    routers = 0
+    python_files_result = runner.run(
+        (
+            "find",
+            ".",
+            "-type",
+            "d",
+            "(",
+            "-name",
+            ".git",
+            "-o",
+            "-name",
+            ".venv",
+            "-o",
+            "-name",
+            "venv",
+            "-o",
+            "-name",
+            "node_modules",
+            ")",
+            "-prune",
+            "-o",
+            "-type",
+            "f",
+            "-name",
+            "*.py",
+            "-print",
+        ),
+        cwd=repository,
+    )
 
-    for file in python_files:
-        try:
-            data = file.read_text(encoding="utf-8", errors="ignore")
-        except Exception:
-            continue
+    if not python_files_result.ok:
+        message = (
+            python_files_result.stderr.strip()
+            or python_files_result.stdout.strip()
+        )
+        raise RuntimeError(
+            "API Python inventory failed"
+            + (f": {message}" if message else "")
+        )
 
-        fastapi_routes += data.count("@app.")
-        fastapi_routes += data.count("@router.")
+    def count_matches(*patterns: str) -> int:
+        command = [
+            "grep",
+            "-Roh",
+            "--include=*.py",
+            *exclusions,
+        ]
+        for pattern in patterns:
+            command.extend(("-e", pattern))
+        command.append(".")
 
-        flask_routes += data.count("@bp.route")
-        flask_routes += data.count("@app.route")
+        result = runner.run(tuple(command), cwd=repository)
+        if result.returncode not in (0, 1):
+            message = result.stderr.strip() or result.stdout.strip()
+            raise RuntimeError(
+                "API source scan failed"
+                + (f": {message}" if message else "")
+            )
+        return sum(1 for line in result.stdout.splitlines() if line)
 
-        routers += data.count("APIRouter(")
+    python_files = sum(
+        1
+        for line in python_files_result.stdout.splitlines()
+        if line.strip()
+    )
 
     return {
-        "python_files": len(python_files),
-        "fastapi_routes": fastapi_routes,
-        "flask_routes": flask_routes,
-        "routers": routers,
+        "python_files": python_files,
+        "fastapi_routes": count_matches("@app\\.", "@router\\."),
+        "flask_routes": count_matches("@bp\\.route", "@app\\.route"),
+        "routers": count_matches("APIRouter("),
     }
 
 
@@ -492,10 +669,18 @@ def readiness_command(args) -> int:
 
     output_directory.mkdir(parents=True, exist_ok=True)
 
-    git_information = _collect_git_information(repository)
-    test_information = _collect_test_information(repository)
-    module_information = _collect_module_information(repository)
-    api_information = _collect_api_information(repository)
+    host = getattr(args, "host", None)
+    user = getattr(args, "user", None)
+    runner: CommandRunner = (
+        SSHRunner(host, user)
+        if host
+        else LocalRunner()
+    )
+
+    git_information = _collect_git_information(repository, runner)
+    test_information = _collect_test_information(repository, runner)
+    module_information = _collect_module_information(repository, runner)
+    api_information = _collect_api_information(repository, runner)
     http_information = _collect_http_health_information(repository)
     systemd_information = _collect_systemd_information()
     docker_information = _collect_docker_information()
