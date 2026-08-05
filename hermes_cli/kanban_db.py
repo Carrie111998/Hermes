@@ -134,6 +134,16 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Events that establish a new durable task-state generation for native
+# supervision. Informational events such as comments and heartbeats do not
+# invalidate a still-current block.
+SUPERVISOR_STATE_EVENT_KINDS = (
+    "created", "promoted", "claimed", "reclaimed", "completed", "archived",
+    "scheduled", "dependency_wait", "blocked", "gave_up",
+    "block_loop_detected", "status", "unblocked", "specified",
+    "supervisor_recovery", "supervisor_answered",
+)
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -5989,6 +5999,24 @@ def supervisor_recover_task(
         if task is None:
             return False, "missing"
 
+        # The source event is a generation token, not just audit context. A
+        # dashboard move, manual unblock, later block, or successful recovery
+        # permanently invalidates an older blocking event.
+        state_placeholders = ",".join("?" for _ in SUPERVISOR_STATE_EVENT_KINDS)
+        current = conn.execute(
+            f"SELECT id, kind FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({state_placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *SUPERVISOR_STATE_EVENT_KINDS),
+        ).fetchone()
+        if (
+            current is None
+            or int(current["id"]) != int(source_event_id)
+            or str(current["kind"]) != str(source_kind)
+        ):
+            return False, "stale_event"
+        if task["status"] not in {"blocked", "triage"}:
+            return False, "not_blocked"
+
         prior_rows = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'supervisor_recovery'",
@@ -6005,8 +6033,6 @@ def supervisor_recover_task(
             return False, "already_recovered"
         if len(prior_rows) >= limit:
             return False, "budget_exhausted"
-        if task["status"] not in {"blocked", "triage"}:
-            return False, "not_blocked"
 
         undone_parent = conn.execute(
             "SELECT 1 FROM task_links l "
@@ -6052,6 +6078,7 @@ def resume_supervisor_gate(
     conn: sqlite3.Connection,
     task_id: str,
     *,
+    expected_event_id: int,
     answer: str,
     author: str,
 ) -> tuple[bool, str]:
@@ -6069,6 +6096,20 @@ def resume_supervisor_gate(
             return False, "missing"
         if task["status"] not in {"blocked", "triage"}:
             return False, "not_waiting"
+        state_placeholders = ",".join("?" for _ in SUPERVISOR_STATE_EVENT_KINDS)
+        current = conn.execute(
+            f"SELECT id, kind FROM task_events WHERE task_id = ? "
+            f"AND kind IN ({state_placeholders}) ORDER BY id DESC LIMIT 1",
+            (task_id, *SUPERVISOR_STATE_EVENT_KINDS),
+        ).fetchone()
+        if (
+            current is None
+            or int(current["id"]) != int(expected_event_id)
+            or str(current["kind"]) not in {
+                "blocked", "gave_up", "block_loop_detected"
+            }
+        ):
+            return False, "stale_gate"
         undone_parent = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -6094,7 +6135,11 @@ def resume_supervisor_gate(
             conn,
             task_id,
             "supervisor_answered",
-            {"author": author.strip(), "status": new_status},
+            {
+                "author": author.strip(),
+                "status": new_status,
+                "source_event_id": int(expected_event_id),
+            },
         )
         return True, new_status
 

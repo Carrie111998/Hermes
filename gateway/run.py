@@ -14466,6 +14466,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     reply_to_text=getattr(event, "reply_to_text", None),
                     answer=event.text or "",
                     author=source.user_name or source.user_id or "user",
+                    platform=getattr(source.platform, "value", str(source.platform)),
+                    chat_id=source.chat_id,
+                    thread_id=source.thread_id or "",
+                    notifier_profile=source.profile or self._active_profile_name(),
+                    reply_to_is_own_message=bool(
+                        getattr(event, "reply_to_is_own_message", False)
+                    ),
                 )
             except Exception as exc:
                 logger.warning("Kanban supervisor reply handling failed: %s", exc)

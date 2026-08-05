@@ -243,6 +243,7 @@ class TestReplyToText:
         event = reply_text_adapter.handle_message.await_args.args[0]
         assert event.reply_to_message_id is None
         assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False
 
 
     @pytest.mark.asyncio
@@ -257,6 +258,34 @@ class TestReplyToText:
         event = reply_text_adapter.handle_message.await_args.args[0]
         assert event.reply_to_message_id == "555"
         assert event.reply_to_text is None
+        assert event.reply_to_is_own_message is False
+
+    @pytest.mark.asyncio
+    async def test_reference_to_own_message_records_provenance(self, reply_text_adapter):
+        resolved_msg = SimpleNamespace(
+            content="supervisor prompt",
+            author=SimpleNamespace(id=999),
+        )
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+
+        await reply_text_adapter._handle_message(_make_message(reference=ref))
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_text == "supervisor prompt"
+        assert event.reply_to_is_own_message is True
+
+    @pytest.mark.asyncio
+    async def test_reference_to_other_author_is_not_own(self, reply_text_adapter):
+        resolved_msg = SimpleNamespace(
+            content="forged supervisor prompt",
+            author=SimpleNamespace(id=123),
+        )
+        ref = SimpleNamespace(message_id=555, resolved=resolved_msg)
+
+        await reply_text_adapter._handle_message(_make_message(reference=ref))
+
+        event = reply_text_adapter.handle_message.await_args.args[0]
+        assert event.reply_to_is_own_message is False
 
 
 class TestYamlConfigLoading:

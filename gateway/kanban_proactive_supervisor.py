@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Optional
 
@@ -26,9 +27,7 @@ _PROTECTED_GATE_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
-_REPLY_MARKER_RE = re.compile(
-    r"\[kanban-supervisor:([a-z0-9][a-z0-9_-]{0,63}):(t_[a-zA-Z0-9]+)\]"
-)
+_REPLY_MARKER_RE = re.compile(r"\[kanban-gate:([a-f0-9]{32})\]", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -96,7 +95,8 @@ def _event_payload(raw: Any) -> dict[str, Any]:
 
 
 def _active_blocking_events(conn) -> list[dict[str, Any]]:
-    placeholders = ",".join("?" for _ in _MATERIAL_EVENT_KINDS)
+    state_placeholders = ",".join("?" for _ in kb.SUPERVISOR_STATE_EVENT_KINDS)
+    material_placeholders = ",".join("?" for _ in _MATERIAL_EVENT_KINDS)
     rows = conn.execute(
         f"""
         SELECT t.id AS task_id, t.title, t.status, t.block_kind,
@@ -107,12 +107,13 @@ def _active_blocking_events(conn) -> list[dict[str, Any]]:
               SELECT MAX(e2.id)
                 FROM task_events e2
                WHERE e2.task_id = t.id
-                 AND e2.kind IN ({placeholders})
+                 AND e2.kind IN ({state_placeholders})
           )
          WHERE t.status IN ('blocked', 'triage')
+           AND e.kind IN ({material_placeholders})
          ORDER BY e.id
         """,
-        _MATERIAL_EVENT_KINDS,
+        (*kb.SUPERVISOR_STATE_EVENT_KINDS, *_MATERIAL_EVENT_KINDS),
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -125,6 +126,7 @@ def _ensure_supervisor_subscription(
     event_id: int,
     config: ProactiveSupervisorConfig,
     notifier_profile: str,
+    mode: str,
 ) -> bool:
     existing = next(
         (
@@ -137,8 +139,21 @@ def _ensure_supervisor_subscription(
         None,
     )
     metadata = dict(existing.get("delivery_metadata") or {}) if existing else {}
+    if (
+        metadata.get("_kanban_supervisor_event_id") == int(event_id)
+        and metadata.get("_kanban_supervisor_mode") == mode
+    ):
+        return False
+    token = secrets.token_hex(16)
     metadata["_kanban_proactive_supervisor"] = True
     metadata["_kanban_supervisor_board"] = board
+    metadata["_kanban_supervisor_task"] = task_id
+    metadata["_kanban_supervisor_event_id"] = int(event_id)
+    metadata["_kanban_supervisor_gate_token"] = token
+    metadata["_kanban_supervisor_mode"] = mode
+    metadata["_kanban_supervisor_owned_subscription"] = bool(
+        metadata.get("_kanban_supervisor_owned_subscription", existing is None)
+    )
     if config.thread_id:
         metadata.setdefault("thread_id", config.thread_id)
     if config.chat_type:
@@ -154,7 +169,18 @@ def _ensure_supervisor_subscription(
         delivery_metadata=metadata,
         start_event_id=max(0, int(event_id) - 1),
     )
-    return existing is None
+    # A pre-existing ordinary subscription may already have claimed this event
+    # before supervision was enabled. Rewind only to the still-current event.
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE kanban_notify_subs SET last_event_id = MIN(last_event_id, ?) "
+            "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
+            (
+                max(0, int(event_id) - 1), task_id, config.platform,
+                config.chat_id, config.thread_id,
+            ),
+        )
+    return True
 
 
 def reconcile_board(
@@ -196,6 +222,7 @@ def reconcile_board(
                 event_id=event_id,
                 config=config,
                 notifier_profile=notifier_profile,
+                mode="protected_gate",
             ):
                 result.protected_gates.append(task_id)
             continue
@@ -219,14 +246,27 @@ def reconcile_board(
                 event_id=event_id,
                 config=config,
                 notifier_profile=notifier_profile,
+                mode="recovery_exhausted",
             ):
                 result.recovery_exhausted.append(task_id)
 
     return result
 
 
-def render_supervisor_event(*, board: str, task, event) -> Optional[str]:
-    """Render a concise gate prompt or exhausted-recovery status message."""
+def render_supervisor_event(
+    *,
+    board: str,
+    task,
+    event,
+    delivery_metadata: Optional[Mapping[str, Any]] = None,
+    current_event_id: Optional[int] = None,
+) -> Optional[str]:
+    """Render one event-bound supervisor message.
+
+    An empty string means the event belongs to a supervisor-owned subscription
+    but is stale and must be silent. ``None`` leaves an unrelated event to the
+    ordinary notifier renderer when a pre-existing subscription was reused.
+    """
     payload = _event_payload(getattr(event, "payload", None))
     reason = str(
         payload.get("reason")
@@ -237,17 +277,42 @@ def render_supervisor_event(*, board: str, task, event) -> Optional[str]:
     task_id = str(getattr(task, "id", "") or "")
     title = str(getattr(task, "title", task_id) or task_id)
     block_kind = str(payload.get("kind") or getattr(task, "block_kind", "") or "")
-    if block_kind in {"needs_input", "capability"} and is_protected_gate(reason):
+    metadata = delivery_metadata if isinstance(delivery_metadata, Mapping) else {}
+    try:
+        bound_event_id = int(metadata.get("_kanban_supervisor_event_id", -1))
+    except (TypeError, ValueError):
+        bound_event_id = -1
+    event_id = int(getattr(event, "id", -2))
+    owned = bool(metadata.get("_kanban_supervisor_owned_subscription"))
+    # State truth outranks subscription ownership. A reused ordinary
+    # subscription must not fall back to its generic "blocked" renderer after
+    # the supervisor already recovered this event (or another actor resolved
+    # it); that would report a task as paused when it is actually ready.
+    if current_event_id != event_id or getattr(task, "status", None) not in {
+        "blocked", "triage"
+    }:
+        return ""
+    if bound_event_id != event_id:
+        return "" if owned else None
+
+    mode = str(metadata.get("_kanban_supervisor_mode") or "")
+    if mode == "protected_gate":
+        if block_kind not in {"needs_input", "capability"} or not is_protected_gate(reason):
+            return ""
+        token = str(metadata.get("_kanban_supervisor_gate_token") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", token):
+            return ""
         return (
             f"Hermes needs one decision to continue {title}:\n{reason[:700]}\n\n"
             "Reply to this message with the decision. Hermes will attach it to "
             "the existing task and resume the same work graph.\n"
-            f"[kanban-supervisor:{board}:{task_id}]"
+            f"[kanban-gate:{token}]"
         )
+    if mode != "recovery_exhausted":
+        return ""
     return (
         f"Hermes could not recover {title} after the bounded retry. "
-        "The task remains paused for engineering follow-up; no decision is requested.\n"
-        f"[kanban-supervisor-status:{board}:{task_id}]"
+        "The task remains paused for engineering follow-up; no decision is requested."
     )
 
 
@@ -256,27 +321,69 @@ def consume_supervisor_reply(
     reply_to_text: Optional[str],
     answer: str,
     author: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str = "",
+    notifier_profile: str = "",
+    reply_to_is_own_message: bool = False,
 ) -> Optional[SupervisorReplyResult]:
     """Consume a direct reply to a native gate prompt and resume that task."""
     match = _REPLY_MARKER_RE.search(reply_to_text or "")
     if match is None:
         return None
-    if not answer or not answer.strip():
+    if not answer or not answer.strip() or not reply_to_is_own_message:
         return None
-    board, task_id = match.groups()
-    conn = kb.connect(board=board)
+    token = match.group(1)
+    boards = [kb.read_board_metadata(kb.DEFAULT_BOARD)]
     try:
-        resumed, status = kb.resume_supervisor_gate(
-            conn,
-            task_id,
-            answer=answer,
-            author=author or "user",
-        )
-        return SupervisorReplyResult(
-            board=board,
-            task_id=task_id,
-            resumed=resumed,
-            status=status,
-        )
-    finally:
-        conn.close()
+        boards.extend(kb.list_boards(include_archived=False))
+    except Exception:
+        pass
+    seen_paths: set[str] = set()
+    for board_meta in boards:
+        board = str(board_meta.get("slug") or kb.DEFAULT_BOARD)
+        db_path = str(kb.kanban_db_path(board).resolve())
+        if db_path in seen_paths:
+            continue
+        seen_paths.add(db_path)
+        conn = kb.connect(board=board)
+        try:
+            for sub in kb.list_notify_subs(conn):
+                metadata = sub.get("delivery_metadata")
+                if not isinstance(metadata, dict):
+                    continue
+                if metadata.get("_kanban_supervisor_gate_token") != token:
+                    continue
+                if metadata.get("_kanban_supervisor_mode") != "protected_gate":
+                    continue
+                if str(sub.get("platform") or "").lower() != str(platform).lower():
+                    continue
+                if str(sub.get("chat_id") or "") != str(chat_id):
+                    continue
+                if str(sub.get("thread_id") or "") != str(thread_id or ""):
+                    continue
+                owner = str(sub.get("notifier_profile") or "")
+                if notifier_profile and owner and owner != notifier_profile:
+                    continue
+                task_id = str(metadata.get("_kanban_supervisor_task") or "")
+                try:
+                    raw_event_id = metadata.get("_kanban_supervisor_event_id")
+                    event_id = int(str(raw_event_id))
+                except (TypeError, ValueError):
+                    return None
+                resumed, status = kb.resume_supervisor_gate(
+                    conn,
+                    task_id,
+                    expected_event_id=event_id,
+                    answer=answer,
+                    author=author or "user",
+                )
+                return SupervisorReplyResult(
+                    board=board,
+                    task_id=task_id,
+                    resumed=resumed,
+                    status=status,
+                )
+        finally:
+            conn.close()
+    return None

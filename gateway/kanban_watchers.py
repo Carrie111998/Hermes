@@ -369,6 +369,14 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    _state_kinds = _kb.SUPERVISOR_STATE_EVENT_KINDS
+                                    _state_placeholders = ",".join("?" for _ in _state_kinds)
+                                    _current_state_event = conn.execute(
+                                        f"SELECT id FROM task_events WHERE task_id = ? "
+                                        f"AND kind IN ({_state_placeholders}) "
+                                        "ORDER BY id DESC LIMIT 1",
+                                        (sub["task_id"], *_state_kinds),
+                                    ).fetchone()
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -379,6 +387,10 @@ class GatewayKanbanWatchersMixin:
                                         "cursor": cursor,
                                         "events": events,
                                         "task": task,
+                                        "current_state_event_id": (
+                                            int(_current_state_event["id"])
+                                            if _current_state_event is not None else None
+                                        ),
                                         "board": slug,
                                     })
                                 except Exception as sub_exc:
@@ -442,6 +454,7 @@ class GatewayKanbanWatchersMixin:
                         sub["task_id"], sub["platform"],
                         sub["chat_id"], sub.get("thread_id") or "",
                     )
+                    _supervisor_suppressed_event_ids: set[int] = set()
                     for ev in d["events"]:
                         kind = ev.kind
                         # Identity prefix: attribute terminal pings to the
@@ -464,8 +477,13 @@ class GatewayKanbanWatchersMixin:
                                 board=board_slug or _kb.DEFAULT_BOARD,
                                 task=task,
                                 event=ev,
+                                delivery_metadata=delivery_metadata,
+                                current_event_id=d.get("current_state_event_id"),
                             )
-                        if _supervisor_msg:
+                        if _supervisor_msg == "":
+                            _supervisor_suppressed_event_ids.add(int(ev.id))
+                            continue
+                        if _supervisor_msg is not None:
                             msg = _supervisor_msg
                         elif kind == "completed":
                             # Prefer the run's summary (the worker's
@@ -557,6 +575,11 @@ class GatewayKanbanWatchersMixin:
                         # not platform delivery options.
                         metadata.pop("_kanban_proactive_supervisor", None)
                         metadata.pop("_kanban_supervisor_board", None)
+                        metadata.pop("_kanban_supervisor_task", None)
+                        metadata.pop("_kanban_supervisor_event_id", None)
+                        metadata.pop("_kanban_supervisor_gate_token", None)
+                        metadata.pop("_kanban_supervisor_mode", None)
+                        metadata.pop("_kanban_supervisor_owned_subscription", None)
                         if sub.get("thread_id") and not metadata.get("thread_id"):
                             metadata["thread_id"] = sub["thread_id"]
                         # Adapters with no push channel (the API server —
@@ -679,7 +702,12 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status in {"done", "archived"}
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
-                        _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
+                        _wake_kinds = {
+                            ev.kind
+                            for ev in d["events"]
+                            if ev.kind in _WAKE_KINDS
+                            and int(ev.id) not in _supervisor_suppressed_event_ids
+                        }
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 
                         _is_push_adapter = _adapter_push_ok(adapter)
