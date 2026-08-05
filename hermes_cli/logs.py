@@ -17,8 +17,11 @@ Usage examples::
     hermes logs --component tools  # only tool-related lines
     hermes logs --since 1h         # lines from the last hour
     hermes logs --since 30m -f     # follow, starting 30 min ago
+    hermes logs events --since 1h --subsystem updates
+                                    # structured events.jsonl, filtered
 """
 
+import json
 import re
 import sys
 import time
@@ -38,6 +41,10 @@ LOG_FILES = {
     # Every stdio MCP subprocess's stderr (tools/mcp_tool.py redirects it
     # here, with per-server session markers) — the "MCP output channel".
     "mcp": "mcp-stderr.log",
+    # Structured, machine-readable action events — see hermes_logging.emit_event().
+    # One JSON object per line, not the plain-text format the regex filters
+    # below assume, so this name is special-cased in tail_log().
+    "events": "events.jsonl",
 }
 
 # Log line timestamp regex — matches "2026-04-05 22:35:00,123" or
@@ -142,6 +149,90 @@ def _matches_filters(
     return True
 
 
+# ---------------------------------------------------------------------------
+# events.jsonl — structured, machine-readable events (one JSON object/line)
+# ---------------------------------------------------------------------------
+
+def _matches_event_filters(
+    obj: dict,
+    *,
+    session_filter: Optional[str] = None,
+    since: Optional[datetime] = None,
+    subsystem: Optional[str] = None,
+) -> bool:
+    """Check if a parsed events.jsonl object passes all active filters."""
+    if since is not None:
+        ts_str = obj.get("ts")
+        if ts_str:
+            try:
+                ts = datetime.fromisoformat(ts_str)
+                if ts.tzinfo is not None:
+                    ts = ts.astimezone().replace(tzinfo=None)
+                if ts < since:
+                    return False
+            except (ValueError, TypeError):
+                pass
+
+    if session_filter is not None:
+        if session_filter not in (obj.get("session_id") or ""):
+            return False
+
+    if subsystem is not None:
+        if (obj.get("subsystem") or "") != subsystem:
+            return False
+
+    return True
+
+
+def _read_events_tail(
+    path: Path,
+    num_lines: int,
+    *,
+    has_filters: bool,
+    session_filter: Optional[str] = None,
+    since: Optional[datetime] = None,
+    subsystem: Optional[str] = None,
+) -> list:
+    """Read the last *num_lines* matching lines from events.jsonl."""
+    if not has_filters:
+        return _read_last_n_lines(path, num_lines)
+
+    raw_lines = _read_last_n_lines(path, max(num_lines * 20, 2000))
+    filtered = []
+    for line in raw_lines:
+        try:
+            obj = json.loads(line)
+        except (ValueError, TypeError):
+            continue
+        if _matches_event_filters(obj, session_filter=session_filter, since=since, subsystem=subsystem):
+            filtered.append(line)
+    return filtered[-num_lines:]
+
+
+def _follow_events_log(
+    path: Path,
+    *,
+    session_filter: Optional[str] = None,
+    since: Optional[datetime] = None,
+    subsystem: Optional[str] = None,
+) -> None:
+    """Poll events.jsonl for new lines and print matching ones."""
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        f.seek(0, 2)
+        while True:
+            line = f.readline()
+            if line:
+                try:
+                    obj = json.loads(line)
+                except (ValueError, TypeError):
+                    continue
+                if _matches_event_filters(obj, session_filter=session_filter, since=since, subsystem=subsystem):
+                    print(line, end="")
+                    sys.stdout.flush()
+            else:
+                time.sleep(0.3)
+
+
 def tail_log(
     log_name: str = "agent",
     *,
@@ -151,6 +242,7 @@ def tail_log(
     session: Optional[str] = None,
     since: Optional[str] = None,
     component: Optional[str] = None,
+    subsystem: Optional[str] = None,
 ) -> None:
     """Read and display log lines, optionally following in real time.
 
@@ -170,6 +262,9 @@ def tail_log(
         Relative time string (e.g. ``"1h"``, ``"30m"``).
     component
         Component name to filter by (e.g. ``"gateway"``, ``"tools"``).
+    subsystem
+        (events log only) Subsystem to filter by (e.g. ``"updates"``,
+        ``"tools"``, ``"cron"``).
     """
     filename = LOG_FILES.get(log_name)
     if filename is None:
@@ -189,6 +284,12 @@ def tail_log(
         if since_dt is None:
             print(f"Invalid --since value: {since!r}. Use format like '1h', '30m', '2d'.")
             sys.exit(1)
+
+    if log_name == "events":
+        _tail_events_log(log_path, filename, num_lines=num_lines, follow=follow,
+                         session=session, since=since, since_dt=since_dt,
+                         subsystem=subsystem)
+        return
 
     min_level = level.upper() if level else None
     if min_level and min_level not in _LEVEL_ORDER:
@@ -249,6 +350,56 @@ def tail_log(
     try:
         _follow_log(log_path, min_level=min_level, session_filter=session,
                      since=since_dt, component_prefixes=component_prefixes)
+    except KeyboardInterrupt:
+        print("\n--- stopped ---")
+
+
+def _tail_events_log(
+    log_path: Path,
+    filename: str,
+    *,
+    num_lines: int,
+    follow: bool,
+    session: Optional[str],
+    since: Optional[str],
+    since_dt: Optional[datetime],
+    subsystem: Optional[str],
+) -> None:
+    """``tail_log``'s branch for the JSONL events log — separate from the
+    plain-text regex-filter path since the two formats have nothing in
+    common structurally."""
+    has_filters = session is not None or since_dt is not None or subsystem is not None
+
+    try:
+        lines = _read_events_tail(log_path, num_lines, has_filters=has_filters,
+                                  session_filter=session, since=since_dt,
+                                  subsystem=subsystem)
+    except PermissionError:
+        print(f"Permission denied: {log_path}")
+        sys.exit(1)
+
+    filter_parts = []
+    if session:
+        filter_parts.append(f"session={session}")
+    if subsystem:
+        filter_parts.append(f"subsystem={subsystem}")
+    if since:
+        filter_parts.append(f"since={since}")
+    filter_desc = f" [{', '.join(filter_parts)}]" if filter_parts else ""
+
+    if follow:
+        print(f"--- {display_hermes_home()}/logs/{filename}{filter_desc} (Ctrl+C to stop) ---")
+    else:
+        print(f"--- {display_hermes_home()}/logs/{filename}{filter_desc} (last {num_lines}) ---")
+
+    for line in lines:
+        print(line, end="")
+
+    if not follow:
+        return
+
+    try:
+        _follow_events_log(log_path, session_filter=session, since=since_dt, subsystem=subsystem)
     except KeyboardInterrupt:
         print("\n--- stopped ---")
 
@@ -372,7 +523,7 @@ def list_logs() -> None:
     print(f"Log files in {display_hermes_home()}/logs/:\n")
     found = False
     for entry in sorted(log_dir.iterdir()):
-        if entry.is_file() and entry.suffix == ".log":
+        if entry.is_file() and entry.suffix in (".log", ".jsonl"):
             size = entry.stat().st_size
             mtime = datetime.fromtimestamp(entry.stat().st_mtime)
             if size < 1024:

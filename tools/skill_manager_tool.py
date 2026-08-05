@@ -1416,8 +1416,12 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
 
     decision = wa.evaluate_gate(wa.SKILLS)
     if decision.allow:
+        import uuid
+        wa.emit_gate_event(wa.SKILLS, "allowed", uuid.uuid4().hex[:8], f"{action} {name}")
         return None
     if decision.blocked:
+        import uuid
+        wa.emit_gate_event(wa.SKILLS, "blocked", uuid.uuid4().hex[:8], f"{action} {name}")
         return tool_error(decision.message, success=False)
 
     # stage — record the full skill_manage kwargs so approval can replay it.
@@ -1431,6 +1435,7 @@ def _apply_skill_write_gate(action, name, **payload_kwargs):
         new_string=payload_kwargs.get("new_string") or "",
     )
     record = wa.stage_write(wa.SKILLS, payload, summary=gist, origin=wa.current_origin())
+    wa.emit_gate_event(wa.SKILLS, "staged", record["id"], f"{action} {name}")
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "gist": gist, "message": decision.message},

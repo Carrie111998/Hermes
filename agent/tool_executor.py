@@ -576,6 +576,16 @@ def _begin_tool_execution(
     except Exception:
         pass
 
+    try:
+        from hermes_logging import emit_event
+
+        emit_event(
+            "tool.started", subsystem="tools", outcome="started",
+            action_id=tool_call_id, detail=function_name,
+        )
+    except Exception:
+        pass
+
     if agent.tool_progress_callback:
         try:
             display_args = (
@@ -1253,6 +1263,17 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
 
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "tool.completed", subsystem="tools",
+                outcome="blocked" if blocked else ("failed" if is_error else "succeeded"),
+                action_id=tc.id, detail=f"{name} ({tool_duration:.2f}s)",
+            )
+        except Exception:
+            pass
+
         # Print cute message per tool
         if agent._should_emit_quiet_tool_messages():
             cute_msg = _get_cute_tool_message_impl(
@@ -1909,6 +1930,17 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        try:
+            from hermes_logging import emit_event
+
+            emit_event(
+                "tool.completed", subsystem="tools",
+                outcome="blocked" if _execution_blocked else ("failed" if _is_error_result else "succeeded"),
+                action_id=tool_call.id, detail=f"{function_name} ({tool_duration:.2f}s)",
+            )
+        except Exception:
+            pass
 
         if not _execution_blocked and agent.tool_complete_callback:
             try:

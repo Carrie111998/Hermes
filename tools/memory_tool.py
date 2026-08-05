@@ -941,9 +941,16 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
     decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
 
     if decision.allow:
+        # Covers both "gate off" and "inline prompt approved" — GateDecision
+        # doesn't distinguish the two, so this uses a neutral outcome rather
+        # than mislabeling an inline approval as a bare bypass.
+        import uuid
+        wa.emit_gate_event(wa.MEMORY, "allowed", uuid.uuid4().hex[:8], summary)
         return None
 
     if decision.blocked:
+        import uuid
+        wa.emit_gate_event(wa.MEMORY, "blocked", uuid.uuid4().hex[:8], summary)
         return tool_error(decision.message, success=False)
 
     # stage
@@ -958,6 +965,7 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    wa.emit_gate_event(wa.MEMORY, "staged", record["id"], summary)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},
@@ -994,9 +1002,13 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
     decision = wa.evaluate_gate(wa.MEMORY, inline_summary=summary, inline_detail=detail)
 
     if decision.allow:
+        import uuid
+        wa.emit_gate_event(wa.MEMORY, "allowed", uuid.uuid4().hex[:8], summary)
         return None
 
     if decision.blocked:
+        import uuid
+        wa.emit_gate_event(wa.MEMORY, "blocked", uuid.uuid4().hex[:8], summary)
         return tool_error(decision.message, success=False)
 
     payload = {"action": "batch", "target": target, "operations": operations}
@@ -1005,6 +1017,7 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         summary=f"{summary}: {detail[:120]}",
         origin=wa.current_origin(),
     )
+    wa.emit_gate_event(wa.MEMORY, "staged", record["id"], summary)
     return json.dumps(
         {"success": True, "staged": True, "pending_id": record["id"],
          "message": decision.message},

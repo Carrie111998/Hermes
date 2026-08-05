@@ -34,13 +34,15 @@ Examples:
     hermes logs --since 1h         Lines from the last hour
     hermes logs --since 30m -f     Follow, starting from 30 min ago
     hermes logs list               List available log files with sizes
+    hermes logs events --since 1h --subsystem updates
+                                    Structured action events (approvals, cron, tools, ...)
 """,
     )
     logs_parser.add_argument(
         "log_name",
         nargs="?",
         default="agent",
-        help="Log to view: agent (default), errors, gateway, gui, or 'list' to show available files",
+        help="Log to view: agent (default), errors, gateway, gui, events, or 'list' to show available files",
     )
     logs_parser.add_argument(
         "-n",
@@ -74,5 +76,10 @@ Examples:
         "--component",
         metavar="NAME",
         help="Filter by component: gateway, agent, tools, cli, cron, gui",
+    )
+    logs_parser.add_argument(
+        "--subsystem",
+        metavar="NAME",
+        help="(events log only) Filter by subsystem: tools, updates, memory, skills, cron, process",
     )
     logs_parser.set_defaults(func=cmd_logs)
