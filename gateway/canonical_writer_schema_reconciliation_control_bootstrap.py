@@ -43,6 +43,8 @@ from gateway.canonical_writer_db import (
 from gateway.canonical_writer_schema_reconciliation import (
     _control_foundation_contract_sha256,
     _load_control_artifact,
+    _target_policy,
+    collect_schema_contract,
 )
 
 
@@ -894,7 +896,7 @@ def _validate_observation(
         helper_absent is True and helper_same_name_count == 0
     ) or (
         allow_routeback_helper_present
-        and phase == "post_cleanup"
+        and phase in {"before_install", "after_install", "post_cleanup"}
         and helper_absent is False
         and helper_same_name_count == 1
     )
@@ -2955,7 +2957,7 @@ def _parse_foundation_observation_result(
         )
         target_helper_replay = (
             allow_routeback_helper_present
-            and phase == "post_cleanup"
+            and phase in {"before_install", "after_install", "post_cleanup"}
             and drift_code
             == "schema_reconciliation_control_routeback_helper_present"
             and helper_absent == "false"
@@ -3406,6 +3408,50 @@ def _close_database_session(session: Any) -> None:
         ) from exc
 
 
+def _require_exact_target_helper_replay(
+    context: _ControlRuntimeContext,
+    session: Any,
+    observation: Mapping[str, Any],
+) -> None:
+    """Bind the one tolerated helper to the sealed target schema contract.
+
+    A stopped schema upgrade can commit the target helper before its terminal
+    owner receipt is delivered.  The control bootstrap may replay across that
+    state only when the complete live schema is byte-for-byte the reviewed
+    target.  The allowance is derived from catalog evidence; no caller or wire
+    frame can select it.
+    """
+
+    helper_absent = observation.get("helper_absent")
+    helper_same_name_count = observation.get("helper_same_name_count")
+    if helper_absent is True and helper_same_name_count == 0:
+        return
+    if helper_absent is not False or helper_same_name_count != 1:
+        _fail("schema_reconciliation_control_routeback_helper_contract_invalid")
+    try:
+        config = context.base.dependencies.writer_config()
+        target = context.base.target
+        observed = collect_schema_contract(
+            session,
+            config=config,
+            policy=_target_policy(target.attestation),
+            managed_hba_receipt=None,
+            subject_user=config.user,
+        )
+    except BaseException as exc:
+        if (
+            isinstance(exc, ControlBootstrapError)
+            and exc.code
+            == "schema_reconciliation_control_routeback_helper_contract_invalid"
+        ):
+            raise
+        raise ControlBootstrapError(
+            "schema_reconciliation_control_routeback_helper_contract_invalid"
+        ) from exc
+    if observed.sha256 != target.sha256:
+        _fail("schema_reconciliation_control_routeback_helper_contract_invalid")
+
+
 def _execute_install_artifact(
     context: _ControlRuntimeContext,
     session: Any,
@@ -3483,7 +3529,9 @@ def _runtime_install_callback(
             session,
             phase="before_install",
             observed_at_unix=context.base.dependencies.now,
+            allow_routeback_helper_present=True,
         )
+        _require_exact_target_helper_replay(context, session, before)
         _revalidate_stopped(
             context,
             "schema_reconciliation_control_install_stopped_boundary_drifted",
@@ -3501,7 +3549,9 @@ def _runtime_install_callback(
             session,
             phase="after_install",
             observed_at_unix=context.base.dependencies.now,
+            allow_routeback_helper_present=True,
         )
+        _require_exact_target_helper_replay(context, session, after)
         if after["state"] != "exact_installed":
             _fail("schema_reconciliation_control_install_reattestation_failed")
     except BaseException as exc:
@@ -3589,7 +3639,9 @@ def _runtime_post_cleanup_callback(
             session,
             phase="post_cleanup",
             observed_at_unix=context.base.dependencies.now,
+            allow_routeback_helper_present=True,
         )
+        _require_exact_target_helper_replay(context, session, observation)
     except BaseException as exc:
         primary = exc
     finally:

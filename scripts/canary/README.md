@@ -882,6 +882,11 @@ the successor supplies only the current trusted local runtime. Success requires
 the predecessor terminal receipt to prove the control installed, the temporary
 admin absent, and services stopped. A current-release source, an unrelated
 source, or any partial terminal receipt fails closed.
+If an interrupted stopped schema upgrade already committed the single reviewed
+route-back helper, the replay accepts it only after collecting the complete
+live schema contract and proving it exactly matches the predecessor's sealed
+target. A duplicate helper, a different definition, or any surrounding schema
+drift fails closed.
 
 ```bash
 /Users/emillomliev/.local/share/uv/python/\
