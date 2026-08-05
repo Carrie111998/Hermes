@@ -240,6 +240,12 @@ PROVIDER_REGISTRY: Dict[str, ProviderConfig] = {
         api_key_env_vars=("GOOGLE_API_KEY", "GEMINI_API_KEY"),
         base_url_env_var="GEMINI_BASE_URL",
     ),
+    "gemini-oauth": ProviderConfig(
+        id="gemini-oauth",
+        name="Google Gemini OAuth (via Antigravity CLI)",
+        auth_type="oauth_external",
+        inference_base_url="https://generativelanguage.googleapis.com/v1beta",
+    ),
     "zai": ProviderConfig(
         id="zai",
         name="Z.AI / GLM",
@@ -2719,8 +2725,163 @@ def get_qwen_auth_status() -> Dict[str, Any]:
 
 
 # =============================================================================
-# Spotify auth — PKCE tokens stored in ~/.hermes/auth.json
+# Google Gemini OAuth (via Antigravity CLI)
 # =============================================================================
+
+
+def _antigravity_cli_auth_path() -> Path:
+    return Path.home() / ".gemini" / "oauth_creds.json"
+
+
+def _read_antigravity_cli_tokens() -> Dict[str, Any]:
+    auth_path = _antigravity_cli_auth_path()
+    if not auth_path.exists():
+        raise AuthError(
+            "Antigravity CLI credentials not found. Run 'gemini auth login' first.",
+            provider="gemini-oauth",
+            code="gemini_oauth_auth_missing",
+        )
+    try:
+        data = json.loads(auth_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise AuthError(
+            f"Failed to read Antigravity CLI credentials from {auth_path}: {exc}",
+            provider="gemini-oauth",
+            code="gemini_oauth_auth_read_failed",
+        ) from exc
+    if not isinstance(data, dict):
+        raise AuthError(
+            f"Invalid Antigravity CLI credentials in {auth_path}.",
+            provider="gemini-oauth",
+            code="gemini_oauth_auth_invalid",
+        )
+    return data
+
+
+def _save_antigravity_cli_tokens(tokens: Dict[str, Any]) -> Path:
+    auth_path = _antigravity_cli_auth_path()
+    auth_path.parent.mkdir(parents=True, exist_ok=True)
+    secure_parent_dir(auth_path)
+    tmp_path = auth_path.with_name(f"{auth_path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
+    fd = os.open(
+        str(tmp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        os.write(fd, json.dumps(tokens, indent=2).encode("utf-8"))
+    finally:
+        os.close(fd)
+    os.replace(tmp_path, auth_path)
+    return auth_path
+
+
+def _antigravity_access_token_is_expiring(access_token: str, skew_seconds: int = 120) -> bool:
+    """Check if an Antigravity access token is expiring within skew_seconds."""
+    try:
+        import base64
+        parts = access_token.split(".")
+        if len(parts) != 3:
+            return True  # malformed, treat as expiring
+        payload = parts[1]
+        payload += "=" * (-len(payload) % 4)
+        decoded = base64.urlsafe_b64decode(payload)
+        claims = json.loads(decoded)
+        exp = claims.get("exp")
+        if exp is None:
+            return True
+        return float(exp) <= (time.time() + max(0, int(skew_seconds)))
+    except Exception:
+        return True  # on any error, treat as expiring
+
+
+def get_gemini_oauth_auth_status() -> Dict[str, Any]:
+    auth_path = _antigravity_cli_auth_path()
+    try:
+        data = _read_antigravity_cli_tokens()
+        access_token = data.get("access_token")
+        refresh_token = data.get("refresh_token")
+        expiry_date = data.get("expiry_date")
+        
+        if not access_token:
+            return {
+                "logged_in": False,
+                "auth_file": str(auth_path),
+                "error": "No access token found",
+            }
+        
+        # Check if token is expiring
+        is_expiring = _antigravity_access_token_is_expiring(access_token)
+        
+        if is_expiring and refresh_token:
+            # Token is expiring but we have a refresh token - it can be refreshed
+            pass
+        elif is_expiring and not refresh_token:
+            return {
+                "logged_in": False,
+                "auth_file": str(auth_path),
+                "error": "Access token expired and no refresh token available",
+            }
+        
+        return {
+            "logged_in": True,
+            "auth_store_path": str(auth_path),
+            "source": "antigravity_cli",
+            "api_key": access_token,
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "expires_at": expiry_date / 1000 if expiry_date else None,
+            "expires_at_ms": expiry_date,
+            "has_refresh_token": bool(refresh_token),
+        }
+    except AuthError as exc:
+        return {
+            "logged_in": False,
+            "auth_store_path": str(auth_path),
+            "error": str(exc),
+        }
+
+
+def resolve_gemini_oauth_runtime_credentials(
+    *,
+    force_refresh: bool = False,
+    refresh_if_expiring: bool = True,
+    refresh_skew_seconds: int = 120,
+) -> Dict[str, Any]:
+    """Resolve runtime credentials from Antigravity CLI token store."""
+    data = _read_antigravity_cli_tokens()
+    access_token = data.get("access_token")
+    refresh_token = data.get("refresh_token")
+    expiry_date = data.get("expiry_date")
+    
+    if not access_token:
+        raise AuthError(
+            "No access token found in Antigravity CLI credentials.",
+            provider="gemini-oauth",
+            code="gemini_oauth_access_token_missing",
+        )
+    
+    # Check if token is expiring
+    is_expiring = _antigravity_access_token_is_expiring(access_token, refresh_skew_seconds)
+    
+    if is_expiring and refresh_token:
+        # Token is expiring but we have a refresh token - warn but continue
+        # The actual refresh would need to be done by the Antigravity CLI itself
+        # since we don't have the OAuth client_id/client_secret used for initial auth
+        logger.warning(
+            "Gemini OAuth access token is expiring. "
+            "Run 'gemini auth login' in a terminal to refresh tokens, "
+            "or Hermes will continue with the current token which may still work."
+        )
+    
+    base_url = os.getenv("HERMES_GEMINI_BASE_URL", "").strip().rstrip("/") or "https://generativelanguage.googleapis.com/v1beta"
+    return {
+        "provider": "gemini-oauth",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": "antigravity_cli",
+        "expires_at_ms": expiry_date,
+    }
 
 
 def _spotify_scope_list(raw_scope: Optional[str] = None) -> List[str]:

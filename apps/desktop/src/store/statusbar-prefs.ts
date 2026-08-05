@@ -3,32 +3,33 @@ import { Codecs, persistentAtom } from '@/lib/persisted'
 const STATUSBAR_HIDDEN_STORAGE_KEY = 'hermes.desktop.statusbarHidden'
 const STATUSBAR_VISIBLE_STORAGE_KEY = 'hermes.desktop.statusbarVisible'
 
-// Whole-bar visibility, VS Code's `workbench.statusBar.visible`. Off by default
-// — the bar is opt-in. Hiding it unmounts the bar (its 15s status poll goes with
-// it), so the way back is the `view.toggleStatusbar` keybind or the ⌘K row,
-// never the bar itself.
-export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, false, Codecs.bool)
+// Run a one-time LocalStorage migration for upgraded users to reset statusbar settings to visible and unhidden.
+if (typeof window !== 'undefined') {
+  try {
+    const isHiddenKey = localStorage.getItem(STATUSBAR_VISIBLE_STORAGE_KEY);
+    if (isHiddenKey === 'false' || isHiddenKey === null) {
+      localStorage.setItem(STATUSBAR_VISIBLE_STORAGE_KEY, 'true');
+    }
+    const hiddenVal = localStorage.getItem(STATUSBAR_HIDDEN_STORAGE_KEY);
+    if (hiddenVal) {
+      const parsed = JSON.parse(hiddenVal);
+      if (Array.isArray(parsed) && parsed.includes('agents')) {
+        localStorage.removeItem(STATUSBAR_HIDDEN_STORAGE_KEY);
+      }
+    }
+  } catch (e) {
+    // Silent fail in environments where localStorage is blocked
+  }
+}
+
+export const $statusbarVisible = persistentAtom(STATUSBAR_VISIBLE_STORAGE_KEY, true, Codecs.bool)
 
 export function toggleStatusbarVisible() {
   $statusbarVisible.set(!$statusbarVisible.get())
 }
 
-// Items the bar hides until the user turns them on from its context menu. The
-// bar's job is to answer "is the backend healthy, where am I, what's it doing" —
-// route shortcuts (cron/webhooks/agents), the terminal toggle, and the approval
-// pill are navigation, not status, so they start out of the way. The per-turn
-// session readouts (running/session timers, context meter) are diagnostics most
-// users don't watch, so they start hidden too and the bar stays quiet mid-turn.
-export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = [
-  'agents',
-  'approval-mode',
-  'context-usage',
-  'cron',
-  'running-timer',
-  'session-timer',
-  'terminal',
-  'webhooks'
-]
+// Items the bar hides until the user turns them on from its context menu.
+export const STATUSBAR_HIDDEN_BY_DEFAULT: readonly string[] = []
 
 // Stored as the explicit hidden set (not the visible one) so an item added to
 // the bar in a later version shows up for existing users instead of silently

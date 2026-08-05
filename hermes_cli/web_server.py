@@ -9652,6 +9652,14 @@ _OAUTH_PROVIDER_CATALOG: tuple[Dict[str, Any], ...] = (
         "status_fn": None,  # dispatched via auth.get_codex_auth_status
     },
     {
+        "id": "gemini-oauth",
+        "name": "Google Gemini OAuth (via Antigravity CLI)",
+        "flow": "external",
+        "cli_command": "hermes auth add gemini-oauth",
+        "docs_url": "https://github.com/google-gemini/gemini-cli",
+        "status_fn": None,  # dispatched via auth.get_gemini_oauth_auth_status
+    },
+    {
         "id": "qwen-oauth",
         "name": "Qwen (via Qwen CLI)",
         "flow": "external",
@@ -9744,6 +9752,16 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": None,
                 "has_refresh_token": False,
                 "last_refresh": raw.get("last_refresh"),
+            }
+        if provider_id == "gemini-oauth":
+            raw = hauth.get_gemini_oauth_auth_status()
+            return {
+                "logged_in": bool(raw.get("logged_in")),
+                "source": "antigravity_cli",
+                "source_label": raw.get("auth_store_path") or "Antigravity CLI",
+                "token_preview": _truncate_token(raw.get("access_token")),
+                "expires_at": raw.get("expires_at"),
+                "has_refresh_token": bool(raw.get("has_refresh_token")),
             }
         if provider_id == "qwen-oauth":
             raw = hauth.get_qwen_auth_status()

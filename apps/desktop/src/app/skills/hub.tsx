@@ -258,13 +258,27 @@ export function SkillsHub({ query }: SkillsHubProps) {
   // Installed map: sources seeds it, search results patch it (a term can surface
   // installs the sources list didn't feature); the optimistic override wins so a
   // just-(un)installed row reflects its own outcome without the refetch race.
-  const installed = { ...(sourcesQuery.data?.installed ?? {}) }
+  // Normalize all keys to use forward slashes (convert backslashes) to align
+  // with search results.
+  const installed = useMemo(() => {
+    const map: Record<string, any> = {}
+    const rawInstalled = sourcesQuery.data?.installed ?? {}
+    for (const [key, value] of Object.entries(rawInstalled)) {
+      map[key.replace(/\\/g, '/')] = value
+    }
+    for (const q of sourceSearches) {
+      const qInstalled = q.data?.installed ?? {}
+      for (const [key, value] of Object.entries(qInstalled)) {
+        map[key.replace(/\\/g, '/')] = value
+      }
+    }
+    return map
+  }, [sourcesQuery.data, sourceSearches])
 
-  for (const q of sourceSearches) {
-    Object.assign(installed, q.data?.installed ?? {})
+  const isInstalled = (identifier: string) => {
+    const normalized = identifier.replace(/\\/g, '/')
+    return overrides[normalized] ?? Boolean(installed[normalized])
   }
-
-  const isInstalled = (identifier: string) => overrides[identifier] ?? Boolean(installed[identifier])
 
   const sources = sourcesQuery.data?.sources ?? []
   const featured = sourcesQuery.data?.featured ?? []
@@ -359,10 +373,10 @@ export function SkillsHub({ query }: SkillsHubProps) {
           <div className="flex flex-col">
             {listed.map(skill => (
               <HubSkillRow
-                installedName={installed[skill.identifier]?.name ?? null}
+                installedName={installed[skill.identifier.replace(/\\/g, '/')]?.name ?? null}
                 key={skill.identifier}
                 onPreview={openDetail}
-                rawInstalled={Boolean(installed[skill.identifier])}
+                rawInstalled={Boolean(installed[skill.identifier.replace(/\\/g, '/')])}
                 skill={skill}
               />
             ))}

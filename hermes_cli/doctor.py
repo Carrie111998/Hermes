@@ -1373,6 +1373,7 @@ def run_doctor(args):
             get_nous_auth_status_local,
             get_codex_auth_status,
             get_minimax_oauth_auth_status,
+            get_gemini_oauth_auth_status,
         )
 
         # Read-only display: refresh-free snapshot — doctor must never
@@ -1407,6 +1408,14 @@ def run_doctor(args):
             check_ok("MiniMax OAuth", f"(logged in, region={region})")
         else:
             check_warn("MiniMax OAuth", "(not logged in)")
+
+        gemini_oauth_status = get_gemini_oauth_auth_status()
+        if gemini_oauth_status.get("logged_in"):
+            check_ok("Google Gemini OAuth", "(logged in via Antigravity CLI)")
+        else:
+            check_warn("Google Gemini OAuth", "(not logged in)")
+            if gemini_oauth_status.get("error"):
+                check_info(gemini_oauth_status["error"])
     except Exception as e:
         check_warn("Auth provider status", f"(could not check: {e})")
 
