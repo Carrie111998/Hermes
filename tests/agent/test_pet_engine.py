@@ -249,7 +249,18 @@ def test_vscode_terminal_ignores_leaked_graphics_env(monkeypatch):
     monkeypatch.setenv("TERM_PROGRAM", "vscode")
 
     assert render.detect_terminal_graphics() == "unicode"
-    for leaked in ("ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE"):
+    for leaked in ("ITERM_SESSION_ID", "KITTY_WINDOW_ID", "WEZTERM_PANE", "JANET_KITTY_GRAPHICS"):
         monkeypatch.setenv(leaked, "1")
         assert render.detect_terminal_graphics() == "unicode"
         monkeypatch.delenv(leaked)
+
+
+def test_janet_private_graphics_capability(monkeypatch):
+    for key in ("JANET_KITTY_GRAPHICS", "KITTY_WINDOW_ID", "TERM_PROGRAM", "WEZTERM_PANE", "TERM"):
+        monkeypatch.delenv(key, raising=False)
+
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setenv("TERM_PROGRAM", "JaneT")
+    monkeypatch.setenv("JANET_KITTY_GRAPHICS", "1")
+
+    assert render.detect_terminal_graphics() == "kitty"

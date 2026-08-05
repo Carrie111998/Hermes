@@ -67,6 +67,11 @@ def detect_terminal_graphics() -> str:
     if term_program == "vscode":
         return "unicode"
 
+    # JaneT advertises only its bounded Kitty subset through this private flag;
+    # TERM remains truthful for every other terminal capability.
+    if os.environ.get("JANET_KITTY_GRAPHICS") == "1":
+        return "kitty"
+
     # kitty graphics protocol
     if os.environ.get("KITTY_WINDOW_ID") or "kitty" in term or "ghostty" in term:
         return "kitty"
