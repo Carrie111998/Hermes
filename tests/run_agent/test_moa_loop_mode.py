@@ -830,9 +830,15 @@ def test_prepared_aggregator_preserves_reasoning_config(monkeypatch):
     assert captured["reasoning_config"] == expected_reasoning
 
 
-@pytest.mark.parametrize("provider", ["copilot", "github-copilot"])
+@pytest.mark.parametrize(
+    ("provider", "base_url"),
+    [
+        ("copilot", "https://api.githubcopilot.com"),
+        ("github-copilot", "https://models.github.ai/inference"),
+    ],
+)
 def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
-    monkeypatch, provider
+    monkeypatch, provider, base_url
 ):
     from agent import moa_loop
 
@@ -842,7 +848,11 @@ def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        lambda slot: {
+            "provider": slot["provider"],
+            "model": slot["model"],
+            "base_url": base_url,
+        },
     )
     monkeypatch.setattr(
         moa_loop,
@@ -877,18 +887,20 @@ def test_prepared_copilot_aggregator_marks_only_first_call_user_initiated(
 
 
 @pytest.mark.parametrize(
-    "provider",
+    ("provider", "base_url"),
     [
-        "openrouter",
-        "custom:copilot",
-        "custom:github-copilot",
-        "copilot-acp",
-        "github-copilot-acp",
-        "copilot-acp-agent",
+        ("openrouter", "https://openrouter.ai/api/v1"),
+        ("custom:copilot", "https://custom.example/v1"),
+        ("custom:github-copilot", "https://custom.example/v1"),
+        ("copilot", "https://custom.example/v1"),
+        ("github-copilot", "https://custom.example/v1"),
+        ("copilot-acp", ""),
+        ("github-copilot-acp", ""),
+        ("copilot-acp-agent", ""),
     ],
 )
 def test_prepared_non_http_copilot_aggregator_preserves_request_headers(
-    monkeypatch, provider
+    monkeypatch, provider, base_url
 ):
     from agent import moa_loop
 
@@ -899,7 +911,11 @@ def test_prepared_non_http_copilot_aggregator_preserves_request_headers(
     monkeypatch.setattr(
         moa_loop,
         "_slot_runtime",
-        lambda slot: {"provider": slot["provider"], "model": slot["model"]},
+        lambda slot: {
+            "provider": slot["provider"],
+            "model": slot["model"],
+            "base_url": base_url,
+        },
     )
     monkeypatch.setattr(
         moa_loop,

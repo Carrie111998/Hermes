@@ -20,6 +20,7 @@ from typing import Any
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
 from agent.transports import get_transport
+from utils import base_url_host_matches
 
 logger = logging.getLogger(__name__)
 
@@ -1723,9 +1724,14 @@ class MoAChatCompletions:
         from agent.auxiliary_client import _normalize_aux_provider
 
         raw_provider = str(agg_runtime.get("provider") or "").strip()
+        resolved_base_url = str(agg_runtime.get("base_url") or "")
         is_http_copilot = (
             not raw_provider.lower().startswith("custom:")
             and _normalize_aux_provider(raw_provider) == "copilot"
+            and (
+                base_url_host_matches(resolved_base_url, "githubcopilot.com")
+                or base_url_host_matches(resolved_base_url, "models.github.ai")
+            )
         )
         if (
             _agent is not None
