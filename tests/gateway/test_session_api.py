@@ -1,5 +1,6 @@
 """Focused tests for API server session-control endpoints."""
 
+import json
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -124,6 +125,27 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         "context_session_key": "request-key",
         "child_session_id": "request-session",
     }
+
+
+@pytest.mark.asyncio
+async def test_session_fork_persists_branch_marker(adapter, session_db):
+    source_id = session_db.create_session("source-session", "api_server", model="test-model")
+    session_db.append_message(source_id, "user", "first path")
+
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post(f"/api/sessions/{source_id}/fork", json={"title": "Alternative"})
+        assert resp.status == 201
+        fork = (await resp.json())["session"]
+
+    stored_fork = session_db.get_session(fork["id"])
+    assert stored_fork["parent_session_id"] == source_id
+    assert json.loads(stored_fork["model_config"])["_branched_from"] == source_id
+    assert [m["content"] for m in session_db.get_messages(fork["id"])] == ["first path"]
+
+    session_db.reopen_session(source_id)
+    session_db.end_session(source_id, "tui_shutdown")
+    assert fork["id"] in {session["id"] for session in session_db.list_sessions_rich()}
 
 
 @pytest.mark.asyncio
@@ -606,5 +628,4 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
             body = await resp.json()
             assert body["error"]["code"] in {"model_lock_unavailable", "invalid_model_lock", "missing_model"}
     mock_run.assert_not_called()
-
 
