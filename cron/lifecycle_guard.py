@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable / special files.  ValueError: embedded NUL
+        # byte in path (e.g. binary junk from a >1 MB executable read by
+        # _read_script_in_env, #78833).
         return None, False
     try:
         metadata = os.fstat(descriptor)
