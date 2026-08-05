@@ -209,3 +209,148 @@ def test_migration_leaves_ordinary_triage_auto_decomposable(kanban_home: Path) -
     with kb.connect_closing() as conn:
         assert kb.specify_triage_task(conn, tid, body="spec") is True
         assert kb.get_task(conn, tid).status in ("todo", "ready")
+
+
+# ---------------------------------------------------------------------------
+# Legacy DBs whose ``task_events`` still carries drifted TEXT ids (#35096)
+# ---------------------------------------------------------------------------
+
+
+_LEGACY_EVENTS_SQL = """
+CREATE TABLE task_events (
+    id         TEXT PRIMARY KEY,
+    task_id    TEXT NOT NULL,
+    run_id     INTEGER,
+    kind       TEXT NOT NULL,
+    payload    TEXT,
+    created_at INTEGER NOT NULL
+)
+"""
+
+
+def _drift_task_events_to_text_ids(conn: sqlite3.Connection) -> None:
+    """Rewrite ``task_events`` into the pre-#35096 TEXT-id shape.
+
+    Rows keep their chronological order but get ``ev-1 … ev-N`` string ids —
+    which sort *lexicographically*, so ``ev-9`` compares greater than
+    ``ev-10``. ``_rebuild_drifted_tables`` is what repairs this on init.
+    """
+    rows = conn.execute(
+        "SELECT task_id, run_id, kind, payload, created_at "
+        "FROM task_events ORDER BY id"
+    ).fetchall()
+    conn.execute("DROP TABLE task_events")
+    conn.execute(_LEGACY_EVENTS_SQL)
+    for idx, row in enumerate(rows, start=1):
+        conn.execute(
+            "INSERT INTO task_events (id, task_id, run_id, kind, payload, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (f"ev-{idx}", row["task_id"], row["run_id"], row["kind"],
+             row["payload"], row["created_at"]),
+        )
+    conn.commit()
+    assert kb._table_has_drifted(conn, "task_events")
+
+
+def _legacy_triage_row_with_history(
+    conn: sqlite3.Connection, title: str, *, tail_kinds: list[str],
+    filler: int,
+) -> str:
+    """A triage row with a realistic (>= 10 event) history whose final
+    chronological events are ``tail_kinds``.
+
+    ``filler`` pads the history so the caller can place ``tail_kinds`` at exact
+    positions in the *global* event sequence — which is what decides whether
+    the legacy TEXT ids (``ev-9`` vs ``ev-10``) sort the wrong way round.
+    ``create_task`` already emits one ``created`` event, so the row carries
+    ``1 + filler + len(tail_kinds)`` events in total.
+    """
+    tid = kb.create_task(conn, title=title)
+    now = int(time.time())
+    kinds = ["claimed", "heartbeat", "comment", "claimed", "reclaimed",
+             "claimed", "comment", "heartbeat", "comment", "claimed"]
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET status='triage', block_kind='needs_input', "
+            "block_recurrences=? WHERE id=?",
+            (kb.BLOCK_RECURRENCE_LIMIT, tid),
+        )
+        for offset, kind in enumerate(kinds[:filler] + tail_kinds):
+            payload = None
+            if kind == "block_loop_detected":
+                payload = json.dumps({
+                    "reason": "need creds", "kind": "needs_input",
+                    "recurrences": kb.BLOCK_RECURRENCE_LIMIT,
+                    "limit": kb.BLOCK_RECURRENCE_LIMIT,
+                })
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (tid, kind, payload, now + offset),
+            )
+    return tid
+
+
+def test_migration_reads_event_order_after_text_id_drift_is_repaired(
+    kanban_home: Path,
+) -> None:
+    """A legacy drifted board must not have its escalation migration decided by
+    lexicographic TEXT ids.
+
+    On a pre-#35096 board ``task_events.id`` is TEXT, so ``ORDER BY id DESC``
+    picks ``ev-9`` over ``ev-10``. A task whose real history ends
+    ``… block_loop_detected (ev-9), unblocked (ev-10)`` — i.e. an operator
+    already cleared the escalation — then looks *still escalated*. If the
+    escalation migration runs before ``_rebuild_drifted_tables`` repairs the
+    ids, init converts that triage card to ``blocked``; the rebuild then
+    renumbers the events, ``_has_sticky_block`` reads the true tail
+    (``unblocked``) and returns False, and the very next ``recompute_ready``
+    promotes the card to ``ready`` for a worker to claim. That is the
+    resurrection this branch exists to prevent, reached by a different door.
+    """
+    with kb.connect_closing() as conn:
+        # Built first so its events own global ids 1-10: the escalation lands
+        # at ev-9 and the operator's unblock at ev-10, which TEXT ids sort
+        # backwards ('ev-9' > 'ev-10').
+        cleared = _legacy_triage_row_with_history(
+            conn, "operator already unblocked", filler=7,
+            tail_kinds=["block_loop_detected", "unblocked"],
+        )
+        still_escalated = _legacy_triage_row_with_history(
+            conn, "still waiting on a human", filler=8,
+            tail_kinds=["unblocked", "block_loop_detected"],
+        )
+        ordinary = kb.create_task(conn, title="ordinary idea", triage=True)
+        for tid in (cleared, still_escalated):
+            n = conn.execute(
+                "SELECT COUNT(*) AS n FROM task_events WHERE task_id=?", (tid,)
+            ).fetchone()["n"]
+            assert n >= 10, n
+        _drift_task_events_to_text_ids(conn)
+        # Pin the hazard itself: on the drifted table the event log reads
+        # backwards for the cleared row.
+        assert kb._latest_block_event_kind(conn, cleared) == "block_loop_detected"
+
+    kb.init_db()  # activation: rebuild + escalation migration
+
+    with kb.connect_closing() as conn:
+        assert kb._table_has_drifted(conn, "task_events") is False
+        # The cleared row was never ours to touch — it must stay exactly where
+        # the operator left it, and must not be silently made claimable.
+        assert kb.get_task(conn, cleared).status == "triage", (
+            "a legacy row whose newest event is 'unblocked' must not be "
+            "migrated out of triage on the strength of lexicographic id order"
+        )
+        assert kb.has_block_loop_escalation(conn, cleared) is False
+        # The genuinely-escalated row still becomes a sticky block.
+        assert kb.get_task(conn, still_escalated).status == "blocked"
+        assert kb._has_sticky_block(conn, still_escalated) is True
+        assert kb.get_task(conn, ordinary).status == "triage"
+
+        # No dispatcher tick may hand either card back to a worker.
+        for _ in range(3):
+            kb.recompute_ready(conn)
+        assert kb.get_task(conn, cleared).status == "triage"
+        assert kb.get_task(conn, still_escalated).status == "blocked"
+        assert kb.claim_task(conn, cleared, claimer="worker") is None
+        assert kb.claim_task(conn, still_escalated, claimer="worker") is None

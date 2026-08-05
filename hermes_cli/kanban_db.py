@@ -2705,9 +2705,19 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             (new, old),
         )
 
-    _migrate_block_loop_escalations_out_of_triage(conn)
-
+    # Order matters: the escalation migration decides which rows are still
+    # escalated by reading the NEWEST block-lifecycle event (``ORDER BY id
+    # DESC``). On a pre-#35096 board ``task_events.id`` is still TEXT, so that
+    # ordering is lexicographic — ``ev-9`` outranks ``ev-10`` — and a history
+    # ending ``block_loop_detected (ev-9), unblocked (ev-10)`` reads backwards.
+    # ``_rebuild_drifted_tables`` renumbers those ids to chronological
+    # INTEGERs, so it has to run FIRST or the migration converts an
+    # already-unblocked triage card to ``blocked``, the rebuild then makes it
+    # nonsticky again, and the next ``recompute_ready`` promotes it to
+    # ``ready`` for a worker to claim.
     _rebuild_drifted_tables(conn)
+
+    _migrate_block_loop_escalations_out_of_triage(conn)
 
 
 def _migrate_block_loop_escalations_out_of_triage(
