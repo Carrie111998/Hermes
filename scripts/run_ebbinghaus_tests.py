@@ -34,6 +34,7 @@ cmds = [
         "--tb=short",
         "--noconftest",
         "tests/plugins/test_ebbinghaus_plugin.py",
+        "tests/plugins/test_ebbinghaus_experience.py",
         "tests/skills/test_ebbinghaus_memory_skill.py",
     ],
 ]

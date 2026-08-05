@@ -13,14 +13,17 @@ import logging
 import math
 import re
 import sqlite3
+import threading
 import time
 import unicodedata
 import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
+from .experience import EbbinghausExperienceLedger, normalize_query_hash
+from .models import RecallAttemptResult, RetrievalOutcome, RevisionResult
 from .policies import (
     CapacityPolicy,
     DreamPolicy,
@@ -323,11 +326,18 @@ class EbbinghausMemoryStore:
         # In-process cache of dream previews; durable copy lives in dream_previews.
         self._preview_registry: dict[str, dict[str, Any]] = {}
         self._negative_prefetch_suppressed_count = 0
+        self._lock = threading.RLock()
         self._conn = sqlite3.connect(
             str(self.db_path), check_same_thread=False, timeout=10.0
         )
         self._conn.row_factory = sqlite3.Row
         self._init_db()
+        self.experience = EbbinghausExperienceLedger(
+            self._conn,
+            now_fn=self._now,
+            policies=self.policies,
+            lock=self._lock,
+        )
         self._hydrate_preview_registry()
 
     # ------------------------------------------------------------------
@@ -348,6 +358,9 @@ class EbbinghausMemoryStore:
         self._conn.executescript(_BASE_SCHEMA)
         self._migrate()
         self._conn.commit()
+        from .migrations import apply_experience_migrations
+
+        apply_experience_migrations(self._conn, self.db_path, now=self._now())
 
     def _migrate(self) -> None:
         self._conn.execute("BEGIN")
@@ -563,6 +576,11 @@ class EbbinghausMemoryStore:
             "memory_type": row["memory_type"] or "episodic",
             "sleep_rehearsal_count": int(row["sleep_rehearsal_count"] or 0),
             "dream_candidate": bool(row["dream_candidate"]),
+            "access_state": str(row["access_state"] or "accessible"),
+            "belief_status": str(row["belief_status"] or "current"),
+            "belief_id": str(row["belief_id"] or ""),
+            "reactivation_count": int(row["reactivation_count"] or 0),
+            "confidence": round(float(row["confidence"] or 0.0), 3),
         }
         if query_score is not None:
             result["score"] = round(float(query_score), 4)
@@ -655,6 +673,19 @@ class EbbinghausMemoryStore:
             )
             self._conn.commit()
             memory_id = int(cur.lastrowid)
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET belief_id = ?,
+                    belief_version = 1,
+                    belief_status = 'current',
+                    access_state = 'accessible'
+                WHERE memory_id = ?
+                  AND (belief_id IS NULL OR belief_id = '')
+                """,
+                (f"memory-{memory_id}", memory_id),
+            )
+            self._conn.commit()
             return {"memory_id": memory_id, "status": "remembered", **self.get(memory_id)}
         except sqlite3.IntegrityError:
             row = self._conn.execute(
@@ -662,6 +693,32 @@ class EbbinghausMemoryStore:
             ).fetchone()
             if not row:
                 raise
+            belief_status = str(row["belief_status"] or "current")
+            if belief_status == "superseded":
+                belief_id = str(row["belief_id"] or f"memory-{row['memory_id']}")
+                current = self._conn.execute(
+                    """
+                    SELECT memory_id FROM memories
+                    WHERE belief_id = ? AND belief_status = 'current'
+                    ORDER BY belief_version DESC, memory_id DESC
+                    LIMIT 1
+                    """,
+                    (belief_id,),
+                ).fetchone()
+                return {
+                    "status": "historical_duplicate",
+                    "historical_memory_id": int(row["memory_id"]),
+                    "current_memory_id": (
+                        int(current["memory_id"]) if current else None
+                    ),
+                    "belief_id": belief_id,
+                }
+            if belief_status == "retracted":
+                return {
+                    "status": "retracted_duplicate",
+                    "historical_memory_id": int(row["memory_id"]),
+                    "belief_id": str(row["belief_id"] or ""),
+                }
             gain = self._reinforcement_gain(row, kind="duplicate")
             merged_tags = sorted(set(_split_tags(row["tags"])) | set(tag_list))
             self._conn.execute(
@@ -674,7 +731,11 @@ class EbbinghausMemoryStore:
                     last_anchor_at = ?,
                     state = CASE WHEN state = 'archived' THEN 'active' ELSE state END,
                     archived_at = CASE WHEN state = 'archived' THEN NULL ELSE archived_at END,
-                    archive_reason = CASE WHEN state = 'archived' THEN '' ELSE archive_reason END
+                    archive_reason = CASE WHEN state = 'archived' THEN '' ELSE archive_reason END,
+                    access_state = CASE
+                        WHEN state = 'archived' THEN 'reactivated'
+                        ELSE COALESCE(access_state, 'accessible')
+                    END
                 WHERE memory_id = ?
                 """,
                 (
@@ -692,6 +753,141 @@ class EbbinghausMemoryStore:
             memory_id = int(row["memory_id"])
             return {"memory_id": memory_id, "status": "reinforced", **self.get(memory_id)}
 
+    def revise_memory(
+        self,
+        memory_id: int,
+        new_content: str,
+        *,
+        reason: str,
+        evidence: list[dict[str, Any]] | None = None,
+        confidence: float = 0.95,
+        test_query: str = "",
+        source: str = "explicit_correction",
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        content = _normalize_text(new_content)
+        if not content:
+            raise ValueError("new_content must not be empty")
+        old = self.get(int(memory_id))
+        tags = old.get("tags") or []
+        encoded = _encode_memory(content, tags)
+        result = self.experience.revise_memory(
+            memory_id=int(memory_id),
+            normalized_content=content,
+            encoded=encoded,
+            reason=reason,
+            evidence=evidence or [],
+            confidence=float(confidence),
+            test_query=test_query,
+            source=source,
+            session_id=session_id,
+            tags=_join_tags(tags),
+            salience=float(old.get("salience") or 0.65),
+            valence=float(old.get("valence") or 0.0),
+            memory_type=str(old.get("memory_type") or "episodic"),
+        )
+        if isinstance(result, RevisionResult):
+            return {
+                "status": "revised",
+                "belief_id": result.belief_id,
+                "old_memory_id": result.old_memory_id,
+                "new_memory_id": result.new_memory_id,
+                "old_version": result.old_version,
+                "new_version": result.new_version,
+                "contested_memory_ids": list(result.contested_memory_ids),
+                "queued_rehearsal_id": result.queued_rehearsal_id,
+                **self.get(result.new_memory_id),
+            }
+        return dict(result)
+
+    def retract_memory(
+        self,
+        memory_id: int,
+        *,
+        reason: str,
+        session_id: str = "",
+    ) -> dict[str, Any]:
+        return self.experience.retract_memory(
+            memory_id=int(memory_id),
+            reason=reason,
+            session_id=session_id,
+        )
+
+    def belief_history(
+        self,
+        *,
+        memory_id: int | None = None,
+        belief_id: str = "",
+    ) -> list[dict[str, Any]]:
+        return self.experience.belief_history(
+            memory_id=memory_id,
+            belief_id=belief_id,
+        )
+
+    def run_correction_check(
+        self,
+        *,
+        rehearsal_id: int | None = None,
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        return self.experience.run_correction_check(
+            recall_fn=self.recall_with_experience,
+            rehearsal_id=rehearsal_id,
+            limit=limit,
+        )
+
+    def association_preview(self, *, limit: int | None = None) -> dict[str, Any]:
+        lim = (
+            int(self.policies.insight.association_limit)
+            if limit is None
+            else int(limit)
+        )
+        return self.experience.association_preview(limit=lim)
+
+    def propose_insight(
+        self,
+        *,
+        association_id: str,
+        hypothesis: str,
+        source_memory_ids: Sequence[int],
+        initial_confidence: float = 0.55,
+    ) -> dict[str, Any]:
+        return self.experience.propose_insight(
+            association_id=association_id,
+            hypothesis=hypothesis,
+            source_memory_ids=source_memory_ids,
+            initial_confidence=initial_confidence,
+        )
+
+    def validate_insight(
+        self,
+        *,
+        candidate_id: str,
+        validation_method: str,
+        evidence: Sequence[Mapping[str, Any]],
+        validated_confidence: float,
+        summary: str = "",
+    ) -> dict[str, Any]:
+        result = self.experience.validate_insight(
+            candidate_id=candidate_id,
+            validation_method=validation_method,
+            evidence=evidence,
+            validated_confidence=validated_confidence,
+            summary=summary,
+            remember_fn=lambda content, **kwargs: self.remember(content, **kwargs),
+        )
+        return {
+            "status": result.status.value,
+            "candidate_id": result.candidate_id,
+            "promoted_memory_id": result.promoted_memory_id,
+            "contested_source_ids": list(result.contested_source_ids),
+        }
+
+    def reject_insight(self, *, candidate_id: str, reason: str) -> dict[str, Any]:
+        return self.experience.reject_insight(
+            candidate_id=candidate_id, reason=reason
+        )
+
     def _protected_category_breakdown(self) -> dict[str, int]:
         breakdown: dict[str, int] = {}
         rows = self._conn.execute(
@@ -708,13 +904,31 @@ class EbbinghausMemoryStore:
 
     def _eviction_rank(self, row: sqlite3.Row) -> tuple:
         """Lower tuple sorts first = better eviction candidate."""
+        access = str(row["access_state"] or "accessible")
+        belief = str(row["belief_status"] or "current")
+        if belief in {"contested", "superseded", "retracted"}:
+            tier = -1
+        elif access == "latent":
+            tier = 0
+        elif access == "accessible":
+            tier = 1
+        else:
+            tier = 2
         retention = self._retention(row)
+        reactivated_at = _timestamp_value(
+            row["last_reactivated_at"],
+            default=_timestamp_value(row["created_at"]),
+        )
+        anchor = _timestamp_value(
+            row["last_anchor_at"], default=_timestamp_value(row["created_at"])
+        )
         return (
+            tier,
             retention,
             float(row["salience"] or 0.0),
             int(row["retrieval_count"] or 0),
             int(row["rehearsal_count"] or 0),
-            _timestamp_value(row["last_anchor_at"], default=_timestamp_value(row["created_at"])),
+            reactivated_at if access == "reactivated" else anchor,
             int(row["memory_id"]),
         )
 
@@ -776,63 +990,337 @@ class EbbinghausMemoryStore:
         reinforce: bool = False,
         include_archived: bool = False,
     ) -> list[dict]:
+        result = self.recall_with_experience(
+            query,
+            limit=limit,
+            min_score=min_score,
+            reinforce=reinforce,
+            include_archived=include_archived,
+            include_history=False,
+            allow_rescue=None,
+            track=True,
+        )
+        return result.results
+
+    def recall_with_experience(
+        self,
+        query: str,
+        *,
+        limit: int = 5,
+        min_score: float = 0.12,
+        reinforce: bool = False,
+        include_archived: bool = False,
+        include_history: bool = False,
+        allow_rescue: bool | None = None,
+        track: bool = True,
+    ) -> RecallAttemptResult:
+        """Cue recall with optional miss tracking, rescue, and historical access."""
         query = _normalize_text(query)
         if not query:
-            return []
+            return RecallAttemptResult(
+                query=query,
+                outcome=RetrievalOutcome.MISS,
+                results=[],
+            )
+
         query_counts = _cue_counts(query)
         query_lower = query.lower()
+        query_cues = _top_cues(query_counts, limit=32)
+        query_hash = normalize_query_hash(query)
+        excerpt = (
+            query[:240]
+            if self.policies.experience.record_query_excerpt
+            else ""
+        )
+        xp = self.policies.experience
+        rescue_allowed = (
+            bool(xp.rescue_enabled)
+            if allow_rescue is None
+            else bool(allow_rescue)
+        )
 
-        if include_archived:
-            rows = self._conn.execute("SELECT * FROM memories").fetchall()
-        else:
-            rows = self._conn.execute(
-                "SELECT * FROM memories WHERE state = 'active'"
-            ).fetchall()
-
+        rows = self._conn.execute("SELECT * FROM memories").fetchall()
         scored: list[dict] = []
+        best_score = 0.0
         for row in rows:
-            encoded = self._decode(row["encoded"])
-            memory_counts = Counter(encoded.get("cue_vector") or {})
-            tags = _split_tags(row["tags"])
-            tag_counts = _cue_counts(tags)
-            lexical = _cosine(query_counts, memory_counts + tag_counts)
-            substring = 0.35 if query_lower in str(row["content"]).lower() else 0.0
-            tag_bonus = 0.12 if set(_split_tags(query)) & set(tags) else 0.0
-            if lexical <= 0 and substring <= 0 and tag_bonus <= 0:
-                continue
+            state = str(row["state"] or "active")
+            access_state = str(row["access_state"] or "accessible")
+            belief_status = str(row["belief_status"] or "current")
 
-            retention = self._retention(row)
-            salience = float(row["salience"] or 0.0)
-            rehearsal_bonus = min(
-                0.08, math.log1p(int(row["rehearsal_count"] or 0)) * 0.025
+            historical = False
+            if include_history and belief_status in {
+                "superseded",
+                "retracted",
+                "contested",
+                "unverified",
+            }:
+                historical = True
+            else:
+                if state != "active" and not include_archived:
+                    continue
+                if include_archived and state not in {"active", "archived"}:
+                    continue
+                if state == "active" and access_state not in {"accessible", "reactivated"}:
+                    continue
+                if (
+                    state == "archived"
+                    and access_state not in {"accessible", "reactivated", "latent"}
+                ):
+                    continue
+                if belief_status not in {"current", "context_dependent"}:
+                    continue
+
+            score = self._score_row_against_query(
+                row, query_counts=query_counts, query_lower=query_lower, query=query
             )
-            score = (
-                max(lexical, substring) * 0.68
-                + retention * 0.18
-                + salience * 0.08
-                + tag_bonus
-                + rehearsal_bonus
-            )
+            if score is None:
+                continue
+            best_score = max(best_score, float(score))
             if score < min_score:
                 continue
-            scored.append(
-                self._row_to_result(row, query_score=score, retention=retention)
-            )
+            retention = self._retention(row)
+            item = self._row_to_result(row, query_score=score, retention=retention)
+            if historical:
+                item["historical"] = True
+            scored.append(item)
 
         scored.sort(
             key=lambda item: (item["score"], item["retention"], item["salience"]),
             reverse=True,
         )
-        results = scored[: max(1, int(limit))]
+        results = scored[: max(1, int(limit))] if scored else []
 
-        if reinforce:
+        if results and reinforce and not any(r.get("historical") for r in results):
             for result in results:
                 self._reinforce_retrieval(result["memory_id"])
             results = [
                 self.get(r["memory_id"]) | {"score": r["score"]}
                 for r in results
             ]
-        return results
+
+        if results:
+            if (
+                track
+                and xp.enabled
+                and xp.record_hits
+            ):
+                self.experience.record_event(
+                    "retrieval_hit",
+                    memory_id=int(results[0]["memory_id"]),
+                    payload={
+                        "query_hash": query_hash,
+                        "direct_best_score": best_score,
+                        "result_count": len(results),
+                    },
+                )
+            return RecallAttemptResult(
+                query=query,
+                outcome=RetrievalOutcome.HIT,
+                results=results,
+                direct_best_score=best_score,
+            )
+
+        attempt_id = None
+        if track and xp.enabled:
+            attempt_id = self.experience.record_retrieval_miss(
+                query_hash=query_hash,
+                query_excerpt=excerpt,
+                query_cues=query_cues,
+                direct_best_score=best_score,
+            )
+
+        if xp.enabled and rescue_allowed:
+            rescued = self._attempt_rescue(
+                query=query,
+                query_counts=query_counts,
+                query_lower=query_lower,
+                query_cues=query_cues,
+                query_hash=query_hash,
+                direct_best_score=best_score,
+                reinforce=reinforce,
+                attempt_id=attempt_id,
+            )
+            if rescued is not None:
+                return rescued
+
+        return RecallAttemptResult(
+            query=query,
+            outcome=RetrievalOutcome.MISS,
+            results=[],
+            attempt_id=attempt_id,
+            direct_best_score=best_score,
+        )
+
+    def _score_row_against_query(
+        self,
+        row: sqlite3.Row,
+        *,
+        query_counts: Counter,
+        query_lower: str,
+        query: str,
+    ) -> float | None:
+        encoded = self._decode(row["encoded"])
+        memory_counts = Counter(encoded.get("cue_vector") or {})
+        tags = _split_tags(row["tags"])
+        tag_counts = _cue_counts(tags)
+        lexical = _cosine(query_counts, memory_counts + tag_counts)
+        substring = 0.35 if query_lower in str(row["content"]).lower() else 0.0
+        tag_bonus = 0.12 if set(_split_tags(query)) & set(tags) else 0.0
+        if lexical <= 0 and substring <= 0 and tag_bonus <= 0:
+            return None
+        retention = self._retention(row)
+        salience = float(row["salience"] or 0.0)
+        rehearsal_bonus = min(
+            0.08, math.log1p(int(row["rehearsal_count"] or 0)) * 0.025
+        )
+        return (
+            max(lexical, substring) * 0.68
+            + retention * 0.18
+            + salience * 0.08
+            + tag_bonus
+            + rehearsal_bonus
+        )
+
+    def _attempt_rescue(
+        self,
+        *,
+        query: str,
+        query_counts: Counter,
+        query_lower: str,
+        query_cues: Sequence[str],
+        query_hash: str,
+        direct_best_score: float,
+        reinforce: bool,
+        attempt_id: int | None,
+    ) -> RecallAttemptResult | None:
+        xp = self.policies.experience
+        candidates: list[tuple[float, sqlite3.Row]] = []
+        for state_filter in ("active", "archived"):
+            rows = self._conn.execute(
+                """
+                SELECT * FROM memories
+                WHERE state = ?
+                  AND access_state = 'latent'
+                  AND belief_status IN ('current', 'context_dependent')
+                """,
+                (state_filter,),
+            ).fetchall()
+            for row in rows:
+                score = self._score_row_against_query(
+                    row,
+                    query_counts=query_counts,
+                    query_lower=query_lower,
+                    query=query,
+                )
+                if score is None or score < float(xp.rescue_min_score):
+                    continue
+                candidates.append((float(score), row))
+            if candidates:
+                break
+
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        rescue_score, row = candidates[0]
+        memory_id = int(row["memory_id"])
+        now = self._now()
+        created = _timestamp_value(row["created_at"], default=now)
+        age_days = max(0.0, (now - created) / 86400.0)
+        resolution_gain = max(0.0, float(rescue_score) - float(direct_best_score))
+        surprise = _clamp(
+            0.50 * (1.0 - float(direct_best_score))
+            + 0.30 * resolution_gain
+            + 0.20 * min(1.0, age_days / 90.0),
+            0.0,
+            1.0,
+        )
+
+        with self._lock:
+            self._conn.execute(
+                """
+                UPDATE memories
+                SET state = 'active',
+                    access_state = 'reactivated',
+                    archived_at = NULL,
+                    archive_reason = '',
+                    reactivation_count = COALESCE(reactivation_count, 0) + 1,
+                    last_reactivated_at = ?,
+                    last_retrieved_at = ?,
+                    retrieval_count = retrieval_count + ?,
+                    updated_at = ?,
+                    last_anchor_at = CASE WHEN ? > 0 THEN ? ELSE last_anchor_at END
+                WHERE memory_id = ?
+                """,
+                (
+                    now,
+                    now,
+                    1 if reinforce else 0,
+                    now,
+                    1 if reinforce else 0,
+                    now,
+                    memory_id,
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT OR IGNORE INTO memory_relations(
+                    source_memory_id, target_memory_id, relation_type, metadata, created_at
+                ) VALUES (?, ?, 'triggered_recall', ?, ?)
+                """,
+                (
+                    memory_id,
+                    memory_id,
+                    json.dumps({"query_hash": query_hash}, ensure_ascii=False),
+                    now,
+                ),
+            )
+            self._conn.commit()
+
+        self.experience.record_event(
+            "memory_reactivated",
+            memory_id=memory_id,
+            belief_id=str(row["belief_id"] or ""),
+            payload={
+                "rescue_score": rescue_score,
+                "direct_best_score": direct_best_score,
+                "surprise": surprise,
+                "query_hash": query_hash,
+            },
+        )
+        resolved = self.experience.resolve_retrieval_miss(
+            current_query_hash=query_hash,
+            current_cues=query_cues,
+            rescued_memory_id=memory_id,
+            rescue_score=rescue_score,
+            direct_best_score=direct_best_score,
+        )
+        matched_miss_id = None
+        if resolved:
+            matched_miss_id = int(resolved.get("matched_miss_id") or resolved.get("attempt_id") or 0) or None
+            if "surprise" in resolved:
+                surprise = float(resolved["surprise"])
+
+        result = self.get(memory_id) | {"score": round(float(rescue_score), 4)}
+        state_note = (
+            "[Memory state]\n"
+            "A previously inaccessible memory was recovered from a latent or archived trace.\n"
+            "Treat it as recalled context, not verified truth.\n"
+            "Outcome: forgotten_then_recalled\n"
+            f"Surprise: {surprise:.2f}"
+        )
+        return RecallAttemptResult(
+            query=query,
+            outcome=RetrievalOutcome.RESCUED,
+            results=[result],
+            attempt_id=attempt_id,
+            matched_miss_id=matched_miss_id,
+            rescued_memory_id=memory_id,
+            direct_best_score=direct_best_score,
+            rescue_score=float(rescue_score),
+            surprise=float(surprise),
+            state_note=state_note,
+        )
 
     # ------------------------------------------------------------------
     # rehearse
@@ -1006,12 +1494,19 @@ class EbbinghausMemoryStore:
         now = self._now()
         rehearsed: list[int] = []
         forgotten_ids: list[int] = []
+        latent_ids: list[int] = []
         archived_ids: list[int] = []
         dream_candidate_ids: list[int] = []
         negative_rehearsal_suppressed: list[int] = []
         protected_skipped: list[int] = []
         reviewed_ids: list[int] = []
         processed = 0
+
+        xp = self.policies.experience
+        functional = bool(xp.enabled and xp.functional_forgetting)
+        latent_threshold = (
+            float(xp.latent_retention_threshold) if functional else forget_threshold
+        )
 
         for retention, salience, row in scored:
             if processed >= limit:
@@ -1022,6 +1517,7 @@ class EbbinghausMemoryStore:
             valence = float(row["valence"] or 0.0)
             prot = self._is_row_protected(row)
             src = int(row["sleep_rehearsal_count"] or 0)
+            access_state = str(row["access_state"] or "accessible")
 
             if prot:
                 if (
@@ -1052,8 +1548,11 @@ class EbbinghausMemoryStore:
             if strongly_negative:
                 # Forget/archive first when retention is exhausted; otherwise
                 # allow a small number of attenuated sleep rehearsals.
-                if retention <= forget_threshold:
+                if retention <= latent_threshold and salience < salience_keep_threshold:
                     forgotten_ids.append(mid)
+                    if functional and access_state in {"accessible", "reactivated"}:
+                        self._mark_memory_latent(mid, now=now)
+                        latent_ids.append(mid)
                     self._conn.execute(
                         "UPDATE memories SET dream_candidate = 1 WHERE memory_id = ?",
                         (mid,),
@@ -1085,8 +1584,11 @@ class EbbinghausMemoryStore:
 
             # Instruction §8.6: forget before rehearse so capped high-salience
             # traces can leave the active set once retention collapses.
-            if retention <= forget_threshold:
+            if retention <= latent_threshold and salience < salience_keep_threshold:
                 forgotten_ids.append(mid)
+                if functional and access_state in {"accessible", "reactivated"}:
+                    self._mark_memory_latent(mid, now=now)
+                    latent_ids.append(mid)
             elif (
                 retention <= rehearse_threshold
                 and salience >= salience_keep_threshold
@@ -1118,7 +1620,7 @@ class EbbinghausMemoryStore:
                 dream_candidate_ids.append(mid)
 
         pruned_ids: list[int] = []
-        if forgotten_ids:
+        if forgotten_ids and not functional:
             if resolved_prune == "archive":
                 for mid in forgotten_ids:
                     self._archive_memory(mid, reason="sleep-forget", now=now)
@@ -1129,6 +1631,23 @@ class EbbinghausMemoryStore:
                     [(mid,) for mid in forgotten_ids],
                 )
                 pruned_ids.extend(forgotten_ids)
+        elif functional:
+            archived_from_latent = self._archive_exhausted_latent(
+                now, skip_ids=set(latent_ids)
+            )
+            for mid in archived_from_latent:
+                if mid not in forgotten_ids:
+                    forgotten_ids.append(mid)
+                archived_ids.append(mid)
+
+        self._archive_noncurrent_beliefs(now)
+
+        correction_report = {"passed": [], "failed": []}
+        if xp.enabled and int(xp.correction_rehearsals_per_sleep) > 0:
+            correction_report = self.run_correction_check(
+                rehearsal_id=None,
+                limit=int(xp.correction_rehearsals_per_sleep),
+            )
 
         capacity_archived = self._enforce_capacity_ceiling(now)
 
@@ -1152,8 +1671,13 @@ class EbbinghausMemoryStore:
             "prune_mode": resolved_prune,
             "rehearsed": rehearsed,
             "forgotten": forgotten_ids,
+            "latent": latent_ids,
             "archived": archived_ids,
             "pruned": pruned_ids,
+            "correction_rehearsals": {
+                "passed": list(correction_report.get("passed") or []),
+                "failed": list(correction_report.get("failed") or []),
+            },
             "negative_rehearsal_suppressed": negative_rehearsal_suppressed,
             "dream_candidates": dream_candidate_ids,
             "capacity_archived": capacity_archived,
@@ -1172,11 +1696,89 @@ class EbbinghausMemoryStore:
             """
             UPDATE memories
             SET state = 'archived', archived_at = ?, archive_reason = ?,
-                updated_at = ?
+                updated_at = ?,
+                access_state = CASE
+                    WHEN COALESCE(access_state, 'accessible') = 'accessible'
+                    THEN 'latent'
+                    ELSE access_state
+                END
             WHERE memory_id = ? AND state = 'active'
             """,
             (now, reason, now, memory_id),
         )
+
+    def _mark_memory_latent(self, memory_id: int, *, now: float) -> None:
+        self._conn.execute(
+            """
+            UPDATE memories
+            SET access_state = 'latent',
+                latent_at = COALESCE(latent_at, ?),
+                updated_at = ?
+            WHERE memory_id = ?
+              AND COALESCE(access_state, 'accessible') IN ('accessible', 'reactivated')
+            """,
+            (now, now, memory_id),
+        )
+        belief = self._conn.execute(
+            "SELECT belief_id FROM memories WHERE memory_id = ?",
+            (memory_id,),
+        ).fetchone()
+        self.experience.record_event(
+            "memory_became_latent",
+            memory_id=int(memory_id),
+            belief_id=str(belief["belief_id"] if belief else "") or "",
+            payload={"reason": "sleep-functional-forgetting"},
+        )
+
+    def _archive_exhausted_latent(
+        self, now: float, *, skip_ids: set[int] | None = None
+    ) -> list[int]:
+        xp = self.policies.experience
+        skip = skip_ids or set()
+        archived: list[int] = []
+        rows = self._conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE state = 'active' AND access_state = 'latent'
+            """
+        ).fetchall()
+        max_latent_age = float(xp.latent_archive_after_days) * 86400.0
+        for row in rows:
+            mid = int(row["memory_id"])
+            if mid in skip or self._is_row_protected(row):
+                continue
+            retention = self._retention(row)
+            latent_at = _timestamp_value(row["latent_at"], default=now)
+            aged = (now - latent_at) >= max_latent_age
+            if retention <= float(xp.archive_retention_threshold) or aged:
+                self._archive_memory(mid, reason="latent-exhausted", now=now)
+                self._conn.execute(
+                    "UPDATE memories SET access_state = 'latent' WHERE memory_id = ?",
+                    (mid,),
+                )
+                archived.append(mid)
+        return archived
+
+    def _archive_noncurrent_beliefs(self, now: float) -> list[int]:
+        archived: list[int] = []
+        rows = self._conn.execute(
+            """
+            SELECT memory_id, tags FROM memories
+            WHERE state = 'active'
+              AND belief_status IN ('contested', 'superseded', 'retracted')
+            """
+        ).fetchall()
+        for row in rows:
+            if self._is_row_protected(row):
+                continue
+            mid = int(row["memory_id"])
+            self._archive_memory(mid, reason="noncurrent-belief", now=now)
+            self._conn.execute(
+                "UPDATE memories SET access_state = 'latent' WHERE memory_id = ?",
+                (mid,),
+            )
+            archived.append(mid)
+        return archived
 
     def _enforce_capacity_ceiling(self, now: float) -> list[int]:
         cp = self.policies.capacity
@@ -1593,6 +2195,53 @@ class EbbinghausMemoryStore:
             ).fetchall()
         return [self._row_to_result(row, query_score=None) for row in rows]
 
+    def list_events(
+        self,
+        *,
+        event_type: str = "",
+        memory_id: int | None = None,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if event_type:
+            clauses.append("event_type = ?")
+            params.append(str(event_type))
+        if memory_id is not None:
+            clauses.append("memory_id = ?")
+            params.append(int(memory_id))
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        rows = self._conn.execute(
+            f"""
+            SELECT event_id, event_type, memory_id, related_memory_id, belief_id,
+                   session_id, payload, created_at
+            FROM memory_events
+            {where}
+            ORDER BY created_at DESC, event_id DESC
+            LIMIT ?
+            """,
+            (*params, max(1, int(limit))),
+        ).fetchall()
+        out: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                payload = {}
+            out.append(
+                {
+                    "event_id": int(row["event_id"]),
+                    "event_type": str(row["event_type"] or ""),
+                    "memory_id": row["memory_id"],
+                    "related_memory_id": row["related_memory_id"],
+                    "belief_id": str(row["belief_id"] or ""),
+                    "session_id": str(row["session_id"] or ""),
+                    "payload": payload,
+                    "created_at": float(row["created_at"] or 0.0),
+                }
+            )
+        return out
+
     def stats(self) -> dict:
         active_row = self._conn.execute(
             """
@@ -1695,6 +2344,55 @@ class EbbinghausMemoryStore:
             "warning": warning,
             "db_path": str(self.db_path),
             "dreaming_enabled": self.policies.dreaming.enabled,
+            **self._experience_stats(),
+        }
+
+    def _experience_stats(self) -> dict[str, Any]:
+        if not self.policies.experience.enabled:
+            return {"experience_enabled": False}
+        latent = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM memories WHERE access_state = 'latent'"
+        ).fetchone()["c"]
+        reactivated = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM memories WHERE access_state = 'reactivated'"
+        ).fetchone()["c"]
+        unresolved_miss = self._conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM retrieval_attempts
+            WHERE outcome = 'miss' AND resolved_at IS NULL
+            """
+        ).fetchone()["c"]
+        completed = self._conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM correction_rehearsals
+            WHERE status IN ('passed', 'failed')
+            """
+        ).fetchone()["c"]
+        failed = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM correction_rehearsals WHERE status = 'failed'"
+        ).fetchone()["c"]
+        candidates = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'candidate'"
+        ).fetchone()["c"]
+        validated = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'validated'"
+        ).fetchone()["c"]
+        rejected = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'rejected'"
+        ).fetchone()["c"]
+        return {
+            "experience_enabled": True,
+            "latent_count": int(latent),
+            "reactivated_count": int(reactivated),
+            "unresolved_miss_count": int(unresolved_miss),
+            "correction_rehearsal_completed_count": int(completed),
+            "correction_rehearsal_failed_count": int(failed),
+            "corrected_error_recurrence_rate": round(
+                float(failed) / max(1, int(completed)), 4
+            ),
+            "insight_candidate_count": int(candidates),
+            "insight_validated_count": int(validated),
+            "insight_rejected_count": int(rejected),
         }
 
 

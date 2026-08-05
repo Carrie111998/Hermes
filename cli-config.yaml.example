@@ -751,6 +751,30 @@ memory:
 #       min_source_count: 2
 #       negative_summary_max_valence: -0.20
 #       archive_sources_after_apply: true
+#     experience:
+#       enabled: false            # keep legacy behavior until explicitly enabled
+#       functional_forgetting: true
+#       latent_retention_threshold: 0.10
+#       archive_retention_threshold: 0.03
+#       latent_archive_after_days: 30
+#       rescue_enabled: true
+#       rescue_min_score: 0.24
+#       miss_resolution_days: 90
+#       record_query_excerpt: false
+#       record_hits: false
+#       max_unresolved_misses: 2000
+#       correction_rehearsals_per_sleep: 10
+#     revision:
+#       enabled: true
+#       auto_archive_superseded: true
+#       contest_dependents: true
+#       protected_revision_allowed: true
+#     insight:
+#       enabled: true
+#       require_validation: true
+#       association_limit: 8
+#       candidate_ttl_days: 30
+#       validation_min_confidence: 0.65
 
 # =============================================================================
 # Session Reset Policy (Messaging Platforms)
