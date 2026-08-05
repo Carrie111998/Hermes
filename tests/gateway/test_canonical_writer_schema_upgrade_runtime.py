@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -432,6 +433,77 @@ def test_exact_target_gate_is_a_crash_recovery_replay() -> None:
     assert validated["state"] == "exact_target_stopped_upgrade_replay_ready"
     assert receipt["state"] == "already_exact_target"
     assert receipt["mutation_applied"] is False
+
+
+def test_prepare_runtime_allows_helper_only_before_full_target_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = SchemaContractAsset.from_bytes(ASSET.read_bytes()).contract
+    artifact = _load_source_artifacts_for_tests()["base_migration"]
+    plan = SchemaUpgradePlan.build(
+        release_revision=REVISION,
+        target=target,
+        artifact=artifact,
+    )
+    calls: list[dict[str, object]] = []
+
+    def observe(_session, **kwargs):
+        calls.append(dict(kwargs))
+        return {"state": "exact_installed", "observation_sha256": "7" * 64}
+
+    session = SimpleNamespace(close=lambda: None)
+    writer_config = SimpleNamespace(user="canonical_brain_writer")
+    dependencies = SimpleNamespace(
+        writer_config=lambda: writer_config,
+        now=lambda: 100,
+        collect_hba=lambda *_args, **_kwargs: SimpleNamespace(sha256="8" * 64),
+        open_session=lambda _config: session,
+        random_bytes=lambda _length: b"x" * 32,
+    )
+    base = SimpleNamespace(
+        revision=REVISION,
+        target=target,
+        dependencies=dependencies,
+        initial_release_binding={
+            "release_manifest_sha256": "1" * 64,
+            "stopped_release_receipt_file_sha256": "2" * 64,
+            "stopped_release_receipt_sha256": "3" * 64,
+            "release_artifact_sha256": "4" * 64,
+            "python_version": reconciliation_runtime.EXPECTED_PYTHON_VERSION,
+            "interpreter_sha256": "5" * 64,
+            "activation_inventory_sha256": "6" * 64,
+        },
+        initial_host_state={"state_sha256": "9" * 64},
+        initial_services_state={"state_sha256": "a" * 64},
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_load_sealed_artifacts",
+        lambda _revision: {runtime.BASE_ARTIFACT_NAME: artifact},
+    )
+    monkeypatch.setattr(
+        runtime.control_bootstrap,
+        "_observe_foundation",
+        observe,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "collect_schema_contract",
+        lambda *_args, **_kwargs: SimpleNamespace(sha256=target.sha256),
+    )
+
+    context = runtime._prepare_runtime(
+        runtime._RuntimeDependencies(prepare_base=lambda _deps: base)
+    )
+
+    assert context.gate["state"] == "exact_target_stopped_upgrade_replay_ready"
+    assert calls == [
+        {
+            "phase": "post_cleanup",
+            "observed_at_unix": dependencies.now,
+            "allow_routeback_helper_present": True,
+        }
+    ]
 
 
 def test_cleanup_rejects_operation_ledger_not_causally_bound() -> None:

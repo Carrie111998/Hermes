@@ -875,13 +875,28 @@ def _validate_install_claim(
     return raw
 
 
-def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
+def _validate_observation(
+    value: Any,
+    *,
+    phase: str,
+    allow_routeback_helper_present: bool = False,
+) -> Mapping[str, Any]:
     code = "schema_reconciliation_control_observation_invalid"
     raw = _hashed_mapping(
         value,
         fields=_OBSERVATION_FIELDS,
         digest_field="observation_sha256",
         code=code,
+    )
+    helper_absent = raw.get("helper_absent")
+    helper_same_name_count = raw.get("helper_same_name_count")
+    helper_boundary_exact = (
+        helper_absent is True and helper_same_name_count == 0
+    ) or (
+        allow_routeback_helper_present
+        and phase == "post_cleanup"
+        and helper_absent is False
+        and helper_same_name_count == 1
     )
     if (
         phase not in {"before_install", "after_install", "post_cleanup"}
@@ -916,10 +931,9 @@ def _validate_observation(value: Any, *, phase: str) -> Mapping[str, Any]:
         or type(raw.get("executor_owned_object_count")) is not int
         or type(raw.get("executor_acl_dependency_count")) is not int
         or type(raw.get("foundation_exact")) is not bool
-        or type(raw.get("helper_absent")) is not bool
-        or raw.get("helper_absent") is not True
-        or type(raw.get("helper_same_name_count")) is not int
-        or raw.get("helper_same_name_count") != 0
+        or type(helper_absent) is not bool
+        or type(helper_same_name_count) is not int
+        or not helper_boundary_exact
         or raw.get("non_template_database_inventory_exact") is not True
         or raw.get("all_connectable_database_inventory_exact") is not True
         or raw.get("latent_provider_exception_exact") is not True
@@ -2881,6 +2895,7 @@ def _parse_foundation_observation_result(
     *,
     phase: str,
     observed_at_unix: int,
+    allow_routeback_helper_present: bool = False,
 ) -> Mapping[str, Any]:
     code = "schema_reconciliation_control_database_observation_invalid"
     if (
@@ -2934,10 +2949,25 @@ def _parse_foundation_observation_result(
     except (TypeError, ValueError) as exc:
         raise ControlBootstrapError(code) from exc
     if state == "drift":
-        _fail(_foundation_drift_error_code(
+        drift_code = _foundation_drift_error_code(
             row,
             control_admin_expected=phase in {"before_install", "after_install"},
-        ))
+        )
+        target_helper_replay = (
+            allow_routeback_helper_present
+            and phase == "post_cleanup"
+            and drift_code
+            == "schema_reconciliation_control_routeback_helper_present"
+            and helper_absent == "false"
+            and helper_same_name_count == "1"
+        )
+        if not target_helper_replay:
+            _fail(drift_code)
+        # The control foundation itself is exact.  The one route-back helper
+        # belongs to the target writer schema and is validated immediately by
+        # the schema-upgrade contract collector before a gate can be emitted.
+        state = "exact_installed"
+        foundation_exact = "true"
     parsed_control_admin_count = _parse_decimal(control_admin_count, code)
     parsed_attributes_mask = _parse_decimal(
         control_admin_attributes_mask, code
@@ -3047,6 +3077,7 @@ def _parse_foundation_observation_result(
     return _validate_observation(
         _hashed(unsigned, "observation_sha256"),
         phase=phase,
+        allow_routeback_helper_present=allow_routeback_helper_present,
     )
 
 
@@ -3097,6 +3128,7 @@ def _observe_foundation(
     *,
     phase: str,
     observed_at_unix: int | Callable[[], int],
+    allow_routeback_helper_present: bool = False,
 ) -> Mapping[str, Any]:
     """Observe one fresh SERIALIZABLE snapshot under the deployment lock."""
 
@@ -3146,6 +3178,7 @@ def _observe_foundation(
             result,
             phase=phase,
             observed_at_unix=captured_at_unix,
+            allow_routeback_helper_present=allow_routeback_helper_present,
         )
     except BaseException as exc:
         primary = exc

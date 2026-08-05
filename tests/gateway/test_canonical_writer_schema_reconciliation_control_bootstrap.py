@@ -1011,6 +1011,97 @@ def test_fixed_observation_parser_binds_authenticated_session_and_exact_shape() 
     assert session.closed is False
 
 
+def test_schema_upgrade_replay_accepts_only_one_target_routeback_helper() -> None:
+    values = {
+        "database_name": bootstrap.foundation.SQL_DATABASE,
+        "version_num": "180002",
+        "session_user_name": bootstrap.foundation.SQL_USER,
+        "control_admin_count": "0",
+        "control_admin_identity_exact": "false",
+        "control_admin_attributes_exact": "false",
+        "control_admin_attributes_mask": "0",
+        "control_admin_memberships_exact": "false",
+        "control_admin_memberships_mask": "0",
+        "control_admin_forward_roles_exact": "false",
+        "control_admin_role_exact": "false",
+        "control_admin_forward_role_count": "0",
+        "provider_forward_role_count": "1",
+        "control_admin_owned_object_count": "0",
+        "control_admin_shared_dependency_count": "0",
+        "foreign_client_session_count": "0",
+        "max_prepared_transactions": "0",
+        "cluster_prepared_xact_count": "0",
+        "non_template_database_inventory_exact": "true",
+        "all_connectable_database_inventory_exact": "true",
+        "latent_provider_exception_exact": "true",
+        "executor_database_effective_privileges_exact": "true",
+        "migration_owner_role_exact": "true",
+        "current_database_owner_exact": "true",
+        "executor_membership_count": "0",
+        "executor_owned_object_count": "0",
+        "executor_acl_dependency_count": "4",
+        "observer_prosrc_sha256": bootstrap.OBSERVER_PROSRC_SHA256,
+        "observer_definition_sha256": bootstrap.OBSERVER_DEFINITION_SHA256,
+        "apply_prosrc_sha256": bootstrap.APPLY_PROSRC_SHA256,
+        "apply_definition_sha256": bootstrap.APPLY_DEFINITION_SHA256,
+        "foundation_state": "drift",
+        "foundation_exact": "false",
+        "helper_absent": "false",
+        "helper_same_name_count": "1",
+    }
+    result = QueryResult(
+        bootstrap._FOUNDATION_OBSERVATION_COLUMNS,
+        (tuple(values[name] for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS),),
+        "COMMIT",
+    )
+    session = type(
+        "Session",
+        (),
+        {"username": bootstrap.foundation.SQL_USER},
+    )()
+
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_routeback_helper_present",
+    ):
+        bootstrap._parse_foundation_observation_result(
+            session,
+            result,
+            phase="post_cleanup",
+            observed_at_unix=NOW,
+        )
+
+    receipt = bootstrap._parse_foundation_observation_result(
+        session,
+        result,
+        phase="post_cleanup",
+        observed_at_unix=NOW,
+        allow_routeback_helper_present=True,
+    )
+    assert receipt["state"] == "exact_installed"
+    assert receipt["foundation_exact"] is True
+    assert receipt["helper_absent"] is False
+    assert receipt["helper_same_name_count"] == 1
+
+    values["helper_same_name_count"] = "2"
+    duplicate_result = QueryResult(
+        bootstrap._FOUNDATION_OBSERVATION_COLUMNS,
+        (tuple(values[name] for name in bootstrap._FOUNDATION_OBSERVATION_COLUMNS),),
+        "COMMIT",
+    )
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_routeback_helper_present",
+    ):
+        bootstrap._parse_foundation_observation_result(
+            session,
+            duplicate_result,
+            phase="post_cleanup",
+            observed_at_unix=NOW,
+            allow_routeback_helper_present=True,
+        )
+
+
 @pytest.mark.parametrize(
     ("replacement", "expected_code"),
     (
