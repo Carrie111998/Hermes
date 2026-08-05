@@ -4173,7 +4173,9 @@ class TestStatusStalePlatformSnapshot:
     window the state file still contains the predecessor's PID and platform
     snapshot, so the resolved live PID and the record's PID disagree.  The
     dashboard would otherwise render "Discord — connected" for a process that
-    never connected to Discord.
+    never connected to Discord.  The successor's first status stamp closes this
+    window by clearing a predecessor-owned platform block before re-stamping the
+    runtime record.
 
     ``resolve_gateway_liveness`` validates PIDs for the *liveness* answer only;
     it deliberately does not gate the platform snapshot.  These tests pin the
@@ -4384,26 +4386,17 @@ class TestStatusStalePlatformSnapshot:
         assert data["gateway_platforms"] == {}
 
 
-class TestRuntimeStatusRestartPreservesPlatformsBlock:
-    """Documents the abrupt-restart hole the ``get_status()`` PID guard cannot close.
+class TestRuntimeStatusRestartClearsPredecessorPlatformsBlock:
+    """A successor must reject predecessor platforms before stamping its PID.
 
-    ``write_runtime_status`` is a read-modify-write: it preserves the inherited
-    ``platforms`` block and unconditionally re-stamps ``pid``/``start_time`` to
-    the *current* process.  A new gateway's first action is
-    ``write_runtime_status(gateway_state="starting", ...)``, after which the file
-    holds the NEW pid next to the DEAD gateway's ``platforms`` snapshot.  From
-    that point ``runtime_pid == gateway_pid`` and the reader-side guard cannot
-    fire.  The guard's real scope ends with that first write: it covers only the
-    startup window after the dead predecessor's pidfile is gone and the successor
-    has claimed ``gateway.pid``, while the state file still carries the
-    predecessor's PID and inherited platform snapshot.
-
-    This is pinned as a test rather than left in a comment so that if a future
-    change makes the writer clear ``platforms`` at startup, this test fails and
-    the ``get_status()`` comment gets revisited with it.
+    ``write_runtime_status`` is a read-modify-write that normally preserves the
+    existing ``platforms`` block.  Gateway startup must compare that persisted
+    record with the successor before the write re-stamps ``pid``/``start_time``;
+    otherwise the stale predecessor snapshot becomes indistinguishable from a
+    live successor snapshot.
     """
 
-    def test_restart_preserves_stale_platforms_under_the_new_pid(
+    def test_restart_clears_stale_platforms_before_stamping_the_new_pid(
         self, monkeypatch, _isolate_hermes_home
     ):
         import gateway.status as gs
@@ -4423,14 +4416,49 @@ class TestRuntimeStatusRestartPreservesPlatformsBlock:
         # first status write (gateway/run.py, "starting").
         monkeypatch.setattr(gs.os, "getpid", lambda: 9999)
         monkeypatch.setattr(gs, "_get_process_start_time", lambda pid: 222.0)
-        gs.write_runtime_status(gateway_state="starting", exit_reason=None)
+        gs.write_runtime_status(
+            gateway_state="starting",
+            exit_reason=None,
+            clear_predecessor_platforms=True,
+        )
 
         record = gs.read_runtime_status()
 
         assert record["pid"] == 9999, "the writer always stamps the current pid"
         assert record["start_time"] == 222.0
-        assert record["platforms"]["discord"]["state"] == "connected", (
-            "the dead gateway's platform snapshot survives the restart; a "
-            "reader-side pid comparison therefore cannot detect it, because "
-            "the record now carries the live pid"
+        assert record["platforms"] == {}, (
+            "startup must clear the dead gateway's platform snapshot before "
+            "re-stamping the record with the successor pid"
+        )
+
+    def test_restart_clears_stale_platforms_when_pid_is_reused(
+        self, monkeypatch, _isolate_hermes_home
+    ):
+        import gateway.status as gs
+
+        monkeypatch.setattr(gs.os, "getpid", lambda: 4242)
+        monkeypatch.setattr(gs, "_get_process_start_time", lambda pid: 111.0)
+        gs.write_runtime_status(gateway_state="running", exit_reason=None)
+        gs.write_runtime_status(
+            platform="discord",
+            platform_state="connected",
+            error_code=None,
+            error_message=None,
+        )
+
+        # The OS reuses the predecessor's numeric PID for a later gateway.
+        monkeypatch.setattr(gs, "_get_process_start_time", lambda pid: 222.0)
+        gs.write_runtime_status(
+            gateway_state="starting",
+            exit_reason=None,
+            clear_predecessor_platforms=True,
+        )
+
+        record = gs.read_runtime_status()
+
+        assert record["pid"] == 4242
+        assert record["start_time"] == 222.0
+        assert record["platforms"] == {}, (
+            "a matching numeric pid with a different process start time is a "
+            "reused pid, not authority to inherit predecessor platforms"
         )

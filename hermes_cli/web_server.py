@@ -3123,12 +3123,10 @@ async def get_status(profile: Optional[str] = None):
             # Scope, precisely: this fires after a predecessor dies with its
             # final PID/platform snapshot still in ``gateway_state.json`` and a
             # successor claims ``gateway.pid``, but before the successor's first
-            # ``write_runtime_status(gateway_state="starting")`` call.  That
-            # write re-stamps ``pid``/``start_time`` to the successor while
-            # preserving the inherited ``platforms`` block, so from then onward
-            # the two PIDs agree and a stale snapshot is indistinguishable here.
-            # Closing that hole needs a writer-side reset, not a reader-side
-            # comparison.
+            # status stamp.  Gateway startup separately clears a predecessor's
+            # platform block before re-stamping the record, so this reader-side
+            # check covers the reachable handoff window rather than becoming
+            # unreachable at that first write.
             #
             # Only ever applied to the LOCAL record: a remote health body is
             # the other container's own self-report and its PID belongs to
