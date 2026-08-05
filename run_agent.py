@@ -286,6 +286,7 @@ _DB_PERSISTENCE_MESSAGE_KEY = "_db_persistence_message_key"
 _DB_PERSISTENCE_ORDINAL = "_db_persistence_ordinal"
 _DB_PERSISTENCE_TIMESTAMP = "_db_persistence_timestamp"
 _DB_PERSISTENCE_PAYLOAD_FINGERPRINT = "_db_persistence_payload_fingerprint"
+_DB_PERSISTENCE_UNIT_FINGERPRINT = "_db_persistence_unit_fingerprint"
 _DB_CANONICAL_COMMIT_MARKER = "_db_canonical_commit"
 
 
@@ -350,6 +351,16 @@ def _batch_message_payload_fingerprint(message: Any) -> str:
         separators=(",", ":"),
         ensure_ascii=False,
         default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _unit_payload_fingerprint(payload_fingerprints: Sequence[str]) -> str:
+    """Freeze unit membership, order, cardinality, and per-row payloads."""
+    encoded = json.dumps(
+        list(payload_fingerprints),
+        separators=(",", ":"),
+        ensure_ascii=False,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
 
@@ -2172,6 +2183,7 @@ class AIAgent:
                     _DB_PERSISTENCE_ORDINAL,
                     _DB_PERSISTENCE_TIMESTAMP,
                     _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
+                    _DB_PERSISTENCE_UNIT_FINGERPRINT,
                     _DB_CANONICAL_COMMIT_MARKER,
                 ):
                     msg.pop(private_key, None)
@@ -2212,6 +2224,7 @@ class AIAgent:
                 _batch_message_payload_fingerprint(batch_message)
                 for batch_message in batch_messages
             )
+            unit_fingerprint = _unit_payload_fingerprint(fingerprints)
             fingerprint_changed = any(
                 (
                     source_msg.get(_DB_PERSISTENCE_PAYLOAD_FINGERPRINT) is not None
@@ -2225,6 +2238,18 @@ class AIAgent:
                 for (_unit_idx, source_msg), fingerprint in zip(
                     unit_items, fingerprints
                 )
+            )
+            fingerprint_changed = fingerprint_changed or any(
+                (
+                    source_msg.get(_DB_PERSISTENCE_UNIT_FINGERPRINT) is not None
+                    and source_msg.get(_DB_PERSISTENCE_UNIT_FINGERPRINT)
+                    != unit_fingerprint
+                )
+                or (
+                    source_msg.get(_DB_SPOOLED_MARKER)
+                    and source_msg.get(_DB_PERSISTENCE_UNIT_FINGERPRINT) is None
+                )
+                for _unit_idx, source_msg in unit_items
             )
             unit_blocked = fingerprint_changed and any(
                 source_msg.get(_DB_SPOOLED_MARKER)
@@ -2246,6 +2271,7 @@ class AIAgent:
                         _DB_PERSISTENCE_ORDINAL,
                         _DB_PERSISTENCE_TIMESTAMP,
                         _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
+                        _DB_PERSISTENCE_UNIT_FINGERPRINT,
                         _DB_CANONICAL_COMMIT_MARKER,
                     ):
                         source_msg.pop(private_key, None)
@@ -2258,11 +2284,13 @@ class AIAgent:
                     _batch_message_payload_fingerprint(batch_message)
                     for batch_message in batch_messages
                 )
+                unit_fingerprint = _unit_payload_fingerprint(fingerprints)
             if not unit_blocked:
                 for (_unit_idx, source_msg), fingerprint in zip(
                     unit_items, fingerprints
                 ):
                     source_msg[_DB_PERSISTENCE_PAYLOAD_FINGERPRINT] = fingerprint
+                    source_msg[_DB_PERSISTENCE_UNIT_FINGERPRINT] = unit_fingerprint
 
             selected_ids = {id(unit_msg) for _unit_idx, unit_msg in unit_items}
             pending_messages = [
@@ -2315,6 +2343,7 @@ class AIAgent:
                         _DB_PERSISTENCE_ORDINAL,
                         _DB_PERSISTENCE_TIMESTAMP,
                         _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
+                        _DB_PERSISTENCE_UNIT_FINGERPRINT,
                     ):
                         source_msg.pop(private_key, None)
                 committed_units.append(unit)
@@ -3488,6 +3517,7 @@ class AIAgent:
                             _DB_PERSISTENCE_ORDINAL,
                             _DB_PERSISTENCE_TIMESTAMP,
                             _DB_PERSISTENCE_PAYLOAD_FINGERPRINT,
+                            _DB_PERSISTENCE_UNIT_FINGERPRINT,
                             _DB_CANONICAL_COMMIT_MARKER,
                         }
                     }

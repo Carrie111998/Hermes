@@ -546,6 +546,35 @@ def test_rewritten_spooled_message_blocks_before_stale_replay(agent, monkeypatch
     assert len(spool_calls) == 1
 
 
+def test_removed_row_from_spooled_unit_blocks_before_stale_replay(agent, monkeypatch):
+    db = _RecordingBatchDB(outcomes=[RuntimeError("first failure")])
+    _prime_batch_flush_agent(agent, db)
+    messages = [
+        {"role": "assistant", "content": None, "tool_calls": [{"id": "call-1"}]},
+        {"role": "tool", "content": "tool result", "tool_call_id": "call-1"},
+    ]
+    monkeypatch.setattr(
+        run_agent.session_spool,
+        "append_records",
+        lambda records: _spool_append_result(*records),
+    )
+    replay = MagicMock(return_value=None)
+    agent._replay_pending_session_spool = replay
+
+    first = agent._persist_session(messages, [])
+    assert first.state is run_agent.SessionPersistState.SPOOLED
+    assert messages[0]["_db_persistence_unit_fingerprint"] == messages[1][
+        "_db_persistence_unit_fingerprint"
+    ]
+
+    messages.pop()
+    direct = agent._flush_messages_to_session_db(messages, [])
+
+    assert direct is False
+    assert replay.call_count == 1
+    assert len(db.calls) == 1
+
+
 def test_rewritten_failed_nonspooled_unit_rekeys_before_retry(agent, monkeypatch):
     db = _RecordingBatchDB(
         outcomes=[
@@ -627,15 +656,18 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
         run_agent._DB_PERSISTENCE_UNIT_ID: "unit-1",
         "_db_canonical_commit": True,
         "_db_persistence_payload_fingerprint": "fingerprint-1",
+        "_db_persistence_unit_fingerprint": "unit-fingerprint-1",
     }
 
     agent._save_session_log([message])
 
     saved = json.loads((tmp_path / "session_session-123.json").read_text(encoding="utf-8"))
-    assert run_agent._DB_SPOOLED_MARKER not in saved["messages"][0]
-    assert run_agent._DB_PERSISTENCE_UNIT_ID not in saved["messages"][0]
-    assert "_db_canonical_commit" not in saved["messages"][0]
-    assert "_db_persistence_payload_fingerprint" not in saved["messages"][0]
+    saved_message = saved["messages"][0]
+    assert run_agent._DB_SPOOLED_MARKER not in saved_message
+    assert run_agent._DB_PERSISTENCE_UNIT_ID not in saved_message
+    assert "_db_canonical_commit" not in saved_message
+    assert "_db_persistence_payload_fingerprint" not in saved_message
+    assert "_db_persistence_unit_fingerprint" not in saved_message
 
 
 def test_persist_session_replays_spool_before_canonical_append_under_persist_lock(agent, monkeypatch):
