@@ -413,6 +413,7 @@ from hermes_cli.subcommands.login import build_login_parser
 from hermes_cli.subcommands.logout import build_logout_parser
 from hermes_cli.subcommands.auth import build_auth_parser
 from hermes_cli.subcommands.status import build_status_parser
+from hermes_cli.subcommands.readiness import build_readiness_parser
 from hermes_cli.subcommands.webhook import build_webhook_parser
 from hermes_cli.subcommands.hooks import build_hooks_parser
 from hermes_cli.subcommands.doctor import build_doctor_parser
@@ -4429,6 +4430,13 @@ def cmd_status(args):
     from hermes_cli.status import show_status
 
     show_status(args)
+
+
+def cmd_readiness(args):
+    """Generate project go-live readiness reports."""
+    from hermes_cli.readiness import readiness_command
+
+    return readiness_command(args)
 
 
 def cmd_cron(args):
@@ -14095,6 +14103,11 @@ def main():
     # status command  (parser built in hermes_cli/subcommands/status.py)
     # =========================================================================
     build_status_parser(subparsers, cmd_status=cmd_status)
+
+    # =========================================================================
+    # readiness command  (parser built in hermes_cli/subcommands/readiness.py)
+    # =========================================================================
+    build_readiness_parser(subparsers, cmd_readiness=cmd_readiness)
 
     # =========================================================================
     # cron command  (parser built in hermes_cli/subcommands/cron.py)
