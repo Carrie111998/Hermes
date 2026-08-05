@@ -63,6 +63,21 @@ def test_deliver_wake_push_adapter_uses_handle_message():
     assert evt.source.chat_id == "chat-1"
 
 
+def test_deliver_wake_push_adapter_preserves_stable_message_id():
+    """Synthetic wakes need an origin key so transient Discord status embeds
+    can be found and deleted after the turn completes."""
+    adapter = PushAdapter()
+    asyncio.run(
+        deliver_wake(
+            adapter,
+            text="wake up",
+            source=_source(),
+            message_id="agent-mail:9085",
+        )
+    )
+    assert adapter.handled[0].message_id == "agent-mail:9085"
+
+
 def test_deliver_wake_push_adapter_requires_source():
     with pytest.raises(ValueError):
         asyncio.run(deliver_wake(PushAdapter(), text="x", session_id="sid"))

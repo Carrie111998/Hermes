@@ -132,7 +132,12 @@ class GatewayAgentMailWatchersMixin:
                 messages = await asyncio.to_thread(_fetch_unread, identity, project_key, after_id, batch_size)
                 for message in messages:
                     message_id = int(message["id"])
-                    await deliver_wake(adapter, text=_wake_text(identity, message), source=source)
+                    await deliver_wake(
+                        adapter,
+                        text=_wake_text(identity, message),
+                        source=source,
+                        message_id=f"agent-mail:{message_id}",
+                    )
                     # `handle_message` queues a normal agent turn and returns before
                     # its response. Leave read-state ownership to the identity-bound
                     # Agent Mail tool after that turn has classified the message; the

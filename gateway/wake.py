@@ -59,13 +59,15 @@ async def deliver_wake(
     text: str,
     session_id: str = "",
     source: Any = None,
+    message_id: str = "",
 ) -> None:
     """Deliver a wake turn to the session behind ``adapter``.
 
     ``session_id`` is the RAW session id (the ``X-Hermes-Session-Id`` value /
     ``state.db`` key) — required for non-push adapters. ``source`` is the
     ``SessionSource`` used to build the synthetic event — required for
-    push-capable adapters.
+    push-capable adapters. ``message_id`` is an optional stable origin key for
+    transient UI cleanup on synthetic wakes.
 
     Raises on failure (bad arguments, exhausted retries, HTTP error) so the
     caller can rewind/retry instead of treating the wake as delivered.
@@ -81,6 +83,7 @@ async def deliver_wake(
             text=text,
             message_type=MessageType.TEXT,
             source=source,
+            message_id=message_id or None,
             internal=True,
         )
         await adapter.handle_message(synth_event)
