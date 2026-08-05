@@ -608,3 +608,67 @@ async def test_require_model_lock_hard_fails_when_global_default_would_be_used(a
     mock_run.assert_not_called()
 
 
+@pytest.mark.asyncio
+async def test_create_session_without_model_persists_none(adapter, session_db):
+    """A session created without an explicit model should not inherit the
+    advertised virtual model name (e.g. 'hermes-agent') as its persisted model."""
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json={})
+        assert resp.status == 201, await resp.text()
+        payload = await resp.json()
+
+    assert payload["session"]["model"] is None
+    row = session_db.get_session(payload["session"]["id"])
+    assert row["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_create_session_with_virtual_model_alias_persists_none(adapter, session_db):
+    """Sending the advertised virtual model as the session model is an alias
+    for 'use the gateway default' and must not be persisted as a real model."""
+    app = _create_session_app(adapter)
+    async with TestClient(TestServer(app)) as cli:
+        resp = await cli.post("/api/sessions", json={"model": adapter._model_name})
+        assert resp.status == 201, await resp.text()
+        payload = await resp.json()
+
+    assert payload["session"]["model"] is None
+    row = session_db.get_session(payload["session"]["id"])
+    assert row["model"] is None
+
+
+@pytest.mark.asyncio
+async def test_session_chat_with_virtual_model_alias_uses_gateway_default(adapter, session_db):
+    """A session that was persisted with the virtual model alias must fall
+    back to the gateway's default model instead of passing the alias through
+    as a real model ID."""
+    session_id = session_db.create_session(
+        "virtual-alias-session", "api_server", model=adapter._model_name
+    )
+
+    class FakeAgent:
+        session_prompt_tokens = 0
+        session_completion_tokens = 0
+        session_total_tokens = 0
+
+        def __init__(self, **kwargs):
+            self.session_id = kwargs["session_id"]
+
+        def run_conversation(self, user_message, conversation_history, task_id):
+            return {"final_response": "default", "session_id": self.session_id}
+
+    app = _create_session_app(adapter)
+    with patch.object(adapter, "_create_agent", side_effect=FakeAgent) as mock_create:
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                f"/api/sessions/{session_id}/chat",
+                json={"message": "hi"},
+            )
+            assert resp.status == 200, await resp.text()
+
+    _, kwargs = mock_create.call_args
+    assert kwargs.get("session_model") is None
+    assert kwargs.get("route") is None
+
+

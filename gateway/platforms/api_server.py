@@ -3312,7 +3312,10 @@ class APIServerAdapter(BasePlatformAdapter):
         if len(session_id) > self._MAX_SESSION_HEADER_LEN:
             return web.json_response(_openai_error("Session ID too long", code="invalid_session_id"), status=400)
 
-        model = body.get("model") or self._model_name
+        raw_model = _clean_request_string(body.get("model"))
+        # The advertised virtual model name (e.g. "hermes-agent") is an alias
+        # for "use the gateway default"; don't persist it as a real model.
+        model = raw_model if raw_model and raw_model != self._model_name else None
         system_prompt = body.get("system_prompt")
         if system_prompt is not None and not isinstance(system_prompt, str):
             return web.json_response(_openai_error("system_prompt must be a string", code="invalid_system_prompt"), status=400)
@@ -3322,13 +3325,18 @@ class APIServerAdapter(BasePlatformAdapter):
         if lock_error is not None:
             return lock_error
         requested = runtime_request.get("requested") or {}
-        model_name = self._clean_runtime_id(requested.get("model")) or (str(model) if model else None)
+        requested_model = self._clean_runtime_id(requested.get("model"))
+        # The advertised virtual model is an alias for the gateway default;
+        # don't persist it as a real model or runtime lock target.
+        if requested_model == self._model_name:
+            requested_model = ""
+        model_name = requested_model or model
         model_config = None
-        if requested.get("model") or requested.get("provider"):
+        if requested_model or requested.get("provider"):
             model_config = {
                 "browser_model_lock": {
                     "provider": requested.get("provider") or "",
-                    "model": requested.get("model") or "",
+                    "model": requested_model or "",
                     "model_options": runtime_request.get("model_options") or {},
                     "route_source": runtime_request.get("route_source") or "",
                     "confirmed": bool(runtime_request.get("require_model_lock")),
@@ -3568,6 +3576,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # The advertised virtual model is an alias for the gateway default;
+            # don't let it override the real default model.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
@@ -3678,6 +3690,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 agent_overrides["model_options"] = runtime_request["model_options"]
         else:
             stored_model = session.get("model") if isinstance(session, dict) else None
+            # The advertised virtual model is an alias for the gateway default;
+            # don't let it override the real default model.
+            if stored_model == self._model_name:
+                stored_model = None
             stored_route = self._resolve_route(stored_model)
             route = stored_route or self._resolve_route(body.get("model"))
             session_model = stored_model if (stored_model and stored_route is None) else None
