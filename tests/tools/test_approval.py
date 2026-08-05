@@ -1027,6 +1027,9 @@ class TestAnsiCQuotingBypass:
         commands = (
             ("sudo " * 12) + "-u root rm -rf /",
             ("env -i " * 5) + "env -u HOME rm -rf /",
+            ("sudo " * 12) + '"$(printf -- -u)" root rm -rf /',
+            ("sudo " * 12) + '"$OPTION" root rm -rf /',
+            ("sudo " * 12) + "`printf -- -u` root rm -rf /",
         )
         for cmd in commands:
             is_hardline, desc = detect_hardline_command(cmd)
@@ -1036,6 +1039,11 @@ class TestAnsiCQuotingBypass:
         monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
         for cmd in commands:
             assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
 
     def test_env_assignment_ends_option_parsing(self):
         is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")

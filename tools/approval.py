@@ -2717,7 +2717,12 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             continue
         return word_start
     word_start, word_end, word = _read_shell_word(command, current)
-    if skip_next or _deobfuscate_shell_word_for_detection(word).startswith("-"):
+    resolved_boundary, unsupported_boundary = _resolve_env_split_outer_word(word)
+    if (
+        skip_next
+        or unsupported_boundary
+        or (resolved_boundary is not None and resolved_boundary.startswith("-"))
+    ):
         return -1
     return word_start if word_start < word_end else current
 
