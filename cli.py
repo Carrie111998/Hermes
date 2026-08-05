@@ -3198,7 +3198,17 @@ def _detect_terminal_size() -> tuple[int, int]:
         try:
             size = os.get_terminal_size(fd)
             if size.columns > 0 and size.lines > 0:
-                return size.columns, size.lines
+                # A genuine (non-fallback) ioctl value is authoritative.  The
+                # exception is exactly 80×24: that is the classic stale-winsize
+                # marker inside tmux/kitty (and identical to the value
+                # shutil.get_terminal_size returns), so returning it here would
+                # reproduce the misdetection without ever reaching the
+                # tmux-aware tput source below.  Treat a stale 80×24 as a
+                # candidate and keep looking so a later fd or source that
+                # reports the real pane size wins.
+                if (size.columns, size.lines) != (80, 24):
+                    return size.columns, size.lines
+                best_cols, best_rows = size.columns, size.lines
         except (OSError, ValueError):
             continue
 
@@ -3232,7 +3242,7 @@ def _detect_terminal_size() -> tuple[int, int]:
     return best_cols, best_rows
 
 
-def _make_window_too_small_widget():
+def _make_window_too_small_widget() -> "Window":
     """Create a diagnostic ``window_too_small`` container for the root ``HSplit``.
 
     prompt_toolkit's default shows a bare ``" Window too small... "`` message
@@ -3314,10 +3324,18 @@ def _build_cpr_disabled_output(stdout):
 
         def _get_term_size():
             rows = columns = None
+            # Prefer the tmux-aware detector so prompt_toolkit's own
+            # `Window too small` decision (made from `output.get_size()`
+            # geometry) sees the real pane size rather than a stale 80×24
+            # winsize that would otherwise reproduce the misdetection.
             try:
-                rows, columns = _get_size(stdout.fileno())
-            except (OSError, _io.UnsupportedOperation, AttributeError, ValueError):
-                pass
+                _cols, _rows = _detect_terminal_size()
+                columns, rows = _cols, _rows
+            except Exception:
+                try:
+                    rows, columns = _get_size(stdout.fileno())
+                except (OSError, _io.UnsupportedOperation, AttributeError, ValueError):
+                    pass
             return Size(rows=rows or 24, columns=columns or 80)
 
         return Vt100_Output(stdout, _get_term_size, enable_cpr=False)
