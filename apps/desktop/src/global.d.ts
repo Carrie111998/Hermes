@@ -1,5 +1,6 @@
 import type { GatewayWsUrlResult } from '@hermes/shared'
 
+import type { WakeIndicatorState } from './lib/wake-indicator'
 import type {
   PetOverlayBounds,
   PetOverlayControl,
@@ -42,6 +43,11 @@ declare global {
       // reply). Resolves true for the first window to claim a key, false for
       // peers — so N open windows don't all fire the same cue.
       claimAmbientCue: (key: string) => Promise<boolean>
+      wakeIndicator?: {
+        getState: () => Promise<WakeIndicatorState>
+        setState: (state: WakeIndicatorState) => void
+        onState: (callback: (state: WakeIndicatorState) => void) => () => void
+      }
       // The pop-out pet overlay: a transparent always-on-top window hosting only
       // the mascot. The main renderer drives it (open/close/drag + state push);
       // the overlay sends control messages back (pop-in, composer submit).
@@ -123,6 +129,12 @@ declare global {
       }
       readFileText: (filePath: string) => Promise<HermesReadFileTextResult>
       selectPaths: (options?: HermesSelectPathsOptions) => Promise<string[]>
+      /** Native save dialog; returns the chosen path or null on cancel. */
+      selectSavePath?: (options?: {
+        defaultPath?: string
+        filters?: Array<{ extensions: string[]; name: string }>
+        title?: string
+      }) => Promise<null | string>
       writeClipboard: (text: string) => Promise<boolean>
       readClipboard: () => Promise<string>
       saveImageFromUrl: (url: string) => Promise<boolean>
@@ -256,6 +268,8 @@ declare global {
       // reload. Wipe session lists (skeletons) and re-dial.
       onConnectionApplied?: (callback: () => void) => () => void
       onPowerResume?: (callback: () => void) => () => void
+      getOnBattery?: () => Promise<boolean>
+      onBatteryChanged?: (callback: (onBattery: boolean) => void) => () => void
       onBootProgress: (callback: (payload: DesktopBootProgress) => void) => () => void
       getBootstrapState: () => Promise<DesktopBootstrapState>
       continueBootstrapLocal: () => Promise<{ ok: boolean }>
@@ -523,6 +537,7 @@ export interface DesktopConnectionConfig {
   sshPort: number | null
   sshKeyPath: string
   sshRemoteHermesPath: string
+  sshRemoteProfile: string
 }
 
 export interface DesktopConnectionConfigInput {
@@ -541,6 +556,7 @@ export interface DesktopConnectionConfigInput {
   sshPort?: number | null
   sshKeyPath?: string
   sshRemoteHermesPath?: string
+  sshRemoteProfile?: string
 }
 
 export interface DesktopConnectionTestResult {
@@ -759,6 +775,8 @@ export interface HermesNotification {
   silent?: boolean
   kind?: string
   sessionId?: string
+  /** Dedupe discriminator for session-less notifications (e.g. plugin id). */
+  tag?: string
   actions?: { id: string; text: string }[]
 }
 
