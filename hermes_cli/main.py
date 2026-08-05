@@ -12318,6 +12318,109 @@ def main():
         help="JSON report path (defaults to <output>.recovery.json)",
     )
 
+    sessions_cold_archive = sessions_subparsers.add_parser(
+        "cold-archive",
+        help="Stage a lineage-safe offline cold archive manifest/export pass",
+        description=(
+            "Purpose-built state.db cold archival. Refuses the active profile "
+            "database, writes a Gate-B manifest, exports restricted redacted QMD, "
+            "creates a rollback bundle, optionally publishes via fail-closed rclone "
+            "readback, and only deletes from the offline candidate when "
+            "--apply-retention is supplied. It never runs VACUUM, optimize, "
+            "checkpoint, auto-prune, or live maintenance actions."
+        ),
+    )
+    sessions_cold_archive.add_argument(
+        "--source",
+        type=Path,
+        required=True,
+        help="Offline recovered candidate state.db; active ~/.hermes/state.db is refused",
+    )
+    sessions_cold_archive.add_argument(
+        "--stage-root",
+        type=Path,
+        required=True,
+        help="Existing or new restricted staging root (directories forced to 0700; files 0600)",
+    )
+    sessions_cold_archive.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Only write the Gate-B manifest and restricted ID files; no export/upload/delete",
+    )
+    sessions_cold_archive.add_argument(
+        "--apply-retention",
+        action="store_true",
+        help="After export/verification, delete the reviewed set from the offline candidate",
+    )
+    sessions_cold_archive.add_argument(
+        "--hot-days",
+        type=float,
+        default=30.0,
+        help="Hot searchable window in days (default: 30)",
+    )
+    sessions_cold_archive.add_argument(
+        "--archive-grace-days",
+        type=float,
+        default=7.0,
+        help="Archived reversible grace window in days (default: 7)",
+    )
+    sessions_cold_archive.add_argument(
+        "--now-epoch",
+        type=float,
+        help="Deterministic clock override for tests/receipts (epoch seconds)",
+    )
+    sessions_cold_archive.add_argument(
+        "--no-default-holds",
+        action="store_true",
+        help="Do not apply the built-in customer/ops platform-source permanent holds",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-source",
+        action="append",
+        default=[],
+        help="Additional session source to hold permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-title-regex",
+        action="append",
+        default=[],
+        help="Regex matching titles that must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--hold-cwd-prefix",
+        action="append",
+        default=[],
+        help="CWD prefix whose sessions must be held permanently; may be repeated",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-remote",
+        help="Bounded encrypted-offsite remote root, e.g. gdrive:vps-offload/hermes-state",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-config",
+        type=Path,
+        help="Dedicated root-owned/minimal rclone config for the gdrive remote",
+    )
+    sessions_cold_archive.add_argument(
+        "--remote-namespace",
+        help="Remote namespace below --rclone-remote (default: manifest hash namespace)",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-recipient-file",
+        type=Path,
+        help="Public age recipient used before publishing the lossless rollback bundle",
+    )
+    sessions_cold_archive.add_argument(
+        "--age-exe",
+        default="age",
+        help="age executable name/path (default: age)",
+    )
+    sessions_cold_archive.add_argument(
+        "--rclone-exe",
+        default="rclone",
+        help="rclone executable name/path (default: rclone)",
+    )
+
     sessions_subparsers.add_parser("stats", help="Show session store statistics")
 
     sessions_rename = sessions_subparsers.add_parser(

@@ -224,6 +224,40 @@ def cmd_sessions(args, sessions_parser=None):
         print("  Do not install it. Review the JSON report for partial data or errors.")
         return 1
 
+    if action == "cold-archive":
+        from hermes_cli.session_cold_archive import (
+            ColdArchiveError,
+            DEFAULT_PERMANENT_HOLD_SOURCES,
+            run_cold_archive_pass,
+        )
+
+        hold_sources = [] if getattr(args, "no_default_holds", False) else list(DEFAULT_PERMANENT_HOLD_SOURCES)
+        hold_sources.extend(getattr(args, "hold_source", None) or [])
+        try:
+            receipt = run_cold_archive_pass(
+                source_db=args.source,
+                stage_root=args.stage_root,
+                hot_days=getattr(args, "hot_days", 30.0),
+                archive_grace_days=getattr(args, "archive_grace_days", 7.0),
+                now=getattr(args, "now_epoch", None),
+                hold_sources=hold_sources,
+                hold_title_regexes=getattr(args, "hold_title_regex", None) or [],
+                hold_cwd_prefixes=getattr(args, "hold_cwd_prefix", None) or [],
+                manifest_only=getattr(args, "manifest_only", False),
+                apply_retention=getattr(args, "apply_retention", False),
+                rclone_remote=getattr(args, "rclone_remote", None),
+                rclone_config=getattr(args, "rclone_config", None),
+                remote_namespace=getattr(args, "remote_namespace", None),
+                age_recipient_file=getattr(args, "age_recipient_file", None),
+                age_exe=getattr(args, "age_exe", "age"),
+                rclone_exe=getattr(args, "rclone_exe", "rclone"),
+            )
+        except ColdArchiveError as exc:
+            print(f"Error: cold archive failed closed: {exc}")
+            return 1
+        print(_json.dumps(receipt, indent=2, sort_keys=True))
+        return 0
+
     try:
         from hermes_state import SessionDB
 
