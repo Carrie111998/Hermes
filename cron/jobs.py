@@ -1814,6 +1814,23 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
         )
 
 
+# C2 (t_95fbd07c): exported accessor for the mark_job_run not-found drop
+# counter.  The liveness collector reads these to report probe-visible
+# last_error / metrics instead of silent metadata-lag false positives.
+
+
+def get_mark_not_found_stats() -> tuple[int, Optional[str], Optional[str]]:
+    """Return (total_dropped_count, last_timestamp_iso, last_job_id).
+
+    All three values reflect in-process state — valid only within the
+    running gateway process.  Callers should use them for alerting/logging
+    rather than durability guarantees across restarts.
+    """
+    return (_last_mark_not_found_count,
+            _last_mark_not_found_at,
+            _last_mark_not_found_job)
+
+
 def _write_wedged_oneshot_diagnostic(job: Dict[str, Any]) -> None:
     """Leave an operator-visible trace when a wedged one-shot is removed.
 
