@@ -64,6 +64,7 @@ from gateway.canonical_canary_host_identity import (
     collect_dedicated_canary_host_identity_receipt,
 )
 from gateway.canonical_writer_activation import ActivationPlan
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 from gateway.canonical_writer_bootstrap import (
     DEFAULT_WRITER_RUNTIME_ATTESTATION_PATH,
     WRITER_RUNTIME_ATTESTATION_VERSION,
@@ -722,11 +723,16 @@ class FullCanarySystemdBundle:
         expected_gateway_credential = (
             f"{API_SERVER_CREDENTIAL_NAME}:{DEFAULT_API_SERVER_CONTROL_KEY}"
         )
+        expected_boot_credential = (
+            SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE.removeprefix("LoadCredential=")
+        )
         if (
             load_credential.findall(raw["edge_service"])
+            != [expected_boot_credential]
             or load_credential.findall(raw["writer_service"])
+            != [expected_boot_credential]
             or load_credential.findall(raw["gateway_service"])
-            != [expected_gateway_credential]
+            != [expected_gateway_credential, expected_boot_credential]
         ):
             raise ValueError("full-canary unit credential boundary is not exact")
         gateway_environment = re.compile(r"(?m)^Environment=(.+)$").findall(
@@ -976,11 +982,10 @@ def _full_writer_service(
         or writer_only.count("NoNewPrivileges=yes\n") != 1
         or writer_only.count("CapabilityBoundingSet=\n") != 1
         or writer_only.count("AmbientCapabilities=\n") != 1
-        or re.search(
-            r"(?m)^(?:LoadCredential|ExecStartPre)=",
-            writer_only,
-        )
-        is not None
+        or writer_only.count(f"{SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n") != 1
+        or re.search(r"(?m)^ExecStartPre=", writer_only) is not None
+        or re.findall(r"(?m)^LoadCredential=(.+)$", writer_only)
+        != [SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE.removeprefix("LoadCredential=")]
     ):
         raise ValueError("writer-only unit cannot be extended exactly")
     result = writer_only.replace(
@@ -1052,6 +1057,7 @@ def render_full_canary_systemd_bundle(
         "TimeoutStopSec=30s",
         "KillMode=mixed",
         "LimitCORE=0",
+        SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE,
         *_fixed_environment(user=identities.edge_user, home=DEFAULT_EDGE_STATE),
         *_common_hardening(),
         "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
@@ -1105,6 +1111,7 @@ def render_full_canary_systemd_bundle(
             f"LoadCredential={API_SERVER_CREDENTIAL_NAME}:"
             f"{DEFAULT_API_SERVER_CONTROL_KEY}"
         ),
+        SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE,
         *_fixed_environment(user=identities.gateway_user, home=DEFAULT_GATEWAY_HOME),
         f"Environment=HERMES_CONFIG={DEFAULT_GATEWAY_CONFIG}",
         f"Environment=HERMES_HOME={DEFAULT_GATEWAY_PROFILE_HOME}",
@@ -1575,7 +1582,15 @@ class FullCanaryPlan:
             or expected_exec["writer"] not in self.unit_bundle.writer_service
             or writer_pre_commands
             or writer_stop_commands
-            or "LoadCredential=" in self.unit_bundle.writer_service
+            or self.unit_bundle.writer_service.count(
+                f"{SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n"
+            )
+            != 1
+            or re.findall(
+                r"(?m)^LoadCredential=(.+)$",
+                self.unit_bundle.writer_service,
+            )
+            != [SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE.removeprefix("LoadCredential=")]
             or str(DEFAULT_WRITER_CONFIG_SOURCE)
             in self.unit_bundle.writer_service
             or "CapabilityBoundingSet=\n"

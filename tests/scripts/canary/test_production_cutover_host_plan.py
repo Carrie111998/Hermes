@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from gateway.canonical_boot_identity import SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE
 from gateway.mac_ops_edge_service import DEFAULT_PROJECT_ID
 from ops.muncho.runtime import upstream_sync_job_rail as dual_sync_rail
 from scripts.canary import package_production_cutover_artifacts as package
@@ -478,6 +479,8 @@ def test_writer_unit_invokes_release_bound_production_readiness() -> None:
     ) in rendered
     assert f"AssertPathExists={receipt}\n" in rendered
     assert f"ReadOnlyPaths={receipt}\n" in rendered
+    assert rendered.count(f"{SYSTEMD_BOOT_ID_CREDENTIAL_DIRECTIVE}\n") == 1
+    assert rendered.count("LoadCredential=") == 1
     assert (
         "Requires=muncho-canonical-writer-phase-b-readiness.service\n"
         in rendered
