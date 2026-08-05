@@ -154,3 +154,58 @@ def test_single_peer_setup_does_not_dream_against_itself(tmp_path, monkeypatch):
     )
     m.maybe_schedule_dream()
     assert client.calls == [{"observer": "kai"}], "no self-targeted second dream"
+
+
+
+def test_provider_session_end_triggers_the_dream(tmp_path, monkeypatch):
+    """The unit tests call maybe_schedule_dream() directly; this proves the
+    PROVIDER actually reaches it from on_session_end, which is the only path
+    that runs in production.
+    """
+    import plugins.memory.honcho as honcho_pkg
+
+    provider_cls = honcho_pkg.HonchoMemoryProvider
+
+    client = _FakeClient()
+    mgr = HonchoSessionManager(honcho=client, config=_config())
+    monkeypatch.setattr(mgr, "_auto_dream_stamp_path", lambda: tmp_path / "s")
+    monkeypatch.setattr(
+        "plugins.memory.honcho.session.threading.Thread",
+        lambda target, name=None, daemon=None: _InlineThread(target),
+    )
+
+    p = provider_cls.__new__(provider_cls)
+    p._cron_skipped = False
+    p._manager = mgr
+    p._session_initialized = True
+    p._init_thread = None
+    p._sync_thread = None
+
+    p.on_session_end([{"role": "user", "content": "x"}] * 20)
+
+    assert client.calls == [
+        {"observer": "kai"},
+        {"observer": "kai", "observed": "hermes"},
+    ], "on_session_end must reach schedule_dream"
+
+
+def test_provider_session_end_respects_the_off_switch(tmp_path, monkeypatch):
+    """Negative control for the test above: same path, autoDream off, silence."""
+    import plugins.memory.honcho as honcho_pkg
+
+    provider_cls = honcho_pkg.HonchoMemoryProvider
+
+    client = _FakeClient()
+    mgr = HonchoSessionManager(honcho=client, config=_config(auto_dream=False))
+    monkeypatch.setattr(mgr, "_auto_dream_stamp_path", lambda: tmp_path / "s")
+
+    p = provider_cls.__new__(provider_cls)
+    p._cron_skipped = False
+    p._manager = mgr
+    p._session_initialized = True
+    p._init_thread = None
+    p._sync_thread = None
+
+    p.on_session_end([{"role": "user", "content": "x"}] * 20)
+
+    assert client.calls == [], "autoDream=False must keep the session-end path silent"
