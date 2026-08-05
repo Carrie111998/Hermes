@@ -3431,11 +3431,16 @@ def _require_exact_target_helper_replay(
     try:
         config = context.base.dependencies.writer_config()
         target = context.base.target
+        managed_hba_receipt = context.base.dependencies.collect_hba(
+            config,
+            now_unix=context.base.dependencies.now(),
+            ttl_seconds=300,
+        )
         observed = collect_schema_contract(
             session,
             config=config,
             policy=_target_policy(target.attestation),
-            managed_hba_receipt=None,
+            managed_hba_receipt=managed_hba_receipt,
             subject_user=config.user,
         )
     except BaseException as exc:
