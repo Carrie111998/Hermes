@@ -9462,7 +9462,7 @@ def _run_prompt_submit(
                 ctx = preprocess_context_references(
                     prompt,
                     cwd=cwd,
-                    allowed_root=cwd,
+                    allowed_root=_desktop_attachment_allowed_roots(session, cwd),
                     context_length=ctx_len,
                 )
                 if ctx.blocked:
@@ -10336,10 +10336,55 @@ def _attachment_ref_path(session: dict, target: Path) -> str:
         return str(target.resolve())
 
 
+_DESKTOP_ATTACHMENT_FALLBACK_KEY = "desktop_attachment_fallback_dir"
+
+
+def _desktop_attachment_allowed_roots(session: dict, cwd: str) -> tuple:
+    """Allowed roots for @file: expansion during prompt.submit.
+
+    Normally just the session cwd. When a desktop attachment was staged to the
+    profile-owned fallback cache root (read-only workspace), its absolute path
+    is outside the cwd, so that root MUST also be allowed or the staged
+    ``@file:`` ref would be rejected by ``preprocess_context_references``.
+    """
+    roots = (cwd,)
+    if session is not None:
+        fallback = session.get(_DESKTOP_ATTACHMENT_FALLBACK_KEY)
+        if fallback:
+            roots = roots + (fallback,)
+    return roots
+
+
+def _desktop_attachment_fallback_dir() -> Path:
+    """Writable profile-owned staging root for desktop attachments.
+
+    Used when the session workspace itself is not writable (e.g. a read-only
+    or stale inherited remote ``cwd`` such as ``/Volumes``). Anchored under
+    ``HERMES_HOME/cache`` so it is profile-owned and independent of the
+    session cwd, and explicitly resolved so the returned path matches the
+    ``@file:`` refs produced against it. The directory is created lazily by
+    the caller.
+    """
+    from hermes_constants import get_hermes_home
+
+    return (get_hermes_home() / "cache" / "desktop-attachments").resolve()
+
+
 def _desktop_attachment_dir(session: dict) -> Path:
     root = Path(_session_cwd(session)).resolve() / ".hermes" / "desktop-attachments"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+        return root
+    except OSError:
+        # Session workspace is not writable. Fall back to a profile-owned
+        # cache root so non-image desktop uploads still work, and record the
+        # fallback on the session so prompt.submit can widen its allowed_root
+        # (preprocess_context_references) to accept the staged @file: ref.
+        fallback = _desktop_attachment_fallback_dir()
+        fallback.mkdir(parents=True, exist_ok=True)
+        if session is not None:
+            session[_DESKTOP_ATTACHMENT_FALLBACK_KEY] = str(fallback)
+        return fallback
 
 
 def _sanitize_attachment_name(name: str) -> str:

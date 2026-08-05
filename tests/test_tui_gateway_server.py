@@ -7956,6 +7956,99 @@ def test_file_attach_uploads_remote_file_into_session_workspace(monkeypatch, tmp
         server._sessions.pop("sid", None)
 
 
+def test_file_attach_readonly_workspace_falls_back_to_hermes_home(
+    monkeypatch, tmp_path
+):
+    """Read-only session cwd must not break non-image desktop uploads.
+
+    Regression for #79065: ``_desktop_attachment_dir`` unconditionally mkdir'd
+    under the session cwd, so a read-only/inherited remote cwd (e.g. /Volumes)
+    raised PermissionError → RPC 5028. It must fall back to the profile-owned
+    ``HERMES_HOME/cache/desktop-attachments`` root, record that root on the
+    session, and return a ref that ``preprocess_context_references`` can expand.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    token = set_hermes_home_override(home)
+    # Existing writable test confirms the same reshape doesn't break the
+    # in-workspace path; here the session cwd is deliberately read-only.
+    workspace = tmp_path / "Volumes-RO"
+    workspace.mkdir()
+    os.chmod(workspace, 0o555)
+    fake_cli = types.ModuleType("cli")
+    fake_cli._detect_file_drop = lambda raw: None
+    fake_cli._split_path_input = lambda raw: (raw, "")
+    fake_cli._resolve_attachment_path = lambda raw: None
+
+    server._sessions["sid"] = _session(cwd=str(workspace))
+    monkeypatch.setitem(sys.modules, "cli", fake_cli)
+
+    try:
+        # 1) Staging must fall back to HERMES_HOME cache, not fail.
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "file.attach",
+                "params": {
+                    "session_id": "sid",
+                    "path": "/Users/alice/Downloads/report.txt",
+                    "name": "report.txt",
+                    "data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=",
+                },
+            }
+        )
+        # No RPC error (5028) and the file landed in the cache fallback root.
+        assert "error" not in resp, resp
+        assert resp["result"]["attached"] is True
+        assert resp["result"]["uploaded"] is True
+        fallback_dir = (home / "cache" / "desktop-attachments").resolve()
+        assert Path(resp["result"]["path"]).parent == fallback_dir
+        assert (fallback_dir / "report.txt").read_text(encoding="utf-8") == "hello world"
+        # The reachable ref is the absolute cache path (outside the read-only cwd).
+        assert resp["result"]["ref_text"] == f"@file:{fallback_dir / 'report.txt'}"
+
+        # 2) The session recorded the fallback so prompt.submit can allow it.
+        assert (
+            server._sessions["sid"].get(server._DESKTOP_ATTACHMENT_FALLBACK_KEY)
+            == str(fallback_dir)
+        )
+        allowed_roots = server._desktop_attachment_allowed_roots(
+            server._sessions["sid"], str(workspace)
+        )
+        assert str(fallback_dir) in allowed_roots
+
+        # 3) The staged @file: ref must EXPAND (not be blocked) when prompt.submit
+        #    preprocesses it with the widened allowed roots — the second-order
+        #    constraint from the original diagnosis.
+        from agent.context_references import preprocess_context_references_async
+
+        import asyncio
+
+        ref = resp["result"]["ref_text"]
+        # Without widening (allowed_root=cwd only) it would be refused:
+        alone = asyncio.run(
+            preprocess_context_references_async(
+                ref, cwd=str(workspace), context_length=100000, allowed_root=str(workspace)
+            )
+        )
+        assert "outside the allowed workspace" in (alone.message or "")
+        # With the widened roots it expands to the uploaded bytes:
+        widened = asyncio.run(
+            preprocess_context_references_async(
+                ref,
+                cwd=str(workspace),
+                context_length=100000,
+                allowed_root=allowed_roots,
+            )
+        )
+        assert widened.blocked is False
+        assert "hello world" in (widened.message or "")
+    finally:
+        os.chmod(workspace, 0o755)
+        server._sessions.pop("sid", None)
+        reset_hermes_home_override(token)
+
+
 def test_file_attach_copies_gateway_visible_file_outside_workspace(monkeypatch, tmp_path):
     """Local case: gateway can see the file but it's outside the workspace → copy in."""
     workspace = tmp_path / "workspace"

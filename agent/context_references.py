@@ -125,7 +125,7 @@ def preprocess_context_references(
     cwd: str | Path,
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: str | Path | None = None,
+    allowed_root: str | Path | tuple[Path, ...] | None = None,
 ) -> ContextReferenceResult:
     coro = preprocess_context_references_async(
         message,
@@ -152,7 +152,7 @@ async def preprocess_context_references_async(
     cwd: str | Path,
     context_length: int,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: str | Path | None = None,
+    allowed_root: str | Path | tuple[Path, ...] | None = None,
 ) -> ContextReferenceResult:
     refs = parse_context_references(message)
     if not refs:
@@ -160,10 +160,17 @@ async def preprocess_context_references_async(
 
     cwd_path = Path(cwd).expanduser().resolve()
     # Default to the current working directory so @ references cannot escape
-    # the active workspace unless a caller explicitly widens the root.
-    allowed_root_path = (
-        Path(allowed_root).expanduser().resolve() if allowed_root is not None else cwd_path
-    )
+    # the active workspace unless a caller explicitly widens the root. A
+    # single root or a tuple of roots is accepted (e.g. a session cwd plus a
+    # fallback desktop-attachment cache dir staged outside the workspace).
+    if allowed_root is None:
+        allowed_root_paths: tuple[Path, ...] = (cwd_path,)
+    elif isinstance(allowed_root, tuple):
+        allowed_root_paths = tuple(
+            Path(r).expanduser().resolve() for r in allowed_root
+        )
+    else:
+        allowed_root_paths = (Path(allowed_root).expanduser().resolve(),)
     warnings: list[str] = []
     blocks: list[str] = []
     injected_tokens = 0
@@ -180,7 +187,7 @@ async def preprocess_context_references_async(
                 ref,
                 cwd_path,
                 url_fetcher=url_fetcher,
-                allowed_root=allowed_root_path,
+                allowed_root=allowed_root_paths,
             )
             for ref in refs
         )
@@ -240,7 +247,7 @@ async def _expand_reference(
     cwd: Path,
     *,
     url_fetcher: Callable[[str], str | Awaitable[str]] | None = None,
-    allowed_root: Path | None = None,
+    allowed_root: Path | tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     try:
         if ref.kind == "file":
@@ -269,7 +276,7 @@ def _expand_file_reference(
     ref: ContextReference,
     cwd: Path,
     *,
-    allowed_root: Path | None = None,
+    allowed_root: Path | tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
@@ -303,7 +310,7 @@ def _expand_folder_reference(
     ref: ContextReference,
     cwd: Path,
     *,
-    allowed_root: Path | None = None,
+    allowed_root: Path | tuple[Path, ...] | None = None,
 ) -> tuple[str | None, str | None]:
     path = _resolve_path(cwd, ref.target, allowed_root=allowed_root)
     _ensure_reference_path_allowed(path)
@@ -368,17 +375,35 @@ async def _default_url_fetcher(url: str) -> str:
     return str(doc.get("content") or doc.get("raw_content") or "").strip()
 
 
-def _resolve_path(cwd: Path, target: str, *, allowed_root: Path | None = None) -> Path:
+def _path_within_root(resolved: Path, root: Path) -> bool:
+    """Return True when *resolved* lives at or below *root*."""
+    try:
+        resolved.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _resolve_path(
+    cwd: Path,
+    target: str,
+    *,
+    allowed_root: Path | tuple[Path, ...] | None = None,
+) -> Path:
     path = Path(os.path.expanduser(target))
     if not path.is_absolute():
         path = cwd / path
     resolved = path.resolve()
-    if allowed_root is not None:
-        try:
-            resolved.relative_to(allowed_root)
-        except ValueError as exc:
-            raise ValueError("path is outside the allowed workspace") from exc
-    return resolved
+    # ``allowed_root`` may be a single root or a tuple of roots (e.g. a session
+    # cwd plus a fallback desktop-attachment cache dir that lives outside the
+    # workspace). A ref resolves iff it is within ANY of the allowed roots.
+    roots = (cwd,) if allowed_root is None else (
+        allowed_root if isinstance(allowed_root, tuple) else (allowed_root,)
+    )
+    for root in roots:
+        if _path_within_root(resolved, root):
+            return resolved
+    raise ValueError("path is outside the allowed workspace")
 
 
 def _ensure_reference_path_allowed(path: Path) -> None:
