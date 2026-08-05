@@ -300,6 +300,7 @@ interface MessageLineProps {
   detailsMode?: DetailsMode
   detailsModeCommandOverride?: boolean
   isStreaming?: boolean
+  streamingIsFull?: boolean
   msg: Msg
   // The block rendered directly above this one. Drives the group-boundary
   // lead gap (see domain/blockLayout.ts::hasLeadGap). Undefined at the top of
