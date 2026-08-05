@@ -270,6 +270,10 @@ def _check_api_supports_update_mode_append(api_url: str,
 _loop: asyncio.AbstractEventLoop | None = None
 _loop_thread: threading.Thread | None = None
 _loop_lock = threading.Lock()
+# Serialize embedded-daemon startup and stale-client replacement across all
+# provider instances in the gateway. One provider is created per concurrent
+# chat session, so an unhealthy daemon must not create a restart stampede.
+_embedded_daemon_lock = threading.Lock()
 
 # Sentinel pushed to the per-provider retain queue to wake the writer for a
 # clean exit. A unique object so it can never collide with a real job.
@@ -1143,10 +1147,16 @@ class HindsightMemoryProvider(MemoryProvider):
                         + (f": {reason}" if reason else "")
                     )
                 try:
-                    from tools.lazy_deps import ensure as _lazy_ensure
+                    from tools.lazy_deps import ensure as _lazy_ensure, FeatureUnavailable
+                except ImportError:
+                    FeatureUnavailable = Exception
+                    _lazy_ensure = lambda feature, prompt: None
+                try:
                     _lazy_ensure("memory.hindsight", prompt=False)
                 except ImportError:
                     pass
+                except FeatureUnavailable as _e:
+                    raise ImportError(str(_e))
                 except Exception as _e:
                     raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
@@ -1172,7 +1182,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 )
                 self._idle_timeout = idle_timeout
                 kwargs["idle_timeout"] = idle_timeout
-                self._client = HindsightEmbedded(**kwargs)
+                client = HindsightEmbedded(**kwargs)
+                # HindsightEmbedded registers its config back into the profile
+                # after a successful health check. Keep the complete profile
+                # environment on the wrapper; otherwise that registration can
+                # replace the profile with only the LLM fields and silently
+                # drop the external embeddings/reranker/database settings.
+                embedded_config = getattr(client, "config", None)
+                if isinstance(embedded_config, dict):
+                    embedded_config.update(
+                        _build_embedded_profile_env(self._config)
+                    )
+                self._client = client
             else:
                 _ensure_cloud_client_dependency()
                 from hindsight_client import Hindsight
@@ -1259,7 +1280,11 @@ class HindsightMemoryProvider(MemoryProvider):
         means "no longer pending" and is treated as done. Transient errors
         return False so the caller keeps waiting until its deadline.
         """
-        from hindsight_client_api.exceptions import NotFoundException
+        from tools.lazy_deps import FeatureUnavailable
+        try:
+            from hindsight_client_api.exceptions import NotFoundException
+        except (ImportError, FeatureUnavailable):
+            class NotFoundException(Exception): pass
 
         try:
             resp = self._run_hindsight_operation(
@@ -1434,6 +1459,39 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
+    def _close_replaced_embedded_client(self, client) -> None:
+        """Release a stale embedded wrapper before replacing it.
+
+        The wrapper owns an async HTTP client on the shared Hindsight loop.
+        Abandoning it leaks sockets/eventpoll descriptors; the wrapper's
+        manager may also leave concurrent daemon-start callers queued on the
+        profile lock.
+        """
+        inner_client = getattr(client, "_client", None)
+        if inner_client is not None and hasattr(inner_client, "aclose"):
+            try:
+                self._run_sync(inner_client.aclose())
+                try:
+                    client._client = None
+                except Exception:
+                    pass
+            except Exception as exc:
+                logger.debug(
+                    "Failed to close stale Hindsight async client: %s",
+                    exc,
+                    exc_info=True,
+                )
+        try:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
+        except Exception as exc:
+            logger.debug(
+                "Failed to close stale Hindsight embedded wrapper: %s",
+                exc,
+                exc_info=True,
+            )
+
     def _run_hindsight_operation(self, operation):
         """Run an async Hindsight client operation, retrying once after idle shutdown."""
         client = self._get_client()
@@ -1446,10 +1504,18 @@ class HindsightMemoryProvider(MemoryProvider):
                 "Hindsight embedded daemon appears unreachable; recreating client and retrying once: %s",
                 exc,
             )
-            self._client = None
-            client = self._get_client()
-            self._client = client
-            return self._run_sync(operation(client))
+            # Every concurrent gateway session owns a provider. Serialize the
+            # replacement so they cannot all open the same profile lock and a
+            # fresh set of sockets/event loops at once.
+            with _embedded_daemon_lock:
+                stale_client = self._client
+                if stale_client is not None:
+                    self._close_replaced_embedded_client(stale_client)
+                    if self._client is stale_client:
+                        self._client = None
+                client = self._get_client()
+                self._client = client
+                return self._run_sync(operation(client))
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1714,7 +1780,11 @@ class HindsightMemoryProvider(MemoryProvider):
                                 f.write("\n=== Config changed, restarting daemon ===\n")
                             client._manager.stop(profile)
 
-                    client._ensure_started()
+                    # Provider initialization happens once per concurrent chat
+                    # session. Allow only one embedded-daemon start/health
+                    # sequence at a time to avoid a profile-lock stampede.
+                    with _embedded_daemon_lock:
+                        client._ensure_started()
                     with open(log_path, "a", encoding="utf-8") as f:
                         f.write("\n=== Daemon started successfully ===\n")
                 except Exception as e:
