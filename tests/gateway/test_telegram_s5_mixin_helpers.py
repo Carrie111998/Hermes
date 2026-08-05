@@ -91,7 +91,7 @@ def _msg(text=None, caption=None, entities=None, caption_entities=None, chat=Non
 
 def test_all_s5_mixins_in_mro_before_base():
     from plugins.platforms.telegram.adapter import TelegramAdapter
-    from plugins.platforms.telegram.dm_topics_mixin import DmTopicsMixin
+    from plugins.platforms.telegram.dm_topics_cache_mixin import DmTopicsCacheMixin
     from plugins.platforms.telegram.group_observe_mixin import GroupObserveMixin
     from plugins.platforms.telegram.inbound_handlers_mixin import InboundHandlersMixin
     from plugins.platforms.telegram.media_batching_mixin import MediaBatchingMixin
@@ -112,7 +112,7 @@ def test_all_s5_mixins_in_mro_before_base():
         InboundHandlersMixin,
         TextBatchingMixin,
         MediaBatchingMixin,
-        DmTopicsMixin,
+        DmTopicsCacheMixin,
         RichTextFlattenMixin,
         ReactionsMixin,
     ):
@@ -491,7 +491,7 @@ async def test_processing_lifecycle_reactions(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# DM-topic cache cluster (dm_topics_mixin)
+# DM-topic cache cluster (dm_topics_cache_mixin)
 # ---------------------------------------------------------------------------
 
 

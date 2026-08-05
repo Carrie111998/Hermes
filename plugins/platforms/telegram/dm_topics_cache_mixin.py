@@ -22,7 +22,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("plugins.platforms.telegram.adapter")
 
-class DmTopicsMixin:
+class DmTopicsCacheMixin:
     """Dm-topic config cache cluster lifted verbatim from ``TelegramAdapter``."""
 
     def _reload_dm_topics_from_config(self) -> None:
