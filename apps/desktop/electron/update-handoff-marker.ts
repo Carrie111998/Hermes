@@ -55,12 +55,14 @@ export function handoffMarkerPath(hermesHome) {
 export function defaultResolveSha(updateRoot) {
   try {
     const { execFileSync } = require('child_process')
+
     const sha = execFileSync('git', ['rev-parse', 'HEAD'], {
       cwd: updateRoot,
       encoding: 'utf8',
       timeout: 5000,
       stdio: ['pipe', 'pipe', 'pipe']
     }).trim()
+
     return sha
   } catch {
     return ''
@@ -78,19 +80,23 @@ export function defaultResolveSha(updateRoot) {
  */
 export function writeHermesUpdateHandoff(hermesHome, { sha, version, at }: any = {}) {
   const markerPath = handoffMarkerPath(hermesHome)
+
   try {
     fs.mkdirSync(path.dirname(markerPath), { recursive: true })
   } catch {
     // directory likely exists already
   }
+
   const body = JSON.stringify({
     sha: sha || '',
     version: version || '',
     at: at || Date.now()
   })
+
   // Atomic write (temp + rename) so a crash mid-write can't leave a
   // half-written marker that would be misparsed on next boot.
   const tmp = markerPath + '.tmp'
+
   try {
     fs.writeFileSync(tmp, body, 'utf8')
     fs.renameSync(tmp, markerPath)
@@ -131,6 +137,7 @@ export function readUpdateHandoffResult(hermesHome, updateRoot, opts: any = {}) 
 
   const markerPath = handoffMarkerPath(hermesHome)
   let raw
+
   try {
     raw = fs.readFileSync(markerPath, 'utf8')
   } catch {
@@ -138,16 +145,19 @@ export function readUpdateHandoffResult(hermesHome, updateRoot, opts: any = {}) 
   }
 
   let marker
+
   try {
     marker = JSON.parse(raw)
   } catch {
     // Malformed marker — prune and move on.
     try { fs.unlinkSync(markerPath) } catch { /* ignore */ }
+
     return { pending: false }
   }
 
   if (!marker || typeof marker !== 'object') {
     try { fs.unlinkSync(markerPath) } catch { /* ignore */ }
+
     return { pending: false }
   }
 
@@ -158,6 +168,7 @@ export function readUpdateHandoffResult(hermesHome, updateRoot, opts: any = {}) 
   // doesn't false-positive on a much later relaunch.
   if (ageMs > maxAgeMs) {
     try { fs.unlinkSync(markerPath) } catch { /* ignore */ }
+
     return { pending: false }
   }
 
@@ -168,6 +179,7 @@ export function readUpdateHandoffResult(hermesHome, updateRoot, opts: any = {}) 
   if (currentSha && recordedSha && currentSha !== recordedSha) {
     // Prune the marker — it's a one-shot.
     try { fs.unlinkSync(markerPath) } catch { /* ignore */ }
+
     return { pending: false, succeeded: true }
   }
 
@@ -200,6 +212,7 @@ export function readUpdateHandoffResult(hermesHome, updateRoot, opts: any = {}) 
   // Prune the one-shot marker and surface a closeable error to the user
   // instead of silently reverting to the old version.
   try { fs.unlinkSync(markerPath) } catch { /* ignore */ }
+
   return {
     pending: true,
     failed: true,

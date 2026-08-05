@@ -188,8 +188,8 @@ import {
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
-import { writeHermesUpdateHandoff, readUpdateHandoffResult } from './update-handoff-marker'
 import { waitForUpdateClearance } from './update-gate'
+import { readUpdateHandoffResult, writeHermesUpdateHandoff } from './update-handoff-marker'
 import { readLiveUpdateMarker, updateHandoffConflict, writeUpdateMarker } from './update-marker'
 import { runRebuildWithRetry } from './update-rebuild'
 import {
@@ -2993,12 +2993,14 @@ async function applyUpdates(opts = {}) {
     // SHA on next boot) and surface a closeable error instead of silently
     // reverting to the old version. (#57645)
     let preHandoffSha = ''
+
     try {
       const head = await runGit(['rev-parse', 'HEAD'], { cwd: updateRoot })
       preHandoffSha = (head.stdout || '').trim()
     } catch {
       // best-effort; the marker still records version + timestamp
     }
+
     writeHermesUpdateHandoff(HERMES_HOME, {
       sha: preHandoffSha,
       version: resolveHermesVersion()
@@ -3598,12 +3600,14 @@ fi
   // of silently reverting to the old version. (#57645) This mirrors the
   // marker write in the staged-helper hand-off path.
   let preSwapSha = ''
+
   try {
     const head = await runGit(['rev-parse', 'HEAD'], { cwd: updateRoot })
     preSwapSha = (head.stdout || '').trim()
   } catch {
     // best-effort; the marker still records version + timestamp
   }
+
   writeHermesUpdateHandoff(HERMES_HOME, {
     sha: preSwapSha,
     version: resolveHermesVersion()
@@ -11461,6 +11465,7 @@ ipcMain.handle('hermes:updates:apply', async (_event, payload) =>
 ipcMain.handle('hermes:updates:handoff-result', async () => {
   try {
     const updateRoot = resolveUpdateRoot()
+
     return readUpdateHandoffResult(HERMES_HOME, updateRoot)
   } catch (error) {
     return { pending: false, error: error?.message || String(error) }
