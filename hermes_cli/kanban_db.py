@@ -4857,7 +4857,9 @@ def submit_task_for_review(
                    claim_expires = NULL,
                    worker_pid = NULL,
                    block_kind = NULL,
-                   block_recurrences = 0
+                   block_recurrences = 0,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
              WHERE id = ?
                AND status IN ('running', 'ready')
         """
@@ -8264,18 +8266,23 @@ def _resolve_review_mode(value: Optional[str] = None) -> str:
         try:
             from hermes_cli.config import load_config
 
-            value = str(
-                (load_config().get("kanban") or {}).get("review_mode", "agent")
+            kanban_config = load_config().get("kanban") or {}
+            value = str(kanban_config.get("review_mode", "agent"))
+        except Exception as exc:
+            _log.warning(
+                "kanban dispatcher: could not load kanban.review_mode (%s); "
+                "using human to suppress automated review dispatch",
+                exc,
             )
-        except Exception:
-            value = "agent"
+            return "human"
     mode = str(value).strip().lower()
     if mode not in {"agent", "human"}:
         _log.warning(
-            "kanban dispatcher: invalid kanban.review_mode=%r; using agent",
+            "kanban dispatcher: invalid kanban.review_mode=%r; using human "
+            "to suppress automated review dispatch",
             mode,
         )
-        return "agent"
+        return "human"
     return mode
 
 

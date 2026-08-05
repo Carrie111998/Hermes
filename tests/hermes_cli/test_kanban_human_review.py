@@ -25,6 +25,11 @@ def test_submit_task_for_review_closes_worker_run_and_preserves_handoff(kanban_h
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
         run_id = claimed.current_run_id
+        conn.execute(
+            "UPDATE tasks SET consecutive_failures = 1, last_failure_error = ? WHERE id = ?",
+            ("prior implementation crash", task_id),
+        )
+        conn.commit()
 
         assert kb.submit_task_for_review(
             conn,
@@ -42,6 +47,8 @@ def test_submit_task_for_review_closes_worker_run_and_preserves_handoff(kanban_h
         assert task.claim_expires is None
         assert task.worker_pid is None
         assert task.completed_at is None
+        assert task.consecutive_failures == 0
+        assert task.last_failure_error is None
 
         run = kb.latest_run(conn, task_id)
         assert run is not None
@@ -126,3 +133,12 @@ def test_human_review_mode_does_not_dispatch_review_agent(kanban_home, monkeypat
         assert task.current_run_id is None
     finally:
         conn.close()
+
+
+def test_invalid_explicit_review_mode_fails_closed_to_human(kanban_home):
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n  review_mode: humam\n",
+        encoding="utf-8",
+    )
+
+    assert getattr(kb, "_resolve_review_mode")() == "human"

@@ -646,6 +646,7 @@ class GatewayKanbanWatchersMixin:
                             _assignee = task.assignee if task else ""
                             _parts = []
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
+                            if "submitted_for_review" in _wake_kinds: _parts.append(t("gateway.kanban.wake.review"))
                             if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
                             if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
                             if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
