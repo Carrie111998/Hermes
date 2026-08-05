@@ -264,4 +264,3 @@ class CLIUsageMixin:
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
-
