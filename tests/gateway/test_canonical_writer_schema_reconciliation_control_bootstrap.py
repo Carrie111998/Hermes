@@ -227,6 +227,8 @@ def _observation(
     membership_count: int,
     observed_at_unix: int,
     provider_forward_role_count: int = 1,
+    helper_absent: bool = True,
+    helper_same_name_count: int = 0,
 ) -> dict[str, Any]:
     exact = state == "exact_installed"
     return _hashed(
@@ -276,8 +278,8 @@ def _observation(
                 bootstrap.APPLY_DEFINITION_SHA256 if exact else None
             ),
             "foundation_exact": exact,
-            "helper_absent": True,
-            "helper_same_name_count": 0,
+            "helper_absent": helper_absent,
+            "helper_same_name_count": helper_same_name_count,
             "observed_at_unix": observed_at_unix,
         },
         "observation_sha256",
@@ -1722,6 +1724,80 @@ def test_runtime_install_closes_broad_session_before_intermediate(
     ) == intermediate
 
 
+def test_runtime_install_replay_defers_full_contract_until_admin_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _key, gate, install, _intermediate_value, _cleanup, _terminal_value = (
+        _protocol_fixture()
+    )
+    events: list[str] = []
+    times = iter((960, 970, 980, 990, 1_000))
+    context = bootstrap._ControlRuntimeContext(
+        base=types.SimpleNamespace(
+            dependencies=types.SimpleNamespace(now=lambda: next(times))
+        ),
+        gate=gate,
+        install_artifact=types.SimpleNamespace(),
+    )
+
+    class Session:
+        def close(self) -> None:
+            events.append("control-close")
+
+    monkeypatch.setattr(bootstrap, "_revalidate_stopped", lambda *_: None)
+    monkeypatch.setattr(
+        bootstrap,
+        "_open_control_session",
+        lambda *_args: Session(),
+    )
+
+    def observe(
+        _session: Any,
+        *,
+        phase: str,
+        observed_at_unix: Any,
+        allow_routeback_helper_present: bool = False,
+    ) -> Mapping[str, Any]:
+        assert allow_routeback_helper_present is True
+        return _observation(
+            phase=phase,
+            state="exact_installed",
+            session_user_sha256=gate[
+                "temporary_control_admin_username_sha256"
+            ],
+            control_admin_count=1,
+            membership_count=0,
+            observed_at_unix=observed_at_unix(),
+            helper_absent=False,
+            helper_same_name_count=1,
+        )
+
+    monkeypatch.setattr(bootstrap, "_observe_foundation", observe)
+    monkeypatch.setattr(
+        bootstrap,
+        "_require_exact_target_helper_replay",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("full contract must wait for admin cleanup")
+        ),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "_execute_install_artifact",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("replay must remain read-only")
+        ),
+    )
+    intermediate = bootstrap._runtime_install_callback(
+        context,
+        gate,
+        install,
+        bytearray(CREDENTIAL),
+    )
+    assert intermediate["initial_foundation_state"] == "exact_installed"
+    assert intermediate["mutation_applied"] is False
+    assert events == ["control-close"]
+
+
 def test_runtime_install_rejects_claim_expired_during_before_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1806,11 +1882,21 @@ def test_runtime_post_cleanup_uses_fresh_fixed_writer_then_closes(
 
     session = Session()
     config = types.SimpleNamespace(user=bootstrap.foundation.SQL_USER)
-    times = iter((990, 995))
+    target_sha256 = _digest("target-contract")
+    target = types.SimpleNamespace(
+        attestation=object(),
+        sha256=target_sha256,
+    )
+    managed_hba_receipt = object()
+    times = iter((990, 992, 995))
     base = types.SimpleNamespace(
+        target=target,
         dependencies=types.SimpleNamespace(
             now=lambda: next(times),
             writer_config=lambda: config,
+            collect_hba=lambda *_args, **_kwargs: (
+                events.append("writer-hba") or managed_hba_receipt
+            ),
             open_session=lambda value: (
                 events.append("writer-open") or session
                 if value is config
@@ -1854,9 +1940,30 @@ def test_runtime_post_cleanup_uses_fresh_fixed_writer_then_closes(
             control_admin_count=0,
             membership_count=0,
             observed_at_unix=captured_at,
+            helper_absent=False,
+            helper_same_name_count=1,
         )
 
     monkeypatch.setattr(bootstrap, "_observe_foundation", observe)
+    policy = object()
+    monkeypatch.setattr(bootstrap, "_target_policy", lambda value: policy)
+
+    def collect(
+        contract_session: Any,
+        *,
+        config: Any,
+        policy: Any,
+        managed_hba_receipt: Any,
+        subject_user: str,
+    ) -> Any:
+        assert contract_session is session
+        assert config is base.dependencies.writer_config()
+        assert managed_hba_receipt is not None
+        assert subject_user == bootstrap.foundation.SQL_USER
+        events.append("writer-contract")
+        return types.SimpleNamespace(sha256=target_sha256)
+
+    monkeypatch.setattr(bootstrap, "collect_schema_contract", collect)
     terminal = bootstrap._runtime_post_cleanup_callback(
         context,
         gate,
@@ -1868,6 +1975,8 @@ def test_runtime_post_cleanup_uses_fresh_fixed_writer_then_closes(
         "stopped",
         "writer-open",
         "writer-observe",
+        "writer-hba",
+        "writer-contract",
         "writer-close",
         "stopped",
     ]
@@ -1937,7 +2046,7 @@ def test_runtime_routeback_helper_replay_requires_exact_target_contract(
         return types.SimpleNamespace(sha256=target_sha256)
 
     monkeypatch.setattr(bootstrap, "collect_schema_contract", collect)
-    session = object()
+    session = types.SimpleNamespace(username=config.user)
     bootstrap._require_exact_target_helper_replay(
         context,
         session,
@@ -1956,13 +2065,54 @@ def test_runtime_routeback_helper_replay_requires_exact_target_contract(
     with pytest.raises(
         bootstrap.ControlBootstrapError,
         match=(
-            "schema_reconciliation_control_routeback_helper_contract_invalid"
+            "schema_reconciliation_control_routeback_contract_mismatch"
         ),
     ):
         bootstrap._require_exact_target_helper_replay(
             context,
             session,
             observation,
+        )
+
+
+def test_runtime_routeback_helper_replay_rejects_temporary_control_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_sha256 = _digest("target-contract")
+    config = types.SimpleNamespace(user=bootstrap.foundation.SQL_USER)
+    target = types.SimpleNamespace(
+        attestation=object(),
+        sha256=target_sha256,
+    )
+    base = types.SimpleNamespace(
+        target=target,
+        dependencies=types.SimpleNamespace(
+            writer_config=lambda: config,
+        ),
+    )
+    context = bootstrap._ControlRuntimeContext(
+        base=base,
+        gate={},
+        install_artifact=types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "collect_schema_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("temporary control session must never collect contract")
+        ),
+    )
+    temporary_control_session = types.SimpleNamespace(
+        username="muncho_canary_control_0123456789abcdef"
+    )
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match="schema_reconciliation_control_routeback_writer_boundary_invalid",
+    ):
+        bootstrap._require_exact_target_helper_replay(
+            context,
+            temporary_control_session,
+            {"helper_absent": False, "helper_same_name_count": 1},
         )
 
 
