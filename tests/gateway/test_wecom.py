@@ -295,6 +295,85 @@ class TestWeComReplyMode:
         )
 
     @pytest.mark.asyncio
+    async def test_send_long_final_keeps_reasoning_on_first_stream_chunk(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._thinking_reply_req_id = "req-1"
+        adapter._thinking_stream_id = "stream-1"
+        adapter.record_stream_reasoning(
+            "req-1",
+            "stream-1",
+            "**Confirming unavailability of research skills**",
+        )
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+        content = "ResearchAgent设计要点。" * 500
+
+        result = await adapter.send(
+            "chat-123",
+            content,
+            metadata={
+                "expect_edits": True,
+                "notify": True,
+                "wecom_reply_req_id": "req-1",
+                "wecom_stream_id": "stream-1",
+            },
+        )
+
+        assert result.success is True
+        payloads = [call.args[1] for call in adapter._send_reply_request.await_args_list]
+        chunks = [payload["stream"]["content"] for payload in payloads]
+
+        assert len(chunks) > 1
+        assert chunks[0].startswith(
+            "<think>**Confirming unavailability of research skills**</think>\n"
+        )
+        assert all(len(chunk) <= adapter.MAX_MESSAGE_LENGTH for chunk in chunks)
+        combined = "".join(
+            re.sub(r" \(\d+/\d+\)$", "", chunk)
+            for chunk in chunks
+        )
+        assert combined == (
+            "<think>**Confirming unavailability of research skills**</think>\n"
+            + content
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_draft_preserves_thinking_block_when_no_reasoning_yet(self):
+        from plugins.platforms.wecom.adapter import WAITING_MODEL_TEXT, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._thinking_reply_req_id = "req-1"
+        adapter._thinking_stream_id = "stream-1"
+        adapter._thinking_accumulated_lines = [f"{WAITING_MODEL_TEXT} 0s"]
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "req-1"}, "errcode": 0}
+        )
+        adapter._cancel_thinking_indicator = AsyncMock()
+
+        result = await adapter.send_draft(
+            "chat-123",
+            1,
+            "draft answer",
+            metadata={
+                "wecom_reply_req_id": "req-1",
+                "wecom_stream_id": "stream-1",
+            },
+        )
+
+        assert result.success is True
+        adapter._cancel_thinking_indicator.assert_not_awaited()
+        payload = adapter._send_reply_request.await_args.args[1]
+        assert payload["stream"]["id"] == "stream-1"
+        assert payload["stream"]["finish"] is False
+        assert payload["stream"]["content"] == (
+            f"<think>{WAITING_MODEL_TEXT} 0s</think>\ndraft answer"
+        )
+        assert adapter._thinking_draft_content == "draft answer"
+
+    @pytest.mark.asyncio
     async def test_send_final_keeps_reasoning_after_intermediate_stream_close(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
 
@@ -490,6 +569,46 @@ class TestWeComReplyMode:
         finally:
             await adapter._cancel_thinking_indicator(close_stream=False)
 
+    @pytest.mark.asyncio
+    async def test_real_reasoning_replaces_waiting_timer_in_thinking_stream(self):
+        from plugins.platforms.wecom.adapter import WAITING_MODEL_TEXT, WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_json = AsyncMock()
+        adapter._start_thinking_indicator("req-1", "stream-1")
+
+        try:
+            for _ in range(20):
+                if adapter._send_json.await_count:
+                    break
+                await asyncio.sleep(0.01)
+
+            adapter.record_stream_reasoning(
+                "req-1",
+                "stream-1",
+                "Planning the comparison",
+            )
+
+            for _ in range(30):
+                contents = [
+                    call.args[0]["body"]["stream"]["content"]
+                    for call in adapter._send_json.await_args_list
+                ]
+                if any("Planning the comparison" in content for content in contents):
+                    break
+                await asyncio.sleep(0.01)
+
+            reasoning_frames = [
+                call.args[0]["body"]["stream"]["content"]
+                for call in adapter._send_json.await_args_list
+                if "Planning the comparison" in call.args[0]["body"]["stream"]["content"]
+            ]
+            assert reasoning_frames
+            assert all(WAITING_MODEL_TEXT not in content for content in reasoning_frames)
+            assert getattr(adapter, "_thinking_accumulated_lines", []) == []
+        finally:
+            await adapter._cancel_thinking_indicator(close_stream=False)
+
     def test_supports_draft_streaming_requires_wecom_metadata(self):
         from plugins.platforms.wecom.adapter import WeComAdapter
 
@@ -500,6 +619,24 @@ class TestWeComReplyMode:
         assert adapter.supports_draft_streaming(
             metadata={"wecom_reply_req_id": "req-1", "wecom_stream_id": "stream-1"}
         ) is True
+
+    def test_stream_metadata_falls_back_to_active_thinking_stream_without_reply_anchor(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._thinking_reply_req_id = "req-1"
+        adapter._thinking_stream_id = "stream-1"
+
+        metadata = adapter.stream_metadata_for_reply_to(
+            None,
+            {"thread_id": "thread-1"},
+        )
+
+        assert metadata == {
+            "thread_id": "thread-1",
+            "wecom_reply_req_id": "req-1",
+            "wecom_stream_id": "stream-1",
+        }
 
     @pytest.mark.asyncio
     async def test_shared_consumer_splits_long_unicode_final_without_truncation(self):
@@ -532,15 +669,42 @@ class TestWeComReplyMode:
         await consumer.run()
 
         payloads = [call.args[1] for call in adapter._send_reply_request.await_args_list]
-        stream_payloads = [payload["stream"] for payload in payloads]
-        contents = [payload["content"] for payload in stream_payloads]
+        contents = []
+        for payload in payloads:
+            assert payload["msgtype"] == "stream"
+            assert payload["stream"]["finish"] is True
+            contents.append(payload["stream"]["content"])
 
         assert len(contents) >= 2
-        assert all(payload["finish"] is True for payload in stream_payloads)
         assert all(len(content) <= adapter.MAX_MESSAGE_LENGTH for content in contents)
         combined = "".join(re.sub(r" \(\d+/\d+\)$", "", content) for content in contents)
         assert combined == text
         assert consumer.final_response_sent is True
+
+    @pytest.mark.asyncio
+    async def test_reply_markdown_fallback_splits_long_content_without_truncation(self):
+        from plugins.platforms.wecom.adapter import WeComAdapter
+
+        adapter = WeComAdapter(PlatformConfig(enabled=True))
+        adapter._send_reply_request = AsyncMock(
+            return_value={"headers": {"req_id": "sent"}, "errcode": 0}
+        )
+        adapter._reply_req_ids["msg-1"] = "req-1"
+        text = "fallback🙂" * 900
+
+        result = await adapter.send("chat-123", text, reply_to="msg-1")
+
+        assert result.success is True
+        payloads = [call.args[1] for call in adapter._send_reply_request.await_args_list]
+        contents = []
+        for payload in payloads:
+            assert payload["msgtype"] == "markdown"
+            contents.append(payload["markdown"]["content"])
+
+        assert len(contents) >= 2
+        assert all(len(content) <= adapter.MAX_MESSAGE_LENGTH for content in contents)
+        combined = "".join(re.sub(r" \(\d+/\d+\)$", "", content) for content in contents)
+        assert combined == text
 
     @pytest.mark.asyncio
     async def test_shared_consumer_preserves_prefix_when_draft_overflows_before_finish(self):
@@ -581,12 +745,12 @@ class TestWeComReplyMode:
         await task
 
         payloads = [call.args[1] for call in adapter._send_reply_request.await_args_list]
-        final_streams = [
-            payload["stream"]
-            for payload in payloads
-            if payload["stream"]["finish"] is True
-        ]
-        contents = [payload["content"] for payload in final_streams]
+        contents = []
+        for payload in payloads:
+            assert payload["msgtype"] == "stream"
+            if payload["stream"]["finish"] is not True:
+                continue
+            contents.append(payload["stream"]["content"])
         combined = "".join(re.sub(r" \(\d+/\d+\)$", "", content) for content in contents)
 
         assert combined == first + second
@@ -634,14 +798,14 @@ class TestWeComReplyMode:
         await task
 
         payloads = [call.args[1] for call in adapter._send_reply_request.await_args_list]
-        final_streams = [
-            payload["stream"]
-            for payload in payloads
-            if payload["stream"]["finish"] is True
-        ]
+        contents = []
+        for payload in payloads:
+            assert payload["msgtype"] == "stream"
+            assert payload["stream"]["finish"] is True
+            contents.append(payload["stream"]["content"])
         combined = "".join(
-            re.sub(r" \(\d+/\d+\)$", "", payload["content"])
-            for payload in final_streams
+            re.sub(r" \(\d+/\d+\)$", "", content)
+            for content in contents
         )
 
         assert combined == first + second

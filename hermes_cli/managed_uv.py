@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _RUNTIME_DIR_NAME = ".hermes-runtime"
 _VENV_NAME = "venv"
+_ALT_VENV_NAME = ".venv"
 _REPAIR_LOCK_NAME = "runtime-repair.lock"
 
 # ---------------------------------------------------------------------------
@@ -274,9 +275,46 @@ def ensure_uv(
     return _UvResult(result)
 
 
+def _uv_self_update_is_fresh(now: float | None = None) -> bool:
+    """Return True when ``uv self update`` ran recently enough to skip.
+
+    uv releases roughly weekly while many users run ``hermes update`` daily;
+    re-running a blocking network self-update on every invocation is waste
+    and, offline, an unbounded hang risk. A stamp file under HERMES_HOME
+    caches the last successful self-update time.
+    """
+    try:
+        from hermes_constants import get_hermes_home
+
+        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        age = (now if now is not None else time.time()) - stamp.stat().st_mtime
+        return 0 <= age < UV_SELF_UPDATE_INTERVAL_SECONDS
+    except Exception:
+        return False
+
+
+def _touch_uv_self_update_stamp() -> None:
+    try:
+        from hermes_constants import get_hermes_home
+
+        stamp = get_hermes_home() / "cache" / ".uv_self_update_stamp"
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.touch()
+    except OSError:
+        pass
+
+
+# uv ships releases ~weekly; refresh the managed binary at most this often.
+UV_SELF_UPDATE_INTERVAL_SECONDS = 7 * 24 * 3600
+# `uv self update` is a network call; unbounded it can hang forever on a
+# blackholed connection (no default timeout in uv's downloader path).
+UV_SELF_UPDATE_TIMEOUT_SECONDS = 60
+
+
 def update_managed_uv(
     *,
     repair_observer: Callable[[RuntimeRepairResult], None] | None = None,
+    force: bool = False,
 ) -> Optional[str]:
     """Run ``uv self update`` on the managed uv binary.
 
@@ -284,31 +322,43 @@ def update_managed_uv(
     Returns the managed path when uv is available and ``None`` otherwise.
     A self-update failure is non-fatal because the old version still works.
     ``repair_observer``, when provided, receives the runtime repair result.
+
+    The network self-update is skipped when it succeeded within the last
+    ``UV_SELF_UPDATE_INTERVAL_SECONDS`` (7 days) unless ``force=True``; the
+    vulnerable-runtime repair probe below ALWAYS runs — CVE-driven runtime
+    repair must never be gated behind the freshness stamp.
     """
     existing = resolve_uv()
     if not existing:
         # Not installed yet — ensure_uv() will handle that elsewhere.
         return None
 
-    result = subprocess.run(
-        [existing, "self", "update"],
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        check=False,
-    )
-    if result.returncode == 0:
-        version = subprocess.run(
-            [existing, "--version"],
-            capture_output=True,
-            text=True, encoding='utf-8', errors='replace',
-            check=False,
-        ).stdout.strip()
-        print(f"  ✓ Managed uv updated ({version})")
-    else:
-        # Non-fatal — old uv still works fine.
-        logger.debug(
-            "uv self update failed (rc=%d): %s", result.returncode, result.stderr
-        )
+    if force or not _uv_self_update_is_fresh():
+        try:
+            result = subprocess.run(
+                [existing, "self", "update"],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                check=False,
+                timeout=UV_SELF_UPDATE_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            logger.debug("uv self update timed out after %ss", UV_SELF_UPDATE_TIMEOUT_SECONDS)
+            result = None
+        if result is not None and result.returncode == 0:
+            _touch_uv_self_update_stamp()
+            version = subprocess.run(
+                [existing, "--version"],
+                capture_output=True,
+                text=True, encoding='utf-8', errors='replace',
+                check=False,
+            ).stdout.strip()
+            print(f"  ✓ Managed uv updated ({version})")
+        elif result is not None:
+            # Non-fatal — old uv still works fine.
+            logger.debug(
+                "uv self update failed (rc=%d): %s", result.returncode, result.stderr
+            )
 
     # Keep this hook inside the long-standing API. During an update, main.py is
     # already imported from the old checkout, then ``git pull`` replaces this
@@ -937,6 +987,31 @@ def _refresh_managed_uv_catalog(uv_bin: str) -> bool:
     return after != before
 
 
+def _default_live_venv(root: Path) -> Path:
+    """Return the venv that runtime repair should target for *root*.
+
+    Managed installs create ``<checkout>/venv``, but uv-default and dev
+    checkouts use ``<checkout>/.venv``.  Historically only ``venv`` was
+    probed, so a ``.venv`` install linking a vulnerable SQLite returned
+    ``not-applicable`` on every ``hermes update`` and stayed on
+    journal_mode=DELETE forever — even though the WAL fallback warning
+    promises that ``hermes update`` repairs the runtime (issue class:
+    2,600x slower ``state.db`` appends under DELETE).
+
+    ``venv`` wins when it holds an interpreter (managed layout takes
+    precedence); otherwise fall back to ``.venv`` when that one does.
+    When neither has an interpreter, return the ``venv`` path so the
+    caller's existing ``not-applicable`` handling fires unchanged.
+    """
+    primary = root / _VENV_NAME
+    if _venv_python(primary).is_file():
+        return primary
+    fallback = root / _ALT_VENV_NAME
+    if _venv_python(fallback).is_file():
+        return fallback
+    return primary
+
+
 def repair_vulnerable_runtime(
     uv_bin: str,
     *,
@@ -949,7 +1024,7 @@ def repair_vulnerable_runtime(
     post-cutover smoke failures restore the parked venv synchronously.
     """
     root = Path(project_root) if project_root is not None else _PROJECT_ROOT
-    live = Path(venv_dir) if venv_dir is not None else root / _VENV_NAME
+    live = Path(venv_dir) if venv_dir is not None else _default_live_venv(root)
     live_python = _venv_python(live)
     if not (root / "pyproject.toml").is_file() or not live_python.is_file():
         return RuntimeRepairResult("not-applicable")
