@@ -2110,8 +2110,11 @@ def _env_split_string_findings(command: str):
                         option_phase = False
                         continue
                     if option_phase and resolved.startswith("-"):
+                        option_status, option_consumes_next = _classify_env_option(resolved)
+                        if option_status != "continue":
+                            break
                         split_value_expected = _env_option_owns_split_value(resolved)
-                        option_arg_expected = _env_option_consumes_next_arg(resolved)
+                        option_arg_expected = option_consumes_next
                         continue
                     option_phase = False
                     split_value_expected = False
@@ -2883,7 +2886,7 @@ def _command_detection_variants(command: str):
         decoded_payload = _deobfuscate_shell_words_preserving_boundaries(variant)
         if decoded_payload not in payload_variants:
             payload_variants.append(decoded_payload)
-        for _ in range(12):
+        for pass_index in range(13):
             added_unwrapped = False
             for base in tuple(payload_variants):
                 unwrapped = _mark_unwrapped_executables(base)
@@ -2892,8 +2895,9 @@ def _command_detection_variants(command: str):
                     added_unwrapped = True
             if not added_unwrapped:
                 break
-        else:
-            yield _PARSER_LIMIT_VARIANT
+            if pass_index == 12:
+                yield _PARSER_LIMIT_VARIANT
+                break
 
         for payload_variant in payload_variants:
             if payload_variant not in seen:

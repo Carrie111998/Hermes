@@ -997,9 +997,17 @@ class TestAnsiCQuotingBypass:
         assert "parser limit" in desc
 
     def test_wrapper_depth_limit_fails_closed(self, monkeypatch):
+        safe_at_limit = ("command " * 12) + "printf safe"
+        dangerous_at_limit = ("command " * 12) + "rm -rf /"
         dangerous = ("command " * 13) + "rm -rf /"
         nested = "env -S " + repr(dangerous)
         safe = ("command " * 13) + "printf safe"
+
+        assert detect_hardline_command(safe_at_limit) == (False, None)
+        is_hardline, desc = detect_hardline_command(dangerous_at_limit)
+        assert is_hardline is True
+        assert "parser limit" not in desc
+
         for cmd in (dangerous, nested, safe):
             is_hardline, desc = detect_hardline_command(cmd)
             assert is_hardline is True, cmd
@@ -1029,6 +1037,11 @@ class TestAnsiCQuotingBypass:
             "env --bogus -S 'rm -rf /'",
             "env --ignore -S 'rm -rf /'",
             "env -0 -S 'rm -rf /'",
+            'env --help "$PAYLOAD"',
+            'env --version "$PAYLOAD"',
+            'env --null "$PAYLOAD"',
+            'env --bogus "$PAYLOAD"',
+            'env --ignore "$PAYLOAD"',
         ):
             assert detect_hardline_command(cmd) == (False, None), cmd
 
