@@ -267,7 +267,11 @@ class PtyBridge:
         # leader: the dashboard TUI starts helper children such as the Python
         # slash worker, and killing only the leader can strand those helpers.
         for sig in (signal.SIGHUP, signal.SIGTERM, signal.SIGKILL):  # windows-footgun: ok — POSIX-only module (imports fcntl/termios/ptyprocess at top)
-            if not self._proc.isalive():
+            try:
+                alive = self._proc.isalive()
+            except Exception:
+                alive = True
+            if not alive:
                 break
             try:
                 if pgid is not None:
@@ -277,7 +281,12 @@ class PtyBridge:
             except Exception:
                 pass
             deadline = time.monotonic() + 0.5
-            while self._proc.isalive() and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                try:
+                    if not self._proc.isalive():
+                        break
+                except Exception:
+                    break
                 time.sleep(0.02)
 
         try:

@@ -9,6 +9,7 @@ docs/superpowers/specs/2026-06-20-pty-keepalive-reattach-design.md.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import time
 from typing import Callable, Dict, Optional, Tuple
 
@@ -40,6 +41,31 @@ class RingBuffer:
         return self._truncated
 
 
+class TokenTombstones:
+    """Fixed-memory process-lifetime revocation filter with no false negatives."""
+
+    def __init__(self, byte_size: int = 1 << 20) -> None:
+        self._bits = bytearray(byte_size)
+        self._bit_count = byte_size * 8
+
+    def _indices(self, token: str):
+        digest = hashlib.blake2b(token.encode("utf-8"), digest_size=16).digest()
+        for offset in range(0, 16, 4):
+            yield int.from_bytes(digest[offset:offset + 4], "big") % self._bit_count
+
+    def add(self, token: str) -> None:
+        for index in self._indices(token):
+            self._bits[index >> 3] |= 1 << (index & 7)
+
+    def __contains__(self, token: object) -> bool:
+        if not isinstance(token, str):
+            return False
+        return all(
+            self._bits[index >> 3] & (1 << (index & 7))
+            for index in self._indices(token)
+        )
+
+
 class PtySession:
     def __init__(self, key: str, bridge, *, buffer_cap: int, read_timeout: float) -> None:
         self.key = key
@@ -50,7 +76,9 @@ class PtySession:
         self.last_detached_at: Optional[float] = None
         self._read_timeout = read_timeout
         self._ws = None
+        self._attaching_ws = None
         self._drain_task: Optional[asyncio.Task] = None
+        self._output_lock = asyncio.Lock()
         self._closing = False
         self._close_task: Optional[asyncio.Task[None]] = None
 
@@ -73,33 +101,46 @@ class PtySession:
             if not chunk:                            # idle tick
                 await asyncio.sleep(0)
                 continue
-            self.buffer.append(chunk)
-            ws = self._ws
-            if ws is not None:
-                try:
-                    await ws.send_bytes(chunk)
-                except Exception:
-                    pass                             # detached mid-send; keep buffering
+            async with self._output_lock:
+                self.buffer.append(chunk)
+                ws = self._ws
+                if ws is not None:
+                    try:
+                        await ws.send_bytes(chunk)
+                    except Exception:
+                        pass                         # detached mid-send; keep buffering
 
     async def attach(self, ws) -> None:
-        # These state transitions happen synchronously before the first await,
-        # so begin_close() either wins first or captures this exact socket.
-        if self._closing:
-            raise SessionTerminated(self.key)
-        old = self._ws
-        self._ws = ws
-        self.attached = True
-        self.last_detached_at = None
-        snap = self.buffer.snapshot()
-        if old is not None and old is not ws:
+        # Drain forwarding shares this barrier, so buffered replay is always
+        # delivered before bytes read concurrently from the live PTY.
+        async with self._output_lock:
+            if self._closing:
+                raise SessionTerminated(self.key)
+            old = self._ws
+            self._attaching_ws = ws
             try:
-                await old.close(code=WS_CLOSE_SUPERSEDED)
-            except Exception:
-                pass
-        if snap:
-            await ws.send_bytes(snap)
-        if self._closing:
-            raise SessionTerminated(self.key)
+                if old is not None and old is not ws:
+                    try:
+                        await old.close(code=WS_CLOSE_SUPERSEDED)
+                    except Exception:
+                        pass
+                snap = self.buffer.snapshot()
+                if snap:
+                    await ws.send_bytes(snap)
+                if self._closing:
+                    raise SessionTerminated(self.key)
+                self._ws = ws
+                self._attaching_ws = None
+                self.attached = True
+                self.last_detached_at = None
+            except BaseException:
+                if self._attaching_ws is ws:
+                    self._attaching_ws = None
+                if self._ws is old:
+                    self._ws = None
+                    self.attached = False
+                    self.last_detached_at = time.monotonic()
+                raise
 
     def detach(self, ws) -> None:
         # Only the currently-attached socket may mark the session detached.
@@ -113,8 +154,8 @@ class PtySession:
         self.attached = False
         self.last_detached_at = time.monotonic()
 
-    async def _finish_close(self, ws) -> None:
-        if ws is not None:
+    async def _finish_close(self, sockets) -> None:
+        for ws in sockets:
             try:
                 await ws.close(code=WS_CLOSE_TERMINATED)
             except Exception:
@@ -138,10 +179,14 @@ class PtySession:
         if task is None:
             self._closing = True
             self.alive = False
-            ws = self._ws
+            sockets = []
+            for ws in (self._ws, self._attaching_ws):
+                if ws is not None and ws not in sockets:
+                    sockets.append(ws)
             self._ws = None
+            self._attaching_ws = None
             self.attached = False
-            task = asyncio.create_task(self._finish_close(ws))
+            task = asyncio.create_task(self._finish_close(sockets))
             self._close_task = task
         return task
 
@@ -178,23 +223,25 @@ class PtySessionRegistry:
         self._read_timeout = read_timeout
         self._sessions: Dict[str, PtySession] = {}
         self._pending: Dict[str, asyncio.Task[PtySession]] = {}
-        self._generations: Dict[str, int] = {}
-        self._terminated_tokens: set[str] = set()
+        self._terminated_tokens = TokenTombstones()
         self._lock = asyncio.Lock()
 
     @staticmethod
     def _base_token(key: str) -> str:
         return key.split("\0", 1)[0]
 
+
     @staticmethod
-    async def _await_close_tasks(tasks: list[asyncio.Task[None]]) -> None:
+    async def _await_tasks(tasks: list[asyncio.Task]) -> None:
         if tasks:
-            await asyncio.gather(*(asyncio.shield(task) for task in tasks))
+            await asyncio.gather(
+                *(asyncio.shield(task) for task in tasks),
+                return_exceptions=True,
+            )
 
     async def _spawn_and_register(
         self,
         key: str,
-        generation: int,
         spawn: Callable[[], object],
     ) -> PtySession:
         session: Optional[PtySession] = None
@@ -211,8 +258,6 @@ class PtySessionRegistry:
             async with self._lock:
                 terminated = (
                     self._base_token(key) in self._terminated_tokens
-                    or
-                    self._generations.get(self._base_token(key), 0) != generation
                 )
                 if not terminated:
                     self._sessions[key] = session
@@ -248,13 +293,12 @@ class PtySessionRegistry:
             if task is None:
                 if len(self._sessions) + len(self._pending) >= self._max:
                     close_tasks.append(self._reap_one_idle_or_raise().begin_close())
-                generation = self._generations.get(self._base_token(key), 0)
                 task = asyncio.create_task(
-                    self._spawn_and_register(key, generation, spawn)
+                    self._spawn_and_register(key, spawn)
                 )
                 self._pending[key] = task
 
-        await self._await_close_tasks(close_tasks)
+        await self._await_tasks(close_tasks)
         # A disconnected creator must not cancel a spawn that another attach
         # is already awaiting. Explicit termination uses the generation check.
         return await asyncio.shield(task), created
@@ -269,7 +313,6 @@ class PtySessionRegistry:
         qualified_prefix = f"{token}\0"
         async with self._lock:
             self._terminated_tokens.add(token)
-            self._generations[token] = self._generations.get(token, 0) + 1
             keys = [
                 key
                 for key in self._sessions
@@ -281,7 +324,7 @@ class PtySessionRegistry:
             )
             sessions = [self._sessions.pop(key) for key in keys]
             close_tasks = [session.begin_close() for session in sessions]
-        await self._await_close_tasks(close_tasks)
+        await self._await_tasks(close_tasks)
         return len(sessions) + pending_count
 
     async def reap_idle(self, now: Optional[float] = None) -> None:
@@ -295,7 +338,7 @@ class PtySessionRegistry:
             ]
             sessions = [self._sessions.pop(key) for key in doomed]
             close_tasks = [session.begin_close() for session in sessions]
-        await self._await_close_tasks(close_tasks)
+        await self._await_tasks(close_tasks)
 
     def _reap_one_idle_or_raise(self) -> PtySession:
         idle = [s for s in self._sessions.values()
@@ -308,11 +351,13 @@ class PtySessionRegistry:
 
     async def close_all(self) -> None:
         async with self._lock:
+            pending_tasks = list(self._pending.values())
             for key in self._pending:
                 token = self._base_token(key)
                 self._terminated_tokens.add(token)
-                self._generations[token] = self._generations.get(token, 0) + 1
             sessions = list(self._sessions.values())
             self._sessions.clear()
             close_tasks = [session.begin_close() for session in sessions]
-        await self._await_close_tasks(close_tasks)
+        # Pending spawns are registry-owned through bridge creation. Their
+        # generation/tombstone checks will start and await bridge cleanup.
+        await self._await_tasks([*close_tasks, *pending_tasks])

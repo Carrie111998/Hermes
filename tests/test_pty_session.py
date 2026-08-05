@@ -77,6 +77,89 @@ async def test_attach_replays_buffer_then_streams_live():
     await s.close()
 
 
+@pytest.mark.asyncio
+async def test_attach_replays_buffer_before_concurrent_live_output():
+    from hermes_cli.pty_session import PtySession
+
+    bridge = FakeBridge([])
+    session = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    session.buffer.append(b"OLD")
+    replay_started = asyncio.Event()
+    release_replay = asyncio.Event()
+
+    class BlockingReplayWS(FakeWS):
+        async def send_bytes(self, data):
+            if data == b"OLD":
+                replay_started.set()
+                await release_replay.wait()
+            await super().send_bytes(data)
+
+    ws = BlockingReplayWS()
+    attach_task = asyncio.create_task(session.attach(ws))
+    await replay_started.wait()
+    session.bridge._chunks.append(b"LIVE")
+    await session.start()
+    await asyncio.sleep(0.02)
+    release_replay.set()
+    await attach_task
+    await asyncio.sleep(0.02)
+
+    assert [payload for kind, payload in ws.sent if kind == "bytes"] == [
+        b"OLD",
+        b"LIVE",
+    ]
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_initial_replay_rolls_back_attachment_state():
+    from hermes_cli.pty_session import PtySession
+
+    bridge = FakeBridge([])
+    session = PtySession("k", bridge, buffer_cap=1024, read_timeout=0.01)
+    session.buffer.append(b"OLD")
+
+    class FailingReplayWS(FakeWS):
+        async def send_bytes(self, data):
+            raise RuntimeError("replay failed")
+
+    with pytest.raises(RuntimeError, match="replay failed"):
+        await session.attach(FailingReplayWS())
+
+    assert session.attached is False
+    assert session._ws is None
+    assert session.last_detached_at is not None
+    await session.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_initial_replay_rolls_back_attachment_state():
+    from hermes_cli.pty_session import PtySession
+
+    session = PtySession(
+        "k", FakeBridge([]), buffer_cap=1024, read_timeout=0.01
+    )
+    session.buffer.append(b"OLD")
+    replay_started = asyncio.Event()
+
+    class BlockingReplayWS(FakeWS):
+        async def send_bytes(self, data):
+            replay_started.set()
+            await asyncio.Event().wait()
+
+    attach_task = asyncio.create_task(session.attach(BlockingReplayWS()))
+    await replay_started.wait()
+    attach_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await attach_task
+
+    assert session.attached is False
+    assert session._ws is None
+    assert session._attaching_ws is None
+    assert session.last_detached_at is not None
+    await session.close()
+
+
 
 
 @pytest.mark.asyncio
@@ -172,6 +255,71 @@ async def test_termination_wins_over_in_flight_spawn():
     assert bridge.closed is True
     assert not reg._sessions
     assert not reg._pending
+
+
+@pytest.mark.asyncio
+async def test_close_all_awaits_tombstoned_pending_spawn_cleanup():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    bridges = []
+
+    def blocked_spawn():
+        bridge = FakeBridge([b""])
+        bridges.append(bridge)
+        spawn_started.set()
+        release_spawn.wait(timeout=2)
+        return bridge
+
+    attach_task = asyncio.create_task(
+        reg.attach_or_spawn("token", spawn=blocked_spawn)
+    )
+    assert await asyncio.to_thread(spawn_started.wait, 1)
+    close_task = asyncio.create_task(reg.close_all())
+    await asyncio.sleep(0)
+    returned_before_spawn = close_task.done()
+    release_spawn.set()
+    await close_task
+    with pytest.raises(SessionTerminated):
+        await attach_task
+
+    assert returned_before_spawn is False
+    assert bridges[0].closed is True
+    assert not reg._pending
+    assert not reg._sessions
+
+
+@pytest.mark.asyncio
+async def test_cancelled_close_all_does_not_abandon_pending_spawn_cleanup():
+    reg = make_registry()
+    spawn_started = threading.Event()
+    release_spawn = threading.Event()
+    bridges = []
+
+    def blocked_spawn():
+        bridge = FakeBridge([b""])
+        bridges.append(bridge)
+        spawn_started.set()
+        release_spawn.wait(timeout=2)
+        return bridge
+
+    attach_task = asyncio.create_task(
+        reg.attach_or_spawn("token", spawn=blocked_spawn)
+    )
+    assert await asyncio.to_thread(spawn_started.wait, 1)
+    close_task = asyncio.create_task(reg.close_all())
+    await asyncio.sleep(0)
+    close_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await close_task
+
+    release_spawn.set()
+    with pytest.raises(SessionTerminated):
+        await attach_task
+
+    assert bridges[0].closed is True
+    assert not reg._pending
+    assert not reg._sessions
 
 
 @pytest.mark.asyncio
@@ -386,6 +534,19 @@ async def test_cancelled_bulk_registry_cleanup_starts_every_session(operation):
 
     assert all(bridge.closed for bridge in bridges)
     assert not reg._sessions
+
+
+@pytest.mark.asyncio
+async def test_terminated_token_tombstones_use_fixed_memory():
+    reg = make_registry()
+    storage_size = len(reg._terminated_tokens._bits)
+    first = f"{0:032x}"
+
+    for index in range(2000):
+        await reg.terminate_attach_token(f"{index:032x}")
+
+    assert len(reg._terminated_tokens._bits) == storage_size
+    assert first in reg._terminated_tokens
 
 
 @pytest.mark.asyncio
