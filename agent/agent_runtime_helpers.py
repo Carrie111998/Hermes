@@ -909,7 +909,8 @@ def sync_credential_pool_entry_id(agent) -> None:
             if pool is not None
             else None
         )
-    except Exception:
+    except Exception as e:
+        logger.debug("Credential pool entry ID reset failed: %s", e)
         agent._credential_pool_entry_id = None
 
 
@@ -975,7 +976,8 @@ def recover_with_credential_pool(
                     (get_custom_provider_pool_key(_agent_base) or "").strip().lower()
                     == pool_provider
                 )
-            except Exception:
+            except Exception as e:
+                logger.debug("Custom provider pool key match failed: %s", e)
                 _custom_match = False
         if not _custom_match:
             _ra().logger.warning(

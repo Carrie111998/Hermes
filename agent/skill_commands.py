@@ -185,7 +185,8 @@ def _resolve_skill_commands_platform() -> Optional[str]:
             os.getenv("HERMES_PLATFORM")
             or get_session_env("HERMES_SESSION_PLATFORM")
         )
-    except Exception:
+    except Exception as e:
+        logger.debug("Session platform resolution failed, using env fallback: %s", e)
         resolved_platform = os.getenv("HERMES_PLATFORM")
     return resolved_platform or None
 
@@ -204,7 +205,8 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
         loaded_skill = json.loads(
             skill_view(normalized, task_id=task_id, preprocess=False)
         )
-    except Exception:
+    except Exception as e:
+        logger.debug("skill_view failed for %r: %s", raw_identifier, e)
         return None
 
     if not loaded_skill.get("success"):
@@ -223,7 +225,8 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     elif skill_path:
         try:
             skill_dir = SKILLS_DIR / Path(skill_path).parent
-        except Exception:
+        except Exception as e:
+            logger.debug("Skill dir reconstruction failed: %s", e)
             skill_dir = None
 
     return loaded_skill, skill_dir, skill_name
@@ -264,8 +267,8 @@ def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None
             lines.append(f"  {key} = {display_val}")
         lines.append("]")
         parts.extend(lines)
-    except Exception:
-        pass  # Non-critical — skill still loads without config injection
+    except Exception as e:
+        logger.debug("Skill config injection failed: %s", e)
 
 
 def _build_skill_message(
@@ -460,10 +463,11 @@ def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
                         "skill_md_path": str(skill_md),
                         "skill_dir": str(skill_md.parent),
                     }
-                except Exception:
+                except Exception as e:
+                    logger.debug("Skill scan: failed to index one skill: %s", e)
                     continue
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Skill scan aborted: %s", e)
     return _skill_commands
 
 
@@ -596,8 +600,8 @@ def build_skill_invocation_message(
     try:
         from tools.skill_usage import bump_use
         bump_use(skill_name)
-    except Exception:
-        pass  # Non-critical — skill invocation proceeds regardless
+    except Exception as e:
+        logger.debug("skill_usage bump failed for %r: %s", skill_name, e)
 
     activation_note = (
         f'[IMPORTANT: The user has invoked the "{skill_name}" skill, indicating they want '
@@ -704,8 +708,8 @@ def build_stacked_skill_invocation_message(
         try:
             from tools.skill_usage import bump_use
             bump_use(skill_name)
-        except Exception:
-            pass  # Non-critical
+        except Exception as e:
+            logger.debug("skill_usage bump failed for %r: %s", skill_name, e)
 
         # NOTE: must start with "[Loaded as part of the " — that prefix is
         # the bundle block marker the memory-scaffolding extractor cuts on.
@@ -766,7 +770,8 @@ def build_preloaded_skills_prompt(
     try:
         from agent.skill_utils import get_disabled_skill_names
         disabled_names = get_disabled_skill_names()
-    except Exception:
+    except Exception as e:
+        logger.debug("Disabled skills lookup failed: %s", e)
         disabled_names = set()
 
     seen: set[str] = set()
@@ -791,8 +796,8 @@ def build_preloaded_skills_prompt(
         try:
             from tools.skill_usage import bump_use
             bump_use(skill_name)
-        except Exception:
-            pass  # Non-critical
+        except Exception as e:
+            logger.debug("skill_usage bump failed for %r: %s", skill_name, e)
 
         activation_note = (
             f'[IMPORTANT: The user launched this CLI session with the "{skill_name}" skill '

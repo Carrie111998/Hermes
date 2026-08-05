@@ -49,6 +49,8 @@ _NON_CODE_VERIFY_FILENAMES = frozenset(
         "contributors",
         "changelog",
         "codeowners",
+        "readme",
+        "copying",
     }
 )
 

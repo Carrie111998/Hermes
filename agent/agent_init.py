@@ -103,13 +103,8 @@ def _relay_moa_reference_event(agent: Any, event: str, **kwargs: Any) -> None:
                 None,
                 moa_ref_count=kwargs.get("ref_count"),
             )
-    except Exception:
-        pass
-
-
-def _normalize_route_base_url(base_url: Any) -> str:
-    """Canonicalize an endpoint URL for model-route identity comparisons."""
-    return normalize_route_base_url(base_url)
+    except Exception as e:
+        logger.debug("MoA reference event callback failed: %s", e)
 
 
 def _provider_default_routes(provider: str) -> set[str]:
@@ -124,23 +119,23 @@ def _provider_default_routes(provider: str) -> set[str]:
             getattr(overlay, "base_url_override", ""),
             getattr(provider_def, "base_url", ""),
         ):
-            route = _normalize_route_base_url(value)
+            route = normalize_route_base_url(value)
             if route:
                 routes.add(route)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Provider default routes (overlay/provider_def) failed: %s", e)
 
     try:
         from providers import get_provider_profile
 
         profile = get_provider_profile(provider)
-        route = _normalize_route_base_url(
+        route = normalize_route_base_url(
             getattr(profile, "base_url", "")
         )
         if route:
             routes.add(route)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Provider default routes (profile) failed: %s", e)
 
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -153,13 +148,13 @@ def _provider_default_routes(provider: str) -> set[str]:
             )
             if canonical_id != provider:
                 continue
-            route = _normalize_route_base_url(
+            route = normalize_route_base_url(
                 getattr(config, "inference_base_url", "")
             )
             if route:
                 routes.add(route)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Provider default routes (registry) failed: %s", e)
 
     if provider == "gemini":
         routes.update(
@@ -182,8 +177,8 @@ def _context_route_mismatch(
         configured_route = str(configured_base_url or "")
         active_route = str(active_base_url or "")
     else:
-        configured_route = _normalize_route_base_url(configured_base_url)
-        active_route = _normalize_route_base_url(active_base_url)
+        configured_route = normalize_route_base_url(configured_base_url)
+        active_route = normalize_route_base_url(active_base_url)
     if configured_route:
         return configured_route != active_route
 
@@ -196,7 +191,8 @@ def _context_route_mismatch(
 
         configured_provider = normalize_model_provider(configured_provider)
         active_provider = normalize_model_provider(active_provider)
-    except Exception:
+    except Exception as e:
+        logger.debug("Model provider normalization failed: %s", e)
         configured_provider = configured_provider.lower()
         active_provider = active_provider.lower()
     try:
@@ -204,8 +200,8 @@ def _context_route_mismatch(
 
         configured_provider = normalize_registry_provider(configured_provider)
         active_provider = normalize_registry_provider(active_provider)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Registry provider normalization failed: %s", e)
 
     if active_route:
         configured_routes = _provider_default_routes(configured_provider)
@@ -679,15 +675,16 @@ def init_agent(
                 base_url=agent.base_url,
             ):
                 agent._credential_pool = None
-        except Exception:
+        except Exception as e:
+            logger.debug("Credential pool validation failed: %s", e)
             agent._credential_pool = None
 
     # Eagerly warm the transport cache so import errors surface at init,
     # not mid-conversation.  Also validates the api_mode is registered.
     try:
         agent._get_transport()
-    except Exception:
-        pass  # Non-fatal — transport may not exist for all modes yet
+    except Exception as e:
+        logger.debug("Transport warm-up failed: %s", e)
 
     try:
         from hermes_cli.model_normalize import (
@@ -697,8 +694,8 @@ def init_agent(
 
         if agent.provider not in _AGGREGATOR_PROVIDERS:
             agent.model = normalize_model_for_provider(agent.model, agent.provider)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Model normalization for provider failed: %s", e)
 
     # GPT-5.x models usually require the Responses API path, but some
     # providers have exceptions (for example Copilot's gpt-5-mini still
@@ -877,8 +874,8 @@ def init_agent(
             agent._use_native_cache_layout = False
             agent._cache_ttl = None
             agent._cache_disabled = True
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug("Prompt-caching config load failed: %s", e)
 
     # Iteration budget: the LLM is only notified when it actually exhausts
     # the iteration budget (api_call_count >= max_iterations).  At that
@@ -2170,7 +2167,7 @@ def init_agent(
             except Exception:
                 pass
         _configured_provider = str(_model_cfg.get("provider") or "").strip()
-        _configured_base_url = _normalize_route_base_url(
+        _configured_base_url = normalize_route_base_url(
             _model_cfg.get("base_url")
         )
         _configured_provider_norm = _normalize_custom_provider_name(
@@ -2232,7 +2229,7 @@ def init_agent(
                         continue
                     if _configured_custom_provider not in _entry_provider_ids:
                         continue
-                    _configured_base_url = _normalize_route_base_url(
+                    _configured_base_url = normalize_route_base_url(
                         _provider_entry.get("api")
                         or _provider_entry.get("url")
                         or _provider_entry.get("base_url")
@@ -2260,7 +2257,7 @@ def init_agent(
                         continue
                     if _configured_custom_provider not in _entry_provider_ids:
                         continue
-                    _configured_base_url = _normalize_route_base_url(
+                    _configured_base_url = normalize_route_base_url(
                         _provider_entry.get("base_url")
                     )
                     if _configured_base_url:
@@ -2273,13 +2270,13 @@ def init_agent(
                 _requested_without_query = urlunparse(
                     _requested_parts._replace(query="")
                 )
-                if _normalize_route_base_url(
+                if normalize_route_base_url(
                     _requested_without_query
-                ) == _normalize_route_base_url(_active_route_url):
+                ) == normalize_route_base_url(_active_route_url):
                     _active_route_url = _requested_route_url
             except (TypeError, ValueError):
                 pass
-        _active_base_url = _normalize_route_base_url(_active_route_url)
+        _active_base_url = normalize_route_base_url(_active_route_url)
         _route_mismatch = _context_route_mismatch(
             _configured_base_url,
             _active_base_url,
@@ -2325,11 +2322,11 @@ def init_agent(
         # Surface a clear warning if the user set a context_length but it
         # wasn't a valid positive int — the helper silently skips those.
         if _config_context_length is None:
-            _target = _normalize_route_base_url(agent.base_url)
+            _target = normalize_route_base_url(agent.base_url)
             for _cp_entry in _custom_providers:
                 if not isinstance(_cp_entry, dict):
                     continue
-                _cp_url = _normalize_route_base_url(_cp_entry.get("base_url"))
+                _cp_url = normalize_route_base_url(_cp_entry.get("base_url"))
                 if _target and _cp_url == _target:
                     _cp_models = _cp_entry.get("models", {})
                     if isinstance(_cp_models, dict):
