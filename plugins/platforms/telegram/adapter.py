@@ -9778,7 +9778,7 @@ class TelegramAdapter(BasePlatformAdapter):
             reply_to_id = str(message.reply_to_message.message_id)
             replied_user = getattr(message.reply_to_message, "from_user", None)
             replied_user_id = getattr(replied_user, "id", None)
-            current_bot_id = getattr(self._bot, "id", None)
+            current_bot_id = getattr(getattr(self, "_bot", None), "id", None)
             reply_to_is_own_message = bool(
                 replied_user_id is not None
                 and current_bot_id is not None
