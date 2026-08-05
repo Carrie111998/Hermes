@@ -1,4 +1,4 @@
-"""``hermes debug`` debug tools for Hermes Agent.
+"""``hermes debug`` debug tools for IYARI.
 
 Currently supports:
     hermes debug share    Upload debug report (system info + logs) to a
@@ -876,13 +876,13 @@ def run_debug_share(args):
     # Manual delete fallback
     print("To delete now:  hermes debug delete <url>")
 
-    print("\nShare these links with the Hermes team for support.")
+    print("\nShare these links with the IYARI team for support.")
 
 
 _NOUS_PRIVACY_NOTICE = """\
 ⚠️  --nous: This uploads your debug bundle to Nous-INTERNAL storage (AWS S3),
     NOT a public paste service. The following is included:
-  • System info (OS, Python/Hermes version, provider, which API keys are
+  • System info (OS, Python/IYARI version, provider, which API keys are
     configured — NOT the actual keys)
   • Full agent.log, gateway.log, and desktop.log (up to 512 KB each — likely
     contains conversation content, tool outputs, and file paths)

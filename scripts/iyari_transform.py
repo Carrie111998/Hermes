@@ -20,7 +20,7 @@ Reglas (ver CLAUDE.md para el criterio completo). Se aplican EN ESTE ORDEN:
     0b. Nous Research (con espacio)        -> Digital Services LLC   (salvo --skip-nous-research)
     1.  Hermes Agent                       -> IYARI                  (elimina "Agent")
     2.  \\bHermes\\b (?![- ][34])          -> IYARI                  (protege modelo Hermes-3/4)
-    3.  IYARI' (posesivo, no seguido de s) -> IYARI's
+    3.  IYARI' + espacio+minuscula (posesivo en prosa) -> IYARI's
 
 Preservado (NO se toca): URLs nousresearch.com, comando/paquete `hermes` minuscula,
 paths ~/.hermes/ y env vars HERMES_*, modelo Hermes-3/Hermes-4, LICENSE, y el
@@ -39,8 +39,12 @@ def transform(s):
     s = re.sub(r'Hermes Agent', 'IYARI', s)
     # 2) Hermes suelto -> IYARI, protegiendo modelo Hermes-3 / Hermes-4 / Hermes 3 / Hermes 4
     s = re.sub(r'\bHermes\b(?![- ][34])', 'IYARI', s)
-    # 3) posesivo: "Hermes'" quedo como "IYARI'"; "Hermes's" quedo como "IYARI's"
-    s = re.sub(r"IYARI'(?!s)", "IYARI's", s)
+    # 3) posesivo: "Hermes' algo" (prosa) quedo como "IYARI' algo" -> "IYARI's algo".
+    #    Requiere espacio+minuscula despues del apostrofo para no confundir la
+    #    comilla de cierre de un string literal ('Hermes' en codigo) con un
+    #    posesivo real -- bug real encontrado en Fase 0.4 (corrompia
+    #    'Hermes' -> 'IYARI's, sintaxis Python invalida).
+    s = re.sub(r"IYARI'(?=\s[a-z])", "IYARI's", s)
     return s
 
 dry = '--dry' in sys.argv

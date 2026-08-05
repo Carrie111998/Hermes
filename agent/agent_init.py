@@ -1600,7 +1600,7 @@ def init_agent(
         agent.show_commentary = True
 
     # LM Studio can either be explicitly preloaded through LM Studio's
-    # management API (the historical Hermes behavior) or left to LM Studio's
+    # management API (the historical IYARI behavior) or left to LM Studio's
     # just-in-time / Auto-Evict chat-completions path.  Keep the default
     # explicit for backward compatibility; users with LM Studio Auto-Evict can
     # opt into JIT via ``model.lmstudio_load_mode: jit``.
@@ -1786,7 +1786,7 @@ def init_agent(
             pass
 
     # Per-platform prompt-hint overrides (config.yaml → platform_hints).
-    # Lets an enterprise admin append to or replace Hermes' built-in
+    # Lets an enterprise admin append to or replace IYARI's built-in
     # platform hint for a single messaging platform (e.g. WhatsApp) without
     # affecting other platforms. Shape:
     #   platform_hints:
@@ -2505,7 +2505,7 @@ def init_agent(
         raise ValueError(
             f"Model {agent.model} has a context window of {_ctx:,} tokens, "
             f"which is below the minimum {MINIMUM_CONTEXT_LENGTH:,} required "
-            f"by Hermes Agent.  Choose a model with at least "
+            f"by IYARI.  Choose a model with at least "
             f"{MINIMUM_CONTEXT_LENGTH // 1000}K context.  If your server "
             f"reports a window smaller than the model's true window, set "
             f"model.context_length in config.yaml to the real value "

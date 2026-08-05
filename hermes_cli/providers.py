@@ -1,5 +1,5 @@
 """
-Single source of truth for provider identity in Hermes Agent.
+Single source of truth for provider identity in IYARI.
 
 Two data sources, merged at runtime:
 
@@ -7,7 +7,7 @@ Two data sources, merged at runtime:
    names, and full model metadata (context, cost, capabilities).  This is
    the primary database.
 
-2. **Hermes overlays** — transport type, auth patterns, aggregator flags,
+2. **IYARI overlays** — transport type, auth patterns, aggregator flags,
    and additional env vars that models.dev doesn't track.  Small dict,
    maintained here.
 
@@ -28,12 +28,12 @@ from utils import base_url_host_matches, base_url_hostname
 logger = logging.getLogger(__name__)
 
 
-# -- Hermes overlay ----------------------------------------------------------
-# Hermes-specific metadata that models.dev doesn't provide.
+# -- IYARI overlay ----------------------------------------------------------
+# IYARI-specific metadata that models.dev doesn't provide.
 
 @dataclass(frozen=True)
 class HermesOverlay:
-    """Hermes-specific provider metadata layered on top of models.dev."""
+    """IYARI-specific provider metadata layered on top of models.dev."""
 
     transport: str = "openai_chat"        # openai_chat | anthropic_messages | codex_responses
     is_aggregator: bool = False
@@ -444,8 +444,8 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
     """Look up a built-in provider by id or alias.
 
     Resolution order:
-      1. Hermes overlays (for providers not in models.dev: nous, openai-codex, etc.)
-      2. models.dev catalog + Hermes overlay
+      1. IYARI overlays (for providers not in models.dev: nous, openai-codex, etc.)
+      2. models.dev catalog + IYARI overlay
 
     User-defined providers from config.yaml (``providers:`` / ``custom_providers:``)
     are resolved by :func:`resolve_provider_full`, which layers ``resolve_user_provider``
@@ -500,7 +500,7 @@ def get_provider(name: str, *, allow_network: bool = True) -> Optional[ProviderD
         )
 
     if overlay is not None:
-        # Hermes-only provider (not in models.dev)
+        # IYARI-only provider (not in models.dev)
         return ProviderDef(
             id=canonical,
             name=_LABEL_OVERRIDES.get(canonical, canonical),
@@ -674,7 +674,7 @@ def determine_api_mode(provider: str, base_url: str = "", model: str = "") -> st
         return mandated
 
     # Nous is dual-wire: anthropic/* → Messages, everything else →
-    # chat_completions. The Hermes overlay still advertises openai_chat
+    # chat_completions. The IYARI overlay still advertises openai_chat
     # (the majority of the Portal catalog), so the transport lookup below
     # would pin Claude on the wrong wire without this carve-out.
     provider_norm = (provider or "").strip().lower()
@@ -877,7 +877,7 @@ def resolve_provider_full(
         if user_pdef is not None:
             return user_pdef
 
-    # 0.5 Exact Hermes provider IDs must win over LOSSY alias collapsing.
+    # 0.5 Exact IYARI provider IDs must win over LOSSY alias collapsing.
     # Example: kimi-coding-cn should stay distinct from kimi-coding instead of
     # normalizing through the shared models.dev alias "kimi-for-coding".
     # A collapse is lossy only when MULTIPLE distinct registry providers

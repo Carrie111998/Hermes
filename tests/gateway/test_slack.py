@@ -4555,7 +4555,7 @@ class TestSlackUserAgent:
     """
 
     def test_hermes_slack_user_agent_prefix_format(self):
-        """Module constant matches the HermesAgent/<version> convention used
+        """Module constant matches the IYARI/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
-        assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
+        assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("IYARI/")
 

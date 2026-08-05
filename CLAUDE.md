@@ -12,6 +12,16 @@ Hermes/Nous Research → IYARI/Digital Services LLC, **SALVO** lo funcional/lega
 - URLs `nousresearch.com` (y subdominios, p.ej. `hermes-agent.nousresearch.com`) — romperían llamadas.
 - Comando y paquete `hermes` en **minúscula** (`hermes model`, `hermes-agent`, `hermes-gateway`, `hermes_cli`…).
 - Paths `~/.hermes/` y env vars `HERMES_*` (funcionales).
+- **Headers HTTP `X-Hermes-*`** (`X-Hermes-Session-Token`, `X-Hermes-Session-Id`,
+  `X-Hermes-Session-Key`, `X-Hermes-Sidecar-Token`, `X-Hermes-Completed`,
+  `X-Hermes-Partial`, `X-Hermes-Error`, y cualquier otro `X-Hermes-*` que aparezca)
+  — son contrato de API real entre servidor/cliente (dashboard, sidecar de Photon
+  en Node.js, clientes de `/v1/chat/completions`). Renombrar el string SIN
+  cambiar todos los lados a la vez rompe la autenticación/protocolo en
+  silencio — no lo detecta el audit-brand-residue.sh porque busca "Hermes
+  Agent"/"Nous Research" como frases, no "Hermes" suelto convertido de más.
+  Encontrado como regresión real dos veces (Fase 0.4, 2026-08-05): una vez ya
+  mergeada a `main` la noche anterior sin que el gate la detectara.
 - Modelo LLM real `Hermes-3` / `Hermes-4` (incluye `Hermes-4-70B`, `Hermes-4-405B`).
 - `LICENSE` (legal).
 - Servicio de terceros **Nous Portal** (y `Nous Subscription`, `Nous Tool`, `Nous Chat`,
@@ -551,3 +561,43 @@ El usuario delega aprobación previa para lotes mecánicos de rebranding en `web
 7. Autor: `Digital Services LLC <info@digitalservices.app>`, sin Co-Authored-By.
 
 Si FALTA alguna condición, Claude para y pregunta. Esta delegación NO aplica a Fase 1, operaciones destructivas ni gasto extra no presupuestado.
+
+## Fase 0.4 — Barrido de identificadores de marca residuales en código Python
+
+Arrancada 2026-08-05, rama `feature/phase-0-4-brand-sweep`. Objetivo: barrer
+"Hermes Agent"/"Hermes-Agent"/"HermesAgent"/"Nous Research" en código Python
+fuera de `website/` que 1.3 dejó fuera a propósito (OAuth client_name MCP,
+X-Title OpenRouter, bot_name Telegram, Home Assistant, Hindsight, Google Meet,
+y ~140 archivos más encontrados en el barrido general).
+
+**Bugs reales encontrados y corregidos durante el barrido** (documentados en
+detalle en `REBRAND-EXCEPTIONS.md`):
+1. Regla 3 del transformador (posesivo) corrompía strings literales de Python
+   (`'Hermes'` → `'IYARI's`, sintaxis inválida) — arreglado, requiere
+   espacio+minúscula tras el apóstrofo, con test de regresión añadido.
+2. El propio `scripts/iyari_transform.py` se autocorrompió al incluirse en su
+   propia lista de archivos a transformar (sus patrones regex son literales
+   que contienen "Hermes Agent"/"NousResearch" como texto) — revertido, nunca
+   incluir este archivo en un lote de transformación.
+3. **Headers HTTP `X-Hermes-*` renombrados por error** (`X-Hermes-Session-Token/
+   Id/Key`, `X-Hermes-Sidecar-Token`, `X-Hermes-Completed/Partial/Error`) —
+   contrato de API real, no marca. Uno de estos casos ya estaba mergeado a
+   `main` desde la noche anterior sin que el gate lo detectara (ver gotcha
+   dedicado en `REBRAND-EXCEPTIONS.md` y la entrada en la lista de
+   identificadores funcionales arriba). Corregido en código Y en los 4 docs
+   afectados.
+4. Cluster de User-Agent `"Hermes-Agent"` (con guion, sin espacio) en 6
+   archivos (`microsoft_graph_client.py`, `discord_tool.py`, `krea/__init__.py`,
+   `xai/__init__.py`, `xai_http.py`, `mini_swe_runner.py`) que el grep inicial
+   ("Hermes Agent" con espacio) no capturaba — encontrado por búsqueda
+   ampliada a las 3 variantes (espacio/guion/camelCase) al final del barrido.
+
+**⚠️ PENDIENTE, NO RESUELTO — hallazgo nuevo, fuera del alcance de esta fase:**
+al hacer la búsqueda final de las 3 variantes en TODO el árbol (no solo
+código Python), aparecieron 100+ archivos `SKILL.md`/`README.md` bajo
+`skills/` y `optional-skills/` (las carpetas reales que el agente carga en
+runtime — **distintas** de `website/docs/user-guide/skills/`, que GRUPO 5/6 ya
+cubrió) con "Hermes Agent"/"Hermes-Agent" sin rebrandear. No se tocaron esta
+sesión — son Markdown, no código Python, y es un scope nuevo y grande (100+
+archivos) que merece su propia fase/sesión con el mismo criterio de
+convertir/preservar que GRUPO 5/6, no una añadidura de última hora a Fase 0.4.

@@ -634,7 +634,7 @@ CMD ["hermes", "gateway"]
 代理模式不限于 Matrix。任何平台适配器都可以使用它——在任意 gateway 实例上设置 `GATEWAY_PROXY_URL`，它将转发到远程 agent 而不是在本地运行。这适用于平台适配器需要在与 agent 不同的环境中运行的任何部署场景（网络隔离、E2EE 要求、资源限制）。
 
 :::tip
-会话连续性通过 `X-IYARI-Session-Id` 请求头维护。主机的 API 服务器按此 ID 跟踪会话，因此对话在消息之间持续存在，就像使用本地 agent 一样。
+会话连续性通过 `X-Hermes-Session-Id` 请求头维护。主机的 API 服务器按此 ID 跟踪会话，因此对话在消息之间持续存在，就像使用本地 agent 一样。
 :::
 
 :::note

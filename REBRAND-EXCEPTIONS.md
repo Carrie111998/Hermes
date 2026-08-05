@@ -354,11 +354,39 @@ seguridad real para `locales/` — correrlo explícitamente
 (`pytest tests/agent/test_i18n.py`) es parte del checklist de todo sync que
 toque `locales/`, no solo confiar en el checkout.
 
+## Gotcha recurrente (grave): headers HTTP `X-Hermes-*` son contrato de API, no marca
+
+Fase 0.4 (2026-08-05) corrió `iyari_transform.py` sobre código Python fuera de
+`website/` por primera vez, y la regla 2 (`\bHermes\b` suelto → `IYARI`)
+convirtió headers HTTP funcionales que tienen "Hermes" como palabra completa
+separada por guiones: `X-Hermes-Session-Token`, `X-Hermes-Session-Id`,
+`X-Hermes-Session-Key`, `X-Hermes-Sidecar-Token`, `X-Hermes-Completed`,
+`X-Hermes-Partial`, `X-Hermes-Error`. Estos NO son marca — son el nombre real
+de un header que servidor y cliente deben acordar exactamente igual (el
+dashboard, el sidecar de Photon en Node.js, y `/v1/chat/completions`). Cambiar
+el nombre en un solo lado rompe autenticación/protocolo en silencio: no lanza
+excepción, simplemente el cliente deja de autenticarse (401) o el sidecar deja
+de recibir las peticiones.
+
+**Por qué `audit-brand-residue.sh` no lo detectó:** el gate busca "Hermes
+Agent"/"Nous Research" como frases exactas sin convertir — no detecta "Hermes"
+suelto que SÍ se convirtió pero no debía (sobre-conversión). Uno de estos casos
+(`website/docs/user-guide/features/api-server.md` y otros 3 docs) ya se había
+mergeado a `main` la noche anterior sin que nadie lo notara, hasta que la
+suite de tests lo destapó en Fase 0.4 (12 tests de `test_web_oauth_dispatch.py`
++ 6 de `test_api_server.py` fallando con 401/headers ausentes).
+
+**Regla a aplicar:** antes de correr el transformador sobre CUALQUIER archivo
+de código Python (no solo docs), grepear primero `X-Hermes-\|X-Nous-` en el
+árbol completo y añadir cada hit a una lista de exclusión, o revisar el diff
+en seco buscando explícitamente `^-.*X-Hermes` antes de aplicar. Ver también
+`CLAUDE.md` — lista de headers ya encontrados.
+
 ## Identificadores funcionales que NUNCA se tocan (recordatorio, detalle completo en CLAUDE.md)
 
 `hermes` (comando/paquete en minúscula), `~/.hermes/`, `HERMES_*` (env vars),
 `Hermes-3`/`Hermes-4` (modelo LLM real), URLs `nousresearch.com` y subdominios,
-`LICENSE`, y los identificadores de clase heredados del código Python
-(`HermesCLI`, `HermesPlugin`, `HermesACPAgent`, `HermesTokenStorage`,
-`HermesSweEnv`, `HermesBench` — este último confirmado con el usuario como
-benchmark externo de Nous, no nuestro).
+`LICENSE`, headers HTTP `X-Hermes-*` (ver gotcha arriba), y los identificadores
+de clase heredados del código Python (`HermesCLI`, `HermesPlugin`,
+`HermesACPAgent`, `HermesTokenStorage`, `HermesSweEnv`, `HermesBench` — este
+último confirmado con el usuario como benchmark externo de Nous, no nuestro).

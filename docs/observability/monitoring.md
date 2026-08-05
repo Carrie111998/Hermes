@@ -1,7 +1,7 @@
 # Gateway Monitoring
 
 Service health monitoring plus structured operational diagnostics for the
-Hermes gateway daemon, exported over OTLP/HTTP to an operator-configured
+IYARI gateway daemon, exported over OTLP/HTTP to an operator-configured
 endpoint (OpenTelemetry Collector, DataDog, or any OTLP receiver).
 
 This plane is content-free by construction. It exports gateway and cron
@@ -10,7 +10,7 @@ diagnostics. It never exports prompts, messages, tool arguments or results,
 job names, destinations, schedules, raw errors, session history, usage
 analytics, audit logs, or detailed execution traces. Run/model/tool trajectory
 capture is a separate plane served by the NeMo Relay integration
-(`plugins/observability/nemo_relay/`) and its Hermes-owned subscribers.
+(`plugins/observability/nemo_relay/`) and its IYARI-owned subscribers.
 
 ## What gets exported
 
@@ -171,7 +171,7 @@ collector and backend:
 5. **Killed gateway:** terminate one canary, verify missing-series detection,
    restart it, and confirm the same opaque instance identity returns.
 
-Hermes Agent-owned Relay transport health remains in scope. A separate gateway
+IYARI-owned Relay transport health remains in scope. A separate gateway
 or connector service remains authoritative for any shared connected-platform
 state that it owns and should export that state through its own telemetry path.
 
@@ -293,8 +293,8 @@ allowlist entries and re-verify against the backend, not just the local capture.
 ## Boundaries and roadmap
 
 The `hermes monitoring` CLI intentionally exposes `status` only. This first
-release covers only Hermes Agent-owned service-health and operational-diagnostic
-signals, including Hermes Agent-owned Relay transport health. Team Gateway's
+release covers only IYARI-owned service-health and operational-diagnostic
+signals, including IYARI-owned Relay transport health. Team Gateway's
 authoritative shared connector/platform state is explicitly out of scope, as
 are product analytics, audit/quality reporting, and detailed execution traces.
 Shared client usage metrics and enterprise trace telemetry are being designed on

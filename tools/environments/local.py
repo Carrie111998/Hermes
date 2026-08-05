@@ -55,7 +55,7 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
 
     ``TERMINAL_CWD`` can be populated from config.yaml before the terminal
     backend is created.  If that value is relative and happens to match the
-    directory Hermes was already launched from (for example ``hermes-agent``
+    directory IYARI was already launched from (for example ``hermes-agent``
     while the process cwd is ``~/.hermes/hermes-agent``), passing it through
     unchanged makes the wrapper run ``cd hermes-agent`` *inside* the project
     and fail with a confusing nested-path error.  Anchor relative local cwd
@@ -77,7 +77,7 @@ def _resolve_local_initial_cwd(cwd: str) -> str:
     candidate = os.path.abspath(expanded)
     current = os.getcwd()
 
-    # Common recovery for config values like ``hermes-agent`` when Hermes was
+    # Common recovery for config values like ``hermes-agent`` when IYARI was
     # launched from that directory already.  ``os.path.abspath`` would point at
     # a nonexistent nested ``./hermes-agent``; use the current directory instead.
     if not os.path.isdir(candidate):
@@ -197,12 +197,12 @@ def _resolve_safe_cwd(cwd: str) -> str:
     return tempfile.gettempdir()
 
 
-# Hermes-internal env vars that should NOT leak into terminal subprocesses.
+# IYARI-internal env vars that should NOT leak into terminal subprocesses.
 _HERMES_PROVIDER_ENV_FORCE_PREFIX = "_HERMES_FORCE_"
 
-# Hermes-managed AWS *inference* credentials for ``auth_type="aws_sdk"``
+# IYARI-managed AWS *inference* credentials for ``auth_type="aws_sdk"``
 # providers (Bedrock).  Scoped DELIBERATELY NARROW: this lists only the
-# Bedrock-specific bearer token, which is a Hermes inference secret exactly
+# Bedrock-specific bearer token, which is a IYARI inference secret exactly
 # analogous to ``OPENAI_API_KEY`` — nobody drives the ``aws``/``terraform``/
 # ``boto3`` toolchain off it, so stripping it from terminal/execute_code
 # subprocesses costs no user capability.
@@ -323,8 +323,8 @@ def _build_provider_env_blocklist() -> frozenset:
     })
     # CLAUDE_CODE_OAUTH_TOKEN is deliberately NOT stripped.  It is set and
     # owned by the user's Claude Code install (subscription OAuth), not a
-    # Hermes-managed inference credential — Claude subscription auth is not a
-    # working Hermes provider path.  Stripping it broke agent-spawned
+    # IYARI-managed inference credential — Claude subscription auth is not a
+    # working IYARI provider path.  Stripping it broke agent-spawned
     # ``claude`` CLIs: the child fell through to the shared macOS Keychain /
     # ``~/.claude/.credentials.json`` store and, on auth failure, cleared it,
     # logging the user out of their interactive Claude sessions (#55878).
@@ -341,16 +341,16 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # VIRTUAL_ENV (and possibly CONDA_PREFIX). If those leak into commands the
 # agent runs against OTHER Python projects, tools like ``uv``/``poetry`` treat
 # the inherited value as the active environment and build/sync that other
-# project's dependencies into the Hermes venv path instead of the project's own
-# ``.venv`` — silently clobbering the Hermes environment (e.g. a project pinned
+# project's dependencies into the IYARI venv path instead of the project's own
+# ``.venv`` — silently clobbering the IYARI environment (e.g. a project pinned
 # to a different Python version overwrites it and breaks the gateway). The
-# Hermes venv stays reachable via PATH (its bin dir is first), so stripping
+# IYARI venv stays reachable via PATH (its bin dir is first), so stripping
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
 
 
 def _is_hermes_internal_secret(key: str) -> bool:
-    """Return True for Hermes-internal secrets injected under *dynamic* names.
+    """Return True for IYARI-internal secrets injected under *dynamic* names.
 
     ``_HERMES_PROVIDER_ENV_BLOCKLIST`` is name-based and derived from the
     provider/tool registries, but the gateway and CLI also inject secrets into
@@ -374,7 +374,7 @@ def _is_hermes_internal_secret(key: str) -> bool:
     ``KEY`` / ``SECRET`` / ``TOKEN``; the terminal backend's narrower name-based
     blocklist did not, which is the leak this predicate closes.
 
-    This is the single source of truth for "Hermes-internal dynamic secret"
+    This is the single source of truth for "IYARI-internal dynamic secret"
     across every spawn path — the terminal ``_make_run_env`` /
     ``_sanitize_subprocess_env`` filters, the Docker passthrough filter, and the
     non-terminal :func:`hermes_subprocess_env` helper all call it, so the
@@ -395,7 +395,7 @@ def _is_hermes_internal_secret(key: str) -> bool:
 
 
 def _inject_context_hermes_home(env: dict) -> None:
-    """Bridge the context-local Hermes home override into subprocess env."""
+    """Bridge the context-local IYARI home override into subprocess env."""
     try:
         from hermes_constants import get_hermes_home_override
 
@@ -454,7 +454,7 @@ def _inject_session_context_env(env: dict) -> None:
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
-    """Filter Hermes-managed secrets from a subprocess environment."""
+    """Filter IYARI-managed secrets from a subprocess environment."""
     try:
         from tools.env_passthrough import (
             is_env_passthrough as _is_passthrough,
@@ -531,7 +531,7 @@ def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
 # Tier-1 secrets: stripped from EVERY spawned subprocess unconditionally —
 # even when the caller opts into credential inheritance for a model-driving
 # CLI (claude / codex / gemini).  These are not LLM provider credentials; no
-# legitimate child Hermes spawns needs them, and they are the highest-value
+# legitimate child IYARI spawns needs them, and they are the highest-value
 # secrets to keep out of a compromised dependency's reach (gateway bot tokens,
 # GitHub auth, remote-compute tokens, dashboard session secret).  The set is a
 # narrow subset of _HERMES_PROVIDER_ENV_BLOCKLIST; provider keys are handled by
@@ -587,7 +587,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
 
     * **Tier 1 (always):** ``_ALWAYS_STRIP_KEYS`` — gateway bot tokens, GitHub
       auth, and remote-compute secrets are removed regardless of
-      ``inherit_credentials``.  No child Hermes spawns legitimately needs them.
+      ``inherit_credentials``.  No child IYARI spawns legitimately needs them.
     * **Tier 2 (conditional):** the rest of ``_HERMES_PROVIDER_ENV_BLOCKLIST``
       (LLM provider API keys, tool secrets) is removed unless the caller passes
       ``inherit_credentials=True``.
@@ -608,7 +608,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # Tier 1 — always strip.
     for key in _ALWAYS_STRIP_KEYS:
         env.pop(key, None)
-    # Internal routing hints and Hermes-internal dynamic secrets
+    # Internal routing hints and IYARI-internal dynamic secrets
     # (``AUXILIARY_<TASK>_API_KEY`` / ``_BASE_URL`` side-LLM credentials,
     # ``GATEWAY_RELAY_*`` relay-auth material) must never reach a child,
     # regardless of ``inherit_credentials`` — a model-driving CLI has no
@@ -669,7 +669,7 @@ def build_subprocess_env(
     function (or :func:`hermes_subprocess_env` for the model-driving-CLI
     surface) instead of copying ``os.environ`` directly, so profile-home
     propagation (``HERMES_HOME`` / subprocess ``HOME`` contract) and the
-    Hermes secret-scrub policy have a single owner.  History: ~11 separate
+    IYARI secret-scrub policy have a single owner.  History: ~11 separate
     commits each fixed one more spawn site that missed profile-HOME or
     secret-scrub propagation; this factory is the fix for the class.
 
@@ -691,7 +691,7 @@ def build_subprocess_env(
       scrubbing could change behavior.  The site is still a win: it becomes
       grep-able and future-fixable.
     * ``inherit_profile_home`` — on the non-scrub path, when True, bridge the
-      context-local Hermes home override into ``HERMES_HOME`` and apply the
+      context-local IYARI home override into ``HERMES_HOME`` and apply the
       subprocess HOME contract (``hermes_constants.apply_subprocess_home_env``).
       Pass False to keep the inherited env untouched (exact legacy
       ``os.environ.copy()`` behavior).
@@ -801,7 +801,7 @@ def _find_bash() -> str:
         return candidates[0]
 
     raise RuntimeError(
-        "Git Bash not found. Hermes Agent requires Git for Windows on Windows.\n"
+        "Git Bash not found. IYARI requires Git for Windows on Windows.\n"
         "Install it from: https://git-scm.com/download/win\n"
         "Or set HERMES_GIT_BASH_PATH to your bash.exe location."
     )
@@ -889,7 +889,7 @@ def _git_bash_aslr_help(bash: str, details: str = "") -> str:
         'Get-Item "$gitRoot\\bin\\bash.exe", "$gitRoot\\usr\\bin\\*.exe" '
         "-ErrorAction SilentlyContinue | ForEach-Object { "
         "Set-ProcessMitigation -Name $_.FullName -Disable ForceRelocateImages }\n"
-        "Then restart Hermes. If the override is blocked or later re-applied, "
+        "Then restart IYARI. If the override is blocked or later re-applied, "
         "ask your Windows administrator to allow this per-program exception."
     )
 
@@ -1141,11 +1141,11 @@ def _prepend_hermes_bin_dir(existing_path: str) -> str:
 
 
 def _managed_runtime_path_entries() -> list[str]:
-    """Return existing Hermes-managed runtime dirs for the terminal subshell PATH.
+    """Return existing IYARI-managed runtime dirs for the terminal subshell PATH.
 
     The terminal tool spawns a subshell whose PATH is the agent process's PATH
-    plus ``_SANE_PATH``. Neither carries the runtimes Hermes installs for
-    itself, so on a machine where Hermes provisioned its own toolchain a
+    plus ``_SANE_PATH``. Neither carries the runtimes IYARI installs for
+    itself, so on a machine where IYARI provisioned its own toolchain a
     command the agent runs resolves a system copy instead — or nothing at all:
 
     - ``$HERMES_HOME/node`` (+ ``/bin``) — installed to satisfy the desktop and
@@ -1185,7 +1185,7 @@ def _append_missing_sane_path_entries(existing_path: str) -> str:
     - **Duplicates are collapsed** (first occurrence wins), so a caller PATH
       that already contains repeats is not propagated verbatim.
 
-    Hermes-managed runtime dirs are appended alongside the sane entries, not
+    IYARI-managed runtime dirs are appended alongside the sane entries, not
     prepended: a tool the user deliberately put on their own PATH still wins,
     and the managed one only fills the gap where there would otherwise be
     nothing.
@@ -1229,7 +1229,7 @@ def _apply_windows_msys_bash_env_defaults(env: dict) -> None:
 
     Git Bash rewrites arguments that look like Unix paths (``/FO``, ``/TN``,
     ``/Create``) into ``C:/.../git/FO``-style paths, which breaks native
-    Windows commands such as ``tasklist``, ``schtasks``, and ``wmic``.  Hermes
+    Windows commands such as ``tasklist``, ``schtasks``, and ``wmic``.  IYARI
     runs terminal commands through bash on Windows, so set the standard MSYS
     opt-out by default.  Users who need conversion can override in their env.
     Refs #56700.
@@ -1354,7 +1354,7 @@ def _resolve_shell_init_files() -> list[str]:
     Expands ``~`` and ``${VAR}`` references and drops anything that doesn't
     exist on disk, so a missing ``~/.bashrc`` never breaks the snapshot.
     The ``auto_source_bashrc`` path runs only when the user hasn't supplied
-    an explicit list — once they have, Hermes trusts them.
+    an explicit list — once they have, IYARI trusts them.
     """
     explicit, auto_bashrc = _read_terminal_shell_init_config()
 

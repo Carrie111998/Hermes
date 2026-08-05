@@ -95,7 +95,7 @@ GET  /v1/models                  列出 hermes-agent
 GET  /health, /health/detailed
 ```
 
-配置、请求头（`X-IYARI-Session-Id`、`X-IYARI-Session-Key`）及前端接入：[API Server](../user-guide/features/api-server)。
+配置、请求头（`X-Hermes-Session-Id`、`X-Hermes-Session-Key`）及前端接入：[API Server](../user-guide/features/api-server)。
 
 ---
 

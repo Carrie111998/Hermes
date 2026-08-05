@@ -1,9 +1,9 @@
 """
-Buzz Platform Adapter for Hermes Agent.
+Buzz Platform Adapter for IYARI.
 
 A plugin-based gateway adapter that connects to a Buzz community relay
 (Block's open-source human+agent collaboration platform, built on the
-Nostr protocol) and relays messages to/from the Hermes agent.
+Nostr protocol) and relays messages to/from the IYARI agent.
 
 The adapter does not speak Nostr itself — it shells out to the ``buzz``
 CLI binary ("JSON in, JSON out") via ``asyncio.create_subprocess_exec``.
@@ -1431,7 +1431,7 @@ def interactive_setup() -> None:
         if not prompt_yes_no("Reconfigure Buzz?", False):
             return
 
-    print_info("Connect Hermes to a Buzz community (Block's Nostr-based human+agent platform).")
+    print_info("Connect IYARI to a Buzz community (Block's Nostr-based human+agent platform).")
     print_info("   Requires the buzz CLI binary and a Nostr key that is a community member.")
     print()
 
@@ -1485,7 +1485,7 @@ def interactive_setup() -> None:
 
 
 def register(ctx):
-    """Plugin entry point: called by the Hermes plugin system."""
+    """Plugin entry point: called by the IYARI plugin system."""
     ctx.register_platform(
         name="buzz",
         label="Buzz",

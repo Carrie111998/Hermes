@@ -3,12 +3,12 @@ label: Buzz
 kind: platform
 version: 1.0.0
 description: >
-  Buzz gateway adapter for Hermes Agent.
+  Buzz gateway adapter for IYARI.
   Connects to a Buzz community relay (Block's open-source human+agent
   collaboration platform built on Nostr) and relays messages between
-  channels/DMs and the Hermes agent.  Pure stdlib — shells out to the
+  channels/DMs and the IYARI agent.  Pure stdlib — shells out to the
   buzz CLI binary (JSON in/out); no Python packages required.
-author: Nous Research
+author: Digital Services LLC
 # ``requires_env`` entries are surfaced in ``hermes config`` UI via the
 # platform-plugin env var injector in ``hermes_cli/config.py``.
 requires_env:

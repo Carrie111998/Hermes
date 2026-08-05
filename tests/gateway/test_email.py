@@ -158,7 +158,7 @@ class TestDispatchMessage(unittest.TestCase):
         msg_data = {
             "uid": b"1",
             "sender_addr": "hermes@test.com",
-            "sender_name": "Hermes",
+            "sender_name": "IYARI",
             "subject": "Test",
             "message_id": "<msg1@test.com>",
             "in_reply_to": "",
@@ -613,7 +613,7 @@ class TestSendEmailStandalone(unittest.TestCase):
             _, kwargs = mock_server.starttls.call_args
             self.assertIsInstance(kwargs["context"], ssl.SSLContext)
             send_call = mock_server.send_message.call_args[0][0]
-            self.assertEqual(send_call["Subject"], "Hermes Agent")
+            self.assertEqual(send_call["Subject"], "IYARI")
             self.assertIn("Date", send_call)
             self.assertEqual(send_call["To"], "user@test.com")
             self.assertEqual(send_call["From"], "hermes@test.com")

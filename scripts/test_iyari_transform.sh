@@ -64,3 +64,25 @@ grep -q "Digital Services LLC built this" "$TMPDIR/sanity.md" || fail "sanity: i
 echo "OK: iyari_transform.py sin --skip-nous-research si convierte 'Nous Research' (confirma que el flag tiene efecto real, el test anterior no es vacio)."
 echo ""
 echo "REGRESION DE 2026-07 CUBIERTA: si alguien vuelve a correr apply-iyari-rebrand.sh sin el flag por defecto, este test lo detecta."
+
+# --- Fixture 5: bug de la regla 3 (posesivo) encontrado en Fase 0.4 (2026-08) --
+# 'Hermes' como string literal de Python (comilla de cierre inmediatamente
+# despues de la palabra) NO debe convertirse en "IYARI's" -- eso corrompe la
+# sintaxis del string. Solo debe activarse el posesivo cuando hay prosa real
+# (espacio + minuscula) despues del apostrofo.
+rm -f "$TMPDIR"/*.md
+cat > "$TMPDIR/literal.py" <<'EOF'
+return f"status: {value or 'Hermes'}"
+EOF
+cat > "$TMPDIR/possessive.py" <<'EOF'
+# This is Hermes' own config loader.
+EOF
+python3 scripts/iyari_transform.py "$TMPDIR/literal.py" "$TMPDIR/possessive.py" > /dev/null
+
+grep -q "'IYARI'" "$TMPDIR/literal.py" || fail "literal.py: 'Hermes' como string literal no quedo como 'IYARI' (¿volvio el bug de la regla 3 corrompiendo la comilla de cierre?)"
+if grep -q "IYARI's" "$TMPDIR/literal.py"; then
+    fail "literal.py: la comilla de cierre del string se corrompio a IYARI's -- BUG DE REGLA 3 REGRESADO (rompe sintaxis Python)"
+fi
+grep -q "IYARI's own config loader" "$TMPDIR/possessive.py" || fail "possessive.py: posesivo real en prosa ('Hermes' own') no se convirtio a IYARI's -- la regla 3 quedo demasiado estricta"
+
+echo "OK: regla 3 (posesivo) distingue comilla de cierre de string literal vs. posesivo real en prosa -- bug de Fase 0.4 cubierto."

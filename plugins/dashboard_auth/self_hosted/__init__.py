@@ -603,7 +603,7 @@ class SelfHostedOIDCProvider(DashboardAuthProvider):
                 lifespan=_JWKS_CACHE_SECONDS,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "HermesAgent/1.0",
+                    "User-Agent": "IYARI/1.0",
                 },
             )
         return self._jwks_client
