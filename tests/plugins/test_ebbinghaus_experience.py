@@ -472,3 +472,77 @@ def test_retract_memory_archives_without_delete(tmp_path):
     assert row["access_state"] == "latent"
     assert store.recall("ASRock", reinforce=False) == []
     store.close()
+
+
+def test_correction_rehearsal_passes_when_new_belief_ranks_first(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {"experience": {"enabled": True, "correction_rehearsals_per_sleep": 5}}
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    old = store.remember("Unique motherboard token ALPHA-OLD-991.")
+    revised = store.revise_memory(
+        old["memory_id"],
+        "Unique motherboard token BETA-NEW-992.",
+        reason="corrected",
+        test_query="Unique motherboard token BETA-NEW-992",
+    )
+    check = store.run_correction_check(limit=5)
+    assert revised["queued_rehearsal_id"] in check["passed"]
+    stats = store.stats()
+    assert stats["experience_enabled"] is True
+    assert stats["corrected_error_recurrence_rate"] == 0.0
+    store.close()
+
+
+def test_insight_lifecycle_requires_evidence_for_validation(tmp_path):
+    policies = EbbinghausPolicies.from_config(
+        {
+            "experience": {"enabled": True},
+            "insight": {"enabled": True, "association_limit": 4},
+        }
+    )
+    store = EbbinghausMemoryStore(tmp_path / "memory.db", policies=policies)
+    a = store.remember("Focus cue about network latency budget.", tags=["net", "latency"])
+    b = store.remember("Related cue about packet loss thresholds.", tags=["net", "packet"])
+    store.experience.record_retrieval_miss(
+        query_hash="a" * 64,
+        query_excerpt="",
+        query_cues=["network", "latency", "packet"],
+        direct_best_score=0.0,
+    )
+    preview = store.association_preview(limit=4)
+    assert preview["associations"]
+    assoc = preview["associations"][0]
+    proposed = store.propose_insight(
+        association_id=assoc["association_id"],
+        hypothesis="Latency budgets should track packet loss spikes.",
+        source_memory_ids=[s["memory_id"] for s in assoc["source_memories"][:2]],
+        initial_confidence=0.7,
+    )
+    with pytest.raises(ValueError, match="evidence"):
+        store.validate_insight(
+            candidate_id=proposed["candidate_id"],
+            validation_method="manual",
+            evidence=[],
+            validated_confidence=0.8,
+        )
+    validated = store.validate_insight(
+        candidate_id=proposed["candidate_id"],
+        validation_method="manual",
+        evidence=[{"type": "note", "summary": "checked"}],
+        validated_confidence=0.8,
+        summary="Validated latency lesson.",
+    )
+    assert validated["status"] == "validated"
+    assert validated["promoted_memory_id"]
+    rejected = store.propose_insight(
+        association_id=assoc["association_id"],
+        hypothesis="A false insight that will be rejected.",
+        source_memory_ids=[a["memory_id"], b["memory_id"]],
+        initial_confidence=0.6,
+    )
+    out = store.reject_insight(
+        candidate_id=rejected["candidate_id"], reason="counterexample found"
+    )
+    assert out["status"] == "rejected"
+    store.close()

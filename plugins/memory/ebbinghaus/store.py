@@ -20,7 +20,7 @@ import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Sequence
+from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from .experience import EbbinghausExperienceLedger, normalize_query_hash
 from .models import RecallAttemptResult, RetrievalOutcome, RevisionResult
@@ -824,6 +824,70 @@ class EbbinghausMemoryStore:
             belief_id=belief_id,
         )
 
+    def run_correction_check(
+        self,
+        *,
+        rehearsal_id: int | None = None,
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        return self.experience.run_correction_check(
+            recall_fn=self.recall_with_experience,
+            rehearsal_id=rehearsal_id,
+            limit=limit,
+        )
+
+    def association_preview(self, *, limit: int | None = None) -> dict[str, Any]:
+        lim = (
+            int(self.policies.insight.association_limit)
+            if limit is None
+            else int(limit)
+        )
+        return self.experience.association_preview(limit=lim)
+
+    def propose_insight(
+        self,
+        *,
+        association_id: str,
+        hypothesis: str,
+        source_memory_ids: Sequence[int],
+        initial_confidence: float = 0.55,
+    ) -> dict[str, Any]:
+        return self.experience.propose_insight(
+            association_id=association_id,
+            hypothesis=hypothesis,
+            source_memory_ids=source_memory_ids,
+            initial_confidence=initial_confidence,
+        )
+
+    def validate_insight(
+        self,
+        *,
+        candidate_id: str,
+        validation_method: str,
+        evidence: Sequence[Mapping[str, Any]],
+        validated_confidence: float,
+        summary: str = "",
+    ) -> dict[str, Any]:
+        result = self.experience.validate_insight(
+            candidate_id=candidate_id,
+            validation_method=validation_method,
+            evidence=evidence,
+            validated_confidence=validated_confidence,
+            summary=summary,
+            remember_fn=lambda content, **kwargs: self.remember(content, **kwargs),
+        )
+        return {
+            "status": result.status.value,
+            "candidate_id": result.candidate_id,
+            "promoted_memory_id": result.promoted_memory_id,
+            "contested_source_ids": list(result.contested_source_ids),
+        }
+
+    def reject_insight(self, *, candidate_id: str, reason: str) -> dict[str, Any]:
+        return self.experience.reject_insight(
+            candidate_id=candidate_id, reason=reason
+        )
+
     def _protected_category_breakdown(self) -> dict[str, int]:
         breakdown: dict[str, int] = {}
         rows = self._conn.execute(
@@ -1578,6 +1642,13 @@ class EbbinghausMemoryStore:
 
         self._archive_noncurrent_beliefs(now)
 
+        correction_report = {"passed": [], "failed": []}
+        if xp.enabled and int(xp.correction_rehearsals_per_sleep) > 0:
+            correction_report = self.run_correction_check(
+                rehearsal_id=None,
+                limit=int(xp.correction_rehearsals_per_sleep),
+            )
+
         capacity_archived = self._enforce_capacity_ceiling(now)
 
         purged = self._purge_old_archives(now)
@@ -1603,6 +1674,10 @@ class EbbinghausMemoryStore:
             "latent": latent_ids,
             "archived": archived_ids,
             "pruned": pruned_ids,
+            "correction_rehearsals": {
+                "passed": list(correction_report.get("passed") or []),
+                "failed": list(correction_report.get("failed") or []),
+            },
             "negative_rehearsal_suppressed": negative_rehearsal_suppressed,
             "dream_candidates": dream_candidate_ids,
             "capacity_archived": capacity_archived,
@@ -2222,6 +2297,55 @@ class EbbinghausMemoryStore:
             "warning": warning,
             "db_path": str(self.db_path),
             "dreaming_enabled": self.policies.dreaming.enabled,
+            **self._experience_stats(),
+        }
+
+    def _experience_stats(self) -> dict[str, Any]:
+        if not self.policies.experience.enabled:
+            return {"experience_enabled": False}
+        latent = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM memories WHERE access_state = 'latent'"
+        ).fetchone()["c"]
+        reactivated = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM memories WHERE access_state = 'reactivated'"
+        ).fetchone()["c"]
+        unresolved_miss = self._conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM retrieval_attempts
+            WHERE outcome = 'miss' AND resolved_at IS NULL
+            """
+        ).fetchone()["c"]
+        completed = self._conn.execute(
+            """
+            SELECT COUNT(*) AS c FROM correction_rehearsals
+            WHERE status IN ('passed', 'failed')
+            """
+        ).fetchone()["c"]
+        failed = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM correction_rehearsals WHERE status = 'failed'"
+        ).fetchone()["c"]
+        candidates = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'candidate'"
+        ).fetchone()["c"]
+        validated = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'validated'"
+        ).fetchone()["c"]
+        rejected = self._conn.execute(
+            "SELECT COUNT(*) AS c FROM insight_candidates WHERE status = 'rejected'"
+        ).fetchone()["c"]
+        return {
+            "experience_enabled": True,
+            "latent_count": int(latent),
+            "reactivated_count": int(reactivated),
+            "unresolved_miss_count": int(unresolved_miss),
+            "correction_rehearsal_completed_count": int(completed),
+            "correction_rehearsal_failed_count": int(failed),
+            "corrected_error_recurrence_rate": round(
+                float(failed) / max(1, int(completed)), 4
+            ),
+            "insight_candidate_count": int(candidates),
+            "insight_validated_count": int(validated),
+            "insight_rejected_count": int(rejected),
         }
 
 

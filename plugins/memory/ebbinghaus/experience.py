@@ -11,10 +11,12 @@ import json
 import logging
 import sqlite3
 import threading
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from .models import (
+    InsightStatus,
     InsightValidationResult,
     RevisionResult,
 )
@@ -603,6 +605,120 @@ class EbbinghausExperienceLedger:
                 test_query=test_query,
             )
 
+    def run_correction_check(
+        self,
+        *,
+        recall_fn: Callable[..., Any],
+        rehearsal_id: int | None = None,
+        limit: int = 1,
+    ) -> dict[str, Any]:
+        """Replay pending correction rehearsals without reinforcing retrieval."""
+        with self._lock:
+            if rehearsal_id is not None:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM correction_rehearsals
+                    WHERE rehearsal_id = ?
+                    """,
+                    (int(rehearsal_id),),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT * FROM correction_rehearsals
+                    WHERE status IN ('pending', 'failed')
+                    ORDER BY created_at ASC, rehearsal_id ASC
+                    LIMIT ?
+                    """,
+                    (max(1, int(limit)),),
+                ).fetchall()
+
+            passed: list[int] = []
+            failed: list[int] = []
+            details: list[dict[str, Any]] = []
+            now = float(self._now_fn())
+            for row in rows:
+                rid = int(row["rehearsal_id"])
+                old_id = int(row["old_memory_id"])
+                new_id = int(row["new_memory_id"])
+                expected = int(row["expected_memory_id"] or new_id)
+                query = str(row["test_query"] or "")
+                outcome = recall_fn(
+                    query,
+                    limit=5,
+                    reinforce=False,
+                    include_archived=False,
+                    include_history=False,
+                    allow_rescue=False,
+                    track=False,
+                )
+                result_ids = [int(item["memory_id"]) for item in outcome.results]
+                top_id = result_ids[0] if result_ids else None
+                old_recurred = old_id in result_ids
+                ok = (
+                    top_id == expected
+                    and expected in result_ids
+                    and not old_recurred
+                )
+                status = "passed" if ok else "failed"
+                self._conn.execute(
+                    """
+                    UPDATE correction_rehearsals
+                    SET status = ?,
+                        old_error_recurred = ?,
+                        actual_memory_ids = ?,
+                        attempt_count = attempt_count + 1,
+                        last_run_at = ?
+                    WHERE rehearsal_id = ?
+                    """,
+                    (
+                        status,
+                        1 if old_recurred else 0,
+                        json.dumps(result_ids, ensure_ascii=False),
+                        now,
+                        rid,
+                    ),
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO memory_events(
+                        event_type, memory_id, related_memory_id, belief_id,
+                        session_id, payload, created_at
+                    ) VALUES (?, ?, ?, ?, '', ?, ?)
+                    """,
+                    (
+                        "correction_rehearsal_passed"
+                        if ok
+                        else "correction_rehearsal_failed",
+                        new_id,
+                        old_id,
+                        str(row["belief_id"] or ""),
+                        _safe_json_payload(
+                            {
+                                "rehearsal_id": rid,
+                                "result_ids": result_ids,
+                                "old_error_recurred": old_recurred,
+                            }
+                        ),
+                        now,
+                    ),
+                )
+                (passed if ok else failed).append(rid)
+                details.append(
+                    {
+                        "rehearsal_id": rid,
+                        "status": status,
+                        "result_ids": result_ids,
+                        "old_error_recurred": old_recurred,
+                    }
+                )
+            self._conn.commit()
+            return {
+                "passed": passed,
+                "failed": failed,
+                "details": details,
+            }
+
     def contest_dependents(
         self,
         *,
@@ -750,7 +866,148 @@ class EbbinghausExperienceLedger:
         return contested
 
     def association_preview(self, *, limit: int) -> dict[str, Any]:
-        raise NotImplementedError("association_preview lands in a later AGIASI task")
+        ip = self.policies.insight
+        if not ip.enabled:
+            return {"mode": "association_preview", "enabled": False, "associations": []}
+        max_assoc = max(1, min(int(limit), int(ip.association_limit)))
+        now = float(self._now_fn())
+        associations: list[dict[str, Any]] = []
+
+        focus_candidates: list[tuple[str, str, list[str]]] = []
+        miss_rows = self._conn.execute(
+            """
+            SELECT attempt_id, query_cues FROM retrieval_attempts
+            WHERE outcome = 'miss' AND resolved_at IS NULL
+            ORDER BY created_at DESC LIMIT 8
+            """
+        ).fetchall()
+        for row in miss_rows:
+            try:
+                cues = [str(c) for c in json.loads(row["query_cues"] or "[]")]
+            except (TypeError, ValueError, json.JSONDecodeError):
+                cues = []
+            focus_candidates.append(("retrieval_miss", str(row["attempt_id"]), cues))
+
+        contested = self._conn.execute(
+            """
+            SELECT memory_id, cues FROM memories
+            WHERE belief_status = 'contested'
+            ORDER BY updated_at DESC LIMIT 4
+            """
+        ).fetchall()
+        for row in contested:
+            cues = str(row["cues"] or "").split()
+            focus_candidates.append(("contested_belief", str(row["memory_id"]), cues))
+
+        pool = self._conn.execute(
+            """
+            SELECT * FROM memories
+            WHERE belief_status IN ('current', 'context_dependent')
+              AND access_state IN ('accessible', 'reactivated')
+              AND state = 'active'
+            ORDER BY salience DESC, updated_at DESC
+            LIMIT 64
+            """
+        ).fetchall()
+
+        for focus_type, focus_id, focus_cues in focus_candidates:
+            if len(associations) >= max_assoc:
+                break
+            focus_tags: set[str] = set()
+            focus_cue_set = {c.lower() for c in focus_cues if c}
+            scored: list[tuple[float, sqlite3.Row]] = []
+            for row in pool:
+                tags = {
+                    t.lower()
+                    for t in str(row["tags"] or "").replace(",", " ").split()
+                    if t.strip()
+                }
+                cues = {c.lower() for c in str(row["cues"] or "").split() if c}
+                tag_overlap = (
+                    len(focus_tags & tags) / max(1, len(focus_tags | tags))
+                    if focus_tags or tags
+                    else 0.0
+                )
+                cue_overlap = (
+                    len(focus_cue_set & cues) / max(1, len(focus_cue_set | cues))
+                    if focus_cue_set or cues
+                    else 0.0
+                )
+                if tag_overlap == 0.0 and cue_overlap == 0.0:
+                    continue
+                bridge = (
+                    0.40 * tag_overlap
+                    + 0.25 * cue_overlap
+                    + 0.20 * (1.0 - cue_overlap)
+                    + 0.15 * float(row["salience"] or 0.0)
+                )
+                scored.append((bridge, row))
+            scored.sort(key=lambda item: item[0], reverse=True)
+            sources = []
+            seen_content: set[str] = set()
+            for _score, row in scored:
+                content = str(row["content"] or "")
+                if content in seen_content:
+                    continue
+                seen_content.add(content)
+                sources.append(
+                    {
+                        "memory_id": int(row["memory_id"]),
+                        "content": content,
+                        "belief_status": str(row["belief_status"] or "current"),
+                        "confidence": float(row["confidence"] or 0.0),
+                    }
+                )
+                if len(sources) >= 6:
+                    break
+            if len(sources) < 2:
+                continue
+            association_id = f"assoc_{uuid.uuid4().hex}"
+            source_ids = [int(s["memory_id"]) for s in sources]
+            fingerprint = hashlib.sha256(
+                ("|".join(map(str, sorted(source_ids))) + focus_type + focus_id).encode()
+            ).hexdigest()
+            expires_at = now + float(ip.candidate_ttl_days) * 86400.0
+            payload = {
+                "association_id": association_id,
+                "focus": {"type": focus_type, "id": focus_id, "cues": focus_cues[:12]},
+                "source_memories": sources,
+                "instructions": [
+                    "Propose one falsifiable hypothesis.",
+                    "Do not present it as a fact.",
+                    "List a validation method and possible counterexample.",
+                ],
+                "expires_at": expires_at,
+            }
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO association_previews(
+                        association_id, focus_type, focus_id, source_memory_ids,
+                        source_fingerprint, prompt_payload, status, expires_at, created_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'previewed', ?, ?)
+                    """,
+                    (
+                        association_id,
+                        focus_type,
+                        focus_id,
+                        json.dumps(source_ids, ensure_ascii=False),
+                        fingerprint,
+                        json.dumps(payload, ensure_ascii=False),
+                        expires_at,
+                        now,
+                    ),
+                )
+            except sqlite3.IntegrityError:
+                continue
+            associations.append(payload)
+
+        self._conn.commit()
+        return {
+            "mode": "association_preview",
+            "enabled": True,
+            "associations": associations,
+        }
 
     def propose_insight(
         self,
@@ -760,7 +1017,71 @@ class EbbinghausExperienceLedger:
         source_memory_ids: Sequence[int],
         initial_confidence: float,
     ) -> dict[str, Any]:
-        raise NotImplementedError("propose_insight lands in a later AGIASI task")
+        hyp = str(hypothesis or "").strip()
+        if not hyp:
+            raise ValueError("hypothesis must not be empty")
+        conf = float(initial_confidence)
+        if not 0.0 <= conf <= 1.0:
+            raise ValueError("initial_confidence must be between 0 and 1")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM association_previews WHERE association_id = ?",
+                (str(association_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("association_id not found")
+            now = float(self._now_fn())
+            if float(row["expires_at"] or 0.0) < now:
+                raise ValueError("association preview expired")
+            allowed = set(json.loads(row["source_memory_ids"] or "[]"))
+            sources = [int(x) for x in source_memory_ids]
+            if not sources or not set(sources).issubset(allowed):
+                raise ValueError("source_memory_ids must be a non-empty subset of preview")
+            candidate_id = f"insight_{uuid.uuid4().hex}"
+            self._conn.execute(
+                """
+                INSERT INTO insight_candidates(
+                    candidate_id, association_id, hypothesis, status,
+                    initial_confidence, evidence, created_at, updated_at
+                ) VALUES (?, ?, ?, 'candidate', ?, '[]', ?, ?)
+                """,
+                (candidate_id, str(association_id), hyp, conf, now, now),
+            )
+            for mid in sources:
+                self._conn.execute(
+                    """
+                    INSERT OR IGNORE INTO insight_sources(candidate_id, memory_id, source_role)
+                    VALUES (?, ?, 'support')
+                    """,
+                    (candidate_id, int(mid)),
+                )
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(
+                    event_type, memory_id, related_memory_id, belief_id,
+                    session_id, payload, created_at
+                ) VALUES ('insight_proposed', NULL, NULL, '', '', ?, ?)
+                """,
+                (
+                    _safe_json_payload(
+                        {
+                            "candidate_id": candidate_id,
+                            "association_id": association_id,
+                            "hypothesis": hyp[:500],
+                        }
+                    ),
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return {
+                "status": "candidate",
+                "candidate_id": candidate_id,
+                "association_id": association_id,
+                "hypothesis": hyp,
+                "initial_confidence": conf,
+                "source_memory_ids": sources,
+            }
 
     def validate_insight(
         self,
@@ -770,11 +1091,158 @@ class EbbinghausExperienceLedger:
         evidence: Sequence[Mapping[str, Any]],
         validated_confidence: float,
         summary: str,
+        remember_fn: Callable[..., Mapping[str, Any]] | None = None,
     ) -> InsightValidationResult:
-        raise NotImplementedError("validate_insight lands in a later AGIASI task")
+        from .models import ValidationMethod
+
+        method = str(validation_method or "").strip()
+        if method not in {m.value for m in ValidationMethod}:
+            raise ValueError(f"unsupported validation_method: {method}")
+        if not evidence:
+            raise ValueError("evidence must contain at least one item")
+        conf = float(validated_confidence)
+        ip = self.policies.insight
+        if conf < float(ip.validation_min_confidence):
+            raise ValueError("validated_confidence below validation_min_confidence")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM insight_candidates WHERE candidate_id = ?",
+                (str(candidate_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("candidate_id not found")
+            if str(row["status"]) not in {"candidate", "validating"}:
+                raise ValueError(f"cannot validate status={row['status']}")
+            sources = self._conn.execute(
+                "SELECT memory_id FROM insight_sources WHERE candidate_id = ?",
+                (str(candidate_id),),
+            ).fetchall()
+            source_ids = [int(r["memory_id"]) for r in sources]
+            for mid in source_ids:
+                belief = self._conn.execute(
+                    "SELECT belief_status FROM memories WHERE memory_id = ?",
+                    (mid,),
+                ).fetchone()
+                if belief and str(belief["belief_status"]) in {
+                    "contested",
+                    "superseded",
+                    "retracted",
+                }:
+                    raise ValueError("source memory is no longer current")
+            now = float(self._now_fn())
+            text = str(summary or row["hypothesis"] or "").strip()
+            promoted_id = None
+            if remember_fn is not None:
+                remembered = remember_fn(
+                    text,
+                    tags=["insight", "validated", "semantic"],
+                    salience=min(1.0, max(0.05, conf)),
+                    source="validated_insight",
+                    memory_type="semantic",
+                )
+                promoted_id = int(remembered["memory_id"])
+                self._conn.execute(
+                    "UPDATE memories SET confidence = ? WHERE memory_id = ?",
+                    (conf, promoted_id),
+                )
+                for mid in source_ids:
+                    self._conn.execute(
+                        """
+                        INSERT OR IGNORE INTO memory_provenance(
+                            semantic_memory_id, source_memory_id, relation, created_at
+                        ) VALUES (?, ?, 'insight-derived', ?)
+                        """,
+                        (promoted_id, mid, now),
+                    )
+            self._conn.execute(
+                """
+                UPDATE insight_candidates
+                SET status = 'validated',
+                    validated_confidence = ?,
+                    validation_method = ?,
+                    evidence = ?,
+                    promoted_memory_id = ?,
+                    updated_at = ?
+                WHERE candidate_id = ?
+                """,
+                (
+                    conf,
+                    method,
+                    json.dumps(list(evidence), ensure_ascii=False, default=str),
+                    promoted_id,
+                    now,
+                    str(candidate_id),
+                ),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(
+                    event_type, memory_id, related_memory_id, belief_id,
+                    session_id, payload, created_at
+                ) VALUES ('insight_validated', ?, NULL, '', '', ?, ?)
+                """,
+                (
+                    promoted_id,
+                    _safe_json_payload(
+                        {
+                            "candidate_id": candidate_id,
+                            "validation_method": method,
+                            "validated_confidence": conf,
+                        }
+                    ),
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return InsightValidationResult(
+                candidate_id=str(candidate_id),
+                status=InsightStatus.VALIDATED,
+                promoted_memory_id=promoted_id,
+                contested_source_ids=[],
+            )
 
     def reject_insight(self, *, candidate_id: str, reason: str) -> dict[str, Any]:
-        raise NotImplementedError("reject_insight lands in a later AGIASI task")
+        reason_text = str(reason or "").strip()
+        if not reason_text:
+            raise ValueError("reason must not be empty")
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM insight_candidates WHERE candidate_id = ?",
+                (str(candidate_id),),
+            ).fetchone()
+            if row is None:
+                raise ValueError("candidate_id not found")
+            now = float(self._now_fn())
+            self._conn.execute(
+                """
+                UPDATE insight_candidates
+                SET status = 'rejected',
+                    rejection_reason = ?,
+                    updated_at = ?
+                WHERE candidate_id = ?
+                """,
+                (reason_text, now, str(candidate_id)),
+            )
+            self._conn.execute(
+                """
+                INSERT INTO memory_events(
+                    event_type, memory_id, related_memory_id, belief_id,
+                    session_id, payload, created_at
+                ) VALUES ('false_insight', NULL, NULL, '', '', ?, ?)
+                """,
+                (
+                    _safe_json_payload(
+                        {"candidate_id": candidate_id, "reason": reason_text}
+                    ),
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return {
+                "status": "rejected",
+                "candidate_id": str(candidate_id),
+                "reason": reason_text,
+            }
 
     def _trim_unresolved_misses_locked(self) -> None:
         limit = int(self.policies.experience.max_unresolved_misses)
