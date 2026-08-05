@@ -784,6 +784,50 @@ def test_intermediate_accepts_exact_replay_creator_edge_until_cleanup() -> None:
     ) == intermediate
 
 
+def test_intermediate_accepts_exact_routeback_helper_replay_until_cleanup() -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(
+        gate,
+        install,
+        initial_state="exact_installed",
+        replay_creator_edge=True,
+    )
+    for name in ("before_observation", "after_observation"):
+        observation = intermediate[name]
+        observation["helper_absent"] = False
+        observation["helper_same_name_count"] = 1
+        observation.update(
+            _hashed(
+                {
+                    field: value
+                    for field, value in observation.items()
+                    if field != "observation_sha256"
+                },
+                "observation_sha256",
+            )
+        )
+        intermediate[
+            f"{name.removesuffix('_observation')}_observation_sha256"
+        ] = observation["observation_sha256"]
+    intermediate = _hashed(
+        {
+            name: value
+            for name, value in intermediate.items()
+            if name != "intermediate_sha256"
+        },
+        "intermediate_sha256",
+    )
+
+    assert bootstrap.validate_intermediate_for_owner(
+        intermediate,
+        gate=gate,
+        install_claim=install,
+        now_unix=NOW,
+    ) == intermediate
+
+
 def test_intermediate_rejects_exact_replay_creator_edge_drift() -> None:
     key = Ed25519PrivateKey.generate()
     gate = _gate(key)
