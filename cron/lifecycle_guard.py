@@ -258,7 +258,7 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -318,6 +318,13 @@ def _contains_unsafe_gateway_action(
             # from a binary's decoded contents tokenized as a path — a
             # guarded path must never crash the guard (#76762).
             resolved = script_path
+
+        # NUL-bearing path tokens are not valid filesystem paths and cannot
+        # reference a real script file. Skip them so a malformed token cannot
+        # crash the recursion path.
+        if "\x00" in str(script_path):
+            continue
+
         if resolved in visited:
             continue
         visited.add(resolved)

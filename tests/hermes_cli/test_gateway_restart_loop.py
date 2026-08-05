@@ -9,6 +9,7 @@ Covers:
 import json
 import os
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -627,6 +628,19 @@ class TestLifecycleGuardModule:
         script.write_bytes(b"\xfehermes gateway restart\xff")
         with pytest.raises(GatewayLifecycleBlocked):
             check_gateway_lifecycle("", str(script))
+
+    def test_shell_reference_with_nul_path_does_not_crash(self):
+        """Embedded NUL bytes in referenced script paths should be treated as
+        non-executable junk and skipped, not as a guard crash."""
+        from cron.lifecycle_guard import contains_gateway_lifecycle_command_or_referenced_script
+
+        assert contains_gateway_lifecycle_command_or_referenced_script("sh foo\x00bar.sh") is False
+
+    def test_read_referenced_script_handles_nul_path_without_exception(self):
+        """A NUL byte in a candidate path should fail-safe to "nothing to scan"."""
+        from cron.lifecycle_guard import _read_referenced_script
+
+        assert _read_referenced_script(Path("foo\x00bar")) == (None, False)
 
 
     def test_relative_script_resolved_under_scripts_dir(self, tmp_path, monkeypatch):
