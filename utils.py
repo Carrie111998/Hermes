@@ -8,7 +8,7 @@ import shutil
 import stat
 import tempfile
 from pathlib import Path
-from typing import Any, Union
+from typing import Any, Optional, Union
 from urllib.parse import urlparse
 
 import yaml
@@ -248,6 +248,7 @@ def prune_oldest_files(
     pattern: str,
     keep: int,
     *,
+    protect: Optional[Union[str, Path]] = None,
     log: logging.Logger | None = None,
 ) -> int:
     """Keep the *keep* newest files matching *pattern*; delete the rest.
@@ -269,6 +270,17 @@ def prune_oldest_files(
     timestamp is the whole filename; it silently orders by the wrong field
     when a variable component (e.g. a session id) precedes the timestamp.
 
+    *protect* names one file that must survive this sweep regardless of
+    ordering — normally the file the caller just wrote.  It is excluded from
+    the candidate set and takes one of the *keep* slots, so the cap still holds
+    exactly.  Ordering alone is not enough to guarantee this: when two files
+    share an mtime (coarse-granularity filesystems, or several writes inside
+    one timestamp tick) the filename tiebreaker decides, and it compares the
+    *whole* name — so a sibling whose variable leading component (e.g. a
+    different session id) sorts higher wins the tie and the just-written file
+    is deleted out from under its caller.  An explicit exemption is a property
+    of the write, not of a sort key, so it cannot be lost that way.
+
     Safety properties, because this deletes user files:
 
     * Only direct children of *directory* are considered — ``glob`` is not
@@ -286,10 +298,25 @@ def prune_oldest_files(
     if keep <= 0:
         return 0
     logger_ = log or logging.getLogger(__name__)
+    # Compare by name within this directory: the caller's *protect* and the
+    # glob results are siblings by construction, and name comparison costs no
+    # extra stat() calls on the hot path.
+    protected_name: Optional[str] = None
+    if protect is not None:
+        try:
+            protect_path = Path(protect)
+            if protect_path.parent == Path(directory):
+                protected_name = protect_path.name
+        except (OSError, ValueError, TypeError) as exc:
+            logger_.debug("Could not interpret protected path %r: %s", protect, exc)
     try:
         candidates = []
+        protected_found = False
         for entry in Path(directory).glob(pattern):
             try:
+                if protected_name is not None and entry.name == protected_name:
+                    protected_found = True
+                    continue
                 # is_symlink() first: is_file() follows links, so checking it
                 # alone would happily accept a symlink pointing outside the
                 # directory and then unlink our end of it.
@@ -304,12 +331,15 @@ def prune_oldest_files(
         logger_.debug("Could not scan %s for retention: %s", directory, exc)
         return 0
 
-    if len(candidates) <= keep:
+    # The protected file occupies one of the *keep* slots when it is actually
+    # present, so the directory still ends up with at most *keep* files.
+    effective_keep = keep - 1 if protected_found else keep
+    if len(candidates) <= effective_keep:
         return 0
 
     candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
     deleted = 0
-    for _mtime, name, stale in candidates[keep:]:
+    for _mtime, name, stale in candidates[effective_keep:]:
         try:
             stale.unlink()
             deleted += 1

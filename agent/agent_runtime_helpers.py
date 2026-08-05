@@ -1858,7 +1858,7 @@ def _request_dump_keep() -> int:
         return _REQUEST_DUMP_DEFAULT_KEEP
 
 
-def prune_request_dumps(logs_dir: Path) -> int:
+def prune_request_dumps(logs_dir: Path, *, protect: Optional[Path] = None) -> int:
     """Bound ``request_dump_*.json`` growth in *logs_dir*. Returns count deleted.
 
     The glob is a fixed literal — deliberately NOT keyed to the session id, so
@@ -1869,9 +1869,21 @@ def prune_request_dumps(logs_dir: Path) -> int:
     id from escaping ``logs_dir`` in the first place, and pruning inherits that
     guarantee by only ever matching ``request_dump_*.json`` directly inside the
     resolved directory.
+
+    *protect* exempts the dump just written.  Newest-first ordering almost
+    always spares it already, but two dumps can share an mtime (coarse
+    filesystem granularity, or concurrent agents writing inside one tick), and
+    the tie is then broken on the whole filename — where the session id leads,
+    so a sibling session whose id sorts higher wins and the fresh dump is
+    deleted before its caller can print the path.  The exemption makes
+    "we never delete the dump we just wrote" hold by construction.
     """
     return prune_oldest_files(
-        logs_dir, "request_dump_*.json", _request_dump_keep(), log=logger,
+        logs_dir,
+        "request_dump_*.json",
+        _request_dump_keep(),
+        protect=protect,
+        log=logger,
     )
 
 
@@ -1960,13 +1972,15 @@ def dump_api_request_debug(
 
         # Bound directory growth immediately after the write, so the cap holds
         # even for a process that only ever errors once (#77472).  Pruning runs
-        # after ``dump_file`` exists and is fully written, and keeps the newest
-        # N — so the dump just written is never the one deleted.  Its own
-        # failures are swallowed inside ``prune_oldest_files``; the extra guard
-        # here means even an unexpected raise cannot cost us the return value
-        # or the user-facing path notice below.
+        # after ``dump_file`` exists and is fully written, keeps the newest N,
+        # and exempts ``dump_file`` explicitly — so the dump just written is
+        # never the one deleted even when an mtime tie would otherwise order a
+        # concurrent session's dump ahead of it.  Its own failures are
+        # swallowed inside ``prune_oldest_files``; the extra guard here means
+        # even an unexpected raise cannot cost us the return value or the
+        # user-facing path notice below.
         try:
-            prune_request_dumps(agent.logs_dir)
+            prune_request_dumps(agent.logs_dir, protect=dump_file)
         except Exception as prune_error:
             logger.debug("Request dump retention skipped: %s", prune_error)
 

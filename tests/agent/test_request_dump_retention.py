@@ -358,3 +358,57 @@ class TestPruneHelperDirectly:
 
     def test_prune_request_dumps_on_missing_dir_is_safe(self, hermes_home):
         assert agent_runtime_helpers.prune_request_dumps(hermes_home / "gone") == 0
+
+
+class TestFreshDumpSurvivesAnMtimeTie:
+    """The returned path must still exist, even when mtimes collide.
+
+    ``dump_api_request_debug`` hands the path back to its caller, which prints
+    it for the user to open.  Ordering alone does not guarantee the fresh dump
+    survives: two dumps can land in one mtime tick (coarse-granularity
+    filesystem, or two agents erroring concurrently), and the tie is broken on
+    the whole filename — where the *session id* leads.  A sibling session whose
+    id sorts higher would then win the tie and the just-written dump would be
+    deleted before the user could read it.
+    """
+
+    def test_returned_path_exists_when_a_sibling_session_ties_on_mtime(self, agent):
+        _write_config(
+            Path(os.environ["HERMES_HOME"]),
+            "sessions:\n  request_dump_retention: 2\n",
+        )
+        logs_dir = agent.logs_dir
+        # Pre-seed dumps from a session id that sorts ABOVE ours, all sharing
+        # one mtime tick with the dump we are about to write.
+        tie = 1_700_000_000.0
+        for i in range(4):
+            stale = logs_dir / f"request_dump_zzzz_20260101_00000{i}_000000.json"
+            stale.write_text("{}", encoding="utf-8")
+            os.utime(stale, (tie, tie))
+
+        agent.session_id = "aaaa_20260101_000000"
+        written = agent._dump_api_request_debug(
+            _kwargs("fresh"), reason="non_retryable_client_error",
+        )
+        os.utime(written, (tie, tie))  # force the tie the guard must survive
+        agent_runtime_helpers.prune_request_dumps(logs_dir, protect=written)
+
+        assert written.exists(), "the dump whose path was returned must still exist"
+        payload = json.loads(written.read_text(encoding="utf-8"))
+        assert payload["request"]["body"]["messages"][0]["content"] == "fresh"
+        assert len(_dumps(logs_dir)) == 2, "cap still holds"
+
+    def test_protect_is_passed_through_from_the_write_path(self, agent, monkeypatch):
+        """The write path must hand its own dump to the prune as protected."""
+        seen = {}
+
+        def _spy(logs_dir, *, protect=None):
+            seen["logs_dir"] = logs_dir
+            seen["protect"] = protect
+            return 0
+
+        monkeypatch.setattr(agent_runtime_helpers, "prune_request_dumps", _spy)
+        written = agent._dump_api_request_debug(_kwargs("x"), reason="preflight")
+
+        assert seen["protect"] == written, "the fresh dump is exempted by path"
+        assert seen["logs_dir"] == agent.logs_dir

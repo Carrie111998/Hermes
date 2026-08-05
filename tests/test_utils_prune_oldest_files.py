@@ -120,6 +120,91 @@ class TestOrderingIsByMtimeNotName:
         assert survivors_a == survivors_b
 
 
+class TestProtectedFileSurvives:
+    """``protect`` exempts the file the caller just wrote.
+
+    Newest-first ordering usually spares it, but when mtimes tie the whole
+    filename breaks the tie — and for ``request_dump_<session>_<ts>.json`` the
+    session id leads, so a sibling session's id can sort higher and evict the
+    fresh dump. These assert the invariant the caller depends on ("the file I
+    just wrote is still there when this returns"), not a sort order.
+    """
+
+    def test_protected_file_survives_an_mtime_tie_it_would_lose(self, tmp_path):
+        # Same mtime for all four; the protected name sorts LAST lexically, so
+        # without the exemption the tiebreaker deletes it.
+        losers = [f"request_dump_zzz_{i:02d}.json" for i in range(3)]
+        just_written = "request_dump_aaa_99.json"
+        for path in _seed(tmp_path, [*losers, just_written], step=0.0):
+            os.utime(path, (1_700_000_000.0, 1_700_000_000.0))
+        target = tmp_path / just_written
+
+        prune_oldest_files(tmp_path, "request_dump_*.json", 1, protect=target)
+
+        assert target.exists(), "the file the caller just wrote must survive"
+        assert [p.name for p in tmp_path.glob("request_dump_*.json")] == [just_written]
+
+    def test_protected_file_still_counts_against_the_cap(self, tmp_path):
+        """The exemption must not let the directory exceed *keep*."""
+        names = [f"dump_{i}.json" for i in range(10)]
+        _seed(tmp_path, names)
+        target = tmp_path / names[0]  # oldest, so it would normally be deleted
+
+        prune_oldest_files(tmp_path, "dump_*.json", 3, protect=target)
+
+        survivors = sorted(p.name for p in tmp_path.glob("dump_*.json"))
+        assert len(survivors) == 3, "cap still holds exactly"
+        assert names[0] in survivors, "protected file is one of the survivors"
+
+    def test_protected_name_in_another_directory_is_not_credited(self, tmp_path):
+        """A same-named file elsewhere must not exempt a local file by name."""
+        other = tmp_path / "other"
+        other.mkdir()
+        _seed(tmp_path, [f"dump_{i}.json" for i in range(5)])
+
+        deleted = prune_oldest_files(
+            tmp_path, "dump_*.json", 2, protect=other / "dump_0.json",
+        )
+
+        assert deleted == 3
+        assert len(list(tmp_path.glob("dump_*.json"))) == 2
+
+    def test_protect_of_a_missing_file_keeps_the_full_cap(self, tmp_path):
+        """Nothing to exempt → no slot is reserved, so *keep* files remain."""
+        _seed(tmp_path, [f"dump_{i}.json" for i in range(6)])
+
+        prune_oldest_files(
+            tmp_path, "dump_*.json", 3, protect=tmp_path / "dump_never_written.json",
+        )
+
+        assert len(list(tmp_path.glob("dump_*.json"))) == 3
+
+    def test_protect_none_is_the_previous_behavior(self, tmp_path):
+        _seed(tmp_path, [f"dump_{i}.json" for i in range(6)])
+
+        assert prune_oldest_files(tmp_path, "dump_*.json", 2, protect=None) == 4
+        assert len(list(tmp_path.glob("dump_*.json"))) == 2
+
+    def test_under_cap_with_protect_deletes_nothing(self, tmp_path):
+        paths = _seed(tmp_path, [f"dump_{i}.json" for i in range(3)])
+
+        assert prune_oldest_files(tmp_path, "dump_*.json", 5, protect=paths[-1]) == 0
+        assert len(list(tmp_path.glob("dump_*.json"))) == 3
+
+    def test_keep_one_with_protect_leaves_only_the_protected_file(self, tmp_path):
+        paths = _seed(tmp_path, [f"dump_{i}.json" for i in range(4)])
+        target = paths[1]
+
+        prune_oldest_files(tmp_path, "dump_*.json", 1, protect=target)
+
+        assert [p.name for p in tmp_path.glob("dump_*.json")] == [target.name]
+
+    def test_garbage_protect_value_does_not_break_pruning(self, tmp_path):
+        _seed(tmp_path, [f"dump_{i}.json" for i in range(5)])
+
+        assert prune_oldest_files(tmp_path, "dump_*.json", 2, protect=object()) == 3
+
+
 class TestScopeSafety:
     def test_only_matching_pattern_is_touched(self, tmp_path):
         _seed(tmp_path, [f"dump_{i}.json" for i in range(5)])
