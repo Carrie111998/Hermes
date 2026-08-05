@@ -6,6 +6,12 @@ from run_agent import _repair_tool_call_arguments
 
 
 class TestRepairToolCallArguments:
+    def test_invalid_backslash_apostrophe_escape_is_normalized(self):
+        raw = "{\"command\":\"printf \\'ok\\'\\n\"}"
+        result = _repair_tool_call_arguments(raw, "terminal")
+        parsed = json.loads(result)
+        assert parsed == {"command": "printf 'ok'\n"}
+
     """Verify each repair stage in the pipeline."""
 
     # -- Stage 1: empty / whitespace-only --

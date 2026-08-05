@@ -183,6 +183,45 @@ def _escape_invalid_chars_in_json_strings(raw: str) -> str:
     return "".join(out)
 
 
+def _repair_invalid_json_string_escapes(raw: str) -> str:
+    """Drop illegal backslash escapes inside JSON string values."""
+    out: list[str] = []
+    in_string = False
+    i = 0
+    valid_simple = {'"', "\\", "/", "b", "f", "n", "r", "t"}
+    while i < len(raw):
+        ch = raw[i]
+        if not in_string:
+            out.append(ch)
+            if ch == '"':
+                in_string = True
+            i += 1
+            continue
+        if ch == '"':
+            in_string = False
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(raw):
+            nxt = raw[i + 1]
+            if nxt in valid_simple:
+                out.extend((ch, nxt))
+                i += 2
+                continue
+            if nxt == "u" and i + 5 < len(raw):
+                hex_part = raw[i + 2 : i + 6]
+                if all(c in "0123456789abcdefABCDEF" for c in hex_part):
+                    out.append(raw[i : i + 6])
+                    i += 6
+                    continue
+            out.append(nxt)
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
     """Attempt to repair malformed tool_call argument JSON.
 
@@ -218,6 +257,20 @@ def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
                 tool_name,
             )
         return reserialised
+    except (json.JSONDecodeError, TypeError, ValueError):
+        pass
+
+    # Repair invalid JSON escapes inside string values, e.g. ``\'``.
+    try:
+        fixed_escapes = _repair_invalid_json_string_escapes(raw_stripped)
+        if fixed_escapes != raw_stripped:
+            parsed = json.loads(fixed_escapes, strict=False)
+            reserialised = json.dumps(parsed, separators=(",", ":"))
+            logger.warning(
+                "Repaired invalid JSON string escapes in tool_call arguments for %s",
+                tool_name,
+            )
+            return reserialised
     except (json.JSONDecodeError, TypeError, ValueError):
         pass
 

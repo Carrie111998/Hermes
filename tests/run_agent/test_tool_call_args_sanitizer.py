@@ -50,6 +50,24 @@ def test_valid_arguments_unchanged():
     assert messages == original
 
 
+def test_repairable_illegal_json_escape_is_normalized_without_corruption_marker():
+    marker = AIAgent._TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER
+    messages = [
+        _assistant_message(
+            _tool_call(arguments="{\"command\":\"printf \\'hello\\'\"}")
+        ),
+        _tool_message(content="existing tool output"),
+    ]
+
+    repaired = AIAgent._sanitize_tool_call_arguments(messages)
+
+    assert repaired == 1
+    assert messages[0]["tool_calls"][0]["function"]["arguments"] == (
+        '{"command":"printf \'hello\'"}'
+    )
+    assert not messages[1]["content"].startswith(marker)
+
+
 def test_truncated_arguments_replaced_with_empty_object(caplog):
     messages = [
         _assistant_message(_tool_call(arguments='{"path": "/tmp/foo')),
@@ -120,11 +138,10 @@ def test_multiple_corrupted_tool_calls_in_one_message():
     assert repaired == 2
     assert messages[0]["tool_calls"][0]["function"]["arguments"] == "{}"
     assert messages[0]["tool_calls"][1]["function"]["arguments"] == '{"path":"/tmp/bar"}'
-    assert messages[0]["tool_calls"][2]["function"]["arguments"] == "{}"
+    assert messages[0]["tool_calls"][2]["function"]["arguments"] == '{"mode":"tail"}'
     assert messages[1]["tool_call_id"] == "call_1"
     assert messages[1]["content"] == marker
-    assert messages[2]["tool_call_id"] == "call_3"
-    assert messages[2]["content"] == marker
+    assert len(messages) == 2
 
 
 def test_empty_string_arguments_treated_as_empty_object(caplog):
