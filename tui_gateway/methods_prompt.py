@@ -210,13 +210,34 @@ def _(rid, params: dict) -> dict:
                 len(truncated),
                 ordinal,
             )
-            session["history"] = truncated
-            session["history_version"] = int(session.get("history_version", 0)) + 1
+            # Write-before-memory (mirrors gateway hygiene / manual /compress):
+            # persist the truncated transcript first. If replace_messages fails
+            # after we already rewrote session["history"], the turn still runs
+            # against the short list while state.db keeps the old tail. The
+            # agent flush is append-only for history-dict identities, so the
+            # new exchange is appended on top of the "undone" turns — durable
+            # zombie history on resume, and the edit/regenerate never sticks.
+            # Fail closed: refuse the turn and leave memory/DB unchanged.
             if (db := _get_db()) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:
-                    print(f"[tui_gateway] prompt.submit: replace_messages failed: {exc}", file=sys.stderr)
+                    logger.error(
+                        "prompt.submit: replace_messages failed for session %s "
+                        "(ordinal=%d); refusing turn so memory and DB stay "
+                        "aligned: %s",
+                        sid,
+                        ordinal,
+                        exc,
+                        exc_info=True,
+                    )
+                    return _err(
+                        rid,
+                        5008,
+                        f"failed to persist history truncation: {exc}",
+                    )
+            session["history"] = truncated
+            session["history_version"] = int(session.get("history_version", 0)) + 1
         session["running"] = True
         session["_turn_cancel_requested"] = False
         session["last_active"] = time.time()
@@ -870,6 +891,14 @@ def _(rid, params: dict) -> dict:
     # allow_expired=True: the read_terminal tool's _block() uses a short 30s
     # timeout, so a slow renderer losing the race is the common case — a late
     # response must not error after the tool already returned empty.
+    return _respond(rid, params, "text", allow_expired=True)
+
+
+@method("preview.read.respond")
+def _(rid, params: dict) -> dict:
+    # `text` is a JSON string of the active preview tab's serialized contents.
+    # allow_expired=True for the same reason as terminal.read: the tool's
+    # bounded wait can expire while a slow page extraction is still running.
     return _respond(rid, params, "text", allow_expired=True)
 
 
