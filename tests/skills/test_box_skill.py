@@ -211,9 +211,12 @@ def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
     assert "one App User per Hermes deployment or isolation boundary" in ccg
     assert "current local computer user's signed-in Box browser session" in ccg
     assert "If they decline, give this path with clickable links" in ccg
+    assert "select **Create Platform App**" in ccg
+    assert "https://app.box.com/developers/console/new" not in ccg
     assert "**App Details** sidebar" in ccg
     assert "**App Access Only**" in ccg
-    assert "enable **Manage users** and **Generate User Access Tokens**" in ccg
+    assert "enable **Manage users**" in ccg
+    assert "**Generate User Access Tokens**" in ccg
     assert "Manage users is required to create the App User" in ccg
     assert "**Generate User Access Tokens**" in ccg
     assert 'box users:create "Hermes Production Agent" --app-user' in ccg
