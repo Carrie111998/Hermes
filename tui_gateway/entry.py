@@ -430,6 +430,13 @@ def ensure_mcp_discovery_started() -> None:
 def main():
     _install_sidecar_publisher()
 
+    try:
+        from hermes_cli.plugins import discover_plugins
+
+        discover_plugins()
+    except Exception:
+        logger.warning("Plugin discovery failed at TUI startup", exc_info=True)
+
     # MCP tool discovery — backgrounded so a slow or unreachable MCP server
     # can't freeze TUI startup (a dead stdio/http server burns 1+2+4s of
     # connect retries → ~7s of dead air before the composer appears).  The
