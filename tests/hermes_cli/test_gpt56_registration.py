@@ -36,12 +36,22 @@ class TestGpt56SortInvariants:
         assert models[0] == "gpt-5.6-sol"
 
 
+
+
+class TestModelSortKPrefixVersions:
+    def test_k_prefix_versions_sort_numerically(self):
+        models = ["moonshotai/kimi-k2.6", "moonshotai/kimi-k3", "moonshotai/kimi-k3.5"]
+        models.sort(key=lambda m: _model_sort_key(m, "moonshotai/kimi"))
+        assert models[0] == "moonshotai/kimi-k3.5"
+
+
 class TestGpt56PricingRoute:
     def test_official_pricing_reachable_from_openai(self):
         route = resolve_billing_route("gpt-5.6-sol", provider="openai")
         entry = _lookup_official_docs_pricing(route)
         assert entry is not None
         assert entry.input_cost_per_million == Decimal("5.00")
+
 
 
     def test_cache_write_is_1_25x_input_for_56_series(self):
