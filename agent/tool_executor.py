@@ -33,7 +33,6 @@ from agent.display import (
     _detect_tool_failure,
 )
 from agent.tool_dispatch_helpers import (
-    _is_destructive_command,
     _is_multimodal_tool_result,
     _multimodal_text_summary,
     _append_subdir_hint_to_multimodal,
@@ -42,6 +41,7 @@ from agent.tool_dispatch_helpers import (
 )
 from tools.terminal_tool import (
     get_active_env,
+    resolve_terminal_workdir,
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.tool_result_storage import (
@@ -73,6 +73,23 @@ def _ensure_file_checkpoint(
     resolved_path = _resolve_path_for_task(file_path, effective_task_id or "default")
     work_dir = agent._checkpoint_mgr.get_working_dir_for_path(str(resolved_path))
     agent._checkpoint_mgr.ensure_checkpoint(work_dir, f"before {function_name}")
+
+
+def _ensure_terminal_checkpoint(
+    agent,
+    function_args: dict,
+    effective_task_id: str,
+) -> None:
+    """Checkpoint the same cwd that the terminal tool will execute in."""
+    command = function_args.get("command", "")
+    cwd = resolve_terminal_workdir(
+        workdir=function_args.get("workdir"),
+        task_id=effective_task_id or "default",
+    )
+    agent._checkpoint_mgr.ensure_checkpoint(
+        cwd,
+        f"before terminal: {str(command)[:60]}",
+    )
 
 
 def _budget_for_agent(agent) -> BudgetConfig:
@@ -658,14 +675,11 @@ def _begin_tool_execution(
 
     if function_name == "terminal" and agent._checkpoint_mgr.enabled:
         try:
-            command = function_args.get("command", "")
-            if _is_destructive_command(command):
-                cwd = function_args.get("workdir") or os.getenv(
-                    "TERMINAL_CWD", os.getcwd()
-                )
-                agent._checkpoint_mgr.ensure_checkpoint(
-                    cwd, f"before terminal: {command[:60]}"
-                )
+            _ensure_terminal_checkpoint(
+                agent,
+                function_args,
+                effective_task_id,
+            )
         except Exception:
             pass
 

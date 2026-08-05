@@ -2233,6 +2233,55 @@ def _resolve_command_cwd(
     return get_session_cwd(session_key) or default_cwd
 
 
+def _resolve_terminal_default_cwd(
+    *,
+    task_id: Optional[str],
+    config: Dict[str, Any],
+    overrides: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve the terminal environment cwd before per-command overrides."""
+    resolved_overrides = (
+        resolve_task_overrides(task_id) if overrides is None else overrides
+    )
+    cwd = resolved_overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
+    env_type = config["env_type"]
+    if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
+        if cwd != config["cwd"]:
+            logger.info(
+                "Ignoring host/relative cwd override %r for %s backend "
+                "(won't exist in sandbox). Using %r instead.",
+                cwd,
+                env_type,
+                config["cwd"],
+            )
+        cwd = config["cwd"]
+    return cwd
+
+
+def resolve_terminal_workdir(
+    *,
+    workdir: Optional[str],
+    task_id: Optional[str],
+) -> str:
+    """Return the effective cwd used by a terminal command."""
+    config = _get_env_config()
+    default_cwd = _resolve_terminal_default_cwd(
+        task_id=task_id,
+        config=config,
+    )
+
+    # ContextVars do not cross tool-worker threads, so the raw task id remains
+    # the stable fallback used by terminal_tool() itself.
+    from tools.approval import get_current_session_key
+
+    session_key = get_current_session_key(default="") or (task_id or "")
+    return _resolve_command_cwd(
+        workdir=workdir,
+        default_cwd=default_cwd,
+        session_key=session_key,
+    )
+
+
 def terminal_tool(
     command: str,
     background: bool = False,
@@ -2319,26 +2368,11 @@ def terminal_tool(
         else:
             image = ""
 
-        cwd = overrides.get("cwd") or get_session_cwd(task_id) or config["cwd"]
-        # A per-task cwd override (registered by the gateway/TUI for workspace
-        # tracking, or by RL/benchmark envs) wins over config["cwd"] — but
-        # config["cwd"] was already sanitized for container backends in
-        # _get_env_config() while the override is raw. On a container backend a
-        # raw host path (e.g. a Windows desktop session's C:\Users\<user>, or a
-        # POSIX /home/<user>) reaches `docker run -w <host-path>` and the
-        # container fails to start (exit 125). Re-apply the same host/relative
-        # path guard to the *resolved* cwd so the override can't bypass it.
-        # Valid in-container override paths (RL/benchmark sandboxes that set
-        # cwd to /workspace, /root, etc.) are absolute non-host paths and pass
-        # through untouched.
-        if env_type in _CONTAINER_BACKENDS and _is_unusable_container_cwd(cwd):
-            if cwd != config["cwd"]:
-                logger.info(
-                    "Ignoring host/relative cwd override %r for %s backend "
-                    "(won't exist in sandbox). Using %r instead.",
-                    cwd, env_type, config["cwd"],
-                )
-            cwd = config["cwd"]
+        cwd = _resolve_terminal_default_cwd(
+            task_id=task_id,
+            config=config,
+            overrides=overrides,
+        )
         default_timeout = config["timeout"]
 
         # Validate an explicit timeout before it flows into deadline math.
@@ -2656,10 +2690,9 @@ def terminal_tool(
             # For non-local backends: runs inside the sandbox via env.execute().
             from tools.process_registry import process_registry
 
-            effective_cwd = _resolve_command_cwd(
+            effective_cwd = resolve_terminal_workdir(
                 workdir=workdir,
-                default_cwd=cwd,
-                session_key=session_key,
+                task_id=task_id,
             )
             try:
                 if env_type == "local":
@@ -2916,10 +2949,9 @@ def terminal_tool(
 
             while retry_count <= max_retries:
                 try:
-                    command_cwd = _resolve_command_cwd(
+                    command_cwd = resolve_terminal_workdir(
                         workdir=workdir,
-                        default_cwd=cwd,
-                        session_key=session_key,
+                        task_id=task_id,
                     )
                     execute_kwargs = {
                         "timeout": effective_timeout,

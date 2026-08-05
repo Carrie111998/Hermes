@@ -1495,6 +1495,67 @@ class TestExecuteToolCalls:
         assert messages[0]["role"] == "tool"
         assert "search result" in messages[0]["content"]
 
+    def test_sequential_terminal_always_runs_checkpoint_preflight(self, agent):
+        args = {
+            "command": "python -c \"from pathlib import Path; Path('victim').unlink()\"",
+            "workdir": "/tmp/project",
+        }
+        agent._checkpoint_mgr = SimpleNamespace(enabled=True)
+        tool_call = _mock_tool_call(
+            "terminal",
+            json.dumps(args),
+            "terminal-sequential",
+        )
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        with (
+            patch("agent.tool_executor._ensure_terminal_checkpoint") as checkpoint,
+            patch("run_agent.handle_function_call", return_value="ok"),
+        ):
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
+        checkpoint.assert_called_once_with(agent, args, "task-1")
+
+    def test_concurrent_terminal_always_runs_checkpoint_preflight(self, agent):
+        args_a = {"command": "/bin/rm victim-a", "workdir": "/tmp/project-a"}
+        args_b = {"command": "find . -name victim-b -delete"}
+        calls = [
+            _mock_tool_call("terminal", json.dumps(args_a), "terminal-a"),
+            _mock_tool_call("terminal", json.dumps(args_b), "terminal-b"),
+        ]
+        agent._checkpoint_mgr = SimpleNamespace(enabled=True)
+        message = _mock_assistant_msg(content="", tool_calls=calls)
+
+        with (
+            patch("agent.tool_executor._ensure_terminal_checkpoint") as checkpoint,
+            patch("run_agent.handle_function_call", return_value="ok"),
+        ):
+            agent._execute_tool_calls_concurrent(message, [], "task-1")
+
+        assert checkpoint.call_args_list == [
+            ((agent, args_a, "task-1"),),
+            ((agent, args_b, "task-1"),),
+        ]
+
+    def test_blocked_terminal_does_not_run_checkpoint_preflight(self, agent):
+        args = {"command": "/bin/rm victim", "workdir": "/tmp/project"}
+        agent._checkpoint_mgr = SimpleNamespace(enabled=True)
+        tool_call = _mock_tool_call("terminal", json.dumps(args), "terminal-blocked")
+        message = _mock_assistant_msg(content="", tool_calls=[tool_call])
+
+        with (
+            patch(
+                "hermes_cli.plugins.resolve_pre_tool_block",
+                return_value="blocked by policy",
+            ),
+            patch("agent.tool_executor._ensure_terminal_checkpoint") as checkpoint,
+            patch("run_agent.handle_function_call") as handle,
+        ):
+            agent._execute_tool_calls_sequential(message, [], "task-1")
+
+        checkpoint.assert_not_called()
+        handle.assert_not_called()
+
     def test_sequential_tool_calls_run_without_delay(self, agent):
         """Two sequential tool calls execute back-to-back with no sleep between them."""
         tc1 = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
