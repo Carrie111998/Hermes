@@ -4959,3 +4959,73 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+def test_recursive_metadata_is_nullable_and_depth_defaults_without_backfill(tmp_path):
+    db_path = tmp_path / "legacy-kanban.db"
+    legacy = sqlite3.connect(db_path)
+    legacy.execute(
+        """
+        CREATE TABLE tasks (
+            id TEXT PRIMARY KEY,
+            title TEXT NOT NULL,
+            body TEXT,
+            assignee TEXT,
+            status TEXT NOT NULL,
+            priority INTEGER DEFAULT 0,
+            created_by TEXT,
+            created_at INTEGER NOT NULL,
+            started_at INTEGER,
+            completed_at INTEGER,
+            workspace_kind TEXT NOT NULL DEFAULT 'scratch',
+            workspace_path TEXT,
+            claim_lock TEXT,
+            claim_expires INTEGER
+        )
+        """
+    )
+    legacy.execute(
+        "INSERT INTO tasks (id, title, status, created_at) "
+        "VALUES ('legacy', 'old row', 'ready', 1)"
+    )
+    legacy.commit()
+    legacy.close()
+
+    with kb.connect(db_path) as conn:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+        }
+        row = conn.execute(
+            "SELECT depth, plan_item_index, recursion_enabled, "
+            "recursion_trigger_chars FROM tasks WHERE id = 'legacy'"
+        ).fetchone()
+        task = kb.get_task(conn, "legacy")
+
+    assert {
+        "depth",
+        "plan_item_index",
+        "recursion_enabled",
+        "recursion_trigger_chars",
+    } <= columns
+    assert tuple(row) == (None, None, None, None)
+    assert task is not None
+    assert task.depth == 1
+
+
+def test_recursive_metadata_is_written_for_new_tasks(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="recursive child",
+            depth=2,
+            plan_item_index=3,
+            recursion_enabled=True,
+            recursion_trigger_chars=400,
+        )
+        task = kb.get_task(conn, task_id)
+
+    assert task is not None
+    assert task.depth == 2
+    assert task.plan_item_index == 3
+    assert task.recursion_enabled is True
+    assert task.recursion_trigger_chars == 400

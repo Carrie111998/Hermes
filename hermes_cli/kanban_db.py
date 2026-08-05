@@ -915,6 +915,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Recursive decomposition metadata is nullable on disk so legacy rows are
+    # never backfilled. A missing or NULL depth is the root-compatible depth 1.
+    depth: int = 1
+    plan_item_index: Optional[int] = None
+    recursion_enabled: Optional[bool] = None
+    recursion_trigger_chars: Optional[int] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -998,6 +1004,28 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            depth=(
+                int(row["depth"])
+                if "depth" in keys and row["depth"] is not None
+                else 1
+            ),
+            plan_item_index=(
+                int(row["plan_item_index"])
+                if "plan_item_index" in keys and row["plan_item_index"] is not None
+                else None
+            ),
+            recursion_enabled=(
+                bool(row["recursion_enabled"])
+                if "recursion_enabled" in keys
+                and row["recursion_enabled"] is not None
+                else None
+            ),
+            recursion_trigger_chars=(
+                int(row["recursion_trigger_chars"])
+                if "recursion_trigger_chars" in keys
+                and row["recursion_trigger_chars"] is not None
+                else None
             ),
         )
 
@@ -1176,7 +1204,13 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Recursive decomposition metadata. These columns intentionally remain
+    -- nullable so opening a legacy board never rewrites old rows.
+    depth                INTEGER,
+    plan_item_index      INTEGER,
+    recursion_enabled    INTEGER,
+    recursion_trigger_chars INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2202,6 +2236,17 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
         )
+    # Recursive decomposition metadata is additive and nullable. Do not
+    # backfill depth: Task.from_row supplies the legacy-compatible value 1
+    # while the database preserves NULL for historical rows.
+    for name, definition in (
+        ("depth", "depth INTEGER"),
+        ("plan_item_index", "plan_item_index INTEGER"),
+        ("recursion_enabled", "recursion_enabled INTEGER"),
+        ("recursion_trigger_chars", "recursion_trigger_chars INTEGER"),
+    ):
+        if name not in cols:
+            _add_column_if_missing(conn, "tasks", name, definition)
     # ``idx_tasks_idempotency`` is created unconditionally below alongside
     # the other additive-column indexes — see the block after the
     # legacy-column migration. Creating it here too would be redundant.
@@ -2742,6 +2787,10 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    depth: Optional[int] = None,
+    plan_item_index: Optional[int] = None,
+    recursion_enabled: Optional[bool] = None,
+    recursion_trigger_chars: Optional[int] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2970,8 +3019,10 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        depth, plan_item_index, recursion_enabled,
+                        recursion_trigger_chars
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2994,6 +3045,14 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        int(depth) if depth is not None else None,
+                        int(plan_item_index) if plan_item_index is not None else None,
+                        int(bool(recursion_enabled))
+                        if recursion_enabled is not None else None,
+                        (
+                            int(recursion_trigger_chars)
+                            if recursion_trigger_chars is not None else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -5780,11 +5839,16 @@ def decompose_triage_task(
                 child_ws_path = root_ws_path
             else:
                 child_ws_path = None
+            depth = child.get("depth")
+            plan_item_index = child.get("plan_item_index")
+            recursion_enabled = child.get("recursion_enabled")
+            recursion_trigger_chars = child.get("recursion_trigger_chars")
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, tenant, created_at, created_by, depth, "
+                " plan_item_index, recursion_enabled, recursion_trigger_chars) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -5795,6 +5859,14 @@ def decompose_triage_task(
                     tenant,
                     now,
                     (author or "decomposer"),
+                    int(depth) if depth is not None else None,
+                    int(plan_item_index) if plan_item_index is not None else None,
+                    int(bool(recursion_enabled))
+                    if recursion_enabled is not None else None,
+                    (
+                        int(recursion_trigger_chars)
+                        if recursion_trigger_chars is not None else None
+                    ),
                 ),
             )
             _append_event(
