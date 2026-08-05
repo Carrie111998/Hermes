@@ -191,6 +191,17 @@ def _on_kanban_task_completed(*, task_id: str, **kwargs):
         return  # Run re-opened — supervisor takes over
     _update_node_card_db(task_id, "done")
     _handle_workflow_node_event(task_id, "done")
+    # A completing REVIEWER card is a VERDICT, not a workflow
+    # completion — the supervisor still has to classify PASS/FAIL and
+    # either rewind for rework, block on exhaustion, or accept. Firing
+    # the completion report here produced a FALSE "Workflow completed
+    # 2/2" notification before the verdict was classified (seen live
+    # 2026-08-05: every review-loop-exhaust-test run notified
+    # "completed 2/2" and then BLOCKED). The supervisor owns terminal
+    # notifications for review loops; this hook path only reports
+    # simple (non-review) workflows.
+    if _card_is_reviewer_node(task_id):
+        return
     # Check if this completed card is a final-layer card and notify
     _notify_workflow_complete(task_id)
 
@@ -475,6 +486,56 @@ def _reopen_completed_run(task_id: str) -> bool:
         return True
     except Exception as e:
         logger.error("Auto-resume re-open failed for %s: %s", task_id, e)
+        return False
+
+
+def _card_is_reviewer_node(task_id: str) -> bool:
+    """True when a card is a REVIEWER node for another node in its run.
+
+    Uses the durable card→run→node mapping (workflow_node_cards) plus the
+    YAML's ``reviews:`` lists. A completing reviewer card is a VERDICT —
+    the supervisor classifies it; the completion hook must NOT fire the
+    workflow-complete report (false "2/2 succeeded" before a FAIL verdict,
+    seen live 2026-08-05).
+    """
+    try:
+        from hermes_cli.kanban_db import kanban_home
+        import sqlite3
+        db_path = kanban_home() / "workflows" / "executions.db"
+        if not db_path.exists():
+            return False
+        with sqlite3.connect(str(db_path)) as conn:
+            row = conn.execute(
+                "SELECT run_id, node_id FROM workflow_node_cards WHERE card_id = ?",
+                (task_id,),
+            ).fetchone()
+            if not row:
+                return False
+            run_id, node_id = row
+            # Find the state file for this run
+            wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+            if not wf_dir:
+                wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
+            import glob as _glob
+            candidates = _glob.glob(str(Path(wf_dir) / ".engine-state" / f"*_{run_id}_state.json"))
+            if not candidates:
+                return False
+            state = json.loads(Path(candidates[0]).read_text())
+        # Check YAML reviews lists
+        wf_dir = os.environ.get("HERMES_WORKFLOW_FILES", "")
+        if not wf_dir:
+            wf_dir = str(Path(__file__).resolve().parent.parent.parent / "docs" / "fleet-pipelines")
+        wf_path = Path(wf_dir) / f"{state.get('workflow_name', '')}.yaml"
+        if wf_path.exists():
+            import yaml
+            wf = yaml.safe_load(wf_path.read_text())
+            for nid, node_cfg in (wf.get("nodes", {}) or {}).items():
+                for rev_entry in (node_cfg.get("reviews", []) or []):
+                    rev_id = rev_entry if isinstance(rev_entry, str) else rev_entry.get("review", "")
+                    if rev_id == node_id:
+                        return True
+        return False
+    except Exception:
         return False
 
 

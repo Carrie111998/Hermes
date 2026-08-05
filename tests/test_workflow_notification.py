@@ -738,3 +738,45 @@ class TestNotifyWorkflowBlocked:
 
         markers = list((fake_completions / "test-workflow").glob("*.json"))
         assert markers == [], "no marker expected without session info"
+
+
+class TestReviewerCardCompletionSilence:
+    """A completing REVIEWER card is a VERDICT, not a workflow completion.
+
+    Regression (live 2026-08-05): every review-loop-exhaust-test run
+    fired a FALSE "Workflow completed 2/2" notification the moment the
+    final-layer reviewer card went done — before the supervisor
+    classified the FAIL verdict and blocked the run. The completion hook
+    must stay silent on reviewer cards; the supervisor owns terminal
+    notifications for review loops.
+    """
+
+    def test_reviewer_card_skips_completion_notify(self, tmp_path):
+        """_on_kanban_task_completed on a reviewer card writes NO marker."""
+        from plugins.workflow import _on_kanban_task_completed
+
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            with patch("plugins.workflow._reopen_completed_run", return_value=False):
+                with patch("plugins.workflow._update_node_card_db"):
+                    with patch("plugins.workflow._handle_workflow_node_event"):
+                        with patch("plugins.workflow._card_is_reviewer_node", return_value=True):
+                            with patch("plugins.workflow._notify_workflow_complete") as mock_notify:
+                                _on_kanban_task_completed(task_id="t_qa-review")
+
+        mock_notify.assert_not_called()
+
+    def test_work_card_still_notifies(self, tmp_path):
+        """A non-reviewer (work) card completion still fires the notify."""
+        from plugins.workflow import _on_kanban_task_completed
+
+        fake_completions = tmp_path / "completions"
+        with patch("plugins.workflow._COMPLETIONS_DIR", fake_completions):
+            with patch("plugins.workflow._reopen_completed_run", return_value=False):
+                with patch("plugins.workflow._update_node_card_db"):
+                    with patch("plugins.workflow._handle_workflow_node_event"):
+                        with patch("plugins.workflow._card_is_reviewer_node", return_value=False):
+                            with patch("plugins.workflow._notify_workflow_complete") as mock_notify:
+                                _on_kanban_task_completed(task_id="t_implement")
+
+        mock_notify.assert_called_once_with("t_implement")
