@@ -1557,6 +1557,17 @@ class ShellFileOperations(FileOperations):
         # rather than an external IDE.
         self._snapshot_lsp_baseline(path)
 
+        # Prepare the exact bytes before starting the atomic-write subprocess.
+        # ``surrogateescape`` reverses backend decoding for U+DC80..U+DCFF;
+        # other lone surrogates are unsupported and must fail before a child
+        # can be left waiting for stdin.
+        try:
+            content_bytes = content.encode("utf-8", "surrogateescape")
+        except UnicodeEncodeError as exc:
+            return WriteResult(
+                error=f"Failed to write file: content cannot be encoded as UTF-8: {exc}"
+            )
+
         # Write atomically.  ``mkdir -p`` is folded into _atomic_write
         # (one fewer subprocess vs. a separate mkdir call).
         # ``dirs_created`` has always meant "parent dirs ensured" —
@@ -1589,13 +1600,12 @@ class ShellFileOperations(FileOperations):
 
         # Get bytes written — compute from the content we just wrote
         # (len of the UTF-8 encoding matches wc -c) instead of spawning a
-        # ``wc -c`` subprocess. ``surrogatepass`` matches the sha256
-        # verification below: content that flowed through a surrogateescape
-        # decode (backend output via patch_replace) may carry lone
-        # surrogates a strict encode would reject.  Encode ONCE and share
+        # ``wc -c`` subprocess. ``surrogateescape`` matches the stdin
+        # transport: content decoded from non-UTF-8 backend output may carry
+        # U+DC80..U+DCFF, which must map back to the original bytes rather than
+        # the three-byte encoding produced by ``surrogatepass``. Encode ONCE and share
         # the bytes with the sha256 block — a second full encode of a
         # multi-MB file is measurable.
-        content_bytes = content.encode('utf-8', 'surrogatepass')
         bytes_written = len(content_bytes)
 
         # Post-write content verification (cheap, one shell call): compare

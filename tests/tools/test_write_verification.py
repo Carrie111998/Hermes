@@ -27,6 +27,26 @@ class TestWriteVerification:
         r = json.loads(write_file_tool(str(f), content, task_id="t-wv"))
         assert r.get("verified") is True
 
+    def test_surrogateescape_content_round_trips_original_bytes(self, workdir):
+        from tools.environments.local import LocalEnvironment
+        from tools.file_operations import ShellFileOperations
+
+        original = b"prefix\xffsuffix\n"
+        content = original.decode("utf-8", "surrogateescape")
+        target = workdir / "surrogate.bin"
+        env = LocalEnvironment(cwd=str(workdir), timeout=5)
+
+        try:
+            result = ShellFileOperations(env).write_file(str(target), content)
+        finally:
+            env.cleanup()
+
+        assert result.error is None
+        assert result.bytes_written == len(original)
+        assert result.verified is True
+        assert target.read_bytes() == original
+        assert list(workdir.glob(".hermes-tmp.*")) == []
+
     def test_crlf_preservation_still_verifies(self, workdir):
         # Existing CRLF file: write_file converts LF content to CRLF before
         # writing; verification hashes the shim-adjusted content, so it must

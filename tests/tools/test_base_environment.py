@@ -6,7 +6,9 @@ init_session() failure handling, and the CWD marker contract.
 
 from unittest.mock import MagicMock
 
-from tools.environments.base import BaseEnvironment, _BoundedOutputCollector
+import pytest
+
+from tools.environments.base import BaseEnvironment, _BoundedOutputCollector, _pipe_stdin
 
 
 class _TestableEnv(BaseEnvironment):
@@ -20,6 +22,20 @@ class _TestableEnv(BaseEnvironment):
 
     def cleanup(self):
         pass
+
+
+class TestPipeStdin:
+    def test_invalid_surrogate_closes_pipe_and_propagates(self):
+        from io import BytesIO
+        from types import SimpleNamespace
+
+        stdin = BytesIO()
+        proc = SimpleNamespace(stdin=stdin)
+
+        with pytest.raises(UnicodeEncodeError):
+            _pipe_stdin(proc, "\ud800")
+
+        assert stdin.closed is True
 
 
 class TestBoundedOutputCollector:

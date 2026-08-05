@@ -266,7 +266,7 @@ def get_sandbox_dir() -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
+def _pipe_stdin(proc: subprocess.Popen, data: str | bytes) -> None:
     """Write *data* to proc.stdin on a daemon thread to avoid pipe-buffer deadlocks.
 
     On Windows, text-mode stdin (``text=True`` / ``encoding="utf-8"``)
@@ -283,6 +283,22 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
     produce there.
     """
 
+    # Encode before starting the daemon thread so invalid input fails in the
+    # caller instead of becoming an unhandled thread exception that leaves the
+    # child waiting forever for EOF. ``surrogateescape`` reverses the decoding
+    # used for non-UTF-8 backend output (U+DC80..U+DCFF -> original bytes).
+    target = getattr(proc.stdin, "buffer", proc.stdin)
+    try:
+        raw = data.encode("utf-8", "surrogateescape") if isinstance(data, str) else data
+    except UnicodeEncodeError:
+        # The process already exists by the time stdin is attached. Close the
+        # pipe before propagating so the child observes EOF instead of hanging.
+        try:
+            target.close()
+        except (BrokenPipeError, OSError, ValueError):
+            pass
+        raise
+
     def _write():
         try:
             # proc.stdin is a TextIOWrapper when text=True was set on the
@@ -290,12 +306,14 @@ def _pipe_stdin(proc: subprocess.Popen, data: str) -> None:
             # that bypasses newline translation.  When Popen was created
             # in byte mode, proc.stdin is already a BufferedWriter with
             # no ``.buffer`` attribute — fall back to .write() directly.
-            raw = data.encode("utf-8") if isinstance(data, str) else data
-            target = getattr(proc.stdin, "buffer", proc.stdin)
             target.write(raw)
-            target.close()
         except (BrokenPipeError, OSError):
             pass
+        finally:
+            try:
+                target.close()
+            except (BrokenPipeError, OSError, ValueError):
+                pass
 
     threading.Thread(target=_write, daemon=True).start()
 
