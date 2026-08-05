@@ -1955,6 +1955,19 @@ class HermesACPAgent(acp.Agent):
             # particular — used by the interactive sudo password cache scope).
             ctx = contextvars.copy_context()
             result = await loop.run_in_executor(_executor, ctx.run, _run_agent)
+        except asyncio.CancelledError:
+            # A client stop that tears down the stdio connection makes the ACP
+            # task supervisor cancel this in-flight request while the turn is
+            # still running. CancelledError is a BaseException, so the plain
+            # `except Exception` below never fires — without this handler the
+            # session would stay `is_running=True` forever and every later
+            # prompt would queue behind a turn that will never drain. Reset to
+            # idle and re-raise; the executor thread keeps finishing in the
+            # background and its result is dropped.
+            with state.runtime_lock:
+                state.is_running = False
+                state.current_prompt_text = ""
+            raise
         except Exception:
             logger.exception("Executor error for session %s", session_id)
             with state.runtime_lock:

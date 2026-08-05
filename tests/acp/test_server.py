@@ -446,6 +446,75 @@ class TestPrompt:
 
         assert captured.get("child") == resp.session_id
 
+    @pytest.mark.asyncio
+    async def test_cancelled_prompt_resets_is_running(self, agent, mock_manager):
+        """A cancelled in-flight prompt must not wedge the session forever.
+
+        Regression for #79196: when an ACP client stops a turn and the stdio
+        connection tears down, the ACP task supervisor cancels the in-flight
+        prompt request. ``asyncio.CancelledError`` is a BaseException, so the
+        old ``except Exception`` around the executor await never fired —
+        ``state.is_running`` stayed ``True`` and every later prompt queued
+        behind a turn that would never drain.
+        """
+        import threading
+
+        resp = await agent.new_session(cwd=".")
+        state = mock_manager.get_session(resp.session_id)
+
+        blocker = threading.Event()
+
+        def _blocking_run(*_args, **_kwargs):
+            blocker.wait(10)
+            return {"final_response": "done", "messages": []}
+
+        state.agent.run_conversation = _blocking_run
+        state.agent.model = "test-model"
+        state.agent.provider = "openrouter"
+
+        mock_conn = MagicMock(spec=acp.Client)
+        mock_conn.session_update = AsyncMock()
+        agent._conn = mock_conn
+
+        task = asyncio.create_task(
+            agent.prompt(
+                prompt=[TextContentBlock(type="text", text="hello")],
+                session_id=resp.session_id,
+            )
+        )
+        # Let the turn start and the executor thread block inside the agent run.
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 5.0
+        while not state.is_running:
+            if loop.time() > deadline:
+                raise AssertionError("prompt never entered the running state")
+            await asyncio.sleep(0.01)
+
+        # Client stop: a cancel request followed by stdio teardown, which makes
+        # the ACP task supervisor cancel the in-flight prompt handler task.
+        await agent.cancel(session_id=resp.session_id)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        # The session must be back to idle so later prompts actually run.
+        assert state.is_running is False
+        assert state.current_prompt_text == ""
+
+        # Un-block the abandoned executor thread so it finishes quietly.
+        blocker.set()
+
+        # And a follow-up prompt must run normally instead of queueing forever.
+        state.agent.run_conversation = (
+            lambda *_a, **_k: {"final_response": "ok", "messages": []}
+        )
+        resp2 = await agent.prompt(
+            prompt=[TextContentBlock(type="text", text="again")],
+            session_id=resp.session_id,
+        )
+        assert resp2.stop_reason == "end_turn"
+        assert state.is_running is False
+
 
 
 
