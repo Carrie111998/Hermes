@@ -1195,15 +1195,16 @@ def _jsonable(value: Any) -> Any:
     if callable(model_dump):
         try:
             return _jsonable(value.model_dump(mode="json"))
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Relay _jsonable model_dump failed: %s", e)
     try:
         attributes = {
             str(key): item
             for key, item in vars(value).items()
             if not str(key).startswith("_")
         }
-    except (TypeError, AttributeError):
+    except (TypeError, AttributeError) as e:
+        logger.debug("Relay _jsonable vars() fallback failed: %s", e)
         return str(value)
     return _jsonable(attributes) if attributes else str(value)
 
