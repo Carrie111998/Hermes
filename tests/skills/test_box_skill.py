@@ -13,6 +13,11 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SKILL_DIR = REPO_ROOT / "skills" / "productivity" / "box"
 SKILL_MD = SKILL_DIR / "SKILL.md"
 TEMPLATES_DIR = SKILL_DIR / "templates"
+CCG_ENV_VARS = {
+    "BOX_CLIENT_ID": False,
+    "BOX_CLIENT_SECRET": True,
+    "BOX_ENTERPRISE_ID": False,
+}
 
 
 def _parse_frontmatter(content: str) -> dict:
@@ -66,12 +71,7 @@ def test_box_command_is_declared_without_universal_ccg_secret_gate(frontmatter: 
 def test_ccg_credentials_remain_optional_setup_entries():
     from hermes_cli.config import OPTIONAL_ENV_VARS
 
-    expected = {
-        "BOX_CLIENT_ID": False,
-        "BOX_CLIENT_SECRET": True,
-        "BOX_ENTERPRISE_ID": False,
-    }
-    for name, is_secret in expected.items():
+    for name, is_secret in CCG_ENV_VARS.items():
         entry = OPTIONAL_ENV_VARS[name]
         assert entry["category"] == "skill"
         assert entry["password"] is is_secret
@@ -100,3 +100,17 @@ def test_ccg_template_is_valid_and_matches_registered_credentials():
     assert settings.get("clientID") == "YOUR_BOX_CLIENT_ID"
     assert settings.get("clientSecret") == "YOUR_BOX_CLIENT_SECRET"
     assert data.get("enterpriseID") == "YOUR_BOX_ENTERPRISE_ID"
+
+
+def test_ccg_environment_contract_is_wired_through_all_config_surfaces():
+    env_example = (REPO_ROOT / ".env.example").read_text(encoding="utf-8")
+    example_keys = set(re.findall(r"^# (BOX_[A-Z_]+)=", env_example, re.MULTILINE))
+    template = json.loads((TEMPLATES_DIR / "ccg-config.json.example").read_text(encoding="utf-8"))
+    template_values = {
+        template["boxAppSettings"]["clientID"],
+        template["boxAppSettings"]["clientSecret"],
+        template["enterpriseID"],
+    }
+
+    assert set(CCG_ENV_VARS) <= example_keys
+    assert template_values == {f"YOUR_{name}" for name in CCG_ENV_VARS}

@@ -28,21 +28,7 @@ box files:get <RETURNED_FILE_ID> --json --fields id,name,type,parent
 
 ## Direct REST with CCG
 
-Keep secrets out of shell history and command output. Prefer the CLI or SDK for token refresh; this is a fallback pattern only.
-
-The following `curl` example uses POSIX shell syntax. On Windows PowerShell, prefer the Box CLI or SDK instead of translating this secret-bearing request manually.
-
-```bash
-curl -sS -X POST https://api.box.com/oauth2/token \
-  -H "Content-Type: application/x-www-form-urlencoded" \
-  -d "grant_type=client_credentials" \
-  -d "client_id=${BOX_CLIENT_ID}" \
-  -d "client_secret=${BOX_CLIENT_SECRET}" \
-  -d "box_subject_type=enterprise" \
-  -d "box_subject_id=${BOX_ENTERPRISE_ID}"
-```
-
-Pass the returned access token only through a protected process boundary. Never echo, log, or commit it.
+For normal CCG work, do not mint a Service Account token with `box_subject_type=enterprise`: that bypasses Hermes's dedicated App User permission boundary. Prefer `box request`, which uses the selected `hermes-agent` environment. If the CLI is unavailable, use an SDK client configured with the App User ID as shown in [SDK development](sdk-development.md). Reserve Service Account tokens for approved provisioning actions only. Never echo, log, or commit credentials or tokens.
 
 ## Sources
 

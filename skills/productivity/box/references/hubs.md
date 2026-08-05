@@ -18,13 +18,15 @@ For a known Hub URL or ID, run `box hubs:get <HUB_ID>` directly even if the list
 
 ## Ask questions across a Hub
 
-Use one Hub item and `single_item_qa`. Request citations so Hermes can report the source files behind an answer. The CLI `ai:ask` command supports the Hub item type, but use `box request` when citations are required because it exposes the full API request:
+Use one Hub item and `single_item_qa`. Request citations so Hermes can report the source files behind an answer. Use `box request` (or the SDK) for Hub Q&A rather than relying on `box ai:ask`, whose installed CLI versions may not accept Hub item types:
 
 ```bash
 box request /ai/ask -X POST \
   --body '{"mode":"single_item_qa","items":[{"id":"<HUB_ID>","type":"hubs"}],"prompt":"Summarize the approved renewal terms and cite each source.","include_citations":true}' \
   --json
 ```
+
+If a CCG App User AI request has shown an actor mismatch, append `--as-user <APP_USER_ID>` to this `box request` command as described in [Search and AI](search-and-ai.md).
 
 State the Hub ID and navigation link with the answer. List cited file IDs, names, and file links when Box returns citations. Treat an answer as bounded by indexed, accessible Hub content; do not claim it searched files that have not indexed or that the actor cannot access.
 
@@ -43,11 +45,13 @@ Adding an item curates a reference; it does not move the underlying file or fold
 
 ```bash
 box hubs:items:manage <HUB_ID> \
-  --add id=<FILE_ID>,type=file,parent-id=<ITEM_LIST_BLOCK_ID> --json
+  --add id=<FILE_ID>,type=file --json
 box hubs:items:manage <HUB_ID> \
   --add id=<FOLDER_ID>,type=folder --json
 box hubs:items <HUB_ID> --max-items 100 --json
 ```
+
+Without `parent-id`, the CLI adds the item to the first Item List block. To target a specific Item List block, first list pages with `box hubs:document:pages <HUB_ID> --json`, retrieve blocks with `box hubs:document:blocks <HUB_ID> <PAGE_ID> --json`, then pass the returned Item List block ID as `parent-id`.
 
 Confirm before enabling or disabling Hub AI, deleting or copying a Hub, or changing shared access. Verify each change with `box hubs:get`, `box hubs:items`, or `box hubs:collaborations`:
 

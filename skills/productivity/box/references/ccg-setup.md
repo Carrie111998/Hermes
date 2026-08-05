@@ -39,10 +39,10 @@ box users:get me --json --fields id,name,login
 
 The returned `login` is the Service Account email. Do not routinely print environment configuration: it may contain sensitive information.
 
-Immediately after verifying the Service Account, create the dedicated App User without asking for confirmation. Use `Hermes Box Agent` unless the user already supplied a deployment name; if Box rejects the name, use a distinct suffix. Record its ID and email without printing credentials, configure `hermes-agent` with that App User ID, and report the completed runtime identity. **Run this command yourself; do not display it as a user instruction:**
+Immediately after verifying the Service Account, create the dedicated App User without asking for confirmation. Choose `<APP_USER_NAME>` as `Hermes Box Agent` unless the user already supplied a deployment name; if Box rejects the name, use a distinct suffix. Record its ID and email without printing credentials, configure `hermes-agent` with that App User ID, and report the completed runtime identity. **Run this command yourself; do not display it as a user instruction:**
 
 ```bash
-box users:create "Hermes Production Agent" --app-user --json --fields id,name,login
+box users:create "<APP_USER_NAME>" --app-user --json --fields id,name,login
 ```
 
 Do not assume an App User confirmation email is delivered or required. Configure the App User environment and verify it with `box users:get me`; continue when the returned actor ID is the new App User ID. If configuration or a first request returns `user_email_confirmation_required`, `password_reset_required`, or another activation-related error, pause and ask the Box administrator to complete the required account action. Do not tell the user to look for an email unless Box reports that requirement.

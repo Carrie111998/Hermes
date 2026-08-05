@@ -22,7 +22,7 @@ OAuth follows the user's permissions and app scopes. For CCG, use the Service Ac
 - [Node SDK](https://github.com/box/box-node-sdk)
 - [Other Box SDKs](https://developer.box.com/guides/tooling/sdks/)
 
-Use the SDK matching the project language. Store credentials in the project's approved secret mechanism, not source control.
+Use the SDK matching the project language. Store credentials in the project's approved secret mechanism, not source control. For CCG, store the provisioned App User ID as non-secret application configuration (for example, `BOX_APP_USER_ID`); do not use the Service Account's enterprise ID for normal application work.
 
 ## Python CCG client
 
@@ -35,7 +35,7 @@ auth = BoxCCGAuth(
     CCGConfig(
         client_id=os.environ["BOX_CLIENT_ID"],
         client_secret=os.environ["BOX_CLIENT_SECRET"],
-        enterprise_id=os.environ["BOX_ENTERPRISE_ID"],
+        user_id=os.environ["BOX_APP_USER_ID"],
     )
 )
 client = BoxClient(auth)
