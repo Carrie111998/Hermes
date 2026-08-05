@@ -72,11 +72,7 @@ def classify_failure_scope(reason: Optional[str]) -> FailureScope:
     return _REASON_SCOPES.get((reason or "").strip().lower(), FailureScope.MODEL)
 
 
-def _norm_provider(value: Optional[str]) -> str:
-    return (value or "").strip().lower()
-
-
-def _norm_model(value: Optional[str]) -> str:
+def _norm_label(value: Optional[str]) -> str:
     return (value or "").strip().lower()
 
 
@@ -105,8 +101,8 @@ class BackendIdentity:
         base_url: Optional[str] = None,
     ) -> "BackendIdentity":
         return cls(
-            provider=_norm_provider(provider),
-            model=_norm_model(model),
+            provider=_norm_label(provider),
+            model=_norm_label(model),
             base_url=_norm_base_url(base_url),
         )
 

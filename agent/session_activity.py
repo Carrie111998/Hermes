@@ -89,7 +89,7 @@ def build_activity_snapshot(
     clock = float(now if now is not None else _time.time())
     desc = bound_activity_description(last_activity_description)
     prov = normalize_activity_provenance(last_activity_provenance)
-    elapsed = round(clock - when, 1) if when is not None else None
+    elapsed = round(max(0.0, clock - when), 1) if when is not None else None
     snap: dict[str, Any] = {
         "last_activity_at": when,
         "last_activity_description": desc,
