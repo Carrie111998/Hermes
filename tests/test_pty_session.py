@@ -232,6 +232,92 @@ async def test_eof_during_replay_closes_socket_and_prevents_ghost_attachment():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cleanup_mode", ["direct", "registry"])
+async def test_explicit_cleanup_adopts_blocked_eof_socket_close(cleanup_mode):
+    close_started = asyncio.Event()
+    release_close = asyncio.Event()
+
+    class BlockingCloseWS(FakeWS):
+        def __init__(self):
+            super().__init__()
+            self.close_cancelled = False
+
+        async def close(self, code=1000, reason=""):
+            close_started.set()
+            try:
+                await release_close.wait()
+            except asyncio.CancelledError:
+                self.close_cancelled = True
+                raise
+            self.close_code = code
+
+    if cleanup_mode == "registry":
+        reg = make_registry()
+        session, _ = await reg.attach_or_spawn(
+            "token", spawn=lambda: FakeBridge([None])
+        )
+    else:
+        from hermes_cli.pty_session import PtySession
+
+        reg = None
+        session = PtySession(
+            "token", FakeBridge([None]), buffer_cap=1024, read_timeout=0.01
+        )
+
+    ws = BlockingCloseWS()
+    await session.attach(ws)
+    await session.start()
+    await close_started.wait()
+    if reg is None:
+        cleanup_task = asyncio.create_task(session.close())
+    else:
+        cleanup_task = asyncio.create_task(reg.terminate_attach_token("token"))
+    await asyncio.sleep(0)
+    returned_before_socket_close = cleanup_task.done()
+    release_close.set()
+    await cleanup_task
+
+    assert returned_before_socket_close is False
+    assert ws.close_cancelled is False
+    assert ws.close_code == 4410
+    assert session.bridge.closed is True
+
+
+@pytest.mark.asyncio
+async def test_cancelled_drain_retrieves_late_executor_read_failure():
+    from hermes_cli.pty_session import PtySession
+
+    read_started = threading.Event()
+    release_read = threading.Event()
+    contexts = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: contexts.append(context))
+
+    class LateFailingReadBridge(FakeBridge):
+        def read(self, timeout):
+            read_started.set()
+            release_read.wait(timeout=2)
+            raise RuntimeError("late read failure")
+
+    session = PtySession(
+        "k", LateFailingReadBridge([]), buffer_cap=1024, read_timeout=0.01
+    )
+    try:
+        await session.start()
+        assert await asyncio.to_thread(read_started.wait, 1)
+        close_task = asyncio.create_task(session.close())
+        await asyncio.sleep(0)
+        release_read.set()
+        await close_task
+        await asyncio.sleep(0)
+    finally:
+        loop.set_exception_handler(previous_handler)
+
+    assert contexts == []
+
+
+@pytest.mark.asyncio
 async def test_read_failure_fails_closed_and_cleans_bridge():
     from hermes_cli.pty_session import PtySession
 

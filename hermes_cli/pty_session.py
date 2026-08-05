@@ -91,6 +91,25 @@ class PtySession:
         self._output_lock = asyncio.Lock()
         self._closing = False
         self._close_task: Optional[asyncio.Task[None]] = None
+        self._socket_close_tasks: set[asyncio.Task[None]] = set()
+
+    async def _close_socket(self, ws, code: int) -> None:
+        try:
+            await ws.close(code=code)
+        except Exception:
+            pass
+
+    def _begin_socket_close(self, ws, code: int) -> asyncio.Task[None]:
+        task = asyncio.create_task(self._close_socket(ws, code))
+        self._socket_close_tasks.add(task)
+
+        def done(completed: asyncio.Task[None]) -> None:
+            self._socket_close_tasks.discard(completed)
+            if not completed.cancelled():
+                completed.exception()
+
+        task.add_done_callback(done)
+        return task
 
     async def start(self) -> None:
         self._drain_task = asyncio.create_task(self._drain())
@@ -148,10 +167,7 @@ class PtySession:
             self.attached = False
             self.last_detached_at = time.monotonic()
             for ws in sockets:
-                try:
-                    await ws.close(code=WS_CLOSE_PROCESS_EXITED)
-                except Exception:
-                    pass
+                self._begin_socket_close(ws, WS_CLOSE_PROCESS_EXITED)
             self.begin_close()
 
     async def attach(self, ws) -> None:
@@ -159,13 +175,23 @@ class PtySession:
         # delivered before bytes read concurrently from the live PTY.
         async with self._output_lock:
             if self._process_exited:
+                self._attaching_ws = ws
+                close_task = None
                 try:
                     snap = self.buffer.snapshot()
                     if snap:
                         await ws.send_bytes(snap)
-                    await ws.close(code=WS_CLOSE_PROCESS_EXITED)
-                except Exception:
-                    pass
+                    close_task = self._begin_socket_close(
+                        ws, WS_CLOSE_PROCESS_EXITED
+                    )
+                    await _await_owned(close_task)
+                except BaseException:
+                    if close_task is None:
+                        self._begin_socket_close(ws, WS_CLOSE_PROCESS_EXITED)
+                    raise
+                finally:
+                    if self._attaching_ws is ws:
+                        self._attaching_ws = None
                 return
             if self._closing:
                 raise SessionTerminated(self.key)
@@ -207,12 +233,7 @@ class PtySession:
         self.attached = False
         self.last_detached_at = time.monotonic()
 
-    async def _finish_close(self, sockets) -> None:
-        for ws in sockets:
-            try:
-                await ws.close(code=WS_CLOSE_TERMINATED)
-            except Exception:
-                pass
+    async def _finish_close(self, socket_tasks) -> None:
         if self._drain_task is not None:
             self._drain_task.cancel()
             try:
@@ -221,10 +242,15 @@ class PtySession:
                 pass
         try:
             # bridge.close() joins the child — blocking; keep it off the
-            # event loop (#53227).
+            # event loop (#53227). This remains independent of socket closure.
             await asyncio.to_thread(self.bridge.close)
         except Exception:
             pass
+        if socket_tasks:
+            done, _ = await asyncio.wait(socket_tasks)
+            for task in done:
+                if not task.cancelled():
+                    task.exception()
 
     def begin_close(self) -> asyncio.Task[None]:
         """Atomically start idempotent cleanup before any cancellation point."""
@@ -236,10 +262,13 @@ class PtySession:
             for ws in (self._ws, self._attaching_ws):
                 if ws is not None and all(ws is not item for item in sockets):
                     sockets.append(ws)
+            for ws in sockets:
+                self._begin_socket_close(ws, WS_CLOSE_TERMINATED)
+            socket_tasks = list(self._socket_close_tasks)
             self._ws = None
             self._attaching_ws = None
             self.attached = False
-            task = asyncio.create_task(self._finish_close(sockets))
+            task = asyncio.create_task(self._finish_close(socket_tasks))
             self._close_task = task
         return task
 
