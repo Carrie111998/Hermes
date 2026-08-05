@@ -43,6 +43,25 @@ box ai:text-gen --items=id=<FILE_ID>,type=file \
 
 Do not use a Hub for metadata extraction or text generation. For semantic Q&A across a reusable curated collection, read [Box Hubs](hubs.md). For a one-off request that names more than 25 files, narrow the candidate set before proposing a Hub.
 
+## Diagnose Box AI access for a CCG App User
+
+A file that succeeds with `files:get` or search can still fail through Box AI when the Platform App lacks AI access. If the App User can preview or download a file but `ai:ask` returns `404 not_found`, do not misdiagnose its collaboration as missing. First verify the current actor and the file permissions:
+
+```bash
+box users:get me --json --fields id,name,login
+box files:get <FILE_ID> --json --fields id,name,permissions
+```
+
+For a CCG environment with a persistent default App User, retry the failing Box AI request with an explicit `--as-user <APP_USER_ID>` flag. The CLI's AI command path can otherwise issue the request as the underlying Service Account even when ordinary commands inherit the default App User. Apply this fallback to `box ai:*` calls only, not ordinary file, folder, or collaboration operations:
+
+```bash
+box ai:ask --items=id=<FILE_ID>,type=file \
+  --prompt "Summarize the renewal obligations and dates." \
+  --as-user <APP_USER_ID> --json
+```
+
+A successful explicit call proves the App User collaboration and Box AI entitlement are valid. If it still fails, verify **Configuration → Required Access Scopes → Content Actions → Manage AI** (`ai.readwrite`), have an administrator confirm that Box AI API access is enabled for the enterprise, reauthorize the app after changing the scope, obtain a fresh CCG token, and retry one file before a batch.
+
 ## Extract and persist file metadata
 
 Treat a request to extract metadata as a structured Box metadata workflow, not a request to merely show an AI response. Unless the user asks to preview only, persist values only when one template can represent every requested field with the correct types.

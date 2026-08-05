@@ -200,20 +200,20 @@ def test_box_skill_selects_auth_by_runtime_topology_and_avoids_default_home_assu
     assert "uses POSIX shell syntax" in rest
 
 
-def test_ccg_selects_runtime_identity_by_shared_or_isolated_deployment():
-    """Choose a CCG actor from the Hermes deployment's permission boundary."""
+def test_ccg_always_runs_hermes_as_a_dedicated_app_user():
+    """CCG provisions an App User rather than using the Service Account at runtime."""
     skill = SKILL_MD.read_text(encoding="utf-8")
     ccg = (SKILL_DIR / "references" / "ccg-setup.md").read_text(encoding="utf-8")
 
-    assert "shared Service Account or dedicated App User" in skill
-    assert "One centrally managed Hermes agent serves a shared Slack channel" in ccg
-    assert "one shared Box permission set" in ccg
-    assert "One person uses a Hermes profile" in ccg
-    assert "one App User per profile or isolation boundary" in ccg
-    assert "does not apply each Slack caller's personal Box permissions" in ccg
+    assert "Hermes runs as a dedicated App User" in skill
+    assert "Always configure normal Hermes work as a dedicated App User" in ccg
+    assert "it is not Hermes's runtime actor" in ccg
+    assert "one App User per Hermes deployment or isolation boundary" in ccg
+    assert "current local computer user's signed-in Box browser session" in ccg
+    assert "If they decline, give this path with clickable links" in ccg
     assert "**App Details** sidebar" in ccg
     assert "**App Access Only**" in ccg
-    assert "For an App User runtime, enable **Manage users**" in ccg
+    assert "enable **Manage users** and **Generate User Access Tokens**" in ccg
     assert "Manage users is required to create the App User" in ccg
     assert "**Generate User Access Tokens**" in ccg
     assert 'box users:create "Hermes Production Agent" --app-user' in ccg
@@ -224,17 +224,30 @@ def test_ccg_selects_runtime_identity_by_shared_or_isolated_deployment():
     assert "Do not tell the user to look for an email unless Box reports that requirement" in ccg
     assert "--ccg-user <APP_USER_ID> --name hermes-agent --set-as-current" in ccg
     assert "returned `id` is exactly `<APP_USER_ID>`" in ccg
-    assert "<SERVICE_ENVIRONMENT_NAME>" in ccg
-    assert "Shared agent: use the Service Account directly" in ccg
-    assert "Isolated profile: provision an App User" in ccg
-    assert "<RUNTIME_IDENTITY_EMAIL>" in ccg
-    assert "Ask which specific file, folder, or Hub" in ccg
+    assert "--name hermes-provisioner --set-as-current" in ccg
+    assert "Shared agent: use the Service Account directly" not in ccg
+    assert "<RUNTIME_IDENTITY_EMAIL>" not in ccg
+    assert "Ask which specific file, folder, or Hub the App User should access" in ccg
     assert "Do not choose a top-level folder" in ccg
     assert "If the user prefers a manual invite" in ccg
     assert "only when the current actor is authorized to manage collaborators" in ccg
     assert "do not retry with a broader identity" in ccg
     assert "box collaborations:create <FILE_ID> file" in ccg
     assert "box hubs:collaborations:create <HUB_ID>" in ccg
+    assert "write only the required assignments" in ccg
+    assert "no prose, comments, code fences, placeholders, or other text" in ccg
+
+
+def test_ccg_app_user_box_ai_access_has_a_narrow_actor_fallback():
+    """Diagnose the CLI AI actor path before treating a CCG file collaboration as missing."""
+    ai = (SKILL_DIR / "references" / "search-and-ai.md").read_text(encoding="utf-8")
+
+    assert "`ai:ask` returns `404 not_found`" in ai
+    assert "box files:get <FILE_ID> --json --fields id,name,permissions" in ai
+    assert "--as-user <APP_USER_ID>" in ai
+    assert "Apply this fallback to `box ai:*` calls only" in ai
+    assert "Manage AI** (`ai.readwrite`)" in ai
+    assert "obtain a fresh CCG token" in ai
 
 
 def test_shared_resource_access_uses_type_specific_discovery_not_root_listing():
