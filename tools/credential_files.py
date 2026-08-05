@@ -298,30 +298,49 @@ def _refresh_skills_copy(skills_dir: Path, safe_dir: Path) -> None:
     """
     import shutil
 
-    # Build the set of relative paths that should exist (non-symlink entries).
-    expected: set = set()
+    # Build the map of relative paths that should exist (non-symlink entries)
+    # together with the kind (file vs directory) each must be.  Tracking the
+    # kind matters: if a source entry changes from a file to a directory (or
+    # vice versa) between calls, the old *safe_dir* entry has the wrong kind
+    # and must be removed before we copy — otherwise ``mkdir`` raises
+    # ``FileExistsError`` (file -> dir) or we copy into a stale directory
+    # (dir -> file).
+    expected: Dict[str, str] = {}
     for item in skills_dir.rglob("*"):
         if item.is_symlink():
             continue
-        expected.add(item.relative_to(skills_dir))
+        rel = str(item.relative_to(skills_dir))
+        expected[rel] = "dir" if item.is_dir() else "file"
 
-    # Remove stale entries that no longer correspond to anything in the source.
+    # Remove stale or incompatible destination entries.  We snapshot the
+    # listing first because removing entries mid-iteration can skip items.
     if safe_dir.exists():
-        for existing in safe_dir.rglob("*"):
+        for existing in list(safe_dir.rglob("*")):
             try:
-                rel = existing.relative_to(safe_dir)
+                rel = str(existing.relative_to(safe_dir))
             except ValueError:
                 continue
-            if rel in expected:
-                continue
-            try:
+            expected_kind = expected.get(rel)
+            if expected_kind is None:
+                # Truly stale — no matching source entry.
                 if existing.is_dir() and not existing.is_symlink():
-                    # Leave empty dirs alone — they get cleaned if they become
-                    # empty via the rmdir pass below.
-                    continue
-                existing.unlink()
-            except FileNotFoundError:
-                pass
+                    shutil.rmtree(existing, ignore_errors=True)
+                else:
+                    try:
+                        existing.unlink()
+                    except FileNotFoundError:
+                        pass
+                continue
+            # Same path still exists in the source, but its kind changed.
+            if existing.is_dir() and not existing.is_symlink():
+                if expected_kind != "dir":
+                    shutil.rmtree(existing, ignore_errors=True)
+            elif existing.is_file():
+                if expected_kind != "file":
+                    try:
+                        existing.unlink()
+                    except FileNotFoundError:
+                        pass
 
     # Now copy the current contents.
     for item in skills_dir.rglob("*"):

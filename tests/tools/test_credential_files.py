@@ -238,6 +238,73 @@ class TestSkillsDirectoryMount:
         # Symlink remains excluded.
         assert not (safe_path / "evil_link").exists()
 
+    def test_mount_source_handles_file_to_dir_transition(self, tmp_path):
+        """A source path changing from a file to a directory must not raise.
+
+        Regression: `expected` used to track only the path, not its kind.  If
+        ``foo`` went from a file to a directory, the old ``safe_dir/foo`` file
+        was retained and ``target.mkdir()`` raised ``FileExistsError``.
+        """
+        hermes_home = tmp_path / ".hermes"
+        skills_dir = hermes_home / "skills"
+        skills_dir.mkdir(parents=True)
+        # Force the symlink-sanitized path so we exercise the copy refresh.
+        secret = tmp_path / "secret.txt"
+        secret.write_text("TOP SECRET")
+        (skills_dir / "evil_link").symlink_to(secret)
+        # Start with a file at the transition path.
+        (skills_dir / "foo").write_text("file content")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            first = get_skills_directory_mount()[0]["host_path"]
+            safe_path = Path(first)
+            assert (safe_path / "foo").is_file()
+            assert (safe_path / "foo").read_text() == "file content"
+
+            # Replace the source file with a directory of the same name.
+            (skills_dir / "foo").unlink()
+            (skills_dir / "foo").mkdir()
+            (skills_dir / "foo" / "inner.md").write_text("inner content")
+            second = get_skills_directory_mount()[0]["host_path"]
+
+        # Path stays stable and the transition is handled cleanly.
+        assert first == second
+        assert (safe_path / "foo").is_dir()
+        assert (safe_path / "foo" / "inner.md").read_text() == "inner content"
+
+    def test_mount_source_handles_dir_to_file_transition(self, tmp_path):
+        """A source path changing from a directory to a file must copy correctly.
+
+        Regression: the reverse transition — ``foo`` going from a directory to
+        a file — used to copy into the stale ``safe_dir/foo`` directory instead
+        of replacing it with a file.
+        """
+        hermes_home = tmp_path / ".hermes"
+        skills_dir = hermes_home / "skills"
+        skills_dir.mkdir(parents=True)
+        secret = tmp_path / "secret.txt"
+        secret.write_text("TOP SECRET")
+        (skills_dir / "evil_link").symlink_to(secret)
+        # Start with a directory at the transition path.
+        (skills_dir / "foo").mkdir()
+        (skills_dir / "foo" / "old.md").write_text("old inner content")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(hermes_home)}):
+            first = get_skills_directory_mount()[0]["host_path"]
+            safe_path = Path(first)
+            assert (safe_path / "foo").is_dir()
+
+            # Replace the source directory with a file of the same name.
+            (skills_dir / "foo" / "old.md").unlink()
+            (skills_dir / "foo").rmdir()
+            (skills_dir / "foo").write_text("now a file")
+            second = get_skills_directory_mount()[0]["host_path"]
+
+        # Path stays stable and the stale directory was replaced by a file.
+        assert first == second
+        assert (safe_path / "foo").is_file()
+        assert (safe_path / "foo").read_text() == "now a file"
+
 
 class TestIterSkillsFiles:
     def test_returns_files_skipping_symlinks(self, tmp_path):
