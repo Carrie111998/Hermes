@@ -17,7 +17,7 @@ transport:
   command: "npx"
   args:
     - "-y"
-    - "apple-numbers-mcp@1.1.12"
+    - "apple-numbers-mcp@1.1.13"
 
 # Reads/writes .numbers files via a numbers-parser Python sidecar plus
 # AppleScript for formatting/formulas; no credentials.
