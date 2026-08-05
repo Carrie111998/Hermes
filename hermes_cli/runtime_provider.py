@@ -348,6 +348,45 @@ def _provider_supports_explicit_api_mode(provider: Optional[str], configured_pro
     return normalized_configured == normalized_provider
 
 
+def _resolve_generic_api_mode(
+    provider: Optional[str],
+    base_url: str,
+    model_cfg: Dict[str, Any],
+    *,
+    model: str = "",
+) -> str:
+    """Resolve the wire protocol for a provider that has no bespoke rule.
+
+    Resolution order, highest priority first:
+
+    1. **Host-mandated protocol.** Endpoints like DeepSeek's ``/anthropic``
+       and Kimi's ``/coding`` accept exactly ONE wire; a persisted
+       ``api_mode`` must never redirect them to a protocol they don't
+       speak.  ``model_switch.switch_model`` already applies this
+       precedence — every runtime resolver mirrors it here.
+    2. **A persisted ``model.api_mode``**, but only when the config block
+       carrying it describes THIS provider.  Otherwise it is a stale value
+       left behind by an earlier ``/model`` switch to a different provider.
+    3. **URL-derived detection**, then the transport the provider overlay
+       itself declares, then the ``chat_completions`` default — all via
+       ``_fallback_api_mode``.
+
+    Shared by every resolver path (explicit credentials, the pool-entry
+    route, and the ordinary configured-provider API-key route) so the
+    ordering can't drift between them.
+    """
+    from hermes_cli.providers import host_mandated_api_mode
+
+    mandated_mode = host_mandated_api_mode(base_url)
+    if mandated_mode is not None:
+        return mandated_mode
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
+        return configured_mode
+    return _fallback_api_mode(provider or "", base_url, model)
+
+
 def _copilot_runtime_api_mode(
     model_cfg: Dict[str, Any],
     api_key: str,
@@ -537,22 +576,23 @@ def _resolve_runtime_from_pool_entry(
             cfg_base_url = str(model_cfg.get("base_url") or "").strip().rstrip("/")
             if cfg_base_url:
                 base_url = cfg_base_url
-        configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
         if provider in {"opencode-zen", "opencode-go"}:
             # Re-derive api_mode from the effective model rather than the
             # persisted api_mode: the opencode providers serve both
             # anthropic_messages and chat_completions models, so the previous
             # session's mode must not leak across /model switches.
-            # Refs #16878.
+            # Refs #16878.  This model-derived mode intentionally outranks the
+            # host-mandated one below — normalize_opencode_base_url() rewrites
+            # the /v1 suffix from it, so the two must agree.
             from hermes_cli.models import opencode_model_api_mode
             api_mode = opencode_model_api_mode(provider, effective_model)
-        elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-            api_mode = configured_mode
         else:
-            # URL detection first (Anthropic /anthropic suffix, Kimi /coding,
-            # official OpenAI hosts → codex_responses, api.x.ai →
-            # codex_responses), then the provider's own declared transport.
-            api_mode = _fallback_api_mode(provider, base_url, effective_model)
+            # Shared ordering: host-mandated protocol first, then a persisted
+            # api_mode belonging to this same provider, then URL detection
+            # and the provider's own declared transport.
+            api_mode = _resolve_generic_api_mode(
+                provider, base_url, model_cfg, model=effective_model
+            )
 
     # OpenCode base URLs end with /v1 for OpenAI-compatible models, but the
     # Anthropic SDK prepends its own /v1/messages to the base_url.  Normalize
@@ -1624,16 +1664,12 @@ def _resolve_explicit_runtime(
         elif provider == "xai":
             api_mode = "codex_responses"
         else:
-            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
-            configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-                api_mode = configured_mode
-            else:
-                # URL detection first, then the provider's declared transport
-                # (fixes regional OpenAI hosts and other non-chat overlays).
-                api_mode = _fallback_api_mode(
-                    provider, base_url, target_model or model_cfg.get("default", "")
-                )
+            api_mode = _resolve_generic_api_mode(
+                provider,
+                base_url,
+                model_cfg,
+                model=target_model or model_cfg.get("default", ""),
+            )
 
         return {
             "provider": provider,
@@ -2205,31 +2241,30 @@ def resolve_runtime_provider(
             )
         elif provider == "xai":
             api_mode = "codex_responses"
+        elif provider in {"opencode-zen", "opencode-go"}:
+            # opencode-zen/go must always re-derive api_mode from the
+            # target model (not the stale persisted api_mode), because
+            # the same provider serves both anthropic_messages
+            # (e.g. minimax-m2.7) and chat_completions (e.g.
+            # deepseek-v4-flash) and switching models via /model would
+            # otherwise carry the previous mode forward, stripping /v1
+            # from base_url for chat_completions models and 404'ing.
+            # Refs #16878.  This model-derived mode intentionally outranks
+            # the host-mandated one below: the /v1 suffix is normalized from
+            # it further down, so the two must agree.
+            from hermes_cli.models import opencode_model_api_mode
+            _effective = target_model or model_cfg.get("default", "")
+            api_mode = opencode_model_api_mode(provider, _effective)
         else:
-            configured_provider = str(model_cfg.get("provider") or "").strip().lower()
-            # Only honor persisted api_mode when it belongs to the same provider family.
-            configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
-            if provider in {"opencode-zen", "opencode-go"}:
-                # opencode-zen/go must always re-derive api_mode from the
-                # target model (not the stale persisted api_mode), because
-                # the same provider serves both anthropic_messages
-                # (e.g. minimax-m2.7) and chat_completions (e.g.
-                # deepseek-v4-flash) and switching models via /model would
-                # otherwise carry the previous mode forward, stripping /v1
-                # from base_url for chat_completions models and 404'ing.
-                # Refs #16878.
-                from hermes_cli.models import opencode_model_api_mode
-                _effective = target_model or model_cfg.get("default", "")
-                api_mode = opencode_model_api_mode(provider, _effective)
-            elif configured_mode and _provider_supports_explicit_api_mode(provider, configured_provider):
-                api_mode = configured_mode
-            else:
-                # URL detection first (e.g. https://api.minimax.io/anthropic,
-                # official OpenAI hosts → codex_responses, api.x.ai →
-                # codex_responses), then the provider's declared transport.
-                api_mode = _fallback_api_mode(
-                    provider, base_url, target_model or model_cfg.get("default", "")
-                )
+            # Shared ordering: host-mandated protocol first, then a persisted
+            # api_mode belonging to this same provider, then URL detection
+            # and the provider's own declared transport.
+            api_mode = _resolve_generic_api_mode(
+                provider,
+                base_url,
+                model_cfg,
+                model=target_model or model_cfg.get("default", ""),
+            )
         # Normalize the /v1 suffix for OpenCode by API mode (see comment above).
         if provider in {"opencode-zen", "opencode-go"}:
             from hermes_cli.models import normalize_opencode_base_url
