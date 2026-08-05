@@ -2618,6 +2618,7 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
         return None
     current = word_start
     prefix_words = 0
+    skip_next = False
     while prefix_words < 12:
         word_start, word_end, word = _read_shell_word(command, current)
         if word_start == word_end:
@@ -2715,7 +2716,9 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             prefix_words += 1
             continue
         return word_start
-    word_start, word_end, _ = _read_shell_word(command, current)
+    word_start, word_end, word = _read_shell_word(command, current)
+    if skip_next or _deobfuscate_shell_word_for_detection(word).startswith("-"):
+        return -1
     return word_start if word_start < word_end else current
 
 
@@ -2730,6 +2733,8 @@ def _mark_unwrapped_executables(command: str) -> str:
     offsets: list[int] = []
     for start in _iter_shell_command_starts(command):
         exec_start = _offset_after_command_wrappers(command, start)
+        if exec_start == -1:
+            return _PARSER_LIMIT_VARIANT
         if (
             exec_start is not None
             and exec_start > start

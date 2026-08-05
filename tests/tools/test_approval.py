@@ -1023,6 +1023,20 @@ class TestAnsiCQuotingBypass:
         monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
         assert approval_module.check_all_command_guards(dangerous, "local")["approved"] is False
 
+    def test_wrapper_budget_exhaustion_inside_options_fails_closed(self, monkeypatch):
+        commands = (
+            ("sudo " * 12) + "-u root rm -rf /",
+            ("env -i " * 5) + "env -u HOME rm -rf /",
+        )
+        for cmd in commands:
+            is_hardline, desc = detect_hardline_command(cmd)
+            assert is_hardline is True, cmd
+            assert "parser limit" in desc, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
     def test_env_assignment_ends_option_parsing(self):
         is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")
         assert is_hardline is False
