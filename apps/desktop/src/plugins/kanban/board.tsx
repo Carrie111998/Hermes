@@ -259,20 +259,22 @@ function Card({
   const summary = task.latest_summary || task.body
   const fallback = useDefaultAssignee()
   const arc = arcState(task, fallback)
+  const systemOwned = task.status === 'awaiting_human'
 
   return (
     <ContextMenu>
       <ContextMenuTrigger asChild>
         <div
           className={cn(
-            'group relative flex cursor-grab flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
+            'group relative flex flex-col gap-2 rounded-md border border-(--ui-stroke-tertiary) border-l-2 bg-(--ui-bg-elevated) p-2.5',
+            systemOwned ? 'cursor-default' : 'cursor-grab active:cursor-grabbing',
             // Hover matches the provider-picker rows: a quiet primary fill;
             // selected = the theme's focus color (same as a focused input).
-            'transition-colors hover:bg-primary/[0.06] active:cursor-grabbing',
+            'transition-colors hover:bg-primary/[0.06]',
             selected && 'border-(--dt-composer-ring) bg-[color-mix(in_srgb,var(--dt-composer-ring)_7%,transparent)]',
             dragging && 'opacity-40'
           )}
-          draggable
+          draggable={!systemOwned}
           onClick={event => (event.metaKey || event.ctrlKey ? onToggleSelect(task.id) : onOpen(task.id))}
           onDragEnd={() => setDragging(false)}
           onDragStart={event => {
@@ -311,8 +313,8 @@ function Card({
           <Codicon name={selected ? 'close' : 'check-all'} size="0.85rem" />
           {selected ? k.deselect : k.select}
         </ContextMenuItem>
-        <ContextMenuSeparator />
-        {columns
+        {!systemOwned && <ContextMenuSeparator />}
+        {!systemOwned && columns
           .filter(name => name !== task.status && !isLockedTarget(name))
           .map(name => (
             <ContextMenuItem key={name} onSelect={() => onMove(task.id, name)}>
@@ -320,11 +322,13 @@ function Card({
               {k.moveTo(columnLabel(k, name))}
             </ContextMenuItem>
           ))}
-        <ContextMenuSeparator />
-        <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
-          <Codicon name="trash" size="0.85rem" />
-          {k.delete}
-        </ContextMenuItem>
+        {!systemOwned && <ContextMenuSeparator />}
+        {!systemOwned && (
+          <ContextMenuItem onSelect={() => onDelete(task.id)} variant="destructive">
+            <Codicon name="trash" size="0.85rem" />
+            {k.delete}
+          </ContextMenuItem>
+        )}
       </ContextMenuContent>
     </ContextMenu>
   )

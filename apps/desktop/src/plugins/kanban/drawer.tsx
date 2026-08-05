@@ -658,6 +658,7 @@ export function TaskDrawer({
   }
 
   const errorMessage = error ? errText(error) : null
+  const systemOwned = task?.status === 'awaiting_human'
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -678,7 +679,7 @@ export function TaskDrawer({
       <header className="flex flex-col gap-2 px-4 pt-3.5 pb-3">
         <div className="flex items-center gap-2">
           {task ? (
-            <StatusMenu columns={columns} onMove={move} status={task.status} />
+            <StatusMenu columns={columns} onMove={move} readOnly={systemOwned} status={task.status} />
           ) : (
             <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
           )}
@@ -718,15 +719,19 @@ export function TaskDrawer({
                     <Codicon name="copy" size="0.85rem" />
                     {k.copyTitle}
                   </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
-                    <Codicon name="archive" size="0.85rem" />
-                    {k.archiveTask}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id), onClose)}>
-                    <Codicon name="trash" size="0.85rem" />
-                    {k.deleteTask}
-                  </DropdownMenuItem>
+                  {!systemOwned && <DropdownMenuSeparator />}
+                  {!systemOwned && (
+                    <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
+                      <Codicon name="archive" size="0.85rem" />
+                      {k.archiveTask}
+                    </DropdownMenuItem>
+                  )}
+                  {!systemOwned && (
+                    <DropdownMenuItem className="text-destructive" onSelect={mutate(() => deleteTask(task.id), onClose)}>
+                      <Codicon name="trash" size="0.85rem" />
+                      {k.deleteTask}
+                    </DropdownMenuItem>
+                  )}
                 </DropdownMenuContent>
               </DropdownMenu>
             )}
@@ -758,10 +763,21 @@ export function TaskDrawer({
           <div className="flex flex-col gap-4 text-sm">
             <div className="grid grid-cols-[6rem_minmax(0,1fr)] gap-x-3 gap-y-1 text-[0.71rem]">
               <MetaRow label={k.assignee}>
-                <AssigneeMenu
-                  current={task.assignee}
-                  onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
-                />
+                {systemOwned ? (
+                  task.assignee ? (
+                    <span className="inline-flex items-center gap-1.5">
+                      <Avatar name={task.assignee} size="1rem" />
+                      {task.assignee}
+                    </span>
+                  ) : (
+                    <span className="text-(--ui-text-tertiary)">—</span>
+                  )
+                ) : (
+                  <AssigneeMenu
+                    current={task.assignee}
+                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                  />
+                )}
               </MetaRow>
               {typeof task.priority === 'number' && <MetaRow label={k.metaPriority}>{task.priority}</MetaRow>}
               {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}

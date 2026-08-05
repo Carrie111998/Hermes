@@ -68,6 +68,14 @@ _PR_SNAPSHOT_PROVIDER: Optional[
 ] = None
 
 
+class PRSnapshotUnavailable(ValueError):
+    """The trusted readback is missing, malformed, or too old to act on."""
+
+
+class PRSnapshotMismatch(ValueError):
+    """The live PR deterministically differs from the approved packet."""
+
+
 def register_pr_snapshot_provider(
     provider: Optional[Callable[[Mapping[str, Any]], Mapping[str, Any]]],
 ) -> None:
@@ -277,18 +285,41 @@ def _validate_coderabbit(packet: Mapping[str, Any]) -> None:
     if not isinstance(raw, Mapping):
         raise ValueError("approval packet must include a typed CodeRabbit disposition")
     status = _required_text(raw, "status").casefold()
-    if status not in {"clean", "skipped", "actionable", "rate_limited"}:
+    supported = {
+        "clean",
+        "no_actionable_comments",
+        "skipped",
+        "actionable",
+        "paused",
+        "rate_limited",
+        "unavailable",
+        "pending",
+        "stale",
+    }
+    if status not in supported:
         raise ValueError(f"unsupported CodeRabbit status: {status!r}")
     disposition = str(raw.get("disposition") or "").strip()
     actionable_count = _nonnegative_int(raw, "actionable_count")
     unresolved_count = _nonnegative_int(raw, "unresolved_count")
+    if status in {"pending", "stale"}:
+        raise ValueError(f"CodeRabbit {status} evidence cannot advance to human review")
     if unresolved_count:
         raise ValueError(
             "CodeRabbit has unresolved actionable findings; QA approval is not allowed"
         )
     if status == "actionable" and actionable_count < 1:
         raise ValueError("CodeRabbit actionable status requires actionable_count > 0")
-    if status in {"skipped", "actionable", "rate_limited"} and not disposition:
+    if status in {"clean", "no_actionable_comments"} and actionable_count:
+        raise ValueError(
+            f"CodeRabbit {status} status cannot report actionable findings"
+        )
+    if status in {
+        "skipped",
+        "actionable",
+        "paused",
+        "rate_limited",
+        "unavailable",
+    } and not disposition:
         raise ValueError(
             f"CodeRabbit {status} status requires an explicit QA disposition"
         )
@@ -444,30 +475,41 @@ def _validate_pr_snapshot(
 ) -> int:
     if not isinstance(pr_snapshot, Mapping):
         raise ValueError("pr_snapshot must be an object from a read-only PR adapter")
-    source = _required_text(pr_snapshot, "source")
+    try:
+        source = _required_text(pr_snapshot, "source")
+    except ValueError as exc:
+        raise PRSnapshotUnavailable(str(exc)) from exc
     if source != "github_readback":
-        raise ValueError("pr_snapshot source is not trusted")
-    verified_at = _nonnegative_int(pr_snapshot, "verified_at")
+        raise PRSnapshotUnavailable("pr_snapshot source is not trusted")
+    try:
+        verified_at = _nonnegative_int(pr_snapshot, "verified_at")
+    except ValueError as exc:
+        raise PRSnapshotUnavailable(str(exc)) from exc
     if verified_at < 1:
-        raise ValueError("pr_snapshot verified_at must be positive")
+        raise PRSnapshotUnavailable("pr_snapshot verified_at must be positive")
     current_time = int(time.time())
     if verified_at < current_time - MAX_PR_SNAPSHOT_AGE_SECONDS:
-        raise ValueError("pr_snapshot is stale; refresh the live PR readback")
+        raise PRSnapshotUnavailable("pr_snapshot is stale; refresh the live PR readback")
     if verified_at > current_time + MAX_PR_SNAPSHOT_FUTURE_SKEW_SECONDS:
-        raise ValueError("pr_snapshot verified_at is implausibly far in the future")
+        raise PRSnapshotUnavailable(
+            "pr_snapshot verified_at is implausibly far in the future"
+        )
     if str(pr_snapshot.get("state") or "").upper() != "OPEN":
-        raise ValueError("PR must be OPEN before advancing to human review")
+        raise PRSnapshotMismatch("PR must be OPEN before advancing to human review")
     if pr_snapshot.get("is_draft") is not False:
-        raise ValueError("draft PRs cannot advance to human review")
+        raise PRSnapshotMismatch("draft PRs cannot advance to human review")
 
-    expected = {
-        "repo": packet["repo"],
-        "pr_number": int(packet["pr_number"]),
-        "pr_url": packet["pr_url"],
-        "base_branch": packet["base_branch"],
-        "head_branch": packet["head_branch"],
-        "head_sha": packet["approved_head_sha"],
-    }
+    try:
+        expected = {
+            "repo": _required_text(packet, "repo"),
+            "pr_number": _nonnegative_int(packet, "pr_number"),
+            "pr_url": _required_text(packet, "pr_url"),
+            "base_branch": _required_text(packet, "base_branch"),
+            "head_branch": _required_text(packet, "head_branch"),
+            "head_sha": _required_text(packet, "approved_head_sha"),
+        }
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"approval packet PR identity is invalid: {exc}") from exc
     for key, expected_value in expected.items():
         actual = pr_snapshot.get(key)
         if key == "pr_number":
@@ -477,11 +519,19 @@ def _validate_pr_snapshot(
                 pass
         if actual != expected_value:
             label = "head" if key == "head_sha" else key
-            raise ValueError(
+            raise PRSnapshotMismatch(
                 f"live PR {label} does not match the approval packet "
                 f"({actual!r} != {expected_value!r})"
             )
     return verified_at
+
+
+def validate_pr_snapshot_for_gate(
+    gate: HumanReviewGate,
+    pr_snapshot: Mapping[str, Any],
+) -> int:
+    """Validate a fresh trusted readback against an immutable stored gate."""
+    return _validate_pr_snapshot(gate.approval_packet, pr_snapshot)
 
 
 def _validate_lineage(
@@ -546,6 +596,20 @@ def _validate_lineage(
 
 def _new_gate_id() -> str:
     return "g_" + secrets.token_hex(8)
+
+
+def _packet_idempotency_digest(packet: Mapping[str, Any]) -> str:
+    """Hash approval evidence while ignoring trusted-readback observation time."""
+    semantic = dict(packet)
+    for transient_key in ("approval_packet_sha256", "generated_at", "verified_at"):
+        semantic.pop(transient_key, None)
+    canonical = json.dumps(
+        semantic,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _canonical_dedupe_key(packet: Mapping[str, Any]) -> str:
@@ -661,6 +725,146 @@ def _supersede_active_gate(
     )
 
 
+def supersede_human_review_gate(
+    conn: sqlite3.Connection,
+    gate_id: str,
+    *,
+    reason: str,
+    observed_head_sha: Optional[str] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Monotonically suppress one active gate after trusted PR drift.
+
+    Successful deliveries remain recorded for audit. Only unsent or retryable
+    rows are suppressed, and the linked human card is archived exactly once.
+    """
+    reason = str(reason or "").strip()
+    if not reason:
+        raise ValueError("supersession reason is required")
+    changed_at = int(time.time()) if now is None else int(now)
+    placeholders = ",".join("?" for _ in ACTIVE_GATE_STATES)
+    with kb.write_txn(conn):
+        row = conn.execute(
+            f"SELECT * FROM human_review_gates WHERE id = ? "
+            f"AND state IN ({placeholders})",
+            (gate_id, *sorted(ACTIVE_GATE_STATES)),
+        ).fetchone()
+        if row is None:
+            return False
+        gate = HumanReviewGate.from_row(row)
+        updated = conn.execute(
+            f"UPDATE human_review_gates SET state='superseded', updated_at=? "
+            f"WHERE id=? AND state IN ({placeholders})",
+            (changed_at, gate_id, *sorted(ACTIVE_GATE_STATES)),
+        )
+        if updated.rowcount != 1:
+            return False
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=? "
+            "WHERE id=? AND status='awaiting_human'",
+            (changed_at, gate.task_id),
+        )
+        conn.execute(
+            "UPDATE review_gate_deliveries SET state='superseded', updated_at=? "
+            "WHERE gate_id=? AND state IN ('pending', 'attempting', 'retry', 'failed')",
+            (changed_at, gate_id),
+        )
+        kb._append_event(
+            conn,
+            gate.task_id,
+            "human_gate_superseded",
+            {
+                "gate_id": gate_id,
+                "approved_head_sha": gate.approved_head_sha,
+                "observed_head_sha": observed_head_sha,
+                "reason": reason,
+            },
+        )
+    return True
+
+
+def record_human_review_decision(
+    conn: sqlite3.Connection,
+    gate_id: str,
+    *,
+    reviewer_principal: str,
+    review_state: str,
+    review_head_sha: str,
+    external_review_id: Optional[str] = None,
+    now: Optional[int] = None,
+) -> bool:
+    """Record a previously validated GitHub review; never performs a merge."""
+    normalized = str(review_state or "").strip().upper()
+    if normalized not in {"COMMENTED", "APPROVED", "CHANGES_REQUESTED"}:
+        raise ValueError("unsupported GitHub review state")
+    changed_at = int(time.time()) if now is None else int(now)
+    with kb.write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM human_review_gates WHERE id=?",
+            (gate_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"human-review gate {gate_id!r} does not exist")
+        gate = HumanReviewGate.from_row(row)
+        if reviewer_principal != gate.reviewer_principal:
+            raise ValueError("GitHub review principal does not match the gate reviewer")
+        if review_head_sha != gate.approved_head_sha:
+            raise ValueError("GitHub review is not bound to the approved gate head")
+
+        if normalized == "COMMENTED":
+            if gate.state == "seen":
+                return False
+            if gate.state != "awaiting_human":
+                raise ValueError("human-review gate is not awaiting a reviewer")
+            target_state = "seen"
+            event_kind = "human_gate_seen"
+        elif normalized == "APPROVED":
+            if gate.state == "human_approved":
+                return False
+            if gate.state not in {"awaiting_human", "seen"}:
+                raise ValueError("human-review gate is not awaiting a reviewer")
+            target_state = "human_approved"
+            event_kind = "human_gate_approved"
+        else:
+            if gate.state == "changes_requested":
+                return False
+            if gate.state not in {"awaiting_human", "seen"}:
+                raise ValueError("human-review gate is not awaiting a reviewer")
+            target_state = "changes_requested"
+            event_kind = "human_gate_changes_requested"
+
+        updated = conn.execute(
+            "UPDATE human_review_gates SET state=?, updated_at=? WHERE id=? AND state=?",
+            (target_state, changed_at, gate_id, gate.state),
+        )
+        if updated.rowcount != 1:
+            return False
+        if target_state in {"human_approved", "changes_requested"}:
+            result = (
+                "Exact-head GitHub review approved by the configured human reviewer"
+                if target_state == "human_approved"
+                else "Exact-head GitHub review requested changes"
+            )
+            conn.execute(
+                "UPDATE tasks SET status='done', result=?, completed_at=? "
+                "WHERE id=? AND status='awaiting_human'",
+                (result, changed_at, gate.task_id),
+            )
+        kb._append_event(
+            conn,
+            gate.task_id,
+            event_kind,
+            {
+                "gate_id": gate_id,
+                "reviewer_principal": reviewer_principal,
+                "review_state": normalized,
+                "review_head_sha": review_head_sha,
+                "external_review_id": external_review_id,
+            },
+        )
+    return True
+
+
 def _human_task_body(gate_id: str, packet: Mapping[str, Any], digest: str) -> str:
     return "\n".join(
         (
@@ -746,7 +950,9 @@ def advance_linear_pr_after_qa(
             existing = HumanReviewGate.from_row(existing_row)
             if existing.qa_task_id != qa_task_id or existing.qa_run_id != expected_run_id:
                 raise ValueError("exact-head gate already belongs to a different QA lineage")
-            if existing.approval_packet_sha256 != packet_digest:
+            if _packet_idempotency_digest(
+                existing.approval_packet
+            ) != _packet_idempotency_digest(packet):
                 raise ValueError("exact-head gate already exists with a different approval packet")
             if existing.state in TERMINAL_GATE_STATES:
                 raise ValueError(

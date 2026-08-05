@@ -16,10 +16,19 @@ type KanbanMessages = {
   newTaskCommand: string
   countTip: (running: number, ready: number) => string
   col: Record<
-    'archived' | 'blocked' | 'done' | 'ready' | 'review' | 'running' | 'scheduled' | 'todo' | 'triage',
+    | 'archived'
+    | 'awaiting_human'
+    | 'blocked'
+    | 'done'
+    | 'ready'
+    | 'review'
+    | 'running'
+    | 'scheduled'
+    | 'todo'
+    | 'triage',
     { label: string; help: string }
   >
-  locked: { review: string; running: string; scheduled: string }
+  locked: { awaiting_human: string; review: string; running: string; scheduled: string }
   arcRunning: string
   arcStale: string
   title: string
@@ -200,10 +209,15 @@ const en: KanbanMessages = {
     running: { label: 'Running', help: 'Claimed by a worker — an agent is on it. Set by the dispatcher.' },
     blocked: { label: 'Blocked', help: 'The worker asked for human input.' },
     review: { label: 'Review', help: 'A review agent is checking the work. Set by the dispatcher.' },
+    awaiting_human: {
+      label: 'Awaiting human',
+      help: 'QA approved this exact PR head; the named human reviewer must decide in GitHub.'
+    },
     done: { label: 'Done', help: 'Completed; dependent children become ready.' },
     archived: { label: 'Archived', help: 'Hidden from the default board view.' }
   },
   locked: {
+    awaiting_human: 'Awaiting human is created by the QA gate and leaves only through verified GitHub state.',
     review: 'Review is entered by the dispatcher when a review agent takes the card.',
     running: 'Running is set by the dispatcher when a worker claims the card.',
     scheduled: 'Scheduled needs a wake-up time — agents set it; it can’t be dragged into.'
@@ -392,10 +406,12 @@ const ja: KanbanMessages = {
     running: { label: '実行中', help: 'ワーカーが取得済み — エージェントが作業中。ディスパッチャが設定します。' },
     blocked: { label: 'ブロック', help: 'ワーカーが人間の入力を求めています。' },
     review: { label: 'レビュー', help: 'レビューエージェントが作業を確認中。ディスパッチャが設定します。' },
+    awaiting_human: { label: '人間レビュー待ち', help: 'QA がこの PR ヘッドを承認済み。指定された人間レビュー担当者が GitHub で判断します。' },
     done: { label: '完了', help: '完了。依存する子タスクが Ready になります。' },
     archived: { label: 'アーカイブ', help: 'デフォルトのボード表示から非表示。' }
   },
   locked: {
+    awaiting_human: '人間レビュー待ちは QA ゲートによって作成され、検証済みの GitHub 状態によってのみ解除されます。',
     review: 'レビューは、レビューエージェントがカードを取得するとディスパッチャによって設定されます。',
     running: '実行中は、ワーカーがカードを取得するとディスパッチャによって設定されます。',
     scheduled: 'スケジュールには起動時刻が必要です — エージェントが設定します。ドラッグでは移動できません。'
@@ -583,10 +599,12 @@ const zh: KanbanMessages = {
     running: { label: '运行中', help: '已被工作单元领取 — 有代理在处理。由调度器设置。' },
     blocked: { label: '受阻', help: '工作单元需要人工输入。' },
     review: { label: '审查', help: '审查代理正在检查工作。由调度器设置。' },
+    awaiting_human: { label: '等待人工审核', help: 'QA 已批准此 PR 提交；指定的人工审核人须在 GitHub 中作出决定。' },
     done: { label: '完成', help: '已完成；依赖它的子任务变为就绪。' },
     archived: { label: '已归档', help: '从默认面板视图中隐藏。' }
   },
   locked: {
+    awaiting_human: '等待人工审核由 QA 门禁创建，只能通过已验证的 GitHub 状态退出。',
     review: '审查状态由调度器在审查代理领取卡片时设置。',
     running: '运行中由调度器在工作单元领取卡片时设置。',
     scheduled: '排期需要唤醒时间 — 由代理设置；无法拖入。'
@@ -771,10 +789,12 @@ const zhHant: KanbanMessages = {
     running: { label: '執行中', help: '已被工作單元領取 — 有代理在處理。由排程器設定。' },
     blocked: { label: '受阻', help: '工作單元需要人工輸入。' },
     review: { label: '審查', help: '審查代理正在檢查工作。由排程器設定。' },
+    awaiting_human: { label: '等待人工審查', help: 'QA 已核准此 PR 提交；指定的人工審查人須在 GitHub 中作出決定。' },
     done: { label: '完成', help: '已完成；相依它的子任務變為就緒。' },
     archived: { label: '已封存', help: '從預設面板檢視中隱藏。' }
   },
   locked: {
+    awaiting_human: '等待人工審查由 QA 閘門建立，只能透過已驗證的 GitHub 狀態離開。',
     review: '審查狀態由排程器在審查代理領取卡片時設定。',
     running: '執行中由排程器在工作單元領取卡片時設定。',
     scheduled: '排程需要喚醒時間 — 由代理設定；無法拖入。'

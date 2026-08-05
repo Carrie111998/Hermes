@@ -148,7 +148,8 @@ def _conn(board: Optional[str] = None):
 # tasks into ``todo`` and makes the dashboard look like the Scheduled column
 # disappeared.
 BOARD_COLUMNS: list[str] = [
-    "triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done",
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "awaiting_human", "done",
 ]
 
 
@@ -859,6 +860,15 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if task.status == "awaiting_human":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Awaiting-human gates are system-owned. Dashboard edits are "
+                    "disabled; they advance only from verified GitHub review, PR "
+                    "head/state changes, or an explicit human-decision exception."
+                ),
+            )
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -900,6 +910,14 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(
                     status_code=400,
                     detail="Cannot set status to 'running' directly; use the dispatcher/claim path",
+                )
+            elif s == "awaiting_human":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "Cannot set status to 'awaiting_human' directly; use the typed "
+                        "human-review gate transition"
+                    ),
                 )
             elif s in ("todo", "triage", "scheduled"):
                 ok = _set_status_direct(conn, task_id, s)
@@ -1008,6 +1026,15 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is not None and task.status == "awaiting_human":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "Awaiting-human gates cannot be deleted from the dashboard; "
+                    "record an explicit human-decision exception instead"
+                ),
+            )
         ok = kanban_db.delete_task(conn, task_id)
         if not ok:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
@@ -1247,6 +1274,13 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                 task = kanban_db.get_task(conn, tid)
                 if task is None:
                     entry.update(ok=False, error="not found")
+                    results.append(entry)
+                    continue
+                if task.status == "awaiting_human":
+                    entry.update(
+                        ok=False,
+                        error="awaiting-human gates are system-owned",
+                    )
                     results.append(entry)
                     continue
                 if payload.archive:
@@ -1758,6 +1792,14 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
+        task = kanban_db.get_task(conn, task_id)
+        if task is None:
+            raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if task.status == "awaiting_human":
+            raise HTTPException(
+                status_code=409,
+                detail="Awaiting-human gates are system-owned and cannot be reassigned",
+            )
         ok = kanban_db.reassign_task(
             conn, task_id,
             payload.profile or None,

@@ -87,7 +87,10 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = [
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "awaiting_human", "done",
+  ];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -97,6 +100,9 @@
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
+    scheduled: "Scheduled",
+    review: "Review",
+    awaiting_human: "Awaiting Human",
     done: "Done",
     archived: "Archived",
   };
@@ -106,6 +112,9 @@
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
+    scheduled: "Waiting for a scheduled time to arrive",
+    review: "A review agent is checking the work",
+    awaiting_human: "QA approved this exact PR head; the named human reviewer must decide in GitHub",
     done: "Completed",
     archived: "Archived",
   };
@@ -157,6 +166,9 @@
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
+    scheduled: "hermes-kanban-dot-scheduled",
+    review: "hermes-kanban-dot-review",
+    awaiting_human: "hermes-kanban-dot-awaiting-human",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
   };
@@ -2571,12 +2583,14 @@
     const [dragOver, setDragOver] = useState(false);
     const [showCreate, setShowCreate] = useState(false);
     const colRef = useRef(null);
+    const systemOwned = props.column.name === "awaiting_human";
 
     // Listen for our synthetic touch-drop events from attachTouchDrag().
     useEffect(function () {
       if (!colRef.current) return undefined;
       const el = colRef.current;
       function onTouchDrop(e) {
+        if (systemOwned) return;
         if (e.detail && e.detail.status === props.column.name) {
           const taskId = e.detail.taskId;
           if (props.selectedIds && props.selectedIds.has(taskId) && props.selectedIds.size > 1 && props.onMoveSelected) {
@@ -2588,15 +2602,20 @@
       }
       el.addEventListener("hermes-kanban:drop", onTouchDrop);
       return function () { el.removeEventListener("hermes-kanban:drop", onTouchDrop); };
-    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected]);
+    }, [props.column.name, props.onMove, props.selectedIds, props.onMoveSelected, systemOwned]);
 
     const handleDragOver = function (e) {
+      if (systemOwned) {
+        e.dataTransfer.dropEffect = "none";
+        return;
+      }
       e.preventDefault();
       e.dataTransfer.dropEffect = "move";
       if (!dragOver) setDragOver(true);
     };
     const handleDragLeave = function () { setDragOver(false); };
     const handleDrop = function (e) {
+      if (systemOwned) return;
       e.preventDefault();
       setDragOver(false);
       const taskId = e.dataTransfer.getData(MIME_TASK);
@@ -2652,16 +2671,16 @@
         h("span", { className: "hermes-kanban-column-count",
                     title: `${props.column.tasks.length} task${props.column.tasks.length === 1 ? "" : "s"} in this column` },
           props.column.tasks.length),
-        h("button", {
+        !systemOwned ? h("button", {
           type: "button",
           className: "hermes-kanban-column-add",
           title: tx(t, "createTask", "Create task in this column"),
           onClick: function () { setShowCreate(function (v) { return !v; }); },
-        }, showCreate ? "×" : "+"),
+        }, showCreate ? "×" : "+") : null,
       ),
       h("div", { className: "hermes-kanban-column-sub" },
         colHelp || ""),
-      showCreate ? h(InlineCreate, {
+      showCreate && !systemOwned ? h(InlineCreate, {
         columnName: props.column.name,
         allTasks: props.allTasks,
         defaultWorkspaceKind: (props.boardMeta && props.boardMeta.default_workspace_kind) || "scratch",
@@ -2740,10 +2759,12 @@
     const { t: i18n } = useI18n();
     const t = props.task;
     const cardRef = useRef(null);
+    const systemOwned = t.status === "awaiting_human";
 
     useEffect(function () {
+      if (systemOwned) return undefined;
       return attachTouchDrag(cardRef.current, t.id);
-    }, [t.id]);
+    }, [t.id, systemOwned]);
 
     const handleDragStart = function (e) {
       e.dataTransfer.setData(MIME_TASK, t.id);
@@ -2801,7 +2822,7 @@
         props.draggingSource ? "hermes-kanban-card--dragging-source" : "",
         stalenessClass(t),
       ),
-      draggable: true,
+      draggable: !systemOwned,
       tabIndex: 0,
       role: "button",
       "aria-label": `${t.title || "untitled"} — ${t.id} — ${t.status}`,

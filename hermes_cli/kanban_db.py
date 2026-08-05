@@ -3479,6 +3479,10 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         ).fetchone()
         if not row:
             return False
+        if row["status"] == "awaiting_human":
+            raise RuntimeError(
+                f"cannot reassign {task_id}: awaiting-human gates are system-owned"
+            )
         if row["claim_lock"] is not None and row["status"] == "running":
             raise RuntimeError(
                 f"cannot reassign {task_id}: currently running (claimed). "
@@ -3531,8 +3535,10 @@ def set_model_override(
         ).fetchone()
         if not row:
             return False
-        if row["status"] == "archived":
-            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        if row["status"] in {"archived", "awaiting_human"}:
+            raise RuntimeError(
+                f"cannot set model override on {row['status']} task {task_id}"
+            )
         conn.execute(
             "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
             (model, provider, task_id),
@@ -3568,9 +3574,9 @@ def set_reasoning_effort(
         ).fetchone()
         if not row:
             return False
-        if row["status"] == "archived":
+        if row["status"] in {"archived", "awaiting_human"}:
             raise RuntimeError(
-                f"cannot set reasoning effort on archived task {task_id}"
+                f"cannot set reasoning effort on {row['status']} task {task_id}"
             )
         conn.execute(
             "UPDATE tasks SET reasoning_effort = ? WHERE id = ?",
@@ -6354,7 +6360,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+            "WHERE id = ? AND status NOT IN ('archived', 'awaiting_human')",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -6389,6 +6395,11 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if conn.execute(
+            "SELECT 1 FROM human_review_gates WHERE task_id = ?",
+            (task_id,),
+        ).fetchone():
+            return False
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -6412,6 +6423,11 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if conn.execute(
+            "SELECT 1 FROM human_review_gates WHERE task_id = ?",
+            (task_id,),
+        ).fetchone():
+            return False
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False

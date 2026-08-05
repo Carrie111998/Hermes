@@ -202,6 +202,46 @@ def test_atomic_advance_creates_non_dispatchable_gate_outbox_and_completes_qa(wo
         assert completed[-1].payload["verified_cards"] == [result.task_id]
         assert completed[-1].payload["approval_packet_sha256"] == gate.approval_packet_sha256
 
+        with pytest.raises(RuntimeError, match="system-owned"):
+            kb.assign_task(conn, result.task_id, "default")
+        with pytest.raises(RuntimeError, match="awaiting_human"):
+            kb.set_model_override(conn, result.task_id, "gpt-5")
+        with pytest.raises(RuntimeError, match="awaiting_human"):
+            kb.set_reasoning_effort(conn, result.task_id, "high")
+        assert kb.archive_task(conn, result.task_id) is False
+        assert kb.delete_task(conn, result.task_id) is False
+
+
+def test_exact_head_retry_is_idempotent_across_fresh_readback_timestamps(workflow):
+    with kb.connect(workflow["db_path"]) as conn:
+        first = _advance(conn, workflow, snapshot=_snapshot(verified_at=int(time.time())))
+        second = _advance(
+            conn,
+            workflow,
+            snapshot=_snapshot(verified_at=int(time.time()) + 1),
+        )
+
+        assert first.created is True
+        assert second.created is False
+        assert second.gate_id == first.gate_id
+        assert second.task_id == first.task_id
+        assert second.approval_packet_sha256 == first.approval_packet_sha256
+        assert conn.execute("SELECT COUNT(*) FROM human_review_gates").fetchone()[0] == 1
+
+
+def test_exact_head_retry_rejects_changed_approval_evidence(workflow):
+    with kb.connect(workflow["db_path"]) as conn:
+        _advance(conn, workflow)
+        changed = _packet(workflow["implementation_id"])
+        changed["claimed_fix_summary"] = "Different evidence on retry"
+        with pytest.raises(ValueError, match="different approval packet"):
+            _advance(
+                conn,
+                workflow,
+                packet=changed,
+                snapshot=_snapshot(verified_at=int(time.time()) + 1),
+            )
+
 
 def test_existing_review_claim_semantics_are_unchanged(workflow):
     with kb.connect(workflow["db_path"]) as conn:
@@ -337,3 +377,59 @@ def test_coderabbit_skipped_and_rate_limited_require_explicit_disposition(workfl
             ),
         )
         assert result.created is True
+
+
+@pytest.mark.parametrize(
+    "status",
+    ["no_actionable_comments", "paused", "unavailable"],
+)
+def test_coderabbit_terminal_or_compensated_states_can_advance(workflow, status):
+    disposition = (
+        ""
+        if status == "no_actionable_comments"
+        else "QA performed a compensating exact-head review"
+    )
+    packet = _packet(
+        workflow["implementation_id"],
+        coderabbit={
+            "status": status,
+            "disposition": disposition,
+            "actionable_count": 0,
+            "unresolved_count": 0,
+        },
+    )
+    with kb.connect(workflow["db_path"]) as conn:
+        assert _advance(conn, workflow, packet=packet).created is True
+
+
+@pytest.mark.parametrize("status", ["pending", "stale"])
+def test_coderabbit_nonterminal_or_stale_evidence_cannot_advance(workflow, status):
+    packet = _packet(
+        workflow["implementation_id"],
+        coderabbit={
+            "status": status,
+            "disposition": "",
+            "actionable_count": 0,
+            "unresolved_count": 0,
+        },
+    )
+    with kb.connect(workflow["db_path"]) as conn:
+        with pytest.raises(ValueError, match=status):
+            _advance(conn, workflow, packet=packet)
+        qa_task = kb.get_task(conn, workflow["qa_id"])
+        assert qa_task is not None and qa_task.status == "running"
+
+
+def test_coderabbit_clean_status_cannot_hide_actionable_findings(workflow):
+    packet = _packet(
+        workflow["implementation_id"],
+        coderabbit={
+            "status": "clean",
+            "disposition": "",
+            "actionable_count": 1,
+            "unresolved_count": 0,
+        },
+    )
+    with kb.connect(workflow["db_path"]) as conn:
+        with pytest.raises(ValueError, match="cannot report actionable"):
+            _advance(conn, workflow, packet=packet)

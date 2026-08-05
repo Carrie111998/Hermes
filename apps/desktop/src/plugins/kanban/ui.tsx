@@ -18,7 +18,7 @@ import {
 import { type ReactNode, useEffect, useState } from 'react'
 
 import { fetchOrchestration, ORCHESTRATION_KEY } from './api'
-import { columnLabel, useKanban } from './i18n'
+import { columnLabel, lockedReason, useKanban } from './i18n'
 import { columnMeta, type KanbanTask } from './types'
 
 // Plugin-scoped i18n lives in ./i18n; re-exported so components import strings
@@ -46,9 +46,10 @@ export function useDefaultAssignee(): string {
 // System-owned drop targets — you can drag a card OUT of these, never INTO
 // them, so lanes/menus must not offer them as targets. `running`/`review` are
 // claimed by the dispatcher; `scheduled` needs a wake-up time only an agent or
-// the CLI can attach (a bare status drag is refused with a 409). The reason
-// copy lives in the plugin i18n bundle (`locked.*`); see `lockedReason`.
-export const LOCKED_COLUMNS = ['review', 'running', 'scheduled'] as const
+// the CLI can attach; `awaiting_human` is created by the typed QA gate and may
+// leave only through verified review reconciliation. The reason copy lives in
+// the plugin i18n bundle (`locked.*`); see `lockedReason`.
+export const LOCKED_COLUMNS = ['awaiting_human', 'review', 'running', 'scheduled'] as const
 
 export const isLockedTarget = (name: string): boolean => (LOCKED_COLUMNS as readonly string[]).includes(name)
 
@@ -190,14 +191,29 @@ export function Avatar({ name, size = '1.25rem' }: { name: string; size?: string
 export function StatusMenu({
   columns,
   onMove,
+  readOnly = false,
   status
 }: {
   columns: string[]
   onMove: (status: string) => void
+  readOnly?: boolean
   status: string
 }) {
   const k = useKanban()
   const meta = columnMeta(status)
+
+  if (readOnly) {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded px-2 py-1 text-[0.6875rem] font-semibold uppercase tracking-wide"
+        style={{ backgroundColor: `color-mix(in srgb, ${meta.tone} 15%, transparent)`, color: meta.tone }}
+        title={lockedReason(k, status)}
+      >
+        <span className="size-1.5 rounded-full" style={{ backgroundColor: meta.tone }} />
+        {columnLabel(k, status)}
+      </span>
+    )
+  }
 
   return (
     <DropdownMenu>
