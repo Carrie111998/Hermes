@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_video_from_bytes,
 )
+from tools.todo_tool import MAX_TODO_ITEMS
 
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
@@ -4904,7 +4905,8 @@ class SlackAdapter(BasePlatformAdapter):
             if not secret:
                 return
             if (
-                sum(is_interactive_user_task(task) for task in tasks)
+                len(tasks) >= MAX_TODO_ITEMS
+                or sum(is_interactive_user_task(task) for task in tasks)
                 >= MAX_INTERACTIVE_TASKS
             ):
                 return

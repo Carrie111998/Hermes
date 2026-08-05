@@ -23,6 +23,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Optional, Sequence
 
+from tools.todo_tool import MAX_TODO_ITEMS
+
 
 STATE_VERSION = 1
 MAX_INTERACTIVE_TASKS = 10
@@ -249,6 +251,7 @@ def _control_blocks(
         signing_secret
         and not over_capacity
         and len(user_tasks) < MAX_INTERACTIVE_TASKS
+        and len(todos) < MAX_TODO_ITEMS
     ):
         elements.append({
             "type": "button",
@@ -1055,6 +1058,7 @@ class PlanCardStore:
                     or task_ids != add_ids
                     or not is_user_task_id(add_ids[0])
                     or add_ids[0] in by_id
+                    or len(tasks) >= MAX_TODO_ITEMS
                     or user_task_count >= MAX_INTERACTIVE_TASKS
                     or metadata.get("add_task_status") != "in_progress"
                     or not isinstance(content, str)

@@ -19,6 +19,7 @@ from plugins.platforms.slack.plan_cards import (
     sign_private_metadata,
     verify_private_metadata,
 )
+from tools.todo_tool import MAX_TODO_ITEMS
 
 
 def _adapter(
@@ -2158,6 +2159,99 @@ async def test_future_user_tasks_do_not_block_active_action_or_add_modal(tmp_pat
         "action_id": "hermes_plan_add", "block_id": block_id,
     })
     client.views_open.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("count", "opens_modal"),
+    [(MAX_TODO_ITEMS - 1, True), (MAX_TODO_ITEMS, False)],
+)
+async def test_add_modal_preflight_follows_authoritative_todo_capacity(
+    tmp_path, count: int, opens_modal: bool,
+) -> None:
+    adapter = _adapter(tmp_path)
+    state = _state(adapter, [
+        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
+        for index in range(count)
+    ])
+    assert adapter._plan_store.mark_applied(
+        "sk", revision=state["desired_revision"],
+        snapshot_hash=state["desired_hash"], message_ts="20.0",
+    )
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+    client = adapter._team_clients["T1"]
+    client.views_open = AsyncMock()
+    await adapter._handle_plan_action(AsyncMock(), {
+        "trigger_id": "trigger", "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "message": {"ts": "20.0", "thread_ts": "10.0"},
+        "user": {"id": "U-owner"},
+        "actions": [{"action_ts": f"capacity-{count}"}],
+    }, {
+        "action_id": "hermes_plan_add",
+        "block_id": (
+            f"hermes-plan-controls-r{state['desired_revision']}-"
+            f"{state['desired_hash'][:10]}"
+        ),
+    })
+    assert (client.views_open.await_count == 1) is opens_modal
+
+
+@pytest.mark.asyncio
+async def test_add_modal_submission_fails_after_desired_snapshot_reaches_todo_capacity(
+    tmp_path,
+) -> None:
+    adapter = _adapter(tmp_path)
+    original = _state(adapter, [
+        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
+        for index in range(MAX_TODO_ITEMS - 1)
+    ])
+    assert adapter._plan_store.mark_applied(
+        "sk", revision=original["desired_revision"],
+        snapshot_hash=original["desired_hash"], message_ts="20.0",
+    )
+    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
+    client = adapter._team_clients["T1"]
+    client.views_open = AsyncMock()
+    action_body = {
+        "trigger_id": "trigger", "team": {"id": "T1"},
+        "channel": {"id": "C1"},
+        "message": {"ts": "20.0", "thread_ts": "10.0"},
+        "user": {"id": "U-owner"}, "actions": [{"action_ts": "open"}],
+    }
+    await adapter._handle_plan_action(AsyncMock(), action_body, {
+        "action_id": "hermes_plan_add",
+        "block_id": (
+            f"hermes-plan-controls-r{original['desired_revision']}-"
+            f"{original['desired_hash'][:10]}"
+        ),
+    })
+    view = client.views_open.call_args.kwargs["view"]
+
+    adapter.record_desired_plan_snapshot(
+        session_key="sk", session_id="sid", team_id="T1", channel_id="C1",
+        thread_ts="10.0", route_user_id="U-owner", chat_type="group",
+        todos=[
+            {"id": f"agent:{index}", "content": str(index), "status": "pending"}
+            for index in range(MAX_TODO_ITEMS)
+        ],
+    )
+    events = []
+
+    async def handle(event):
+        events.append(event)
+
+    adapter.set_message_handler(handle)
+    await adapter._handle_plan_add_view(AsyncMock(), {
+        "team": {"id": "T1"}, "user": {"id": "U-owner"},
+        "view": {
+            "id": "V-capacity", "hash": "H-capacity",
+            "private_metadata": view["private_metadata"],
+            "state": {"values": {"task": {"content": {"value": "Too late"}}}},
+        },
+    })
+    await asyncio.sleep(0)
+    assert events == []
 
 
 @pytest.mark.asyncio

@@ -21,6 +21,7 @@ from plugins.platforms.slack.plan_cards import (
     sign_private_metadata,
     verify_private_metadata,
 )
+from tools.todo_tool import MAX_TODO_ITEMS, TodoStore
 
 
 def _snapshot(count: int = 4) -> list[dict[str, str]]:
@@ -88,13 +89,67 @@ def _action_elements(rendered, *, fallback: bool = False):
     ]
 
 
-def test_user_task_id_namespace_is_strict_and_raw() -> None:
+def test_user_task_id_namespace_is_strict_over_canonical_ids() -> None:
     assert is_user_task_id("user:work")
     assert not is_user_task_id("user:")
     assert not is_user_task_id("task-1")
     assert not is_user_task_id("User:work")
-    assert not is_user_task_id(" user:work")
     assert not is_user_task_id("սser:work")
+
+
+def test_todo_store_canonical_ids_drive_plan_classification_and_controls(tmp_path) -> None:
+    todo_store = TodoStore()
+    todo_store.write([
+        {
+            "id": "  user:approve  ",
+            "content": "Approve release",
+            "status": "in_progress",
+        },
+        {
+            "id": "  User:review  ",
+            "content": "Wrong ASCII case",
+            "status": "in_progress",
+        },
+        {
+            "id": "  սser:lookalike  ",
+            "content": "Unicode lookalike",
+            "status": "in_progress",
+        },
+    ])
+    canonical_snapshot = todo_store.read()
+    assert [task["id"] for task in canonical_snapshot] == [
+        "user:approve", "User:review", "սser:lookalike",
+    ]
+
+    store = PlanCardStore(tmp_path)
+    route = {
+        "session_key": "sk", "session_id": "sid", "team_id": "T1",
+        "channel_id": "C1", "thread_ts": "10.0",
+    }
+    state = store.record_desired_snapshot(route, canonical_snapshot)
+    rendered = build_plan_blocks(
+        state["last_desired_snapshot"],
+        revision=state["desired_revision"],
+        snapshot_hash=state["desired_hash"],
+        signing_secret=b"secret",
+    )
+
+    assert [
+        task["task_id"] for task in rendered.native_blocks[0]["tasks"]
+    ] == ["user:approve", "User:review", "սser:lookalike"]
+    checkbox = next(
+        element for element in _action_elements(rendered)
+        if element["action_id"] == "hermes_plan_complete"
+    )
+    cancel = next(
+        element for element in _action_elements(rendered)
+        if element["action_id"] == "hermes_plan_cancel"
+    )
+    assert [option["value"] for option in checkbox["options"]] == ["user:approve"]
+    assert [option["value"] for option in cancel["options"]] == ["user:approve"]
+    assert is_user_task_id(state["last_desired_snapshot"][0]["id"])
+    assert not is_user_task_id(state["last_desired_snapshot"][1]["id"])
+    assert not is_user_task_id(state["last_desired_snapshot"][2]["id"])
 
 
 def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> None:
@@ -105,7 +160,6 @@ def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> N
         {"id": "user:active", "content": "Human active", "status": "in_progress"},
         {"id": "user:cancelled", "content": "Human cancelled", "status": "cancelled"},
         {"id": "User:case", "content": "Wrong case", "status": "pending"},
-        {"id": " user:space", "content": "Leading space", "status": "pending"},
         {"id": "սser:lookalike", "content": "Lookalike", "status": "pending"},
     ]
     rendered = build_plan_blocks(
@@ -235,6 +289,45 @@ def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> No
         "hermes_plan_add",
         "hermes_plan_refresh",
     ]
+
+
+@pytest.mark.parametrize(
+    ("count", "expect_add"),
+    [(MAX_TODO_ITEMS - 1, True), (MAX_TODO_ITEMS, False)],
+)
+def test_renderer_add_control_follows_authoritative_todo_capacity(
+    count: int, expect_add: bool,
+) -> None:
+    todos = [
+        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
+        for index in range(count - 2)
+    ] + [
+        {"id": "user:active", "content": "Active", "status": "in_progress"},
+        {"id": "user:done", "content": "Done", "status": "completed"},
+    ]
+    rendered = build_plan_blocks(
+        todos, revision=1, snapshot_hash="capacity", signing_secret=b"secret",
+    )
+    action_ids = [item["action_id"] for item in _action_elements(rendered)]
+    assert ("hermes_plan_add" in action_ids) is expect_add
+    assert "hermes_plan_complete" in action_ids
+    assert "hermes_plan_cancel" in action_ids
+    assert "hermes_plan_refresh" in action_ids
+    checkbox = next(
+        item for item in _action_elements(rendered)
+        if item["action_id"] == "hermes_plan_complete"
+    )
+    cancel = next(
+        item for item in _action_elements(rendered)
+        if item["action_id"] == "hermes_plan_cancel"
+    )
+    assert [option["value"] for option in checkbox["options"]] == [
+        "user:active", "user:done",
+    ]
+    assert [option["value"] for option in checkbox["initial_options"]] == [
+        "user:done",
+    ]
+    assert [option["value"] for option in cancel["options"]] == ["user:active"]
 
 
 def test_future_and_cancelled_user_tasks_do_not_consume_mutation_capacity() -> None:
@@ -708,6 +801,39 @@ def test_validate_add_capacity_counts_only_in_progress_and_completed_user_tasks(
     }
     assert store.consume_action_id("at-capacity")
     assert store.validate_action(at_capacity_metadata) is None
+
+
+@pytest.mark.parametrize(
+    ("count", "accepted"),
+    [(MAX_TODO_ITEMS - 1, True), (MAX_TODO_ITEMS, False)],
+)
+def test_validate_add_rejects_authoritative_todo_capacity(
+    tmp_path, count: int, accepted: bool,
+) -> None:
+    store = PlanCardStore(tmp_path)
+    route = {
+        "session_key": "sk", "session_id": "sid", "team_id": "T1",
+        "channel_id": "C1", "thread_ts": "10.0",
+    }
+    snapshot = [
+        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
+        for index in range(count)
+    ]
+    state = store.record_desired_snapshot(route, snapshot)
+    assert store.mark_applied(
+        "sk", revision=state["desired_revision"],
+        snapshot_hash=state["desired_hash"], message_ts="20.0",
+    )
+    dedupe_id = f"capacity-{count}"
+    assert store.consume_action_id(dedupe_id)
+    metadata = {
+        **route, "message_ts": "20.0", "revision": state["desired_revision"],
+        "snapshot_hash": state["desired_hash"], "task_ids": ["user:new"],
+        "action_kind": "add_user_task", "add_task_ids": ["user:new"],
+        "add_task_content": "New", "add_task_status": "in_progress",
+        "action_user_id": "U1", "action_dedupe_id": dedupe_id,
+    }
+    assert (store.validate_action(metadata) is not None) is accepted
 
 
 def _converged_session_with_retired_anchor(store, route):
