@@ -122,6 +122,20 @@ test('locateHermes canonicalizes an installer wrapper to its executable target',
   assert.equal(await locateHermes(ssh, ''), '/home/u/.hermes/hermes-agent/venv/bin/hermes')
 })
 
+test('locateHermes resolves venv launcher shim with two exec arguments', async () => {
+  // install.sh venv mode generates:  exec "$HERMES_BIN" "$HERMES_ENTRYPOINT" "$@"
+  // The Python interpreter (words[1]) is executable, but the hermes entry
+  // point (words[2]) is the real target.  resolveLauncher must return the
+  // entry point, not the interpreter.
+  const ssh = fakeSsh([
+    [/command -v hermes/, '/home/u/.local/bin/hermes\n'],
+    [/\[ -x .*\.local\/bin\/hermes/, 'OK'],
+    [/python3 -c/, '/home/u/.hermes/hermes-agent/hermes\n']
+  ])
+
+  assert.equal(await locateHermes(ssh, ''), '/home/u/.hermes/hermes-agent/hermes')
+})
+
 test('locateHermes falls back to ~/.local/bin/hermes when the login-shell probe misses', async () => {
   // ~/.local/bin is the non-root installer's command location (scripts/install.sh).
   const ssh = fakeSsh([
