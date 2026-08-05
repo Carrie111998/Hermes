@@ -201,6 +201,12 @@ def _bootstrap_receipt_fixture(
     runtime._owner_support_source = str(support_root / "source")
     runtime._owner_support_site = str(support_root / "site-packages")
     runtime._owner_support_fingerprint = support_tree
+    runtime._owner_support_identity_fingerprint = (
+        launcher._capture_owner_support_identity_tree(
+            str(support_root),
+            release_sha=RELEASE_SHA,
+        )
+    )
     runtime._owner_support_manifest = support_manifest
 
     unsigned = {
@@ -408,6 +414,108 @@ def test_owner_support_constants_pin_exact_release_inputs() -> None:
         "_cffi_backend",
         "packaging",
     )
+
+
+def test_same_process_runtime_recheck_uses_identity_not_full_content_hash(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sdk_root = tmp_path / "google-cloud-sdk"
+    wrapper = sdk_root / "bin/gcloud"
+    module = sdk_root / "lib/gcloud.py"
+    python_root = tmp_path / "python"
+    python = python_root / "bin/python3.11"
+    _write(wrapper, b"#!/bin/sh\n")
+    _write(module, b"trusted module\n")
+    _write(python, b"trusted python\n")
+    wrapper.chmod(0o700)
+    python.chmod(0o700)
+
+    runtime = object.__new__(launcher.TrustedGcloudExecutable)
+    runtime._wrapper = _PinnedPathStub(str(wrapper))
+    runtime._python = _PinnedPathStub(str(python))
+    runtime._sdk_root = str(sdk_root)
+    runtime._python_root = str(python_root)
+    runtime._gcloud_module = str(module)
+    runtime._sdk_fingerprint = launcher.TrustedGcloudExecutable._capture_tree(
+        str(sdk_root),
+        scope="sdk",
+    )
+    runtime._python_fingerprint = launcher.TrustedGcloudExecutable._capture_tree(
+        str(python_root),
+        scope="python_tree",
+    )
+    runtime._sdk_identity_fingerprint = (
+        launcher.TrustedGcloudExecutable._capture_tree_identity(
+            str(sdk_root),
+            scope="sdk",
+        )
+    )
+    runtime._python_identity_fingerprint = (
+        launcher.TrustedGcloudExecutable._capture_tree_identity(
+            str(python_root),
+            scope="python_tree",
+        )
+    )
+    runtime._production_runtime = False
+
+    def forbid_full_content_rehash(
+        _cls: type[launcher.TrustedGcloudExecutable],
+        _root: str,
+        *,
+        scope: str,
+    ) -> tuple[int, int, str]:
+        raise AssertionError(f"unexpected full {scope} content rehash")
+
+    monkeypatch.setattr(
+        launcher.TrustedGcloudExecutable,
+        "_capture_tree",
+        classmethod(forbid_full_content_rehash),
+    )
+
+    assert runtime.trusted_command_prefix() == (
+        str(python),
+        *launcher._GCLOUD_PYTHON_ISOLATION_ARGS,
+        str(module),
+    )
+
+    original = module.stat()
+    module.write_bytes(b"hostile module\n")
+    os.utime(module, ns=(original.st_atime_ns, original.st_mtime_ns))
+    assert module.stat().st_size == original.st_size
+
+    with pytest.raises(
+        launcher.OwnerLauncherError,
+        match="trusted_gcloud_sdk_changed",
+    ):
+        runtime.trusted_command_prefix()
+
+
+def test_owner_support_identity_recheck_detects_same_size_restored_mtime_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = _support_tree(tmp_path, monkeypatch)
+    before = launcher._capture_owner_support_identity_tree(
+        str(root),
+        release_sha=RELEASE_SHA,
+    )
+    target = root / "source/gateway/__init__.py"
+    original = target.stat()
+    payload = target.read_bytes()
+    target.chmod(0o600)
+    target.write_bytes(bytes(value ^ 1 for value in payload))
+    target.chmod(0o400)
+    os.utime(target, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+    after = launcher._capture_owner_support_identity_tree(
+        str(root),
+        release_sha=RELEASE_SHA,
+    )
+
+    assert target.stat().st_size == original.st_size
+    assert target.stat().st_mtime_ns == original.st_mtime_ns
+    assert after != before
 
 
 def test_v2_bootstrap_receipt_binds_owner_support_tree_and_sources(
@@ -652,6 +760,10 @@ def test_exact_isolated_activation_imports_all_lazy_owner_module_families(
 ) -> None:
     root = _real_import_support_tree(tmp_path, monkeypatch)
     tree = _capture(root)
+    identity_tree = launcher._capture_owner_support_identity_tree(
+        str(root),
+        release_sha=RELEASE_SHA,
+    )
     manifest = launcher._validate_owner_support_manifest(
         str(root),
         release_sha=RELEASE_SHA,
@@ -677,6 +789,7 @@ runtime._owner_support_root = {str(root)!r}
 runtime._owner_support_source = {str(source)!r}
 runtime._owner_support_site = {str(site)!r}
 runtime._owner_support_fingerprint = {tree!r}
+runtime._owner_support_identity_fingerprint = {identity_tree!r}
 runtime._owner_support_manifest = {manifest!r}
 
 activated = namespace["activate_trusted_owner_support"](
@@ -761,6 +874,10 @@ def test_credential_collector_uses_sealed_support_without_git_checkout(
 ) -> None:
     root = _real_import_support_tree(tmp_path, monkeypatch)
     tree = _capture(root)
+    identity_tree = launcher._capture_owner_support_identity_tree(
+        str(root),
+        release_sha=RELEASE_SHA,
+    )
     manifest = launcher._validate_owner_support_manifest(
         str(root),
         release_sha=RELEASE_SHA,
@@ -790,6 +907,7 @@ bootstrap_runtime._owner_support_root = {str(root)!r}
 bootstrap_runtime._owner_support_source = {str(source)!r}
 bootstrap_runtime._owner_support_site = {str(site)!r}
 bootstrap_runtime._owner_support_fingerprint = {tree!r}
+bootstrap_runtime._owner_support_identity_fingerprint = {identity_tree!r}
 bootstrap_runtime._owner_support_manifest = {manifest!r}
 namespace["activate_trusted_owner_support"](
     bootstrap_runtime,
@@ -811,6 +929,7 @@ runtime._owner_support_root = {str(root)!r}
 runtime._owner_support_source = {str(source)!r}
 runtime._owner_support_site = {str(site)!r}
 runtime._owner_support_fingerprint = {tree!r}
+runtime._owner_support_identity_fingerprint = {identity_tree!r}
 runtime._owner_support_manifest = {manifest!r}
 runtime.trusted_command_prefix = lambda: (sys.executable,)
 
