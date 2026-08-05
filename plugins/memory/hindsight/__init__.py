@@ -90,6 +90,24 @@ def _parse_int_setting(value: Any, default: int) -> int:
         return default
 
 
+def _ensure_url_scheme(url: str | None, mode: str) -> str:
+    """Auto-add a scheme when a configured Hindsight api_url omits one.
+
+    A schemeless value (e.g. ``"host:8888"``) would otherwise reach the
+    HTTP layer as an invalid URL and fail with a cryptic URL-only error on
+    every tool call (issue #78967). Local modes default to plain ``http``
+    (self-hosted daemon); everything else defaults to ``https``. Explicit
+    schemes (anything containing ``://``) are left untouched.
+    """
+    if not url:
+        return ""
+    url = str(url).strip()
+    if url and "://" not in url:
+        scheme = "http://" if mode in {"local_embedded", "local_external"} else "https://"
+        url = scheme + url
+    return url
+
+
 # Env var the embedded daemon manager reads (at import time, as a module-level
 # constant) to size the grace window it waits for a slow /health before
 # declaring a daemon stale and killing it. Default upstream is 30s; on
@@ -1526,7 +1544,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 return
         self._api_key = self._config.get("apiKey") or self._config.get("api_key") or get_secret("HINDSIGHT_API_KEY", "")
         default_url = _DEFAULT_LOCAL_URL if self._mode in {"local_embedded", "local_external"} else _DEFAULT_API_URL
-        self._api_url = self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url)
+        self._api_url = _ensure_url_scheme(
+            self._config.get("api_url") or os.environ.get("HINDSIGHT_API_URL", default_url),
+            self._mode,
+        )
         self._llm_base_url = self._config.get("llm_base_url", "")
 
         banks = cfg_get(self._config, "banks", "hermes", default={})

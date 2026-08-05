@@ -213,6 +213,57 @@ def provider_with_config(tmp_path, monkeypatch):
     return _make
 
 
+def _write_config(tmp_path, monkeypatch, config: dict) -> None:
+    """Write a hindsight config.json and point get_hermes_home at tmp_path."""
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
+
+
+def _init_provider(tmp_path, monkeypatch, config: dict) -> HindsightMemoryProvider:
+    _write_config(tmp_path, monkeypatch, config)
+    p = HindsightMemoryProvider()
+    p.initialize(session_id="test-session", hermes_home=str(tmp_path), platform="cli")
+    return p
+
+
+def test_schemeless_api_url_gets_http_for_local_external(tmp_path, monkeypatch):
+    """Schemeless api_url in local_external mode auto-adds http:// (issue #78967)."""
+    p = _init_provider(tmp_path, monkeypatch, {
+        "mode": "local_external",
+        "api_url": "pve1-docker.ts.rmg7.com:8888",
+    })
+    assert p._api_url == "http://pve1-docker.ts.rmg7.com:8888"
+
+
+def test_schemeless_api_url_gets_https_for_cloud(tmp_path, monkeypatch):
+    """Schemeless api_url in cloud mode auto-adds https:// (issue #78967)."""
+    p = _init_provider(tmp_path, monkeypatch, {
+        "mode": "cloud",
+        "api_url": "localhost:8888",
+    })
+    assert p._api_url == "https://localhost:8888"
+
+
+def test_explicit_scheme_api_url_preserved(tmp_path, monkeypatch):
+    """An api_url that already has a scheme is left untouched (issue #78967)."""
+    p = _init_provider(tmp_path, monkeypatch, {
+        "mode": "cloud",
+        "api_url": "http://localhost:9999",
+    })
+    assert p._api_url == "http://localhost:9999"
+
+
+def test_schemeless_env_var_url_gets_scheme(tmp_path, monkeypatch):
+    """Schemeless HINDSIGHT_API_URL env var is normalized at init (issue #78967)."""
+    monkeypatch.delenv("HINDSIGHT_API_URL", raising=False)
+    monkeypatch.delenv("HINDSIGHT_API_KEY", raising=False)
+    monkeypatch.setenv("HINDSIGHT_API_URL", "hindsight.internal:9999")
+    p = _init_provider(tmp_path, monkeypatch, {"mode": "local_external"})
+    assert p._api_url == "http://hindsight.internal:9999"
+
+
 def test_normalize_retain_tags_accepts_csv_and_dedupes():
     assert _normalize_retain_tags("agent:fakeassistantname, source_system:hermes-agent, agent:fakeassistantname") == [
         "agent:fakeassistantname",
