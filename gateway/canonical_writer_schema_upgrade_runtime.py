@@ -1249,6 +1249,12 @@ def _prepare_runtime(dependencies: _RuntimeDependencies) -> _RuntimeContext:
                 session,
                 phase="post_cleanup",
                 observed_at_unix=base.dependencies.now,
+                # A prior upgrade may have committed the exact target helper
+                # before its terminal receipt reached the owner.  Accept only
+                # that one-name presence here; collect_schema_contract below
+                # still proves the complete target definition before a replay
+                # gate is emitted.
+                allow_routeback_helper_present=True,
             )
             observed = collect_schema_contract(
                 session,
