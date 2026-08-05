@@ -44,7 +44,19 @@ from hermes_constants import get_hermes_home
 from hermes_cli.sqlite_runtime import (
     is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
 )
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypeVar
+from typing import (
+    Any,
+    Callable,
+    ClassVar,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+    TypeVar,
+)
 
 from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _BRANCH_CHILD_SQL,
@@ -1686,7 +1698,32 @@ class SessionCompressionInProgressError(CompressionSessionBusyError):
 
 
 @dataclass(frozen=True, kw_only=True)
-class SessionDBBatchMessage:
+class SessionDBBatchMessage(Mapping[str, Any]):
+    """Typed batch row that retains the historical mapping interface.
+
+    ``append_messages_batch`` has long accepted dictionaries, and lightweight
+    database doubles and integrations inspect rows with ``get()``, ``items()``,
+    subscripting, or ``dict(row)``. The immutable typed row adds persistence
+    identities without withdrawing that established protocol.
+    """
+
+    _FIELD_NAMES: ClassVar[tuple[str, ...]] = (
+        "role",
+        "content",
+        "tool_name",
+        "tool_calls",
+        "tool_call_id",
+        "finish_reason",
+        "reasoning",
+        "reasoning_content",
+        "reasoning_details",
+        "codex_reasoning_items",
+        "codex_message_items",
+        "api_content",
+        "display_kind",
+        "display_metadata",
+    )
+
     persistence_unit_id: str
     persistence_message_key: str
     persistence_ordinal: int
@@ -1705,6 +1742,17 @@ class SessionDBBatchMessage:
     api_content: Any = None
     display_kind: Optional[str] = None
     display_metadata: Optional[Dict[str, Any]] = None
+
+    def __getitem__(self, key: str) -> Any:
+        if key not in self._FIELD_NAMES:
+            raise KeyError(key)
+        return getattr(self, key)
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._FIELD_NAMES)
+
+    def __len__(self) -> int:
+        return len(self._FIELD_NAMES)
 
 
 @dataclass(frozen=True)

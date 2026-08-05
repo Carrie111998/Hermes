@@ -285,6 +285,7 @@ _DB_PERSISTENCE_UNIT_ID = "_db_persistence_unit_id"
 _DB_PERSISTENCE_MESSAGE_KEY = "_db_persistence_message_key"
 _DB_PERSISTENCE_ORDINAL = "_db_persistence_ordinal"
 _DB_PERSISTENCE_TIMESTAMP = "_db_persistence_timestamp"
+_DB_CANONICAL_COMMIT_MARKER = "_db_canonical_commit"
 
 
 class SessionPersistState(str, Enum):
@@ -1954,7 +1955,7 @@ class AIAgent:
                 started_at = float(session_start.timestamp())
             except Exception:
                 started_at = None
-        source = _session_source_for_agent(self.platform)
+        source = _session_source_for_agent(getattr(self, "platform", None))
         bootstrap = session_spool.SessionSpoolBootstrap(
             session_id=getattr(self, "session_id", None),
             source=source,
@@ -1987,7 +1988,10 @@ class AIAgent:
 
         current_session_id = getattr(self, "session_id", None)
         flushed_session_id = getattr(self, "_flushed_db_message_session_id", None)
-        if flushed_session_id != current_session_id or self._last_flushed_db_idx == 0:
+        if (
+            flushed_session_id != current_session_id
+            or getattr(self, "_last_flushed_db_idx", 0) == 0
+        ):
             seed_ids = set()
         else:
             seed_ids = getattr(self, "_flushed_db_message_ids", None)
@@ -2119,6 +2123,23 @@ class AIAgent:
                 continue
             if msg.get(_DB_PERSISTED_MARKER):
                 continue
+            # A missing persisted marker after a successful canonical commit
+            # means a caller intentionally rewrote the live row in place (for
+            # example turn_finalizer filling an incremental tool-call row).
+            # Failed writes have no canonical receipt and must retain their
+            # identity for idempotent retry; rewritten committed rows must get
+            # a fresh key or SessionDB will deduplicate the updated content as
+            # the already-durable stale row.
+            if msg.get(_DB_CANONICAL_COMMIT_MARKER):
+                for private_key in (
+                    _DB_SPOOLED_MARKER,
+                    _DB_PERSISTENCE_UNIT_ID,
+                    _DB_PERSISTENCE_MESSAGE_KEY,
+                    _DB_PERSISTENCE_ORDINAL,
+                    _DB_PERSISTENCE_TIMESTAMP,
+                    _DB_CANONICAL_COMMIT_MARKER,
+                ):
+                    msg.pop(private_key, None)
             if id(msg) in history_ids or id(msg) in seed_ids:
                 msg[_DB_PERSISTED_MARKER] = True
                 continue
@@ -2178,13 +2199,27 @@ class AIAgent:
             for unit in plan.pending_units:
                 self._session_db.append_messages_batch(
                     self.session_id,
-                    unit.batch_messages,
+                    messages=unit.batch_messages,
                     compression_lock_holder=getattr(
                         self, "_active_compression_lock_holder", None
                     ),
                 )
                 for source_msg in unit.source_messages:
                     source_msg[_DB_PERSISTED_MARKER] = True
+                    source_msg[_DB_CANONICAL_COMMIT_MARKER] = True
+                    # Identity/timestamp must survive failed canonical writes
+                    # and spool retries, but once this unit is canonical the
+                    # durable marker is sufficient. Removing random retry
+                    # metadata keeps live-message semantics identical to the
+                    # pre-spool path and lets a later marker pop re-key a
+                    # rewritten row cleanly.
+                    for private_key in (
+                        _DB_PERSISTENCE_UNIT_ID,
+                        _DB_PERSISTENCE_MESSAGE_KEY,
+                        _DB_PERSISTENCE_ORDINAL,
+                        _DB_PERSISTENCE_TIMESTAMP,
+                    ):
+                        source_msg.pop(private_key, None)
                 committed_units.append(unit)
             return _CanonicalAppendOutcome(
                 committed_units=tuple(committed_units),
@@ -2337,6 +2372,22 @@ class AIAgent:
             self._drop_trailing_empty_response_scaffolding(messages)
             self._session_messages = messages
             self._save_session_log(messages)
+
+            # Preserve the established instance-level persistence seam used by
+            # lightweight agents and shutdown tests. Real AIAgent instances use
+            # the class method and therefore continue through the classified
+            # canonical/spool path below.
+            flush_override = getattr(self, "__dict__", {}).get(
+                "_flush_messages_to_session_db"
+            )
+            if callable(flush_override):
+                override_result = flush_override(messages, conversation_history)
+                if override_result is False:
+                    return SessionPersistResult(
+                        state=SessionPersistState.NOT_DURABLE,
+                        error_class="PersistenceOverrideFailed",
+                    )
+                return SessionPersistResult(state=SessionPersistState.CANONICAL)
 
             replay_result = self._replay_pending_session_spool(trigger="pre_persist")
             blocked, replay_state_value = self._replay_result_blocks_canonical_persist(
@@ -2575,16 +2626,21 @@ class AIAgent:
             return None
         if not self._session_db:
             return None
+
         try:
-            replay_result = self._replay_pending_session_spool(trigger="pre_persist")
-            blocked, _replay_state_value = self._replay_result_blocks_canonical_persist(
-                replay_result
+            replay_result = AIAgent._replay_pending_session_spool(
+                self, trigger="pre_persist"
+            )
+            blocked, _replay_state_value = (
+                AIAgent._replay_result_blocks_canonical_persist(replay_result)
             )
             if blocked:
                 return False
-            plan = self._plan_session_persistence_units(messages, conversation_history)
+            plan = AIAgent._plan_session_persistence_units(
+                self, messages, conversation_history
+            )
             if not plan.pending_units:
-                self._finalize_full_canonical_flush(messages)
+                AIAgent._finalize_full_canonical_flush(self, messages)
                 return True
             if not self._session_db_created:
                 self._ensure_db_session()
@@ -2594,10 +2650,10 @@ class AIAgent:
                     "Session DB append_message failed: session row not created"
                 )
                 return False
-            outcome = self._append_planned_units_canonically(plan)
+            outcome = AIAgent._append_planned_units_canonically(self, plan)
             if outcome.error is not None:
                 return False
-            self._finalize_full_canonical_flush(messages)
+            AIAgent._finalize_full_canonical_flush(self, messages)
             return True
         except Exception as e:
             self._db_flush_scan_prefix = None
@@ -3313,6 +3369,7 @@ class AIAgent:
                             _DB_PERSISTENCE_MESSAGE_KEY,
                             _DB_PERSISTENCE_ORDINAL,
                             _DB_PERSISTENCE_TIMESTAMP,
+                            _DB_CANONICAL_COMMIT_MARKER,
                         }
                     }
                 cleaned.append(msg)

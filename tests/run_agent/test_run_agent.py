@@ -191,7 +191,7 @@ def test_flush_persist_override_replaces_api_local_multimodal_note(agent):
 
     agent._flush_messages_to_session_db([{"role": "user", "content": api_content}], [])
 
-    batch_write = agent._session_db.append_messages_batch.call_args.args[1]
+    batch_write = agent._session_db.append_messages_batch.call_args.kwargs["messages"]
     assert len(batch_write) == 1
     assert batch_write[0].content == "Describe this screenshot\n[screenshot]"
     assert api_content[0]["text"] == "[MODEL SWITCH NOTE]\n\nDescribe this screenshot"
@@ -241,7 +241,7 @@ def test_direct_session_db_flushes_share_marker_claim(agent):
     assert db.rows == ["exactly once"]
 
 
-def test_flush_messages_to_session_db_batch_marks_only_after_success_and_freezes_private_identity(agent):
+def test_flush_messages_to_session_db_batch_marks_only_after_success_and_clears_retry_identity(agent):
     db = _RecordingBatchDB()
     _prime_batch_flush_agent(agent, db)
     message = {"role": "user", "content": "hello batch"}
@@ -250,17 +250,18 @@ def test_flush_messages_to_session_db_batch_marks_only_after_success_and_freezes
 
     assert result is True
     assert message[run_agent._DB_PERSISTED_MARKER] is True
-    assert run_agent._DB_PERSISTENCE_UNIT_ID in message
-    assert run_agent._DB_PERSISTENCE_MESSAGE_KEY in message
-    assert run_agent._DB_PERSISTENCE_TIMESTAMP in message
+    assert message[run_agent._DB_CANONICAL_COMMIT_MARKER] is True
+    assert run_agent._DB_PERSISTENCE_UNIT_ID not in message
+    assert run_agent._DB_PERSISTENCE_MESSAGE_KEY not in message
+    assert run_agent._DB_PERSISTENCE_TIMESTAMP not in message
     assert "timestamp" not in message
     assert len(db.calls) == 1
     assert len(db.calls[0]["messages"]) == 1
     batch_msg = db.calls[0]["messages"][0]
-    assert batch_msg.persistence_unit_id == message[run_agent._DB_PERSISTENCE_UNIT_ID]
-    assert batch_msg.persistence_message_key == message[run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    assert batch_msg.persistence_unit_id
+    assert batch_msg.persistence_message_key
     assert batch_msg.persistence_ordinal == 0
-    assert batch_msg.timestamp == message[run_agent._DB_PERSISTENCE_TIMESTAMP]
+    assert batch_msg.timestamp > 0
 
 
 def test_persist_session_canonical_returns_explicit_state_and_forbids_bool_coercion(agent):
@@ -382,6 +383,33 @@ def test_flush_messages_to_session_db_retry_reuses_persistence_message_key_and_t
     assert message[run_agent._DB_PERSISTED_MARKER] is True
 
 
+def test_flush_messages_to_session_db_rekeys_after_persisted_message_is_rewritten(agent):
+    """Clearing the durable marker after an in-place rewrite starts a new unit.
+
+    Failed canonical writes must retry the same private identity, but a message
+    that was already committed and then rewritten must not be deduplicated as
+    the stale canonical row.
+    """
+    db = _RecordingBatchDB()
+    _prime_batch_flush_agent(agent, db)
+    message = {"role": "assistant", "content": ""}
+
+    assert agent._flush_messages_to_session_db([message], []) is True
+    first_key = db.calls[0]["messages"][0].persistence_message_key
+    first_unit = db.calls[0]["messages"][0].persistence_unit_id
+
+    message["content"] = "the final answer"
+    message.pop(run_agent._DB_PERSISTED_MARKER)
+    agent._db_flush_scan_prefix = None
+
+    assert agent._flush_messages_to_session_db([message], []) is True
+    assert len(db.calls) == 2
+    second = db.calls[1]["messages"][0]
+    assert second.content == "the final answer"
+    assert second.persistence_message_key != first_key
+    assert second.persistence_unit_id != first_unit
+
+
 def test_flush_messages_to_session_db_retries_old_batch_before_new_unkeyed_messages(agent):
     db = _RecordingBatchDB(
         outcomes=[
@@ -410,7 +438,8 @@ def test_flush_messages_to_session_db_retries_old_batch_before_new_unkeyed_messa
     assert all(msg.persistence_unit_id == failed_unit for msg in retried_batch)
     assert len(new_batch) == 1
     assert new_batch[0].persistence_unit_id != failed_unit
-    assert new_batch[0].persistence_message_key == messages[2][run_agent._DB_PERSISTENCE_MESSAGE_KEY]
+    assert new_batch[0].persistence_message_key
+    assert run_agent._DB_PERSISTENCE_MESSAGE_KEY not in messages[2]
     assert messages[0][run_agent._DB_PERSISTED_MARKER] is True
     assert messages[1][run_agent._DB_PERSISTED_MARKER] is True
     assert messages[2][run_agent._DB_PERSISTED_MARKER] is True
@@ -495,6 +524,7 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
         "content": "hello",
         run_agent._DB_SPOOLED_MARKER: True,
         run_agent._DB_PERSISTENCE_UNIT_ID: "unit-1",
+        "_db_canonical_commit": True,
     }
 
     agent._save_session_log([message])
@@ -502,6 +532,7 @@ def test_save_session_log_strips_private_spool_marker(agent, tmp_path):
     saved = json.loads((tmp_path / "session_session-123.json").read_text(encoding="utf-8"))
     assert run_agent._DB_SPOOLED_MARKER not in saved["messages"][0]
     assert run_agent._DB_PERSISTENCE_UNIT_ID not in saved["messages"][0]
+    assert "_db_canonical_commit" not in saved["messages"][0]
 
 
 def test_persist_session_replays_spool_before_canonical_append_under_persist_lock(agent, monkeypatch):
@@ -6240,7 +6271,9 @@ class TestPersistUserMessageOverride:
             "2-3 sentences max. No code blocks or markdown.] Hello there"
         )
         # But the DB write must get the override.
-        first_db_write = agent._session_db.append_messages_batch.call_args.args[1][0]
+        first_db_write = agent._session_db.append_messages_batch.call_args.kwargs[
+            "messages"
+        ][0]
         assert first_db_write.content == "Hello there"
 
 
