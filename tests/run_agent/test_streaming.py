@@ -676,6 +676,80 @@ class TestCodexStreamCallbacks:
         assert touch_calls.count("receiving stream response") == len(events)
 
 
+class TestDirectApiCallHeartbeat:
+    """direct_api_call must refresh the activity tracker while a non-streaming
+    request is in flight.
+
+    Symmetric gap left by commit 2773b18b5, which added per-event
+    ``_touch_activity()`` calls to the four streaming paths but not to the
+    inline non-streaming path. Without these touches, a provider whose first
+    byte is slow (connection alive, not an error) is indistinguishable from a
+    hung job, so the cron inactivity watchdog (``HERMES_CRON_TIMEOUT``, default
+    600s) kills tasks that would have succeeded once httpx's own timeout
+    elapsed.
+    """
+
+    def test_heartbeat_refreshes_activity_during_slow_response(self, monkeypatch):
+        import time as _time
+        from run_agent import AIAgent
+        from agent import chat_completion_helpers as helpers
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+        agent.api_mode = "chat_completions"
+        agent._interrupt_requested = False
+
+        touch_calls = []
+        agent._touch_activity = lambda desc: touch_calls.append(desc)
+
+        # Shrink the heartbeat interval so the test exercises several beats
+        # in tens of milliseconds rather than waiting 30s.
+        monkeypatch.setattr(helpers, "_DIRECT_API_CALL_HEARTBEAT_INTERVAL_S", 0.02)
+
+        # Stub the dispatch so it blocks long enough for multiple heartbeats
+        # to fire, then returns a minimal response.
+        def _slow_dispatch(agent, api_kwargs, *, make_client):
+            _time.sleep(0.10)
+            return SimpleNamespace(choices=[SimpleNamespace(finish_reason="stop")])
+
+        monkeypatch.setattr(
+            helpers, "_dispatch_nonstreaming_api_request", _slow_dispatch
+        )
+        monkeypatch.setattr(helpers, "_check_stale_giveup", lambda *a, **k: None)
+        monkeypatch.setattr(helpers, "_reset_stale_streak", lambda *a, **k: None)
+        agent._create_request_openai_client = lambda **kw: MagicMock()
+        agent._abort_request_openai_client = lambda *a, **kw: None
+        agent._close_request_openai_client = lambda *a, **kw: None
+
+        helpers.direct_api_call(agent, {"model": "test/model"})
+
+        # Initial touch fires before the request.
+        assert "waiting for non-streaming API response" in touch_calls
+
+        # Heartbeats (elapsed-suffixed) fired while the request blocked.
+        heartbeats = [
+            c for c in touch_calls
+            if c.startswith("waiting for non-streaming API response (")
+        ]
+        assert len(heartbeats) >= 2, (
+            f"expected >=2 heartbeat touches during the wait, got {heartbeats}"
+        )
+
+        # The heartbeat thread stops after the request returns — no further
+        # touches accumulate once _heartbeat_stop is set in finally.
+        before = len(touch_calls)
+        _time.sleep(0.10)
+        assert len(touch_calls) == before, (
+            "heartbeat thread kept touching activity after the request returned"
+        )
+
+
 class TestAnthropicStreamCallbacks:
     """Verify Anthropic streaming refreshes activity on every event."""
 

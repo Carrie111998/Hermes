@@ -57,6 +57,13 @@ _OPENROUTER_PROVIDER_SORT_VALUES = {"throughput", "latency", "price"}
 # narrower non-rate-limit case.  See issue #24996.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+# direct_api_call refreshes the activity tracker this often while a
+# non-streaming request is in flight, so the cron inactivity watchdog
+# (HERMES_CRON_TIMEOUT) sees "slow but alive" rather than "hung". A fraction
+# of typical inactivity limits — frequent enough to feed the watchdog, rare
+# enough to be noise-free on fast responses. See direct_api_call docstring.
+_DIRECT_API_CALL_HEARTBEAT_INTERVAL_S = 30.0
+
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -565,11 +572,42 @@ def direct_api_call(agent, api_kwargs: dict):
     request runs in-flight normally, the per-request OpenAI client's own httpx
     timeout (provider ``request_timeout_seconds`` / ``HERMES_API_TIMEOUT``) bounds
     a genuinely hung provider — the same bound interactive calls already rely on.
+
+    A daemon heartbeat refreshes the activity tracker while the request is in
+    flight. Unlike the streaming paths (commit 2773b18b5), which call
+    ``_touch_activity()`` on every chunk/event, this path blocks on a single
+    ``create()`` with no intermediate events. Without the heartbeat, a provider
+    whose first byte is slow (connection alive, not a connection error) is
+    indistinguishable from a hung job, so the cron inactivity watchdog
+    (``HERMES_CRON_TIMEOUT``, default 600s) kills tasks that would have succeeded
+    once the httpx timeout elapsed. Symmetric gap left by 2773b18b5, which only
+    patched the four streaming paths.
     """
     _check_stale_giveup(agent)
     agent._touch_activity("waiting for non-streaming API response")
     request_client_holder = {"client": None}
     request_client_lock = threading.Lock()
+
+    # Heartbeat: see docstring. Daemon thread, stopped in finally so it never
+    # outlives the request (success, error, or interrupt). Event.wait returns
+    # True the instant the request finishes, so the thread exits promptly
+    # without sleeping off the tail of the interval.
+    _heartbeat_stop = threading.Event()
+    _heartbeat_started_at = time.time()
+
+    def _activity_heartbeat() -> None:
+        while not _heartbeat_stop.wait(_DIRECT_API_CALL_HEARTBEAT_INTERVAL_S):
+            agent._touch_activity(
+                "waiting for non-streaming API response "
+                f"({int(time.time() - _heartbeat_started_at)}s)"
+            )
+
+    _heartbeat_thread = threading.Thread(
+        target=_activity_heartbeat,
+        name="direct-api-call-heartbeat",
+        daemon=True,
+    )
+    _heartbeat_thread.start()
 
     def _abort_active_request(reason: str) -> None:
         """Abort the inline request from a watchdog/interrupt thread."""
@@ -614,6 +652,7 @@ def direct_api_call(agent, api_kwargs: dict):
         succeeded = True
         return response
     finally:
+        _heartbeat_stop.set()
         if getattr(agent, "_active_request_abort", None) is _abort_active_request:
             agent._active_request_abort = None
         with request_client_lock:
