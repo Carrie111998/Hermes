@@ -21,17 +21,22 @@ from agent.anthropic_adapter import (
 
 
 def _tool_result_messages_are_wellformed(messages):
-    """Every user message carrying tool_result blocks must lead with one."""
-    return all(
-        msg["content"][0].get("type") == "tool_result"
-        for msg in messages
-        if msg.get("role") == "user"
-        and isinstance(msg.get("content"), list)
-        and any(
+    """Every tool_result must sit in a contiguous run at the START of its message.
+
+    Checking only ``content[0]`` is too weak: ``[tool_result, text, tool_result]``
+    leads with a tool_result but still strands the second one behind the text.
+    """
+    for msg in messages:
+        if msg.get("role") != "user" or not isinstance(msg.get("content"), list):
+            continue
+        flags = [
             isinstance(b, dict) and b.get("type") == "tool_result"
             for b in msg["content"]
-        )
-    )
+        ]
+        n_results = sum(flags)
+        if n_results and not all(flags[:n_results]):
+            return False
+    return True
 
 
 class TestHoistToolResults:
@@ -94,6 +99,64 @@ class TestHoistToolResults:
                if b["type"] == "tool_result"]
         assert ids == ["a", "b", "c"]
         assert messages[1]["content"][-1]["type"] == "text"
+
+    def test_interleaved_results_are_compacted_into_leading_run(self):
+        """A leading tool_result does not mean the message is valid.
+
+        ``[tool_result, text, tool_result]`` starts at index 0, so a fast path
+        keyed on "is the first tool_result at index 0" skips it and strands the
+        second result behind the text block (review feedback on #79158).
+        """
+        messages = [
+            {"role": "assistant", "content": [
+                {"type": "tool_use", "id": "a", "name": "x", "input": {}},
+                {"type": "tool_use", "id": "b", "name": "y", "input": {}},
+            ]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                {"type": "text", "text": "reminder"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+            ]},
+        ]
+
+        _hoist_tool_results_to_front(messages)
+
+        assert [b["type"] for b in messages[1]["content"]] == [
+            "tool_result", "tool_result", "text",
+        ]
+        assert [b["tool_use_id"] for b in messages[1]["content"]
+                if b["type"] == "tool_result"] == ["a", "b"]
+        assert _tool_result_messages_are_wellformed(messages)
+
+    def test_trailing_result_after_multiple_texts_is_compacted(self):
+        messages = [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                {"type": "text", "text": "one"},
+                {"type": "text", "text": "two"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+            ]},
+        ]
+
+        _hoist_tool_results_to_front(messages)
+
+        assert [b["type"] for b in messages[0]["content"]] == [
+            "tool_result", "tool_result", "text", "text",
+        ]
+        assert [b["text"] for b in messages[0]["content"]
+                if b["type"] == "text"] == ["one", "two"]
+
+    def test_wellformed_helper_rejects_interleaved_shape(self):
+        """The helper itself must not call the interleaved shape valid."""
+        interleaved = [
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "a", "content": "1"},
+                {"type": "text", "text": "reminder"},
+                {"type": "tool_result", "tool_use_id": "b", "content": "2"},
+            ]},
+        ]
+
+        assert not _tool_result_messages_are_wellformed(interleaved)
 
     def test_multiple_leading_blocks_all_move_behind_results(self):
         messages = [

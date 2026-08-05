@@ -2435,25 +2435,27 @@ def _hoist_tool_results_to_front(result: List[Dict[str, Any]]) -> None:
     should still see, it just may not sit ahead of the tool_result blocks.
     Relative order WITHIN each group is preserved, so parallel tool batches
     keep their result order and the surviving text keeps its reading order.
+
+    Note the message is only valid when the tool_result blocks form a
+    CONTIGUOUS leading run -- ``[tool_result, text, tool_result]`` leads with
+    one but still strands the second behind the text, so it is compacted too.
     Mutates ``result`` in place.
     """
     for m in result:
         if m.get("role") != "user" or not isinstance(m.get("content"), list):
             continue
         blocks = m["content"]
-        # Fast path: nothing to do unless a tool_result exists and something
-        # non-tool_result sits ahead of it. Keeps the common case allocation
-        # free and leaves already-valid messages byte-identical (prompt cache).
-        first_tool_result = next(
-            (
-                idx
-                for idx, b in enumerate(blocks)
-                if isinstance(b, dict) and b.get("type") == "tool_result"
-            ),
-            None,
-        )
-        if first_tool_result is None or first_tool_result == 0:
+        # Fast path: the message is already valid only when every tool_result
+        # forms a contiguous prefix. Checking just the first index is not
+        # enough -- [tool_result, text, tool_result] starts at 0 but still
+        # strands the second result behind the text block.
+        is_tool_result = [
+            isinstance(b, dict) and b.get("type") == "tool_result" for b in blocks
+        ]
+        n_results = sum(is_tool_result)
+        if n_results == 0 or all(is_tool_result[:n_results]):
             continue
+        leading = is_tool_result.index(False) if not all(is_tool_result) else 0
 
         tool_results = [
             b for b in blocks
@@ -2464,13 +2466,13 @@ def _hoist_tool_results_to_front(result: List[Dict[str, Any]]) -> None:
             if not (isinstance(b, dict) and b.get("type") == "tool_result")
         ]
         logger.warning(
-            "Pre-call sanitizer: hoisted %d tool_result block(s) ahead of %d "
-            "leading block(s) (types=%s) to satisfy Anthropic tool_use/"
-            "tool_result adjacency",
+            "Pre-call sanitizer: compacted %d tool_result block(s) into a "
+            "leading run past %d interleaved block(s) (types=%s) to satisfy "
+            "Anthropic tool_use/tool_result adjacency",
             len(tool_results),
-            first_tool_result,
-            [b.get("type") if isinstance(b, dict) else type(b).__name__
-             for b in blocks[:first_tool_result]],
+            len(others),
+            sorted({str(b.get("type")) if isinstance(b, dict)
+                    else type(b).__name__ for b in others}),
         )
         m["content"] = tool_results + others
 
