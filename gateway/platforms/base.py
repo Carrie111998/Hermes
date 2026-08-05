@@ -541,7 +541,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Any, Callable, Awaitable, Tuple, Union
 from enum import Enum
 
 from pathlib import Path as _Path
@@ -550,6 +550,9 @@ sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 from gateway.config import Platform, PlatformConfig
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
+
+if TYPE_CHECKING:
+    from agent.display import ToolPreview
 
 
 # ---------------------------------------------------------------------------
@@ -3095,11 +3098,27 @@ class BasePlatformAdapter(ABC):
         # progress bubbles compact — they persist as permanent messages).
         preview = event.preview
         if preview:
+            from agent.display import prepare_tool_preview
+
             cap = preview_max_len if preview_max_len > 0 else 40
-            if len(preview) > cap:
-                preview = preview[:cap - 3] + "..."
-            return f"{emoji} {event.tool_name}: \"{preview}\""
+            prepared = prepare_tool_preview(
+                event.tool_name,
+                event.args,
+                fallback=preview,
+                max_len=cap,
+            )
+            rendered = self.format_tool_preview(prepared)
+            return f"{emoji} {event.tool_name}: \"{rendered}\""
         return f"{emoji} {event.tool_name}..."
+
+    def format_tool_preview(self, preview: "ToolPreview") -> str:
+        """Apply platform-native formatting to a compact tool preview.
+
+        Most adapters only need the compact text. Rich-text adapters can use
+        the preview's explicit metadata to preserve details such as a URL that
+        was shortened for display.
+        """
+        return preview.text
 
     @property
     def has_fatal_error(self) -> bool:
@@ -3418,14 +3437,30 @@ class BasePlatformAdapter(ABC):
             return None
         if not transcript:
             return None
-        # Exclude the current turn's assistant message, which has already been
-        # persisted by the time we reach delivery but must not be treated as
-        # "history" for dedup purposes.
+        # Exclude the CURRENT TURN entirely — everything from the last user
+        # message onward. The agent persists rows as it produces them, so by
+        # delivery time the transcript already contains this turn's tool
+        # results and assistant reply. The old form dropped only the most
+        # recent assistant entry, which left THIS turn's tool results in
+        # "history": a text_to_speech result carrying media_tag then put its
+        # own path into the dedup set and delivery silently stripped the
+        # attachment (staging repro 2026-07-29 — `response_delivery_dropped`
+        # for a MEDIA-tag-only reply; user saw TTS produce no audio).
         history = list(transcript)
-        for msg in reversed(history):
-            if msg.get("role") == "assistant":
-                history.remove(msg)
+        last_user_idx = None
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("role") == "user":
+                last_user_idx = i
                 break
+        if last_user_idx is not None:
+            history = history[:last_user_idx]
+        else:
+            # No user row (unusual store shape): keep the old safe behavior of
+            # at least excluding the trailing assistant reply.
+            for msg in reversed(history):
+                if msg.get("role") == "assistant":
+                    history.remove(msg)
+                    break
         if not history:
             return None
         # Avoid circular import: gateway.run already imports this module.
@@ -5529,11 +5564,16 @@ class BasePlatformAdapter(ABC):
 
         coerce_plaintext_gateway_command(event)
 
-        # Rewrite ``event.source.thread_id`` via the installed recovery hook
-        # (Telegram DM topic mode) so the session key, guard checks, and
-        # downstream delivery all agree on the same lane.
-        # Offloaded: the sync hook must not block the loop.
-        await asyncio.to_thread(self._apply_topic_recovery, event)
+        # Telegram topic recovery only applies to private DM topic lanes. Do
+        # not submit a no-op check for group/forum/channel traffic to the
+        # shared default executor: a busy pool would delay message dispatch.
+        needs_topic_recovery = (
+            getattr(self, "_topic_recovery_fn", None) is not None
+            and event.source.platform == Platform.TELEGRAM
+            and event.source.chat_type == "dm"
+        )
+        if needs_topic_recovery:
+            await asyncio.to_thread(self._apply_topic_recovery, event)
 
         session_key = build_session_key(
             event.source,
@@ -5843,17 +5883,15 @@ class BasePlatformAdapter(ABC):
                 media_files, response = self.extract_media(response)
                 media_files = self.filter_media_delivery_paths(media_files)
 
-                # Deduplicate against media already delivered in prior turns.
-                # The model may echo a previous MEDIA: tag or bare file path in
-                # a later response; without this guard the same file is sent
-                # repeatedly.
+                # Do NOT deduplicate MEDIA tags against prior turns here.
+                # The auto-append path in GatewayRunner._run_agent_inner already
+                # deduplicates auto-appended tags via _collect_auto_append_media_tags
+                # with history_media_paths, so this filter would only catch explicit
+                # MEDIA tags the model deliberately included in its response — which
+                # must be preserved (user asked to resend an image, the model echoed
+                # a path intentionally, etc.).  Bare-file-path dedup still applies
+                # to local_files below via the same _history_media_paths set.
                 _history_media_paths = self._history_media_paths_for_session(session_key)
-                if _history_media_paths:
-                    media_files = [
-                        (path, is_voice)
-                        for path, is_voice in media_files
-                        if path not in _history_media_paths
-                    ]
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
@@ -5874,6 +5912,15 @@ class BasePlatformAdapter(ABC):
                     local_files, text_content = self.extract_local_files(text_content)
                     local_files = self.filter_local_delivery_paths(local_files)
                     if _history_media_paths:
+                        _suppressed = [p for p in local_files if p in _history_media_paths]
+                        if _suppressed:
+                            # Log the suppression (#73771) — silent drops here
+                            # cost operators hours of log-diving.
+                            logger.info(
+                                "[%s] Suppressing %d bare local file path(s) already "
+                                "delivered in this session: %s",
+                                self.name, len(_suppressed), _suppressed,
+                            )
                         local_files = [p for p in local_files if p not in _history_media_paths]
                     if local_files:
                         logger.info("[%s] extract_local_files found %d file(s) in response", self.name, len(local_files))
@@ -6019,13 +6066,14 @@ class BasePlatformAdapter(ABC):
                                 record_obligation,
                             )
 
-                            if ledger_enabled():
+                            if await asyncio.to_thread(ledger_enabled):
                                 _obligation_id = compute_obligation_id(
                                     session_key,
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                record_obligation(
+                                await asyncio.to_thread(
+                                    record_obligation,
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
                                     platform=str(
@@ -6036,7 +6084,7 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(_obligation_id)
+                                await asyncio.to_thread(mark_attempting, _obligation_id)
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -6055,9 +6103,10 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                await asyncio.to_thread(mark_delivered, _obligation_id)
                             else:
-                                mark_failed(
+                                await asyncio.to_thread(
+                                    mark_failed,
                                     _obligation_id,
                                     str(getattr(result, "error", "") or ""),
                                 )

@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Any, Callable, Dict, Optional, cast
+from typing import Any, Callable, Dict, Optional, Tuple, cast
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, SendResult
@@ -30,6 +30,14 @@ from gateway.relay.transport import RelayTransport
 from gateway.session import SessionSource
 
 logger = logging.getLogger(__name__)
+
+# Keep the drain-path going-idle ACK budget strictly under the runner's default
+# adapter disconnect timeout (5s). If go_idle consumes the whole outer budget,
+# cancellation can fire before transport.disconnect() and leave the websocket
+# open. Paired with transport teardown budgets of 1s each for supervisor,
+# reader, and ws.close (~3s), the full drain path stays inside 5s.
+_RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S = 2.0
+_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S = 1.0
 
 
 def _utf16_len(text: str) -> int:
@@ -72,6 +80,11 @@ class RelayAdapter(BasePlatformAdapter):
         # recipient's author binding; we re-attach this user_id as
         # metadata.user_id on the outbound action so it can. See _capture_scope.
         self._dm_user_by_chat: Dict[str, str] = {}
+        # chat_id -> (thread_id, initial_name) of the auto-thread the CONNECTOR
+        # created for our most recent send into that chat (auto-thread routing
+        # feedback off SendResult — see send()). Consumed by the gateway's
+        # semantic thread-rename lane; bounded like the sibling caches.
+        self._auto_thread_by_chat: Dict[str, Tuple[str, str]] = {}
         # chat_id -> chat_type (e.g. "dm", "channel", "group") learned from the
         # inbound event. Used to reproduce native Slack's synthetic-DM-thread
         # suppression on the relay lane: a DM streaming reply carries
@@ -811,8 +824,11 @@ class RelayAdapter(BasePlatformAdapter):
         if self._revocation_monitor is not None:
             self._revocation_monitor.cancel()
             try:
-                await self._revocation_monitor
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
+                await asyncio.wait_for(
+                    self._revocation_monitor,
+                    timeout=_RELAY_REVOCATION_MONITOR_TEARDOWN_TIMEOUT_S,
+                )
+            except (asyncio.TimeoutError, asyncio.CancelledError, Exception):  # noqa: BLE001 - best-effort teardown
                 pass
             self._revocation_monitor = None
         if self._transport is not None:
@@ -826,15 +842,32 @@ class RelayAdapter(BasePlatformAdapter):
             # the ack (Q-5.3c). Best-effort + guarded: a transport without go_idle
             # (the stub) or a failed/timed-out ack must not block shutdown — we
             # proceed to disconnect exactly as before, no regression.
-            go_idle = getattr(self._transport, "go_idle", None)
-            if callable(go_idle):
+            #
+            # transport.disconnect() runs in finally so an outer cancellation
+            # during go_idle (runner default adapter budget is 5s) still closes
+            # the socket/supervisor instead of leaking them. shield() keeps the
+            # teardown await itself from being cancelled mid-flight.
+            try:
+                go_idle = getattr(self._transport, "go_idle", None)
+                if callable(go_idle):
+                    try:
+                        result: Any = go_idle(
+                            timeout_s=_RELAY_GO_IDLE_ON_DISCONNECT_TIMEOUT_S
+                        )
+                        if asyncio.iscoroutine(result):
+                            await result
+                    except Exception:  # noqa: BLE001 - going-idle is an optimization, never blocks drain
+                        logger.debug(
+                            "relay going_idle failed during drain", exc_info=True
+                        )
+            finally:
                 try:
-                    result: Any = go_idle()
-                    if asyncio.iscoroutine(result):
-                        await result
-                except Exception:  # noqa: BLE001 - going-idle is an optimization, never blocks drain
-                    logger.debug("relay going_idle failed during drain", exc_info=True)
-            await self._transport.disconnect()
+                    await asyncio.shield(self._transport.disconnect())
+                except Exception:  # noqa: BLE001 - teardown must not block outer cancel propagation
+                    logger.debug(
+                        "relay transport disconnect failed during drain",
+                        exc_info=True,
+                    )
 
     async def go_dormant(self) -> bool:
         """Quiesce the relay for a scale-to-zero suspend (D12 / Phase 0).
@@ -939,11 +972,40 @@ class RelayAdapter(BasePlatformAdapter):
             },
             platform=self._platform_by_chat.get(str(chat_id)),
         )
+        # Auto-thread routing feedback (contract §SendResult): when the
+        # connector's auto-thread egress policy routed this send into a
+        # thread it just created, the result carries thread_id (+ the
+        # initial name). The conversation was keyed on the PARENT channel —
+        # the thread didn't exist at ingest — so this is the only place the
+        # gateway learns where the reply landed. The semantic-rename lane
+        # (auto session title) reads it via auto_thread_info_for_chat.
+        try:
+            _at_thread = result.get("thread_id")
+            _at_name = result.get("auto_thread_name")
+            if _at_thread and _at_name:
+                self._auto_thread_by_chat[str(chat_id)] = (
+                    str(_at_thread),
+                    str(_at_name),
+                )
+                if len(self._auto_thread_by_chat) > 256:
+                    self._auto_thread_by_chat.pop(
+                        next(iter(self._auto_thread_by_chat)), None
+                    )
+        except Exception:  # noqa: BLE001 - feedback capture must never break send
+            pass
         return SendResult(
             success=bool(result.get("success")),
             message_id=result.get("message_id"),
             error=result.get("error"),
         )
+
+    def auto_thread_info_for_chat(
+        self, chat_id: str
+    ) -> Optional[Tuple[str, str]]:
+        """(thread_id, initial_name) of the auto-thread the connector created
+        for the most recent send into *chat_id*, if any. Consumed by the
+        gateway's semantic thread-rename lane (auto session title)."""
+        return self._auto_thread_by_chat.get(str(chat_id))
 
     def _resolve_reply_to_for_send(
         self,
@@ -2026,6 +2088,7 @@ class RelayAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        prefer_connector_created: bool = False,
         parent_chat_id: Optional[str] = None,
     ) -> bool:
         """Best-effort thread rename via the connector's `thread_rename` op.
@@ -2034,10 +2097,15 @@ class RelayAdapter(BasePlatformAdapter):
         called by the SAME semantic-rename lane (run.py
         _rename_discord_auto_thread_for_session_title), which fires only for
         sources carrying the connector-stamped auto-thread markers.
-        ``only_if_current_name`` crosses the wire; the CONNECTOR enforces the
-        no-clobber guard (it owns the platform read), failing safe on
-        platforms that can't read the current name. ``parent_chat_id`` is
-        the containing chat where the caller knows it (Telegram needs it);
+
+        No-clobber guard: prefer ``prefer_connector_created=True``, which asks
+        the CONNECTOR to enforce the guard from ITS OWN created-name memory
+        (only_if_connector_created) — the gateway no longer has to reproduce
+        the thread's initial name byte-for-byte, which drifted on any
+        normalization difference and silently declined every relay rename.
+        ``only_if_current_name`` is the legacy string guard, kept for the
+        native-marker lane and older connectors. ``parent_chat_id`` is the
+        containing chat where the caller knows it (Telegram needs it);
         defaults to the thread id itself (Discord ignores chat_id).
         """
         if self._transport is None or not self.descriptor.supports_op("thread_rename"):
@@ -2053,7 +2121,9 @@ class RelayAdapter(BasePlatformAdapter):
             "thread_name": cleaned[:100],
             "metadata": self._with_scope(chat_id, None),
         }
-        if only_if_current_name is not None:
+        if prefer_connector_created:
+            action["only_if_connector_created"] = True
+        elif only_if_current_name is not None:
             action["only_if_current_name"] = str(only_if_current_name)
         try:
             result = await self._transport.send_outbound(
