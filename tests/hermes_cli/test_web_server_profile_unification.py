@@ -124,6 +124,89 @@ class TestProfileScopedMcp:
         )
 
 
+class TestProfileScopedMemory:
+    def test_memory_status_reads_requested_profile(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        default_home = isolated_profiles["default"]
+        worker_home = isolated_profiles["worker_beta"]
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"memory": {"provider": "default-provider"}}),
+            encoding="utf-8",
+        )
+        (worker_home / "config.yaml").write_text(
+            yaml.safe_dump({"memory": {"provider": "worker-provider"}}),
+            encoding="utf-8",
+        )
+        (default_home / "memories").mkdir(parents=True, exist_ok=True)
+        (worker_home / "memories").mkdir(parents=True, exist_ok=True)
+        (default_home / "memories" / "USER.md").write_text(
+            "default-user", encoding="utf-8"
+        )
+        (worker_home / "memories" / "USER.md").write_text(
+            "worker", encoding="utf-8"
+        )
+        monkeypatch.setattr(web_server, "_discover_memory_provider_statuses", lambda: [])
+
+        resp = client.get("/api/memory", params={"profile": "worker_beta"})
+
+        assert resp.status_code == 200
+        assert resp.json()["active"] == "worker-provider"
+        assert resp.json()["builtin_files"]["user"] == len("worker")
+
+    def test_memory_provider_selection_writes_requested_profile_only(
+        self, client, isolated_profiles, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        default_home = isolated_profiles["default"]
+        worker_home = isolated_profiles["worker_beta"]
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump({"memory": {"provider": "default-provider"}}),
+            encoding="utf-8",
+        )
+        (worker_home / "config.yaml").write_text("{}\n", encoding="utf-8")
+        monkeypatch.setattr(
+            web_server, "_require_memory_provider_ready", lambda name: None
+        )
+
+        resp = client.put(
+            "/api/memory/provider",
+            params={"profile": "worker_beta"},
+            json={"provider": "honcho"},
+        )
+
+        assert resp.status_code == 200
+        assert _cfg(worker_home)["memory"]["provider"] == "honcho"
+        assert _cfg(default_home)["memory"]["provider"] == "default-provider"
+
+    def test_memory_reset_deletes_requested_profile_only(self, client, isolated_profiles):
+        default_home = isolated_profiles["default"]
+        worker_home = isolated_profiles["worker_beta"]
+        for home, text in ((default_home, "default-user"), (worker_home, "worker-user")):
+            mem_dir = home / "memories"
+            mem_dir.mkdir(parents=True, exist_ok=True)
+            (mem_dir / "USER.md").write_text(text, encoding="utf-8")
+            (mem_dir / "MEMORY.md").write_text(f"{text}-memory", encoding="utf-8")
+
+        resp = client.post(
+            "/api/memory/reset",
+            params={"profile": "worker_beta"},
+            json={"target": "user"},
+        )
+
+        assert resp.status_code == 200
+        assert "USER.md" in resp.json()["deleted"]
+        assert not (worker_home / "memories" / "USER.md").exists()
+        assert (worker_home / "memories" / "MEMORY.md").exists()
+        assert (
+            (default_home / "memories" / "USER.md").read_text(encoding="utf-8")
+            == "default-user"
+        )
+
+
 
     def test_mcp_test_oauth_server_without_token_is_not_ok(
         self, client, isolated_profiles, monkeypatch

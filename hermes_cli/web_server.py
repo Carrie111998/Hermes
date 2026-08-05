@@ -6057,25 +6057,34 @@ async def get_memory_provider_config(name: str, surface: Optional[str] = None, p
     return await asyncio.to_thread(_run)
 
 @app.post("/api/memory/providers/{name}/setup")
-async def setup_memory_provider(name: str, body: MemoryProviderSetupRequest):
+async def setup_memory_provider(
+    name: str,
+    body: MemoryProviderSetupRequest,
+    profile: Optional[str] = None,
+):
     _require_valid_memory_provider_name(name)
-    provider = _load_memory_provider(name)
-    if provider is None and not _memory_provider_manifest(name):
-        # No discoverable plugin directory → nothing whose manifest could
-        # legitimately declare setup commands. Refuse before the
-        # command-running path. (provider may be None with a manifest present
-        # when its pip deps aren't installed yet — that's the setup use case.)
-        raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
-    if provider is not None and body.values:
-        try:
-            _write_memory_provider_config_values(name, provider, body.values)
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception:
-            _log.exception("Failed to persist memory provider setup values for %s", name)
-            raise HTTPException(status_code=500, detail="Internal server error")
-    _invalidate_plugins_hub_cache()
-    return _install_memory_provider_setup(name)
+
+    def _run():
+        with _profile_scope(profile):
+            provider = _load_memory_provider(name)
+            if provider is None and not _memory_provider_manifest(name):
+                # No discoverable plugin directory → nothing whose manifest could
+                # legitimately declare setup commands. Refuse before the
+                # command-running path. (provider may be None with a manifest present
+                # when its pip deps aren't installed yet — that's the setup use case.)
+                raise HTTPException(status_code=404, detail=f"Unknown memory provider: {name}")
+            if provider is not None and body.values:
+                try:
+                    _write_memory_provider_config_values(name, provider, body.values)
+                except ValueError as exc:
+                    raise HTTPException(status_code=400, detail=str(exc)) from exc
+                except Exception:
+                    _log.exception("Failed to persist memory provider setup values for %s", name)
+                    raise HTTPException(status_code=500, detail="Internal server error")
+            _invalidate_plugins_hub_cache()
+            return _install_memory_provider_setup(name)
+
+    return await asyncio.to_thread(_run)
 
 
 @app.put("/api/memory/providers/{name}/config")
@@ -12737,63 +12746,81 @@ async def remove_credential_pool_entry(provider: str, index: int):
 
 
 @app.get("/api/memory")
-async def get_memory_status():
-    cfg = load_config()
-    active = ""
-    mem = cfg.get("memory")
-    if isinstance(mem, dict):
-        active = _normalize_memory_provider_name(mem.get("provider"))
+async def get_memory_status(profile: Optional[str] = None):
+    def _run():
+        with _profile_scope(profile):
+            cfg = load_config()
+            active = ""
+            mem = cfg.get("memory")
+            if isinstance(mem, dict):
+                active = _normalize_memory_provider_name(mem.get("provider"))
 
-    # Built-in memory file sizes (so the UI can show what a reset would erase).
-    mem_dir = get_hermes_home() / "memories"
-    files = {}
-    for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
-        path = mem_dir / fname
-        files[key] = path.stat().st_size if path.exists() else 0
+            # Built-in memory file sizes (so the UI can show what a reset would erase).
+            mem_dir = get_hermes_home() / "memories"
+            files = {}
+            for fname, key in (("MEMORY.md", "memory"), ("USER.md", "user")):
+                path = mem_dir / fname
+                files[key] = path.stat().st_size if path.exists() else 0
 
-    return {
-        "active": active,
-        "providers": _discover_memory_provider_statuses(),
-        "builtin_files": files,
-    }
+            return {
+                "active": active,
+                "providers": _discover_memory_provider_statuses(),
+                "builtin_files": files,
+            }
+
+    return await asyncio.to_thread(_run)
 
 
 @app.put("/api/memory/provider")
-async def set_memory_provider(body: MemoryProviderSelect):
-    provider = _normalize_memory_provider_name(body.provider)
+async def set_memory_provider(
+    body: MemoryProviderSelect,
+    profile: Optional[str] = None,
+):
+    def _run():
+        with _profile_scope(profile):
+            provider = _normalize_memory_provider_name(body.provider)
 
-    _require_memory_provider_ready(provider)
+            _require_memory_provider_ready(provider)
 
-    cfg = load_config()
-    if not isinstance(cfg.get("memory"), dict):
-        cfg["memory"] = {}
-    cfg["memory"]["provider"] = provider
-    save_config(cfg)
-    return {"ok": True, "active": provider}
+            cfg = load_config()
+            if not isinstance(cfg.get("memory"), dict):
+                cfg["memory"] = {}
+            cfg["memory"]["provider"] = provider
+            save_config(cfg)
+            return {"ok": True, "active": provider}
+
+    return await asyncio.to_thread(_run)
 
 
 @app.post("/api/memory/reset")
-async def reset_memory(body: MemoryReset):
+async def reset_memory(
+    body: MemoryReset,
+    profile: Optional[str] = None,
+):
     target = (body.target or "all").strip().lower()
     if target not in {"all", "memory", "user"}:
         raise HTTPException(status_code=400, detail="target must be all, memory, or user")
 
-    mem_dir = get_hermes_home() / "memories"
-    deleted = []
-    targets = []
-    if target in {"all", "memory"}:
-        targets.append("MEMORY.md")
-    if target in {"all", "user"}:
-        targets.append("USER.md")
-    for fname in targets:
-        path = mem_dir / fname
-        if path.exists():
-            try:
-                path.unlink()
-                deleted.append(fname)
-            except OSError as exc:
-                raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
-    return {"ok": True, "deleted": deleted}
+    def _run():
+        with _profile_scope(profile):
+            mem_dir = get_hermes_home() / "memories"
+            deleted = []
+            targets = []
+            if target in {"all", "memory"}:
+                targets.append("MEMORY.md")
+            if target in {"all", "user"}:
+                targets.append("USER.md")
+            for fname in targets:
+                path = mem_dir / fname
+                if path.exists():
+                    try:
+                        path.unlink()
+                        deleted.append(fname)
+                    except OSError as exc:
+                        raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
+            return {"ok": True, "deleted": deleted}
+
+    return await asyncio.to_thread(_run)
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-import { api, fetchJSON } from "./api";
+import { api, fetchJSON, setManagementProfile } from "./api";
 
 const reloadMocks = vi.hoisted(() => ({
   attemptDashboardTokenReloadOnce: vi.fn(() => false),
@@ -33,6 +33,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  setManagementProfile("");
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
 });
@@ -171,5 +172,34 @@ describe("api OAuth helpers", () => {
       expect(init.credentials).toBe("include");
       expect((init.headers as Headers).has(SESSION_HEADER)).toBe(false);
     }
+  });
+});
+
+describe("api Memory helpers", () => {
+  it("scopes memory admin calls to the active management profile", async () => {
+    vi.stubGlobal("window", { __HERMES_SESSION_TOKEN__: "loopback-token" });
+    const fetchMock = jsonFetchMock({
+      active: "",
+      providers: [],
+      builtin_files: { memory: 0, user: 0 },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    setManagementProfile("coder");
+
+    await api.getMemory();
+    await api.getMemoryProviderConfig("honcho");
+    await api.updateMemoryProviderConfig("honcho", { api_key: "secret" });
+    await api.setupMemoryProvider("honcho", { api_key: "secret" });
+    await api.setMemoryProvider("honcho");
+    await api.resetMemory("user");
+
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      "/api/memory?profile=coder",
+      "/api/memory/providers/honcho/config?profile=coder",
+      "/api/memory/providers/honcho/config?profile=coder",
+      "/api/memory/providers/honcho/setup?profile=coder",
+      "/api/memory/provider?profile=coder",
+      "/api/memory/reset?profile=coder",
+    ]);
   });
 });
