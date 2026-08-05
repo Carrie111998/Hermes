@@ -50,7 +50,7 @@ describe('resolvePython (exported for direct testing — #63754)', () => {
     // Regression for #63754: import.meta.dirname was undefined on Node < 20.11,
     // which propagated through `resolvePython(root)` to `path.resolve(undefined, ...)`
     // and crashed with ERR_INVALID_ARG_TYPE.
-    let result: string
+    let result!: string
     expect(() => {
       // Simulate the pre-fix bug: call with the literal value that
       // import.meta.dirname would have produced — undefined — and assert
@@ -62,7 +62,7 @@ describe('resolvePython (exported for direct testing — #63754)', () => {
   })
 
   it('returns a string when root is an empty string', () => {
-    let result: string
+    let result!: string
     expect(() => {
       result = resolvePython('')
     }).not.toThrow()
