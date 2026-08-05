@@ -153,6 +153,78 @@ async def test_agent_failed_early_skip_db_when_agent_has_session_db(
     )
 
 
+@pytest.mark.asyncio
+async def test_internal_event_marks_persisted_user_turn_hidden(monkeypatch, tmp_path):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "failed": True,
+            "final_response": None,
+            "error": "synthetic turn stopped early",
+            "messages": [],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = _event()
+    event.internal = True
+
+    await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    assert (
+        runner._run_agent.await_args.kwargs.get("persist_user_display_kind")
+        == "hidden"
+    )
+    persisted_user_entries = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") == "user"
+    ]
+    assert persisted_user_entries
+    assert persisted_user_entries[-1]["display_kind"] == "hidden"
+
+
+@pytest.mark.asyncio
+async def test_internal_event_does_not_hide_queued_genuine_user_turn(
+    monkeypatch, tmp_path
+):
+    runner = _bootstrap(monkeypatch, tmp_path)
+    runner._run_agent = AsyncMock(
+        return_value={
+            "final_response": "queued turn completed",
+            "messages": [
+                {"role": "user", "content": "internal wake"},
+                {"role": "assistant", "content": "wake handled"},
+                {"role": "user", "content": "genuine queued request"},
+                {"role": "assistant", "content": "queued turn completed"},
+            ],
+            "history_offset": 0,
+            "last_prompt_tokens": 0,
+        }
+    )
+    event = _event()
+    event.internal = True
+
+    await runner._handle_message_with_agent(
+        event, _source(), "agent:main:telegram:group:-1001:12345", 1
+    )
+
+    persisted_user_entries = [
+        call.args[1]
+        for call in runner.session_store.append_to_transcript.call_args_list
+        if len(call.args) >= 2
+        and isinstance(call.args[1], dict)
+        and call.args[1].get("role") == "user"
+    ]
+    assert len(persisted_user_entries) == 2
+    assert persisted_user_entries[0]["display_kind"] == "hidden"
+    assert "display_kind" not in persisted_user_entries[1]
+
+
 # ── Test 2: agent_failed_early with no _session_db → skip_db not True ─
 
 
@@ -189,5 +261,3 @@ async def test_not_new_messages_skip_db_when_agent_has_session_db(
 
 
 # ── Test 4: normal path (new_messages found) uses skip_db=True ────────
-
-

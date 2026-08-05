@@ -60,6 +60,7 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
+from agent.message_content import build_cli_handoff_notice, build_resume_recovery_note
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -933,75 +934,6 @@ def _is_fresh_gateway_interruption(
         return True
     current = time.time() if now is None else now
     return current - timestamp <= window
-
-
-def build_resume_recovery_note(
-    reason: Optional[str],
-    message: str = "",
-    *,
-    interactive: bool = True,
-) -> str:
-    """Build the resume-pending recovery system note for an interrupted turn.
-
-    ``reason`` is the session's ``resume_reason`` (``restart_timeout``,
-    ``shutdown_timeout``, or anything else → generic interruption phrasing).
-    ``message`` is the user's NEW message text; empty means this is the
-    startup auto-resume turn synthesized by
-    ``_schedule_resume_pending_sessions`` with no human message attached.
-
-    ``interactive`` selects the empty-message guidance: on interactive
-    platforms a human is present, so "report the restore and ask what next"
-    is right.  On non-interactive event platforms (webhook, API server —
-    adapters with ``interactive_resume = False``) nobody can answer; the
-    resumed turn must instead complete the interrupted work, or the task is
-    silently abandoned behind a "restored" acknowledgement that goes
-    nowhere (#57056).
-    """
-    reason_phrase = (
-        "a gateway restart"
-        if reason == "restart_timeout"
-        else "a gateway shutdown"
-        if reason == "shutdown_timeout"
-        else "a gateway interruption"
-    )
-    if message:
-        resume_guidance = (
-            "Address the user's NEW message below FIRST and focus "
-            "on what the user is asking now."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
-    elif interactive:
-        resume_guidance = (
-            "Report to the user that the session was restored "
-            "successfully and ask what they would like to do next."
-        )
-        tail_guidance = (
-            "Do NOT re-execute old tool calls — skip any "
-            "unfinished work from the conversation history."
-        )
-    else:
-        resume_guidance = (
-            "No user is present on this non-interactive platform, "
-            "so do NOT emit a 'session restored' acknowledgement "
-            "or ask questions. Review the conversation history and "
-            "CONTINUE the interrupted task to completion."
-        )
-        tail_guidance = (
-            "Do NOT re-run tool calls whose results already "
-            "appear in the history — resume from the first step "
-            "that has no recorded result."
-        )
-    return (
-        f"[System note: The previous turn was interrupted by "
-        f"{reason_phrase}; the gateway is now back online. "
-        f"Any restart/shutdown command in the history has already "
-        f"run — do NOT re-execute or verify it. {resume_guidance} "
-        f"{tail_guidance}]"
-        + (f"\n\n{message}" if message else "")
-    )
 
 
 # Assistant-message fields that must survive transcript replay so multi-turn
@@ -5313,6 +5245,10 @@ class TurnRunner:
                 _conversation_kwargs["moa_config"] = ctx.moa_config
             if _persist_user_timestamp_override is not None:
                 _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
+            if ctx.persist_user_display_kind:
+                _conversation_kwargs["persist_user_display_kind"] = (
+                    ctx.persist_user_display_kind
+                )
             result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
         finally:
             unregister_gateway_notify(_approval_session_key)
@@ -5532,6 +5468,25 @@ class TurnRunner:
             try:
                 from agent.title_generator import maybe_auto_title
                 all_msgs = ctx.result_holder[0].get("messages", []) if ctx.result_holder[0] else []
+                current_user_turn = None
+                current_user_idx = getattr(agent, "_persist_user_message_idx", None)
+                if ctx.persist_user_display_kind:
+                    # Explicit event provenance wins over positional recovery:
+                    # compression can rebuild/re-anchor the returned list, but
+                    # an internal MessageEvent remains internal regardless of
+                    # which model-facing wrapper was applied to its text.
+                    current_user_turn = {
+                        "role": "user",
+                        "content": ctx.message,
+                        "display_kind": ctx.persist_user_display_kind,
+                    }
+                elif (
+                    isinstance(current_user_idx, int)
+                    and 0 <= current_user_idx < len(all_msgs)
+                    and isinstance(all_msgs[current_user_idx], dict)
+                    and all_msgs[current_user_idx].get("role") == "user"
+                ):
+                    current_user_turn = all_msgs[current_user_idx]
                 # In Gateway mode, auto-title failures must NOT be
                 # surfaced as user-visible messages (fixes #23246).
                 # Log them at debug level only — they are not actionable
@@ -5561,6 +5516,7 @@ class TurnRunner:
                         getattr(agent, "model", None) == _title_model
                         and getattr(agent, "provider", None) == _title_provider
                     )) if agent else None,
+                    "current_user_turn": current_user_turn,
                 }
                 if self._runner._is_telegram_topic_lane(ctx.source):
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_telegram_topic_title_rename(
@@ -11752,12 +11708,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # so the synthetic turn isn't queued behind a stale running flag.
         self._release_running_agent_state(session_key)
 
-        synthetic_text = (
-            f"[Session was just handed off from CLI (\"{cli_title}\") to this "
-            f"channel. The full prior conversation history is loaded above. "
-            f"Briefly confirm you're working here and summarize what we were "
-            f"working on, so the user can continue from this device.]"
-        )
+        synthetic_text = build_cli_handoff_notice(cli_title)
 
         synthetic_event = MessageEvent(
             text=synthetic_text,
@@ -16295,6 +16246,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _redact_pii = False
         persist_user_message = None
         persist_user_timestamp = None
+        persist_user_display_kind = (
+            "hidden" if getattr(event, "internal", False) else None
+        )
         try:
             _pcfg = _load_gateway_config()
             _redact_pii = bool((_pcfg.get("privacy") or {}).get("redact_pii", False))
@@ -17395,6 +17349,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
@@ -17839,6 +17794,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else ts
                     ),
                 }
+                if persist_user_display_kind:
+                    _user_entry["display_kind"] = persist_user_display_kind
                 if event.message_id:
                     _user_entry["message_id"] = str(event.message_id)
                 # Dedupe: skip if this platform message_id is already in the
@@ -17881,6 +17838,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else ts
                         ),
                     }
+                    if persist_user_display_kind:
+                        _user_entry["display_kind"] = persist_user_display_kind
                     if event.message_id:
                         _user_entry["message_id"] = str(event.message_id)
                     await self.async_session_store.append_to_transcript(
@@ -17900,12 +17859,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # (e.g. Yuanbao QuoteContextMiddleware's transcript fallback)
                     # can find earlier @bot messages by their original message_id.
                     _user_msg_id_attached = False
+                    _user_display_kind_pending = bool(persist_user_display_kind)
                     for msg in new_messages:
                         # Skip system messages (they're rebuilt each run)
                         if msg.get("role") == "system":
                             continue
                         # Add timestamp to each message for debugging
                         entry = {**msg, "timestamp": ts}
+                        if (
+                            msg.get("role") == "user"
+                            and _user_display_kind_pending
+                        ):
+                            if "display_kind" not in entry:
+                                entry["display_kind"] = persist_user_display_kind
+                            # The provenance belongs only to the initiating
+                            # event. A genuine human turn may have queued and
+                            # completed recursively behind it in this same
+                            # returned message chain.
+                            _user_display_kind_pending = False
                         if (
                             not _user_msg_id_attached
                             and msg.get("role") == "user"
@@ -18069,6 +18040,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 else time.time()
                             ),
                         }
+                        if persist_user_display_kind:
+                            _user_entry["display_kind"] = persist_user_display_kind
                         if getattr(event, "message_id", None):
                             _user_entry["message_id"] = str(event.message_id)
                         await self.async_session_store.append_to_transcript(
@@ -18700,6 +18673,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -23868,6 +23842,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
@@ -23887,6 +23862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
 
@@ -23899,6 +23875,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                persist_user_display_kind=persist_user_display_kind,
                 message_type=message_type,
             )
 
@@ -24021,6 +23998,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        persist_user_display_kind: Optional[str] = None,
         message_type: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
@@ -24306,6 +24284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             moa_config=moa_config,
             persist_user_message=persist_user_message,
             persist_user_timestamp=persist_user_timestamp,
+            persist_user_display_kind=persist_user_display_kind,
         )
         turn_runner = TurnRunner(self, turn_ctx)
         # Callback invoked by agent on tool lifecycle events — extracted to
@@ -25426,6 +25405,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 next_message_id = None
                 next_channel_prompt = None
                 next_session_key = session_key
+                next_persist_user_display_kind = None
                 # #60671 — carry the pending event's message_type into the
                 # recursive call so queued voice turns can stream TTS and
                 # re-mark the generation for the final delivered turn.
@@ -25462,6 +25442,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     next_message_id = self._reply_anchor_for_event(pending_event)
                     next_channel_prompt = getattr(pending_event, "channel_prompt", None)
                     next_message_type = getattr(pending_event, "message_type", None)
+                    next_persist_user_display_kind = (
+                        "hidden"
+                        if getattr(pending_event, "internal", False)
+                        else None
+                    )
 
                 # Clear the completed streaming marker from the prior logical
                 # turn so the recursive turn's streaming TTS is not suppressed
@@ -25516,6 +25501,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    persist_user_display_kind=next_persist_user_display_kind,
                     message_type=next_message_type,
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

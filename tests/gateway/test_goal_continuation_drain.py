@@ -110,6 +110,7 @@ async def test_fifo_enqueued_continuation_is_drained_without_new_user_message():
                 text=CONTINUATION_TEXT,
                 message_type=MessageType.TEXT,
                 source=src,
+                internal=True,
             )
             adapter._pending_messages[key] = cont
         return f"reply-{len(handled)}"
@@ -199,3 +200,4 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
     assert adapter._pending_messages[adapter_key].text.startswith(
         "[Continuing toward your standing goal]"
     )
+    assert adapter._pending_messages[adapter_key].internal is True

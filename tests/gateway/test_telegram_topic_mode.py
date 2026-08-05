@@ -621,6 +621,98 @@ async def test_auto_generated_title_renames_bound_telegram_topic(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_heavy_first_exchange_auto_title_persists_and_renames_bound_topic(
+    tmp_path, monkeypatch
+):
+    import asyncio
+    import threading
+
+    import agent.title_generator as title_generator
+    from agent.context_compressor import SUMMARY_PREFIX
+    from tools.todo_tool import TODO_INJECTION_HEADER
+
+    session_id = "sess-heavy-title"
+    source = _make_source(thread_id="42")
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.apply_telegram_topic_migration()
+    db.create_session(session_id, source="telegram", user_id="208214988")
+    db.enable_telegram_topic_mode(chat_id="208214988", user_id="208214988")
+    db.bind_telegram_topic(
+        chat_id="208214988",
+        thread_id="42",
+        user_id="208214988",
+        session_key="agent:main:telegram:dm:208214988:42",
+        session_id=session_id,
+    )
+
+    binding_calls = MagicMock(wraps=db.get_telegram_topic_binding)
+    monkeypatch.setattr(db, "get_telegram_topic_binding", binding_calls)
+
+    runner = _make_runner(session_db=db)
+    runner._gateway_loop = asyncio.get_running_loop()
+    monkeypatch.setattr(title_generator, "_auto_title_enabled", lambda: True)
+    monkeypatch.setattr(title_generator, "_title_language", lambda: "")
+    title_response = MagicMock()
+    title_response.choices[0].message.content = "  Heavy First Turn  "
+    monkeypatch.setattr(title_generator, "call_llm", lambda **_kwargs: title_response)
+
+    rename_done = threading.Event()
+
+    async def record_rename(**_kwargs):
+        rename_done.set()
+
+    adapter = runner.adapters[Platform.TELEGRAM]
+    adapter.rename_dm_topic = AsyncMock(side_effect=record_rename)
+    callback_seen = []
+
+    def title_callback(title):
+        callback_seen.append(db.get_session_title(session_id))
+        runner._schedule_telegram_topic_title_rename(source, session_id, title)
+
+    history = [
+        {"role": "user", "content": "Fix Telegram topic auto-titling"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [{"id": "call-1", "type": "function"}],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "call-1",
+            "content": "inspection complete",
+        },
+        {
+            "role": "user",
+            "content": f"{SUMMARY_PREFIX}\nEarlier investigation was compacted.",
+        },
+        {
+            "role": "user",
+            "content": f"{TODO_INJECTION_HEADER}\n- [ ] Finish the title fix",
+        },
+        {"role": "assistant", "content": "The fix is complete."},
+    ]
+
+    title_generator.maybe_auto_title(
+        db,
+        session_id,
+        "Fix Telegram topic auto-titling",
+        "The fix is complete.",
+        history,
+        title_callback=title_callback,
+    )
+
+    assert await asyncio.to_thread(rename_done.wait, 10)
+    assert callback_seen == ["Heavy First Turn"]
+    assert db.get_session_title(session_id) == "Heavy First Turn"
+    binding_calls.assert_called_once_with(chat_id="208214988", thread_id="42")
+    adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id="208214988",
+        thread_id="42",
+        name="Heavy First Turn",
+    )
+
+
+@pytest.mark.asyncio
 async def test_topic_refuses_unauthorized_user(tmp_path, monkeypatch):
     """Unauthorized DMs cannot flip multi-session mode on."""
     import gateway.run as gateway_run
@@ -761,4 +853,3 @@ def test_get_telegram_topic_binding_by_session_returns_binding(tmp_path):
 # ---------------------------------------------------------------------------
 # Test for session-split thread_id recovery (issue #27166)
 # ---------------------------------------------------------------------------
-

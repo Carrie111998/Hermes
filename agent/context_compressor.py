@@ -23,6 +23,7 @@ import sqlite3
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional
 
 from agent.auxiliary_client import (
@@ -3266,13 +3267,18 @@ class ContextCompressor(ContextEngine):
                             parsed = args
                         _collect_paths_from_jsonish(parsed)
 
+        from agent.conversation_compression import is_real_user_message
+
         for msg in turns_to_summarize:
             role = msg.get("role", "unknown")
-            text = _compact_fallback_turn(msg.get("content"))
+            synthetic_user = role == "user" and not is_real_user_message(msg)
+            content_message = msg
+            if role == "user" and not synthetic_user:
+                content_message = (
+                    self._strip_context_summary_handoff_message(msg) or msg
+                )
+            text = _compact_fallback_turn(content_message.get("content"))
             _collect_path_mentions(text, relevant_files)
-            synthetic_user = (
-                role == "user" and self._is_synthetic_compression_user_turn(msg)
-            )
 
             turn_text = text
             turn_tool_names: list[str] = []
@@ -4140,7 +4146,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         relying on content-prefix heuristics.  The flag is in-process only —
         the wire sanitizers strip underscore-prefixed keys before API calls.
         """
-        if not isinstance(message, dict):
+        if not isinstance(message, Mapping):
             return False
         return bool(message.get(COMPRESSED_SUMMARY_METADATA_KEY))
 
@@ -4148,17 +4154,14 @@ This compaction should PRIORITISE preserving all information related to the focu
     def _transcript_has_real_user_turn(cls, messages: List[Dict[str, Any]]) -> bool:
         """Return whether *messages* contain a user-authored turn.
 
-        Compaction summaries can deliberately carry ``role="user"`` to keep
-        strict provider transcripts valid. The metadata/content checks prevent
-        those synthetic transport rows from becoming evidence of a real user.
+        Compaction summaries and runtime continuations can deliberately carry
+        ``role="user"`` to keep strict provider transcripts valid. The shared
+        provenance classifier prevents those transport rows from becoming
+        evidence of a real user while retaining media-bearing user input.
         """
-        for message in messages:
-            if not isinstance(message, dict) or message.get("role") != "user":
-                continue
-            if cls._is_synthetic_compression_user_turn(message):
-                continue
-            return True
-        return False
+        from agent.conversation_compression import is_real_user_message
+
+        return any(is_real_user_message(message) for message in messages)
 
     @classmethod
     def _is_synthetic_compression_user_turn(cls, message: Any) -> bool:
@@ -4167,20 +4170,23 @@ This compaction should PRIORITISE preserving all information related to the focu
         SessionDB preserves role/content but not underscore-prefixed metadata,
         so the stable todo and continuation content markers are authoritative.
         """
-        if not isinstance(message, dict) or message.get("role") != "user":
+        if not isinstance(message, Mapping) or message.get("role") != "user":
             return False
         if cls._has_compressed_summary_metadata(message):
             return True
         content = message.get("content")
         if cls._is_context_summary_content(content):
             return True
+        from agent.message_content import has_non_text_content
+
+        if has_non_text_content(content):
+            return False
         text = _content_text_for_contains(content).strip()
         return text in {
             COMPRESSION_CONTINUATION_USER_CONTENT,
             _LEGACY_COMPRESSION_CONTINUATION_USER_CONTENT,
-        } or text.startswith(
-            TODO_INJECTION_HEADER + "\n"
-        )
+            TODO_INJECTION_HEADER,
+        } or text.startswith(TODO_INJECTION_HEADER + "\n")
 
     @staticmethod
     def _validate_summary_user_provenance(summary: str, has_user_turn: bool) -> None:
@@ -4284,14 +4290,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         messages: List[Dict[str, Any]],
     ) -> Optional[str]:
         """Infer a compact focus hint from the most recent real user turns."""
+        from agent.conversation_compression import is_real_user_message
+
         candidates: list[str] = []
         for idx in range(len(messages) - 1, -1, -1):
             msg = messages[idx]
-            if msg.get("role") != "user":
+            if not is_real_user_message(msg):
                 continue
-            if cls._is_synthetic_compression_user_turn(msg):
-                continue
-            content = msg.get("content")
+            content_message = cls._strip_context_summary_handoff_message(msg) or msg
+            content = content_message.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
             if not text:
                 continue
@@ -4328,14 +4335,15 @@ This compaction should PRIORITISE preserving all information related to the focu
         # snapshot can never anchor on user-role scaffolding (todo
         # snapshots, truncation notices, background-process reports) —
         # the exact class of turn this grounding exists to bypass.
-        from agent.conversation_compression import _is_real_user_message
+        from agent.conversation_compression import is_real_user_message
 
         for msg in reversed(messages):
             if msg.get("role") != "user":
                 continue
-            if not _is_real_user_message(msg):
+            if not is_real_user_message(msg):
                 continue
-            content = msg.get("content")
+            content_message = cls._strip_context_summary_handoff_message(msg) or msg
+            content = content_message.get("content")
             text = _redact_compaction_text(_content_text_for_contains(content).strip())
             if not text:
                 continue
@@ -4953,12 +4961,10 @@ This compaction should PRIORITISE preserving all information related to the focu
         If the conversation has fewer than *n* user messages, the earliest
         available user message is used without error.
 
-        Only REAL actionable user turns count toward N — the collector uses
-        the same ``_is_actionable_user_turn`` /
-        ``_is_synthetic_compression_user_turn`` pair as
-        ``_find_last_user_message_idx``, so blank platform echoes, compaction
-        handoffs, continuation markers, and todo-snapshot rows never consume
-        a slot (#69291 bug class).
+        Only actionable user turns count toward N. Blank platform echoes,
+        compaction handoffs, and todo-snapshot-only rows never consume a slot,
+        while structured media and active runtime notifications remain in the
+        protected tail (#69291 bug class).
 
         A user message is already a clean boundary — there is no
         tool_call/result group that spans across it, so
@@ -4969,10 +4975,9 @@ This compaction should PRIORITISE preserving all information related to the focu
         if n <= 1:
             return self._ensure_last_user_message_in_tail(messages, cut_idx, head_end)
 
-        # Collect real user message indices walking backward from end.
-        # Mirror _find_last_user_message_idx's filters: compaction handoffs,
-        # blank platform echoes, and synthetic continuation/todo rows are
-        # continuity artifacts, not real user turns.
+        # Collect actionable user message indices walking backward from end.
+        # Runtime notifications are synthetic provenance, but still carry
+        # instructions/results that the model must process before compaction.
         user_indices = []
         for i in range(len(messages) - 1, head_end - 1, -1):
             msg = messages[i]

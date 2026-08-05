@@ -62,6 +62,7 @@ import tempfile
 import time
 import uuid
 import threading
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -70,6 +71,11 @@ from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.context_engine import (
     automatic_compaction_status_message,
     sanitize_memory_context,
+)
+from agent.message_content import (
+    flatten_message_text,
+    has_non_text_content,
+    is_internal_user_scaffolding_text,
 )
 from agent.model_metadata import estimate_request_tokens_rough
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
@@ -1881,26 +1887,9 @@ def conversation_history_after_compression(
     return None
 
 
-_SYNTHETIC_USER_PREFIXES = (
-    "[System: Your previous response was truncated",
-    "[System: The previous response was cut off",
-    "[System: Your previous tool call",
-    "[Your active task list was preserved across context compression]",
-    "[IMPORTANT: Background process ",
-)
-
-
 def _message_text(message: Any) -> str:
-    content = message.get("content") if isinstance(message, dict) else None
-    if isinstance(content, str):
-        return content
-    if isinstance(content, list):
-        return "\n".join(
-            str(part.get("text") or part.get("content") or "")
-            for part in content
-            if isinstance(part, dict)
-        )
-    return ""
+    content = message.get("content") if isinstance(message, Mapping) else None
+    return flatten_message_text(content)
 
 
 _SYNTHETIC_USER_FLAGS = (
@@ -1908,11 +1897,12 @@ _SYNTHETIC_USER_FLAGS = (
     "_empty_recovery_synthetic",
     "_verification_stop_synthetic",
     "_pre_verify_synthetic",
+    "_kanban_stop_synthetic",
     "_dropped_toolcall_nudge",
 )
 
 
-def _is_real_user_message(message: Any) -> bool:
+def is_real_user_message(message: Any) -> bool:
     """Distinguish human intent from user-role runtime scaffolding.
 
     A compaction summary pinned to ``role="user"`` (the compressor flips the
@@ -1921,18 +1911,40 @@ def _is_real_user_message(message: Any) -> bool:
     short-circuit anchor restoration with a message the model is explicitly
     told NOT to act on.
     """
-    if not isinstance(message, dict) or message.get("role") != "user":
+    if not isinstance(message, Mapping) or message.get("role") != "user":
+        return False
+    if message.get("display_kind"):
         return False
     if any(message.get(flag) for flag in _SYNTHETIC_USER_FLAGS):
         return False
+    from agent.context_compressor import ContextCompressor
+
+    content = message.get("content")
+    if (
+        ContextCompressor._has_compressed_summary_metadata(message)
+        or ContextCompressor._is_context_summary_content(content)
+    ):
+        # A compaction handoff can share a user-role carrier with protected
+        # tail content. Strip only the summary envelope and classify the
+        # preserved portion recursively; a standalone summary unwraps to
+        # ``None`` and remains internal.
+        unwrapped = ContextCompressor._strip_context_summary_handoff_message(
+            dict(message)
+        )
+        return bool(unwrapped) and is_real_user_message(unwrapped)
+    if has_non_text_content(content):
+        return True
+
     text = _message_text(message).strip()
     if not text:
         return False
-    if text.startswith(_SYNTHETIC_USER_PREFIXES):
+    if ContextCompressor._is_synthetic_compression_user_turn(message):
         return False
-    from agent.context_compressor import ContextCompressor
+    return not is_internal_user_scaffolding_text(text)
 
-    return not ContextCompressor._is_synthetic_compression_user_turn(message)
+
+# Backward-compatible private name for existing compression call sites.
+_is_real_user_message = is_real_user_message
 
 
 def _strip_stale_todo_snapshot(content: Any) -> Any:
