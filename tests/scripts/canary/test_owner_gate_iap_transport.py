@@ -584,6 +584,10 @@ def test_transport_has_one_fixed_iap_stdin_command_and_closed_environment(
     assert not any("proxy" in name.casefold() for name in environment)
     assert environment["CLOUDSDK_CORE_PROJECT"] == "adventico-ai-platform"
     assert environment["CLOUDSDK_COMPUTE_ZONE"] == "europe-west3-a"
+    assert environment["PYTHONPYCACHEPREFIX"] == launcher._GCLOUD_PYTHON_CACHE_PREFIX
+    assert environment["CLOUDSDK_PYTHON_ARGS"].endswith(
+        f"pycache_prefix={launcher._GCLOUD_PYTHON_CACHE_PREFIX}"
+    )
     assert configuration.stability_checks >= 5
     assert identity.stability_checks == 2
     assert host_identity.calls == 3
