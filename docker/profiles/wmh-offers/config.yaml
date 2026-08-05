@@ -22,3 +22,44 @@ auxiliary:
 skills:
   external_dirs:
     - /opt/data/skills
+  # Skills désactivées (2026-08-05) — liste partagée par les 5 profils,
+  # rafraîchie depuis ce template à chaque boot Railway (source de vérité).
+  disabled:
+    - airtable
+    - architecture-diagram
+    - arxiv
+    - ascii-art
+    - ascii-video
+    - audio-and-music
+    - axolotl
+    - baoyu-article-illustrator
+    - baoyu-comic
+    - baoyu-infographic
+    - blogwatcher
+    - evaluating-llms-harness
+    - excalidraw
+    - find-nearby
+    - fine-tuning-with-trl
+    - gguf-quantization
+    - gif-search
+    - godmode
+    - grpo-rl-training
+    - huggingface-hub
+    - linear
+    - llama-cpp
+    - manim-video
+    - minecraft-modpack-server
+    - ml-paper-writing
+    - modal-serverless-gpu
+    - notion
+    - openhue
+    - peft-fine-tuning
+    - petdex
+    - pokemon-player
+    - polymarket
+    - research-paper-writing
+    - stable-diffusion-image-generation
+    - unsloth
+    - weights-and-biases
+    - whatsapp-decision-report
+    - yuanbao

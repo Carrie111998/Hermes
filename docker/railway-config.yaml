@@ -77,3 +77,49 @@ toolsets:
 platform_toolsets:
   cli: [hermes-cli]
   discord: [hermes-discord]
+
+# Skills désactivées (2026-08-05) : bundles Nous hors-scope (ML/fine-tuning,
+# jeux, art génératif, intégrations inutilisées). Liste identique sur les 5
+# profils. Le entrypoint rafraîchit config.yaml depuis ce template à CHAQUE
+# boot Railway : cette liste versionnée est donc la source de vérité — toute
+# édition faite uniquement sur le volume est perdue au redeploy.
+skills:
+  disabled:
+    - airtable
+    - architecture-diagram
+    - arxiv
+    - ascii-art
+    - ascii-video
+    - audio-and-music
+    - axolotl
+    - baoyu-article-illustrator
+    - baoyu-comic
+    - baoyu-infographic
+    - blogwatcher
+    - evaluating-llms-harness
+    - excalidraw
+    - find-nearby
+    - fine-tuning-with-trl
+    - gguf-quantization
+    - gif-search
+    - godmode
+    - grpo-rl-training
+    - huggingface-hub
+    - linear
+    - llama-cpp
+    - manim-video
+    - minecraft-modpack-server
+    - ml-paper-writing
+    - modal-serverless-gpu
+    - notion
+    - openhue
+    - peft-fine-tuning
+    - petdex
+    - pokemon-player
+    - polymarket
+    - research-paper-writing
+    - stable-diffusion-image-generation
+    - unsloth
+    - weights-and-biases
+    - whatsapp-decision-report
+    - yuanbao
