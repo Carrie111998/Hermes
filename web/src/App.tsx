@@ -7,9 +7,11 @@ import {
   useRef,
   useState,
   type ComponentType,
+  type ComponentPropsWithoutRef,
   type FocusEvent,
   type MouseEvent,
   type ReactNode,
+  type RefObject,
 } from "react";
 import { createPortal } from "react-dom";
 import {
@@ -373,6 +375,91 @@ function buildRoutes(
 
 const SIDEBAR_COLLAPSED_KEY = "hermes-sidebar-collapsed";
 
+export const CONTEXT_SHELL_BREAKPOINTS = {
+  headerHidden: "xl:hidden",
+  mainPaddingReset: "xl:pt-0",
+  contextBackdropHidden: "xl:hidden",
+} as const;
+
+type PrimarySidebarFrameProps = ComponentPropsWithoutRef<"aside"> & {
+  isMobile: boolean;
+  mobileOpen: boolean;
+  onClose: () => void;
+  triggerRef: RefObject<HTMLElement | null>;
+};
+
+export function PrimarySidebarFrame({
+  children,
+  isMobile,
+  mobileOpen,
+  onClose,
+  triggerRef,
+  ...asideProps
+}: PrimarySidebarFrameProps) {
+  const mobileClosed = isMobile && !mobileOpen;
+  const asideRef = useRef<HTMLElement>(null);
+  const wasMobileOpenRef = useRef(false);
+
+  useEffect(() => {
+    const shouldRestore = wasMobileOpenRef.current && isMobile && !mobileOpen;
+    wasMobileOpenRef.current = isMobile && mobileOpen;
+    if (shouldRestore) {
+      const trigger = triggerRef.current;
+      if (trigger?.matches("button, a[href], [tabindex]")) trigger.focus();
+      else trigger?.querySelector<HTMLElement>("button, a[href], [tabindex]")?.focus();
+    }
+  }, [isMobile, mobileOpen, triggerRef]);
+
+  useEffect(() => {
+    if (!isMobile || !mobileOpen) return;
+    asideRef.current
+      ?.querySelector<HTMLElement>("[data-primary-sidebar-initial-focus]")
+      ?.focus();
+
+    const trapFocus = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onClose();
+        return;
+      }
+      if (event.key !== "Tab") return;
+      const focusable = Array.from(
+        asideRef.current?.querySelectorAll<HTMLElement>(
+          'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+        ) ?? [],
+      );
+      if (focusable.length === 0) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (!asideRef.current?.contains(document.activeElement)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.addEventListener("keydown", trapFocus);
+    return () => document.removeEventListener("keydown", trapFocus);
+  }, [isMobile, mobileOpen, onClose]);
+
+  return (
+    <aside
+      {...asideProps}
+      ref={asideRef}
+      aria-hidden={mobileClosed || undefined}
+      aria-modal={isMobile && mobileOpen ? true : undefined}
+      inert={mobileClosed || undefined}
+      role={isMobile && mobileOpen ? "dialog" : undefined}
+    >
+      {children}
+    </aside>
+  );
+}
+
 export default function App() {
   const { t } = useI18n();
   const { pathname } = useLocation();
@@ -381,6 +468,7 @@ export default function App() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [contextOpen, setContextOpen] = useState(false);
   const contextOpenRef = useRef(false);
+  const primaryTriggerRef = useRef<HTMLSpanElement>(null);
   const contextTriggerRef = useRef<HTMLSpanElement>(null);
   const [dashboardPages, setDashboardPages] = useState<DashboardPage[]>([]);
   const closeMobile = useCallback(() => setMobileOpen(false), []);
@@ -532,7 +620,6 @@ export default function App() {
     if (!mobileOpen && !contextOpen) return;
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
-        setMobileOpen(false);
         if (contextOpen) closeContext();
       }
     };
@@ -575,7 +662,8 @@ export default function App() {
 
       <header
         className={cn(
-          "studio-mobile-header lg:hidden fixed top-0 left-0 right-0 z-40 min-h-14",
+          "studio-mobile-header fixed top-0 left-0 right-0 z-40 min-h-14",
+          CONTEXT_SHELL_BREAKPOINTS.headerHidden,
           "flex items-center gap-2 px-4 py-2",
           "border-b border-current/20",
           "bg-background-base",
@@ -586,19 +674,21 @@ export default function App() {
           clipPath: "var(--component-header-clip-path)",
         }}
       >
-        <Button
-          ghost
-          size="icon"
-          onClick={() => setMobileOpen(true)}
-          aria-label={t.app.openNavigation}
-          aria-expanded={mobileOpen}
-          aria-controls="app-sidebar"
-          className="min-h-11 min-w-11 text-text-secondary hover:text-midground"
-        >
-          <Menu />
-        </Button>
+        <span ref={primaryTriggerRef} className="inline-flex lg:hidden">
+          <Button
+            ghost
+            size="icon"
+            onClick={() => setMobileOpen(true)}
+            aria-label={t.app.openNavigation}
+            aria-expanded={mobileOpen}
+            aria-controls="app-sidebar"
+            className="min-h-11 min-w-11 text-text-secondary hover:text-midground"
+          >
+            <Menu />
+          </Button>
+        </span>
 
-        <Typography className="font-semibold text-[0.95rem] leading-none tracking-[-0.02em] text-midground">
+        <Typography className="font-semibold text-[0.95rem] leading-none tracking-[-0.02em] text-midground lg:hidden">
           Hermes Studio
         </Typography>
 
@@ -628,7 +718,10 @@ export default function App() {
             if (contextOpen) closeContext();
           }}
           className={cn(
-            "lg:hidden fixed inset-0 z-40 p-0 block",
+            "fixed inset-0 z-40 p-0 block",
+            mobileOpen
+              ? "lg:hidden"
+              : CONTEXT_SHELL_BREAKPOINTS.contextBackdropHidden,
             "bg-black/70",
           )}
         />
@@ -637,10 +730,19 @@ export default function App() {
       <PluginSlot name="header-banner" />
       <ProfileScopeBanner />
 
-      <div className="flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14 lg:pt-0">
+      <div
+        className={cn(
+          "flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden pt-14",
+          CONTEXT_SHELL_BREAKPOINTS.mainPaddingReset,
+        )}
+      >
         <div className="flex min-h-0 min-w-0 flex-1">
-          <aside
+          <PrimarySidebarFrame
             id="app-sidebar"
+            isMobile={isMobile}
+            mobileOpen={mobileOpen}
+            onClose={closeMobile}
+            triggerRef={primaryTriggerRef}
             aria-label={t.app.navigation}
             className={cn(
               "studio-primary-sidebar fixed top-0 left-0 z-50 flex h-dvh max-h-dvh w-64 min-h-0 flex-col font-sans",
@@ -693,6 +795,7 @@ export default function App() {
                 size="icon"
                 onClick={closeMobile}
                 aria-label={t.app.closeNavigation}
+                data-primary-sidebar-initial-focus
                 className="lg:hidden text-text-secondary hover:text-midground"
               >
                 <X />
@@ -819,7 +922,7 @@ export default function App() {
               <AuthWidget />
               <SidebarFooter status={sidebarStatus} />
             </div>
-          </aside>
+          </PrimarySidebarFrame>
 
           <PageHeaderProvider pluginTabs={pluginTabMeta}>
             <div
@@ -973,7 +1076,7 @@ export function DashboardContextSidebar({
       <aside
         id="dashboard-context-sidebar-desktop"
         aria-label={`${DASHBOARD_GROUP_LABELS[context.group]} related pages`}
-        className="studio-context-sidebar sticky top-0 z-10 hidden h-dvh w-60 shrink-0 flex-col border-l border-border bg-card/95 shadow-none backdrop-blur-xl lg:flex"
+        className="studio-context-sidebar sticky top-0 z-10 hidden h-dvh w-60 shrink-0 flex-col border-l border-border bg-card/95 shadow-none backdrop-blur-xl xl:flex"
       >
         <DashboardContextSidebarContent context={context} onClose={onClose} />
       </aside>
@@ -985,7 +1088,7 @@ export function DashboardContextSidebar({
           role="dialog"
           aria-modal="true"
           aria-label={`${DASHBOARD_GROUP_LABELS[context.group]} related pages`}
-          className="studio-context-sidebar fixed inset-y-0 right-0 z-50 flex w-72 shrink-0 flex-col border-l border-border bg-card/95 shadow-2xl backdrop-blur-xl lg:hidden"
+          className="studio-context-sidebar fixed inset-y-0 right-0 z-50 flex w-72 shrink-0 flex-col border-l border-border bg-card/95 shadow-2xl backdrop-blur-xl xl:hidden"
         >
           <DashboardContextSidebarContent
             context={context}

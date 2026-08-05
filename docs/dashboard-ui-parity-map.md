@@ -50,7 +50,7 @@ flowchart LR
 ### Contextual-navigation rules
 
 - Workspace pages do not render a contextual rail. They are top-level destinations, and Chat already owns a right-side model/tools inspector.
-- Automation, Integrations, and Manage render sibling pages in the far-right rail on desktop and in the accessible right-side drawer on mobile.
+- Automation, Integrations, Manage, and Extensions render sibling pages in the far-right rail at `xl` and above. Below `xl` they use the accessible right-side drawer so 1024px layouts retain enough workspace width.
 - `/profiles/new` is a secondary route and inherits the Manage context through the `/profiles` prefix.
 - Active, visible, non-overriding plugin pages participate in the canonical manifest under the `extensions` group. Two or more extension pages produce their own contextual rail/drawer group.
 
@@ -104,6 +104,8 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 4. **`/profiles/new` used the raw shell title `Profiles/new`.** It now resolves to `New profile` through explicit route metadata.
 5. **Built-in React routes and the Python page manifest could drift silently.** A cross-language contract test now compares the declared route table to canonical MCP/REST discovery, with only `/` and `/profiles/new` explicitly excluded.
 6. **Plugin routes were visible but absent from canonical discovery/context.** Active plugin tabs now use validated paths, deterministic `plugin-*` IDs, an `extensions` context group, and shared REST/focused-MCP/broad-MCP links.
+7. **Closed primary mobile navigation remained keyboard-accessible off-screen.** The drawer is now inert and assistive-technology-hidden while closed; while open it has modal semantics, initial focus, Tab/Shift+Tab containment, Escape/backdrop dismissal, and trigger-focus restoration.
+8. **The persistent context rail compressed pages at the 1024px breakpoint.** The rail now begins at `xl`; the related-pages trigger and modal drawer remain available from mobile through 1279px, with no horizontal overflow at 1024px or 1280px.
 
 ### Open gaps / decisions
 
@@ -118,5 +120,7 @@ Shell-wide API calls (`/api/status`, `/api/config`, profile scope, dashboard the
 - Failed HTTP responses: 0
 - Browser console errors: 0
 - Desktop viewport: 1440×1000
+- Responsive navigation checks: 390×844, 1024×800, and 1280×800
+- Frontend tests after mobile/responsive remediation: 204/204
 - Dynamic plugin routes discovered from rendered navigation: 2
 - Raw sanitized crawl artifact (local, not committed): `/Users/aibot/.hermes/designs/hermes-dashboard-live-inventory.json`
