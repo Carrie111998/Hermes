@@ -258,7 +258,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: missing/unreadable. ValueError: embedded NUL byte — a
+        # path tokenized out of decoded binary content (see #76762); such
+        # a path can never name a real file. Both mean "nothing to scan".
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -275,11 +278,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # A NUL byte in the first chunk means this is a binary (ELF/Mach-O/
     # PE), not a shell script — scanning its decoded contents would
     # tokenize machine code and feed junk paths into the recursion
-    # (including a `ValueError: embedded null byte` from Path.resolve,
-    # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
-    # executed by the user is not a referenced *shell script*.
+    # (including a `ValueError: embedded null byte` from Path.resolve /
+    # os.open, #76762). Treat it as "nothing to scan" rather than unsafe:
+    # a binary executed by the user is not a referenced *shell script*.
     if b"\x00" in data:
-        return None, False
+        # Return "" rather than None: the caller's `script_text is None`
+        # branch would otherwise fall back to read_remote_script() and
+        # re-fetch the raw bytes as text, tokenizing machine code into
+        # NUL-byte paths that crash the guard (#76762).
+        return "", False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False

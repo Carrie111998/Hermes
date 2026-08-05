@@ -9,6 +9,7 @@ Covers:
 import json
 import os
 from argparse import Namespace
+from pathlib import Path
 
 import pytest
 
@@ -387,6 +388,79 @@ class TestTerminalToolGatewayLifecycleGuard:
 
         assert result["exit_code"] == 1
         assert "referenced script" in result["error"]
+
+    def test_nul_byte_path_read_skipped(self):
+        """#76762: a path with an embedded NUL byte (tokenized out of decoded
+        binary content) must be treated as nothing-to-scan, not crash."""
+        from cron.lifecycle_guard import _read_referenced_script
+
+        text, unsafe = _read_referenced_script(Path("bad\x00path"))
+
+        assert text is None
+        assert unsafe is False
+
+    def test_binary_read_returns_empty_not_none(self, tmp_path):
+        """A binary referenced by a command must be skipped by the local scan
+        (returns "" rather than None) so the caller's remote-read fallback is
+        not triggered for it (#76762)."""
+        from cron.lifecycle_guard import _read_referenced_script
+
+        binary = tmp_path / "tool.bin"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64)
+
+        text, unsafe = _read_referenced_script(binary)
+
+        assert text == ""
+        assert unsafe is False
+
+    def test_binary_referenced_script_passes_guard(self, monkeypatch, tmp_path):
+        """A command referencing a local ELF binary passes the guard (no
+        remote re-fetch of the binary as text) and executes normally."""
+        import tools.terminal_tool as tt
+
+        binary = tmp_path / "tool.bin"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 64)
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(command=f"/bin/bash {binary}"))
+
+        assert result["exit_code"] == 0
+        assert calls == [f"/bin/bash {binary}"]
+
+    def test_binary_remote_content_does_not_crash_guard(self, monkeypatch):
+        """A script missing locally is fetched through the env's shell; when
+        that content is raw binary, NUL-byte paths tokenized from it must be
+        skipped, not crash the guard (#76762)."""
+        import tools.terminal_tool as tt
+
+        class _FakeEnv:
+            env = {}
+
+            def execute(self, command, **kwargs):
+                if "remote-tool.bin" in command:
+                    return {
+                        "output": "#!/bin/sh\nrestart the app\n\x00\x01\x02/usr/bin/tool\x00",
+                        "returncode": 0,
+                    }
+                return {"output": "", "returncode": 1}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+
+        result = json.loads(tt.terminal_tool(
+            command="/bin/bash /nonexistent/remote-tool.bin"
+        ))
+
+        assert result["exit_code"] == 0
 
     def test_relative_script_uses_live_session_cwd(self, monkeypatch, tmp_path):
         import tools.terminal_tool as tt
