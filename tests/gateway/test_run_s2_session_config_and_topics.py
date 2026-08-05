@@ -136,6 +136,14 @@ class TestTelegramTopicClassification:
 
     def test_lobby_reminder_rate_limited(self):
         inst = _telegram_mixin()
+        import time as _time
+        # monotonic() is boot-relative (fresh CI containers start near 0), so
+        # seed an old baseline per chat to make the "first reminder allowed"
+        # assertion independent of how long the machine has been up.
+        inst._telegram_lobby_reminder_ts = {
+            "777": _time.monotonic() - 1000.0,
+            "888": _time.monotonic() - 1000.0,
+        }
         assert inst._should_send_telegram_lobby_reminder(_source(chat_id="777")) is True
         # Immediately after, still inside the cooldown window -> suppressed.
         assert inst._should_send_telegram_lobby_reminder(_source(chat_id="777")) is False
