@@ -4016,8 +4016,11 @@ class WorkflowEngine:
                                     # (prior verdicts) loads as context for
                                     # the next round. The dispatch loop
                                     # resets it to ready when the layer
-                                    # re-dispatches.
-                                    self._clear_block_recurrence(states[_rev].kanban_card_id)
+                                    # re-dispatches. Done-based rounds never
+                                    # touched 'blocked', so kanban's
+                                    # BLOCK_RECURRENCE_LIMIT is irrelevant
+                                    # here (Randy 2026-08-05: "We don't move
+                                    # cards to blocked").
                                     states[_rev].completed_at = None
                                     states[_rev].result = None
                                     _any_reset = True
