@@ -167,6 +167,11 @@ _PLATFORM_DEFAULTS: dict[str, dict[str, Any]] = {
     # global ("all") defaults and compacted/narrated on nearly every turn.
     "photon":          _TIER_LOW,
     "bluebubbles":     _TIER_LOW,
+    # Buzz DMs are permanent-message coordinator inboxes. Keep the timeline
+    # final-answer-first: the inbound reaction is the pickup signal, while
+    # tool traces, scratch commentary, heartbeat repeats, and iteration counts
+    # belong in logs unless the user explicitly opts in per platform.
+    "buzz":            {**_TIER_LOW, "busy_steer_ack_enabled": False},
     "weixin":          _TIER_LOW,
     "wecom":           _TIER_LOW,
     "wecom_callback":  _TIER_LOW,

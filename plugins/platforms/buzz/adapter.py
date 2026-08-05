@@ -88,6 +88,13 @@ from gateway.config import Platform
 # returns housekeeping kinds (joins, canvas updates, …) — only kind 9 is
 # dispatched to the agent.
 _CHAT_KIND = 9
+
+# buzz-cli treats every prose ``@token`` as a member mention and rejects the
+# whole send when it cannot resolve one. Supplying one explicit identity tells
+# the CLI to permit unresolved at-sign text while leaving the content bytes
+# untouched. Avoid matching email addresses (the ``@`` is preceded by a word
+# character there).
+_AT_SIGN_TOKEN_RE = re.compile(r"(?<!\w)@[A-Za-z0-9_][A-Za-z0-9_.-]*")
 # How many events to request per poll / seed call.
 _FETCH_LIMIT = 50
 # Bound on the per-channel de-dupe set (events, not bytes).
@@ -609,9 +616,17 @@ class BuzzAdapter(BasePlatformAdapter):
         if not content:
             return SendResult(success=False, error="Empty message")
         args = ["messages", "send", "--channel", str(chat_id), "--content", "-"]
-        reply_target = reply_to or (metadata or {}).get("thread_id")
+        # A Buzz DM is already a single private timeline. Turning every
+        # assistant answer into a reply creates hidden one-message threads and
+        # makes the coordinator look silent in the main conversation.
+        state = self._channel_state.get(str(chat_id)) or {}
+        reply_target = None
+        if state.get("chat_type") != "dm":
+            reply_target = reply_to or (metadata or {}).get("thread_id")
         if reply_target:
             args += ["--reply-to", str(reply_target)]
+        if self._self_pubkey and _AT_SIGN_TOKEN_RE.search(content):
+            args += ["--mention", self._self_pubkey]
         code, out, err = await self._run_cli(args, input_text=content)
         if code != 0:
             return SendResult(
@@ -628,9 +643,11 @@ class BuzzAdapter(BasePlatformAdapter):
             # Belt-and-braces echo suppression: the poll loop already skips
             # our own pubkey, but marking the id seen makes de-dupe explicit.
             self._mark_seen(str(chat_id), str(event_id))
+        accepted = bool(data.get("accepted", True))
         return SendResult(
-            success=bool(data.get("accepted", True)),
+            success=accepted,
             message_id=str(event_id) if event_id else None,
+            error=None if accepted else str(data.get("message") or "Buzz rejected message"),
             raw_response=data,
         )
 

@@ -168,6 +168,16 @@ class TestPlatformDefaults:
         assert resolve_display_setting({}, "slack", "long_running_notifications") is False
         assert resolve_display_setting({}, "slack", "busy_ack_detail") is False
 
+    def test_buzz_private_coordinator_defaults_to_final_answer_only(self):
+        """Buzz is a permanent-message mobile inbox, not a debug console."""
+        from gateway.display_config import resolve_display_setting
+
+        assert resolve_display_setting({}, "buzz", "tool_progress") == "off"
+        assert resolve_display_setting({}, "buzz", "interim_assistant_messages") is False
+        assert resolve_display_setting({}, "buzz", "long_running_notifications") is False
+        assert resolve_display_setting({}, "buzz", "busy_ack_detail") is False
+        assert resolve_display_setting({}, "buzz", "busy_steer_ack_enabled") is False
+
 
 # ---------------------------------------------------------------------------
 # Config migration: tool_progress_overrides → display.platforms

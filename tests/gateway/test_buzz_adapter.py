@@ -407,6 +407,73 @@ class TestBuzzAdapterSend:
         # Our own event id is marked seen for echo suppression
         assert "evt123" in adapter._channel_state[CHANNEL]["seen"]
 
+    @pytest.mark.asyncio
+    async def test_send_allows_unresolved_at_sign_prose_without_rewriting_content(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-at", "message": ""})
+        adapter._run_cli = cli
+
+        content = "The @session token is documentation, not a Buzz member."
+        result = await adapter.send(CHANNEL, content)
+
+        assert result.success is True
+        args, stdin_text = cli.calls[0]
+        assert args[args.index("--mention") + 1] == SELF_PUBKEY
+        assert stdin_text == content
+
+    @pytest.mark.asyncio
+    async def test_send_preserves_real_multiline_text(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-lines", "message": ""})
+        adapter._run_cli = cli
+
+        content = "first line\nsecond line\n\nfinal paragraph"
+        result = await adapter.send(CHANNEL, content)
+
+        assert result.success is True
+        assert cli.calls[0][1] == content
+
+    @pytest.mark.asyncio
+    async def test_dm_send_stays_top_level_even_with_reply_metadata(self):
+        adapter = _make_adapter()
+        adapter._channel_state[DM_CHANNEL] = {
+            "chat_type": "dm",
+            "last_ts": 0,
+            "seen": {},
+        }
+        cli = _ScriptedCli()
+        cli.script("messages", "send", {"accepted": True, "event_id": "evt-flat", "message": ""})
+        adapter._run_cli = cli
+
+        result = await adapter.send(
+            DM_CHANNEL,
+            "visible in the DM timeline",
+            reply_to="inbound-event",
+            metadata={"thread_id": "inbound-event"},
+        )
+
+        assert result.success is True
+        args, _ = cli.calls[0]
+        assert "--reply-to" not in args
+
+    @pytest.mark.asyncio
+    async def test_rejected_send_returns_cli_message_as_failure(self):
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            {"accepted": False, "event_id": "", "message": "unrecognized member"},
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send(CHANNEL, "hello")
+
+        assert result.success is False
+        assert result.error == "unrecognized member"
+
 
     @pytest.mark.asyncio
     async def test_send_image_local_file_uses_file_flag(self, tmp_path):
