@@ -454,6 +454,79 @@ def test_http_error_empty_error_string_keeps_raw_body():
     assert '{"error": ""}' in msg
 
 
+def _custom_profile():
+    """Resolve the registered "custom" provider profile (the one create_openai_client's
+    routing pairs with this adapter), via the same discovery path production uses."""
+    import model_tools  # noqa: F401  (import triggers plugin discovery/registration)
+    import providers
+
+    profile = providers.get_provider_profile("custom")
+    assert profile is not None, "custom provider profile must be registered"
+    return profile
+
+
+def _capture_client(capture, *, thinking_capable=True):
+    caps = ["completion", "thinking"] if thinking_capable else ["completion"]
+
+    def handler(request):
+        if request.url.path == "/api/show":
+            return httpx.Response(200, json={"capabilities": caps})
+        capture["body"] = json.loads(request.content)
+        return httpx.Response(
+            200, json={"message": {"role": "assistant", "content": "ok"}, "done_reason": "stop"}
+        )
+
+    return OllamaNativeClient(base_url="http://h:11434", http_client=_mock_client(handler))
+
+
+def test_profile_reasoning_level_reaches_native_think():
+    # The custom profile emits an enabled reasoning level as TOP-LEVEL
+    # reasoning_effort (the field /v1 honors), not extra_body.think. Feed the
+    # profile's actual output through the native client and assert the level
+    # reaches the wire as `think` — the full profile-to-request path, not a
+    # hand-built extra_body.
+    profile = _custom_profile()
+    extra_body, top_level = profile.build_api_kwargs_extras(
+        reasoning_config={"enabled": True, "effort": "high"}, ollama_num_ctx=8192
+    )
+    assert top_level.get("reasoning_effort") == "high"  # the profile's contract
+    assert "think" not in extra_body
+
+    capture = {}
+    client = _capture_client(capture)
+    client.chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "x"}], extra_body=extra_body, **top_level
+    )
+    assert capture["body"]["think"] == "high"
+    assert capture["body"]["options"]["num_ctx"] == 8192
+
+
+def test_profile_reasoning_disabled_reaches_native_think_false():
+    # Disabled reasoning: the profile pairs reasoning_effort="none" with
+    # extra_body.think=False — the wire request must carry think=False.
+    profile = _custom_profile()
+    extra_body, top_level = profile.build_api_kwargs_extras(reasoning_config={"effort": "none"})
+    capture = {}
+    client = _capture_client(capture)
+    client.chat.completions.create(
+        model="m", messages=[{"role": "user", "content": "x"}], extra_body=extra_body, **top_level
+    )
+    assert capture["body"]["think"] is False
+
+
+def test_explicit_think_wins_over_reasoning_effort():
+    # An explicit extra_body.think takes precedence over the top-level field.
+    capture = {}
+    client = _capture_client(capture)
+    client.chat.completions.create(
+        model="m",
+        messages=[{"role": "user", "content": "x"}],
+        reasoning_effort="high",
+        extra_body={"think": "low"},
+    )
+    assert capture["body"]["think"] == "low"
+
+
 def test_version_probe_positive_expires_and_redetects(monkeypatch):
     """Positives are bounded by _VERSION_PROBE_TTL (the model_metadata precedent):
     a server swap on the same port re-detects within the TTL instead of hard-404ing
