@@ -3993,6 +3993,100 @@ def _spawn_durable_action(subcommand: List[str], name: str) -> subprocess.Popen:
     return proc
 
 
+def _preflight_durable_action(name: str) -> Dict[str, Any]:
+    """Read-only precheck for a durable dashboard action's likely outcome.
+
+    Composes existing, already-read-only signals into one verdict so a
+    dashboard can warn the user (or grey out the button) BEFORE they click
+    "Update", instead of only discovering the outcome after spawning it:
+
+    * :func:`hermes_cli.update_lock.read_live_update` -- is another update
+      already holding the cross-process lock?
+    * :func:`tools.update_approval.apply_approval_enabled` and
+      :func:`tools.update_approval.approval_bypass_active` -- would this
+      request actually be staged for approval instead of applied?
+    * :func:`cli._worktree_is_dirty` -- is the checkout dirty? (informational
+      only -- nothing in the real update path hard-blocks on this today, so
+      this function doesn't invent a new block for it either.)
+    * :func:`tools.update_approval.list_pending` -- is there already a
+      pending request waiting for review?
+    * :func:`hermes_cli.config.detect_install_method`, plus the same
+      ``_dashboard_local_update_managed_externally`` gate ``update_hermes``
+      itself checks first -- is this install even eligible for the
+      dashboard's local updater?
+
+    This function calls each of those and nothing else: no lock is
+    acquired, no update is staged, no durable action is spawned. The only
+    side effect anywhere in this chain is ``read_live_update``'s own
+    documented cleanup of a provably-stale marker file -- exactly as
+    harmless here as it is everywhere else that function is already called
+    read-only (e.g. the dashboard's action-status poll).
+    """
+    from hermes_cli.update_lock import read_live_update
+    from tools import update_approval as _ua
+    from cli import _worktree_is_dirty
+
+    holder = read_live_update()
+    lock_held = holder is not None
+    will_stage = _ua.apply_approval_enabled() and not _ua.approval_bypass_active()
+    checkout_dirty = _worktree_is_dirty(str(PROJECT_ROOT))
+    pending_exists = bool(_ua.list_pending())
+    install_method = detect_install_method(PROJECT_ROOT)
+
+    result: Dict[str, Any] = {
+        "name": name,
+        "lock_held": lock_held,
+        "will_stage": will_stage,
+        "checkout_dirty": checkout_dirty,
+        "pending_exists": pending_exists,
+        "install_method": install_method,
+        "verdict": "will_apply",
+        "reason": "No blockers found — this will apply immediately.",
+    }
+
+    # Precedence mirrors update_hermes()'s own guard ordering (managed
+    # externally -> docker -> nix -> spawn), plus the lock/pending/staging
+    # signals that endpoint doesn't check today. Each branch below carries a
+    # reason distinct enough that a caller can tell blocked-by-install-method
+    # apart from blocked-by-lock apart from blocked-by-pending-request.
+    if _dashboard_local_update_managed_externally():
+        result["verdict"] = "blocked"
+        result["reason"] = (
+            "Hermes updates are managed outside this dashboard in this "
+            "environment (containerized install) — the built-in local "
+            "updater is disabled here; use that environment's own update "
+            "flow."
+        )
+    elif install_method in {"docker", "nix", "nixos"}:
+        result["verdict"] = "blocked"
+        result["reason"] = (
+            f"Managed via {install_method} — update must be applied "
+            "through that installer's own flow, not the dashboard."
+        )
+    elif lock_held:
+        result["verdict"] = "blocked"
+        minutes, seconds = divmod(int(max(holder.age_seconds, 0)), 60)
+        elapsed = f"{minutes}m {seconds}s" if minutes else f"{seconds}s"
+        result["reason"] = (
+            f"An update is already running (PID {holder.pid}, started "
+            f"{elapsed} ago)."
+        )
+    elif pending_exists:
+        result["verdict"] = "blocked"
+        result["reason"] = (
+            "A pending update request already exists — review, approve, "
+            "or reject it before starting another."
+        )
+    elif will_stage:
+        result["verdict"] = "will_stage"
+        result["reason"] = (
+            "apply_approval is enabled — this will be staged for "
+            "approval, not applied immediately."
+        )
+
+    return result
+
+
 def _tail_lines(path: Path, n: int) -> List[str]:
     """Return the last ``n`` lines of ``path`` without loading huge logs."""
     if n <= 0 or not path.exists():
@@ -4948,6 +5042,21 @@ async def get_action_status(name: str, lines: int = 200):
         "pid": pid,
         "lines": tail,
     }
+
+
+@app.get("/api/actions/{name}/preflight")
+async def get_action_preflight(name: str):
+    """Read-only precheck of a durable action's likely outcome.
+
+    Same 404-if-unknown convention as ``GET /api/actions/{name}/status``,
+    scoped to ``_DURABLE_ACTIONS`` since ``_preflight_durable_action`` only
+    knows how to reason about update-shaped actions (lock/staging/pending/
+    install-method) -- there's nothing analogous to preflight for the
+    simpler spawn-and-tail actions (doctor, backup, ...).
+    """
+    if name not in _DURABLE_ACTIONS:
+        raise HTTPException(status_code=404, detail=f"Unknown action: {name}")
+    return _preflight_durable_action(name)
 
 
 # Per-row fields that no session LIST consumer reads but that dominate the
