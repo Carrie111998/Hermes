@@ -1708,3 +1708,92 @@ def test_lease_refresher_stops_on_persistent_raise() -> None:
     _no_sleep(refresher)
     refresher._run()  # must not propagate
     assert db.calls == refresher._max_consecutive_failures
+
+
+def test_lease_refresher_stops_renewing_after_max_lifetime() -> None:
+    """A holder that never calls stop() must not renew the lease forever.
+
+    Regression for the wedged-holder incident: a compression worker stuck
+    inside a summary call (dead aux provider) keeps its refresher alive
+    indefinitely - the dead-PID reclaim never fires because the process is
+    alive, so append_message fails with CompressionSessionBusyError until a
+    human deletes the lock row. The lifetime cap must stop renewals so the
+    lease expires by TTL on its own.
+    """
+    from agent.conversation_compression import _CompressionLockLeaseRefresher
+
+    db = _FlakyRefreshDB([])  # every refresh succeeds - a healthy-looking zombie
+    refresher = _CompressionLockLeaseRefresher(
+        db,
+        "sess",
+        "holder",
+        ttl_seconds=10.0,
+        refresh_interval_seconds=2.0,
+        max_lifetime_seconds=100.0,
+    )
+    _no_sleep(refresher)
+    # Scripted clock: 3 ticks inside the cap, then the cap is exceeded.
+    clock = iter([0.0, 10.0, 50.0, 99.0, 150.0, 151.0, 152.0])
+    refresher._monotonic = lambda: next(clock)
+    refresher._run()
+
+    # Ticks at 10/50/99s refreshed; the 150s reading tripped the cap before
+    # any further renewal. Successful renewals must never make the loop
+    # immortal - only the cap (or stop()) may end it.
+    assert db.calls == 3, (
+        f"expected renewals to stop at the lifetime cap after 3 ticks, "
+        f"got {db.calls} refresh calls"
+    )
+
+
+def test_lease_refresher_max_lifetime_defaults_are_bounded() -> None:
+    """The default cap derives from the TTL with an absolute floor, and an
+    explicit cap below one TTL is raised to the TTL (a smaller cap is not
+    honorable - the lease outlives the final renewal by up to a full TTL)."""
+    from agent.conversation_compression import _CompressionLockLeaseRefresher
+
+    db = _FlakyRefreshDB([])
+    # Default: max(6 * ttl, 1800) - the floor dominates for the default 300s TTL.
+    r1 = _CompressionLockLeaseRefresher(db, "s", "h", ttl_seconds=300.0)
+    assert r1._max_lifetime_seconds == max(
+        r1._MAX_LIFETIME_TTL_MULTIPLE * 300.0, r1._MAX_LIFETIME_FLOOR_SECONDS
+    )
+    # A huge TTL scales the cap proportionally instead of being outlived by it.
+    r2 = _CompressionLockLeaseRefresher(db, "s", "h", ttl_seconds=3600.0)
+    assert r2._max_lifetime_seconds >= 6.0 * 3600.0
+    # An explicit cap below the TTL is floored at the TTL.
+    r3 = _CompressionLockLeaseRefresher(
+        db, "s", "h", ttl_seconds=60.0, max_lifetime_seconds=5.0
+    )
+    assert r3._max_lifetime_seconds == 60.0
+    # Garbage values fall back to the derived default instead of raising.
+    r4 = _CompressionLockLeaseRefresher(
+        db, "s", "h", ttl_seconds=60.0, max_lifetime_seconds="soon"
+    )
+    assert r4._max_lifetime_seconds == max(
+        r4._MAX_LIFETIME_TTL_MULTIPLE * 60.0, r4._MAX_LIFETIME_FLOOR_SECONDS
+    )
+
+
+def test_lease_refresher_keeps_renewing_under_max_lifetime() -> None:
+    """The cap must not fire early: a clock inside the cap never ends the loop,
+    only the external stop does (the pre-cap behavior is unchanged)."""
+    from agent.conversation_compression import _CompressionLockLeaseRefresher
+
+    db = _FlakyRefreshDB([])
+    refresher = _CompressionLockLeaseRefresher(
+        db,
+        "sess",
+        "holder",
+        ttl_seconds=10.0,
+        refresh_interval_seconds=2.0,
+        max_lifetime_seconds=1000.0,
+    )
+    refresher._monotonic = lambda: 0.0  # time never advances
+    refresher._stop.wait = lambda _i: db.calls >= 5  # type: ignore[assignment]
+    refresher._run()
+
+    assert db.calls >= 5, (
+        "refresher stopped before the external stop signal even though the "
+        f"lifetime cap was never reached (calls: {db.calls})"
+    )

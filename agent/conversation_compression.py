@@ -616,6 +616,14 @@ class _CompressionActivityHeartbeat:
 
 
 class _CompressionLockLeaseRefresher:
+    # Default cap on how long one lease may be renewed, as a multiple of its
+    # TTL, with a generous absolute floor. Must comfortably exceed any
+    # legitimate compression run (chunked summaries of huge sessions, slow
+    # local aux models with 300s+ per-call timeouts, transient retries), so
+    # the floor sits well above the gateway hygiene waiter's 600s ceiling.
+    _MAX_LIFETIME_TTL_MULTIPLE = 6.0
+    _MAX_LIFETIME_FLOOR_SECONDS = 1800.0
+
     def __init__(
         self,
         db: Any,
@@ -623,6 +631,7 @@ class _CompressionLockLeaseRefresher:
         holder: str,
         ttl_seconds: float,
         refresh_interval_seconds: float | None = None,
+        max_lifetime_seconds: float | None = None,
     ) -> None:
         self._db = db
         self._session_id = session_id
@@ -639,6 +648,31 @@ class _CompressionLockLeaseRefresher:
         self._max_consecutive_failures = max(
             1, int(self._ttl_seconds / self._refresh_interval_seconds)
         )
+        # Hard cap on total lease lifetime. The refresher only stops when the
+        # owner calls stop() - but an owner wedged inside a summary call that
+        # never returns (dead aux provider, per-chunk read timeout that resets
+        # on trickling bytes) never calls it, and a live-PID holder is exempt
+        # from dead-PID reclaim. Without this cap such a holder renews forever
+        # and append_message fails with CompressionSessionBusyError until a
+        # human deletes the lock row (observed in production: 45+ minutes of
+        # blocked writes). Once the cap trips we stop renewing, the lease
+        # expires by TTL, writes resume, and the zombie compression - if it
+        # ever returns - fails its lease check at publication and aborts
+        # without forking the session.
+        try:
+            max_lifetime = float(max_lifetime_seconds) if max_lifetime_seconds is not None else None
+        except (TypeError, ValueError):
+            max_lifetime = None
+        if max_lifetime is None or not math.isfinite(max_lifetime) or max_lifetime <= 0:
+            max_lifetime = max(
+                self._MAX_LIFETIME_TTL_MULTIPLE * self._ttl_seconds,
+                self._MAX_LIFETIME_FLOOR_SECONDS,
+            )
+        # A cap below one TTL is not honorable: the lease outlives the last
+        # renewal by up to a full TTL anyway, so floor the cap there.
+        self._max_lifetime_seconds = max(max_lifetime, float(self._ttl_seconds))
+        # Seam for tests; production always uses the monotonic clock.
+        self._monotonic = time.monotonic
         self._stop = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
@@ -671,6 +705,7 @@ class _CompressionLockLeaseRefresher:
         # by the TTL the acquirer set — the lock can never be held past its TTL
         # by a stuck refresher.
         consecutive_failures = 0
+        started_at = self._monotonic()
         # First refresh happens immediately, not one interval late. Everything
         # between try_acquire() and start() (the rotation-ownership lookup, the
         # durable-breaker re-read, thread startup) is charged against the very
@@ -682,6 +717,24 @@ class _CompressionLockLeaseRefresher:
                 first = False
                 if self._stop.is_set():
                     break
+            elapsed = self._monotonic() - started_at
+            if elapsed >= self._max_lifetime_seconds:
+                # The owner never released us and the cap has passed: assume
+                # the compression is wedged, not slow. Stop renewing so the
+                # lease expires by TTL and blocked session writes resume; a
+                # worker that later returns fails its holder-qualified lease
+                # check at publication and aborts without forking the session.
+                logger.warning(
+                    "compression lease for session %s held for %.0fs "
+                    "(cap %.0fs) without completing; stopping the lease "
+                    "refresher so the lock expires by TTL (%.0fs) and "
+                    "session writes can resume",
+                    self._session_id,
+                    elapsed,
+                    self._max_lifetime_seconds,
+                    self._ttl_seconds,
+                )
+                break
             try:
                 refreshed = self._db.refresh_compression_lock(
                     self._session_id,
@@ -1504,6 +1557,7 @@ def compress_context(
     except (TypeError, ValueError):
         _lock_ttl = 300.0
     _lock_refresh_interval = getattr(agent, "_compression_lock_refresh_interval", None)
+    _lock_max_lifetime = getattr(agent, "_compression_lock_max_lifetime_seconds", None)
     _lock_refresher: Optional[_CompressionLockLeaseRefresher] = None
     if _lock_db is not None and _lock_sid:
         _lock_holder = _compression_lock_holder(agent)
@@ -1699,6 +1753,7 @@ def compress_context(
                 _lock_holder,
                 _lock_ttl,
                 _lock_refresh_interval,
+                max_lifetime_seconds=_lock_max_lifetime,
             )
             _lock_refresher.start()
 
