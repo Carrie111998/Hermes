@@ -1265,13 +1265,16 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             file_name or os.path.basename(file_path),
         )
 
-    async def send_typing(self, chat_id: str, metadata=None) -> None:
-        """Send typing indicator via bridge."""
+    async def _post_presence(self, chat_id: str, state: str) -> None:
+        """POST a presence state to the bridge's /typing endpoint.
+
+        Shared by send_typing/stop_typing so the two can't drift apart.
+        """
         if not self._running or not self._http_session:
             return
         if await self._check_managed_bridge_exit():
             return
-        
+
         try:
             import aiohttp
 
@@ -1280,12 +1283,28 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             # socket in CLOSE_WAIT. See #18451.
             async with self._http_session.post(
                 f"http://127.0.0.1:{self._bridge_port}/typing",
-                json={"chatId": to_whatsapp_jid(chat_id)},
+                json={"chatId": to_whatsapp_jid(chat_id), "state": state},
                 timeout=aiohttp.ClientTimeout(total=5)
             ):
                 pass
         except Exception:
             pass  # Ignore typing indicator failures
+
+    async def send_typing(self, chat_id: str, metadata=None) -> None:
+        """Send typing indicator via bridge."""
+        await self._post_presence(chat_id, "composing")
+
+    async def stop_typing(self, chat_id: str, metadata=None) -> None:
+        """Clear the typing indicator.
+
+        WhatsApp presence is sticky — a 'composing' update stays up until an
+        explicit 'paused' arrives, unlike Telegram/Discord where the indicator
+        expires a few seconds after the last refresh. Without this the base
+        class's no-op stop_typing() left the contact showing "typing…"
+        indefinitely after every agent turn, since `_keep_typing` refreshes
+        'composing' for the life of the turn and nothing ever took it down.
+        """
+        await self._post_presence(chat_id, "paused")
     
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         """Get information about a WhatsApp chat."""

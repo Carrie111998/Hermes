@@ -58,14 +58,41 @@ class TestWhatsappTypingLeakFix:
         import inspect
         import plugins.platforms.whatsapp.adapter as mod
 
-        src = inspect.getsource(mod.WhatsAppAdapter.send_typing)
+        # send_typing/stop_typing both delegate to _post_presence, which owns
+        # the single POST to the bridge's /typing endpoint. Assert against
+        # whichever member actually issues the call so the guarantee survives
+        # refactors of the callers.
+        adapter = mod.WhatsAppAdapter
+        holder = getattr(adapter, "_post_presence", adapter.send_typing)
+        src = inspect.getsource(holder)
+
         # The fix must be structural: the post() call is inside an
         # `async with`, not a bare `await`.
         assert "async with self._http_session.post(" in src, (
-            "send_typing must wrap self._http_session.post(...) in "
-            "`async with` to release the aiohttp response socket "
+            "the WhatsApp typing POST must wrap self._http_session.post(...) "
+            "in `async with` to release the aiohttp response socket "
             "(#18451). Otherwise the response sits in CLOSE_WAIT "
             "until GC."
         )
         # The old bare-await form must be gone.
         assert "await self._http_session.post(" not in src
+
+    def test_typing_helpers_do_not_reintroduce_bare_await(self):
+        """Every entry point into the /typing endpoint stays leak-free.
+
+        ``stop_typing`` was added after #18451 (sticky WhatsApp presence left
+        the indicator up forever); it must not open a second, unguarded path
+        to the same endpoint.
+        """
+        import inspect
+        import plugins.platforms.whatsapp.adapter as mod
+
+        for name in ("send_typing", "stop_typing", "_post_presence"):
+            member = getattr(mod.WhatsAppAdapter, name, None)
+            if member is None:
+                continue
+            src = inspect.getsource(member)
+            assert "await self._http_session.post(" not in src, (
+                f"{name} reintroduced a bare `await ...post(...)` — wrap it "
+                "in `async with` or delegate to _post_presence (#18451)."
+            )

@@ -22,7 +22,32 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolvePresenceState,
 } from './bridge_helpers.js';
+
+// -- typing presence state ------------------------------------------------
+//
+// WhatsApp presence is sticky: 'composing' stays up until an explicit
+// 'paused' arrives, so /typing has to be able to take the indicator down or
+// a contact shows "typing…" forever after the agent's turn ends.
+{
+  assert.equal(resolvePresenceState('paused'), 'paused',
+    'explicit paused must clear the indicator');
+  assert.equal(resolvePresenceState('composing'), 'composing');
+
+  // Backward compatibility: callers that post only { chatId } (no state)
+  // must keep starting the indicator, not clear it.
+  assert.equal(resolvePresenceState(undefined), 'composing',
+    'omitted state must default to composing');
+  assert.equal(resolvePresenceState(null), 'composing');
+  assert.equal(resolvePresenceState(''), 'composing');
+
+  // Anything unrecognised is treated as "start", never as a silent clear.
+  assert.equal(resolvePresenceState('bogus'), 'composing');
+  assert.equal(resolvePresenceState('PAUSED'), 'composing',
+    'only the exact literal clears — no case-folding surprises');
+  console.log('  ✓ typing presence resolves paused vs composing, defaults safe');
+}
 
 // -- inbound read receipts ------------------------------------------------
 {

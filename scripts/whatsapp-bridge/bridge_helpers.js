@@ -506,6 +506,22 @@ export function inboundReadReceiptKeys({ key, enabled }) {
   return [key];
 }
 
+/**
+ * Resolve the Baileys presence state for a /typing request.
+ *
+ * WhatsApp presence is STICKY — a 'composing' update stays up until an
+ * explicit 'paused' arrives, unlike Telegram/Discord where the indicator
+ * expires a few seconds after the last refresh. So the endpoint has to be
+ * able to take the indicator back down, or a contact shows "typing…"
+ * indefinitely once the agent's turn ends.
+ *
+ * Anything other than the literal 'paused' resolves to 'composing' so
+ * existing callers that post only `{ chatId }` are unaffected.
+ */
+export function resolvePresenceState(state) {
+  return state === 'paused' ? 'paused' : 'composing';
+}
+
 export function mediaPayloadForFile({ buffer, filePath, mediaType, caption, fileName }) {
   const ext = filePath.toLowerCase().split('.').pop();
   const type = mediaType || inferMediaType(ext);

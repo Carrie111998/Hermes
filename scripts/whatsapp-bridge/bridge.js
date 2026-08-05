@@ -46,6 +46,7 @@ import {
   mediaPayloadForFile,
   pollCreationMessageFromPayload,
   pollUpdateForAggregation,
+  resolvePresenceState,
 } from './bridge_helpers.js';
 
 // Parse CLI args
@@ -1037,17 +1038,27 @@ app.post('/send-location', async (req, res) => {
   }
 });
 
-// Typing indicator
+// Typing indicator.
+//
+// WhatsApp presence is STICKY: unlike Telegram/Discord, whose typing state
+// expires a few seconds after the last refresh, a 'composing' presence stays
+// up until an explicit 'paused' arrives. So a caller that only ever sends
+// 'composing' leaves the contact showing "typing…" forever once the agent's
+// turn ends (and `markOnlineOnConnect: false` means a reconnect does not clear
+// it either). `state: 'paused'` is how the adapter's stop_typing() takes it
+// down. Defaults to 'composing' so existing callers are unaffected.
 app.post('/typing', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected' });
   }
 
-  const { chatId } = req.body;
+  const { chatId, state } = req.body;
   if (!chatId) return res.status(400).json({ error: 'chatId required' });
 
+  const presence = resolvePresenceState(state);
+
   try {
-    await sock.sendPresenceUpdate('composing', chatId);
+    await sock.sendPresenceUpdate(presence, chatId);
     res.json({ success: true });
   } catch (err) {
     res.json({ success: false });
