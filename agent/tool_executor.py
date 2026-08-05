@@ -102,6 +102,45 @@ _DEFAULT_CONCURRENT_TOOL_TIMEOUT_S = 420.0
 # to cover slow-but-legitimate authorization (e.g. an approval round-trip),
 # short enough that one wedged dispatch cannot starve the batch forever.
 _START_ORDER_GATE_TIMEOUT_S = 120.0
+# Upper bound a concurrent worker will wait for the authorization
+# serialization lock before running its prompt unserialized. Mirrors
+# _START_ORDER_GATE_TIMEOUT_S: long enough to cover slow-but-legitimate
+# authorization, short enough that a worker wedged inside the gate (a hanging
+# pre_tool_block plugin, or an approval round-trip to a client that went away)
+# cannot starve every other worker in the batch forever. Losing serialization
+# degrades to interleaved approval prompts — the same tradeoff the start-order
+# gate accepts, and strictly better than a hung turn.
+_AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 120.0
+# Fallback ceiling (seconds) for how much wall-clock time a single open
+# authorization window may exclude from the batch deadline. The ceiling is
+# normally derived from the approval gate's own timeout (approvals.timeout,
+# default 300s) plus a margin — see _authorization_gate_max_window_seconds() —
+# and this constant is only used when that config cannot be read.
+_AUTHORIZATION_GATE_MAX_WINDOW_S = 600.0
+# Margin added on top of the configured approval timeout when deriving the
+# exclusion ceiling, so a slow-but-legitimate human round-trip (which is
+# already bounded by approvals.timeout inside the approval gate) stays
+# covered without the ceiling being so tight it truncates real approvals.
+_AUTHORIZATION_GATE_APPROVAL_MARGIN_S = 120.0
+
+
+def _authorization_gate_max_window_seconds() -> float:
+    """Resolve the ceiling on an open authorization window's deadline exclusion.
+
+    A legitimate approval round-trip is itself bounded by the approval gate's
+    timeout (``approvals.timeout``, default 300s), so the exclusion ceiling
+    tracks that bound plus a margin: slow-but-legitimate human waits stay
+    excluded from the batch deadline, while a wedged ``pre_tool_block`` plugin
+    — which has no intrinsic timeout of its own — can no longer grow the
+    exclusion 1:1 with wall clock and defeat the batch deadline forever. Falls
+    back to a fixed ceiling when the approval config cannot be read.
+    """
+    try:
+        from tools.approval import _get_approval_timeout
+
+        return float(_get_approval_timeout()) + _AUTHORIZATION_GATE_APPROVAL_MARGIN_S
+    except Exception:
+        return _AUTHORIZATION_GATE_MAX_WINDOW_S
 
 
 class _BatchAbandoned(BaseException):
@@ -356,14 +395,35 @@ class _ManagedToolResult:
 
 
 class _ConcurrentToolAuthorizationGate:
-    """Serialize policy prompts and exclude their queue from batch deadlines."""
+    """Serialize policy prompts and exclude their queue from batch deadlines.
 
-    def __init__(self) -> None:
+    Both bounds are deliberately finite so a worker that wedges inside the
+    gate (a hanging ``pre_tool_block`` plugin, or an approval round-trip to a
+    client that went away) cannot hang the turn:
+
+    - The serialization lock is acquired with a timeout; on expiry the worker
+      runs its prompt unserialized rather than blocking behind the wedged
+      holder forever (same tradeoff as the start-order gate in #79705).
+    - The open-window exclusion reported to the batch deadline is capped, so
+      a wedged window cannot grow the exclusion 1:1 with wall clock and make
+      the deadline's ``remaining`` constant — the deadline always fires.
+    """
+
+    def __init__(
+        self,
+        *,
+        lock_timeout: float = _AUTHORIZATION_GATE_LOCK_TIMEOUT_S,
+        max_window_seconds: float | None = None,
+    ) -> None:
         self._serialization_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._pending = 0
         self._window_started: float | None = None
         self._excluded_seconds = 0.0
+        self._lock_timeout = lock_timeout
+        if max_window_seconds is None:
+            max_window_seconds = _authorization_gate_max_window_seconds()
+        self._max_window_seconds = max_window_seconds
 
     def run(self, callback):
         now = time.monotonic()
@@ -372,8 +432,18 @@ class _ConcurrentToolAuthorizationGate:
                 self._window_started = now
             self._pending += 1
         try:
-            with self._serialization_lock:
+            acquired = self._serialization_lock.acquire(timeout=self._lock_timeout)
+            try:
+                if not acquired:
+                    logger.warning(
+                        "authorization gate lock timed out after %.1fs; "
+                        "running prompt unserialized",
+                        self._lock_timeout,
+                    )
                 return callback()
+            finally:
+                if acquired:
+                    self._serialization_lock.release()
         finally:
             now = time.monotonic()
             with self._state_lock:
@@ -386,12 +456,20 @@ class _ConcurrentToolAuthorizationGate:
                     self._window_started = None
 
     def excluded_seconds(self) -> float:
-        """Return completed plus currently active authorization wait time."""
+        """Return completed plus currently active authorization wait time.
+
+        The active window's contribution is capped at ``_max_window_seconds``:
+        the batch deadline loop adds this value to the deadline on every poll,
+        so an *uncapped* open window grows 1:1 with wall clock and ``remaining``
+        never decreases — the deadline never fires. Once the cap is reached the
+        exclusion stops growing and the deadline converges.
+        """
         now = time.monotonic()
         with self._state_lock:
             excluded = self._excluded_seconds
             if self._window_started is not None:
-                excluded += max(0.0, now - self._window_started)
+                open_seconds = max(0.0, now - self._window_started)
+                excluded += min(open_seconds, self._max_window_seconds)
             return excluded
 
 
