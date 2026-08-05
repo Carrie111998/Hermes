@@ -2545,6 +2545,17 @@ def terminal_tool(
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
                             if len(data) <= 1024 * 1024:
+                                # Skip binaries: a NUL byte in the chunk marks
+                                # machine code, not a shell script. Decoding it
+                                # with errors="replace" keeps U+0000 intact (NUL
+                                # is valid UTF-8), and the guard's recursion
+                                # would re-tokenize that text into NUL-bearing
+                                # paths that crash os.open with
+                                # `ValueError: embedded null byte` (#76762).
+                                # Mirror _read_referenced_script: binary ==
+                                # "nothing to scan".
+                                if b"\x00" in data:
+                                    return None
                                 return data.decode("utf-8", errors="replace")
                 except Exception:
                     pass
@@ -2552,7 +2563,12 @@ def terminal_tool(
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        # Same NUL guard for remote reads: a binary dumped by
+                        # `cat` must not feed NUL-laden text into the guard.
+                        if "\x00" in output:
+                            return None
+                        return output
                 except Exception:
                     pass
                 return None

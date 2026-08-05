@@ -8,7 +8,10 @@ Covers:
 
 import json
 import os
+import sys
 from argparse import Namespace
+from pathlib import Path
+from typing import Optional
 
 import pytest
 
@@ -692,6 +695,55 @@ class TestLifecycleGuardModule:
         )
         result = contains_gateway_lifecycle_command_or_referenced_script(
             '/usr/bin/python3 -c "print(1)"'
+        )
+        assert result is False
+
+    def test_binary_read_via_remote_callback_does_not_crash_guard(self, tmp_path):
+        """#76762 regression: a read_remote_script fallback that decodes a
+        binary's bytes must not crash the guard's recursion with
+        ValueError: embedded null byte.
+
+        The gateway passes terminal_tool's _read_script_in_env here; before
+        the fix it read a binary's bytes and decoded them with
+        errors="replace" — NUL (U+0000) is valid UTF-8, so it survived into
+        the returned text. The recursion then re-tokenized NUL-laden machine
+        code into paths and os.open crashed on the embedded NUL. A small
+        synthetic binary keeps the walk deterministic and fast.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        binary = tmp_path / "tiny.bin"
+        binary.write_bytes(b"\x7fELF\x02\x01\x01\x00\x00\x00print(1)\x00")
+
+        def binary_remote_read(script_path: str) -> Optional[str]:
+            # Reproduce the pre-fix _read_script_in_env behavior. NUL bytes
+            # survive errors="replace" decoding. Missing/unreadable/NUL paths
+            # yield nothing rather than raising.
+            try:
+                data = Path(script_path).read_bytes()
+            except (OSError, ValueError):
+                return None
+            return data.decode("utf-8", errors="replace")
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            f'{binary} -c "print(1)"',
+            read_remote_script=binary_remote_read,
+        )
+        assert result is False
+
+    def test_nul_bearing_script_path_does_not_crash_guard(self):
+        """#76762 defense-in-depth: a command token containing an embedded NUL
+        byte must never crash _read_referenced_script's os.open with
+        ValueError — the guard tolerates ValueError from os.open just as it
+        already tolerates it from Path.resolve."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "/usr/bin/python3\x00evil -c 'print(1)'"
         )
         assert result is False
 
