@@ -994,6 +994,9 @@ class DiscordAdapter(BasePlatformAdapter):
         self._tool_progress_channels: Dict[str, Any] = {}
         self._tool_progress_status_messages: Dict[str, Any] = {}
         self._tool_progress_status_tasks: Dict[str, asyncio.Task] = {}
+        # Long-running heartbeats share the transient treatment of the tool
+        # count embed: edit one embed during a turn, then delete it on exit.
+        self._long_running_status_messages: Dict[str, Any] = {}
 
 
     def _config_value(
@@ -2878,6 +2881,7 @@ class DiscordAdapter(BasePlatformAdapter):
         message = event.raw_message
         message_id = str(getattr(message, "id", None) or getattr(event, "message_id", None) or "")
         await self._delete_tool_progress_status(message_id)
+        await self._delete_long_running_status(message_id)
         tool_reactions = self._tool_progress_reactions.pop(message_id, [])
         if not self._reactions_enabled():
             return
@@ -2962,6 +2966,58 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.debug("[%s] tool-progress status delete failed", self.name, exc_info=True)
         self._tool_progress_counts.pop(message_id, None)
         self._tool_progress_channels.pop(message_id, None)
+
+    async def render_long_running_status(
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        origin_message_id: Optional[str] = None,
+        message_id: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Upsert a temporary Discord embed for an active turn's heartbeat."""
+        if not self._client or not DISCORD_AVAILABLE or discord is None:
+            return SendResult(success=False, error="Discord embed status unavailable")
+        try:
+            target_id = str((metadata or {}).get("thread_id") or chat_id)
+            channel = self._client.get_channel(int(target_id))
+            if channel is None:
+                channel = await self._client.fetch_channel(int(target_id))
+            if channel is None or self._is_forum_parent(channel):
+                return SendResult(success=False, error=f"Channel {target_id} cannot host a status embed")
+            embed = discord.Embed(description=content, colour=0x5865F2)
+            key = str(origin_message_id or message_id or "")
+            status = self._long_running_status_messages.get(key) if key else None
+            if status is None and message_id and hasattr(channel, "fetch_message"):
+                try:
+                    status = await channel.fetch_message(int(message_id))
+                except Exception:
+                    status = None
+            if status is not None and hasattr(status, "edit"):
+                await status.edit(content=None, embed=embed)
+                return SendResult(success=True, message_id=str(getattr(status, "id", message_id or "")))
+            if not hasattr(channel, "send"):
+                return SendResult(success=False, error=f"Channel {target_id} cannot send a status embed")
+            status = await channel.send(embed=embed)
+            status_id = str(getattr(status, "id", ""))
+            if key:
+                self._long_running_status_messages[key] = status
+            if status_id:
+                self._nonconversational_messages.mark_many([status_id])
+            return SendResult(success=True, message_id=status_id or None)
+        except Exception as exc:
+            logger.debug("[%s] long-running status render failed: %s", self.name, exc)
+            return SendResult(success=False, error=str(exc))
+
+    async def _delete_long_running_status(self, origin_message_id: str) -> None:
+        """Remove the transient long-running heartbeat for a completed turn."""
+        status = self._long_running_status_messages.pop(str(origin_message_id or ""), None)
+        if status is not None and hasattr(status, "delete"):
+            try:
+                await status.delete()
+            except Exception:
+                logger.debug("[%s] long-running status delete failed", self.name, exc_info=True)
 
     async def send(
         self,

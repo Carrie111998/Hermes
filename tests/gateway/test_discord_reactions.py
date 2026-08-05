@@ -329,6 +329,38 @@ async def test_live_tool_count_embed_is_edited_then_deleted_before_final_reactio
 
 
 @pytest.mark.asyncio
+async def test_long_running_status_is_embed_edited_then_deleted(adapter, monkeypatch):
+    class FakeEmbed:
+        def __init__(self, *, description, colour, title=None):
+            self.description = description
+            self.colour = colour
+            self.title = title
+
+    monkeypatch.setattr(discord_adapter_module, "discord", SimpleNamespace(Embed=FakeEmbed))
+    monkeypatch.setattr(discord_adapter_module, "DISCORD_AVAILABLE", True)
+    status_message = SimpleNamespace(id=456, edit=AsyncMock(), delete=AsyncMock())
+    channel = SimpleNamespace(send=AsyncMock(return_value=status_message))
+    adapter._client.get_channel = lambda _id: channel
+    raw_message = SimpleNamespace(id=123, add_reaction=AsyncMock(), remove_reaction=AsyncMock())
+    event = _make_event("123", raw_message)
+    await adapter.on_processing_start(event)
+
+    first = await adapter.render_long_running_status(
+        "123", "⏳ Working — 3 min", origin_message_id="123"
+    )
+    second = await adapter.render_long_running_status(
+        "123", "⏳ Working — 6 min", origin_message_id="123", message_id=first.message_id
+    )
+
+    assert first.success and second.success
+    assert first.message_id == "456"
+    assert channel.send.await_args.kwargs["embed"].description == "⏳ Working — 3 min"
+    assert status_message.edit.await_args.kwargs["embed"].description == "⏳ Working — 6 min"
+    await adapter.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+    status_message.delete.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_add_tool_progress_reaction_respects_disabled_reactions(adapter, monkeypatch):
     monkeypatch.setenv("DISCORD_REACTIONS", "false")
     raw_message = SimpleNamespace(add_reaction=AsyncMock())

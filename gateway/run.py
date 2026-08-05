@@ -22803,7 +22803,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 try:
                     _notify_res = None
-                    if _heartbeat_msg_id:
+                    _render_heartbeat = getattr(_notify_adapter, "render_long_running_status", None)
+                    if callable(_render_heartbeat):
+                        _rendered = _render_heartbeat(
+                            source.chat_id,
+                            _heartbeat_text,
+                            origin_message_id=event_message_id,
+                            message_id=_heartbeat_msg_id,
+                            metadata=_status_thread_metadata,
+                        )
+                        _notify_res = await _rendered if inspect.isawaitable(_rendered) else _rendered
+                    elif _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
                                 source.chat_id,
