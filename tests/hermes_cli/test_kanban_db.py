@@ -1583,3 +1583,100 @@ def test_bare_connect_does_not_close_on_context_exit(tmp_path):
     # Still usable after with-block exit (the leak).
     conn.execute("SELECT 1").fetchone()
     conn.close()  # explicit close to avoid leaking THIS test
+
+
+# ---------------------------------------------------------------------------
+# Create-time worktree guard (#t_c73918dc, recurrence-prevention for t_9f37bffa)
+# Rejects worktree tasks with no path before they become dead-blocks.
+# ---------------------------------------------------------------------------
+
+
+def test_worktree_no_path_no_default_workdir_raises_at_create(kanban_home):
+    """Creating a worktree task without workspace_path and without
+    board default_workdir MUST raise ValueError at create_time rather than
+    silently persisting a NULL path that auto-blocks on dispatch."""
+    from hermes_cli.kanban_db import DEFAULT_BOARD
+
+    board_meta = kb.read_board_metadata(DEFAULT_BOARD)
+    assert board_meta.get("default_workdir") is None
+
+    with pytest.raises(ValueError, match="worktree tasks require an explicit"):
+        with kb.connect() as conn:
+            kb.create_task(
+                conn,
+                title="dead-block card",
+                assignee="coder",
+                workspace_kind="worktree",
+            )
+
+
+def test_worktree_with_explicit_path_succeeds(kanban_home):
+    """An explicit workspace_path must satisfy the guard regardless of
+    board default_workdir."""
+    from hermes_cli.kanban_db import DEFAULT_BOARD
+
+    board_meta = kb.read_board_metadata(DEFAULT_BOARD)
+    assert board_meta.get("default_workdir") is None
+
+    ws_dir = Path("/tmp/explicit-worktree-test")
+    ws_dir.mkdir(exist_ok=True)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="explicit-path worktree",
+            assignee="coder",
+            workspace_kind="worktree",
+            workspace_path=str(ws_dir),
+        )
+    task = kb.get_task(conn, t)
+    assert task is not None
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(ws_dir)
+
+
+def test_worktree_inherits_board_default_workdir(kanban_home):
+    """A board with default_workdir set must let worktree tasks succeed
+    without an explicit workspace_path — this is the existing behaviour
+    the guard preserves."""
+    from hermes_cli.kanban_db import DEFAULT_BOARD
+
+    # Set up a board-level default_workdir
+    kb.write_board_metadata(DEFAULT_BOARD, default_workdir="/tmp/board-worktree-dir")
+    try:
+        with kb.connect() as conn:
+            t = kb.create_task(
+                conn,
+                title="inherited-default worktree",
+                assignee="coder",
+                workspace_kind="worktree",
+            )
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.workspace_kind == "worktree"
+        assert task.workspace_path == "/tmp/board-worktree-dir"
+    finally:
+        # Restore original state (clear default_workdir)
+        kb.write_board_metadata(DEFAULT_BOARD, default_workdir=None)
+
+
+def test_scratch_workspace_unaffected_by_guard(kanban_home):
+    """The guard only targets worktree; scratch tasks with no path must
+    continue resolving via resolve_workspace as before."""
+    from hermes_cli.kanban_db import DEFAULT_BOARD
+
+    board_meta = kb.read_board_metadata(DEFAULT_BOARD)
+    assert board_meta.get("default_workdir") is None
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="scratch task no path",
+            assignee="coder",
+            workspace_kind="scratch",
+        )
+    task = kb.get_task(conn, t)
+    assert task is not None
+    assert task.workspace_kind == "scratch"
+    # Scratch resolves its own workspace_path later; create_task must NOT raise
+    assert task.workspace_path is None or task.workspace_path != ""

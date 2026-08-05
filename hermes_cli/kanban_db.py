@@ -3153,6 +3153,21 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Create-time guard: reject worktree tasks that will become dead-blocks.
+    # If workspace_kind is worktree and no concrete path was resolved (no
+    # explicit workspace_path, no board default_workdir, no project_repo
+    # fallback), _resolve_worktree at dispatch time raises ValueError and
+    # auto-blocks the card permanently -- this guard fires early so the
+    # caller fixes it at creation instead of at spawn. Keep scratch/dir
+    # behavior unchanged; only worktree triggers the check.
+    if workspace_kind == "worktree" and workspace_path is None and project_repo is None:
+        raise ValueError(
+            "worktree tasks require an explicit workspace_path or a board-level "
+            "default_workdir (or a project link). Pass workspace_path= or set "
+            "board.default_workdir; creating a worktree without either would "
+            "cause the dispatcher to auto-block the task."
+        )
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
