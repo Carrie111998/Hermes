@@ -103,13 +103,85 @@ def test_build_and_validate_exact_pre_phase_b_start_permit(
                 "expected_uid": 0,
                 "expected_gid": 0,
                 "expected_mode": 0o400,
-                "maximum_bytes": 2 * 1024 * 1024,
+                "maximum_bytes": permit_module._MAX_RELEASE_MANIFEST_BYTES,
             },
         )
     ]
     assert permit_module.canonical_pre_phase_b_start_permit_bytes(value).endswith(
         b"\n"
     )
+
+
+@pytest.mark.parametrize(
+    ("manifest_size", "accepted"),
+    (
+        (permit_module._MAX_RELEASE_MANIFEST_BYTES, True),
+        (permit_module._MAX_RELEASE_MANIFEST_BYTES + 1, False),
+    ),
+)
+def test_release_manifest_security_envelope_is_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    manifest_size: int,
+    accepted: bool,
+) -> None:
+    revision = "a" * 40
+    monkeypatch.setattr(permit_module, "DEFAULT_CANARY_RELEASES_ROOT", tmp_path)
+    artifact_root = tmp_path / revision
+    bootstrap = (
+        artifact_root
+        / "venv/lib/python3.11/site-packages/gateway/canonical_writer_bootstrap.py"
+    )
+    bootstrap.parent.mkdir(parents=True)
+    bootstrap.write_bytes(b"bootstrap-module")
+    manifest = artifact_root / "release-manifest.json"
+    config = Path("/etc/muncho-canonical-writer/writer.json")
+    manifest_raw = b"m" * manifest_size
+    config_raw = b'{"writer":"exact"}\n'
+    observed = {
+        bootstrap: bootstrap.read_bytes(),
+        manifest: manifest_raw,
+        config: config_raw,
+    }
+
+    def read(path: Path, *, maximum_bytes: int, **_kwargs) -> bytes:
+        raw = observed[path]
+        if not 0 < len(raw) <= maximum_bytes:
+            raise permit_module.PrePhaseBStartPermitError(
+                "pre_phase_b_start_permit_invalid"
+            )
+        return raw
+
+    monkeypatch.setattr(permit_module, "_read_exact_file", read)
+    monkeypatch.setattr(permit_module, "_boot_id_sha256", lambda: "b" * 64)
+
+    arguments = {
+        "revision": revision,
+        "artifact_root": str(artifact_root),
+        "artifact_sha256": "c" * 64,
+        "release_manifest_file_sha256": _sha(manifest_raw),
+        "writer_config_path": str(config),
+        "writer_config_sha256": _sha(config_raw),
+        "writer_uid": 999,
+        "writer_gid": 994,
+        "boot_id_sha256": "b" * 64,
+        "scope": "native_observation",
+        "plan_sha256": "d" * 64,
+        "owner_approval_receipt_sha256": "e" * 64,
+        "owner_approval_expires_at_unix": 1_800_000_300,
+        "external_iam_receipt_sha256": "f" * 64,
+        "now_unix": 1_800_000_000,
+    }
+
+    if accepted:
+        value = permit_module.build_pre_phase_b_start_permit(**arguments)
+        assert value["release_manifest_file_sha256"] == _sha(manifest_raw)
+    else:
+        with pytest.raises(
+            permit_module.PrePhaseBStartPermitError,
+            match="pre_phase_b_start_permit_invalid",
+        ):
+            permit_module.build_pre_phase_b_start_permit(**arguments)
 
 
 @pytest.mark.parametrize(
@@ -269,4 +341,38 @@ def test_root_only_manifest_metadata_is_validated_without_opening(
             expected_gid=os.getgid(),
             expected_mode=0o400,
             maximum_bytes=16,
+        )
+
+
+def test_release_manifest_metadata_security_envelope_is_exact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(permit_module, "_validate_parent_chain", lambda _path: None)
+    manifest = tmp_path / "release-manifest.json"
+    manifest.write_bytes(b"m" * permit_module._MAX_RELEASE_MANIFEST_BYTES)
+    manifest.chmod(0o400)
+
+    permit_module._validate_exact_file_metadata(
+        manifest,
+        expected_uid=os.getuid(),
+        expected_gid=os.getgid(),
+        expected_mode=0o400,
+        maximum_bytes=permit_module._MAX_RELEASE_MANIFEST_BYTES,
+    )
+
+    manifest.chmod(0o600)
+    with manifest.open("ab") as handle:
+        handle.write(b"m")
+    manifest.chmod(0o400)
+    with pytest.raises(
+        permit_module.PrePhaseBStartPermitError,
+        match="pre_phase_b_start_permit_invalid",
+    ):
+        permit_module._validate_exact_file_metadata(
+            manifest,
+            expected_uid=os.getuid(),
+            expected_gid=os.getgid(),
+            expected_mode=0o400,
+            maximum_bytes=permit_module._MAX_RELEASE_MANIFEST_BYTES,
         )
