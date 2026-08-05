@@ -271,5 +271,29 @@ describe('LINE recents filtering', () => {
     expect($sessions.get().map(s => s.id)).toEqual(['local'])
     expect($messagingSessions.get().map(s => s.id)).toEqual(['line'])
   })
+})
 
+// The same recents/messaging contamination applies to every messaging
+// platform, not just LINE: selecting a Telegram conversation force-kept it in
+// local recents via sessionsToKeep(), so the sidebar rendered one session in
+// two sections (recents + the Telegram platform section) and selecting it
+// highlighted both rows. Regression coverage for the telegram variant.
+describe('Telegram recents filtering', () => {
+  it('does not preserve an active Telegram session during a full refresh', async () => {
+    const local = row('local')
+    const telegram = row('telegram', { source: 'telegram', title: 'Automation Audit' })
+
+    setSessions([local, telegram])
+    setSelectedStoredSessionId(telegram.id)
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [local] }, [], [telegram]))
+
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshSessions()
+    })
+
+    expect($sessions.get().map(s => s.id)).toEqual(['local'])
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['telegram'])
+  })
 })
