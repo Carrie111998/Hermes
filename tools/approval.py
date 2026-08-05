@@ -2004,6 +2004,54 @@ def _mark_command_starts(command: str) -> str:
     return "".join(parts)
 
 
+def _mask_quoted_newlines(command: str) -> str:
+    """Replace raw newlines inside single/double quotes with a space.
+
+    Detection-only rewrite. A newline inside a quoted string is DATA to the
+    shell — part of the argument, not a command separator — yet the flat
+    ``_CMDPOS`` start-position class treats every raw ``\\n`` as a command
+    start. That made any multi-line quoted argument (``hermes send`` message
+    bodies, ``git commit -m`` messages, heredoc text) trip the hardline
+    blocklist when a data line began with e.g. ``sudo reboot``.
+
+    Quote tracking mirrors ``_iter_shell_command_starts``: single quotes are
+    literal until the closing quote; inside double quotes a backslash escapes
+    the next character. Real command boundaries are unaffected: unquoted
+    newlines pass through untouched, ``$(``/backtick remain ``_CMDPOS``
+    anchors independent of newlines, and ``_mark_command_starts`` still
+    re-inserts newlines at every genuine quote-aware command start. An
+    unclosed quote absorbs following newlines exactly as the shell would
+    (the quoted word continues across the line break), so masking them
+    cannot hide a runnable command.
+    """
+    if "\n" not in command:
+        return command
+    out: list[str] = []
+    quote: str | None = None
+    i = 0
+    while i < len(command):
+        ch = command[i]
+        if quote:
+            if ch == "\\" and quote == '"' and i + 1 < len(command):
+                out.append(command[i:i + 2])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            out.append(" " if ch == "\n" else ch)
+            i += 1
+            continue
+        if ch in ("'", '"'):
+            quote = ch
+        elif ch == "\\" and i + 1 < len(command):
+            out.append(command[i:i + 2])
+            i += 2
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _iter_shell_command_word_spans(command: str):
     """Yield command-position words that may be executable names."""
     for command_start in _iter_shell_command_starts(command):
@@ -2047,7 +2095,13 @@ def _iter_shell_command_word_spans(command: str):
 
 
 def _command_detection_variants(command: str):
-    normalized = _normalize_command_for_detection(command)
+    # Mask quoted newlines BEFORE normalization: normalization strips
+    # backslash-escapes (\" -> ") and empty-string pairs (""), which would
+    # corrupt quote tracking — e.g. `echo "a\""` normalizes to `echo "a` (an
+    # unterminated quote), so masking the normalized text could swallow a
+    # REAL unquoted newline separator that follows. The raw command carries
+    # faithful shell quote state.
+    normalized = _normalize_command_for_detection(_mask_quoted_newlines(command))
     # Quote-aware grep parsing hides only structurally identified pattern
     # operands. Malformed/ambiguous input remains byte-for-byte intact.
     grep_safe, _ = _grep_safe_detection_variant(normalized)
@@ -3116,8 +3170,27 @@ def _run_approval_gate(
             ),
         }
 
+    _fire_approval_hook(
+        "pre_approval_request",
+        command=display_target,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+    )
     choice = prompt_dangerous_approval(display_target, description,
                                        approval_callback=approval_callback)
+    _fire_approval_hook(
+        "post_approval_response",
+        command=display_target,
+        description=description,
+        pattern_key=pattern_key,
+        pattern_keys=[pattern_key],
+        session_key=session_key,
+        surface="cli",
+        choice=choice,
+    )
 
     if choice == "timeout":
         return {
@@ -3410,6 +3483,16 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     except Exception as exc:
         logger.warning("Gateway approval notify failed: %s", exc)
         _drop_entry()
+        _fire_approval_hook(
+            "post_approval_response",
+            command=command,
+            description=description,
+            pattern_key=primary_key,
+            pattern_keys=list(all_keys),
+            session_key=session_key,
+            surface=surface,
+            choice="notify_failed",
+        )
         return {"resolved": False, "choice": None, "notify_failed": True}
 
     # Block until the user responds or the canonical approval timeout elapses
