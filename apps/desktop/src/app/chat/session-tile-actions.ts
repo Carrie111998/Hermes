@@ -28,7 +28,7 @@ import { $connection, $sessions, sessionMatchesStoredId } from '@/store/session'
 import { $sessionStates, sessionTileDelegate } from '@/store/session-states'
 import { broadcastSessionsChanged } from '@/store/session-sync'
 import { clearSessionSubagents } from '@/store/subagents'
-import { clearSessionTodos } from '@/store/todos'
+import { clearSessionTodos, rebuildSessionTodoHistory } from '@/store/todos'
 import { setSessionDraftingTool } from '@/store/tool-drafting'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -375,7 +375,11 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
         return
       }
 
-      update(current => applyReloadOptimistic(current, plan))
+      const optimistic = update(current => applyReloadOptimistic(current, plan))
+
+      if (optimistic) {
+        rebuildSessionTodoHistory(runtimeIdRef.current, optimistic.messages)
+      }
 
       try {
         await requestGateway(
@@ -388,7 +392,8 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
           PROMPT_SUBMIT_REQUEST_TIMEOUT_MS
         )
       } catch (err) {
-        update(current => ({ ...current, busy: false, awaitingResponse: false }))
+        update(current => ({ ...current, busy: false, awaitingResponse: false, messages: state.messages }))
+        rebuildSessionTodoHistory(runtimeIdRef.current, state.messages)
         notifyError(err, copy.regenerateFailed)
       }
     },
@@ -407,12 +412,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       const wasBusy = readState()?.busy ?? false
 
-      update(state => applyRewindOptimistic(state, plan.sourceIndex))
+      const optimistic = update(state => applyRewindOptimistic(state, plan.sourceIndex))
+
+      if (optimistic) {
+        rebuildSessionTodoHistory(sessionId, optimistic.messages)
+      }
 
       try {
         await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+        rebuildSessionTodoHistory(sessionId, messages)
         throw err
       }
     },
@@ -436,12 +446,17 @@ export function useSessionTileActions({ runtimeId, scope, storedSessionId }: Ses
 
       const wasBusy = readState()?.busy ?? false
 
-      update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
+      const optimistic = update(state => applyRewindOptimistic(state, plan.sourceIndex, plan.editedMessage))
+
+      if (optimistic) {
+        rebuildSessionTodoHistory(sessionId, optimistic.messages)
+      }
 
       try {
         await submitRewind(plan.text, plan.truncateOrdinal, wasBusy)
       } catch (err) {
         update(state => ({ ...state, busy: false, awaitingResponse: false, messages }))
+        rebuildSessionTodoHistory(sessionId, messages)
         notifyError(err, copy.editFailed)
       }
     },

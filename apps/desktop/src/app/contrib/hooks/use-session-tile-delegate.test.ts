@@ -2,6 +2,7 @@ import { renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
+import { createClientSessionState } from '@/lib/chat-runtime'
 import { setSessions } from '@/store/session'
 import { sessionTileDelegate } from '@/store/session-states'
 import type { SessionInfo } from '@/types/hermes'
@@ -43,7 +44,9 @@ function renderTile(requestGateway: ReturnType<typeof vi.fn>) {
       requestGateway: requestGateway as never,
       runtimeIdByStoredSessionIdRef: { current: new Map() },
       sessionStateByRuntimeIdRef: { current: new Map() },
-      updateSessionState: vi.fn()
+      // Returns the updated state, like the real cache does — resume reads it
+      // back to rebuild the tile's task history.
+      updateSessionState: vi.fn((_runtimeId, updater) => updater(createClientSessionState('stored'))) as never
     })
   )
 }
