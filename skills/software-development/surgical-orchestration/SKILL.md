@@ -387,6 +387,7 @@ npx tsc --noEmit --strict --skipLibCheck --module node16 \
   --moduleResolution node16 --target es2022 --types node *.ts
 npx tsx surgical-orchestration.ts --init
 npx tsx surgical-orchestration.ts --dry-run build-plan.json   # walks the state machine, spawns nothing
+npx tsx surgical-orchestration.ts --help                      # print usage
 ```
 
 `--dry-run` exercises the dispatch loop, ledger compaction and hash registry
