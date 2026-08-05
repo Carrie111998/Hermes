@@ -2544,15 +2544,28 @@ def terminal_tool(
                         metadata = local_path.stat()
                         if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
                             data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
+                            if len(data) <= 1024 * 1024 and b"\x00" not in data:
                                 return data.decode("utf-8", errors="replace")
+                        # A NUL byte marks a binary (ELF/Mach-O/PE), not a
+                        # shell script — scanning its decoded text would
+                        # tokenize machine code and feed junk paths (with
+                        # embedded NULs) into the recursive guard walk
+                        # (#76762 follow-up). Local file that is binary or
+                        # oversized: nothing to scan; do not fall through to
+                        # `cat`, which would return the same bytes.
+                        return None
                 except Exception:
                     pass
                 # Remote / sandboxed backend: read via the environment's shell.
                 try:
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
-                        return result.get("output", "")
+                        output = result.get("output", "")
+                        # A remote `cat` of a binary returns NUL-laden text;
+                        # treat it as nothing to scan rather than poisoning
+                        # the recursive walk (#76762 follow-up).
+                        if "\x00" not in output:
+                            return output
                 except Exception:
                     pass
                 return None

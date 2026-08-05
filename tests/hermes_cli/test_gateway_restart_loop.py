@@ -695,6 +695,43 @@ class TestLifecycleGuardModule:
         )
         assert result is False
 
+    def test_binary_returned_by_read_remote_script_does_not_crash(self):
+        """#76762 follow-up: the guard is called from terminal_tool with a
+        read_remote_script fallback (local read miss -> cat via env). When a
+        referenced path is a binary (ELF), the fallback can return its raw
+        NUL-laden content; the recursive scan must not feed a NUL-embedded
+        path into os.open, which raises ValueError (not OSError) for such
+        paths.
+
+        Before this fix, the scan crashed with
+        ValueError: embedded null byte at _read_referenced_script's os.open.
+        """
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        def fake_remote_script(path):
+            # Mimics terminal_tool._read_script_in_env's cat fallback on a
+            # large binary that exceeds the local read cap: raw bytes decoded
+            # with errors='replace' keep the NUL bytes. Content is harmless
+            # machine-code junk WITHOUT a lifecycle command — the point is
+            # that NUL-laden text must not crash the walk, not that it
+            # triggers a block.
+            return (b"\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+                    b"\x01\x02\x03\x04\x05\x00\x00\x00\xff\xfe\xfd\xfc").decode(
+                "utf-8", errors="replace"
+            )
+
+        # Referenced path is a script (contains "/") so the walk reads it
+        # locally first (binary -> None), then falls back to the remote read
+        # which returns NUL-laden text -> recursion must not crash.
+        result = contains_gateway_lifecycle_command_or_referenced_script(
+            "cd /tmp && ./venv/bin/tool --flag",
+            cwd="/tmp",
+            read_remote_script=fake_remote_script,
+        )
+        assert result is False
+
     def test_shell_script_reference_walk_still_works(self, tmp_path):
         """The referenced-script walk still applies to real shell scripts:
         a .sh script that itself invokes a lifecycle command is caught."""
