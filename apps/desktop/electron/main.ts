@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { HERMES_API_EXPECTED_404 } from './api-expected-404'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -10244,7 +10245,14 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
   return { ...(base as any), sessions: merged.slice(offset, offset + limit), total, profile_totals: profileTotals }
 }
 
-ipcMain.handle('hermes:api', async (_event, request) => {
+// A 404 raised by `fetchJson` — the shape is `404: <body>` (see fetchJson).
+// Session lookups are a probe ladder: "not on this profile" is a normal rung
+// outcome, not a failure.
+function isNotFoundApiError(error) {
+  return /(?:^|\s)404\b/.test(String((error as any)?.message ?? error))
+}
+
+async function handleHermesApiRequest(request) {
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
@@ -10313,6 +10321,33 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     upload: request?.upload,
     timeoutMs
   })
+}
+
+// Electron logs "Error occurred in handler for 'hermes:api'" with a full stack
+// for EVERY rejected invoke, and there is no opt-out on the handler. Session
+// resolution is a deliberate probe ladder (`resolveStoredSession`: cache →
+// active backend → each other profile) and the renderer already handles a miss
+// by falling to the next rung — so an expected 404 is not an error condition.
+// Left rejecting, it printed a multi-line stack per probe on every startup and
+// session switch: pure noise that buries genuine handler failures.
+//
+// So don't reject for that one case — RESOLVE with a sentinel and let preload
+// (our own code, the other side of the same seam) turn it back into a rejection
+// with the identical `404: <body>` message. The renderer contract is unchanged;
+// only Electron's logging is bypassed. Every other failure still rejects and
+// still logs in full.
+ipcMain.handle('hermes:api', async (_event, request) => {
+  try {
+    return await handleHermesApiRequest(request)
+  } catch (error) {
+    const message = String((error as any)?.message ?? error)
+
+    if (isNotFoundApiError(error)) {
+      return { [HERMES_API_EXPECTED_404]: message }
+    }
+
+    throw error
+  }
 })
 
 // One deduper per cross-window cue — the choke point every window shares. Main
