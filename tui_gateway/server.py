@@ -9813,6 +9813,42 @@ def _run_prompt_submit(
                     INTERRUPT_WAITING_FOR_MODEL_PREFIX
                 ):
                     raw = ""
+
+                # When final_response is still missing, empty, or the bare
+                # "(empty)" sentinel after the turn finalizer ran — the
+                # explainer may have been disabled, thrown, or skipped for
+                # interrupted turns — provide a fallback so the client never
+                # receives an empty message.complete text for a
+                # non-interrupted, non-error turn. The TUI/desktop clear busy
+                # on `message.complete` regardless, but an empty bubble makes
+                # the turn look unfinished (#54756). Matches the sentinel the
+                # conversation loop sets when retries are exhausted
+                # (agent/conversation_loop.py line ~4668). ``raw`` can be None
+                # when the run never produced a final_response, so normalize
+                # to a string before the strip check. ``_response_synthesized``
+                # marks the fallback path so downstream stages (auto-title,
+                # voice TTS) can tell a genuine model reply apart from a
+                # placeholder completion notice and skip derived side-effects.
+                _response_synthesized = False
+                if status == "complete":
+                    if not isinstance(raw, str):
+                        raw = "" if raw is None else str(raw)
+                    _stripped = raw.strip()
+                    if not _stripped or _stripped == "(empty)":
+                        turn_exit = result.get("turn_exit_reason", "")
+                        _explanation = ""
+                        if turn_exit:
+                            try:
+                                _explanation = (
+                                    agent._format_turn_completion_explanation(
+                                        turn_exit
+                                    )
+                                    or ""
+                                )
+                            except Exception:
+                                _explanation = ""
+                        raw = _explanation or "The task completed."
+                        _response_synthesized = True
                 lr = result.get("last_reasoning")
                 if isinstance(lr, str) and lr.strip():
                     last_reasoning = lr.strip()
@@ -9935,6 +9971,7 @@ def _run_prompt_submit(
                 status == "complete"
                 and isinstance(raw, str)
                 and raw.strip()
+                and not _response_synthesized
                 and isinstance(text, str)
                 and text.strip()
             ):
@@ -9978,15 +10015,18 @@ def _run_prompt_submit(
                 except Exception:
                     pass
 
-            # Voice TTS fallback: when the streaming pipeline couldn't start
-            # (no provider / missing deps probed at turn start), speak the
-            # final text whole (cli.py:_voice_speak_response parity). The
-            # streaming path already spoke everything via tts_queue.
+            # CLI parity: when voice-mode TTS is on, speak the agent reply
+            # (cli.py:_voice_speak_response).  Only the final text — tool
+            # calls / reasoning already stream separately and would be
+            # noisy to read aloud. Synthesised completion notices are
+            # skipped — the assistant never spoke them, TTS should not
+            # pretend it did.
             if (
                 status == "complete"
                 and tts_queue is None
                 and isinstance(raw, str)
                 and raw.strip()
+                and not _response_synthesized
                 and _voice_tts_enabled()
             ):
                 try:
