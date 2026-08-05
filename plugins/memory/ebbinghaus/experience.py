@@ -866,6 +866,7 @@ class EbbinghausExperienceLedger:
         return contested
 
     def association_preview(self, *, limit: int) -> dict[str, Any]:
+        """Build cue/tag bridge previews without promoting hypotheses to memory."""
         ip = self.policies.insight
         if not ip.enabled:
             return {"mode": "association_preview", "enabled": False, "associations": []}
