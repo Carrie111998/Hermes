@@ -985,7 +985,10 @@ def cronjob(
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if allow_silent is not None:
-                updates["allow_silent"] = bool(allow_silent)
+                # Mirror create_job(): only a real bool is stored; anything else
+                # (e.g. empty string) resets to the default True (backward
+                # compatible). bool("") would wrongly coerce a reset to False.
+                updates["allow_silent"] = allow_silent if isinstance(allow_silent, bool) else True
             if workdir is not None:
                 # Empty string clears the field (restores old behaviour);
                 # otherwise pass raw — update_job() validates / normalizes.
