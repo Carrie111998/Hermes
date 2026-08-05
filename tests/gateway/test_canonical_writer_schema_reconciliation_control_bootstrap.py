@@ -284,6 +284,32 @@ def _observation(
     )
 
 
+@pytest.mark.parametrize("phase", ("before_install", "after_install"))
+def test_observation_accepts_one_routeback_helper_for_exact_replay(
+    phase: str,
+) -> None:
+    value = _observation(
+        phase=phase,
+        state="exact_installed",
+        session_user_sha256=_digest("control-admin"),
+        control_admin_count=1,
+        membership_count=0,
+        observed_at_unix=NOW,
+    )
+    unsigned = {
+        key: item for key, item in value.items() if key != "observation_sha256"
+    }
+    unsigned["helper_absent"] = False
+    unsigned["helper_same_name_count"] = 1
+    replay = _hashed(unsigned, "observation_sha256")
+
+    assert bootstrap._validate_observation(
+        replay,
+        phase=phase,
+        allow_routeback_helper_present=True,
+    ) == replay
+
+
 def _intermediate(
     gate: Mapping[str, Any],
     install: Mapping[str, Any],
@@ -1647,7 +1673,9 @@ def test_runtime_install_closes_broad_session_before_intermediate(
         *,
         phase: str,
         observed_at_unix: Any,
+        allow_routeback_helper_present: bool = False,
     ) -> Mapping[str, Any]:
+        assert allow_routeback_helper_present is True
         events.append(phase)
         captured_at = (
             observed_at_unix()
@@ -1728,8 +1756,10 @@ def test_runtime_install_rejects_claim_expired_during_before_observation(
         *,
         phase: str,
         observed_at_unix: Any,
+        allow_routeback_helper_present: bool = False,
     ) -> Mapping[str, Any]:
         assert phase == "before_install"
+        assert allow_routeback_helper_present is True
         captured_at = observed_at_unix()
         return _observation(
             phase=phase,
@@ -1806,7 +1836,9 @@ def test_runtime_post_cleanup_uses_fresh_fixed_writer_then_closes(
         *,
         phase: str,
         observed_at_unix: Any,
+        allow_routeback_helper_present: bool = False,
     ) -> Mapping[str, Any]:
+        assert allow_routeback_helper_present is True
         events.append("writer-observe")
         captured_at = (
             observed_at_unix()
@@ -1847,6 +1879,94 @@ def test_runtime_post_cleanup_uses_fresh_fixed_writer_then_closes(
         cleanup_claim=cleanup,
         now_unix=NOW,
     ) == terminal
+
+
+def test_runtime_routeback_helper_replay_requires_exact_target_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target_sha256 = _digest("target-contract")
+    config = types.SimpleNamespace(user=bootstrap.foundation.SQL_USER)
+    target = types.SimpleNamespace(
+        attestation=object(),
+        sha256=target_sha256,
+    )
+    base = types.SimpleNamespace(
+        target=target,
+        dependencies=types.SimpleNamespace(writer_config=lambda: config),
+    )
+    context = bootstrap._ControlRuntimeContext(
+        base=base,
+        gate={},
+        install_artifact=types.SimpleNamespace(),
+    )
+    observation = {
+        "helper_absent": False,
+        "helper_same_name_count": 1,
+    }
+    policy = object()
+    calls: list[tuple[Any, Any, Any, Any, Any]] = []
+    monkeypatch.setattr(bootstrap, "_target_policy", lambda value: policy)
+
+    def collect(
+        session: Any,
+        *,
+        config: Any,
+        policy: Any,
+        managed_hba_receipt: Any,
+        subject_user: str,
+    ) -> Any:
+        calls.append(
+            (session, config, policy, managed_hba_receipt, subject_user)
+        )
+        return types.SimpleNamespace(sha256=target_sha256)
+
+    monkeypatch.setattr(bootstrap, "collect_schema_contract", collect)
+    session = object()
+    bootstrap._require_exact_target_helper_replay(
+        context,
+        session,
+        observation,
+    )
+    assert calls == [(session, config, policy, None, config.user)]
+
+    monkeypatch.setattr(
+        bootstrap,
+        "collect_schema_contract",
+        lambda *_args, **_kwargs: types.SimpleNamespace(sha256=_digest("drift")),
+    )
+    with pytest.raises(
+        bootstrap.ControlBootstrapError,
+        match=(
+            "schema_reconciliation_control_routeback_helper_contract_invalid"
+        ),
+    ):
+        bootstrap._require_exact_target_helper_replay(
+            context,
+            session,
+            observation,
+        )
+
+
+def test_runtime_helper_absence_never_collects_target_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    context = bootstrap._ControlRuntimeContext(
+        base=types.SimpleNamespace(),
+        gate={},
+        install_artifact=types.SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        bootstrap,
+        "collect_schema_contract",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("collector must remain unused")
+        ),
+    )
+    bootstrap._require_exact_target_helper_replay(
+        context,
+        object(),
+        {"helper_absent": True, "helper_same_name_count": 0},
+    )
 
 
 def test_install_failure_receipt_binds_accepted_install_claim() -> None:
