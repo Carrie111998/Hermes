@@ -2355,14 +2355,29 @@ const schedulePersistWindowState = debounce(persistWindowState, 250)
 // secondary mirror so pre-JSON installs migrate transparently on first read.
 const DESKTOP_ZOOM_STATE_PATH = path.join(app.getPath('userData'), 'zoom-state.json')
 
-function readZoomState() {
+// Distinguishes "never configured" (ENOENT — the only case that should ever
+// fall back to the shipped default AND persist it) from "the file exists but
+// couldn't be read this time" (disk contention, AV/backup scan, a momentary
+// I/O error, corrupt JSON). The two used to collapse into the same `null`,
+// which meant a transient read hiccup on an existing file with a real saved
+// zoom (e.g. 150%) silently reset the user to 90% AND wrote that 90% back
+// over their setting on the next restore call — every window `show` /
+// `restore` / `resized` / `moved` / `did-finish-load` is a chance to hit this.
+// See restorePersistedZoomLevel: only `missing: true` may persist a fallback.
+function readZoomState(): { level: number | null; missing: boolean } {
   try {
     const raw = JSON.parse(fs.readFileSync(DESKTOP_ZOOM_STATE_PATH, 'utf8'))
     const level = Number(raw?.zoomLevel)
 
-    return Number.isFinite(level) ? level : null
-  } catch {
-    return null
+    return { level: Number.isFinite(level) ? level : null, missing: false }
+  } catch (error) {
+    const missing = (error as NodeJS.ErrnoException)?.code === 'ENOENT'
+
+    if (!missing) {
+      rememberLog(`[zoom] json read failed (keeping on-disk value untouched): ${error?.message || error}`)
+    }
+
+    return { level: null, missing }
   }
 }
 
@@ -5569,7 +5584,7 @@ function restorePersistedZoomLevel(window) {
   // Prefer the JSON file — it survives crash recovery wiping Electron's
   // cache/storage folders (#56726). applyZoomLevel notifies the renderer so
   // the Appearance UI Scale control stays in sync.
-  const saved = readZoomState()
+  const { level: saved, missing } = readZoomState()
 
   if (saved != null) {
     applyZoomLevel(window.webContents, saved)
@@ -5577,9 +5592,24 @@ function restorePersistedZoomLevel(window) {
     return
   }
 
-  // No JSON yet: paint the shipped default immediately so a fresh install
-  // doesn't flash Chromium 100%, then try localStorage for pre-JSON installs
-  // and overwrite if a legacy value is there.
+  // The file exists but couldn't be read this time (disk contention, AV/backup
+  // scan, corrupt JSON, etc.) — NOT the same as never having been configured.
+  // Paint the shipped default in memory only so the window isn't left at
+  // Chromium's un-zoomed 100%, but do not touch the JSON: a real saved zoom
+  // (e.g. 150%) must survive a transient read failure. Without this branch,
+  // every subsequent show/restore/resize/did-finish-load call would persist
+  // this in-memory fallback and permanently clobber the user's setting — the
+  // "randomly resets to 90%" bug.
+  if (!missing) {
+    applyZoomLevel(window.webContents, DEFAULT_ZOOM_LEVEL)
+
+    return
+  }
+
+  // True first run (ENOENT): paint the shipped default immediately so a fresh
+  // install doesn't flash Chromium 100%, then try localStorage for pre-JSON
+  // installs and persist whichever value wins — this is the only path allowed
+  // to write a fallback into the JSON store.
   applyZoomLevel(window.webContents, DEFAULT_ZOOM_LEVEL)
 
   window.webContents
