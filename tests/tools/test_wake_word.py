@@ -2,17 +2,20 @@
 
 No live audio or network: the sounddevice import is faked, engines are stubbed,
 and lazy-dep availability is monkeypatched. Covers config resolution, engine
-dispatch, the requirements probe, the detector fire/cooldown loop, and the
-process-wide singleton lifecycle.
+dispatch, the requirements probe, the detector fire/cooldown loop, the
+process-wide singleton lifecycle, and the CLI wake → continuous-conversation
+wiring (cli.py _on_wake_word + wake watchdog).
 """
 
 import multiprocessing
 import os
+import queue
 import sys
 import threading
 import time
 import types
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -624,3 +627,122 @@ def test_machine_lock_is_released_when_owner_process_exits(tmp_path):
         if process.is_alive():
             process.terminate()
         process.join(10)
+
+
+# ── CLI wake → continuous-conversation wiring ───────────────────────────
+#
+# cli.py _on_wake_word now enters CONTINUOUS voice mode (multi-turn VAD
+# conversation) instead of capturing a single utterance. These tests pin the
+# two invariants that make that safe:
+#   1. On wake, _voice_continuous is set True (the process_loop auto-restart
+#      turns one wake into a full conversation, ended by a voice stop phrase).
+#   2. The wake watchdog treats _voice_continuous as "mic busy": it must NOT
+#      resume the hotword listener mid-conversation (two input streams on one
+#      device is unreliable), and only re-arms once the conversation ends.
+
+def _make_wake_cli(**overrides):
+    """Minimal HermesCLI with only the attrs the wake path touches.
+
+    Bypasses __init__ (no config/env/API setup); mirrors the pattern in
+    tests/tools/test_voice_cli_integration.py.
+    """
+    from cli import HermesCLI
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli._voice_lock = threading.Lock()
+    cli._voice_mode = False
+    cli._voice_tts = False
+    cli._voice_recorder = None
+    cli._voice_recording = False
+    cli._voice_processing = False
+    cli._voice_continuous = False
+    cli._voice_tts_done = threading.Event()
+    cli._voice_tts_done.set()
+    cli._voice_tts_stop = None
+    cli._voice_barge_capture = threading.Event()
+    cli._pending_input = queue.Queue()
+    cli._app = None
+    cli._attached_images = []
+    cli._should_exit = False
+    cli._agent_running = False
+    cli._wake_word_active = False
+    cli._wake_suspended = False
+    cli._wake_start_new_session = False
+    cli._wake_watchdog_started = False
+    for k, v in overrides.items():
+        setattr(cli, k, v)
+    return cli
+
+
+def test_wake_enters_continuous_voice(monkeypatch):
+    """Wake starts a multi-turn conversation: _voice_continuous is True."""
+    cli = _make_wake_cli()
+    monkeypatch.setattr("tools.wake_word.pause_listening", lambda **kw: True)
+    monkeypatch.setattr("tools.wake_word.get_last_match", lambda: None)
+    cli._voice_start_recording = MagicMock()
+
+    cli._on_wake_word()
+
+    assert cli._voice_mode is True
+    assert cli._voice_continuous is True
+    cli._voice_start_recording.assert_called_once()
+
+
+def test_wake_skips_when_agent_busy(monkeypatch):
+    """Wake during an in-flight turn is ignored (single-flight guard)."""
+    cli = _make_wake_cli(_agent_running=True)
+    cli._voice_start_recording = MagicMock()
+
+    cli._on_wake_word()
+
+    cli._voice_start_recording.assert_not_called()
+
+
+def test_wake_pause_failure_does_not_record(monkeypatch):
+    """If the detector can't release the mic, we don't start recording."""
+    cli = _make_wake_cli()
+    monkeypatch.setattr("tools.wake_word.pause_listening", lambda **kw: False)
+    cli._voice_start_recording = MagicMock()
+
+    cli._on_wake_word()
+
+    cli._voice_start_recording.assert_not_called()
+
+
+def test_wake_watchdog_holds_listener_during_continuous(monkeypatch):
+    """While _voice_continuous is True the watchdog must NOT resume the mic."""
+    cli = _make_wake_cli()
+    cli._wake_word_active = True
+    cli._wake_suspended = True
+    cli._voice_continuous = True
+
+    resume_calls = []
+    monkeypatch.setattr("tools.wake_word.resume_listening", lambda **kw: resume_calls.append(1) or True)
+
+    cli._start_wake_watchdog()
+    time.sleep(1.2)  # several watchdog polls while continuous
+
+    assert resume_calls == []
+    cli._wake_word_active = False
+    time.sleep(0.3)
+
+
+def test_wake_watchdog_resumes_after_continuous_ends(monkeypatch):
+    """After the voice chat ends, the watchdog re-arms the listener."""
+    cli = _make_wake_cli()
+    cli._wake_word_active = True
+    cli._wake_suspended = True
+    cli._voice_continuous = False
+
+    resume_calls = []
+    monkeypatch.setattr("tools.wake_word.resume_listening", lambda **kw: resume_calls.append(1) or True)
+
+    cli._start_wake_watchdog()
+    deadline = time.time() + 3.0
+    while not resume_calls and time.time() < deadline:
+        time.sleep(0.05)
+
+    assert resume_calls, "watchdog should resume the listener once idle"
+    cli._wake_word_active = False
+    time.sleep(0.3)
+

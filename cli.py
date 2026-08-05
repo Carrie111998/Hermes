@@ -12963,11 +12963,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as e:
                 logger.debug("wake word new_session failed: %s", e)
 
-        # Single-utterance capture (not continuous) via the voice pipeline;
-        # VAD auto-stop transcribes and queues the transcript for process_loop.
+        # Continuous voice capture (VAD loop): the wake turns into a
+        # multi-turn hands-free conversation — the user keeps talking after
+        # each reply (auto-restart in process_loop), says a voice stop phrase
+        # ("stop" / config voice.stop_phrases) to end it, and the wake-word
+        # listener only re-arms once the voice chat actually ends
+        # (see _start_wake_watchdog: it keeps the detector paused while
+        # continuous mode holds the microphone).
         with self._voice_lock:
             self._voice_mode = True
-        self._voice_continuous = False
+        self._voice_continuous = True
         try:
             self._voice_start_recording()
         except Exception as e:
@@ -12992,6 +12997,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         self._agent_running
                         or self._voice_recording
                         or getattr(self, "_voice_processing", False)
+                        or self._voice_continuous
                         or not self._pending_input.empty()
                     )
                     if busy:
