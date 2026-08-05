@@ -16184,3 +16184,58 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert cleanup_order == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
+
+# ---------------------------------------------------------------------------
+# Model switches on compute-host (turn-isolation) sessions must cross the
+# process boundary — regression tests for the queued-pick handoff.
+# ---------------------------------------------------------------------------
+
+
+def test_config_set_model_defers_on_compute_host_session(monkeypatch):
+    """Idle isolated session: config.set model must stash, not direct-apply."""
+    session = _session(agent=None, running=False)
+    session["_compute_host_active"] = True
+    server._sessions["sid"] = session
+    build_calls = []
+    monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: build_calls.append(a))
+    try:
+        resp = server.handle_request(
+            {"id": "1", "method": "config.set",
+             "params": {"session_id": "sid", "key": "model", "value": "gpt-5.5"}}
+        )
+        assert resp["result"].get("deferred") is True
+        assert session["pending_model_switch"]["raw"] == "gpt-5.5"
+        # The broken path built a second agent inside the server process.
+        assert build_calls == []
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_compute_host_turn_frame_carries_pending_switch():
+    session = _session(agent=None, running=False)
+    session["pending_model_switch"] = {"raw": "gpt-5.5", "display_model": "gpt-5.5"}
+    frame = server._compute_host_turn_frame("r1", "sid", session, "hello")
+    assert frame["pending_model_switch"]["raw"] == "gpt-5.5"
+    # Copied, not popped — the fail-open in-process path may still need it.
+    assert session["pending_model_switch"]["raw"] == "gpt-5.5"
+
+
+def test_compute_host_turn_done_clears_pending_switch_on_success():
+    session = _session(agent=None, running=True)
+    session["pending_model_switch"] = {"raw": "gpt-5.5"}
+    server._sessions["sid"] = session
+    try:
+        server._on_compute_host_turn_done(
+            "r1", "sid", session, {"type": "turn.end", "session_info_emitted": True}
+        )
+        assert "pending_model_switch" not in session
+        # An errored turn must KEEP the stash for the fail-open path.
+        session["pending_model_switch"] = {"raw": "gpt-5.5"}
+        session["running"] = True
+        server._on_compute_host_turn_done(
+            "r1", "sid", session, {"type": "turn.error", "message": "boom",
+                                    "session_info_emitted": True}
+        )
+        assert session["pending_model_switch"]["raw"] == "gpt-5.5"
+    finally:
+        server._sessions.pop("sid", None)

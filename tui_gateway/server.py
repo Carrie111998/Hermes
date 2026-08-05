@@ -1655,6 +1655,14 @@ def _compute_host_turn_frame(
         "cwd": _session_cwd(session),
         "profile_home": session.get("profile_home") or "",
         "model_override": session.get("model_override"),
+        # A model switch queued while the session was busy
+        # (config.set model -> pending_model_switch) must cross the process
+        # boundary — the live agent is in the compute host, and the server-side
+        # _apply_pending_model_switch would pop-and-drop it against agent=None.
+        # COPIED (not popped): the stash is cleared only after a successful
+        # isolated turn (_on_compute_host_turn_done), so the fail-open
+        # in-process path can still apply it if the host dispatch fails.
+        "pending_model_switch": session.get("pending_model_switch"),
         "reasoning_config_override": session.get("create_reasoning_override"),
         "service_tier_override": session.get("create_service_tier_override"),
         "source": _session_source(session),
@@ -1717,6 +1725,12 @@ def _on_compute_host_turn_done(rid: str, sid: str, session: dict, frame: dict) -
         session["running"] = False
         session["last_active"] = time.time()
         _clear_inflight_turn(session)
+        # The isolated turn carried the queued model switch to the
+        # compute host, whose turn thread applied it. Clear the server-side
+        # stash so it isn't re-forwarded (kept on error so the fail-open
+        # in-process path can still apply it).
+        if not is_error:
+            session.pop("pending_model_switch", None)
     if is_error:
         message = str(frame.get("message") or "compute host turn failed")
         _emit("message.complete", sid, {"text": f"Error: {message}", "status": "error"})
@@ -10490,7 +10504,15 @@ def _(rid, params: dict) -> dict:
                 # (_apply_pending_model_switch), where nothing is in flight.
                 # The user gets to pick, keep typing, and send the next turn on
                 # the new model without waiting for the swap or interrupting.
-                if session.get("running"):
+                #
+                # Compute-host sessions ALWAYS defer, busy or idle. Their
+                # live agent is in the child process — the direct path below
+                # would build a SECOND agent in the server, switch that copy,
+                # and leave the child (which handles every turn) on the old
+                # model: checkmark shows the pick, requests keep the old model.
+                # The stash crosses the boundary in the turn frame and the
+                # child's turn thread applies it (_apply_pending_model_switch).
+                if session.get("running") or session.get("_compute_host_active"):
                     parsed = parse_model_switch_args(value)
                     try:
                         pending_model = parsed.model_input
