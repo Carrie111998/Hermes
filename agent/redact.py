@@ -1086,10 +1086,35 @@ def redact_sensitive_text(
     # "[Proxy-]Authorization:" case-insensitively, so "uthorization" is the
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
-        text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
-            text,
-        )
+        # The credential class excludes the quote (#43083) but NOT the backslash
+        # that escapes it, so inside a serialized JSON string the capture ends
+        # ``…secret\`` and masking destroys that escape, leaving the document's
+        # own ``"`` unescaped and closing the string early. Above the 18-char
+        # mask floor the 4-char tail happened to re-emit the backslash, which is
+        # why only short credentials corrupted — an accident of the window, not
+        # a contract. Split the escape off the credential and re-emit it.
+        def _make_redact_authz(subject):
+            scanner = _DocumentStateScanner(subject)
+
+            def _redact_authz(m):
+                cred = m.group(3)
+                escape = ""
+                end = m.end(3)
+                open_quote, _ = scanner.state_at(m.start())
+                # Only when that next byte really is the quote left open here:
+                # a trailing backslash before whitespace, or in flat text with
+                # nothing open, is the credential's own byte and stays masked.
+                if (
+                    open_quote is not None
+                    and subject[end : end + 1] == open_quote
+                    and _escapes_the_quote_at(subject, end)
+                ):
+                    cred, escape = cred[:-1], "\\"
+                return m.group(1) + (m.group(2) or "") + _mask_token(cred) + escape
+
+            return _redact_authz
+
+        text = _AUTH_HEADER_RE.sub(_make_redact_authz(text), text)
 
     # API-key style headers (x-api-key, api-key, …). Header values are
     # colon-separated, so gate on ":" — the regex itself is the precise filter.

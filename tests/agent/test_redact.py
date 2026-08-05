@@ -1511,7 +1511,7 @@ class TestEscapedQuoteSurvivesRedaction:
     unparseable document, reached through the escape byte instead of the
     delimiter byte.
 
-    The affected site:
+    Two distinct sites, one rule:
 
     * ``_ENV_ASSIGN_RE`` / ``_CFG_DOTTED_RE`` / ``_SECRET_HEADER_RE`` — the
       ``(\\S+)`` capture ends exactly at ``\\"`` when whitespace and more
@@ -1569,6 +1569,14 @@ class TestEscapedQuoteSurvivesRedaction:
         pytest.param("run {q}app.api.key={s}{q} now", id="cfg-dotted"),
     ]
 
+    AUTH_HEADER_TEMPLATES = [
+        pytest.param("curl -H {q}Authorization: Bearer {s}{q} -v", id="bearer"),
+        pytest.param("curl -H {q}Authorization: Basic {s}{q} -v", id="basic"),
+        pytest.param("curl -H {q}Authorization: {s}{q} -v", id="bare-credential"),
+        pytest.param("curl -H {q}Proxy-Authorization: Bearer {s}{q} -v", id="proxy"),
+        pytest.param("curl -H {q}Authorization: Bearer {s}{q}", id="bearer-at-end"),
+    ]
+
     @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
     @pytest.mark.parametrize("quote", ['"', "'"])
     @pytest.mark.parametrize("indent", [None, 2])
@@ -1603,6 +1611,35 @@ class TestEscapedQuoteSurvivesRedaction:
                 # its survival would pin a promise the redactor never made.
                 assert value.count('"') == inner.count('"'), ctx
         self._assert_no_incidental_overlap(template)
+
+    @pytest.mark.parametrize("template", AUTH_HEADER_TEMPLATES)
+    @pytest.mark.parametrize("quote", ['"', "'"])
+    @pytest.mark.parametrize("indent", [None, 2])
+    def test_authorization_credential_escape_survives(
+        self, template, quote, indent
+    ):
+        """``_AUTH_HEADER_RE``'s class excludes the quote but not its escape.
+
+        The residual left by #43083: excluding ``"`` from the credential class
+        stops the capture from eating the quote, but the backslash in front of
+        it is still a "not a quote, not whitespace" character, so the capture
+        ends ``…secret\\`` inside a serialized document. Swept across the floor
+        because that is where the old behaviour changed — a 4-char tail
+        re-emitted the backslash, a bare ``***`` deleted it.
+        """
+        self._assert_no_incidental_overlap(template)
+        for n in self.LENGTHS:
+            secret = self._secret(n)
+            inner = template.format(q=quote, s=secret)
+            serialized = json.dumps(
+                {"content": inner}, ensure_ascii=False, indent=indent
+            )
+
+            redacted = redact_sensitive_text(serialized, force=True)
+
+            ctx = (n, quote, indent, serialized, redacted)
+            value = json.loads(redacted)["content"]
+            assert secret not in value, ctx
 
     @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
     @pytest.mark.parametrize("indent", [None, 2])
@@ -1649,7 +1686,10 @@ class TestEscapedQuoteSurvivesRedaction:
             index += 1
         return count
 
-    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    @pytest.mark.parametrize(
+        "template",
+        ESCAPED_QUOTE_TEMPLATES + AUTH_HEADER_TEMPLATES,
+    )
     @pytest.mark.parametrize("quote", ['"', "'"])
     def test_redaction_never_manufactures_delimiters(self, template, quote):
         """Redaction may delete structure bytes, never invent them.
@@ -1699,7 +1739,7 @@ class TestEscapedQuoteSurvivesRedaction:
     ]
 
     @pytest.mark.parametrize("build,path", CONSUMER_SHAPES)
-    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES)
+    @pytest.mark.parametrize("template", ESCAPED_QUOTE_TEMPLATES + AUTH_HEADER_TEMPLATES)
     def test_redacted_json_dump_round_trips_for_reparsing_consumers(
         self, build, path, template
     ):
