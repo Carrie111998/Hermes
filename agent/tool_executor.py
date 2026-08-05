@@ -1677,6 +1677,43 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             tool_duration = time.time() - tool_start_time
             if agent._should_emit_quiet_tool_messages():
                 agent._vprint(f"  {_get_cute_tool_message_impl('read_terminal', function_args, tool_duration, result=function_result)}")
+        elif function_name == "ucm_structured_process":
+            # Phase 1 dispatch: mint a one-shot capability, authorize via consume,
+            # then dispatch to the structured-process executor (Phase 2+).
+            def _execute(next_args: dict) -> Any:
+                from tools.ucm_auth_context import (
+                    mint_ucm_auth_context,
+                    EXPECTED_TOOL_NAME,
+                    is_ucm_auth_capability,
+                )
+                raw_enabled = next_args.get("enabled_tools")
+                enabled: list[str] = (
+                    list(raw_enabled)
+                    if isinstance(raw_enabled, (list, tuple, set, frozenset))
+                    else [EXPECTED_TOOL_NAME]
+                )
+                cap = mint_ucm_auth_context(enabled, tool_call_id=getattr(tool_call, "id", None))
+                if not is_ucm_auth_capability(cap) or not cap.consume(EXPECTED_TOOL_NAME):
+                    return json.dumps(
+                        {"error": "ucm_structured_process: capability authorization failed"},
+                        ensure_ascii=False,
+                    )
+                # Phase 2: real structured-process execution dispatched here.
+                return json.dumps(
+                    {"error": "ucm_structured_process: execution not yet implemented (Phase 2)"},
+                    ensure_ascii=False,
+                )
+            function_result, function_args = _run_agent_tool_execution_middleware(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                execute=_execute,
+            )
+            tool_duration = time.time() - tool_start_time
+            if agent._should_emit_quiet_tool_messages():
+                agent._vprint(f"  {_get_cute_tool_message_impl(function_name, function_args, tool_duration, result=function_result)}")
         elif function_name == "delegate_task":
             tasks_arg = function_args.get("tasks")
             if tasks_arg and isinstance(tasks_arg, list):

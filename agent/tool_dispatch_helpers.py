@@ -41,7 +41,13 @@ logger = logging.getLogger(__name__)
 
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+_NEVER_PARALLEL_TOOLS = frozenset({
+    "clarify",
+    # ucm_structured_process mints a one-shot capability (stateful side-effect);
+    # it must always run on the sequential path so the caller gate stack-frame
+    # check is deterministic and the capability is never raced.
+    "ucm_structured_process",
+})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({

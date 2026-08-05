@@ -55,6 +55,9 @@ MUTATING_TOOL_NAMES = frozenset(
         "send_message",
         "cronjob",
         "delegate_task",
+        # ucm_structured_process mints a one-shot authorization capability;
+        # stateful side-effect — guardrail loop controller must track it.
+        "ucm_structured_process",
         "process",
     }
 )
