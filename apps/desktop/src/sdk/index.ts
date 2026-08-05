@@ -202,7 +202,11 @@ export type {
   PluginContribution,
   PluginNativeNotificationInput,
   PluginOs,
+  PluginProvides,
+  PluginRequires,
   PluginRestOptions,
+  PluginServiceErrorCode,
+  PluginServices,
   PluginStorage
 } from '@/contrib/plugin'
 

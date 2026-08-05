@@ -17,6 +17,7 @@ import { createPluginI18n, type PluginI18n } from '@/i18n'
 import { readKey, writeKey } from '@/lib/storage'
 import { dispatchPluginNativeNotification, type PluginNativeNotificationInput } from '@/store/native-notifications'
 
+import { $pluginRecords } from './plugins-store'
 import { registry } from './registry'
 import type { Contribution } from './types'
 
@@ -33,6 +34,50 @@ export interface PluginStorage {
   get<T>(key: string, fallback: T): T
   set(key: string, value: unknown): void
   remove(key: string): void
+}
+
+export type PluginServiceErrorCode =
+  | 'capability_missing'
+  | 'consumer_undeclared'
+  | 'method_not_allowed'
+  | 'path_not_allowed'
+  | 'provider_disabled'
+  | 'provider_error'
+  | 'provider_missing'
+
+export class PluginServiceError extends Error {
+  readonly code: PluginServiceErrorCode
+
+  constructor(code: PluginServiceErrorCode, message: string) {
+    super(message)
+    this.name = 'PluginServiceError'
+    this.code = code
+  }
+}
+
+/** Provider-owned, named read-only REST surface. Route paths are exact; query
+ *  strings remain caller-owned. GET is intentionally the only first-tier method. */
+export interface PluginRestCapability {
+  id: string
+  methods: readonly ['GET']
+  paths: readonly string[]
+}
+
+export interface PluginProvides {
+  rest?: readonly PluginRestCapability[]
+}
+
+export interface PluginRequirement {
+  capability: string
+  provider: string
+}
+
+export interface PluginRequires {
+  rest?: readonly PluginRequirement[]
+}
+
+export interface PluginServices {
+  rest: <T>(provider: string, capability: string, path: string, opts?: PluginRestOptions) => Promise<T>
 }
 
 /** The curated OS door — every way a plugin reaches outside the app window,
@@ -77,6 +122,8 @@ export interface PluginContext {
    *  returned. Resolves to a no-op on OAuth remotes — treat it as an
    *  accelerator over your polling, never a replacement. */
   socket: (path: string, onMessage: (data: unknown) => void) => () => void
+  /** Two-party cross-plugin capability door: consumer requirement plus provider grant. */
+  services: PluginServices
   /** The curated OS door: native notification, open-external, reveal-in-file-
    *  manager, clipboard — attributed to this plugin, result-shaped (never
    *  throws for a missing capability). */
@@ -97,6 +144,10 @@ export interface HermesPlugin {
    *  for opt-in plugins: they inventory in Settings ▸ Plugins, off until the
    *  user flips the switch. */
   defaultEnabled?: boolean
+  /** Named exact-path GET surfaces granted to declared consumers. */
+  provides?: PluginProvides
+  /** Cross-plugin REST capabilities this plugin intends to consume. */
+  requires?: PluginRequires
   /** Called once at load; wire contributions through `ctx`. */
   register: (ctx: PluginContext) => void
 }
@@ -156,7 +207,11 @@ function createPluginOs(pluginId: string): PluginOs {
 
 /** Build the scoped context handed to a plugin's `register`. `onDispose`
  *  receives every registration's disposer (the loader's unload/reload hook). */
-export function createPluginContext(pluginId: string, onDispose?: (dispose: () => void) => void): PluginContext {
+export function createPluginContext(
+  pluginId: string,
+  onDispose?: (dispose: () => void) => void,
+  requires: PluginRequires = {}
+): PluginContext {
   const source = `plugin:${pluginId}`
   const scope = (c: PluginContribution): Contribution => ({ ...c, id: `${pluginId}:${c.id}`, source })
 
@@ -166,6 +221,66 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     return dispose
   }
 
+  const serviceRest = async <T>(
+    providerId: string,
+    capabilityId: string,
+    path: string,
+    opts: PluginRestOptions = {}
+  ): Promise<T> => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(providerId)) {
+      throw new PluginServiceError('path_not_allowed', `Invalid plugin provider id "${providerId}"`)
+    }
+
+    const declared = requires.rest?.some(
+      requirement => requirement.provider === providerId && requirement.capability === capabilityId
+    )
+
+    if (!declared) {
+      throw new PluginServiceError(
+        'consumer_undeclared',
+        `Plugin "${pluginId}" did not declare ${providerId}:${capabilityId}`
+      )
+    }
+
+    const provider = $pluginRecords.get()[providerId]
+
+    if (!provider) {
+      throw new PluginServiceError('provider_missing', `Plugin provider "${providerId}" is not installed`)
+    }
+    if (provider.status === 'disabled') {
+      throw new PluginServiceError('provider_disabled', `Plugin provider "${providerId}" is disabled`)
+    }
+    if (provider.status === 'error') {
+      throw new PluginServiceError('provider_error', `Plugin provider "${providerId}" failed to load`)
+    }
+
+    const capability = provider.provides?.rest?.find(candidate => candidate.id === capabilityId)
+
+    if (!capability) {
+      throw new PluginServiceError(
+        'capability_missing',
+        `Plugin provider "${providerId}" does not grant capability "${capabilityId}"`
+      )
+    }
+
+    const method = (opts.method ?? 'GET').toUpperCase()
+
+    if (method !== 'GET' || !capability.methods.includes('GET')) {
+      throw new PluginServiceError('method_not_allowed', `Capability "${capabilityId}" permits GET only`)
+    }
+
+    const routePath = (path.startsWith('/') ? path : `/${path}`).split(/[?#]/, 1)[0]
+
+    if (routePath.split('/').includes('..') || !capability.paths.includes(routePath)) {
+      throw new PluginServiceError(
+        'path_not_allowed',
+        `Capability "${capabilityId}" does not grant route "${routePath}"`
+      )
+    }
+
+    return pluginRest<T>(providerId, path, { ...opts, method: 'GET' })
+  }
+
   return {
     source,
     register: c => track(registry.register(scope(c))),
@@ -173,6 +288,7 @@ export function createPluginContext(pluginId: string, onDispose?: (dispose: () =
     onDispose: fn => void track(fn),
     rest: <T>(path: string, opts?: PluginRestOptions) => pluginRest<T>(pluginId, path, opts),
     socket: (path, onMessage) => track(pluginSocket(pluginId, path, onMessage)),
+    services: { rest: serviceRest },
     os: createPluginOs(pluginId),
     storage: createPluginStorage(pluginId),
     i18n: createPluginI18n(pluginId, track)

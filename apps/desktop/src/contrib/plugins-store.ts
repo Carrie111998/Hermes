@@ -10,6 +10,8 @@
 
 import { atom } from 'nanostores'
 
+import type { PluginProvides, PluginRequires } from './plugin'
+
 export type PluginKind = 'bundled' | 'disk' | 'runtime'
 export type PluginStatus = 'disabled' | 'error' | 'loaded'
 
@@ -22,6 +24,9 @@ export interface PluginRecord {
   error?: string
   /** Absolute plugin.js path (disk plugins) — powers "Reveal in Finder". */
   file?: string
+  /** Provider grants and consumer requirements used by the service boundary. */
+  provides?: PluginProvides
+  requires?: PluginRequires
 }
 
 // Explicit user enable/disable choices, id -> boolean. ABSENCE means "no
