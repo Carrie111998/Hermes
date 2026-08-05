@@ -4356,14 +4356,43 @@ class TrustedGcloudExecutable:
         self._sdk_root = str(Path(wrapper_path).parent.parent)
         self._gcloud_module = os.path.join(self._sdk_root, "lib", "gcloud.py")
         self._python_root = str(Path(self._python.absolute_path()).parent.parent)
+        # The complete content digest below is the publication proof.  Later
+        # checks in this same short-lived owner process must still fail closed
+        # on drift, but re-reading roughly half a gigabyte before every gcloud
+        # call can outlive the five-minute signed mutation claims.  Pin a
+        # recursive identity digest once and use it for those same-process
+        # rechecks.  It includes every path plus device/inode, type, ownership,
+        # mode, link count, size, mtime and ctime; an unprivileged content
+        # change cannot restore ctime.  A new process always repeats the full
+        # content proof before it can obtain this identity baseline.
+        sdk_identity_before = self._capture_tree_identity(
+            self._sdk_root,
+            scope="sdk",
+        )
         self._sdk_fingerprint = self._capture_tree(
             self._sdk_root,
             scope="sdk",
+        )
+        self._sdk_identity_fingerprint = self._capture_tree_identity(
+            self._sdk_root,
+            scope="sdk",
+        )
+        if self._sdk_identity_fingerprint != sdk_identity_before:
+            raise OwnerLauncherError("trusted_gcloud_sdk_changed")
+        python_identity_before = self._capture_tree_identity(
+            self._python_root,
+            scope="python_tree",
         )
         self._python_fingerprint = self._capture_tree(
             self._python_root,
             scope="python_tree",
         )
+        self._python_identity_fingerprint = self._capture_tree_identity(
+            self._python_root,
+            scope="python_tree",
+        )
+        if self._python_identity_fingerprint != python_identity_before:
+            raise OwnerLauncherError("trusted_gcloud_python_tree_changed")
         self._production_runtime = production_runtime
         self._release_sha = release_sha
         self._otool: _PinnedExecutablePath | None = None
@@ -4378,6 +4407,7 @@ class TrustedGcloudExecutable:
         self._owner_support_source: str | None = None
         self._owner_support_site: str | None = None
         self._owner_support_fingerprint: tuple[int, int, str] | None = None
+        self._owner_support_identity_fingerprint: tuple[int, int, str] | None = None
         self._owner_support_manifest: Mapping[str, Any] | None = None
         self._owner_support_activated = False
         if self._production_runtime:
@@ -4408,12 +4438,27 @@ class TrustedGcloudExecutable:
                 self._owner_support_source,
                 self._owner_support_site,
             ) = _trusted_owner_support_paths(release_sha)
+            owner_support_identity_before = _capture_owner_support_identity_tree(
+                self._owner_support_root,
+                release_sha=release_sha,
+            )
             self._owner_support_fingerprint = (
                 _capture_owner_support_publication_tree(
                     self._owner_support_root,
                     release_sha=release_sha,
                 )
             )
+            self._owner_support_identity_fingerprint = (
+                _capture_owner_support_identity_tree(
+                    self._owner_support_root,
+                    release_sha=release_sha,
+                )
+            )
+            if (
+                self._owner_support_identity_fingerprint
+                != owner_support_identity_before
+            ):
+                raise OwnerLauncherError("trusted_owner_support_changed")
             self._owner_support_manifest = _validate_owner_support_manifest(
                 self._owner_support_root,
                 release_sha=release_sha,
@@ -4540,6 +4585,142 @@ class TrustedGcloudExecutable:
                 ):
                     raise OwnerLauncherError(invalid_code)
                 cls._feed_tree_entry(digest, ("symlink", *common, target))
+            else:
+                raise OwnerLauncherError(invalid_code)
+            entry_count += 1
+            if (
+                entry_count > _GCLOUD_MAX_SDK_ENTRIES
+                or total_bytes > _GCLOUD_MAX_SDK_BYTES
+            ):
+                raise OwnerLauncherError(oversized_code)
+        return entry_count, total_bytes, digest.hexdigest()
+
+    @classmethod
+    def _capture_tree_identity(
+        cls,
+        root: str,
+        *,
+        scope: str,
+    ) -> tuple[int, int, str]:
+        """Recheck one fully hashed tree by immutable path identities.
+
+        This is deliberately not a replacement for ``_capture_tree``.  The
+        constructor first proves every file byte with ``_capture_tree`` and
+        only then records this recursive identity baseline for fast checks in
+        the same process.  A path replacement, content write, permission or
+        owner change, hard-link change, rename, or directory membership change
+        alters at least one pinned identity field and fails closed.
+        """
+
+        invalid_code = f"trusted_gcloud_{scope}_invalid"
+        changed_code = f"trusted_gcloud_{scope}_changed"
+        oversized_code = f"trusted_gcloud_{scope}_oversized"
+        if not os.path.isabs(root):
+            raise OwnerLauncherError(invalid_code)
+        try:
+            if os.path.realpath(root, strict=True) != root:
+                raise OwnerLauncherError(invalid_code)
+        except OSError:
+            raise OwnerLauncherError(changed_code) from None
+        digest = hashlib.sha256()
+        entry_count = 0
+        total_bytes = 0
+        pending = [root]
+        while pending:
+            path = pending.pop()
+            try:
+                before = os.lstat(path)
+            except OSError:
+                raise OwnerLauncherError(changed_code) from None
+            relative = os.path.relpath(path, root)
+            if scope == "sdk" and (
+                os.path.basename(path) == "__pycache__"
+                or path.endswith((".pyc", ".pyo"))
+            ):
+                raise OwnerLauncherError("trusted_gcloud_sdk_bytecode_forbidden")
+            if before.st_uid not in {0, os.getuid()}:  # windows-footgun: ok
+                raise OwnerLauncherError(invalid_code)
+            if before.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+                raise OwnerLauncherError(invalid_code)
+            identity = (
+                relative,
+                before.st_mode,
+                before.st_uid,
+                before.st_gid,
+                before.st_dev,
+                before.st_ino,
+                before.st_nlink,
+                before.st_mtime_ns,
+                before.st_ctime_ns,
+                before.st_size,
+            )
+            if stat.S_ISDIR(before.st_mode):
+                try:
+                    with os.scandir(path) as entries:
+                        children = sorted(
+                            (entry.path for entry in entries),
+                            key=os.fsencode,
+                            reverse=True,
+                        )
+                    after = os.lstat(path)
+                except OSError:
+                    raise OwnerLauncherError(changed_code) from None
+                if (
+                    after.st_mode,
+                    after.st_uid,
+                    after.st_gid,
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_nlink,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                    after.st_size,
+                ) != identity[1:]:
+                    raise OwnerLauncherError(changed_code)
+                pending.extend(children)
+                cls._feed_tree_entry(digest, ("directory", *identity))
+            elif stat.S_ISREG(before.st_mode):
+                if before.st_size > _GCLOUD_MAX_SDK_FILE_BYTES:
+                    raise OwnerLauncherError(oversized_code)
+                try:
+                    after = os.lstat(path)
+                except OSError:
+                    raise OwnerLauncherError(changed_code) from None
+                if (
+                    after.st_mode,
+                    after.st_uid,
+                    after.st_gid,
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_nlink,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                    after.st_size,
+                ) != identity[1:]:
+                    raise OwnerLauncherError(changed_code)
+                total_bytes += before.st_size
+                cls._feed_tree_entry(digest, ("file", *identity))
+            elif stat.S_ISLNK(before.st_mode):
+                try:
+                    target = os.readlink(path)
+                    resolved = os.path.realpath(path, strict=True)
+                    inside = os.path.commonpath((root, resolved)) == root
+                    after = os.lstat(path)
+                except (OSError, ValueError):
+                    raise OwnerLauncherError(changed_code) from None
+                if not inside or (
+                    after.st_mode,
+                    after.st_uid,
+                    after.st_gid,
+                    after.st_dev,
+                    after.st_ino,
+                    after.st_nlink,
+                    after.st_mtime_ns,
+                    after.st_ctime_ns,
+                    after.st_size,
+                ) != identity[1:]:
+                    raise OwnerLauncherError(invalid_code)
+                cls._feed_tree_entry(digest, ("symlink", *identity, target))
             else:
                 raise OwnerLauncherError(invalid_code)
             entry_count += 1
@@ -4832,11 +5013,14 @@ class TrustedGcloudExecutable:
     def trusted_command_prefix(self) -> tuple[str, ...]:
         self._wrapper.absolute_path()
         python = self._python.absolute_path()
-        if self._capture_tree(self._sdk_root, scope="sdk") != self._sdk_fingerprint:
+        if (
+            self._capture_tree_identity(self._sdk_root, scope="sdk")
+            != self._sdk_identity_fingerprint
+        ):
             raise OwnerLauncherError("trusted_gcloud_sdk_changed")
         if (
-            self._capture_tree(self._python_root, scope="python_tree")
-            != self._python_fingerprint
+            self._capture_tree_identity(self._python_root, scope="python_tree")
+            != self._python_identity_fingerprint
         ):
             raise OwnerLauncherError("trusted_gcloud_python_tree_changed")
         if self._production_runtime:
@@ -4847,9 +5031,9 @@ class TrustedGcloudExecutable:
                 raise OwnerLauncherError("trusted_python_version_changed")
             if self._capture_python_dependencies() != self._python_dependencies:
                 raise OwnerLauncherError("trusted_python_dependencies_changed")
-            publication_fingerprint = _capture_sdk_publication_tree(self._sdk_root)
-            if publication_fingerprint != self._sdk_publication_fingerprint:
-                raise OwnerLauncherError("trusted_runtime_publication_tree_changed")
+            publication_fingerprint = self._sdk_publication_fingerprint
+            if publication_fingerprint is None:
+                raise OwnerLauncherError("trusted_runtime_release_unbound")
             intent_fingerprint, intent = _validate_sdk_publication_intent(
                 self._publication_intent_path(),
                 destination=self._sdk_root,
@@ -4940,12 +5124,13 @@ class TrustedGcloudExecutable:
             or self._owner_support_source is None
             or self._owner_support_site is None
             or self._owner_support_fingerprint is None
+            or self._owner_support_identity_fingerprint is None
             or self._owner_support_manifest is None
         ):
             if self._production_runtime:
                 raise OwnerLauncherError("trusted_owner_support_unavailable")
             return
-        observed_tree = _capture_owner_support_publication_tree(
+        observed_identity = _capture_owner_support_identity_tree(
             self._owner_support_root,
             release_sha=self._release_sha,
         )
@@ -4953,7 +5138,7 @@ class TrustedGcloudExecutable:
             self._owner_support_root,
             release_sha=self._release_sha,
         )
-        if observed_tree != self._owner_support_fingerprint:
+        if observed_identity != self._owner_support_identity_fingerprint:
             raise OwnerLauncherError("trusted_owner_support_changed")
         if observed_manifest != self._owner_support_manifest:
             raise OwnerLauncherError("trusted_owner_support_manifest_changed")
@@ -6877,6 +7062,157 @@ def _capture_owner_support_publication_tree(
         else:
             # In particular, release support never admits symlinks, sockets,
             # devices, FIFOs, or wheel-created hard-link aliases.
+            raise OwnerLauncherError("trusted_owner_support_invalid")
+        entry_count += 1
+        if (
+            entry_count > _TRUSTED_OWNER_SUPPORT_MAX_ENTRIES
+            or total_bytes > _TRUSTED_OWNER_SUPPORT_MAX_BYTES
+        ):
+            raise OwnerLauncherError("trusted_owner_support_oversized")
+    if root_children != {
+        "owner-support.json",
+        _TRUSTED_OWNER_SUPPORT_SOURCE_RELATIVE,
+        _TRUSTED_OWNER_SUPPORT_SITE_RELATIVE,
+    } or source_children != set(_TRUSTED_OWNER_SUPPORT_SOURCE_MODULES):
+        raise OwnerLauncherError("trusted_owner_support_invalid")
+    required = (
+        *(
+            os.path.join(source_root, package, "__init__.py")
+            for package in _TRUSTED_OWNER_SUPPORT_SOURCE_MODULES
+        ),
+        os.path.join(site_root, "cryptography", "__init__.py"),
+        os.path.join(site_root, "yaml", "__init__.py"),
+        os.path.join(site_root, "cffi", "__init__.py"),
+        os.path.join(site_root, "pycparser", "__init__.py"),
+        os.path.join(site_root, "packaging", "__init__.py"),
+    )
+    if any(not os.path.isfile(path) for path in required):
+        raise OwnerLauncherError("trusted_owner_support_invalid")
+    return entry_count, total_bytes, digest.hexdigest()
+
+
+def _capture_owner_support_identity_tree(
+    root: str,
+    *,
+    release_sha: str,
+) -> tuple[int, int, str]:
+    """Fast same-process drift proof for an already content-hashed support tree."""
+
+    expected_root, _expected_source, _expected_site = _trusted_owner_support_paths(
+        release_sha
+    )
+    if not os.path.isabs(root) or root != expected_root:
+        raise OwnerLauncherError("trusted_owner_support_path_invalid")
+    try:
+        if os.path.realpath(root, strict=True) != root:
+            raise OwnerLauncherError("trusted_owner_support_path_invalid")
+    except OSError:
+        raise OwnerLauncherError("trusted_owner_support_changed") from None
+    source_root = os.path.join(root, _TRUSTED_OWNER_SUPPORT_SOURCE_RELATIVE)
+    site_root = os.path.join(root, _TRUSTED_OWNER_SUPPORT_SITE_RELATIVE)
+    digest = hashlib.sha256()
+    TrustedGcloudExecutable._feed_tree_entry(
+        digest,
+        (TRUSTED_OWNER_SUPPORT_TREE_SCHEMA, release_sha, "identity"),
+    )
+    entry_count = 0
+    total_bytes = 0
+    pending = [root]
+    root_children: set[str] | None = None
+    source_children: set[str] | None = None
+    while pending:
+        path = pending.pop()
+        try:
+            before = os.lstat(path)
+            relative = os.path.relpath(path, root)
+        except (OSError, ValueError):
+            raise OwnerLauncherError("trusted_owner_support_changed") from None
+        if relative != "." and _owner_support_name_forbidden(
+            PurePosixPath(*Path(relative).parts).as_posix()
+        ):
+            raise OwnerLauncherError("trusted_owner_support_invalid")
+        if (
+            before.st_uid != os.getuid()  # windows-footgun: ok
+            or before.st_mode & (stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+        ):
+            raise OwnerLauncherError("trusted_owner_support_invalid")
+        _require_owner_support_no_xattrs(path)
+        identity = (
+            relative,
+            before.st_mode,
+            before.st_uid,
+            before.st_gid,
+            before.st_dev,
+            before.st_ino,
+            before.st_nlink,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+            before.st_size,
+        )
+        if stat.S_ISDIR(before.st_mode):
+            if stat.S_IMODE(before.st_mode) != 0o500:
+                raise OwnerLauncherError("trusted_owner_support_invalid")
+            try:
+                with os.scandir(path) as entries:
+                    children = sorted(
+                        (entry.path for entry in entries),
+                        key=os.fsencode,
+                        reverse=True,
+                    )
+                after = os.lstat(path)
+            except OSError:
+                raise OwnerLauncherError("trusted_owner_support_changed") from None
+            if (
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_dev,
+                after.st_ino,
+                after.st_nlink,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_size,
+            ) != identity[1:]:
+                raise OwnerLauncherError("trusted_owner_support_changed")
+            child_names = {os.path.basename(child) for child in children}
+            if path == root:
+                root_children = child_names
+            elif path == source_root:
+                source_children = child_names
+            pending.extend(children)
+            TrustedGcloudExecutable._feed_tree_entry(
+                digest,
+                ("directory", *identity),
+            )
+        elif stat.S_ISREG(before.st_mode):
+            if (
+                stat.S_IMODE(before.st_mode) != 0o400
+                or before.st_nlink != 1
+                or before.st_size > _TRUSTED_OWNER_SUPPORT_MAX_FILE_BYTES
+            ):
+                raise OwnerLauncherError("trusted_owner_support_invalid")
+            try:
+                after = os.lstat(path)
+            except OSError:
+                raise OwnerLauncherError("trusted_owner_support_changed") from None
+            if (
+                after.st_mode,
+                after.st_uid,
+                after.st_gid,
+                after.st_dev,
+                after.st_ino,
+                after.st_nlink,
+                after.st_mtime_ns,
+                after.st_ctime_ns,
+                after.st_size,
+            ) != identity[1:]:
+                raise OwnerLauncherError("trusted_owner_support_changed")
+            total_bytes += before.st_size
+            TrustedGcloudExecutable._feed_tree_entry(
+                digest,
+                ("file", *identity),
+            )
+        else:
             raise OwnerLauncherError("trusted_owner_support_invalid")
         entry_count += 1
         if (
