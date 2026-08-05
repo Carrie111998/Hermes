@@ -545,6 +545,7 @@ _GCLOUD_SDK_ARCHIVE_BYTES = 60_511_521
 _GCLOUD_SDK_ARCHIVE_SHA256 = (
     "2d4ab8eb0a9362a69feabade6df4163763cd989cb840dc3f7ced5ac24dde6e67"
 )
+_GCLOUD_PYTHON_CACHE_PREFIX = "/var/empty/muncho-canary"
 _TRUSTED_SDK_RELATIVE = ".hermes/trusted/google-cloud-sdk-569.0.0"
 _TRUSTED_SDK_PUBLICATION_INTENT_RELATIVE = (
     ".hermes/trusted/trusted-sdk-publication-569.0.0-"
@@ -678,7 +679,7 @@ _GCLOUD_PYTHON_ISOLATION_ARGS = (
     "-S",
     "-B",
     "-X",
-    "pycache_prefix=/var/empty/muncho-canary",
+    f"pycache_prefix={_GCLOUD_PYTHON_CACHE_PREFIX}",
 )
 _AMBIGUOUS_CLOUD_SQL_CREATE_ERRORS = frozenset({
     "cloud_sql_operation_failed",
@@ -5014,6 +5015,11 @@ def _owner_gcloud_environment(
         "CLOUDSDK_PYTHON_ARGS": " ".join(_GCLOUD_PYTHON_ISOLATION_ARGS),
         "PYTHONNOUSERSITE": "1",
         "PYTHONDONTWRITEBYTECODE": "1",
+        # ``gcloud compute ssh`` starts the IAP proxy as a descendant Python
+        # process.  Keep the cache prefix inherited as an environment-level
+        # invariant too: a descendant that does not preserve the parent's
+        # ``-X`` argv must still be unable to repopulate the sealed SDK tree.
+        "PYTHONPYCACHEPREFIX": _GCLOUD_PYTHON_CACHE_PREFIX,
     })
     return result
 
@@ -8111,7 +8117,7 @@ def _validate_owner_interpreter_invocation(python_path: str) -> None:
         or flags.no_user_site != 1
         or flags.ignore_environment != 1
         or getattr(flags, "safe_path", False) is not True
-        or sys.pycache_prefix != "/var/empty/muncho-canary"
+        or sys.pycache_prefix != _GCLOUD_PYTHON_CACHE_PREFIX
     ):
         raise OwnerLauncherError("trusted_owner_interpreter_invalid")
 
@@ -19995,6 +20001,7 @@ class OwnerGateIapTransport:
         "CLOUDSDK_PYTHON_ARGS",
         "PYTHONNOUSERSITE",
         "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
     })
 
     def __init__(
