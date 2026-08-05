@@ -118,6 +118,50 @@ describe("api.getModelOptions", () => {
   });
 });
 
+describe("api Memory admin profile scoping", () => {
+  it("appends the management profile to /api/memory status reads", async () => {
+    vi.stubGlobal("window", {});
+
+    const fetchMock = jsonFetchMock({
+      active: "",
+      providers: [],
+      builtin_files: { memory: 0, user: 0 },
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { setManagementProfile } = await import("./api");
+    setManagementProfile("coder");
+
+    await api.getMemory();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/memory?profile=coder",
+      expect.objectContaining({ credentials: "include" }),
+    );
+
+    setManagementProfile("");
+  });
+
+  it("scopes memory reset to the management profile", async () => {
+    vi.stubGlobal("window", {});
+
+    const fetchMock = jsonFetchMock({ ok: true, deleted: [] });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const { setManagementProfile } = await import("./api");
+    setManagementProfile("coder");
+
+    await api.resetMemory("all");
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/api/memory/reset?profile=coder",
+      expect.objectContaining({ method: "POST" }),
+    );
+
+    setManagementProfile("");
+  });
+});
+
 describe("api OAuth helpers", () => {
   it("starts OAuth login in gated mode without requiring an injected session token", async () => {
     vi.stubGlobal("window", { __HERMES_AUTH_REQUIRED__: true });

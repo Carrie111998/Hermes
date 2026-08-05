@@ -88,6 +88,10 @@ const PROFILE_SCOPED_PREFIXES = [
   // consults that one — approving into the global store would grant access
   // the running gateway never sees.
   "/api/pairing",
+  // Memory admin (status / provider select / reset / setup / config) reads
+  // and writes the managed profile's own HERMES_HOME — without the param it
+  // would touch the dashboard launch profile instead (issue #79655).
+  "/api/memory",
 ];
 
 function withManagementProfile(url: string): string {

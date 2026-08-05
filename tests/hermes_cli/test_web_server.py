@@ -734,6 +734,55 @@ class TestWebServerEndpoints:
         assert "secret-value" not in json.dumps(data)
 
 
+    def test_memory_admin_profile_scopes_status_and_reset(self):
+        """?profile=<name> must scope Memory admin to the selected profile.
+
+        The dashboard Memory admin (status / provider select / reset) resolves
+        the dashboard launch profile instead of the selected management
+        profile when the request omits ?profile= (#79655): builtin file sizes
+        come from the launch profile's memories dir and reset deletes the
+        launch profile's files. With ?profile=<name>, both must use the
+        selected profile's HERMES_HOME.
+        """
+        import hermes_cli.web_server as web_server
+        from hermes_cli import profiles as profiles_mod
+
+        worker_home = profiles_mod.get_profile_dir("worker")
+        worker_home.mkdir(parents=True)
+        worker_mem_dir = worker_home / "memories"
+        worker_mem_dir.mkdir(parents=True, exist_ok=True)
+        (worker_mem_dir / "MEMORY.md").write_text("w" * 3)
+        (worker_mem_dir / "USER.md").write_text("w" * 5)
+
+        default_mem_dir = web_server.get_hermes_home() / "memories"
+        default_mem_dir.mkdir(parents=True, exist_ok=True)
+        (default_mem_dir / "MEMORY.md").write_text("d" * 9)
+        (default_mem_dir / "USER.md").write_text("d" * 11)
+
+        # Status must reflect the selected profile's memory files.
+        resp = self.client.get("/api/memory?profile=worker")
+        assert resp.status_code == 200
+        builtin = resp.json()["builtin_files"]
+        assert builtin["memory"] == 3
+        assert builtin["user"] == 5
+
+        # Without ?profile= it keeps resolving the launch profile (default).
+        resp = self.client.get("/api/memory")
+        assert resp.status_code == 200
+        builtin = resp.json()["builtin_files"]
+        assert builtin["memory"] == 9
+        assert builtin["user"] == 11
+
+        # Reset must delete only the selected profile's files.
+        resp = self.client.post("/api/memory/reset?profile=worker", json={"target": "all"})
+        assert resp.status_code == 200
+        assert resp.json()["deleted"] == ["MEMORY.md", "USER.md"]
+        assert not (worker_mem_dir / "MEMORY.md").exists()
+        assert not (worker_mem_dir / "USER.md").exists()
+        assert (default_mem_dir / "MEMORY.md").exists()
+        assert (default_mem_dir / "USER.md").exists()
+
+
 
 
     # ── Memory provider config (Honcho host-block backend) ──────────────
