@@ -26,10 +26,12 @@ import { $gateway } from '@/store/gateway'
 import { applyGoalStatusText } from '@/store/goals'
 import {
   notifyCronChanged,
+  notifyMemoryChanged,
   notifyPairingChanged,
   notifyPetChanged,
   notifyPlatformsChanged,
   notifySessionsChanged,
+  type MemoryChangeMeta,
   type PetChangeMeta,
   setChangeEventsAvailable
 } from '@/store/live-sync'
@@ -309,7 +311,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         event.type === 'cron.changed' ||
         event.type === 'sessions.changed' ||
         event.type === 'platforms.changed' ||
-        event.type === 'pairing.changed'
+        event.type === 'pairing.changed' ||
+        event.type === 'memory.changed'
       ) {
         // Change-watcher broadcasts (server._broadcast_watched_changes): the
         // backend's on-disk signature moved. Route to the live-sync ticks the
@@ -327,6 +330,8 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             notifyPlatformsChanged()
           } else if (event.type === 'pairing.changed') {
             notifyPairingChanged()
+          } else if (event.type === 'memory.changed') {
+            notifyMemoryChanged(payload as MemoryChangeMeta | undefined)
           } else {
             notifySessionsChanged()
           }

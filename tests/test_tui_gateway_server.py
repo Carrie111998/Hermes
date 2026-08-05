@@ -15967,3 +15967,27 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch):
         assert cleanup_order == ["trim", "reset_home"]
     finally:
         server._sessions.pop("sid_trim", None)
+
+
+def test_memory_tool_broadcasts_on_save(monkeypatch, tmp_path):
+    """MemoryStore.save_to_disk emits memory.changed via _broadcast_global_event."""
+    import tools.memory_tool as memory_tool
+
+    memory_dir = tmp_path / ".hermes" / "memories"
+    memory_dir.mkdir(parents=True)
+    monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: memory_dir)
+
+    broadcasts = []
+    def _capture(event, payload=None):
+        broadcasts.append((event, payload))
+    monkeypatch.setattr("tui_gateway.server._broadcast_global_event", _capture)
+
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+
+    store = memory_tool.MemoryStore()
+    result = store.add("memory", "test entry")
+    assert result["success"] is True
+    assert len(broadcasts) == 1
+    assert broadcasts[0][0] == "memory.changed"
+    assert broadcasts[0][1] == {"profile": "default", "target": "memory", "source": "default_memory_tool"}
+

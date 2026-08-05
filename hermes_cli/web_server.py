@@ -99,6 +99,7 @@ from gateway.status import (
     resolve_gateway_liveness,
 )
 from utils import env_var_enabled
+from hermes_cli.profiles import get_active_profile_name
 
 try:
     from fastapi import (
@@ -12691,6 +12692,14 @@ async def reset_memory(body: MemoryReset):
                 deleted.append(fname)
             except OSError as exc:
                 raise HTTPException(status_code=500, detail=f"Could not delete {fname}: {exc}")
+    try:
+        from tui_gateway.server import _broadcast_global_event
+        profile = get_active_profile_name()
+        payload = {"profile": profile, "target": target, "source": "default_memory_tool_reset"}
+        _broadcast_global_event("memory.changed", payload)
+        _log.info("memory.changed emitted (reset): %s", payload)
+    except Exception:
+        pass
     return {"ok": True, "deleted": deleted}
 
 
