@@ -572,6 +572,8 @@ def _resolve_runtime_from_pool_entry(
 
     if provider == "lmstudio":
         base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
+    elif provider == "deepseek":
+        base_url = auth_mod._normalize_deepseek_public_base_url(base_url)
 
     return {
         "provider": provider,
@@ -1635,6 +1637,9 @@ def _resolve_explicit_runtime(
                     provider, base_url, target_model or model_cfg.get("default", "")
                 )
 
+        if provider == "deepseek":
+            base_url = auth_mod._normalize_deepseek_public_base_url(base_url)
+
         return {
             "provider": provider,
             "api_mode": api_mode,
@@ -2236,6 +2241,8 @@ def resolve_runtime_provider(
             base_url = normalize_opencode_base_url(provider, api_mode, base_url)
         if provider == "lmstudio":
             base_url = auth_mod._normalize_lmstudio_runtime_base_url(base_url)
+        elif provider == "deepseek":
+            base_url = auth_mod._normalize_deepseek_public_base_url(base_url)
         return {
             "provider": provider,
             "api_mode": api_mode,

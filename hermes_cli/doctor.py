@@ -2270,6 +2270,10 @@ def run_doctor(args):
         try:
             import httpx
             base = os.getenv(base_env, "") if base_env else ""
+            if pname == "DeepSeek":
+                from hermes_cli.auth import _normalize_deepseek_public_base_url
+
+                base = _normalize_deepseek_public_base_url(base)
             # Auto-detect Kimi Code keys (sk-kimi-) → api.kimi.com/coding/v1
             # (OpenAI-compat surface, which exposes /models for health check).
             if not base and key.startswith("sk-kimi-"):

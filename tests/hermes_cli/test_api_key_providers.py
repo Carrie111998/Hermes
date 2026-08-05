@@ -329,12 +329,51 @@ class TestApiKeyProviderStatus:
         assert status["key_source"] == "GLM_API_KEY"
         assert "z.ai" in status["base_url"].lower() or "api.z.ai" in status["base_url"]
 
+    def test_deepseek_status_upgrades_canonical_http_base_url(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://api.deepseek.com/v1/")
+
+        status = get_api_key_provider_status("deepseek")
+
+        assert status["base_url"] == "https://api.deepseek.com/v1/"
+
+    def test_other_provider_status_preserves_configured_url_shape(self, monkeypatch):
+        monkeypatch.setenv("GMI_API_KEY", "gmi-key")
+        monkeypatch.setenv("GMI_BASE_URL", "http://proxy.internal/v1/")
+
+        status = get_api_key_provider_status("gmi")
+
+        assert status["base_url"] == "http://proxy.internal/v1/"
+
 
 # =============================================================================
 # Credential Resolution tests
 # =============================================================================
 
 class TestResolveApiKeyProviderCredentials:
+
+    def test_resolve_deepseek_upgrades_canonical_http_base_url(self, monkeypatch):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", "http://api.deepseek.com/v1")
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == "https://api.deepseek.com/v1"
+
+    @pytest.mark.parametrize(
+        "base_url",
+        [
+            "http://deepseek-proxy.internal/v1",
+            "http://api.deepseek.com.attacker.test/v1",
+        ],
+    )
+    def test_resolve_deepseek_preserves_noncanonical_http_base_url(self, monkeypatch, base_url):
+        monkeypatch.setenv("DEEPSEEK_API_KEY", "deepseek-key")
+        monkeypatch.setenv("DEEPSEEK_BASE_URL", base_url)
+
+        creds = resolve_api_key_provider_credentials("deepseek")
+
+        assert creds["base_url"] == base_url
 
 
 
@@ -1213,4 +1252,3 @@ class TestDeepInfraProviderProfile:
         # Fallback list intentionally empty — live catalog is the source
         # of truth. Pin the shape only, not contents.
         assert isinstance(profile.fallback_models, tuple)
-

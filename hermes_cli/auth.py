@@ -802,6 +802,24 @@ def _resolve_zai_base_url(api_key: str, default_url: str, env_override: str) -> 
     return default_url
 
 
+def _normalize_deepseek_public_base_url(base_url: str) -> str:
+    """Upgrade only DeepSeek's canonical public API host from HTTP to HTTPS.
+
+    Custom/local proxies remain untouched. Exact hostname parsing prevents
+    lookalike hosts such as ``api.deepseek.com.attacker.test`` from matching.
+    """
+    candidate = str(base_url or "")
+    try:
+        parsed = urlparse(candidate)
+        hostname = (parsed.hostname or "").lower().rstrip(".")
+    except (TypeError, ValueError):
+        return candidate
+
+    if parsed.scheme.lower() == "http" and hostname == "api.deepseek.com":
+        return parsed._replace(scheme="https").geturl()
+    return candidate
+
+
 def _normalize_lmstudio_runtime_base_url(base_url: str) -> str:
     """Return the OpenAI-compatible LM Studio runtime base URL.
 
@@ -6937,6 +6955,9 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
     else:
         base_url = pconfig.inference_base_url
 
+    if provider_id == "deepseek":
+        base_url = _normalize_deepseek_public_base_url(base_url)
+
     return {
         "configured": bool(api_key),
         "provider": provider_id,
@@ -7148,6 +7169,8 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     if provider_id == "lmstudio":
         base_url = _normalize_lmstudio_runtime_base_url(base_url)
+    elif provider_id == "deepseek":
+        base_url = _normalize_deepseek_public_base_url(base_url)
 
     # Last-resort guard: an API-key provider must never hand back an empty
     # base URL (a set-but-empty COPILOT_API_BASE_URL or similar env override
