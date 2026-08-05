@@ -1495,6 +1495,122 @@ CREATE TABLE IF NOT EXISTS linear_pr_head_generations (
     PRIMARY KEY (repository, pr_number, head_sha)
 );
 
+-- CodeRabbit is a read-only, asynchronous evidence producer.  The trusted
+-- current-head pointer is kept separate from immutable review observations so
+-- a head change can invalidate old evidence without deleting its audit trail.
+CREATE TABLE IF NOT EXISTS coderabbit_pr_heads (
+    repository          TEXT NOT NULL,
+    pr_number            INTEGER NOT NULL,
+    current_head_sha     TEXT NOT NULL,
+    observed_at          INTEGER NOT NULL,
+    updated_at           INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number)
+);
+
+CREATE TABLE IF NOT EXISTS coderabbit_review_observations (
+    id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+    provider             TEXT NOT NULL,
+    observation_id       TEXT NOT NULL,
+    repository           TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    head_sha              TEXT NOT NULL,
+    review_generation     INTEGER NOT NULL,
+    observed_at           INTEGER NOT NULL,
+    check_status          TEXT NOT NULL,
+    snapshot_json         TEXT NOT NULL,
+    snapshot_sha256       TEXT NOT NULL,
+    payload_sha256        TEXT NOT NULL,
+    assessment_state      TEXT NOT NULL,
+    assessment_reason     TEXT NOT NULL,
+    received_at           INTEGER NOT NULL
+);
+
+-- Exactly one current aggregate per PR/head.  Finding IDs are grouped by
+-- thread, so downstream correction orchestration gets one stable work key per
+-- PR/head rather than one Kanban card per CodeRabbit comment.
+CREATE TABLE IF NOT EXISTS coderabbit_head_assessments (
+    repository                    TEXT NOT NULL,
+    pr_number                      INTEGER NOT NULL,
+    head_sha                       TEXT NOT NULL,
+    review_generation              INTEGER NOT NULL,
+    observed_at                    INTEGER NOT NULL,
+    state                          TEXT NOT NULL,
+    reason                         TEXT NOT NULL,
+    actionable_count               INTEGER NOT NULL,
+    unresolved_count               INTEGER NOT NULL,
+    resolved_count                 INTEGER NOT NULL,
+    outdated_count                 INTEGER NOT NULL,
+    superseded_count               INTEGER NOT NULL,
+    non_blocking_count             INTEGER NOT NULL,
+    actionable_finding_ids_json    TEXT NOT NULL,
+    snapshot_sha256                TEXT NOT NULL,
+    correction_work_key            TEXT NOT NULL,
+    loop_prevention_key            TEXT NOT NULL,
+    correction_attempt_count       INTEGER NOT NULL DEFAULT 0,
+    max_correction_attempts        INTEGER NOT NULL DEFAULT 1,
+    created_at                     INTEGER NOT NULL,
+    updated_at                     INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha)
+);
+
+-- Reservations are metadata-only loop guards.  This phase never creates a
+-- correction task/card and never performs an external write.
+CREATE TABLE IF NOT EXISTS coderabbit_correction_attempts (
+    repository             TEXT NOT NULL,
+    pr_number               INTEGER NOT NULL,
+    head_sha                TEXT NOT NULL,
+    review_generation       INTEGER NOT NULL,
+    correction_work_key     TEXT NOT NULL,
+    loop_prevention_key     TEXT NOT NULL,
+    attempt_number          INTEGER NOT NULL,
+    created_at              INTEGER NOT NULL,
+    PRIMARY KEY (repository, pr_number, head_sha, loop_prevention_key)
+);
+
+-- GitHub remains the authoritative readback for PR identity, state, checks,
+-- reviews, threads, and requested reviewers.  This outbox stores restricted
+-- human-review intents only; it contains no credentials and exposes no merge,
+-- branch-write, push, approval, or auto-merge operation.
+CREATE TABLE IF NOT EXISTS github_human_review_outbox (
+    id                         TEXT PRIMARY KEY,
+    gate_id                    TEXT NOT NULL,
+    repository                 TEXT NOT NULL,
+    pr_number                  INTEGER NOT NULL,
+    head_sha                   TEXT NOT NULL,
+    surface                    TEXT NOT NULL,
+    operation                  TEXT NOT NULL,
+    payload_json               TEXT NOT NULL,
+    payload_sha256             TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL,
+    state                      TEXT NOT NULL,
+    attempt_count              INTEGER NOT NULL DEFAULT 0,
+    max_attempts               INTEGER NOT NULL DEFAULT 3,
+    next_attempt_at            INTEGER,
+    external_id                TEXT,
+    last_snapshot_sha256       TEXT,
+    last_snapshot_observed_at  INTEGER,
+    last_failure_kind          TEXT,
+    last_error                 TEXT,
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    sent_at                    INTEGER
+);
+
+-- Append-only delivery outcomes make retries and timeout-after-send recovery
+-- auditable without replaying an already accepted provider operation.
+CREATE TABLE IF NOT EXISTS github_human_review_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id         TEXT NOT NULL,
+    attempt_number    INTEGER NOT NULL,
+    outcome           TEXT NOT NULL,
+    retryable         INTEGER NOT NULL,
+    snapshot_sha256   TEXT,
+    external_id       TEXT,
+    failure_kind      TEXT,
+    error             TEXT,
+    attempted_at      INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1524,6 +1640,28 @@ CREATE INDEX IF NOT EXISTS idx_linear_issue_pr
     ON linear_issue_pr_links(repository, pr_number, linear_issue_id);
 CREATE INDEX IF NOT EXISTS idx_linear_pr_state
     ON linear_pr_aggregates(state, repository, pr_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_observation_provider_id
+    ON coderabbit_review_observations(provider, observation_id);
+CREATE INDEX IF NOT EXISTS idx_coderabbit_observation_pr_head
+    ON coderabbit_review_observations(
+        repository, pr_number, head_sha, review_generation, observed_at
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_correction_work
+    ON coderabbit_head_assessments(correction_work_key);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_coderabbit_correction_attempt_number
+    ON coderabbit_correction_attempts(
+        repository, pr_number, head_sha, attempt_number
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_outbox_semantic_identity
+    ON github_human_review_outbox(
+        repository, pr_number, head_sha, surface, operation
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_outbox_idempotency_key
+    ON github_human_review_outbox(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_github_outbox_due
+    ON github_human_review_outbox(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_github_attempt_number
+    ON github_human_review_attempts(intent_id, attempt_number);
 """
 
 
