@@ -384,6 +384,30 @@ class ContextEngine(ABC):
 
     # -- Optional: session lifecycle ---------------------------------------
 
+    def create_runtime(self) -> "ContextEngine":
+        """Create an isolated runtime for one agent.
+
+        Context-engine plugins are registered once and their registered engine
+        is retained as a process-owned prototype.  A loader must call this
+        explicit boundary before handing an engine to an agent; it must not
+        copy an engine implicitly.  Engines that do not need per-agent state
+        may return a fresh lightweight runtime from this method.
+
+        The base implementation deliberately returns ``self`` so existing
+        engines remain importable and can be diagnosed by the loader.  The
+        loader rejects that shared result with an actionable error.
+        """
+        return self
+
+    def close(self) -> None:
+        """Release runtime-owned resources; safe to call repeatedly.
+
+        The default is an idempotent no-op for engines without resources.
+        Resource-owning engines must override this boundary and make their
+        implementation idempotent.
+        """
+        return None
+
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Called when a new conversation session begins.
 

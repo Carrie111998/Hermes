@@ -22,12 +22,21 @@ import importlib
 import importlib.util
 import logging
 import sys
+import threading
 from pathlib import Path
 from typing import List, Optional, Tuple
+
+from agent.context_engine import ContextEngine
 
 logger = logging.getLogger(__name__)
 
 _CONTEXT_ENGINE_PLUGINS_DIR = Path(__file__).parent
+_ENGINE_PROTOTYPES = {}
+_ENGINE_PROTOTYPES_LOCK = threading.RLock()
+
+
+class ContextEngineLifecycleError(RuntimeError):
+    """Raised when a plugin does not provide an isolated runtime boundary."""
 
 
 def discover_context_engines() -> List[Tuple[str, str, bool]]:
@@ -92,6 +101,8 @@ def load_context_engine(name: str) -> Optional["ContextEngine"]:
             return engine
         logger.warning("Context engine '%s' loaded but no engine instance found", name)
         return None
+    except ContextEngineLifecycleError:
+        raise
     except Exception as e:
         logger.warning("Failed to load context engine '%s': %s", name, e)
         return None
@@ -104,6 +115,40 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
     - A register(ctx) function (plugin-style) — we simulate a ctx
     - A top-level class that extends ContextEngine — we instantiate it
     """
+    name = engine_dir.name
+    prototype_key = str(engine_dir.resolve())
+    with _ENGINE_PROTOTYPES_LOCK:
+        prototype = _ENGINE_PROTOTYPES.get(prototype_key)
+        if prototype is None:
+            prototype = _load_engine_prototype_from_dir(engine_dir)
+            if prototype is None:
+                return None
+            _ENGINE_PROTOTYPES[prototype_key] = prototype
+
+        factory = getattr(prototype, "create_runtime", None)
+        if not callable(factory) or type(prototype).create_runtime is ContextEngine.create_runtime:
+            raise ContextEngineLifecycleError(
+                f"Context engine '{name}' must implement create_runtime() to create "
+                "an isolated per-agent runtime; shared prototype instances and "
+                "implicit copying are unsupported."
+            )
+
+        runtime = factory()
+        if runtime is prototype:
+            raise ContextEngineLifecycleError(
+                f"Context engine '{name}' create_runtime() returned its shared "
+                "prototype. Return a distinct runtime instance instead."
+            )
+        if not isinstance(runtime, ContextEngine):
+            raise ContextEngineLifecycleError(
+                f"Context engine '{name}' create_runtime() returned "
+                f"{type(runtime).__name__}, not a ContextEngine runtime."
+            )
+        return runtime
+
+
+def _load_engine_prototype_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
+    """Import an engine module and register one process-owned prototype."""
     name = engine_dir.name
     module_name = f"plugins.context_engine.{name}"
     init_file = engine_dir / "__init__.py"
@@ -183,7 +228,6 @@ def _load_engine_from_dir(engine_dir: Path) -> Optional["ContextEngine"]:
             logger.debug("register() failed for %s: %s", name, e)
 
     # Fallback: find a ContextEngine subclass and instantiate it
-    from agent.context_engine import ContextEngine
     for attr_name in dir(mod):
         attr = getattr(mod, attr_name, None)
         if (isinstance(attr, type) and issubclass(attr, ContextEngine)
