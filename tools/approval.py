@@ -385,18 +385,9 @@ _CMDPOS = (
     r'(?:^|[\n`]|\$\()'            # start position
     r'\s*'                          # optional whitespace
     r'(?:sudo\s+(?:-[^\s]+\s+)*)?'  # optional sudo with flags
-    # optional GNU env prefix: options (-i/-u=NAME/--…), bare `-` (= -i),
-    # `--` end-of-options, and NAME=VALUE assignments. Option *arguments*
-    # that are separate argv words (`-u HOME`) are peeled into a canonical
-    # executable-position variant by `_mark_unwrapped_executables` — a flat
-    # regex cannot safely consume non-option tokens after `-u`/`-C`/`-S`/`-a`.
-    r'(?:env\s+(?:'
-    r'(?:--\s+)|'                               # env --
-    r'(?:-\s+)|'                                # env -  (alias for -i)
-    r'(?:--[\w-]+(?:=[^\s]*)?\s+)|'             # --ignore-environment, --unset=X
-    r'(?:-[^\s-]+\s+)|'                         # -i, -iv, -uNAME (glued)
-    r'(?:\w+=\S*\s+)'                           # VAR=VAL
-    r')*)?'
+    # GNU env is intentionally not represented by this flat regex. Its option
+    # abbreviations, terminal modes, and argument ownership require structural
+    # parsing in `_mark_unwrapped_executables` before exposing an executable.
     # Optional wrappers with unconditional execution semantics. `command` and
     # `builtin` are parsed structurally by `_mark_unwrapped_executables` because
     # query mode (`command -v`) and non-builtin operands do not execute argv.
@@ -552,6 +543,8 @@ def detect_hardline_command(command: str) -> tuple:
     for command_variant in _command_detection_variants(command):
         if command_variant == _PARSER_LIMIT_VARIANT:
             return (True, _PARSER_LIMIT_DESCRIPTION)
+        if command_variant == _MALFORMED_EXEC_VARIANT:
+            return (True, _MALFORMED_EXEC_DESCRIPTION)
         variant_lower = command_variant.lower()
         for pattern_re, description in HARDLINE_PATTERNS_COMPILED:
             if pattern_re.search(variant_lower):
@@ -1388,6 +1381,7 @@ _MAX_DETECTION_SEGMENTS = 25_000
 _PARSER_LIMIT_DESCRIPTION = "command parser limit exceeded"
 _MALFORMED_EXEC_DESCRIPTION = "command parser limit or malformed executable payload"
 _PARSER_LIMIT_VARIANT = "__hermes_internal_detection_traversal_limit__"
+_MALFORMED_EXEC_VARIANT = "__hermes_internal_malformed_executable__"
 
 
 
@@ -1799,6 +1793,12 @@ def _execution_flag_findings(command: str):
                 found, payload = _bash_exec_payload(tokens[1:])
                 if found:
                     yield ("shell command via -c/-lc flag", payload)
+            if executable_name == "eval" and len(tokens) > 1:
+                payload = " ".join(tokens[1:])
+                if "$" in payload or "`" in payload:
+                    yield (_MALFORMED_EXEC_DESCRIPTION, None)
+                else:
+                    yield ("shell command via eval builtin", payload)
             tool = executable_name
             if tool in _READ_TOOL_EXEC_FLAGS:
                 finding = _read_tool_exec_flag(tool, tokens[1:])
@@ -1900,6 +1900,37 @@ def _resolve_env_long_option(option: str) -> str | None:
         return None
     matches = [candidate for candidate in _ENV_LONG_OPTIONS if candidate.startswith(option)]
     return matches[0] if len(matches) == 1 else None
+
+
+def _classify_env_option(token: str) -> tuple[str, bool]:
+    """Return (status, consumes_next) for a GNU env option token."""
+    option, separator, _ = token.partition("=")
+    if option == "-":
+        return "continue", False
+    if option.startswith("--"):
+        canonical = _resolve_env_long_option(option)
+        if canonical is None:
+            return "invalid", False
+        if canonical in {"--help", "--null", "--version"}:
+            return "terminal", False
+        owns_value = canonical in _ENV_OPTIONS_WITH_ARG
+        if separator and not (owns_value or canonical in {
+            "--block-signal", "--default-signal", "--ignore-signal",
+        }):
+            return "invalid", False
+        return "continue", owns_value and not separator
+    if not option.startswith("-") or len(option) == 1:
+        return "invalid", False
+    chars = option[1:]
+    for index, char in enumerate(chars):
+        if char == "0":
+            return "terminal", False
+        if char in {"i", "v"}:
+            continue
+        if char in {"u", "C", "S", "a"}:
+            return "continue", index == len(chars) - 1
+        return "invalid", False
+    return "continue", False
 
 
 def _env_option_owns_split_value(token: str) -> bool:
@@ -2607,11 +2638,9 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
             if builtin_start == word_end:
                 return None
             builtin_name = _deobfuscate_shell_word_for_detection(builtin_word).lower()
-            if builtin_name not in {"command", "exec"}:
+            if builtin_name not in {"command", "eval", "exec"}:
                 return None
-            current = builtin_start
-            prefix_words += 1
-            continue
+            return builtin_start
         if lower_word in _COMMAND_WRAPPER_WORDS:
             wrapper = lower_word
             current = word_end
@@ -2632,10 +2661,33 @@ def _offset_after_command_wrappers(command: str, pos: int) -> int | None:
                     current = opt_end
                     prefix_words += 1
                     break
-                if opt_lower == "--" and wrapper in {"env", "sudo"}:
+                if opt_lower == "--" and wrapper in {"env", "exec", "sudo"}:
                     current = opt_end
                     prefix_words += 1
                     break
+                if wrapper == "env" and opt_deob.startswith("-"):
+                    status, consumes_next = _classify_env_option(opt_deob)
+                    if status != "continue":
+                        return None
+                    skip_next = consumes_next
+                    current = opt_end
+                    prefix_words += 1
+                    continue
+                if wrapper == "exec" and opt_lower.startswith("-"):
+                    option_chars = opt_lower[1:]
+                    if not option_chars or not set(option_chars) <= {"a", "c", "l"}:
+                        return None
+                    current = opt_end
+                    prefix_words += 1
+                    if "a" in option_chars:
+                        if not option_chars.endswith("a"):
+                            return None
+                        _, value_end, value_word = _read_shell_word(command, current)
+                        if not value_word:
+                            return None
+                        current = value_end
+                        prefix_words += 1
+                    continue
                 if opt_lower.startswith("-"):
                     skip_next = _wrapper_option_consumes_next_arg(wrapper, opt_lower)
                     current = opt_end
@@ -2817,22 +2869,34 @@ def _command_detection_variants(command: str):
         decoded_payload = _deobfuscate_shell_words_preserving_boundaries(variant)
         if decoded_payload not in payload_variants:
             payload_variants.append(decoded_payload)
-        for base in tuple(payload_variants):
-            unwrapped = _mark_unwrapped_executables(base)
-            if unwrapped != base and unwrapped not in payload_variants:
-                payload_variants.append(unwrapped)
+        for _ in range(12):
+            added_unwrapped = False
+            for base in tuple(payload_variants):
+                unwrapped = _mark_unwrapped_executables(base)
+                if unwrapped != base and unwrapped not in payload_variants:
+                    payload_variants.append(unwrapped)
+                    added_unwrapped = True
+            if not added_unwrapped:
+                break
 
         for payload_variant in payload_variants:
             if payload_variant not in seen:
                 seen.add(payload_variant)
                 yield payload_variant
 
-        for nested_payload, malformed in _env_split_string_findings(variant):
-            if not malformed and nested_payload and nested_payload not in seen:
-                pending.append(nested_payload)
+        for env_source in payload_variants:
+            for nested_payload, malformed in _env_split_string_findings(env_source):
+                if malformed:
+                    yield _MALFORMED_EXEC_VARIANT
+                    continue
+                if nested_payload and nested_payload not in seen:
+                    pending.append(nested_payload)
 
         for payload_variant in payload_variants:
-            for _, payload in _execution_flag_findings(payload_variant):
+            for description, payload in _execution_flag_findings(payload_variant):
+                if description == _MALFORMED_EXEC_DESCRIPTION:
+                    yield _MALFORMED_EXEC_VARIANT
+                    continue
                 if not payload or payload in seen:
                     continue
                 seen.add(payload)

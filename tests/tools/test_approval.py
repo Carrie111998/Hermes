@@ -832,6 +832,45 @@ class TestAnsiCQuotingBypass:
             is_hardline, _ = detect_hardline_command(cmd)
             assert is_hardline is False, f"nonexecuting wrapper form blocked: {cmd!r}"
 
+    def test_eval_payloads_hit_hardline_floor(self, monkeypatch):
+        commands = (
+            "eval 'rm -rf /'",
+            "builtin eval 'rm -rf /'",
+            "command eval 'rm -rf /'",
+            "builtin command eval 'rm -rf /'",
+            'eval "$PAYLOAD"',
+        )
+        for cmd in commands:
+            assert detect_hardline_command(cmd)[0] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
+
+    def test_exec_argv0_options_hit_hardline_floor(self, monkeypatch):
+        commands = (
+            "exec -a harmless rm -rf /",
+            "exec -ca harmless rm -rf /",
+            "command exec -a harmless rm -rf /",
+            "builtin exec -a harmless rm -rf /",
+        )
+        for cmd in commands:
+            assert detect_hardline_command(cmd)[0] is True, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", True)
+        for cmd in commands:
+            assert approval_module.check_dangerous_command(cmd, "local")["approved"] is False, cmd
+
+        monkeypatch.setattr(approval_module, "_YOLO_MODE_FROZEN", False)
+        monkeypatch.setattr(approval_module, "_get_approval_mode", lambda: "off")
+        for cmd in commands:
+            assert approval_module.check_all_command_guards(cmd, "local")["approved"] is False, cmd
+
     def test_env_option_prefixes_still_hit_hardline_floor(self):
         r"""GNU env options / `--` must stay inside the hardline command-position
         prefix. Assignment-only `env FOO=1 rm` already matched; `env -i` and
@@ -847,6 +886,9 @@ class TestAnsiCQuotingBypass:
             "env --u HOME rm -rf /",
             "env -C /tmp rm -rf /",
             "env --ch /tmp rm -rf /",
+            "env --block-signal rm -rf /",
+            "env --default-signal rm -rf /",
+            "env --ignore-signal rm -rf /",
             "env -i PATH=/usr/bin rm -rf /",
             "sudo env -i rm -rf /",
             "env -i $'\\x72\\x6d' -rf /",
@@ -882,6 +924,11 @@ class TestAnsiCQuotingBypass:
             "env -S $'rm -rf /'",
             'env -S "$PAYLOAD"',
             "env -S 'sh -c \"rm -rf /\"'",
+            "command env -S 'rm -rf /'",
+            "command -p env -S 'rm -rf /'",
+            "builtin command env -S 'rm -rf /'",
+            "builtin exec env -S 'rm -rf /'",
+            'command env "$OPT" \'rm -rf /\'',
         ):
             result = approval_module.check_dangerous_command(cmd, "local")
             assert result["approved"] is False, cmd
@@ -896,6 +943,9 @@ class TestAnsiCQuotingBypass:
             'env -S "$(printf \'rm -rf /\')"',
             "env -S `printf 'rm -rf /'`",
             "sudo env -S 'sh -c \"rm -rf /\"'",
+            "command env -S 'rm -rf /'",
+            "builtin exec env -S 'rm -rf /'",
+            'command env "$OPT" \'rm -rf /\'',
         ):
             result = approval_module.check_all_command_guards(cmd, "local")
             assert result["approved"] is False, cmd
@@ -944,6 +994,19 @@ class TestAnsiCQuotingBypass:
     def test_env_assignment_ends_option_parsing(self):
         is_hardline, _ = detect_hardline_command("env FOO=x -S 'rm -rf /'")
         assert is_hardline is False
+
+    def test_invalid_or_nonexecuting_env_forms_are_not_hardline(self):
+        for cmd in (
+            "env --i rm -rf /",
+            "env --ignore rm -rf /",
+            "env --bogus rm -rf /",
+            "env -Z rm -rf /",
+            "env --help rm -rf /",
+            "env --version rm -rf /",
+            "env -0 rm -rf /",
+            "env --null rm -rf /",
+        ):
+            assert detect_hardline_command(cmd) == (False, None), cmd
 
     def test_safe_env_split_string_payloads_are_not_hardline(self):
         for cmd in (
