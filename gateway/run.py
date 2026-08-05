@@ -12559,6 +12559,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         async def _stop_impl() -> None:
+            def _release_kanban_worker_claims(phase: str) -> None:
+                """Release host-local Kanban claims before child-process cleanup.
+
+                Dispatcher workers are independent subprocesses rather than
+                process_registry entries, but systemd still reaps them with the
+                gateway's cgroup.  Do this immediately before each shutdown
+                cleanup phase that can terminate children.  Repeating it is
+                intentional: the second, compare-and-swap guarded pass covers
+                claims that appeared during the preceding teardown phase.
+                """
+                try:
+                    from hermes_cli import kanban_db as _kanban_db
+                    _boards = _kanban_db.list_boards(include_archived=False)
+                except Exception as _e:
+                    logger.debug(
+                        "list_boards for gateway shutdown release (%s) error: %s",
+                        phase, _e,
+                    )
+                    try:
+                        _boards = [
+                            _kanban_db.read_board_metadata(_kanban_db.DEFAULT_BOARD)
+                        ]
+                    except Exception as _fallback_error:
+                        logger.debug(
+                            "default-board fallback for gateway shutdown release (%s) error: %s",
+                            phase, _fallback_error,
+                        )
+                        return
+                for _board in _boards:
+                    _slug = _board.get("slug") or _kanban_db.DEFAULT_BOARD
+                    try:
+                        with _kanban_db.connect(board=_slug) as _conn:
+                            _released = _kanban_db.release_running_workers_for_gateway_shutdown(
+                                _conn,
+                                f"Gateway shutdown ({phase}) interrupted the worker before the run finished.",
+                            )
+                        if _released:
+                            logger.warning(
+                                "Shutdown (%s): released %d in-flight kanban worker(s) on %s: %s",
+                                phase, len(_released), _slug, ", ".join(_released),
+                            )
+                    except Exception as _e:
+                        logger.debug(
+                            "release_running_workers_for_gateway_shutdown (%s, %s) error: %s",
+                            phase, _slug, _e,
+                        )
+
             def _kill_tool_subprocesses(phase: str) -> None:
                 """Kill tool subprocesses + tear down terminal envs + browsers.
 
@@ -12663,12 +12710,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await _stop_impl_body(
                     _kill_tool_subprocesses,
+                    _release_kanban_worker_claims,
                     _stop_started_at_box,
                 )
             finally:
                 _watchdog_done.set()
 
-        async def _stop_impl_body(_kill_tool_subprocesses, _stop_started_at_box) -> None:
+        async def _stop_impl_body(
+            _kill_tool_subprocesses,
+            _release_kanban_worker_claims,
+            _stop_started_at_box,
+        ) -> None:
             logger.info(
                 "Stopping gateway%s...",
                 " for restart" if self._restart_requested else "",
@@ -12681,6 +12733,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+            _release_kanban_worker_claims("pre-drain")
 
             stop_watchdog = getattr(self, "_stop_systemd_watchdog", None)
             if callable(stop_watchdog):
@@ -12809,6 +12862,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # children left behind by an interrupted terminal tool get
                 # killed by systemd instead of us (issue #8202).  The final
                 # catch-all cleanup below still runs for the graceful path.
+                _release_kanban_worker_claims("post-interrupt")
                 _kill_tool_subprocesses("post-interrupt")
                 logger.info(
                     "Shutdown phase: post-interrupt tool kill done at +%.2fs",
@@ -12907,6 +12961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # where drain succeeded without interrupt, and (b) anything
             # that got respawned between the earlier call and adapter
             # disconnect (defense in depth; safe to call repeatedly).
+            _release_kanban_worker_claims("final-cleanup")
             _kill_tool_subprocesses("final-cleanup")
             logger.info(
                 "Shutdown phase: final-cleanup tool kill done at +%.2fs",

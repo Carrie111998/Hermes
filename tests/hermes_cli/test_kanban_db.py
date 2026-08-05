@@ -318,6 +318,75 @@ def test_rate_limit_exit_requeues_without_counting_failure(
         assert "crashed" not in outcomes
 
 
+def test_gateway_shutdown_release_requeues_without_counting_failure(
+    kanban_home, monkeypatch,
+):
+    """Gateway lifecycle restarts must not look like worker crashes.
+
+    Kanban workers run as gateway child processes, so systemd restarts kill
+    them from the outside. The shutdown hook releases those host-local claims
+    with a first-class ``released`` run instead of incrementing the task's
+    consecutive-failure counter.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="restart", assignee="worker")
+        kb.claim_task(conn, tid, claimer=f"{host}:gateway-worker")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+            (76543, 1, tid),
+        )
+        conn.commit()
+
+        released = kb.release_running_workers_for_gateway_shutdown(
+            conn,
+            "Gateway shutdown (test) interrupted the worker before the run finished.",
+        )
+
+        assert released == [tid]
+        task = kb.get_task(conn, tid)
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 1
+        assert "Gateway shutdown" in task.last_failure_error
+
+        run = kb.latest_run(conn, tid)
+        assert run.status == "released"
+        assert run.outcome == "released"
+        assert "Gateway shutdown" in (run.error or "")
+        events = kb.list_events(conn, tid)
+        assert any(e.kind == "gateway_interrupted" for e in events)
+
+
+def test_gateway_shutdown_release_ignores_nonlocal_claims(
+    kanban_home,
+):
+    """Only workers claimed by this gateway host are released on shutdown."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="remote", assignee="worker")
+        kb.claim_task(conn, tid, claimer="other-host:worker")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+            (76544, 0, tid),
+        )
+        conn.commit()
+
+        released = kb.release_running_workers_for_gateway_shutdown(
+            conn,
+            "Gateway shutdown (test)",
+            host="this-host",
+        )
+
+        assert released == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock == "other-host:worker"
+        assert task.worker_pid == 76544
+
+
 
 
 def test_respawn_guard_defers_rate_limited_within_cooldown(

@@ -1323,7 +1323,7 @@ CREATE TABLE IF NOT EXISTS task_runs (
     ended_at            INTEGER,
     outcome             TEXT,
     -- outcome: completed | blocked | crashed | timed_out | spawn_failed |
-    --          gave_up | reclaimed | (null while still running)
+    --          gave_up | reclaimed | released | (null while still running)
     summary             TEXT,
     metadata            TEXT,
     error               TEXT
@@ -4595,6 +4595,96 @@ def release_stale_claims(
             )
             reclaimed += 1
     return reclaimed
+
+
+def release_running_workers_for_gateway_shutdown(
+    conn: sqlite3.Connection,
+    reason: str,
+    *,
+    host: Optional[str] = None,
+) -> list[str]:
+    """Release host-local running workers during gateway shutdown.
+
+    Kanban workers are subprocesses of the gateway service. A managed
+    gateway restart terminates those children via the service cgroup; counting
+    that lifecycle event as a worker crash trips the task circuit breaker even
+    though the task did nothing wrong. This function is only called from the
+    gateway shutdown path, before the service manager kills child workers.
+
+    Returns the task ids released back to ``ready`` without incrementing
+    ``consecutive_failures``.
+    """
+    host = host or _claimer_id().split(":", 1)[0]
+    host_prefix = f"{host}:"
+    rows = conn.execute(
+        """
+        SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at
+          FROM tasks
+         WHERE status = 'running'
+           AND claim_lock LIKE ?
+        """,
+        (f"{host_prefix}%",),
+    ).fetchall()
+    released: list[str] = []
+    now = int(time.time())
+    for row in rows:
+        with write_txn(conn):
+            cur = conn.execute(
+                """
+                UPDATE tasks
+                   SET status = 'ready',
+                       claim_lock = NULL,
+                       claim_expires = NULL,
+                       worker_pid = NULL,
+                       last_heartbeat_at = NULL,
+                       last_failure_error = ?
+                 WHERE id = ?
+                   AND status = 'running'
+                   AND claim_lock IS ?
+                """,
+                (reason[:500], row["id"], row["claim_lock"]),
+            )
+            if cur.rowcount != 1:
+                continue
+            run_id = _end_run(
+                conn, row["id"],
+                outcome="released", status="released",
+                error=reason,
+                metadata={
+                    "reason": reason,
+                    "release_kind": "gateway_shutdown",
+                    "claim_lock": row["claim_lock"],
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "claim_expires": (
+                        int(row["claim_expires"])
+                        if row["claim_expires"] is not None else None
+                    ),
+                    "last_heartbeat_at": (
+                        int(row["last_heartbeat_at"])
+                        if row["last_heartbeat_at"] is not None else None
+                    ),
+                    "released_at": now,
+                    "host": host,
+                },
+            )
+            _append_event(
+                conn, row["id"], "gateway_interrupted",
+                {
+                    "reason": reason,
+                    "claim_lock": row["claim_lock"],
+                    "worker_pid": (
+                        int(row["worker_pid"])
+                        if row["worker_pid"] is not None else None
+                    ),
+                    "host": host,
+                },
+                run_id=run_id,
+            )
+            released.append(row["id"])
+    return released
 
 
 def reclaim_task(
