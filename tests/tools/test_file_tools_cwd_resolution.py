@@ -17,11 +17,13 @@ Core invariant these tests pin:
 
 import os
 from pathlib import Path, PurePosixPath
+from unittest.mock import MagicMock
 
 import pytest
 
 import tools.file_tools as ft
 import tools.terminal_tool as terminal_tool
+from tools.environments.ssh import SSHEnvironment
 
 
 @pytest.fixture
@@ -310,3 +312,86 @@ def test_v4a_patch_applies_to_resolved_workspace_not_backend_cwd(
     assert (workspace / "target.py").read_text() == "WORKSPACE_PATCHED\n"
     # The decoy (backend cwd) was left untouched.
     assert (decoy / "target.py").read_text() == "DECOY_ORIGINAL\n"
+
+
+# ── #79663: ssh paths live on the remote host, not on the Hermes host ───────
+
+
+REMOTE_ABS_PATH = "/home/michidut/hermes-workspace/file.txt"
+
+
+def _use_backend(monkeypatch, env_type):
+    """Pin the terminal backend without touching the resolver under test."""
+    monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {"env_type": env_type})
+    monkeypatch.setattr(terminal_tool, "_active_environments", {})
+    monkeypatch.delenv("TERMINAL_ENV", raising=False)
+
+
+def _assert_left_for_the_remote(resolved, expected=REMOTE_ABS_PATH):
+    """The path must survive verbatim AND skip host resolution entirely.
+
+    ``_normalize_without_host_deref`` returns a pure ``PurePosixPath``; the
+    host branch returns a concrete ``Path`` (``WindowsPath`` / ``PosixPath``)
+    that has already been through ``resolve()``. The isinstance check is what
+    makes this test meaningful on a Linux host too, where a nonexistent
+    ``/home/...`` survives ``resolve()`` unchanged by luck rather than design.
+    """
+    assert str(resolved) == expected, f"path was rewritten on the Hermes host: {resolved}"
+    assert not isinstance(resolved, Path), (
+        f"path went through host resolution ({type(resolved).__name__}); "
+        "remote paths must not be resolved against the Hermes filesystem"
+    )
+
+
+def test_ssh_absolute_path_is_not_resolved_on_the_hermes_host(monkeypatch):
+    """An absolute ssh path must reach the remote shell byte-identical.
+
+    ``terminal`` runs the command on the remote host, so ``file`` tools must
+    agree with it. Resolving on the Hermes host rewrites the path before the
+    remote ever sees it: a macOS ``/home`` firmlink expands to
+    ``/System/Volumes/Data/home/...`` and a Windows host anchors it to the
+    ``C:`` drive, neither of which exists on the remote (#79663).
+    """
+    _use_backend(monkeypatch, "ssh")
+
+    _assert_left_for_the_remote(ft._resolve_path_for_task(REMOTE_ABS_PATH, task_id="default"))
+
+
+def test_ssh_live_environment_is_not_host_resolved(monkeypatch):
+    """The live-session path: a registered SSHEnvironment, not just config.
+
+    ``_terminal_env_type_for_task`` prefers the registered environment over
+    ``_get_env_config``, so this is the branch a real ssh session takes.
+    """
+    _use_backend(monkeypatch, "local")
+    monkeypatch.setattr(
+        terminal_tool, "_active_environments", {"default": MagicMock(spec=SSHEnvironment)}
+    )
+
+    assert ft._terminal_env_type_for_task("default") == "ssh"
+    _assert_left_for_the_remote(ft._resolve_path_for_task(REMOTE_ABS_PATH, task_id="default"))
+
+
+def test_ssh_relative_path_anchors_under_the_remote_cwd(monkeypatch):
+    """A relative ssh path must join the remote cwd with posix semantics."""
+    _use_backend(monkeypatch, "ssh")
+    monkeypatch.setattr(terminal_tool, "_session_cwd", {})
+    terminal_tool.record_session_cwd("default", "/home/michidut/hermes-workspace")
+
+    _assert_left_for_the_remote(ft._resolve_path_for_task("file.txt", task_id="default"))
+
+
+def test_ssh_stays_out_of_the_container_cwd_guard(monkeypatch):
+    """ssh takes the remote-path branch without becoming a container backend.
+
+    ``_CONTAINER_BACKENDS`` also drives the container cwd guard
+    (``_is_unusable_container_cwd``), which rejects ``/home/...`` as a working
+    directory. That is correct for ``docker run -w`` and wrong for ssh, where
+    ``/home/<user>`` is exactly where the remote session belongs, so ssh must
+    widen path resolution only.
+    """
+    _use_backend(monkeypatch, "ssh")
+
+    assert ft._uses_container_paths("default") is True
+    assert "ssh" not in terminal_tool._CONTAINER_BACKENDS
+    assert terminal_tool._is_unusable_container_cwd("/home/michidut") is True

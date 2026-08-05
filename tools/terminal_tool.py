@@ -1366,6 +1366,15 @@ _HOST_CWD_PREFIXES = ("/Users/", "/home/", "C:\\", "C:/")
 
 _CONTAINER_BACKENDS = frozenset({"docker", "singularity", "modal", "daytona", "vercel_sandbox"})
 
+# Backends whose filesystem lives in a namespace other than the Hermes host's,
+# so file-tool paths must reach the backend unresolved (no host symlink deref,
+# no drive anchoring). Deliberately a superset of _CONTAINER_BACKENDS rather
+# than an addition to it: ssh paths are remote, but ssh is not a sandbox, so
+# container-only handling — image config, docker volumes, and the
+# _is_unusable_container_cwd guard, for which /home/<user> is a perfectly good
+# remote cwd — must keep excluding it.
+_REMOTE_PATH_BACKENDS = _CONTAINER_BACKENDS | {"ssh"}
+
 
 def _is_ssh_remote_tilde_cwd(backend: str, cwd: str) -> bool:
     """Return True when *cwd* is a tilde path that the remote SSH shell must
