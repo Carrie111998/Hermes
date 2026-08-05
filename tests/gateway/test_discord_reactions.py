@@ -278,4 +278,3 @@ async def test_remove_reaction_without_a_tracked_emoji_reports_why(adapter):
 
     assert result["success"] is False
     message.remove_reaction.assert_not_awaited()
-
