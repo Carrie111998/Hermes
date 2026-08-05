@@ -17,6 +17,7 @@ import os
 import random
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 
@@ -61,24 +62,45 @@ from gateway.platforms.base import (
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
     from .plan_cards import (
+        MAX_INTERACTIVE_TASKS,
+        MAX_USER_TASK_CONTENT_LENGTH,
+        PLAN_ACTION_ADD_USER_TASK,
+        PLAN_ACTION_CANCEL,
+        PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
         build_plan_blocks,
+        is_interactive_user_task,
+        is_user_task_id,
         sign_private_metadata,
         verify_private_metadata,
     )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
     from plan_cards import (  # type: ignore
+        MAX_INTERACTIVE_TASKS,
+        MAX_USER_TASK_CONTENT_LENGTH,
+        PLAN_ACTION_ADD_USER_TASK,
+        PLAN_ACTION_CANCEL,
+        PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
         build_plan_blocks,
+        is_interactive_user_task,
+        is_user_task_id,
         sign_private_metadata,
         verify_private_metadata,
     )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _profile_from_hermes_home(home: Any) -> Optional[str]:
+    path = _Path(home)
+    if path.parent.name == "profiles" and path.name:
+        return path.name
+    return None
 
 
 class _PlanRetryPersistenceError(RuntimeError):
@@ -533,7 +555,9 @@ class SlackAdapter(BasePlatformAdapter):
             default=False,
         )
         from hermes_constants import get_hermes_home
-        self._plan_store = PlanCardStore(get_hermes_home())
+        plan_home = get_hermes_home()
+        self._plan_profile = _profile_from_hermes_home(plan_home)
+        self._plan_store = PlanCardStore(plan_home)
         self._plan_reconcile_task: Optional[asyncio.Task] = None
         self._plan_reconcile_generation = 0
         self._plan_reconcile_stopping = True
@@ -4032,6 +4056,9 @@ class SlackAdapter(BasePlatformAdapter):
         channel_id: str = "",
         user_name: Optional[str] = None,
         team_id: str = "",
+        profile: Optional[str] = None,
+        thread_id: Optional[str] = None,
+        fail_closed_on_lookup_error: bool = False,
     ) -> bool:
         """Return whether a Slack interactive caller may perform gated actions."""
         normalized_user_id = str(user_id or "").strip()
@@ -4041,6 +4068,17 @@ class SlackAdapter(BasePlatformAdapter):
         runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
+            if profile:
+                try:
+                    pairing_stores = getattr(runner, "pairing_stores", None)
+                    if (
+                        not isinstance(pairing_stores, dict)
+                        or profile not in pairing_stores
+                        or pairing_stores[profile] is None
+                    ):
+                        return False
+                except Exception:
+                    return False
             try:
                 from gateway.session import SessionSource
 
@@ -4050,10 +4088,14 @@ class SlackAdapter(BasePlatformAdapter):
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
+                    thread_id=thread_id,
                     scope_id=str(team_id) if team_id else None,
+                    profile=profile,
                 )
                 return bool(auth_fn(source))
             except Exception:
+                if fail_closed_on_lookup_error:
+                    return False
                 logger.debug(
                     "[Slack] Falling back to env-only interactive auth for user %s",
                     normalized_user_id,
@@ -4128,6 +4170,7 @@ class SlackAdapter(BasePlatformAdapter):
                 "thread_ts": thread_ts,
                 "route_user_id": route_user_id,
                 "chat_type": chat_type,
+                "profile": self._plan_profile,
             },
             todos,
         )
@@ -4142,6 +4185,7 @@ class SlackAdapter(BasePlatformAdapter):
             "message_ts": state.get("message_ts", ""),
             "route_user_id": state.get("route_user_id", ""),
             "chat_type": state.get("chat_type", "group"),
+            "profile": state.get("profile"),
         }
         return build_plan_blocks(
             state.get("last_desired_snapshot") or [],
@@ -4651,7 +4695,45 @@ class SlackAdapter(BasePlatformAdapter):
             self._plan_reconcile_task = None
 
     def validate_plan_action_metadata(self, metadata: Dict[str, Any]) -> bool:
-        return self._plan_store.validate_action(metadata) is not None
+        try:
+            state = self._plan_store.validate_action(metadata)
+        except Exception:
+            logger.warning(
+                "[Slack] Claim-time plan action state lookup failed",
+                exc_info=True,
+            )
+            return False
+        if not state:
+            return False
+        if state.get("profile") != self._plan_profile:
+            return False
+        action_user_id = metadata.get("action_user_id")
+        if (
+            not isinstance(action_user_id, str)
+            or not action_user_id
+            or action_user_id != action_user_id.strip()
+        ):
+            return False
+        channel_id = str(state.get("channel_id") or "")
+        team_id = str(state.get("team_id") or "")
+        if not channel_id or not team_id:
+            return False
+        try:
+            return self._is_interactive_user_authorized(
+                action_user_id,
+                channel_id=channel_id,
+                user_name=None,
+                team_id=team_id,
+                profile=state.get("profile"),
+                thread_id=str(state.get("thread_ts") or "") or None,
+                fail_closed_on_lookup_error=True,
+            )
+        except Exception:
+            logger.warning(
+                "[Slack] Claim-time plan action authorization lookup failed",
+                exc_info=True,
+            )
+            return False
 
     def _plan_state_from_interaction(
         self,
@@ -4664,6 +4746,8 @@ class SlackAdapter(BasePlatformAdapter):
         message_ts = str(message.get("ts") or "")
         state = self._plan_store.lookup_route(team_id, channel_id, message_ts)
         if not state:
+            return None
+        if state.get("profile") != self._plan_profile:
             return None
         if (
             team_id != str(state.get("team_id") or "")
@@ -4710,6 +4794,8 @@ class SlackAdapter(BasePlatformAdapter):
         *,
         state: Dict[str, Any],
         body: Dict[str, Any],
+        action_kind: str,
+        action_dedupe_id: str,
         changes: Dict[str, Any],
     ) -> None:
         task_ids = sorted({
@@ -4724,10 +4810,13 @@ class SlackAdapter(BasePlatformAdapter):
             "team_id": state["team_id"],
             "channel_id": state["channel_id"],
             "thread_ts": state.get("thread_ts", ""),
+            "profile": state.get("profile"),
             "message_ts": state["message_ts"],
             "revision": state["desired_revision"],
             "snapshot_hash": state["desired_hash"],
             "task_ids": task_ids,
+            "action_kind": action_kind,
+            "action_dedupe_id": action_dedupe_id,
             "action_user_id": str((body.get("user") or {}).get("id") or ""),
             **changes,
         }
@@ -4738,6 +4827,7 @@ class SlackAdapter(BasePlatformAdapter):
             thread_id=str(state.get("thread_ts") or "") or None,
             scope_id=str(state.get("team_id") or "") or None,
         )
+        source.profile = state.get("profile")
         prompt = (
             "[Trusted Slack plan action]\n"
             "Use the todo tool to apply exactly this structured change to the current full todo list. "
@@ -4767,34 +4857,59 @@ class SlackAdapter(BasePlatformAdapter):
     async def _handle_plan_action_after_ack(self, body, action) -> None:
         if not self._plan_cards_enabled:
             return
+        action_id = str(action.get("action_id") or "")
+        if action_id not in {
+            "hermes_plan_complete",
+            "hermes_plan_cancel",
+            "hermes_plan_add",
+            "hermes_plan_refresh",
+        }:
+            return
         team_id = self._event_team_id({}, body)
         channel_id = str((body.get("channel") or {}).get("id") or "")
+        state = self._plan_state_from_interaction(body, action)
+        if not state:
+            return
         user = body.get("user") or {}
         if not self._is_interactive_user_authorized(
             str(user.get("id") or ""),
             channel_id=channel_id,
             user_name=user.get("name"),
             team_id=team_id,
+            profile=state.get("profile"),
+            thread_id=str(state.get("thread_ts") or "") or None,
         ):
-            return
-        state = self._plan_state_from_interaction(body, action)
-        if not state:
             return
         if not self._plan_interaction_owner_matches(state, str(user.get("id") or "")):
             return
         dedupe_id = self._plan_action_dedupe_id(body, action)
         if not self._plan_store.consume_action_id(dedupe_id):
             return
-        action_id = str(action.get("action_id") or "")
         tasks = state.get("last_desired_snapshot") or []
         if action_id == "hermes_plan_refresh":
             self._plan_store.request_refresh(state["session_key"])
             self.request_plan_reconcile()
             return
+        snapshot_ids = [str(task.get("id") or "") for task in tasks]
+        if (
+            len(snapshot_ids) != len(set(snapshot_ids))
+            or sum(is_interactive_user_task(task) for task in tasks)
+            > MAX_INTERACTIVE_TASKS
+        ):
+            return
         if action_id == "hermes_plan_add":
             secret = self._plan_signing_secret()
             if not secret:
                 return
+            if (
+                sum(is_interactive_user_task(task) for task in tasks)
+                >= MAX_INTERACTIVE_TASKS
+            ):
+                return
+            existing_ids = set(snapshot_ids)
+            generated_id = f"user:{uuid.uuid4()}"
+            while generated_id in existing_ids:
+                generated_id = f"user:{uuid.uuid4()}"
             payload = {
                 "session_key": state["session_key"],
                 "session_id": state["session_id"],
@@ -4804,7 +4919,12 @@ class SlackAdapter(BasePlatformAdapter):
                 "message_ts": state["message_ts"],
                 "revision": state["desired_revision"],
                 "snapshot_hash": state["desired_hash"],
-                "task_ids": [],
+                "profile": state.get("profile"),
+                "task_ids": [generated_id],
+                "action_kind": PLAN_ACTION_ADD_USER_TASK,
+                "add_task_ids": [generated_id],
+                "action_user_id": str(user.get("id") or ""),
+                "action_dedupe_id": dedupe_id,
             }
             private_metadata = sign_private_metadata(payload, secret)
             if not private_metadata:
@@ -4815,17 +4935,18 @@ class SlackAdapter(BasePlatformAdapter):
                     "type": "modal",
                     "callback_id": "hermes_plan_add_task",
                     "private_metadata": private_metadata,
-                    "title": {"type": "plain_text", "text": "Add task"},
+                    "title": {"type": "plain_text", "text": "Add user task"},
                     "submit": {"type": "plain_text", "text": "Add"},
                     "close": {"type": "plain_text", "text": "Cancel"},
                     "blocks": [{
                         "type": "input",
                         "block_id": "task",
-                        "label": {"type": "plain_text", "text": "Task"},
+                        "label": {"type": "plain_text", "text": "User task"},
                         "element": {
                             "type": "plain_text_input",
                             "action_id": "content",
                             "multiline": True,
+                            "max_length": MAX_USER_TASK_CONTENT_LENGTH,
                         },
                     }],
                 },
@@ -4836,21 +4957,37 @@ class SlackAdapter(BasePlatformAdapter):
             task_id = str(selected.get("value") or "")
             eligible_cancel = {
                 task["id"] for task in tasks
-                if task["status"] not in {"completed", "cancelled"}
+                if is_user_task_id(task["id"]) and task["status"] == "pending"
             }
             if task_id in eligible_cancel:
                 await self._dispatch_plan_action_event(
-                    state=state, body=body, changes={"cancel_task_ids": [task_id]}
+                    state=state,
+                    body=body,
+                    action_kind=PLAN_ACTION_CANCEL,
+                    action_dedupe_id=dedupe_id,
+                    changes={"cancel_task_ids": [task_id]},
                 )
             return
         if action_id == "hermes_plan_complete":
-            selected = {
-                str(option.get("value") or "")
-                for option in action.get("selected_options") or []
-                if option.get("value")
+            raw_selected = action.get("selected_options")
+            if not isinstance(raw_selected, list) or any(
+                not isinstance(option, dict) or not option.get("value")
+                for option in raw_selected
+            ):
+                return
+            selected_ids = [str(option["value"]) for option in raw_selected]
+            if len(selected_ids) != len(set(selected_ids)):
+                return
+            selected = set(selected_ids)
+            eligible = {
+                task["id"] for task in tasks
+                if is_user_task_id(task["id"])
+                and task["status"] in {"pending", "completed"}
             }
-            eligible = {task["id"] for task in tasks if task["status"] != "cancelled"}
-            completed = {task["id"] for task in tasks if task["status"] == "completed"}
+            completed = {
+                task["id"] for task in tasks
+                if is_user_task_id(task["id"]) and task["status"] == "completed"
+            }
             if not selected.issubset(eligible):
                 return
             complete_ids = sorted(selected - completed)
@@ -4860,6 +4997,8 @@ class SlackAdapter(BasePlatformAdapter):
             await self._dispatch_plan_action_event(
                 state=state,
                 body=body,
+                action_kind=PLAN_ACTION_COMPLETE_REOPEN,
+                action_dedupe_id=dedupe_id,
                 changes={
                     "complete_task_ids": complete_ids,
                     "reopen_task_ids": reopen_ids,
@@ -4882,19 +5021,31 @@ class SlackAdapter(BasePlatformAdapter):
         )
         if not payload:
             return
-        state = self._plan_store.validate_action(payload)
+        user = body.get("user") or {}
+        user_id = str(user.get("id") or "")
+        if user_id != str(payload.get("action_user_id") or ""):
+            return
+        values = ((body.get("view") or {}).get("state") or {}).get("values") or {}
+        content = str((((values.get("task") or {}).get("content") or {}).get("value")) or "").strip()
+        if not content or len(content) > MAX_USER_TASK_CONTENT_LENGTH:
+            return
+        validated_metadata = {**payload, "add_task_content": content}
+        state = self._plan_store.validate_action(validated_metadata)
         if not state:
             return
-        user = body.get("user") or {}
+        if state.get("profile") != self._plan_profile:
+            return
         if not self._is_interactive_user_authorized(
-            str(user.get("id") or ""),
+            user_id,
             channel_id=str(state.get("channel_id") or ""),
             user_name=user.get("name"),
             team_id=str(state.get("team_id") or ""),
+            profile=state.get("profile"),
+            thread_id=str(state.get("thread_ts") or "") or None,
         ):
             return
         if not self._plan_interaction_owner_matches(
-            state, str(user.get("id") or "")
+            state, user_id
         ):
             return
         view_body = body.get("view") or {}
@@ -4903,21 +5054,22 @@ class SlackAdapter(BasePlatformAdapter):
                 "view_submission",
                 str(view_body.get("id") or ""),
                 str(view_body.get("hash") or ""),
-                str(user.get("id") or ""),
+                user_id,
                 str(payload.get("session_key") or ""),
                 str(payload.get("revision") or ""),
             )).encode("utf-8")
         ).hexdigest()
         if not self._plan_store.consume_action_id(dedupe_id):
             return
-        values = ((body.get("view") or {}).get("state") or {}).get("values") or {}
-        content = str((((values.get("task") or {}).get("content") or {}).get("value")) or "").strip()
-        if not content:
-            return
         await self._dispatch_plan_action_event(
             state=state,
             body=body,
-            changes={"add_task_content": content},
+            action_kind=PLAN_ACTION_ADD_USER_TASK,
+            action_dedupe_id=str(payload.get("action_dedupe_id") or ""),
+            changes={
+                "add_task_ids": list(payload["add_task_ids"]),
+                "add_task_content": content,
+            },
         )
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:

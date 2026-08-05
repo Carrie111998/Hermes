@@ -26,7 +26,20 @@ from typing import Any, Iterator, Mapping, Optional, Sequence
 
 STATE_VERSION = 1
 MAX_INTERACTIVE_TASKS = 10
+MAX_USER_TASK_CONTENT_LENGTH = 3000
+MAX_NATIVE_TASK_TITLE_LENGTH = 3000
 MAX_ACTION_DEDUPE_IDS = 512
+USER_TASK_ID_PREFIX = "user:"
+INTERACTIVE_USER_TASK_STATUSES = frozenset({"pending", "completed"})
+PLAN_ACTION_COMPLETE_REOPEN = "complete_reopen"
+PLAN_ACTION_CANCEL = "cancel"
+PLAN_ACTION_ADD_USER_TASK = "add_user_task"
+PLAN_MUTATION_ACTIONS = frozenset({
+    PLAN_ACTION_COMPLETE_REOPEN,
+    PLAN_ACTION_CANCEL,
+    PLAN_ACTION_ADD_USER_TASK,
+})
+_NATIVE_TITLE_TRUNCATION_SUFFIX = "... [truncated]"
 _STATUS_LABELS = {
     "pending": "Pending",
     "in_progress": "In progress",
@@ -58,20 +71,33 @@ def _json_loads_prefix(value: str) -> Any:
         return data
 
 
+def is_user_task_id(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and value.startswith(USER_TASK_ID_PREFIX)
+        and len(value) > len(USER_TASK_ID_PREFIX)
+    )
+
+
+def is_interactive_user_task(task: Mapping[str, Any]) -> bool:
+    return (
+        is_user_task_id(task.get("id"))
+        and task.get("status") in INTERACTIVE_USER_TASK_STATUSES
+    )
+
+
 def normalize_todos(todos: Sequence[Mapping[str, Any]]) -> list[dict[str, str]]:
     normalized: list[dict[str, str]] = []
-    seen: set[str] = set()
     for item in todos:
         if not isinstance(item, Mapping):
             continue
-        task_id = str(item.get("id") or "").strip()
-        if not task_id or task_id in seen:
+        task_id = str(item.get("id") or "")
+        if not task_id:
             continue
         content = str(item.get("content") or "").strip() or "(no description)"
         status = str(item.get("status") or "pending").strip().lower()
         if status not in _NATIVE_STATUSES:
             status = "pending"
-        seen.add(task_id)
         normalized.append({"id": task_id, "content": content, "status": status})
     return normalized
 
@@ -157,6 +183,16 @@ def _plain_text(text: str) -> dict[str, Any]:
     return {"type": "plain_text", "text": text[:3000], "emoji": True}
 
 
+def _native_task_title(task: Mapping[str, str]) -> str:
+    title = task["content"]
+    if task["status"] == "cancelled":
+        title = f"[cancelled] {title}"
+    if len(title) <= MAX_NATIVE_TASK_TITLE_LENGTH:
+        return title
+    prefix_length = MAX_NATIVE_TASK_TITLE_LENGTH - len(_NATIVE_TITLE_TRUNCATION_SUFFIX)
+    return title[:prefix_length] + _NATIVE_TITLE_TRUNCATION_SUFFIX
+
+
 def _control_blocks(
     todos: list[dict[str, str]],
     *,
@@ -165,22 +201,23 @@ def _control_blocks(
     signing_secret: Optional[bytes],
     action_context: Optional[Mapping[str, Any]],
 ) -> list[dict[str, Any]]:
-    if len(todos) > MAX_INTERACTIVE_TASKS:
-        return []
     base = dict(action_context or {})
     base.update({"revision": revision, "snapshot_hash": desired_hash})
     encoded = encode_action_value(base)
-    completed = {task["id"] for task in todos if task["status"] == "completed"}
+    user_tasks = [task for task in todos if is_interactive_user_task(task)]
+    over_capacity = len(user_tasks) > MAX_INTERACTIVE_TASKS
+    completed = {
+        task["id"] for task in user_tasks if task["status"] == "completed"
+    }
     checkbox_options = [
         {
             "text": _plain_text(task["content"][:75]),
             "value": task["id"],
         }
-        for task in todos
-        if task["status"] != "cancelled"
+        for task in user_tasks
     ]
     elements: list[dict[str, Any]] = []
-    if checkbox_options:
+    if checkbox_options and not over_capacity:
         checkbox: dict[str, Any] = {
             "type": "checkboxes",
             "action_id": "hermes_plan_complete",
@@ -198,21 +235,25 @@ def _control_blocks(
         elements.append(checkbox)
     cancel_options = [
         {"text": _plain_text(task["content"][:75]), "value": task["id"]}
-        for task in todos
-        if task["status"] not in {"completed", "cancelled"}
+        for task in user_tasks
+        if task["status"] == "pending"
     ]
-    if cancel_options:
+    if cancel_options and not over_capacity:
         elements.append({
             "type": "static_select",
             "action_id": "hermes_plan_cancel",
             "placeholder": _plain_text("Cancel task"),
             "options": cancel_options,
         })
-    if signing_secret:
+    if (
+        signing_secret
+        and not over_capacity
+        and len(user_tasks) < MAX_INTERACTIVE_TASKS
+    ):
         elements.append({
             "type": "button",
             "action_id": "hermes_plan_add",
-            "text": _plain_text("Add task"),
+            "text": _plain_text("Add user task"),
             "value": encoded,
         })
     elements.append({
@@ -242,15 +283,12 @@ def build_plan_blocks(
     count = len(tasks)
     text = f"Hermes plan: {count} task{'s' if count != 1 else ''}"
     native_tasks = []
-    for task in tasks:
-        title = task["content"]
-        if task["status"] == "cancelled":
-            title = f"[cancelled] {title}"
+    for index, task in enumerate(tasks):
         native_tasks.append({
             "type": "task_card",
-            "block_id": f"hermes-task-{task['id'][:80]}-r{revision}-{snapshot_hash[:8]}",
+            "block_id": f"hermes-task-{index}-{task['id'][:70]}-r{revision}-{snapshot_hash[:8]}",
             "task_id": task["id"],
-            "title": title[:3000],
+            "title": _native_task_title(task),
             "status": _NATIVE_STATUSES[task["status"]],
         })
     native = [{
@@ -271,31 +309,41 @@ def build_plan_blocks(
     for task in tasks:
         label = _STATUS_LABELS[task["status"]]
         lines.append(f"• *{label}* `{task['id']}` — {task['content']}")
-    if count > MAX_INTERACTIVE_TASKS:
+    user_task_count = sum(is_interactive_user_task(task) for task in tasks)
+    if user_task_count > MAX_INTERACTIVE_TASKS:
         lines.append(
-            f"_Interactive controls unavailable: this plan has {count} tasks; "
-            f"the safe control limit is {MAX_INTERACTIVE_TASKS}._"
+            f"_User task mutation controls unavailable: this plan has {user_task_count} "
+            f"mutable user tasks; the safe control limit is {MAX_INTERACTIVE_TASKS}. Refresh remains available._"
         )
-    chunks: list[str] = []
-    current = ""
-    for line in lines:
-        candidate = f"{current}\n{line}".strip()
-        if current and len(candidate) > 2900:
-            chunks.append(current)
-            current = line
-        else:
-            current = candidate
-    if current:
-        chunks.append(current)
+    fallback_text = "\n".join(lines)
+    chunks = [
+        fallback_text[index:index + 3000]
+        for index in range(0, len(fallback_text), 3000)
+    ]
+    control_blocks = _control_blocks(
+        tasks,
+        revision=revision,
+        desired_hash=snapshot_hash,
+        signing_secret=signing_secret,
+        action_context=action_context,
+    )
+    max_fallback_blocks = 50
+    if len(control_blocks) > max_fallback_blocks:
+        control_blocks = []
+    text_block_budget = max_fallback_blocks - len(control_blocks)
+    truncated = len(chunks) > text_block_budget
+    section_limit = text_block_budget
+    if truncated and text_block_budget:
+        section_limit -= 1
     fallback = [
         {
             "type": "section",
             "block_id": f"hermes-plan-fallback-r{revision}-{index}-{snapshot_hash[:8]}",
-            "text": {"type": "mrkdwn", "text": chunk[:3000]},
+            "text": {"type": "mrkdwn", "text": chunk},
         }
-        for index, chunk in enumerate(chunks[:49])
+        for index, chunk in enumerate(chunks[:section_limit])
     ]
-    if len(chunks) > 49:
+    if truncated and text_block_budget:
         fallback.append({
             "type": "context",
             "block_id": f"hermes-plan-overflow-r{revision}-{snapshot_hash[:8]}",
@@ -307,19 +355,17 @@ def build_plan_blocks(
                 ),
             }],
         })
-    if count <= MAX_INTERACTIVE_TASKS:
-        fallback.extend(_control_blocks(
-            tasks,
-            revision=revision,
-            desired_hash=snapshot_hash,
-            signing_secret=signing_secret,
-            action_context=action_context,
-        ))
+    if len(fallback) + len(control_blocks) <= max_fallback_blocks:
+        fallback.extend(control_blocks)
     return RenderedPlan(text=text, native_blocks=native, fallback_blocks=fallback)
 
 
 class PlanCardStore:
-    """Cross-process durable store for desired/applied Slack projections."""
+    """Native Slack plugin authority for its current desired Todo projection.
+
+    This is durable Slack projection state, not a replacement for or claim of
+    authority over the core TodoStore.
+    """
 
     def __init__(self, hermes_home: Path | str):
         root = Path(hermes_home)
@@ -409,7 +455,7 @@ class PlanCardStore:
         defaults = {"chat_type": "group"}
         for key in (
             "session_key", "session_id", "team_id", "channel_id",
-            "thread_ts", "route_user_id", "chat_type",
+            "thread_ts", "route_user_id", "chat_type", "profile",
         ):
             default = defaults.get(key, "")
             left_value = str(left.get(key) or "") if key in left else default
@@ -428,6 +474,7 @@ class PlanCardStore:
             "channel_id": str(state.get("channel_id") or ""),
             "thread_ts": str(state.get("thread_ts") or ""),
             "route_user_id": str(state.get("route_user_id") or ""),
+            "profile": state.get("profile"),
             "chat_type": (
                 str(state.get("chat_type") or "")
                 if "chat_type" in state
@@ -476,6 +523,9 @@ class PlanCardStore:
             new_thread_ts = route_value("thread_ts")
             new_route_user_id = route_value("route_user_id")
             new_chat_type = route_value("chat_type", "group")
+            new_profile = route.get("profile") if "profile" in route else prior.get("profile")
+            if new_profile is not None:
+                new_profile = str(new_profile)
             prior_chat_type = (
                 str(prior.get("chat_type") or "")
                 if "chat_type" in prior
@@ -488,6 +538,7 @@ class PlanCardStore:
                 new_thread_ts != str(prior.get("thread_ts") or ""),
                 new_route_user_id != str(prior.get("route_user_id") or ""),
                 new_chat_type != prior_chat_type,
+                str(new_profile or "") != str(prior.get("profile") or ""),
             ))
             retired_anchors = list(prior.get("retired_anchors") or [])
             if route_changed:
@@ -509,6 +560,7 @@ class PlanCardStore:
                 "thread_ts": new_thread_ts,
                 "route_user_id": new_route_user_id,
                 "chat_type": new_chat_type,
+                "profile": new_profile,
                 "message_ts": "" if route_changed else prior_message_ts,
                 "client_msg_id": "" if route_changed else str(prior.get("client_msg_id") or ""),
                 "create_attempted_at": 0 if route_changed else float(prior.get("create_attempted_at") or 0),
@@ -877,15 +929,124 @@ class PlanCardStore:
                 "team_id": state.get("team_id"),
                 "channel_id": state.get("channel_id"),
                 "thread_ts": state.get("thread_ts"),
+                "profile": state.get("profile"),
                 "message_ts": state.get("message_ts"),
                 "revision": state.get("desired_revision"),
                 "snapshot_hash": state.get("desired_hash"),
             }
             if any(str(metadata.get(key)) != str(expected) for key, expected in comparisons.items()):
                 return None
-            task_ids = {task["id"] for task in state.get("last_desired_snapshot") or []}
-            if not set(metadata.get("task_ids") or []).issubset(task_ids):
+            action_kind = metadata.get("action_kind")
+            if action_kind not in PLAN_MUTATION_ACTIONS:
                 return None
+            action_user_id = str(metadata.get("action_user_id") or "")
+            if not action_user_id:
+                return None
+            route_user_id = str(state.get("route_user_id") or "")
+            if route_user_id and action_user_id != route_user_id:
+                return None
+            action_dedupe_id = str(metadata.get("action_dedupe_id") or "")
+            if not action_dedupe_id or action_dedupe_id not in {
+                str(value) for value in data.get("action_ids") or []
+            }:
+                return None
+
+            snapshot = state.get("last_desired_snapshot")
+            if not isinstance(snapshot, list) or any(
+                not isinstance(task, Mapping) for task in snapshot
+            ):
+                return None
+            tasks = normalize_todos(snapshot)
+            if len(tasks) != len(snapshot):
+                return None
+            snapshot_ids = [task["id"] for task in tasks]
+            if len(snapshot_ids) != len(set(snapshot_ids)):
+                return None
+            if snapshot_hash(tasks) != str(state.get("desired_hash") or ""):
+                return None
+            by_id = {task["id"]: task for task in tasks}
+            user_task_count = sum(is_interactive_user_task(task) for task in tasks)
+            if user_task_count > MAX_INTERACTIVE_TASKS:
+                return None
+
+            def id_list(key: str) -> Optional[list[str]]:
+                value = metadata.get(key)
+                if not isinstance(value, list) or any(
+                    not isinstance(task_id, str) or not task_id for task_id in value
+                ):
+                    return None
+                if len(value) != len(set(value)):
+                    return None
+                return value
+
+            task_ids = id_list("task_ids")
+            if task_ids is None:
+                return None
+            change_keys = {
+                "complete_task_ids", "reopen_task_ids", "cancel_task_ids",
+                "add_task_ids", "add_task_content",
+            }
+
+            if action_kind == PLAN_ACTION_COMPLETE_REOPEN:
+                if any(key in metadata for key in change_keys - {
+                    "complete_task_ids", "reopen_task_ids",
+                }):
+                    return None
+                complete_ids = id_list("complete_task_ids")
+                reopen_ids = id_list("reopen_task_ids")
+                if complete_ids is None or reopen_ids is None:
+                    return None
+                combined = complete_ids + reopen_ids
+                if not combined or len(combined) != len(set(combined)):
+                    return None
+                if task_ids != sorted(combined):
+                    return None
+                if any(
+                    not is_user_task_id(task_id)
+                    or task_id not in by_id
+                    or by_id[task_id]["status"] != "pending"
+                    for task_id in complete_ids
+                ):
+                    return None
+                if any(
+                    not is_user_task_id(task_id)
+                    or task_id not in by_id
+                    or by_id[task_id]["status"] != "completed"
+                    for task_id in reopen_ids
+                ):
+                    return None
+            elif action_kind == PLAN_ACTION_CANCEL:
+                if any(key in metadata for key in change_keys - {"cancel_task_ids"}):
+                    return None
+                cancel_ids = id_list("cancel_task_ids")
+                if cancel_ids is None or len(cancel_ids) != 1 or task_ids != cancel_ids:
+                    return None
+                task_id = cancel_ids[0]
+                if (
+                    not is_user_task_id(task_id)
+                    or task_id not in by_id
+                    or by_id[task_id]["status"] != "pending"
+                ):
+                    return None
+            else:
+                if any(key in metadata for key in change_keys - {
+                    "add_task_ids", "add_task_content",
+                }):
+                    return None
+                add_ids = id_list("add_task_ids")
+                content = metadata.get("add_task_content")
+                if (
+                    add_ids is None
+                    or len(add_ids) != 1
+                    or task_ids != add_ids
+                    or not is_user_task_id(add_ids[0])
+                    or add_ids[0] in by_id
+                    or user_task_count >= MAX_INTERACTIVE_TASKS
+                    or not isinstance(content, str)
+                    or not content.strip()
+                    or len(content) > MAX_USER_TASK_CONTENT_LENGTH
+                ):
+                    return None
             return dict(state)
 
     def consume_action_id(self, action_id: str) -> bool:
@@ -904,14 +1065,21 @@ class PlanCardStore:
 
 __all__ = [
     "MAX_INTERACTIVE_TASKS",
+    "MAX_USER_TASK_CONTENT_LENGTH",
+    "PLAN_ACTION_ADD_USER_TASK",
+    "PLAN_ACTION_CANCEL",
+    "PLAN_ACTION_COMPLETE_REOPEN",
     "PlanCardStore",
     "RenderedPlan",
     "build_plan_blocks",
     "decode_action_value",
     "encode_action_value",
+    "is_interactive_user_task",
+    "is_user_task_id",
     "normalize_todos",
     "parse_todo_result",
     "sign_private_metadata",
     "snapshot_hash",
+    "USER_TASK_ID_PREFIX",
     "verify_private_metadata",
 ]

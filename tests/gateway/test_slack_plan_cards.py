@@ -10,11 +10,13 @@ from unittest.mock import patch
 import pytest
 
 from plugins.platforms.slack.plan_cards import (
+    MAX_INTERACTIVE_TASKS,
     PlanCardStore,
     _RetryScheduleKind,
     build_plan_blocks,
     decode_action_value,
     encode_action_value,
+    is_user_task_id,
     parse_todo_result,
     sign_private_metadata,
     verify_private_metadata,
@@ -68,7 +70,7 @@ def test_native_renderer_preserves_status_and_rotates_block_ids() -> None:
     assert [task["status"] for task in plan["tasks"]] == [
         "pending", "in_progress", "complete", "error"
     ]
-    assert plan["tasks"][3]["title"].startswith("[cancelled]")
+    assert plan["tasks"][3]["title"].startswith("[cancelled] Task 3")
     assert first.text == "Hermes plan: 4 tasks"
     assert first.native_blocks[0]["block_id"] != second.native_blocks[0]["block_id"]
     assert first.native_blocks[0]["tasks"][0]["block_id"] != second.native_blocks[0]["tasks"][0]["block_id"]
@@ -77,26 +79,88 @@ def test_native_renderer_preserves_status_and_rotates_block_ids() -> None:
     ))
 
 
-def test_renderer_adds_controls_and_degrades_without_truncating_truth() -> None:
-    normal = build_plan_blocks(
-        _snapshot(10), revision=3, snapshot_hash="hash", signing_secret=b"secret"
+def _action_elements(rendered, *, fallback: bool = False):
+    return [
+        element
+        for block in (rendered.fallback_blocks if fallback else rendered.native_blocks)
+        if block["type"] == "actions"
+        for element in block["elements"]
+    ]
+
+
+def test_user_task_id_namespace_is_strict_and_raw() -> None:
+    assert is_user_task_id("user:work")
+    assert not is_user_task_id("user:")
+    assert not is_user_task_id("task-1")
+    assert not is_user_task_id("User:work")
+    assert not is_user_task_id(" user:work")
+    assert not is_user_task_id("սser:work")
+
+
+def test_renderer_shows_full_plan_but_controls_only_actionable_user_tasks() -> None:
+    todos = [
+        {"id": "agent:research", "content": "Agent research", "status": "pending"},
+        {"id": "user:pending", "content": "Human pending", "status": "pending"},
+        {"id": "user:done", "content": "Human done", "status": "completed"},
+        {"id": "user:active", "content": "Human active", "status": "in_progress"},
+        {"id": "user:cancelled", "content": "Human cancelled", "status": "cancelled"},
+        {"id": "User:case", "content": "Wrong case", "status": "pending"},
+        {"id": " user:space", "content": "Leading space", "status": "pending"},
+        {"id": "սser:lookalike", "content": "Lookalike", "status": "pending"},
+    ]
+    rendered = build_plan_blocks(
+        todos, revision=3, snapshot_hash="hash", signing_secret=b"secret"
     )
-    actions = normal.native_blocks[-1]
-    assert actions["type"] == "actions"
-    action_ids = [element["action_id"] for element in actions["elements"]]
+    assert [task["task_id"] for task in rendered.native_blocks[0]["tasks"]] == [
+        task["id"] for task in todos
+    ]
+    elements = _action_elements(rendered)
+    checkbox = next(item for item in elements if item["action_id"] == "hermes_plan_complete")
+    cancel = next(item for item in elements if item["action_id"] == "hermes_plan_cancel")
+    assert [option["value"] for option in checkbox["options"]] == [
+        "user:pending", "user:done"
+    ]
+    assert [option["value"] for option in checkbox["initial_options"]] == ["user:done"]
+    assert [option["value"] for option in cancel["options"]] == ["user:pending"]
+    assert next(item for item in elements if item["action_id"] == "hermes_plan_add")["text"]["text"] == "Add user task"
+
+
+def test_renderer_limits_total_user_set_not_total_plan_and_keeps_refresh() -> None:
+    large_agent_plan = [
+        {"id": f"agent:{index}", "content": f"Agent {index}", "status": "pending"}
+        for index in range(40)
+    ] + [
+        {"id": "user:one", "content": "One", "status": "pending"},
+        {"id": "user:two", "content": "Two", "status": "completed"},
+    ]
+    normal = build_plan_blocks(
+        large_agent_plan, revision=3, snapshot_hash="hash", signing_secret=b"secret"
+    )
+    assert len(normal.native_blocks[0]["tasks"]) == 42
+    action_ids = [element["action_id"] for element in _action_elements(normal)]
     assert action_ids == [
         "hermes_plan_complete",
         "hermes_plan_cancel",
         "hermes_plan_add",
         "hermes_plan_refresh",
     ]
+    assert [element["action_id"] for element in _action_elements(normal, fallback=True)] == action_ids
+
+    at_capacity = build_plan_blocks(
+        [{"id": f"user:{index}", "content": str(index), "status": "pending"}
+         for index in range(MAX_INTERACTIVE_TASKS)],
+        revision=4, snapshot_hash="capacity", signing_secret=b"secret",
+    )
+    assert "hermes_plan_add" not in [item["action_id"] for item in _action_elements(at_capacity)]
 
     oversized = build_plan_blocks(
-        _snapshot(11), revision=4, snapshot_hash="hash", signing_secret=b"secret"
+        [{"id": f"user:{index}", "content": str(index), "status": "pending"}
+         for index in range(MAX_INTERACTIVE_TASKS + 1)],
+        revision=5, snapshot_hash="oversized", signing_secret=b"secret",
     )
-    assert len(oversized.native_blocks[0]["tasks"]) == 11
-    assert "11 tasks" in oversized.text
-    assert all(block.get("type") != "actions" for block in oversized.native_blocks)
+    assert [item["action_id"] for item in _action_elements(oversized)] == [
+        "hermes_plan_refresh"
+    ]
     assert "controls unavailable" in json.dumps(oversized.fallback_blocks).lower()
 
     extreme = build_plan_blocks(
@@ -104,18 +168,144 @@ def test_renderer_adds_controls_and_degrades_without_truncating_truth() -> None:
             {"id": f"long-{index}", "content": "x" * 3000, "status": "pending"}
             for index in range(80)
         ],
-        revision=5,
+        revision=6,
         snapshot_hash="extreme",
         signing_secret=b"secret",
     )
     fallback_text = json.dumps(extreme.fallback_blocks).lower()
+    assert len(extreme.native_blocks[0]["tasks"]) == 80
+    assert len(extreme.fallback_blocks) <= 50
     assert "display truncated" in fallback_text
     assert "no tasks were omitted" not in fallback_text
+    assert [item["action_id"] for item in _action_elements(extreme, fallback=True)] == [
+        "hermes_plan_add", "hermes_plan_refresh",
+    ]
+
+    extreme_with_users = build_plan_blocks(
+        [
+            {"id": f"agent:long-{index}", "content": "x" * 3000, "status": "pending"}
+            for index in range(80)
+        ] + [
+            {"id": "user:pending", "content": "Pending", "status": "pending"},
+            {"id": "user:done", "content": "Done", "status": "completed"},
+        ],
+        revision=7,
+        snapshot_hash="extreme-users",
+        signing_secret=b"secret",
+    )
+    assert len(extreme_with_users.native_blocks[0]["tasks"]) == 82
+    assert len(extreme_with_users.fallback_blocks) <= 50
+    assert "display truncated" in json.dumps(extreme_with_users.fallback_blocks).lower()
+    assert [
+        item["action_id"] for item in _action_elements(extreme_with_users, fallback=True)
+    ] == [
+        "hermes_plan_complete",
+        "hermes_plan_cancel",
+        "hermes_plan_add",
+        "hermes_plan_refresh",
+    ]
+
+
+def test_inactive_user_tasks_do_not_consume_mutation_capacity() -> None:
+    inactive = [
+        {
+            "id": f"user:inactive-{index}",
+            "content": f"Inactive {index}",
+            "status": "cancelled" if index % 2 else "in_progress",
+        }
+        for index in range(MAX_INTERACTIVE_TASKS + 5)
+    ]
+    rendered = build_plan_blocks(
+        inactive + [{"id": "user:pending", "content": "Pending", "status": "pending"}],
+        revision=7,
+        snapshot_hash="inactive-capacity",
+        signing_secret=b"secret",
+    )
+
+    assert len(rendered.native_blocks[0]["tasks"]) == MAX_INTERACTIVE_TASKS + 6
+    elements = _action_elements(rendered)
+    assert [item["action_id"] for item in elements] == [
+        "hermes_plan_complete",
+        "hermes_plan_cancel",
+        "hermes_plan_add",
+        "hermes_plan_refresh",
+    ]
+    checkbox = next(item for item in elements if item["action_id"] == "hermes_plan_complete")
+    cancel = next(item for item in elements if item["action_id"] == "hermes_plan_cancel")
+    assert [option["value"] for option in checkbox["options"]] == ["user:pending"]
+    assert [option["value"] for option in cancel["options"]] == ["user:pending"]
+    assert "controls unavailable" not in json.dumps(rendered.fallback_blocks).lower()
+    assert [item["action_id"] for item in _action_elements(rendered, fallback=True)] == [
+        item["action_id"] for item in elements
+    ]
+
+
+def test_fallback_splits_single_overlong_lines_without_undisclosed_loss() -> None:
+    todos = [
+        {"id": "agent:long", "content": "a" * 3000, "status": "pending"},
+        {"id": "user:long", "content": "u" * 3000, "status": "pending"},
+    ]
+    rendered = build_plan_blocks(
+        todos,
+        revision=8,
+        snapshot_hash="long-lines",
+        signing_secret=b"secret",
+    )
+    section_text = "".join(
+        block["text"]["text"]
+        for block in rendered.fallback_blocks
+        if block["type"] == "section"
+    )
+    expected = "\n".join([
+        "*Hermes plan* (2 tasks)",
+        f"• *Pending* `agent:long` — {'a' * 3000}",
+        f"• *Pending* `user:long` — {'u' * 3000}",
+    ])
+
+    assert section_text == expected
+    assert all(
+        len(block["text"]["text"]) <= 3000
+        for block in rendered.fallback_blocks
+        if block["type"] == "section"
+    )
+    assert len(rendered.fallback_blocks) <= 50
+    assert "display truncated" not in json.dumps(rendered.fallback_blocks).lower()
+    assert [item["action_id"] for item in _action_elements(rendered, fallback=True)] == [
+        "hermes_plan_complete",
+        "hermes_plan_cancel",
+        "hermes_plan_add",
+        "hermes_plan_refresh",
+    ]
+
+
+@pytest.mark.parametrize("task_prefix", ["agent", "user"])
+def test_native_task_titles_disclose_content_truncation_at_boundary(task_prefix) -> None:
+    exact_content = "x" * 3000
+    over_content = "y" * 3001
+    rendered = build_plan_blocks(
+        [
+            {"id": f"{task_prefix}:exact", "content": exact_content, "status": "pending"},
+            {"id": f"{task_prefix}:over", "content": over_content, "status": "pending"},
+        ],
+        revision=9,
+        snapshot_hash=f"title-{task_prefix}",
+        signing_secret=b"secret",
+    )
+    exact_title, over_title = [
+        task["title"] for task in rendered.native_blocks[0]["tasks"]
+    ]
+
+    assert exact_title == exact_content
+    assert len(exact_title) == 3000
+    assert len(over_title) <= 3000
+    assert over_title.endswith("... [truncated]")
+    assert over_title != over_content[:3000]
 
 
 def test_add_task_is_disabled_without_signing_material() -> None:
     rendered = build_plan_blocks(
-        _snapshot(2), revision=1, snapshot_hash="hash", signing_secret=None
+        [{"id": "user:a", "content": "A", "status": "pending"}],
+        revision=1, snapshot_hash="hash", signing_secret=None
     )
     actions = rendered.native_blocks[-1]["elements"]
     assert "hermes_plan_add" not in [item["action_id"] for item in actions]
@@ -371,8 +561,12 @@ def test_validate_action_returns_exact_matching_snapshot(tmp_path) -> None:
     )
     metadata = {
         **route, "message_ts": "20.0", "revision": original["desired_revision"],
-        "snapshot_hash": original["desired_hash"], "task_ids": [],
+        "snapshot_hash": original["desired_hash"], "task_ids": ["user:new"],
+        "action_kind": "add_user_task", "add_task_ids": ["user:new"],
+        "add_task_content": "New", "action_user_id": "U1",
+        "action_dedupe_id": "dedupe",
     }
+    assert store.consume_action_id("dedupe")
 
     validated = store.validate_action(metadata)
     store.record_desired_snapshot(
@@ -383,6 +577,98 @@ def test_validate_action_returns_exact_matching_snapshot(tmp_path) -> None:
     assert validated["session_id"] == "sid"
     assert validated["channel_id"] == "C1"
     assert validated["desired_revision"] == original["desired_revision"]
+
+
+def test_validate_action_rejects_duplicate_snapshot_ids_and_forged_metadata(tmp_path) -> None:
+    store = PlanCardStore(tmp_path)
+    route = {
+        "session_key": "sk", "session_id": "sid", "team_id": "T1",
+        "channel_id": "C1", "thread_ts": "10.0",
+    }
+    state = store.record_desired_snapshot(route, [
+        {"id": "agent:a", "content": "Agent", "status": "pending"},
+        {"id": "user:a", "content": "User", "status": "pending"},
+    ])
+    assert store.mark_applied(
+        "sk", revision=state["desired_revision"], snapshot_hash=state["desired_hash"],
+        message_ts="20.0",
+    )
+    base = {
+        **route, "message_ts": "20.0", "revision": state["desired_revision"],
+        "snapshot_hash": state["desired_hash"], "action_user_id": "U1",
+        "action_dedupe_id": "dedupe",
+    }
+    assert store.consume_action_id("dedupe")
+    assert store.validate_action({
+        **base, "action_kind": "complete_reopen", "task_ids": ["agent:a", "user:a"],
+        "complete_task_ids": ["agent:a", "user:a"], "reopen_task_ids": [],
+    }) is None
+    assert store.validate_action({
+        **base, "action_kind": "cancel", "task_ids": ["agent:a"],
+        "cancel_task_ids": ["agent:a"],
+    }) is None
+    assert store.validate_action({
+        **base, "action_kind": "add_user_task", "task_ids": ["user:new"],
+        "add_task_ids": ["user:replacement"], "add_task_content": "New",
+    }) is None
+
+    data = json.loads(store.state_path.read_text(encoding="utf-8"))
+    duplicate = dict(data["sessions"]["sk"]["last_desired_snapshot"][1])
+    data["sessions"]["sk"]["last_desired_snapshot"].append(duplicate)
+    store.state_path.write_text(json.dumps(data), encoding="utf-8")
+    assert store.validate_action({
+        **base, "action_kind": "cancel", "task_ids": ["user:a"],
+        "cancel_task_ids": ["user:a"],
+    }) is None
+
+
+def test_validate_add_capacity_counts_only_pending_and_completed_user_tasks(tmp_path) -> None:
+    store = PlanCardStore(tmp_path)
+    route = {
+        "session_key": "sk", "session_id": "sid", "team_id": "T1",
+        "channel_id": "C1", "thread_ts": "10.0",
+    }
+    inactive = [
+        {
+            "id": f"user:inactive-{index}",
+            "content": str(index),
+            "status": "cancelled" if index % 2 else "in_progress",
+        }
+        for index in range(MAX_INTERACTIVE_TASKS + 3)
+    ]
+    below_capacity = store.record_desired_snapshot(route, inactive + [
+        {"id": "user:pending", "content": "Pending", "status": "pending"},
+    ])
+    assert store.mark_applied(
+        "sk", revision=below_capacity["desired_revision"],
+        snapshot_hash=below_capacity["desired_hash"], message_ts="20.0",
+    )
+    metadata = {
+        **route, "message_ts": "20.0", "revision": below_capacity["desired_revision"],
+        "snapshot_hash": below_capacity["desired_hash"], "task_ids": ["user:new"],
+        "action_kind": "add_user_task", "add_task_ids": ["user:new"],
+        "add_task_content": "New", "action_user_id": "U1",
+        "action_dedupe_id": "below-capacity",
+    }
+    assert store.consume_action_id("below-capacity")
+    assert store.validate_action(metadata) is not None
+
+    at_capacity = store.record_desired_snapshot(route, inactive + [
+        {"id": f"user:mutable-{index}", "content": str(index), "status": "pending"}
+        for index in range(MAX_INTERACTIVE_TASKS)
+    ])
+    assert store.mark_applied(
+        "sk", revision=at_capacity["desired_revision"],
+        snapshot_hash=at_capacity["desired_hash"], message_ts="20.0",
+    )
+    at_capacity_metadata = {
+        **metadata,
+        "revision": at_capacity["desired_revision"],
+        "snapshot_hash": at_capacity["desired_hash"],
+        "action_dedupe_id": "at-capacity",
+    }
+    assert store.consume_action_id("at-capacity")
+    assert store.validate_action(at_capacity_metadata) is None
 
 
 def _converged_session_with_retired_anchor(store, route):
