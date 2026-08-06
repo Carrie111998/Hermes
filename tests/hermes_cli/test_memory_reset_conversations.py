@@ -163,7 +163,11 @@ def test_everything_target_clears_files_and_conversations(tmp_path, monkeypatch)
 
 def test_running_gateway_blocks_reset_without_touching_state(tmp_path, monkeypatch):
     home, _fts_objects = _seed_home(tmp_path, monkeypatch)
-    monkeypatch.setattr(memory_reset_module, "_get_running_gateway_pid", lambda: 4242)
+    monkeypatch.setattr(
+        memory_reset_module,
+        "_get_running_gateway_pid",
+        lambda _hermes_home: 4242,
+    )
 
     result = cmd_memory_reset(Namespace(target="everything", yes=True))
 
