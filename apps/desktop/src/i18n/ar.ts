@@ -124,6 +124,7 @@ export const ar = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'يتطلب ElevenLabs STT المفتاح ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'رفض ElevenLabs مفتاح API (401).',
+      diskFull: 'القرص ممتلئ — حرّر مساحة ثم أعد المحاولة.',
       gatewayAuthFailed: 'فشلت مصادقة البوابة — تحقق من المفتاح API_SERVER_KEY.',
       methodNotAllowed: 'رفضت خلفية سطح المكتب هذا الطلب (405 Method Not Allowed). جرب إعادة تشغيل Hermes Desktop.',
       microphonePermission: 'تم رفض إذن الميكروفون.',
@@ -379,6 +380,10 @@ export const ar = defineLocale({
         credits: {
           label: 'تنبيهات الرصيد',
           description: 'تعليق الوصول إلى الرصيد أو استعادته.'
+        },
+        plugin: {
+          label: 'إشعارات الإضافات',
+          description: 'أرسلت إضافة سطح المكتب إشعارًا بينما كان Hermes في الخلفية.'
         }
       },
       test: 'إرسال إشعار تجريبي',
@@ -432,6 +437,12 @@ export const ar = defineLocale({
       uiScaleTitle: 'مقياس الواجهة',
       uiScaleDesc: (percent: number) =>
         `يضبط حجم النصّ وعناصر التحكّم في التطبيق كلّه. ويمكن أيضًا استخدام Cmd/Ctrl مع + و - و 0. الحالي: ${percent}%.`,
+      terminalFontTitle: 'خط الطرفية',
+      terminalFontDesc:
+        'اختر خطًا مثبتًا لطرفيّات سطح المكتب. خطوط Nerd تعرض أيقونات Powerlevel10k والصدفة؛ اتركه فارغًا لاستخدام JetBrains Mono المضمّن.',
+      terminalFontPlaceholder: 'MesloLGS NF أو مكدس خطوط CSS',
+      terminalFontPreview: 'معاينة الرموز',
+      terminalFontReset: 'استخدام الافتراضي',
       translucencyTitle: 'شفافية النافذة',
       translucencyDesc: 'إظهار سطح المكتب من خلال النافذة بالكامل. متاح على macOS وWindows فقط.',
       backdropTitle: 'خلفية النافذة',
@@ -902,6 +913,8 @@ export const ar = defineLocale({
       sshHermesPathTitle: 'مسار Hermes (اختياري)',
       sshHermesPathDesc: 'المسار الكامل للملف التنفيذي hermes على الجهاز البعيد. اتركه فارغًا للاكتشاف التلقائي.',
       sshHermesPathPlaceholder: 'اكتشاف تلقائي',
+      sshRemoteProfileTitle: 'الملف الشخصي البعيد (اختياري)',
+      sshRemoteProfileDesc: 'اسم الملف الشخصي على المضيف البعيد. فارغ = استخدام اسم ملف سطح المكتب.',
       sshTestConnection: 'اختبار SSH',
       sshConnect: 'اتصال',
       sshButtonsHint: 'يسري الحفظ عند التشغيل التالي، أما الاتصال فيعيد الربط الآن.',
@@ -1871,6 +1884,12 @@ export const ar = defineLocale({
     search: 'البحث في الملفات الشخصية...',
     loading: 'جار التحميل...',
     newProfile: 'ملف شخصي جديد',
+    importProfile: 'استيراد ملف شخصي…',
+    exportProfile: 'تصدير ملف شخصي…',
+    imported: 'تم استيراد الملف الشخصي',
+    exported: 'تم تصدير الملف الشخصي',
+    failedImport: 'فشل استيراد الملف الشخصي',
+    failedExport: 'فشل تصدير الملف الشخصي',
     allProfiles: 'كل الملفات الشخصية',
     showAllProfiles: 'إظهار كل الملفات الشخصية',
     switchToProfile: name => `التبديل إلى ${name}`,
@@ -2186,6 +2205,11 @@ export const ar = defineLocale({
       reveal: 'إظهار في المجلد',
       copyPath: 'نسخ المسار',
       removeFromSidebar: 'إخفاء من الشريط الجانبي',
+      moveToProject: 'نقل إلى مشروع',
+      movedTo: name => `نُقل إلى ${name}`,
+      moveFailed: 'تعذّر نقل الجلسة',
+      moveNoFolder: 'لا يوجد مجلد في ذلك المشروع للنقل إليه',
+      moveNoProjects: 'لا توجد مشاريع أخرى',
       createFailed: 'تعذّر إنشاء المشروع',
       staleBackend:
         'حدّث تطبيق Hermes العامل لإنشاء المشاريع — تطبيقك العامل أقدم من تطبيق سطح المكتب هذا (الإعدادات ← التحديثات ← التطبيق العامل).',
@@ -2198,6 +2222,9 @@ export const ar = defineLocale({
       baseBranchPlaceholder: 'البحث في الفروع...',
       baseBranchNone: 'لم يُعثر على فروع',
       startWorkFailed: 'تعذّر إنشاء شجرة العمل',
+      worktreeProjectLabel: 'المشروع',
+      worktreeProjectPlaceholder: 'ابحث في المشاريع…',
+      worktreeProjectNone: 'لا توجد مشاريع بمجلد',
       convertBranch: 'تحويل فرع...',
       convertBranchTitle: 'تحويل فرع',
       convertBranchDesc: 'افتح الفروع المسحوبة، أو أنشئ شجرة عمل لفرع حر.',
@@ -2206,6 +2233,7 @@ export const ar = defineLocale({
       branchOpenExisting: 'فتح',
       branchSwitchHome: 'تبديل الموطن',
       branchCreateWorktree: 'شجرة عمل جديدة',
+      branchTrackRemote: 'تتبع البعيد',
       branchesLoading: 'جار تحميل الفروع...',
       noBranches: 'لم يتم العثور على فروع',
       removeWorktree: 'إزالة شجرة العمل',
@@ -2275,6 +2303,7 @@ export const ar = defineLocale({
     newSessionPlaceholders: ['اسأل Hermes عن شيء...', 'اطلب من Hermes تنفيذ مهمة...', 'ابدأ محادثة جديدة...'],
     followUpPlaceholders: ['اكتب متابعة...', 'أضف توجيها...', 'اسأل سؤالا آخر...'],
     startVoice: 'بدء الصوت',
+    openDirective: 'فتح',
     queueMessage: 'إضافة الرسالة للطابور',
     steer: 'توجيه',
     stop: 'إيقاف',
@@ -2854,10 +2883,6 @@ export const ar = defineLocale({
   },
   preview: {
     tab: 'معاينة',
-    closeTab: label => `إغلاق ${label}`,
-    closeOthers: 'إغلاق الأخرى',
-    closeToRight: 'إغلاق ما على اليمين',
-    closeAll: 'إغلاق الكل',
     closePane: 'إغلاق جزء المعاينة',
     loading: 'جار تحميل المعاينة',
     unavailable: 'المعاينة غير متاحة',
@@ -2953,6 +2978,7 @@ export const ar = defineLocale({
     closeRunningBody:
       'هذه المحادثة ما زالت تعمل (أو تنتظر إدخالك). إغلاق التبويب يخفيها فقط — ستحتفظ الجلسة بتقدمها ويمكن إعادة فتحها من الشريط الجانبي.',
     closeRunningConfirm: 'إغلاق التبويب',
+    reload: 'إعادة التحميل',
     closeOthers: 'إغلاق الأخرى',
     closeToRight: 'إغلاق ما على اليمين',
     closeAll: 'إغلاق الكل',
@@ -2982,7 +3008,8 @@ export const ar = defineLocale({
     layoutNamePlaceholder: fallback => `اسم التخطيط (${fallback})`,
     saveApply: 'حفظ وتطبيق',
     notExpressible: 'هذا الترتيب متشابك — لا يمكن تمثيله كتقسيمات متداخلة بعد',
-    zoneCount: count => `${count} مناطق`
+    zoneCount: count => `${count} مناطق`,
+    tabCount: count => `${count} تبويبات`
   },
   assistant: {
     thread: {
