@@ -259,6 +259,45 @@ class TestDashboardRemoval:
         assert flat.is_dir()
 
 
+class TestEntryPointPlugins:
+    """An entry-point plugin must not take part in directory matching.
+
+    ``_discover_all_plugins`` stores the entry-point value ("pkg.mod:register")
+    where directory-backed plugins store a ``Path``. Feeding that to
+    ``Path.resolve()`` is meaningless everywhere and invalid path syntax on
+    Windows, and a raise there would abandon the whole identity set and skip
+    cleanup silently — reintroducing the bug this file guards.
+    """
+
+    @pytest.mark.parametrize(
+        "ep_value",
+        [
+            "pkg.mod:register",
+            # Stands in for any value Path() rejects outright; Windows reaches
+            # the same branch with the ordinary colon-bearing value above.
+            "pkg.mod:register\x00bad",
+        ],
+    )
+    def test_entry_point_plugin_does_not_block_cleanup(
+        self, plugin_env, monkeypatch, ep_value
+    ):
+        home = plugin_env
+        _install(home, "solo", "solo")
+        _write_plugins_config(
+            home, {"enabled": ["solo"], "disabled": [], "entries": _grant("solo")}
+        )
+        monkeypatch.setattr(
+            "hermes_cli.plugins_cmd._discover_entrypoint_plugins",
+            lambda: [("ep_plugin", "1.0.0", "", ep_value)],
+        )
+
+        cmd_remove("solo")
+
+        plugins_cfg = _read_plugins_config(home)
+        assert plugins_cfg["enabled"] == []
+        assert "solo" not in plugins_cfg["entries"]
+
+
 class TestManagedMode:
     """Managed mode keeps main's behaviour: the tree goes, config is not written."""
 

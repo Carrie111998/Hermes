@@ -734,8 +734,16 @@ def _plugin_removal_identities(target: Path) -> set:
     try:
         target_dir = target.resolve()
         entries = _discover_all_plugins()
-        # entry = (name, version, description, source, dir_path, key)
-        owned = [e for e in entries if Path(e[4]).resolve() == target_dir]
+        # entry = (name, version, description, source, dir_path, key).
+        # Entry-point plugins are installed as Python packages and carry the
+        # entry-point value ("pkg.mod:register") in the dir_path slot instead of
+        # a directory, so restrict the match to real Path entries: that string
+        # is invalid path syntax on Windows, and letting one raise escape here
+        # would abandon the whole identity set and silently skip cleanup.
+        owned = [
+            e for e in entries
+            if isinstance(e[4], Path) and e[4].resolve() == target_dir
+        ]
         if len(owned) != 1:
             return set()
         manifest_name, canonical = owned[0][0], owned[0][5]
