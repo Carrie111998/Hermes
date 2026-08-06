@@ -9,9 +9,19 @@ import type { BundledLanguage, ThemedToken } from 'shiki'
 
 // Message types for worker communication
 export interface WorkerMessage<T = unknown> {
-  type: 'tokenize' | 'tokenizeChunk' | 'cancel' | 'init'
+  type: 'tokenize' | 'tokenizeChunk' | 'cancel' | 'init' | 'reinit'
   id: number
   payload?: T
+}
+
+export interface InitPayload {
+  language?: BundledLanguage
+  theme?: 'github-dark-dimmed' | 'github-light-default'
+}
+
+export interface ReinitPayload {
+  language?: BundledLanguage
+  theme?: 'github-dark-dimmed' | 'github-light-default'
 }
 
 export interface TokenizePayload {
@@ -46,17 +56,30 @@ export interface TokenizeChunkResult {
 
 // Global state
 let shikiLoaded = false
+let currentLanguage: BundledLanguage = 'txt' as BundledLanguage
+let currentTheme: 'github-dark-dimmed' | 'github-light-default' = 'github-light-default'
 let codeToTokens: (code: string, options: { lang: BundledLanguage; theme: string }) => Promise<{ tokens: ThemedToken[][] }>
 const pendingRequests = new Map<number, (response: WorkerResponse) => void>()
 
 // Initialize Shiki in the worker
-async function initShiki(messageId: number) {
-  if (shikiLoaded) {return}
+async function initShiki(messageId: number, language?: BundledLanguage, theme?: 'github-dark-dimmed' | 'github-light-default') {
+  if (shikiLoaded) {
+    if (language) {currentLanguage = language}
+
+    if (theme) {currentTheme = theme}
+    self.postMessage({ type: 'init', id: messageId, success: true } satisfies WorkerResponse)
+
+    return
+  }
   
   try {
     const shiki = await import('shiki')
     codeToTokens = shiki.codeToTokens
     shikiLoaded = true
+
+    if (language) {currentLanguage = language}
+
+    if (theme) {currentTheme = theme}
     self.postMessage({ type: 'init', id: messageId, success: true } satisfies WorkerResponse)
   } catch (error) {
     self.postMessage({ 
@@ -71,7 +94,7 @@ async function initShiki(messageId: number) {
 // Handle tokenization request
 async function handleTokenize(message: WorkerMessage<TokenizePayload>) {
   if (!shikiLoaded) {
-    await initShiki(message.id)
+    await initShiki(message.id, message.payload?.language, message.payload?.theme)
   }
   
   if (!codeToTokens) {
@@ -105,7 +128,7 @@ async function handleTokenize(message: WorkerMessage<TokenizePayload>) {
 // Handle chunk tokenization request
 async function handleTokenizeChunk(message: WorkerMessage<TokenizeChunkPayload>) {
   if (!shikiLoaded) {
-    await initShiki(message.id)
+    await initShiki(message.id, message.payload?.language, message.payload?.theme)
   }
   
   if (!codeToTokens) {
@@ -139,13 +162,50 @@ async function handleTokenizeChunk(message: WorkerMessage<TokenizeChunkPayload>)
   }
 }
 
+// Handle cancel request
+function handleCancel(messageId: number) {
+  // Remove from pending and reject
+  const callback = pendingRequests.get(messageId)
+
+  if (callback) {
+    callback({
+      type: 'error',
+      id: messageId,
+      error: 'Cancelled'
+    } satisfies WorkerResponse)
+    pendingRequests.delete(messageId)
+  }
+}
+
+// Handle reinit - reinitialize with new language/theme
+async function handleReinit(messageId: number, language?: BundledLanguage, theme?: 'github-dark-dimmed' | 'github-light-default') {
+  // Reset shiki state to reload with new config
+  shikiLoaded = false
+
+  if (language) {currentLanguage = language}
+
+  if (theme) {currentTheme = theme}
+  
+  // Reject all pending requests
+  pendingRequests.forEach((callback, id) => {
+    callback({
+      type: 'error',
+      id,
+      error: 'Worker reinitializing'
+    } satisfies WorkerResponse)
+  })
+  pendingRequests.clear()
+  
+  await initShiki(messageId, language, theme)
+}
+
 // Message handler
 self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
   const message = event.data
   
   switch (message.type) {
     case 'init':
-      await initShiki(message.id)
+      await initShiki(message.id, (message.payload as InitPayload | undefined)?.language, (message.payload as InitPayload | undefined)?.theme)
 
       break
       
@@ -166,7 +226,13 @@ self.onmessage = async (event: MessageEvent<WorkerMessage>) => {
       break
       
     case 'cancel':
-      // For future: implement cancellation token support
+      handleCancel(message.id)
+
+      break
+      
+    case 'reinit':
+      await handleReinit(message.id, (message.payload as ReinitPayload | undefined)?.language, (message.payload as ReinitPayload | undefined)?.theme)
+
       break
   }
 }
