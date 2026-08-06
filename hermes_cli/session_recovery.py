@@ -533,6 +533,14 @@ def _probe_populated_edge(
     domain at X; a probe that errors (its b-tree path crosses the damage) or
     finds a row keeps growing. At most ~64 probes per edge, so the cap costs
     a bounded, tiny slice of the salvage budget instead of all of it.
+
+    The ``sqlite_sequence`` hint (AUTOINCREMENT tables) caps in one query:
+    when the damaged leaf sits at the populated range's edge, every outward
+    gallop probe must cross it to confirm emptiness and raises instead —
+    the gallop then doubles into the synthetic tail and exhausts the budget,
+    the exact #80205 failure. The sequence value is a best-effort hint only
+    (never the sole source of truth); it is checked against ``anchor`` and
+    skipped on any read error.
     """
 
     ascending = edge == "high"
@@ -543,6 +551,25 @@ def _probe_populated_edge(
     )
     domain_limit = _MAX_SQLITE_ROWID if ascending else _MIN_SQLITE_ROWID
     result: dict[str, Any] = {"edge": edge, "probes": 0, "capped": False}
+
+    # AUTOINCREMENT hint (issue #80205 suggestion 2): sqlite_sequence records
+    # the highest rowid ever assigned. When the damaged leaf sits at the edge
+    # of the populated range, the gallop below can never confirm emptiness
+    # (every outward probe must cross the corrupt page and raises), so this
+    # hint caps in one query. Best-effort: only used when >= the readable
+    # anchor, skipped on read errors.
+    if ascending:
+        try:
+            row = source.execute(
+                "SELECT seq FROM sqlite_sequence WHERE name = ?", (table,)
+            ).fetchone()
+        except sqlite3.DatabaseError:
+            row = None
+        if row is not None and isinstance(row[0], int) and int(row[0]) >= anchor:
+            result["bound"] = int(row[0]) + 1
+            result["capped"] = True
+            result["hint"] = "sqlite_sequence"
+            return result
 
     position = anchor
     span = 1
