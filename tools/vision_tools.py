@@ -1251,6 +1251,7 @@ async def vision_analyze_tool(
         # Local vision models (llama.cpp, ollama) can take well over 30s.
         vision_timeout = 120.0
         vision_temperature = 0.1
+        _vmax = None
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
@@ -1261,15 +1262,23 @@ async def vision_analyze_tool(
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
+            _vmax = _vision_cfg.get("max_tokens")
         except Exception:
             pass
         call_kwargs = {
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
             "timeout": vision_timeout,
         }
+        # Omit max_tokens by default so the model sizes its own response --
+        # matching auxiliary_client.py's documented no-cap policy for
+        # auxiliary tasks (compression summaries, titles, vision, etc.), an
+        # explicit cap only risks truncating a long image description
+        # (issue #80025). "auto" (or unset) means omit; any other value is
+        # an explicit user-configured cap.
+        if _vmax is not None and str(_vmax).strip().lower() != "auto":
+            call_kwargs["max_tokens"] = int(_vmax)
         if model:
             call_kwargs["model"] = model
         _load_auxiliary_client()
@@ -1757,6 +1766,7 @@ async def video_analyze_tool(
 
         vision_timeout = 180.0
         vision_temperature = 0.1
+        _vmax = None
         try:
             from hermes_cli.config import cfg_get, load_config
             _cfg = load_config()
@@ -1767,6 +1777,7 @@ async def video_analyze_tool(
             _vtemp = _vision_cfg.get("temperature")
             if _vtemp is not None:
                 vision_temperature = float(_vtemp)
+            _vmax = _vision_cfg.get("max_tokens")
         except Exception:
             pass
 
@@ -1774,9 +1785,12 @@ async def video_analyze_tool(
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 4000,
             "timeout": vision_timeout,
         }
+        # Omit max_tokens by default -- see the image analysis call site
+        # above for the full rationale (issue #80025).
+        if _vmax is not None and str(_vmax).strip().lower() != "auto":
+            call_kwargs["max_tokens"] = int(_vmax)
         if model:
             call_kwargs["model"] = model
 
