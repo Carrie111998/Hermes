@@ -656,6 +656,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
         result["enabled_toolsets"] = job["enabled_toolsets"]
+    if job.get("max_iterations"):
+        result["max_iterations"] = job["max_iterations"]
     if job.get("workdir"):
         result["workdir"] = job["workdir"]
     return result
@@ -1166,6 +1168,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    max_iterations: Optional[int] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1249,6 +1252,7 @@ def cronjob(
                     script=_normalize_optional_job_value(script),
                     context_from=context_from,
                     enabled_toolsets=enabled_toolsets or None,
+                    max_iterations=max_iterations,
                     workdir=_normalize_optional_job_value(workdir),
                     no_agent=_no_agent,
                     attach_to_session=attach_to_session,
@@ -1509,6 +1513,11 @@ def cronjob(
                 updates["context_from"] = refs or None
             if enabled_toolsets is not None:
                 updates["enabled_toolsets"] = enabled_toolsets or None
+            if max_iterations is not None:
+                # Zero is reserved for user-facing clear operations (the CLI
+                # --clear-max-iterations flag). Other invalid values are
+                # rejected by cron.jobs.update_job's shared validator.
+                updates["max_iterations"] = None if max_iterations == 0 else max_iterations
             if attach_to_session is not None:
                 updates["attach_to_session"] = bool(attach_to_session)
             if workdir is not None:
@@ -1714,10 +1723,12 @@ registry.register(
         include_disabled=args.get("include_disabled", True),
         skill=args.get("skill"),
         skills=args.get("skills"),
-        # model / provider / base_url are intentionally NOT read from the
-        # agent's arguments: per-job inference pins are user-owned (dashboard,
-        # `hermes cron create/edit --model`, or hand-edited jobs). The agent
-        # must not be able to point unattended spend at a different model.
+        # model / provider / base_url / max_iterations are intentionally NOT
+        # read from the agent's arguments: per-job inference pins are
+        # user-owned (dashboard,
+        # `hermes cron create/edit`, or hand-edited jobs). The agent must not
+        # be able to point unattended spend at a different model or raise its
+        # iteration budget.
         # Programmatic callers of cronjob() itself retain the parameters.
         reason=args.get("reason"),
         script=args.get("script"),

@@ -23,6 +23,7 @@ function form(overrides: Partial<CronJobFormState> = {}): CronJobFormState {
     no_agent: false,
     context_from: "",
     enabled_toolsets: [],
+    max_iterations: "",
     workdir: "",
     ...overrides,
   };
@@ -44,6 +45,7 @@ describe("buildCronJobPayload", () => {
       form({
         base_url: "https://example.invalid/v1/",
         enabled_toolsets: ["web", ""],
+        max_iterations: "25",
         context_from: "upstream-a\nupstream-b",
       }),
     );
@@ -52,6 +54,7 @@ describe("buildCronJobPayload", () => {
       base_url: "https://example.invalid/v1",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      max_iterations: 25,
     });
   });
 
@@ -67,6 +70,7 @@ describe("buildCronJobPayload", () => {
       no_agent: false,
       context_from: null,
       enabled_toolsets: null,
+      max_iterations: null,
       workdir: null,
     });
   });
@@ -96,12 +100,14 @@ describe("cronJobFormFromJob", () => {
       schedule_display: "every 1h",
       context_from: ["upstream-a", "upstream-b"],
       enabled_toolsets: ["web"],
+      max_iterations: 18,
     };
 
     expect(cronJobFormFromJob(job)).toMatchObject({
       schedule: "every 1h",
       context_from: "upstream-a\nupstream-b",
       enabled_toolsets: ["web"],
+      max_iterations: "18",
     });
   });
 

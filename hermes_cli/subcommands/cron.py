@@ -105,6 +105,14 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         dest="model_provider",
         help="Inference provider paired with --model (e.g. 'openrouter', 'nous').",
     )
+    cron_create.add_argument(
+        "--max-iterations",
+        type=int,
+        help=(
+            "Positive per-job agent iteration limit. Overrides "
+            "cron.max_iterations for this job."
+        ),
+    )
 
     # cron edit
     cron_edit = cron_subparsers.add_parser(
@@ -196,6 +204,19 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         "--provider",
         dest="model_provider",
         help="Inference provider paired with --model. Pass empty string to clear.",
+    )
+    max_iterations_group = cron_edit.add_mutually_exclusive_group()
+    max_iterations_group.add_argument(
+        "--max-iterations",
+        type=int,
+        help="Set a positive per-job agent iteration limit.",
+    )
+    max_iterations_group.add_argument(
+        "--clear-max-iterations",
+        dest="max_iterations",
+        action="store_const",
+        const=0,
+        help="Clear the per-job limit and follow cron.max_iterations.",
     )
 
     # lifecycle actions

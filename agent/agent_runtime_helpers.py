@@ -66,6 +66,28 @@ _TOOL_CALL_BLOCK_PATTERNS = tuple(
     for name in _TOOL_CALL_TAG_NAMES
 )
 
+
+def apply_provider_iteration_policy(agent, provider: str | None) -> None:
+    """Apply a cron run's provider-specific weekly iteration allowance.
+
+    Cron attaches this short-lived policy only when a weekly burst is active.
+    Keeping it separate from ``_primary_runtime`` avoids turning the normal
+    fallback transport snapshot into a second owner of iteration budgets.
+    """
+    policy = getattr(agent, "_cron_iteration_policy", None)
+    if not isinstance(policy, dict):
+        return
+    base = policy.get("base")
+    burst = policy.get("burst")
+    if not isinstance(base, int) or not isinstance(burst, int):
+        return
+    policy_provider = str(policy.get("provider") or "").strip().lower()
+    active_provider = str(provider or "").strip().lower()
+    agent.max_iterations = (
+        burst if not policy_provider or active_provider == policy_provider else base
+    )
+
+
 # Named <function name=...> blocks — see strip_think_blocks step 1c for the
 # full rationale (sentence-boundary lookbehind + tempered-dot body so a plain
 # prose mention of "function" is never eaten).
@@ -1346,6 +1368,8 @@ def try_recover_primary_transport(
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]
         agent.api_mode = rt["api_mode"]
+        apply_provider_iteration_policy(agent, agent.provider)
+        agent.max_tokens = rt.get("max_tokens", getattr(agent, "max_tokens", None))
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -1576,6 +1600,8 @@ def restore_primary_runtime(agent) -> bool:
         agent.requested_provider = rt.get("requested_provider", agent.provider)
         agent.base_url = rt["base_url"]           # setter updates _base_url_lower
         agent.api_mode = rt["api_mode"]
+        apply_provider_iteration_policy(agent, agent.provider)
+        agent.max_tokens = rt.get("max_tokens", getattr(agent, "max_tokens", None))
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent.api_key = rt["api_key"]
@@ -2959,6 +2985,18 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
 
     # ── Update _primary_runtime so the change persists across turns ──
     _cc = agent.context_compressor if hasattr(agent, "context_compressor") and agent.context_compressor else None
+    # A model switch can be requested while a turn-scoped fallback is active.
+    # Preserve the primary response cap in that case: the fallback's tighter
+    # cap is temporary and must not become the new primary policy.
+    _previous_primary = getattr(agent, "_primary_runtime", {}) or {}
+    if not isinstance(_previous_primary, dict):
+        _previous_primary = {}
+    _primary_max_tokens = (
+        _previous_primary.get("max_tokens", getattr(agent, "max_tokens", None))
+        if getattr(agent, "_fallback_activated", False)
+        else getattr(agent, "max_tokens", None)
+    )
+    agent.max_tokens = _primary_max_tokens
     agent._primary_runtime = {
         "model": agent.model,
         "provider": agent.provider,
@@ -2966,6 +3004,7 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
         "base_url": agent.base_url,
         "api_mode": agent.api_mode,
         "api_key": getattr(agent, "api_key", ""),
+        "max_tokens": _primary_max_tokens,
         "client_kwargs": dict(agent._client_kwargs),
         "use_prompt_caching": agent._use_prompt_caching,
         "use_native_cache_layout": agent._use_native_cache_layout,
@@ -4320,6 +4359,7 @@ __all__ = [
     "repair_message_sequence",
     "strip_think_blocks",
     "recover_with_credential_pool",
+    "apply_provider_iteration_policy",
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",

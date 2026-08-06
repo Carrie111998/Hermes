@@ -2428,6 +2428,21 @@ DEFAULT_CONFIG = {
         # mid-loop, never mutating the cached system prompt). Only the origin
         # chat is ever touched — fan-out / broadcast targets are never mirrored.
         "mirror_delivery": False,
+        # Fleet-wide agent-loop limit for cron only. A positive user-owned
+        # per-job ``max_iterations`` takes priority; null falls through to the
+        # interactive ``agent.max_turns`` value for backward compatibility.
+        "max_iterations": None,
+        # Optional provider-specific burst in the bounded window immediately
+        # before a weekly quota reset. Python weekday numbering is used
+        # (Monday=0 ... Sunday=6). Disabled by default.
+        "weekly_final_day": {
+            "enabled": False,
+            "provider": "",
+            "reset_weekday": 0,
+            "reset_time": "00:00",
+            "window_hours": 24,
+            "max_iterations": None,
+        },
         # Maximum number of due jobs to run in parallel per tick.
         # null/0 = unbounded (limited only by thread count).
         # 1 = serial (pre-v0.9 behaviour).

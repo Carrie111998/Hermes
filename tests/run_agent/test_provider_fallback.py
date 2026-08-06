@@ -7,6 +7,8 @@ advancement through multiple providers.
 
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from run_agent import AIAgent, _pool_may_recover_from_rate_limit
 
 
@@ -145,6 +147,129 @@ class TestFallbackChainAdvancement:
             assert agent._try_activate_fallback() is True
             assert mock_rpc.call_args.kwargs["explicit_api_key"] == "env-secret"
 
+    def test_fallback_entry_applies_and_restores_max_output_tokens(self):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "fallback-model",
+                "base_url": "https://fallback.example/v1",
+                "max_output_tokens": 2048,
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        assert agent.max_tokens is None
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(
+                _mock_client(
+                    base_url="https://fallback.example/v1",
+                    api_key="env-secret",
+                ),
+                "fallback-model",
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.max_tokens == 2048
+        assert agent._restore_primary_runtime() is True
+        assert agent.max_tokens is None
+
+    def test_each_fallback_entry_starts_from_primary_response_cap(self):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "tight-fallback",
+                "base_url": "https://tight.example/v1",
+                "max_tokens": 1024,
+            },
+            {
+                "provider": "custom",
+                "model": "plain-fallback",
+                "base_url": "https://plain.example/v1",
+            },
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.max_tokens = 8192
+        agent._primary_runtime["max_tokens"] = 8192
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            side_effect=[
+                (
+                    _mock_client(base_url="https://tight.example/v1"),
+                    "tight-fallback",
+                ),
+                (
+                    _mock_client(base_url="https://plain.example/v1"),
+                    "plain-fallback",
+                ),
+            ],
+        ):
+            assert agent._try_activate_fallback() is True
+            assert agent.max_tokens == 1024
+
+            assert agent._try_activate_fallback() is True
+
+        assert agent.max_tokens == 8192
+
+    def test_weekly_cron_burst_does_not_leak_to_an_ineligible_fallback(self):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "fallback-model",
+                "base_url": "https://fallback.example/v1",
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        agent.provider = "zai"
+        agent.requested_provider = "zai"
+        agent._primary_runtime["provider"] = "zai"
+        agent._primary_runtime["requested_provider"] = "zai"
+        agent.max_iterations = 40
+        agent._cron_iteration_policy = {
+            "base": 20,
+            "burst": 40,
+            "provider": "zai",
+        }
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(
+                _mock_client(base_url="https://fallback.example/v1"),
+                "fallback-model",
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.provider == "custom"
+        assert agent.max_iterations == 20
+        assert agent._restore_primary_runtime() is True
+        assert agent.provider == "zai"
+        assert agent.max_iterations == 40
+
+    @pytest.mark.parametrize("invalid_cap", [True, 0, -1, 1.5, float("inf")])
+    def test_invalid_fallback_token_cap_is_non_fatal(self, caplog, invalid_cap):
+        fbs = [
+            {
+                "provider": "custom",
+                "model": "fallback-model",
+                "base_url": "https://fallback.example/v1",
+                "max_output_tokens": invalid_cap,
+            }
+        ]
+        agent = _make_agent(fallback_model=fbs)
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client",
+            return_value=(
+                _mock_client(base_url="https://fallback.example/v1"),
+                "fallback-model",
+            ),
+        ):
+            assert agent._try_activate_fallback() is True
+
+        assert agent.max_tokens is None
+        assert "Ignoring invalid fallback max_output_tokens" in caplog.text
 
     def test_nous_anthropic_fallback_uses_the_messages_wire(self):
         """Portal Claude fallbacks must not stay on chat_completions.

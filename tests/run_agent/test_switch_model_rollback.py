@@ -202,3 +202,25 @@ def test_successful_switch_still_works_after_rollback_refactor():
     assert agent.provider == "openrouter"
     assert agent.api_key == "or-key-new"
     assert agent.client is new_client
+
+
+def test_switch_while_fallback_active_does_not_promote_temporary_token_cap():
+    """A /model switch keeps the primary cap, not the active fallback cap."""
+    agent = _make_agent_openrouter()
+    agent.max_tokens = 1024
+    agent._primary_runtime = {"max_tokens": 8192}
+    agent._fallback_activated = True
+    agent._create_openai_client = lambda *_a, **_kw: MagicMock(name="NewClient")
+
+    with patch("hermes_cli.timeouts.get_provider_request_timeout", return_value=None):
+        agent.switch_model(
+            new_model="openai/gpt-5",
+            new_provider="openrouter",
+            api_key="or-key-new",
+            base_url="https://openrouter.ai/api/v1",
+            api_mode="chat_completions",
+        )
+
+    assert agent.max_tokens == 8192
+    assert agent._primary_runtime["max_tokens"] == 8192
+    assert agent._fallback_activated is False
