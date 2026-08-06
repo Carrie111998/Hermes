@@ -17,6 +17,7 @@ from typing import Any
 # comfortably below SQLite builds that retain the legacy 999-variable limit.
 _SESSION_DELETE_BATCH = 250
 _CONVERSATION_TARGETS = frozenset({"conversations", "everything"})
+_UNKNOWN_RUNNING_PID = 0
 
 
 def _close_db(db: Any) -> None:
@@ -35,6 +36,9 @@ def _get_running_gateway_pid(hermes_home: Path) -> int | None:
     ``gateway.pid``: launch-service-managed gateways can remain live with only
     ``gateway_state.json`` available. ``profile_dir`` also prevents one
     profile's reset from being blocked by another profile's gateway.
+
+    A running gateway whose liveness source cannot expose a host PID returns
+    ``_UNKNOWN_RUNNING_PID`` so the destructive command still fails closed.
     """
     from gateway.status import resolve_gateway_liveness
 
@@ -44,7 +48,9 @@ def _get_running_gateway_pid(hermes_home: Path) -> int | None:
     )
     if liveness.probe_error and not liveness.running:
         raise RuntimeError("gateway liveness probe was inconclusive")
-    return liveness.pid if liveness.running else None
+    if not liveness.running:
+        return None
+    return liveness.pid if liveness.pid is not None else _UNKNOWN_RUNNING_PID
 
 
 def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
@@ -64,19 +70,20 @@ def _preflight_memory_file_deletion(
 ) -> None:
     """Fail before DB mutation when selected memory files cannot be removed.
 
-    Unlink permission is primarily controlled by the parent directory; Windows
-    also commonly refuses deletion of a read-only file. This is a best-effort
-    preflight against both conditions. The actual unlink remains guarded because
-    permissions can still change after this check.
+    Unlink permission is controlled by the parent directory on POSIX. Windows
+    additionally refuses deletion of common read-only files, so check the file
+    write bit there as a best-effort preflight. The actual unlink remains
+    guarded because permissions can still change after this check.
     """
     if not existing_files:
         return
     if not os.access(memories_dir, os.W_OK | os.X_OK):
         raise PermissionError(f"memory directory is not writable: {memories_dir}")
-    for name, _description in existing_files:
-        path = memories_dir / name
-        if not os.access(path, os.W_OK):
-            raise PermissionError(f"memory file is not writable: {path}")
+    if os.name == "nt":
+        for name, _description in existing_files:
+            path = memories_dir / name
+            if not os.access(path, os.W_OK):
+                raise PermissionError(f"memory file is read-only: {path}")
 
 
 def _collect_session_ids(db: Any) -> list[str]:
@@ -177,9 +184,10 @@ def cmd_memory_reset(args: Any) -> int:
         print(f"\n  ✗ Could not verify gateway status: {exc}\n")
         return 1
     if running_pid is not None:
+        pid_detail = f" (PID {running_pid})" if running_pid else ""
         print(
-            "\n  ✗ The gateway is running "
-            f"(PID {running_pid}). Stop it before clearing conversation history:\n"
+            f"\n  ✗ The gateway is running{pid_detail}. "
+            "Stop it before clearing conversation history:\n"
             "      hermes gateway stop\n"
         )
         return 1
