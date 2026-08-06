@@ -29,6 +29,7 @@ import time
 import cli as cli_mod
 from cli import HermesCLI
 from tui_gateway._stdin_recovery import handle_spurious_eof
+from tui_gateway._input_limits import FrameTooLarge, MAX_FRAME_BYTES, check_frame_size
 from rich.console import Console
 
 # Env-overridable so the integration test can drive sub-second timing.
@@ -152,11 +153,31 @@ def main():
         print(f"[slash-worker] {reason}", file=sys.stderr, flush=True)
 
     while True:
-        raw = sys.stdin.readline()
-        if not raw:
+        # Bounded read on the worker's stdin pipe. The gateway forwards
+        # command.dispatch payloads here; an upstream caller that slipped
+        # past the gateway's transport cap (or reached us via a different
+        # entry) could otherwise pin this process on a 100 MB line.
+        raw_bytes = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
+        if not raw_bytes:
             if not handle_spurious_eof(_sw_recovery_times, _sw_log):
                 break
             continue
+        try:
+            check_frame_size(raw_bytes)
+        except FrameTooLarge as exc:
+            logger.warning(
+                "slash worker dropping oversized frame: size=%d limit=%d",
+                exc.size, exc.limit,
+            )
+            # Drain to next newline so the next request line starts clean.
+            while not raw_bytes.endswith(b"\n"):
+                more = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
+                if not more:
+                    break
+                raw_bytes = raw_bytes + more
+            continue
+
+        raw = raw_bytes.decode("utf-8", errors="replace")
 
         line = raw.strip()
         if not line:

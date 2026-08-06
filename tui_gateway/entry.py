@@ -18,6 +18,11 @@ import time
 import traceback
 
 from tui_gateway._stdin_recovery import handle_spurious_eof
+from tui_gateway._input_limits import (
+    FrameTooLarge,
+    MAX_FRAME_BYTES,
+    check_frame_size,
+)
 
 from tui_gateway import server
 from tui_gateway.server import _CRASH_LOG, dispatch, resolve_skin, write_json
@@ -467,13 +472,38 @@ def main():
         logger.debug("picker cache prewarm (tui) failed to start", exc_info=True)
 
     while True:
-        raw = sys.stdin.readline()
-        if not raw:
+        # Bounded stdin read: a 100 MB attack frame would otherwise
+        # consume that much RAM before ``readline()`` returns. Read into
+        # the raw byte buffer with a hard cap, then validate before
+        # decoding to text. The newline terminator is *included* in the
+        # cap so a stream that just sends bytes-without-newlines still
+        # trips the limit.
+        raw_bytes = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
+        if not raw_bytes:
             # Stdin fell through — check if spurious (O_NONBLOCK flip by a
             # child on the shared open file description) or genuine EOF.
             if not handle_spurious_eof(_recovery_times, _log_exit):
                 break
             continue
+        try:
+            check_frame_size(raw_bytes)
+        except FrameTooLarge as exc:
+            # Drain any overflow bytes until the next newline so a
+            # subsequent request doesn't trip the same guard. Without
+            # this, the next readline() picks up the rest of the
+            # over-cap line as a fresh request.
+            while not raw_bytes.endswith(b"\n"):
+                more = sys.stdin.buffer.readline(MAX_FRAME_BYTES + 1)
+                if not more:
+                    break
+                raw_bytes = raw_bytes + more
+            _log_exit(
+                f"stdio frame too large: {exc.size} bytes (limit {exc.limit}); "
+                "dropping connection"
+            )
+            sys.exit(0)
+
+        raw = raw_bytes.decode("utf-8", errors="replace")
 
         line = raw.strip()
         if not line:

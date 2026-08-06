@@ -665,3 +665,180 @@ def test_unregister_live_transport_stops_delivery(capture):
     assert json.loads(buf.getvalue())["params"]["type"] == "skin.changed"
 
 
+# ── input-size caps (PR #23396 hardening follow-up) ─────────────────
+
+
+def test_command_dispatch_rejects_oversized_arg(server, monkeypatch):
+    """command.dispatch must reject an ``arg`` field over MAX_FIELD_BYTES with code 4000."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+
+    monkeypatch.setattr(
+        "tui_gateway._input_limits.MAX_FIELD_BYTES", 1024, raising=True,
+    )
+    big_arg = "x" * 2048  # 2x the test limit
+
+    resp = server.handle_request({
+        "id": "r1",
+        "method": "command.dispatch",
+        "params": {"name": "queue", "arg": big_arg, "session_id": sid},
+    })
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4000
+    assert "too large" in resp["error"]["message"]
+
+
+def test_command_dispatch_accepts_arg_at_field_boundary(server, monkeypatch):
+    """Field at exactly MAX_FIELD_BYTES is allowed (off-by-one safety)."""
+    from tui_gateway._input_limits import MAX_FIELD_BYTES
+
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+
+    monkeypatch.setattr(
+        "tui_gateway._input_limits.MAX_FIELD_BYTES", 1024, raising=True,
+    )
+    boundary_arg = "x" * 1024  # exactly the cap
+
+    resp = server.handle_request({
+        "id": "r1",
+        "method": "command.dispatch",
+        "params": {"name": "queue", "arg": boundary_arg, "session_id": sid},
+    })
+
+    assert "error" not in resp or resp["error"]["code"] != 4000, resp
+
+
+def test_command_dispatch_emoji_bytes_not_codepoints(server, monkeypatch):
+    """Emoji-heavy payloads inflate under UTF-8; cap is bytes, not codepoints."""
+    from tui_gateway._input_limits import MAX_FIELD_BYTES
+
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+
+    monkeypatch.setattr(
+        "tui_gateway._input_limits.MAX_FIELD_BYTES", 100, raising=True,
+    )
+    # 50 emoji = ~200 bytes (each emoji is 4 UTF-8 bytes). Codepoint count
+    # is only 50, well under a code-point cap; byte count blows past it.
+    big_emoji = "🚀" * 50
+
+    resp = server.handle_request({
+        "id": "r1",
+        "method": "command.dispatch",
+        "params": {"name": "queue", "arg": big_emoji, "session_id": sid},
+    })
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4000
+
+
+def test_slash_exec_rejects_oversized_command(server):
+    """slash.exec must reject a command field over MAX_FIELD_BYTES."""
+    from tui_gateway._input_limits import MAX_FIELD_BYTES
+
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid, "agent": None}
+
+    big_cmd = "echo " + ("x" * (MAX_FIELD_BYTES + 100))
+
+    resp = server.handle_request({
+        "id": "r1",
+        "method": "slash.exec",
+        "params": {"command": big_cmd, "session_id": sid},
+    })
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4000
+    assert "too large" in resp["error"]["message"]
+
+
+def test_shell_exec_rejects_oversized_command(server):
+    """shell.exec must reject a command field over MAX_FIELD_BYTES BEFORE
+    invoking the dangerous-command detector (so the detector itself can't be
+    a DoS amplifier on a 100 MB command string)."""
+    from tui_gateway._input_limits import MAX_FIELD_BYTES
+
+    big_cmd = "echo " + ("x" * (MAX_FIELD_BYTES + 100))
+
+    # Spy: if the dangerous-command detector is called with the full payload,
+    # the cap didn't fire first.
+    detector_calls: list[str] = []
+
+    class _StubApproval:
+        @staticmethod
+        def detect_dangerous_command(cmd):
+            detector_calls.append(cmd)
+            return (False, None, None)
+
+        @staticmethod
+        def detect_hardline_command(cmd):
+            return (False, None)
+
+    server_mod = server
+    sys.modules["tools.approval"] = _StubApproval
+
+    resp = server_mod.handle_request({
+        "id": "r1",
+        "method": "shell.exec",
+        "params": {"command": big_cmd, "session_id": ""},
+    })
+
+    assert "error" in resp, resp
+    assert resp["error"]["code"] == 4000
+    # The cap must have rejected BEFORE the detector ran.
+    assert detector_calls == [], (
+        "size cap must fire before approval detector; "
+        f"detector saw {len(detector_calls[0]) if detector_calls else 0} chars"
+    )
+
+
+def test_input_limits_module_raises_typed_exceptions():
+    """The shared validator raises typed exceptions handlers can catch."""
+    from tui_gateway._input_limits import (
+        MAX_FRAME_BYTES,
+        MAX_FIELD_BYTES,
+        FieldTooLarge,
+        FrameTooLarge,
+        check_field,
+        check_frame_size,
+    )
+
+    # Frame cap
+    try:
+        check_frame_size(b"x" * (MAX_FRAME_BYTES + 1))
+    except FrameTooLarge as exc:
+        assert exc.size > MAX_FRAME_BYTES
+        assert exc.limit == MAX_FRAME_BYTES
+    else:
+        raise AssertionError("expected FrameTooLarge")
+
+    # Field cap
+    try:
+        check_field("arg", "y" * (MAX_FIELD_BYTES + 1), kind="test")
+    except FieldTooLarge as exc:
+        assert exc.name == "arg"
+        assert exc.size > MAX_FIELD_BYTES  # 65k+1 > 1MB? no — must be > MAX_FIELD_BYTES
+        assert exc.limit == MAX_FIELD_BYTES
+    else:
+        raise AssertionError("expected FieldTooLarge")
+
+    # Boundary OK (off-by-one safety)
+    check_field("arg", "z" * MAX_FIELD_BYTES, kind="test")
+    check_frame_size(b"w" * MAX_FRAME_BYTES)
+
+
+def test_input_limits_env_override(monkeypatch):
+    """Operators can lower the cap for debugging without a code change."""
+    from tui_gateway import _input_limits
+
+    monkeypatch.setenv("HERMES_TUI_MAX_FIELD_BYTES", "256")
+    # The module reads env at import; re-import to pick up the override.
+    import importlib
+    reloaded = importlib.reload(_input_limits)
+    assert reloaded.MAX_FIELD_BYTES == 256
+    importlib.reload(reloaded)  # restore so other tests aren't poisoned
+
+
+

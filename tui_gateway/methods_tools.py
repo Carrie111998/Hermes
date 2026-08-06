@@ -5,10 +5,18 @@ are rebound onto server.py's globals at install time — see method_ctx.py.
 """
 
 from .method_ctx import HandlerRegistry
+from . import _input_limits as _il_mod
 
 _registry = HandlerRegistry()
 method = _registry.method
 _profile_scoped = _registry.profile_scoped
+
+# Bind the exception class into server.py's globals so handlers rebound
+# via register() can ``except _FieldTooLarge`` (function globals = server.py's
+# namespace, not methods_tools.py's). The check_field callable itself is
+# NOT bound here -- handlers call ``_il_mod.check_field(...)`` so tests
+# can monkeypatch the module attribute and intercept the call.
+_FieldTooLarge = _il_mod.FieldTooLarge
 
 
 @method("system.battery")
@@ -432,6 +440,11 @@ def _(rid, params: dict) -> dict:
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
+    try:
+        _il_mod.check_field("name", name, kind="command.dispatch")
+        _il_mod.check_field("arg", arg, kind="command.dispatch")
+    except _FieldTooLarge as e:
+        return _err(rid, 4000, str(e))
     resolved = _resolve_name(name)
     if resolved != name:
         name = resolved
@@ -1079,6 +1092,10 @@ def _(rid, params: dict) -> dict:
     cmd = params.get("command", "").strip()
     if not cmd:
         return _err(rid, 4004, "empty command")
+    try:
+        _il_mod.check_field("command", cmd, kind="slash.exec")
+    except _FieldTooLarge as e:
+        return _err(rid, 4000, str(e))
 
     # Skill and bundle slash commands plus _pending_input commands must NOT go
     # through the slash worker — see _PENDING_INPUT_COMMANDS definition above.
@@ -1869,6 +1886,10 @@ def _(rid, params: dict) -> dict:
     cmd = params.get("command", "")
     if not cmd:
         return _err(rid, 4004, "empty command")
+    try:
+        _il_mod.check_field("command", cmd, kind="shell.exec")
+    except _FieldTooLarge as e:
+        return _err(rid, 4000, str(e))
     try:
         from tools.approval import detect_dangerous_command, detect_hardline_command
 
