@@ -49,6 +49,10 @@ from hermes_cli.config import (
 from hermes_cli.fallback_config import get_fallback_chain
 from hermes_time import now as _hermes_now
 from agent.interrupt_compat import request_hard_interrupt
+from agent.delegation_context import (
+    enter_non_dispatcher_owned_context,
+    exit_non_dispatcher_owned_context,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -149,17 +153,19 @@ def _cron_failure_delivery_content(
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
-    Three protected toolsets are always disabled in cron context:
+    Four protected toolsets are always disabled in cron context:
       - ``cronjob`` — would let a cron-spawned agent schedule more cron jobs
       - ``messaging`` — interactive, needs a live gateway session
       - ``clarify`` — interactive, blocks waiting for user input
+      - ``memory`` — cron agents are constructed with ``skip_memory=True``, so
+        exposing this tool only gives the model an unbacked tool that fails
 
     User-level ``agent.disabled_toolsets`` from config.yaml is layered on top
     so per-job ``enabled_toolsets`` cannot bypass policy that applies to
     ordinary agent runs (#25752 — LLM-supplied enabled_toolsets was widening
     past config.yaml's denylist).
     """
-    disabled = ["cronjob", "messaging", "clarify"]
+    disabled = ["cronjob", "messaging", "clarify", "memory"]
     agent_cfg = (cfg or {}).get("agent") or {}
     user_disabled = agent_cfg.get("disabled_toolsets") or []
     for name in user_disabled:
@@ -3224,7 +3230,8 @@ def run_job(
 
     _cron_history_authority_token = bind_cron_history_job(job_id)
     _cron_session_var = _VAR_MAP["HERMES_CRON_SESSION"]
-    _cron_session_token = _cron_session_var.set("1")
+    _cron_session_token = None
+    _non_dispatcher_token = None
 
     # Everything after the acquire MUST live inside this try, so the finally
     # below always releases the lock even if the env override or any later
@@ -3232,6 +3239,31 @@ def run_job(
     # (every future job blocks on acquire_*); a leaked reader blocks all
     # future writers.  Acquire itself can't leak (it either blocks or returns).
     try:
+        # Scope cron approval policy to this job. Keep the token so the finally
+        # restores the pre-job state instead of pinning an explicit empty value,
+        # which would suppress the legacy os.environ fallback used by standalone
+        # cron entrypoints and tests.
+        _cron_session_token = _cron_session_var.set("1")
+
+        # Mark this job as NOT the dispatcher-owned kanban worker.
+        #
+        # A kanban worker is a normal `hermes chat -q` CLI agent whose default
+        # toolset includes `cronjob`, running with HERMES_KANBAN_TASK
+        # legitimately in its own env; `cronjob(action="run")` calls
+        # run_one_job() -> run_job() right here in that process.  Without this
+        # marker the cron agent is misread as that worker: the kanban toolset is
+        # force-added, the worker protocol is injected into its system prompt,
+        # and kanban_complete defaults task_id to $HERMES_KANBAN_TASK -- letting
+        # an unrelated cron job close the worker's task and overwrite real
+        # results.
+        #
+        # A ContextVar, NOT an os.environ clear: the env is process-global and
+        # shared with the worker's own claim heartbeat (run_agent._touch_activity
+        # -> heartbeat_current_worker_from_env, which would starve and let the
+        # dispatcher reclaim a live task), the gateway's kanban watchers, and
+        # concurrent cron jobs on the parallel pool.  contextvars.copy_context()
+        # at the run_conversation hop carries this into the agent thread.
+        _non_dispatcher_token = enter_non_dispatcher_owned_context()
         if _job_workdir:
             os.environ["TERMINAL_CWD"] = _job_workdir
             logger.info("Job '%s': using workdir %s", job_id, _job_workdir)
@@ -3906,9 +3938,14 @@ def run_job(
             clear_session_vars(_ctx_tokens)
         finally:
             try:
-                _cron_session_var.reset(_cron_session_token)
+                if _cron_session_token is not None:
+                    _cron_session_var.reset(_cron_session_token)
             finally:
-                reset_cron_history_job(_cron_history_authority_token)
+                try:
+                    if _non_dispatcher_token is not None:
+                        exit_non_dispatcher_owned_context(_non_dispatcher_token)
+                finally:
+                    reset_cron_history_job(_cron_history_authority_token)
         for _var_name in _cron_delivery_vars:
             _VAR_MAP[_var_name].set("")
         if _session_db:
