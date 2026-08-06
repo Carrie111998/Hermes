@@ -20045,12 +20045,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             loop = getattr(self, "_gateway_loop", None)
         if loop is not None and not loop.is_closed():
-            safe_schedule_threadsafe(
-                _rename(),
-                loop,
-                logger=logger,
-                log_message="Discord thread lifecycle rename failed to schedule",
-            )
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is loop:
+                asyncio.create_task(_rename())
+            else:
+                safe_schedule_threadsafe(
+                    _rename(),
+                    loop,
+                    logger=logger,
+                    log_message="Discord thread lifecycle rename failed to schedule",
+                )
 
     def _schedule_discord_semantic_thread_rename(
         self,
