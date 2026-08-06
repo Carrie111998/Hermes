@@ -372,7 +372,7 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
     return None
 
 
-def _extract_retry_delay_seconds(message: str) -> Optional[float]:
+def _extract_retry_delay_seconds(message: str, status_code: Optional[int] = None) -> Optional[float]:
     if not message:
         return None
     delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
@@ -392,10 +392,23 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     min_only_match = re.search(r"resets?\s+in\s+(\d+)\s*min\b", message, re.IGNORECASE)
     if min_only_match:
         return int(min_only_match.group(1)) * 60
+    # Ollama Cloud "session usage limit" — the per-session cap resets every
+    # 5 hours, but the reset window started before the limit was hit, so the
+    # actual remaining time is unknown.  A 30-minute TTL is a better default
+    # than the 1-hour 429 cooldown: if the credential is still limited, the
+    # 429 fires again and we rotate back (one wasted request); if it has
+    # cleared, we reclaim the credential sooner.  Gated on status_code == 429
+    # per sweeper review (#68832): the phrase could appear in a non-429 body
+    # where a shorter cooldown is inappropriate.
+    if status_code == 429 and "session usage limit" in message.lower():
+        return 30 * 60
     return None
 
 
-def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_error_context(
+    error_context: Optional[Dict[str, Any]],
+    status_code: Optional[int] = None,
+) -> Dict[str, Any]:
     if not isinstance(error_context, dict):
         return {}
     normalized: Dict[str, Any] = {}
@@ -412,7 +425,7 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     )
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
     if parsed_reset_at is None and isinstance(message, str):
-        retry_delay_seconds = _extract_retry_delay_seconds(message)
+        retry_delay_seconds = _extract_retry_delay_seconds(message, status_code=status_code)
         if retry_delay_seconds is not None:
             parsed_reset_at = time.time() + retry_delay_seconds
     if parsed_reset_at is not None:
@@ -799,7 +812,7 @@ class CredentialPool:
         persist: bool = True,
         failure_reason: Optional[str] = None,
     ) -> PooledCredential:
-        normalized_error = _normalize_error_context(error_context)
+        normalized_error = _normalize_error_context(error_context, status_code=status_code)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters

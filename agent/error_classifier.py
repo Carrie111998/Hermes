@@ -200,6 +200,11 @@ _USAGE_LIMIT_PATTERNS = [
     "quota",
     "limit exceeded",
     "key limit exceeded",
+    # Ollama Cloud's per-session cap — semipermanent for the session,
+    # not a transient throttle that clears in seconds.  Matched here so
+    # the recovery flow rotates immediately instead of retrying the same
+    # key and then treating the follow-up 429 as a fresh rate-limit.
+    "session usage limit",
 ]
 
 # Patterns confirming usage limit is transient (not billing)
@@ -1147,6 +1152,19 @@ def _classify_by_status(
                 should_rotate_credential=False,
                 should_fallback=True,
                 error_context=ctx,
+            )
+        # Ollama Cloud returns HTTP 429 "session usage limit" for a per-session
+        # cap that is semipermanent (not a transient throttle that clears in
+        # seconds).  Classify as billing so the pool rotates immediately and
+        # applies the full billing cooldown, instead of retrying the same key
+        # once and then treating the follow-up 429 as a fresh rate-limit —
+        # which burns both keys within minutes on a multi-credential pool.
+        if "session usage limit" in error_msg:
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         return result_fn(
             FailoverReason.rate_limit,
