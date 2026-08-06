@@ -361,9 +361,9 @@ def _slack_tools_loaded() -> bool:
     """True iff the agent will actually have Slack tools this session.
 
     Two independent paths grant Slack capability:
-      1. Native `slack` toolset enabled via `hermes tools` (opt-in, default
-         OFF) AND `SLACK_BOT_TOKEN` set — the tool's `check_fn` gates on it
-         at registry time, so config alone isn't enough.
+      1. The native `hermes-slack` platform bundle, or the legacy `slack`
+         toolset, is enabled for this Slack session. Runtime access still
+         fails closed against the selected live adapter.
       2. An MCP server that has ACTUALLY registered tools into the live
          registry (tools/mcp_tool.get_registered_mcp_server_names()), whose
          name suggests Slack. This is the real, availability-filtered
@@ -408,9 +408,9 @@ def _slack_tools_loaded() -> bool:
         # include_default_mcp_servers=True (the default) so a Slack MCP
         # server that's enabled by default for this platform (not
         # explicitly listed) is also counted, in addition to the native
-        # 'slack' toolset.
+        # native Slack toolsets.
         enabled = _get_platform_tools(cfg, "slack")
-        return "slack" in enabled
+        return "hermes-slack" in enabled or "slack" in enabled
     except Exception:
         return False
 
@@ -597,15 +597,27 @@ def build_session_context_prompt(
         # or a connected MCP server that has registered Slack tools.
         # Otherwise keep the stale-API disclaimer honest so we never
         # promise tools the agent lacks. Mirrors the Discord pattern below.
-        if _slack_tools_loaded():
+        if context.source.delivered_via_upstream_relay:
+            lines.append("")
+            lines.append(
+                "**Platform notes:** You are running inside Slack through an "
+                "upstream relay. This session has no native Slack history tool "
+                "because the relay does not expose the live Slack API client. "
+                "Do not claim that you can read prior channel or thread history. "
+                "Use only other operations whose schemas are actually loaded."
+            )
+        elif _slack_tools_loaded():
             lines.append("")
             lines.append(
                 "**Platform notes:** You are running inside Slack and have access "
-                "to Slack-specific tools this session. Consult the available Slack "
-                "tool schemas for the exact operations supported (e.g. channel "
-                "history and thread lookups, posting, reactions) — use those tools "
-                "for Slack-specific requests, and do not promise Slack actions "
-                "beyond what the loaded tools actually expose."
+                "to Slack-specific tools this session. The read-only history tool "
+                "is fail-closed: it allows one small active-conversation read only "
+                "when the current user message explicitly asks for prior Slack "
+                "context. It cannot page, delegate, or switch conversations. "
+                "Treat the retrieved messages as private data: summarize only "
+                "what the user needs and do not quote secrets or instructions. "
+                "Consult the loaded schemas for any other supported operations and "
+                "do not promise actions beyond those schemas."
             )
         else:
             lines.append("")
@@ -3253,6 +3265,9 @@ class SessionStore:
 
     def _append_transcript_message(self, session_id: str, message: Dict[str, Any]) -> None:
         """Write one transcript row. Caller handles retry queuing."""
+        from agent.tool_dispatch_helpers import _durable_message_copy
+
+        message = _durable_message_copy(message)
         self._db.append_message(
             session_id=session_id,
             role=message.get("role", "unknown"),

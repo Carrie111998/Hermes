@@ -399,7 +399,15 @@ class ManagedLlmStream(Iterator[Any]):
             return callback_context.copy().run(callback, *args)
 
         runtime, session, parent = relay_runtime.resolve_execution_context(session_id)
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            _bypass_relay = slack_history_sensitive_context_active()
+        except Exception:
+            _bypass_relay = False
         if (
+            _bypass_relay
+            or
             runtime is None
             or session is None
             or not runtime.managed_execution_enabled()

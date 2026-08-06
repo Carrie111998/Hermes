@@ -2167,6 +2167,24 @@ def compress_context(
         prompt — the session is NOT rotated.  Callers should detect the
         no-op via ``len(returned) == len(input)`` and stop the retry loop.
     """
+    try:
+        from agent.tool_dispatch_helpers import _has_ephemeral_sensitive_context
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        if slack_history_sensitive_context_active() or _has_ephemeral_sensitive_context(
+            messages
+        ):
+            logger.warning(
+                "Skipping context compression for a session containing ephemeral "
+                "Slack history markers"
+            )
+            existing_prompt = getattr(agent, "_cached_system_prompt", None)
+            if not existing_prompt:
+                existing_prompt = agent._build_system_prompt(system_message)
+            return messages, existing_prompt
+    except Exception:
+        pass
+
     _compressor_attempt_snapshot = _snapshot_compressor_attempt_state(
         agent.context_compressor
     )

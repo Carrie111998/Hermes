@@ -2297,6 +2297,28 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _toolsets_for_inbound_transport(source, configured_toolsets):
+    """Remove native Slack API tools from relay-backed Slack turns.
+
+    The relay can transport Slack messages but does not expose the in-process
+    Slack SDK clients required by ``slack_history``. Preserve the normal core
+    tool surface by replacing the platform bundle with ``hermes-cli``.
+    """
+
+    toolsets = list(configured_toolsets or [])
+    if not (
+        getattr(source, "platform", None) == Platform.SLACK
+        and bool(getattr(source, "delivered_via_upstream_relay", False))
+    ):
+        return toolsets
+    normalized = [
+        "hermes-cli" if toolset == "hermes-slack" else toolset
+        for toolset in toolsets
+        if toolset != "slack"
+    ]
+    return list(dict.fromkeys(normalized))
+
+
 _OWN_POLICY_OPEN_ENV = {
     Platform.WECOM: ("WECOM_DM_POLICY", "WECOM_GROUP_POLICY", "WECOM_ALLOW_ALL_USERS"),
     Platform.WEIXIN: ("WEIXIN_DM_POLICY", "WEIXIN_GROUP_POLICY", "WEIXIN_ALLOW_ALL_USERS"),
@@ -16289,7 +16311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         context = build_session_context(source, self.config, session_entry)
         
         # Set session context variables for tools (task-local, concurrency-safe)
-        _session_env_tokens = self._set_session_env(context)
+        _session_env_tokens = self._set_session_env(context, event)
         
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
@@ -19262,7 +19284,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform_key = _platform_config_key(source.platform)
 
             from hermes_cli.tools_config import _get_platform_tools
-            enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+            enabled_toolsets = _toolsets_for_inbound_transport(
+                source,
+                sorted(_get_platform_tools(user_config, platform_key)),
+            )
             agent_cfg = user_config.get("agent") or {}
             disabled_toolsets = agent_cfg.get("disabled_toolsets") or None
 
@@ -21074,7 +21099,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return delivered
 
-    def _set_session_env(self, context: SessionContext) -> list:
+    def _set_session_env(
+        self, context: SessionContext, event: Optional[MessageEvent] = None
+    ) -> list:
         """Set session context variables for the current async task.
 
         Uses ``contextvars`` instead of ``os.environ`` so that concurrent
@@ -21083,7 +21110,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns a list of reset tokens; pass them to ``_clear_session_env``
         in a ``finally`` block.
         """
-        from gateway.session_context import set_session_vars
+        from gateway.session_context import (
+            is_explicit_slack_history_request,
+            set_session_vars,
+        )
         # Propagate the adapter's async-delivery capability so async tools
         # (terminal notify_on_complete / watch_patterns, delegate_task
         # background=True) know whether this channel can wake a later turn.
@@ -21094,6 +21124,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _adapters = getattr(self, "adapters", None) or {}
         _adapter = _adapters.get(context.source.platform)
         _async_delivery = getattr(_adapter, "supports_async_delivery", True)
+        _transport_adapter = self._registered_transport_adapter(context.source)
         return set_session_vars(
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
@@ -21102,13 +21133,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
             chat_name=context.source.chat_name or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
+            scope_id=str(context.source.scope_id) if context.source.scope_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
-            message_id=str(context.source.message_id) if context.source.message_id else "",
+            message_id=str(
+                getattr(event, "message_id", None)
+                or context.source.message_id
+                or ""
+            ),
             profile=getattr(context.source, "profile", "") or "",
             async_delivery=_async_delivery,
             cron_session="",
+            transport_adapter=_transport_adapter,
+            slack_history_authorized=(
+                context.source.platform == Platform.SLACK
+                and event is not None
+                and not bool(getattr(event, "internal", False))
+                and is_explicit_slack_history_request(
+                    (
+                        getattr(event, "metadata", None) or {}
+                    ).get("slack_authored_text", "")
+                )
+            ),
         )
 
     def _clear_session_env(self, tokens: list) -> None:
@@ -24060,7 +24107,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform_key = _platform_config_key(source.platform)
 
         from hermes_cli.tools_config import _get_platform_tools
-        enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        enabled_toolsets = _toolsets_for_inbound_transport(
+            source,
+            sorted(_get_platform_tools(user_config, platform_key)),
+        )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 

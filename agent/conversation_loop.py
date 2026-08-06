@@ -1230,7 +1230,7 @@ def _notify_context_engine_turn_complete(
         )
 
 
-def run_conversation(
+def _run_conversation_impl(
     agent,
     user_message: Any,
     system_message: str = None,
@@ -2237,24 +2237,40 @@ def run_conversation(
                     api_kwargs["extra_headers"] = _xh
                     agent._is_user_initiated_turn = False
                 try:
-                    from hermes_cli.middleware import apply_llm_request_middleware
-
-                    _llm_request_mw = apply_llm_request_middleware(
-                        api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
+                    from gateway.session_context import (
+                        slack_history_sensitive_context_active,
                     )
-                    api_kwargs = _llm_request_mw.payload
-                    _original_api_kwargs = _llm_request_mw.original_payload
-                    _llm_middleware_trace = _llm_request_mw.trace
+
+                    _private_slack_provider_request = (
+                        slack_history_sensitive_context_active()
+                    )
+                except Exception:
+                    _private_slack_provider_request = False
+                try:
+                    if _private_slack_provider_request:
+                        # The provider must see the bounded context, but plugin
+                        # middleware and Relay must never observe or retain it.
+                        _original_api_kwargs = dict(api_kwargs)
+                        _llm_middleware_trace = []
+                    else:
+                        from hermes_cli.middleware import apply_llm_request_middleware
+
+                        _llm_request_mw = apply_llm_request_middleware(
+                            api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                        )
+                        api_kwargs = _llm_request_mw.payload
+                        _original_api_kwargs = _llm_request_mw.original_payload
+                        _llm_middleware_trace = _llm_request_mw.trace
                 except Exception:
                     _original_api_kwargs = dict(api_kwargs)
                     _llm_middleware_trace = []
@@ -2264,7 +2280,14 @@ def run_conversation(
                         has_hook,
                         invoke_hook as _invoke_hook,
                     )
-                    if has_hook("pre_api_request"):
+                    from gateway.session_context import (
+                        slack_history_sensitive_context_active,
+                    )
+
+                    if (
+                        has_hook("pre_api_request")
+                        and not slack_history_sensitive_context_active()
+                    ):
                         request_messages = api_kwargs.get("messages")
                         if not isinstance(request_messages, list):
                             request_messages = api_kwargs.get("input")
@@ -2286,7 +2309,28 @@ def run_conversation(
                         # ``api_kwargs`` is the same object passed to the
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
+                        from agent.tool_dispatch_helpers import (
+                            _durable_message_copy,
+                            _has_ephemeral_sensitive_context,
+                        )
+                        _sensitive_observer_boundary = (
+                            slack_history_sensitive_context_active()
+                            or _has_ephemeral_sensitive_context(messages)
+                        )
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        _observer_history = [
+                            _durable_message_copy(message)
+                            if isinstance(message, dict)
+                            else message
+                            for message in messages
+                        ]
+                        _observer_request_messages = (
+                            []
+                            if _sensitive_observer_boundary
+                            else list(request_messages)
+                            if isinstance(request_messages, list)
+                            else []
+                        )
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -2294,7 +2338,7 @@ def run_conversation(
                             api_request_id=api_request_id,
                             session_id=agent.session_id or "",
                             user_message=original_user_message,
-                            conversation_history=list(messages),
+                            conversation_history=_observer_history,
                             platform=agent.platform or "",
                             model=agent.model,
                             provider=agent.provider,
@@ -2302,9 +2346,7 @@ def run_conversation(
                             api_mode=agent.api_mode,
                             api_call_count=api_call_count,
                             retry_count=retry_count,
-                            request_messages=list(request_messages)
-                            if isinstance(request_messages, list)
-                            else [],
+                            request_messages=_observer_request_messages,
                             message_count=len(api_messages),
                             tool_count=len(agent.tools or []),
                             approx_input_tokens=approx_tokens,
@@ -2392,6 +2434,8 @@ def run_conversation(
                         return agent._interruptible_streaming_api_call(
                             next_api_kwargs, on_first_delta=_stop_spinner
                         )
+                    if _private_slack_provider_request:
+                        return agent._interruptible_api_call(next_api_kwargs)
                     from agent import relay_llm
 
                     return relay_llm.execute(
@@ -2427,22 +2471,25 @@ def run_conversation(
                     _model_request_active.set()
                 _redirect_crossed_response = False
                 try:
-                    response = run_llm_execution_middleware(
-                        api_kwargs,
-                        _perform_api_call,
-                        original_request=_original_api_kwargs,
-                        task_id=effective_task_id,
-                        turn_id=turn_id,
-                        api_request_id=api_request_id,
-                        session_id=agent.session_id or "",
-                        platform=agent.platform or "",
-                        model=agent.model,
-                        provider=agent.provider,
-                        base_url=agent.base_url,
-                        api_mode=agent.api_mode,
-                        api_call_count=api_call_count,
-                        middleware_trace=list(_llm_middleware_trace),
-                    )
+                    if _private_slack_provider_request:
+                        response = _perform_api_call(api_kwargs)
+                    else:
+                        response = run_llm_execution_middleware(
+                            api_kwargs,
+                            _perform_api_call,
+                            original_request=_original_api_kwargs,
+                            task_id=effective_task_id,
+                            turn_id=turn_id,
+                            api_request_id=api_request_id,
+                            session_id=agent.session_id or "",
+                            platform=agent.platform or "",
+                            model=agent.model,
+                            provider=agent.provider,
+                            base_url=agent.base_url,
+                            api_mode=agent.api_mode,
+                            api_call_count=api_call_count,
+                            middleware_trace=list(_llm_middleware_trace),
+                        )
                 finally:
                     if _redirect_lock is not None:
                         with _redirect_lock:
@@ -5725,7 +5772,14 @@ def run_conversation(
                     has_hook,
                     invoke_hook as _invoke_hook,
                 )
-                if has_hook("post_api_request"):
+                from gateway.session_context import (
+                    slack_history_sensitive_context_active,
+                )
+
+                if (
+                    has_hook("post_api_request")
+                    and not slack_history_sensitive_context_active()
+                ):
                     _assistant_tool_calls = (
                         getattr(assistant_message, "tool_calls", None) or []
                     )
@@ -5771,7 +5825,11 @@ def run_conversation(
 
             # Notify progress callback of model's thinking (used by subagent
             # delegation to relay the child's reasoning to the parent display).
-            if (assistant_message.content and agent.tool_progress_callback):
+            if (
+                assistant_message.content
+                and agent.tool_progress_callback
+                and not slack_history_sensitive_context_active()
+            ):
                 _think_text = assistant_message.content.strip()
                 # Strip reasoning XML tags that shouldn't leak to parent display
                 _think_text = re.sub(
@@ -7329,6 +7387,48 @@ def run_conversation(
         _pending_verification_response_previewed=_pending_verification_response_previewed,
     )
 
+
+
+def run_conversation(
+    agent,
+    user_message: Any,
+    system_message: str = None,
+    conversation_history: List[Dict[str, Any]] = None,
+    task_id: str = None,
+    stream_callback: Optional[callable] = None,
+    persist_user_message: Optional[Any] = None,
+    persist_user_timestamp: Optional[float] = None,
+    persist_user_display_kind: Optional[str] = None,
+    persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+    moa_config: Optional[dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Run a turn and erase ephemeral Slack payloads on every exit path."""
+
+    result: Dict[str, Any] | None = None
+    try:
+        result = _run_conversation_impl(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            persist_user_display_kind,
+            persist_user_display_metadata,
+            moa_config,
+        )
+        return result
+    finally:
+        from agent.tool_dispatch_helpers import _seal_ephemeral_tool_results
+
+        result_messages = result.get("messages") if isinstance(result, dict) else None
+        if isinstance(result_messages, list):
+            _seal_ephemeral_tool_results(result_messages)
+        session_messages = getattr(agent, "_session_messages", None)
+        if isinstance(session_messages, list) and session_messages is not result_messages:
+            _seal_ephemeral_tool_results(session_messages)
 
 
 __all__ = ["run_conversation"]

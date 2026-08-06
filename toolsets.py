@@ -251,6 +251,12 @@ TOOLSETS = {
         "includes": []
     },
 
+    "slack": {
+        "description": "Read bounded history from the active Slack conversation",
+        "tools": ["slack_history"],
+        "includes": []
+    },
+
     "project": {
         "description": "Desktop Projects — create/switch named workspaces (GUI sessions only)",
         "tools": ["project_list", "project_create", "project_switch"],
@@ -500,7 +506,7 @@ TOOLSETS = {
     
     "hermes-slack": {
         "description": "Slack bot toolset - full access for workspace use (terminal has safety checks)",
-        "tools": _HERMES_CORE_TOOLS,
+        "tools": _HERMES_CORE_TOOLS + ["slack_history"],
         "includes": []
     },
     

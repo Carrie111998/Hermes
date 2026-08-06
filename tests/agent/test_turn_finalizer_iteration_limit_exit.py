@@ -114,6 +114,58 @@ def _finalize(
     )
 
 
+def test_sensitive_slack_turn_skips_secondary_output_hooks(monkeypatch):
+    from gateway.session_context import (
+        clear_session_vars,
+        consume_slack_history_authorization,
+        set_session_vars,
+    )
+
+    lifecycle_calls = []
+    context_calls = []
+    monkeypatch.setattr(
+        "hermes_cli.lifecycle.invoke_hook",
+        lambda name, **kwargs: lifecycle_calls.append((name, kwargs)) or [],
+    )
+    monkeypatch.setattr(
+        "agent.conversation_loop._notify_context_engine_turn_complete",
+        lambda *_args, **_kwargs: context_calls.append(True),
+    )
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = _LimitAgent(max_iterations=1, budget_remaining=1)
+    tokens = set_session_vars(
+        platform="slack",
+        chat_id="C12345678",
+        scope_id="T12345678",
+        slack_history_authorized=True,
+    )
+    try:
+        assert consume_slack_history_authorization() is True
+        result = finalize_turn(
+            agent,
+            final_response="bounded summary",
+            api_call_count=1,
+            interrupted=False,
+            failed=False,
+            messages=[{"role": "user", "content": "read above"}],
+            conversation_history=[],
+            effective_task_id="task",
+            turn_id="turn",
+            user_message="read above",
+            original_user_message="read above",
+            _should_review_memory=False,
+            _turn_exit_reason="completed",
+        )
+    finally:
+        clear_session_vars(tokens)
+
+    assert result["final_response"] == "bounded summary"
+    assert {name for name, _kwargs in lifecycle_calls}.isdisjoint(
+        {"transform_llm_output", "post_llm_call"}
+    )
+    assert context_calls == []
+
+
 
 
 
@@ -233,5 +285,3 @@ def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch)
     assert agent.persisted_messages is not None
     persisted_roles = [m["role"] for m in agent.persisted_messages]
     assert persisted_roles == ["user", "assistant"]
-
-

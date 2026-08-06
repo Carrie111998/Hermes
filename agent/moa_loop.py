@@ -19,6 +19,7 @@ from typing import Any
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
+from agent.tool_dispatch_helpers import _durable_message_copy
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -110,6 +111,7 @@ def _redact_trace_messages(messages: Any) -> Any:
         if not isinstance(m, dict):
             out.append(m)
             continue
+        m = _durable_message_copy(m)
         content = m.get("content")
         if isinstance(content, str):
             out.append({**m, "content": _redact_reference_text(content)})

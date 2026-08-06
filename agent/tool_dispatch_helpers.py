@@ -39,9 +39,11 @@ from tools.threat_patterns import scan_for_threats
 
 logger = logging.getLogger(__name__)
 
+_PERSIST_CONTENT_OVERRIDE_KEY = "_persist_content_override"
+
 # Tools that must never run concurrently (interactive / user-facing).
 # When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
+_NEVER_PARALLEL_TOOLS = frozenset({"clarify", "slack_history"})
 
 # Read-only tools with no shared mutable session state.
 _PARALLEL_SAFE_TOOLS = frozenset({
@@ -516,6 +518,7 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
     """
     if not isinstance(msg, dict):
         return msg
+    msg = _durable_message_copy(msg)
     content = msg.get("content")
     if _is_multimodal_tool_result(content):
         return {**msg, "content": _multimodal_text_summary(content)}
@@ -528,6 +531,75 @@ def _trajectory_normalize_msg(msg: Dict[str, Any]) -> Dict[str, Any]:
                 cleaned.append(p)
         return {**msg, "content": cleaned}
     return msg
+
+
+def _durable_message_copy(msg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return the persistence-safe representation of an in-memory message."""
+
+    if not isinstance(msg, dict):
+        return msg
+    sensitive_turn = False
+    try:
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        sensitive_turn = slack_history_sensitive_context_active()
+    except Exception:
+        pass
+    strip_reasoning = sensitive_turn and msg.get("role") == "assistant"
+    if _PERSIST_CONTENT_OVERRIDE_KEY not in msg and not strip_reasoning:
+        return msg
+    durable = dict(msg)
+    if _PERSIST_CONTENT_OVERRIDE_KEY in durable:
+        durable["content"] = durable.pop(_PERSIST_CONTENT_OVERRIDE_KEY)
+        durable.pop("api_content", None)
+        durable.pop("_tool_output_risk", None)
+    if strip_reasoning:
+        for key in (
+            "reasoning",
+            "reasoning_content",
+            "reasoning_details",
+            "codex_reasoning_items",
+        ):
+            durable.pop(key, None)
+    return durable
+
+
+def _seal_ephemeral_tool_results(messages: list[Any]) -> int:
+    """Erase one-turn tool payloads after the model completes the turn."""
+
+    sealed = 0
+    sensitive_segment = False
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "user":
+            sensitive_segment = False
+        if _PERSIST_CONTENT_OVERRIDE_KEY in message:
+            message["content"] = message.pop(_PERSIST_CONTENT_OVERRIDE_KEY)
+            message.pop("api_content", None)
+            message.pop("_tool_output_risk", None)
+            sensitive_segment = True
+            sealed += 1
+            continue
+        if sensitive_segment and message.get("role") == "assistant":
+            for key in (
+                "reasoning",
+                "reasoning_content",
+                "reasoning_details",
+                "codex_reasoning_items",
+            ):
+                message.pop(key, None)
+    return sealed
+
+
+def _has_ephemeral_sensitive_context(messages: list[Any]) -> bool:
+    """Return whether a live history still carries private-turn markers."""
+
+    return any(
+        isinstance(message, dict)
+        and _PERSIST_CONTENT_OVERRIDE_KEY in message
+        for message in messages
+    )
 
 
 def make_tool_result_message(
@@ -582,6 +654,7 @@ def make_tool_result_message(
 # promptware defense.  Skipped for short outputs (under 32 chars) where the
 # overhead of the wrapper outweighs any indirect-injection risk.
 _UNTRUSTED_TOOL_NAMES = frozenset({
+    "slack_history",
     "web_extract",
     "web_search",
 })
@@ -728,5 +801,8 @@ __all__ = [
     "_extract_landed_file_mutation_paths",
     "_extract_error_preview",
     "_trajectory_normalize_msg",
+    "_durable_message_copy",
+    "_seal_ephemeral_tool_results",
+    "_has_ephemeral_sensitive_context",
     "make_tool_result_message",
 ]

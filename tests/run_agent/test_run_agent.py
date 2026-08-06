@@ -2918,6 +2918,79 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_private_slack_followup_bypasses_llm_middleware_and_relay(
+        self, agent, monkeypatch
+    ):
+        from gateway.session_context import (
+            clear_session_vars,
+            consume_slack_history_authorization,
+            set_session_vars,
+        )
+
+        self._setup_agent(agent)
+        agent.valid_tool_names = [*agent.valid_tool_names, "slack_history"]
+        agent.tools = [*agent.tools, *_make_tool_defs("slack_history")]
+        tc = _mock_tool_call(name="slack_history", arguments="{}", call_id="c1")
+        agent.client.chat.completions.create.side_effect = [
+            _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc]),
+            _mock_response(content="bounded summary", finish_reason="stop"),
+        ]
+        request_middleware = MagicMock(
+            side_effect=lambda request, **_kwargs: SimpleNamespace(
+                payload=request,
+                original_payload=request,
+                trace=[],
+            )
+        )
+        execution_middleware = MagicMock(
+            side_effect=lambda request, callback, **_kwargs: callback(request)
+        )
+        relay_execute = MagicMock(
+            side_effect=lambda request, callback, **_kwargs: callback(request)
+        )
+        agent.tool_progress_callback = MagicMock()
+
+        def private_history(*_args, **_kwargs):
+            assert consume_slack_history_authorization() is True
+            return "private Slack history"
+
+        tokens = set_session_vars(
+            platform="slack",
+            chat_id="C12345678",
+            scope_id="T12345678",
+            slack_history_authorized=True,
+        )
+        try:
+            with (
+                patch("run_agent.handle_function_call", side_effect=private_history),
+                patch(
+                    "hermes_cli.middleware.apply_llm_request_middleware",
+                    request_middleware,
+                ),
+                patch(
+                    "hermes_cli.middleware.run_llm_execution_middleware",
+                    execution_middleware,
+                ),
+                patch("agent.relay_llm.execute", relay_execute),
+                patch.object(agent, "_persist_session"),
+                patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+            ):
+                result = agent.run_conversation("Läs meddelandena ovan")
+        finally:
+            clear_session_vars(tokens)
+
+        assert result["final_response"] == "bounded summary"
+        assert request_middleware.call_count == 1
+        assert execution_middleware.call_count == 1
+        assert relay_execute.call_count == 1
+        assert not any(
+            call.args and call.args[0] in {"_thinking", "reasoning.available"}
+            for call in agent.tool_progress_callback.call_args_list
+        )
+        second_request = agent.client.chat.completions.create.call_args_list[1].kwargs
+        assert "private Slack history" in json.dumps(second_request)
+
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)

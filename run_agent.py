@@ -219,6 +219,7 @@ from agent.tool_dispatch_helpers import (
     _extract_landed_file_mutation_paths,
     _extract_error_preview,
     _trajectory_normalize_msg,  # noqa: F401  # re-exported for tests that `from run_agent import _trajectory_normalize_msg`
+    _durable_message_copy,
 )
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_float, is_truthy_value, model_forces_max_completion_tokens
 
@@ -2127,13 +2128,14 @@ class AIAgent:
                 if id(msg) in history_ids or id(msg) in seed_ids:
                     msg[_DB_PERSISTED_MARKER] = True
                     continue
-                role = msg.get("role", "unknown")
-                content = msg.get("content")
+                durable_msg = _durable_message_copy(msg)
+                role = durable_msg.get("role", "unknown")
+                content = durable_msg.get("content")
                 # api_content sidecar: the exact bytes sent to the API when
                 # they differ from the clean content (stamped by the turn
                 # prologue for prefetch/plugin injections). Written verbatim
                 # so replay can reproduce the sent prefix byte-for-byte.
-                _row_api_content = msg.get("api_content")
+                _row_api_content = durable_msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
                 _row_timestamp = msg.get("timestamp")
@@ -2225,17 +2227,17 @@ class AIAgent:
                 _batch_rows.append({
                     "role": role,
                     "content": content,
-                    "tool_name": msg.get("tool_name"),
+                    "tool_name": durable_msg.get("tool_name"),
                     "tool_calls": tool_calls_data,
-                    "tool_call_id": msg.get("tool_call_id"),
+                    "tool_call_id": durable_msg.get("tool_call_id"),
                     "finish_reason": msg.get("finish_reason"),
                     # Reasoning/codex fields are role-gated (assistant-only)
                     # inside _insert_message_rows — pass through untouched.
-                    "reasoning": msg.get("reasoning"),
-                    "reasoning_content": msg.get("reasoning_content"),
-                    "reasoning_details": msg.get("reasoning_details"),
-                    "codex_reasoning_items": msg.get("codex_reasoning_items"),
-                    "codex_message_items": msg.get("codex_message_items"),
+                    "reasoning": durable_msg.get("reasoning"),
+                    "reasoning_content": durable_msg.get("reasoning_content"),
+                    "reasoning_details": durable_msg.get("reasoning_details"),
+                    "codex_reasoning_items": durable_msg.get("codex_reasoning_items"),
+                    "codex_message_items": durable_msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
                     "display_kind": (
@@ -2786,6 +2788,16 @@ class AIAgent:
             for key, value in (api_kwargs or {}).items()
             if key not in {"timeout", "http_client"}
         }
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                for key in ("messages", "input"):
+                    if key in body:
+                        body[key] = []
+                body["ephemeral_context_omitted"] = True
+        except Exception:
+            pass
         return self._sanitize_hook_payload(
             {
                 "method": "POST",
@@ -2842,6 +2854,10 @@ class AIAgent:
         # dispatch at this call site. After first call the import is a
         # ``sys.modules`` dict lookup, so retries don't repay any real cost.
         try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return
             from hermes_cli import lifecycle as _lifecycle
 
             if not _lifecycle.has_hook("api_request_error"):
@@ -2967,6 +2983,7 @@ class AIAgent:
                 # internal retry state, never durable transcript content.
                 if _is_ephemeral_scaffolding(msg):
                     continue
+                msg = _durable_message_copy(msg)
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
@@ -4032,9 +4049,15 @@ class AIAgent:
         NOT called per-turn — only at CLI exit, /reset, gateway
         session expiry, etc.
         """
+        durable_messages = [
+            _durable_message_copy(message)
+            if isinstance(message, dict)
+            else message
+            for message in (messages or [])
+        ]
         if self._memory_manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(durable_messages)
             except Exception as e:
                 logger.warning("Memory provider on_session_end failed during shutdown: %s", e, exc_info=True)
             try:
@@ -4046,7 +4069,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    durable_messages,
                 )
             except Exception:
                 pass
@@ -4056,9 +4079,15 @@ class AIAgent:
         Called when session_id rotates (e.g. /new, context compression);
         providers keep their state and continue running under the old
         session_id — they just flush pending extraction now."""
+        durable_messages = [
+            _durable_message_copy(message)
+            if isinstance(message, dict)
+            else message
+            for message in (messages or [])
+        ]
         if self._memory_manager:
             try:
-                self._memory_manager.on_session_end(messages or [])
+                self._memory_manager.on_session_end(durable_messages)
             except Exception:
                 pass
         # Notify context engine of session end too — same lifecycle moment as
@@ -4071,7 +4100,7 @@ class AIAgent:
             try:
                 self.context_compressor.on_session_end(
                     self.session_id or "",
-                    messages or [],
+                    durable_messages,
                 )
             except Exception:
                 pass
@@ -6188,6 +6217,13 @@ class AIAgent:
 
     def _fire_streamed_codex_commentary(self, text: str) -> None:
         """Deliver a completed live Codex commentary message immediately."""
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return
+        except Exception:
+            pass
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(text, str):
             return
@@ -6215,6 +6251,13 @@ class AIAgent:
         when the only streamed text was unrelated mid-turn commentary. (#65919
         review: response-loss blocker)
         """
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return
+        except Exception:
+            pass
         cb = getattr(self, "interim_assistant_callback", None)
         if cb is None or not isinstance(assistant_msg, dict):
             return
@@ -6393,6 +6436,14 @@ class AIAgent:
         if self._stream_writer_superseded():
             self._note_dropped_stream_writer("_fire_reasoning_delta")
             return
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return
+        except Exception:
+            # The gateway context is optional outside gateway-backed sessions.
+            pass
         cb = self.reasoning_callback
         if cb is not None:
             try:
@@ -6431,6 +6482,13 @@ class AIAgent:
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return False
+        except Exception:
+            pass
         from agent.chat_completion_helpers import try_activate_fallback
         return try_activate_fallback(self, reason)
 
@@ -6442,6 +6500,13 @@ class AIAgent:
         fallback chain configured).  Mirrors the early-return guard in
         ``try_activate_fallback`` (#35314, #17446).
         """
+        try:
+            from gateway.session_context import slack_history_sensitive_context_active
+
+            if slack_history_sensitive_context_active():
+                return False
+        except Exception:
+            pass
         chain = getattr(self, "_fallback_chain", None) or []
         index = getattr(self, "_fallback_index", 0)
         return index < len(chain)
@@ -7804,7 +7869,11 @@ class AIAgent:
         task_started = False
         task_finished = False
         relay_outcome = "failed"
+        moa_token = None
         try:
+            from gateway.session_context import set_moa_turn_active
+
+            moa_token = set_moa_turn_active(bool(moa_config))
             relay_lease = relay_runtime.SESSION_COORDINATOR.acquire_conversation(
                 profile_key=relay_runtime.current_profile_key(),
                 session_id=task_context["session_id"],
@@ -7916,6 +7985,10 @@ class AIAgent:
                         reset_accounting_context(acct_token)
                     if token is not None:
                         reset_conversation_context(token)
+                    if moa_token is not None:
+                        from gateway.session_context import reset_moa_turn_active
+
+                        reset_moa_turn_active(moa_token)
 
     def chat(self, message: str, stream_callback: Optional[callable] = None) -> str:
         """

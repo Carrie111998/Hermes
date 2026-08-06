@@ -916,6 +916,7 @@ class SlackAdapter(BasePlatformAdapter):
         # Multi-workspace support
         self._team_clients: Dict[str, Any] = {}  # team_id → WebClient
         self._team_bot_user_ids: Dict[str, str] = {}  # team_id → bot_user_id
+        self._team_bot_ids: Dict[str, str] = {}  # team_id → verified bot_id
         # channel_id → team_id. Grows with every channel AND every DM the bot
         # sees (DM channel IDs are per-user), so it must be bounded on busy
         # multi-workspace installs. Eviction is safe: entries are re-learned
@@ -1889,6 +1890,7 @@ class SlackAdapter(BasePlatformAdapter):
             self._bot_user_id = None
             self._team_clients = {}
             self._team_bot_user_ids = {}
+            self._team_bot_ids = {}
             self._bot_display_name = None
             self._team_bot_names = {}
 
@@ -1911,11 +1913,14 @@ class SlackAdapter(BasePlatformAdapter):
                 auth_response = await client.auth_test()
                 team_id = auth_response.get("team_id", "")
                 bot_user_id = auth_response.get("user_id", "")
+                bot_id = auth_response.get("bot_id", "")
                 bot_name = auth_response.get("user", "unknown")
                 team_name = auth_response.get("team", "unknown")
 
                 self._team_clients[team_id] = client
                 self._team_bot_user_ids[team_id] = bot_user_id
+                if bot_id:
+                    self._team_bot_ids[team_id] = bot_id
                 self._team_bot_names[team_id] = bot_name
 
                 # First token always wins as the primary bot user id; we
@@ -5110,11 +5115,9 @@ class SlackAdapter(BasePlatformAdapter):
         the Slack API, so unlike the in-memory _bot_message_ts set it
         also survives gateway restarts.
 
-        Implementation: check the in-memory _thread_context_cache first
-        (cheap; populated whenever thread context is fetched). On a miss,
-        fetch thread context — the fetch is bounded by the TTL cache in
-        _fetch_thread_context, so the API-call overhead is paid only on
-        the miss path.
+        Fetches only the root message metadata. It deliberately does not use
+        the formatted thread-context cache: routing may inspect authorship,
+        but prior Slack content must not be retained or injected implicitly.
         """
         if not thread_ts:
             return False
@@ -5123,32 +5126,25 @@ class SlackAdapter(BasePlatformAdapter):
         if not bot_uid:
             return False
 
-        def _cached_parent_matches() -> Optional[bool]:
-            # Cache keys are "{channel_id}:{thread_ts}:{team_id}"; team_id may
-            # be empty at some call sites, so match on the channel+thread
-            # prefix rather than guessing the exact key.
-            for cached_key, cached_entry in self._thread_context_cache.items():
-                if cached_key.startswith(f"{channel_id}:{thread_ts}:"):
-                    return bool(
-                        cached_entry.parent_user_id
-                        and cached_entry.parent_user_id == bot_uid
-                    )
-            return None
-
-        cached = _cached_parent_matches()
-        if cached is not None:
-            return cached
-
-        # Miss path: fetch thread context (its own TTL cache applies) and
-        # re-check — a successful fetch populates parent_user_id.
-        await self._fetch_thread_context(
-            channel_id=channel_id,
-            thread_ts=thread_ts,
-            current_ts="",
-            team_id=team_id,
-        )
-        cached = _cached_parent_matches()
-        return bool(cached)
+        try:
+            result = await self._get_client(
+                channel_id, team_id=team_id
+            ).conversations_replies(
+                channel=channel_id,
+                ts=thread_ts,
+                limit=1,
+                inclusive=True,
+            )
+            messages = result.get("messages", []) if result else []
+            if not messages:
+                return False
+            root = messages[0]
+            return bool(
+                root.get("ts", "") == thread_ts
+                and root.get("user", "") == bot_uid
+            )
+        except Exception:
+            return False
 
     async def _should_wake_on_unmentioned_message(
         self,
@@ -5221,7 +5217,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if parent_text and f"<@{bot_uid}>" in parent_text:
                     # Remember the thread so later replies skip the fetch.
                     if not self._slack_strict_mention():
-                        self._register_mentioned_thread(event_thread_ts)
+                        self._register_mentioned_thread(event_thread_ts, team_id)
                     return True
         return False
 
@@ -5756,60 +5752,14 @@ class SlackAdapter(BasePlatformAdapter):
             ):
                 self._register_mentioned_thread(thread_ts, team_id=team_id)
 
-        # Thread context rules:
-        # - First message in a thread session (cold start): hydrate full
-        #   context.
-        # - Active thread + explicit @mention: refresh with only the delta
-        #   since the last hydrate/refresh (#23918), bypassing the TTL cache.
-        #   The delta is injected as part of the NEW turn (via
-        #   ``channel_context``) — prior conversation history is never
-        #   rewritten, so prompt caching is preserved.
-        #
-        # Keep recovered history separate from ``text``. Prepending it here
-        # moves a recognized command away from character zero, so downstream
-        # command routing can misclassify it as conversational text.
-        # ``channel_context`` is prepended only after command dispatch.
+        # Prior Slack messages are never hydrated automatically. History is a
+        # separate, explicit, one-shot capability (`slack_history`); injecting
+        # it here would bypass that capability's authorization and ephemeral
+        # persistence boundary before the agent turn even starts.
         channel_context = None
-        # Thread-root images recovered on the cold-start hydrate: when the
-        # bot is mentioned mid-thread for the first time, the thread root is
-        # very often the artifact the mention is about ("@bot what's in this
-        # chart?" replying under an image post) — deliver its images with
-        # this first turn. One-time by construction: the cold-start path is
-        # guarded by _has_active_session_for_thread, so subsequent turns in
-        # the same session never re-deliver (adapted from #69185).
         thread_root_media_urls: List[str] = []
         thread_root_media_types: List[str] = []
-        has_active_thread_session = is_thread_reply and self._has_active_session_for_thread(
-            channel_id=channel_id,
-            thread_ts=event_thread_ts,
-            user_id=user_id,
-            team_id=team_id,
-            chat_type="dm" if is_dm else "group",
-        )
-        if is_thread_reply and not has_active_thread_session:
-            thread_context = await self._fetch_thread_context(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                current_ts=ts,
-                team_id=team_id,
-            )
-            if thread_context:
-                channel_context = thread_context
-            # Deliver the thread root's images with this first turn. The
-            # root is always a PRIOR message here (is_thread_reply implies
-            # thread_ts != ts); the trigger's own files ride event["files"].
-            (
-                thread_root_media_urls,
-                thread_root_media_types,
-            ) = await self._collect_thread_root_images(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                team_id=team_id,
-            )
-            # Record the trigger ts as the consumption watermark: everything
-            # up to and including this turn is now (or will be) in session
-            # history, so a later explicit-mention refresh only needs newer
-            # messages.
+        if is_thread_reply:
             self._set_thread_watermark(
                 channel_id=channel_id,
                 thread_ts=event_thread_ts,
@@ -5820,88 +5770,6 @@ class SlackAdapter(BasePlatformAdapter):
             self._mark_thread_rehydration_checked(
                 channel_id, event_thread_ts, user_id, team_id
             )
-        elif is_thread_reply and has_active_thread_session and is_mentioned:
-            # Explicit @mention on an active thread is a fresh intent signal:
-            # the user expects the bot to read the CURRENT thread state, which
-            # may include replies (e.g. from other bots/integrations) that
-            # arrived since the initial hydrate and never reached the session.
-            watermark_ts = self._get_thread_watermark(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                user_id=user_id,
-                team_id=team_id,
-            )
-            thread_context = await self._fetch_thread_context(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                current_ts=ts,
-                team_id=team_id,
-                after_ts=watermark_ts,
-                force_refresh=True,
-            )
-            if thread_context:
-                channel_context = thread_context
-            self._set_thread_watermark(
-                channel_id=channel_id,
-                thread_ts=event_thread_ts,
-                user_id=user_id,
-                watermark_ts=ts,
-                team_id=team_id,
-            )
-            self._mark_thread_rehydration_checked(
-                channel_id, event_thread_ts, user_id, team_id
-            )
-        elif is_thread_reply and has_active_thread_session:
-            # Restart rehydration (#63530 restart gap / #33215): persistent
-            # sessions survive gateway restarts, but thread replies posted
-            # while the gateway was down never reached the session. On the
-            # FIRST ordinary reply per thread in this process, fetch the
-            # delta past the persisted watermark and inject anything missed
-            # as part of this new turn. Checked at most once per thread per
-            # process; a non-empty watermark plus an empty delta costs one
-            # cached conversations.replies call.
-            rehydration_key = self._thread_rehydration_key(
-                channel_id, event_thread_ts, user_id, team_id
-            )
-            if rehydration_key not in self._thread_rehydration_checked:
-                watermark_ts = self._get_thread_watermark(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
-                    team_id=team_id,
-                )
-                if watermark_ts:
-                    thread_context = await self._fetch_thread_context(
-                        channel_id=channel_id,
-                        thread_ts=event_thread_ts,
-                        current_ts=ts,
-                        team_id=team_id,
-                        after_ts=watermark_ts,
-                        force_refresh=True,
-                    )
-                    if thread_context:
-                        channel_context = thread_context
-                self._set_thread_watermark(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
-                    watermark_ts=ts,
-                    team_id=team_id,
-                )
-                self._mark_thread_rehydration_checked(
-                    channel_id, event_thread_ts, user_id, team_id
-                )
-            else:
-                # Steady state: keep the watermark advancing so a future
-                # refresh/rehydration never re-injects messages the session
-                # already carries as ordinary turns.
-                self._set_thread_watermark(
-                    channel_id=channel_id,
-                    thread_ts=event_thread_ts,
-                    user_id=user_id,
-                    watermark_ts=ts,
-                    team_id=team_id,
-                )
 
         # Determine message type
         msg_type = MessageType.TEXT
@@ -6171,8 +6039,9 @@ class SlackAdapter(BasePlatformAdapter):
                 msg_type = MessageType.DOCUMENT
 
         # Every enrichment path above (blocks, unfurls, attachment notices,
-        # text-file injection, thread history) is deliberately allowed for
-        # normal messages. Commands are restored from canonical authored
+        # text-file injection) is deliberately allowed for normal messages.
+        # Prior thread history is excluded and available only through the
+        # explicit one-shot slack_history capability. Commands are restored from canonical authored
         # input only: the gateway parser requires the command token at
         # character zero, and enrichment must never mutate a command's
         # arguments.
@@ -6244,28 +6113,9 @@ class SlackAdapter(BasePlatformAdapter):
             None,
         )
 
-        # Extract reply context if this message is a thread reply.
-        # Mirrors the Telegram/Discord implementations so that gateway.run
-        # can inject a `[Replying to: "..."]` prefix when the parent is not
-        # already in the session history. Uses the thread-context cache when
-        # available to avoid redundant conversations.replies calls.
+        # Slack reply parents are prior history and therefore follow the same
+        # explicit-read boundary as all other thread context.
         reply_to_text = None
-        if thread_ts and thread_ts != ts:
-            try:
-                reply_to_text = (
-                    await self._fetch_thread_parent_text(
-                        channel_id=channel_id,
-                        thread_ts=thread_ts,
-                        team_id=team_id,
-                    )
-                    or None
-                )
-                if reply_to_text:
-                    reply_to_text = await self._humanize_user_mentions(
-                        reply_to_text, chat_id=channel_id, team_id=team_id
-                    )
-            except Exception:  # pragma: no cover - defensive
-                reply_to_text = None
 
         # Humanize remaining user mentions: the bot's own mention was already
         # stripped above, so any ``<@UID>`` left in the trigger text refers to
@@ -6295,6 +6145,11 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                # Authorization provenance: the flat human-authored Slack
+                # text before blocks, quotes, unfurls, files, or attachment
+                # notices are appended. Security gates must never classify
+                # the enriched ``MessageEvent.text`` field.
+                "slack_authored_text": original_text,
             },
         )
 
@@ -7490,8 +7345,7 @@ class SlackAdapter(BasePlatformAdapter):
     ) -> str:
         """Return the text of the thread parent message.
 
-        Used for reply_to_text injection (mention stripped) and for the
-        parent-mentioned-bot wake check (#24848 — pass
+        Used for the parent-mentioned-bot wake check (#24848 — pass
         ``strip_bot_mention=False`` so the ``<@bot>`` token is preserved).
 
         Uses the same per-thread cache as :meth:`_fetch_thread_context` to avoid
@@ -7499,7 +7353,8 @@ class SlackAdapter(BasePlatformAdapter):
         message fetch (``limit=1, inclusive=True``) when the cache is cold.
 
         Returns empty string on any failure — callers should treat an empty
-        return as "no parent context to inject".
+        return as "no routing signal". The caller must not add this text to
+        model context; it is read only to decide whether the bot was addressed.
         """
         cache_key = f"{channel_id}:{thread_ts}:{team_id}"
         now = time.monotonic()
@@ -7529,10 +7384,9 @@ class SlackAdapter(BasePlatformAdapter):
             if parent.get("ts", "") != thread_ts:
                 return ""
             bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-            text = self._render_message_text(parent, bot_uid=bot_uid or "")
-            if strip_bot_mention and bot_uid:
-                text = text.replace(f"<@{bot_uid}>", "").strip()
-            return text
+            if not strip_bot_mention:
+                return (parent.get("text") or "").strip()
+            return self._render_message_text(parent, bot_uid=bot_uid or "")
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("[Slack] Failed to fetch thread parent text: %s", exc)
             return ""

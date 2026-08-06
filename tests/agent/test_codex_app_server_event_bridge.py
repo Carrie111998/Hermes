@@ -178,6 +178,30 @@ class TestStreamDeltaDispatch:
 
 
 class TestToolProgressDispatch:
+    def test_slack_history_completion_uses_private_placeholder(self):
+        agent = _make_stub_agent()
+        bridge = make_codex_app_server_event_bridge(agent)
+        bridge(_item_started({
+            "type": "dynamicToolCall",
+            "id": "slack-1",
+            "tool": "slack_history",
+            "arguments": {},
+        }))
+        bridge(_item_completed({
+            "type": "dynamicToolCall",
+            "id": "slack-1",
+            "tool": "slack_history",
+            "arguments": {},
+            "contentItems": [{"type": "text", "text": "private history"}],
+            "success": True,
+        }))
+
+        completed = agent.tool_progress_callback.call_args_list[-1]
+        assert completed.kwargs["result"] == (
+            "[Ephemeral Slack context was used for this turn and was not retained.]"
+        )
+        assert "private history" not in str(completed)
+
     def test_command_started_fires_tool_started(self):
         agent = _make_stub_agent()
         bridge = make_codex_app_server_event_bridge(agent)
