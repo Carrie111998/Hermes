@@ -438,8 +438,12 @@ class TestPlainLanguageBodies:
             "reason": "laptop-monitor status.json stale",
             "age_seconds": 900,
         })
-        assert "degraded" in body
+        assert "Laptop monitor stopped updating its health snapshot" in body
+        assert r"C:\Users\diego\architecture-map\status.json" in body
         assert "15m" in body
+        assert "Service health shown by the watchdog may be out of date" in body
+        assert "No action is usually needed" in body
+        assert "If this persists" in body
 
     def test_silence_alert_body(self):
         from events.formatting import silence_alert_body

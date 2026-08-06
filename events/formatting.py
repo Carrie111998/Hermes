@@ -503,6 +503,19 @@ def watchdog_burst_body(payload: dict, *, max_listed: int = 5,
 def watchdog_self_degraded_body(payload: dict) -> str:
     """The watchdog itself can't do its job — say why in plain language."""
     reason = str(payload.get("reason") or "unspecified").strip()
+    if reason == "laptop-monitor status.json stale":
+        path = payload.get("path") or r"C:\Users\diego\architecture-map\status.json"
+        age = format_duration(payload.get("age_seconds"))
+        return "\n".join([
+            "Laptop monitor stopped updating its health snapshot.",
+            f"File: {path}",
+            f"Last update: {age} ago (this alert starts after 10m).",
+            "Service health shown by the watchdog may be out of date; "
+            "this does not mean those services are down.",
+            "No action is usually needed for one alert; the watchdog will "
+            "check again automatically. If this persists, check laptop-monitor.",
+        ])
+
     lines = [f"The health monitor itself is degraded: {reason}."]
     skipped = payload.get("skipped_probes")
     if skipped:
