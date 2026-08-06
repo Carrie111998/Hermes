@@ -11090,6 +11090,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
             # before the narrower agent-turn scope is installed.
+            self._stamp_receiving_profile(adapter, self._active_profile_name())
             adapter.set_message_handler(self._primary_message_handler())
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
@@ -12462,6 +12463,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
+                    self._stamp_receiving_profile(adapter, self._active_profile_name())
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
@@ -13395,6 +13397,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._safe_adapter_disconnect(adapter, platform)
         return connected
 
+    @staticmethod
+    def _stamp_receiving_profile(adapter: BasePlatformAdapter, profile_name: str) -> None:
+        """Stamp the immutable per-adapter receiving-profile field, if this adapter type has one.
+
+        Slice 1.1R-B (conflict #7): TelegramAdapter's capture-aware queue
+        seam needs to know which profile's bot account received an update
+        at construction time, before dispatch -- profile identity was
+        previously only stamped onto outbound message sources, after
+        dispatch, too late for a pre-dispatch capture seam. Duck-typed
+        (``hasattr``) rather than an isinstance check against TelegramAdapter
+        specifically, since ``BasePlatformAdapter`` (shared by every
+        platform) is out of this envelope's scope to change -- adapters that
+        don't expose ``receiving_profile`` are silently skipped.
+        """
+        if not hasattr(adapter, "receiving_profile"):
+            return
+        try:
+            adapter.receiving_profile = profile_name
+        except Exception:
+            logger.debug(
+                "Could not stamp receiving_profile=%r on %s adapter",
+                profile_name, getattr(adapter, "platform", "?"), exc_info=True,
+            )
+
     def _configure_profile_adapter(
         self,
         adapter: BasePlatformAdapter,
@@ -13402,6 +13428,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         platform: Platform,
     ) -> None:
         """Install the profile-scoped handlers shared by startup and reconnect."""
+        self._stamp_receiving_profile(adapter, profile_name)
         adapter.set_message_handler(self._make_profile_message_handler(profile_name))
         adapter.set_fatal_error_handler(
             self._make_profile_fatal_error_handler(profile_name, platform)

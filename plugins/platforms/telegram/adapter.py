@@ -305,6 +305,12 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.capture_ingress import (
+    CaptureAwareQueue,
+    CaptureIngressStore,
+    RoutePolicyTable,
+    normalize_thread_id,
+)
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -705,6 +711,19 @@ class TelegramAdapter(BasePlatformAdapter):
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False
+        # Slice 1.1R-B: which config profile's bot account this adapter
+        # instance is receiving updates for. Immutable once set (see the
+        # ``receiving_profile`` property below) -- it is stamped once by
+        # gateway/run.py's per-profile startup path, right after this
+        # adapter is constructed and before it ever connects, and every
+        # ingress-ledger row this adapter captures carries it verbatim.
+        self._receiving_profile: Optional[str] = None
+        # Reused across the rebuild-on-init-failure loop inside connect() so
+        # a rebuilt Application never silently reverts to a plain queue (see
+        # "Rebuilt PTB application after init failure" in the capture
+        # acceptance matrix). Recreated fresh on each new connect() call.
+        self._capture_queue: Optional[CaptureAwareQueue] = None
+        self._capture_store: Optional[CaptureIngressStore] = None
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
@@ -3869,6 +3888,29 @@ class TelegramAdapter(BasePlatformAdapter):
 
             get_updates_request = self._instrument_polling_request(get_updates_request)
             builder = builder.request(request).get_updates_request(get_updates_request)
+            # Slice 1.1R-B: installed before .build() so every update this
+            # Application ever delivers -- polling or webhook, initial build
+            # or a rebuild below after a retried init failure -- is captured
+            # before PTB's own dispatch ever sees it. One instance, reused
+            # for the whole connect() attempt loop (not recreated per
+            # rebuild), so a rebuild can never silently revert to a plain
+            # queue.
+            if self._capture_queue is None:
+                self._capture_queue = self._build_capture_queue()
+            # Not reassigned (unlike the chained calls above): PTB's real
+            # ApplicationBuilder.update_queue() mutates self and returns
+            # self, same as every other builder setter, so a plain call is
+            # equivalent to `builder = builder.update_queue(...)` for the
+            # real builder -- and it does not require test doubles that
+            # construct a bare MagicMock() builder (see test_telegram_conflict.py)
+            # to also stub update_queue's return value just to keep their
+            # existing `.build.return_value` wiring intact. hasattr-gated
+            # because some pre-existing test doubles (test_telegram_polling_progress.py's
+            # _LifecycleBuilder) implement only the specific builder methods
+            # they exercise; the real ApplicationBuilder always has this
+            # method, so the guard only ever matters for those fakes.
+            if hasattr(builder, "update_queue"):
+                builder.update_queue(self._capture_queue)
             self._app = builder.build()
             self._bot = self._app.bot
             
@@ -4002,6 +4044,13 @@ class TelegramAdapter(BasePlatformAdapter):
                     # and will be GC'd (#67498).
                     if rebuild_app and _attempt < _max_connect - 1:
                         old_app = self._app
+                        # `builder` is the same ApplicationBuilder instance
+                        # configured above (mutate-and-return-self per PTB),
+                        # so the capture-aware queue installed via
+                        # .update_queue() before the first .build() is still
+                        # in effect here -- a rebuild never reverts to a
+                        # plain queue. Do not replace `builder` with a fresh
+                        # ApplicationBuilder() in this retry loop.
                         self._app = builder.build()
                         self._bot = self._app.bot
                         # Re-register handlers on the new app
@@ -8634,6 +8683,89 @@ class TelegramAdapter(BasePlatformAdapter):
             adapter_name = getattr(self, "name", "telegram")
             logger.warning("[%s] Failed to observe Telegram group message: %s", adapter_name, exc)
 
+    @property
+    def receiving_profile(self) -> Optional[str]:
+        """Config profile this adapter instance receives Telegram updates for.
+
+        Immutable once set -- see conflict #7 in the 1.1R-B plan
+        (``docs/hermes-program/phases/01-reliable-capture/
+        slice-1.1r-b-capture-first-intake.md`` in hermes-control-plane):
+        multiplex profile identity was previously applied only *after*
+        dispatch, too late for a pre-dispatch capture seam.
+        """
+        return self._receiving_profile
+
+    @receiving_profile.setter
+    def receiving_profile(self, value: str) -> None:
+        if self._receiving_profile is not None:
+            raise RuntimeError(
+                f"[{self.name}] receiving_profile is immutable once set "
+                f"(already {self._receiving_profile!r}, refused {value!r})"
+            )
+        if not re.match(r"^[a-z][a-z0-9_-]{0,63}$", str(value)):
+            raise ValueError(f"invalid receiving_profile {value!r}")
+        self._receiving_profile = str(value)
+
+    def _capture_route_table(self) -> "RoutePolicyTable":
+        """(chat_id, thread_id) -> route entry, read fresh from config each call.
+
+        Matches this adapter's existing convention (``_telegram_allowed_topics``,
+        ``_telegram_ignored_threads``, etc.) of re-reading ``config.extra``
+        per call rather than caching -- the route list is small and static
+        per process, and this keeps the value correct for adapters
+        constructed via ``object.__new__`` in tests without requiring
+        ``__init__`` to have run.
+        """
+        return RoutePolicyTable(self.config.extra.get("capture_routes"))
+
+    def _capture_route_for_message(self, message: Message):
+        """The matching route-policy entry for ``message``, or None if unrouted."""
+        chat_id = getattr(getattr(message, "chat", None), "id", None)
+        if chat_id is None:
+            return None
+        thread_id = normalize_thread_id(self._effective_message_thread_id(message))
+        return self._capture_route_table().lookup(chat_id, thread_id)
+
+    def _capture_db_path(self) -> str:
+        override = self.config.extra.get("capture_db_path")
+        if override:
+            return str(override)
+        from hermes_constants import get_hermes_home
+
+        return str(get_hermes_home() / "capture_ingress.db")
+
+    def _ensure_capture_store(self) -> CaptureIngressStore:
+        if self._capture_store is None:
+            self._capture_store = CaptureIngressStore(self._capture_db_path())
+        return self._capture_store
+
+    def _alert_capture_failure(self, message: str) -> None:
+        # Deliverable per the plan: "only deterministic failure is alerted,
+        # and only to Hermes Hub General topic -- never a per-message
+        # acknowledgment." Wiring an actual outbound alert send is out of
+        # scope for this envelope (excluded: no new outbound-send path, no
+        # live Telegram call) -- log loudly; the raised exception is what
+        # actually enforces fail-closed (blocks offset advance / webhook ack).
+        logger.error("[%s] %s", self.name, message)
+
+    def _build_capture_queue(self) -> CaptureAwareQueue:
+        """Construct a fresh capture-aware queue bound to this adapter's own gating logic.
+
+        Reuses ``_is_own_message`` and ``_is_user_authorized_from_message``
+        (the same authorization decision the rest of the adapter already
+        makes) rather than re-implementing sender gating in the queue seam.
+        """
+        return CaptureAwareQueue(
+            store=self._ensure_capture_store(),
+            route_table_provider=self._capture_route_table,
+            account_id_provider=lambda: getattr(self._bot, "id", None),
+            profile_provider=lambda: self.receiving_profile or "default",
+            thread_id_resolver=self._effective_message_thread_id,
+            is_own_message=self._is_own_message,
+            is_authorized_sender=self._is_user_authorized_from_message,
+            alert_failure=self._alert_capture_failure,
+        )
+
     def _is_own_message(self, message: Message) -> bool:
         """Return True when the message was sent by this bot itself.
 
@@ -8685,6 +8817,15 @@ class TelegramAdapter(BasePlatformAdapter):
         # addressed to us as one addressed to some other bot.
         self._observe_bot_identity_from_message(message)
         if self._is_own_message(message):
+            return False
+
+        # Defense-in-depth (Slice 1.1R-B): a capture-only route must never
+        # reach reply/mention/command/free-response/wake-word gating, even
+        # though the queue-level terminal deny (CaptureAwareQueue.put) is
+        # meant to make this branch unreachable for a capture-only route in
+        # the first place. Deliberate belt-and-suspenders, tested directly.
+        route = self._capture_route_for_message(message)
+        if route is not None and route.mode == "capture_only":
             return False
 
         if not self._is_group_chat(message):

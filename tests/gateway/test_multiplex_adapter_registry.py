@@ -495,3 +495,80 @@ class TestFeishuPortBindingConditional:
         assert connected == 0  # no error, just nothing connected
 
 
+class _ImmutableProfileAdapter:
+    """Mimics TelegramAdapter's immutable receiving_profile property (Slice 1.1R-B)."""
+
+    platform = Platform.TELEGRAM
+
+    def __init__(self):
+        self._receiving_profile = None
+
+    @property
+    def receiving_profile(self):
+        return self._receiving_profile
+
+    @receiving_profile.setter
+    def receiving_profile(self, value):
+        if self._receiving_profile is not None:
+            raise RuntimeError("receiving_profile is immutable once set")
+        self._receiving_profile = value
+
+    def set_message_handler(self, handler):
+        pass
+
+    def set_fatal_error_handler(self, handler):
+        pass
+
+    def set_session_store(self, store):
+        pass
+
+    def set_busy_session_handler(self, handler):
+        pass
+
+    def set_topic_recovery_fn(self, handler):
+        pass
+
+    def set_authorization_check(self, handler):
+        pass
+
+
+class TestReceivingProfileStamping:
+    """Slice 1.1R-B, conflict #7: profile identity must reach the adapter
+    at construction time, before dispatch -- not only stamped onto outbound
+    message sources afterward. See gateway/run.py's ``_stamp_receiving_profile``
+    and TelegramAdapter's ``receiving_profile`` property.
+    """
+
+    def test_stamps_receiving_profile_when_adapter_supports_it(self):
+        adapter = _ImmutableProfileAdapter()
+        GatewayRunner._stamp_receiving_profile(adapter, "coder")
+        assert adapter.receiving_profile == "coder"
+
+    def test_silently_skips_adapters_without_the_field(self):
+        # _FakeAdapter (top of this file) has no receiving_profile property.
+        adapter = _FakeAdapter()
+        GatewayRunner._stamp_receiving_profile(adapter, "coder")  # must not raise
+        assert not hasattr(adapter, "_receiving_profile")
+
+    def test_does_not_raise_when_adapter_setter_rejects_a_second_stamp(self):
+        adapter = _ImmutableProfileAdapter()
+        adapter.receiving_profile = "coder"
+        GatewayRunner._stamp_receiving_profile(adapter, "different")  # logged, not raised
+        assert adapter.receiving_profile == "coder"  # first stamp wins
+
+    def test_configure_profile_adapter_stamps_receiving_profile(self):
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.session_store = object()
+        runner._handle_active_session_busy_message = object()
+        runner._recover_telegram_topic_thread_id = object()
+        runner._busy_text_mode = "queue"
+        runner._make_adapter_auth_check = lambda platform, profile_name=None: object()
+        runner._make_profile_message_handler = lambda profile_name: (lambda event: None)
+        runner._make_profile_fatal_error_handler = lambda profile_name, platform: (lambda *_a: None)
+
+        adapter = _ImmutableProfileAdapter()
+        runner._configure_profile_adapter(adapter, "coder", Platform.TELEGRAM)
+
+        assert adapter.receiving_profile == "coder"
+
+

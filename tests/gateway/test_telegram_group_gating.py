@@ -882,3 +882,101 @@ def test_identity_freshness_does_not_depend_on_host_uptime(monkeypatch):
 
     adapter._note_bot_username("new_helper_bot")
     assert adapter._bot_identity_is_fresh() is True
+
+
+# ── Slice 1.1R-B: capture-only route defense-in-depth ───────────────────
+#
+# The queue-level terminal deny (CaptureAwareQueue.put, see
+# tests/gateway/test_telegram_capture_ingress.py) is meant to make a
+# capture-only route's update unreachable here in the first place.
+# _should_process_message must independently return False anyway --
+# deliberate belt-and-suspenders, not redundant dead code (see the plan's
+# "Corrected seam" section).
+
+_CAPTURE_ONLY_CHAT_ID = -1003910549809
+_CAPTURE_ONLY_THREAD_ID = 271
+
+
+def _with_capture_only_route(adapter, *, chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=_CAPTURE_ONLY_THREAD_ID):
+    adapter.config.extra["capture_routes"] = [
+        {
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "mode": "capture_only",
+            "sink": "braindump",
+            "policy_version": "1.0.0",
+        }
+    ]
+    return adapter
+
+
+def test_capture_only_route_denies_plain_text():
+    adapter = _with_capture_only_route(_make_adapter())
+    message = _group_message("just some notes", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=_CAPTURE_ONLY_THREAD_ID)
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_capture_only_route_denies_command():
+    adapter = _with_capture_only_route(_make_adapter())
+    message = _group_message("/deploy prod", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=_CAPTURE_ONLY_THREAD_ID)
+
+    assert adapter._should_process_message(message, is_command=True) is False
+
+
+def test_capture_only_route_denies_reply_to_bot():
+    adapter = _with_capture_only_route(_make_adapter(require_mention=True))
+    message = _group_message(
+        "yes", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=_CAPTURE_ONLY_THREAD_ID, reply_to_bot=True,
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_capture_only_route_denies_explicit_mention():
+    adapter = _with_capture_only_route(_make_adapter(require_mention=True))
+    text = "@hermes_bot are you there"
+    message = _group_message(
+        text,
+        chat_id=_CAPTURE_ONLY_CHAT_ID,
+        thread_id=_CAPTURE_ONLY_THREAD_ID,
+        entities=[_mention_entity(text)],
+    )
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_capture_only_route_denies_free_response_topic_override():
+    adapter = _with_capture_only_route(
+        _make_adapter(free_response_topics=[str(_CAPTURE_ONLY_THREAD_ID)])
+    )
+    message = _group_message("hi", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=_CAPTURE_ONLY_THREAD_ID)
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_same_thread_number_other_chat_is_not_capture_only():
+    """Route matching is exact on (chat_id, thread_id) -- no chat-agnostic wildcard."""
+    adapter = _with_capture_only_route(_make_adapter())
+    message = _group_message(
+        "hello", chat_id=-999, thread_id=_CAPTURE_ONLY_THREAD_ID,
+    )
+
+    assert adapter._should_process_message(message) is True
+
+
+def test_general_topic_route_applies_to_null_thread_message():
+    adapter = _with_capture_only_route(_make_adapter(), thread_id=None)
+    message = _group_message("hello", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=None)
+
+    assert adapter._should_process_message(message) is False
+
+
+def test_non_capture_route_unaffected():
+    """Regression: a chat/topic with no configured route behaves exactly as before."""
+    adapter = _with_capture_only_route(_make_adapter(require_mention=True))
+    message = _group_message(
+        "hello", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=999,  # different topic, unrouted
+    )
+
+    assert adapter._should_process_message(message) is False  # require_mention still gates it
