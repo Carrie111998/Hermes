@@ -84,6 +84,20 @@ class TestPlatformRegistry:
         assert reg.unregister("beta") is False  # already gone
 
 
+    def test_create_adapter_check_fn_raises(self):
+        """check_fn() raising must not propagate — create_adapter returns None."""
+        reg = PlatformRegistry()
+        entry = PlatformEntry(
+            name="check_raises",
+            label="CheckRaises",
+            adapter_factory=lambda cfg: MagicMock(),
+            check_fn=lambda: (_ for _ in ()).throw(ImportError("optional dep missing")),
+            validate_config=None,
+            source="plugin",
+        )
+        reg.register(entry)
+        assert reg.create_adapter("check_raises", MagicMock()) is None
+
     def test_create_adapter_no_validate(self):
         """When validate_config is None, skip validation."""
         reg = PlatformRegistry()
