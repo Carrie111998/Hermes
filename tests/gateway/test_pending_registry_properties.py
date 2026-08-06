@@ -9,21 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import pytest
-
-# Hypothesis is optional.  A module-level importorskip took the plain unit
-# tests down with it, so an environment without Hypothesis silently covered
-# nothing (review: teknium1, 2026-07-30).  Unconditional regressions now live in
-# tests/gateway/test_completion_registry_regressions.py; only the property-based
-# state machine below is gated.
-hypothesis = pytest.importorskip(
-    "hypothesis",
-    reason="hypothesis is an optional test dependency; unconditional coverage "
-           "lives in test_completion_registry_regressions.py",
-)
-
-from hypothesis import HealthCheck, settings  # noqa: E402
-from hypothesis import strategies as st  # noqa: E402
-from hypothesis.stateful import RuleBasedStateMachine, invariant, rule  # noqa: E402
+from hypothesis import HealthCheck, settings
+from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, invariant, rule
 
 from gateway.run import GatewayRunner  # type: ignore
 

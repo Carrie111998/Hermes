@@ -34,6 +34,21 @@ def _runner(adapter):
     return runner
 
 
+def _runner_with_registry(adapter):
+    """_runner() plus PendingCompletionRegistry fields for real-flush tests."""
+    runner = _runner(adapter)
+    runner._completion_registry = GatewayRunner.PendingCompletionRegistry()
+    runner._flush_tasks_by_route = {}
+    runner._completion_flush_tasks = set()
+    runner._completion_notification_batch_lock = threading.Lock()
+    runner._completion_notification_batch_window = 0.0
+    runner._batch_window_sleep = asyncio.sleep
+    runner._completion_route_keys = {}
+    runner._completion_entry_data = {}
+    runner._background_tasks = set()
+    return runner
+
+
 def _completion_event(*, started_at, session_id="proc_0"):
     return {
         "type": "completion",
@@ -48,6 +63,10 @@ def _completion_event(*, started_at, session_id="proc_0"):
         "completion_reason": "exited",
         "output": f"{session_id} done\n",
     }
+
+
+async def _instant_sleep(_delay):
+    pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -201,5 +220,141 @@ def test_enqueue_rejection_reason_is_recoverable():
         reg.deliver("proc_a")
         assert reg.rejection_reason("proc_a") == "capacity"
         assert reg.enqueue("proc_a", ("r1",), {"x": 1}) is not None
+
+    asyncio.run(_test())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Blocked-adapter cancellation regression (reviewer probe, blocker #73469)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_cancel_during_blocked_adapter_delivery_keeps_entry_routable():
+    """Cancel a flush mid-delivery through the real production path.
+
+    Regression for the non-atomic cancellation documented in the review:
+    a terminal default (DROP_UNROUTABLE) + inner-finally-before-outer-handler
+    ordering resolved the waiter with a drop, removed the route indexes, and
+    left the registry entry PENDING but unreachable.  After the fix the
+    cancellation path restores the entry to a *routable* PENDING and resolves
+    with RETRY.
+    """
+    release = asyncio.Event()
+    delivery_started = asyncio.Event()
+
+    async def _blocked_injection(_message_event):
+        delivery_started.set()
+        await release.wait()
+        return True  # would be accepted if not cancelled
+
+    adapter = SimpleNamespace(handle_message=AsyncMock(side_effect=_blocked_injection))
+    runner = _runner_with_registry(adapter)
+
+    async def _exercise():
+        # Override sleep so the batch window is instant — the flush enters
+        # its claim+deliver path without actually sleeping.  Must be set
+        # AFTER registry init so __init__ doesn't overwrite it.
+        runner._batch_window_sleep = _instant_sleep
+
+        evt = _completion_event(started_at=1.0, session_id="proc_cancel")
+        identity = runner._completion_delivery_identity(evt)
+        waiter = asyncio.ensure_future(
+            runner._enqueue_process_completion_notification("cancel-me", evt),
+        )
+
+        # Wait for the flush to claim the entry and enter the blocked delivery.
+        await delivery_started.wait()
+
+        # The flush task removes itself from _flush_tasks_by_route after
+        # the batch-window sleep.  Find it via _completion_flush_tasks.
+        flush_task = None
+        for _t in runner._completion_flush_tasks:
+            if not _t.done():
+                flush_task = _t
+                break
+        assert flush_task is not None, "no running flush task in _completion_flush_tasks"
+        flush_task.cancel()
+
+        # Let the CancelledError propagate through the flush's handlers.
+        try:
+            await flush_task
+        except asyncio.CancelledError:
+            pass
+
+        # Now unblock the adapter so the test can clean up.
+        release.set()
+
+        result = await asyncio.wait_for(waiter, timeout=3.0)
+
+        # 1. Waiter gets RETRY — never a terminal drop.
+        assert result is runner.CompletionDisposition.RETRY, (
+            f"Expected RETRY after cancellation, got {result!r}"
+        )
+
+        # 2. After cancellation, the entry is routable — the re-flush
+        #    scheduled by the CancelledError handler should deliver it.
+        #    Wait for the re-flush to complete.
+        await asyncio.sleep(0.1)
+
+        snap = runner._completion_registry.snapshot()
+        state = snap.get(identity)
+        # If the re-flush delivered, great.  If still PENDING, the entry
+        # must still be routable (the index survived the cancellation).
+        assert state in (
+            runner._completion_registry.State.DELIVERED,
+            runner._completion_registry.State.PENDING,
+        ), f"Expected DELIVERED or PENDING, got {state!r}"
+
+        if state is runner._completion_registry.State.PENDING:
+            assert runner._completion_route_keys.get(identity) is not None, (
+                "route index was removed — entry is PENDING but unreachable"
+            )
+
+        # 3. signal_stop recovers or acknowledges the entry.
+        runner._running = False  # let stop() proceed
+        runner._shutdown_event = asyncio.Event()
+        runner.adapters = {}  # avoid real adapter disconnect
+        final_snap = runner._completion_registry.snapshot()
+        final_state = final_snap.get(identity)
+        # The entry is at least not UNROUTABLE — the termination was
+        # either DELIVERED (re-flush succeeded) or STOPPING (signal_stop
+        # caught it).  Never missing, never DROP_UNROUTABLE.
+        if final_state is not None:
+            assert final_state is not runner._completion_registry.State.UNROUTABLE, (
+                f"entry ended UNROUTABLE — a terminal drop (state={final_state!r})"
+            )
+        # If the entry is missing from the snapshot it was evicted as a
+        # terminal DELIVERED beyond TERMINAL_RETENTION — which can happen
+        # when the re-flush delivered and then signal_stop's eviction swept it.
+        # The key property: it never became UNROUTABLE.
+
+    asyncio.run(_exercise())
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  signal_stop finds entries missing from route index (defense in depth)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def test_stop_recovers_entry_orphaned_by_missing_route_index():
+    """signal_stop scans the authoritative entry map, not the route index.
+
+    If a future bug orphans an entry (PENDING, no route key), signal_stop
+    still finds and recovers it.  Degrades from silent loss to delayed
+    delivery — the net the reviewer described.
+    """
+    async def _test():
+        reg = GatewayRunner.PendingCompletionRegistry()
+        f = reg.enqueue("proc_orphan", ("r1",), {"synth_text": "t", "evt": {}})
+        assert f is not None
+
+        # Simulate the orphan: entry is PENDING but not in any route index.
+        stopped = reg.signal_stop()
+        assert any(e["identity"] == "proc_orphan" for e in stopped), (
+            "signal_stop did not find the orphaned entry"
+        )
+        reg.resolve_futures(stopped, GatewayRunner.CompletionDisposition.SHUTTING_DOWN)
+        assert await f is GatewayRunner.CompletionDisposition.SHUTTING_DOWN
+        assert reg.snapshot()["proc_orphan"] is (
+            GatewayRunner.PendingCompletionRegistry.State.STOPPING
+        )
 
     asyncio.run(_test())

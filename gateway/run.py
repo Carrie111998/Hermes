@@ -22820,7 +22820,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
 
             entry_data = self._completion_entry_data
-            delivered_disposition = self.CompletionDisposition.DROP_UNROUTABLE
+            # None = undecided.  A terminal default (DROP_UNROUTABLE) makes
+            # "not yet decided" and "decided to drop" the same value — the
+            # exact Optional[bool] ambiguity this registry was built to
+            # remove.  Cancellation hitting the inner finally before a
+            # decision is reached would then resolve the waiter with a
+            # terminal drop, remove the route indexes, and leave the
+            # registry entry PENDING but unreachable (yuzilongleif-collab,
+            # blocker #73469).
+            outcome: "CompletionDisposition | None" = None
+            cancelled_path_taken = False
 
             try:
                 # Build entries list for formatting
@@ -22846,7 +22855,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         break
 
                 if delivered is self.CompletionDisposition.DELIVERED:
-                    delivered_disposition = self.CompletionDisposition.DELIVERED
+                    outcome = self.CompletionDisposition.DELIVERED
                     for reg in claimed:
                         self._completion_registry.deliver(reg["identity"])
                         evt_data = entry_data.get(reg["identity"], ({},))[1] if entry_data.get(reg["identity"]) else {}
@@ -22861,55 +22870,85 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 ):
                                     self._completion_deliveries_delivered.popitem(last=False)
                 elif delivered is self.CompletionDisposition.RETRY:
-                    delivered_disposition = self.CompletionDisposition.RETRY
+                    outcome = self.CompletionDisposition.RETRY
                     retryable, exhausted, retry_at = self._plan_completion_retry(
                         claimed,
                     )
                 elif delivered is self.CompletionDisposition.DROP_DUPLICATE:
                     # A duplicate is SUPERSEDED, not UNROUTABLE — conflating the
                     # two is exactly the state ambiguity this registry removes.
-                    delivered_disposition = self.CompletionDisposition.DROP_DUPLICATE
+                    outcome = self.CompletionDisposition.DROP_DUPLICATE
                     for reg in claimed:
                         self._completion_registry.supersede(reg["identity"])
                 else:
-                    delivered_disposition = self.CompletionDisposition.DROP_UNROUTABLE
+                    outcome = self.CompletionDisposition.DROP_UNROUTABLE
                     for reg in claimed:
                         self._completion_registry.mark_unroutable(reg["identity"])
+            except asyncio.CancelledError:
+                # Single-owner atomic transition: restore entries to a
+                # *routable* PENDING before resolving any waiter.  The
+                # inner finally must see cancelled_path_taken=True so it
+                # does not resolve with a terminal drop.
+                cancelled_path_taken = True
+                for reg in claimed:
+                    self._completion_registry.retry(reg["identity"])
+                # Schedule a re-flush so entries stay reachable through
+                # the normal delivery path.
+                self._schedule_completion_retry(key, None)
+                # Resolve with RETRY — never a terminal drop.  The caller
+                # retries; the registry keeps the entry routable.
+                self._completion_registry.resolve_futures(
+                    claimed, self.CompletionDisposition.RETRY,
+                )
+                raise
             except Exception:
                 logger.exception("Coalesced process completion delivery failed")
-                delivered_disposition = self.CompletionDisposition.RETRY
+                outcome = self.CompletionDisposition.RETRY
                 retryable, exhausted, retry_at = self._plan_completion_retry(
                     claimed,
                 )
             finally:
-                # Entries going back to PENDING keep their route/payload
-                # indexes so the scheduled re-flush can find them; only
-                # terminal entries are unindexed and resolved here.
-                if delivered_disposition is self.CompletionDisposition.RETRY:
-                    for reg in exhausted:
-                        entry_data.pop(reg["identity"], None)
-                        self._completion_route_keys.pop(reg["identity"], None)
-                    self._completion_registry.resolve_futures(
-                        exhausted, self.CompletionDisposition.FAILED,
+                # Only act when a decision was reached.  cancelled_path_taken
+                # means the CancelledError handler already did everything:
+                # restored PENDING, kept indexes, resolved with RETRY, and
+                # scheduled a re-flush.  outcome is still None here.
+                if outcome is not None:
+                    if outcome is self.CompletionDisposition.RETRY:
+                        for reg in exhausted:
+                            entry_data.pop(reg["identity"], None)
+                            self._completion_route_keys.pop(reg["identity"], None)
+                        self._completion_registry.resolve_futures(
+                            exhausted, self.CompletionDisposition.FAILED,
+                        )
+                        if retryable:
+                            self._schedule_completion_retry(key, retry_at)
+                    else:
+                        self._completion_registry.resolve_futures(
+                            claimed, outcome,
+                        )
+                        for reg in claimed:
+                            entry_data.pop(reg["identity"], None)
+                            self._completion_route_keys.pop(reg["identity"], None)
+                elif not cancelled_path_taken:
+                    # Reached finally with no decision and no cancellation —
+                    # this is a logic bug.  Fail loudly; never resolve a
+                    # waiter with an undecided disposition.
+                    logger.error(
+                        "flush reached finally with undecided outcome", extra={
+                            "route_key": key, "claimed_count": len(claimed),
+                        },
                     )
-                    if retryable:
-                        self._schedule_completion_retry(key, retry_at)
-                else:
-                    self._completion_registry.resolve_futures(
-                        claimed, delivered_disposition,
-                    )
-                    for reg in claimed:
-                        entry_data.pop(reg["identity"], None)
-                        self._completion_route_keys.pop(reg["identity"], None)
+                    raise AssertionError("undecided completion outcome")
         except asyncio.CancelledError:
-            # Cancellation is never terminal by omission.  Claimed entries go
-            # back to PENDING with their indexes intact; entries still PENDING
-            # (cancelled inside the batch window) were never claimed, so they
-            # stay enqueued and their waiters stay unresolved until either a
-            # later flush delivers them or signal_stop() resolves them as
-            # SHUTTING_DOWN.
-            if claimed:
-                self._plan_completion_retry(claimed)
+            # Cancellation before the inner try (during batch-window sleep or
+            # identity collection).  Entries were never claimed, so they stay
+            # PENDING with their indexes intact.  If the CancelledError
+            # handler inside the inner try already ran (cancelled_path_taken),
+            # claimed entries were already restored there; this is a no-op
+            # because retry() on a non-CLAIMED entry returns None.
+            if claimed and not cancelled_path_taken:
+                for reg in claimed:
+                    self._completion_registry.retry(reg["identity"])
             raise
         finally:
             with self._completion_notification_batch_lock:
