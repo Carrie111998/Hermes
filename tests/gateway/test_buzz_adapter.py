@@ -152,8 +152,16 @@ class TestCliErrorContract:
         msg = _cli_error_message('{"error":"relay_error","message":"boom","retryable":false}', 2)
         assert "relay_error" in msg and "boom" in msg and "exit 2" in msg
 
+    def test_bounds_untrusted_nonzero_cli_error(self):
+        msg = _cli_error_message(
+            json.dumps({"error": "relay_error", "message": "x" * 100_000}),
+            2,
+        )
+        assert msg.startswith("relay_error:")
+        assert len(msg) <= 900
 
-# ── Seeding / high-water mark / de-dupe ───────────────────────────────────
+
+# ── Seeding / high-water mark / de-dupe ────────────────────────────────────
 
 
 class TestPollingDedupe:

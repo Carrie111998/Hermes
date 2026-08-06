@@ -317,20 +317,27 @@ async def _exec_buzz(
     )
 
 
-def _cli_error_message(stderr: str, returncode: int) -> str:
-    """Extract the human-readable message from the CLI's JSON error contract.
+_MAX_CLI_MESSAGE_CHARS = 900
 
-    stderr is ``{"error": "<category>", "message": "<detail>"}`` on failure;
-    fall back to the raw (stripped) stderr when it isn't JSON.
-    """
+
+def _bounded_cli_message(message: str) -> str:
+    if len(message) <= _MAX_CLI_MESSAGE_CHARS:
+        return message
+    return f"{message[: _MAX_CLI_MESSAGE_CHARS - 3]}..."
+
+
+def _cli_error_message(stderr: str, returncode: int) -> str:
+    """Extract a bounded human-readable message from the CLI error contract."""
     text = (stderr or "").strip()
     try:
         data = json.loads(text)
         if isinstance(data, dict) and data.get("message"):
-            return f"{data.get('error', 'error')}: {data['message']} (exit {returncode})"
+            return _bounded_cli_message(
+                f"{data.get('error', 'error')}: {data['message']} (exit {returncode})"
+            )
     except ValueError:
         pass
-    return text or f"buzz CLI failed with exit code {returncode}"
+    return _bounded_cli_message(text or f"buzz CLI failed with exit code {returncode}")
 
 
 def _cli_retryable(raw: str, exit_code: int) -> bool:
