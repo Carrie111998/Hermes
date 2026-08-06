@@ -8,7 +8,10 @@ and working-directory resolution.
 ---
 
 ### config.yaml options:
-1. Add to `DEFAULT_CONFIG` in `hermes_cli/config.py`
+1. Add documented/defaulted keys to `DEFAULT_CONFIG` in
+   `hermes_cli/config.py`. It is the primary known-root/default source, not a
+   universal schema: `_EXTRA_KNOWN_ROOT_KEYS` and `read_user_config_raw()` cover
+   intentionally absent, dynamic, or presence-sensitive roots.
 2. Bump `_config_version` (check the current value at the top of `DEFAULT_CONFIG`)
    ONLY if you need to actively migrate/transform existing user config
    (renaming keys, changing structure). Adding a new key to an existing
@@ -31,7 +34,10 @@ its own provider/model/base_url/max_tokens/reasoning_effort. See
 `enabled`, `interval_hours`, `min_idle_hours`, `stale_after_days`,
 `archive_after_days`, `backup` (nested).
 
-### .env variables (SECRETS ONLY — API keys, tokens, passwords):
+### .env variables
+
+New credentials (API keys, tokens, passwords) are declared in
+`OPTIONAL_ENV_VARS`; do not add new env-only behavioral configuration:
 1. Add to `OPTIONAL_ENV_VARS` in `hermes_cli/config.py` with metadata:
 ```python
 "NEW_API_KEY": {
@@ -44,9 +50,11 @@ its own provider/model/base_url/max_tokens/reasoning_effort. See
 ```
 
 Non-secret settings (timeouts, thresholds, feature flags, paths, display
-preferences) belong in `config.yaml`, not `.env`. If internal code needs an
-env var mirror for backward compatibility, bridge it from `config.yaml` to
-the env var in code (see `gateway_timeout`, `terminal.cwd` → `TERMINAL_CWD`).
+preferences) canonically belong in `config.yaml`, not `.env`. Legacy/internal,
+platform, and plugin behavioral env variables still exist (for example
+`HERMES_BACKGROUND_NOTIFICATIONS` and `HERMES_CRON_TIMEOUT`); preserve needed
+compatibility, but bridge new user-facing behavior from config rather than
+presenting runtime env as secret-only.
 
 ### Config loaders (three paths — know which one you're in):
 
@@ -56,8 +64,9 @@ the env var in code (see `gateway_timeout`, `terminal.cwd` → `TERMINAL_CWD`).
 | `load_config()` | `hermes tools`, `hermes setup`, most CLI subcommands | `hermes_cli/config.py` — merges `DEFAULT_CONFIG` + user YAML |
 | Direct YAML load | Gateway runtime | `gateway/run.py` + `gateway/config.py` — reads user YAML raw |
 
-If you add a new key and the CLI sees it but the gateway doesn't (or vice
-versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
+If a new key appears in one surface but not another, trace the actual loader.
+Check `DEFAULT_CONFIG` and the raw/presence-sensitive paths rather than assuming
+one merged schema governs every runtime.
 
 ### Working directory:
 - **CLI** — uses the process's current directory (`os.getcwd()`).
@@ -66,3 +75,16 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
   removed** — the config loader prints a deprecation warning if it's set in
   `.env`. Same for `TERMINAL_CWD` in `.env`; the canonical setting is
   `terminal.cwd` in `config.yaml`.
+
+### Background process notifications
+
+`display.background_process_notifications` controls gateway messages for
+tracked background commands:
+
+- `all` — running-output updates and the final message (default)
+- `result` — only the final completion message
+- `error` — only a non-zero-exit final message
+- `off` — no watcher messages
+
+`HERMES_BACKGROUND_NOTIFICATIONS` remains an internal/backward-compatible
+override; user-facing configuration belongs in `config.yaml`.
