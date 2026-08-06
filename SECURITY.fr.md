@@ -8,7 +8,7 @@ et définit le périmètre des signalements de vulnérabilités.
 
 Signalez de manière privée via les [GitHub Security Advisories](https://github.com/NousResearch/hermes-agent/security/advisories/new)
 ou **security@nousresearch.com**. N'ouvrez pas d'issues publiques pour
-des vulnérabilités de sécurité. **Hermes Agent n'opère pas de programme
+des vulnérabilités de sécurité. **Hermes Agent n'a pas de programme
 de bug bounty.**
 
 Un signalement utile comprend :
@@ -113,7 +113,7 @@ Hermes Agent le permet de deux façons :
   déclarative couvrant le système de fichiers, le réseau (egress L7),
   les processus/syscalls et le routage d'inférence. Les politiques
   réseau et d'inférence sont rechargeables à chaud. Les identifiants
-  sont injectés depuis un magasin Provider et ne touchent jamais le
+  sont injectés depuis le store Provider et ne touchent jamais le
   système de fichiers de la sandbox.
 
 Sous une encapsulation du processus complet, les heuristiques
@@ -140,7 +140,7 @@ et les tokens du gateway sont retirés par défaut ; les variables
 explicitement déclarées par l'opérateur ou par une skill chargée sont
 transmises.
 
-Cela réduit l'exfiltration opportuniste. Ce n'est pas du confinement.
+Cela réduit l'exfiltration accidentelle. Ce n'est pas du confinement.
 Tout composant s'exécutant dans le processus de l'agent (skills,
 plugins, gestionnaires de hooks) peut lire tout ce que l'agent lui-même
 peut lire, y compris les identifiants en mémoire. La parade contre un
@@ -187,7 +187,7 @@ installe sont dans le périmètre au titre du §3.1.
 
 Une **surface externe** est tout canal extérieur au processus local de
 l'agent par lequel un appelant peut déclencher du travail de l'agent,
-résoudre des approbations ou recevoir la sortie de l'agent. Chaque
+statuer sur les approbations ou recevoir la sortie de l'agent. Chaque
 surface a son propre modèle d'autorisation, mais les règles ci-dessous
 s'appliquent uniformément.
 
@@ -208,7 +208,7 @@ s'appliquent uniformément.
 1. **Une autorisation est requise à chaque surface qui franchit une
    frontière de confiance.** Pour les surfaces de messagerie et HTTP
    réseau, la frontière est le réseau : l'autorisation prend la forme
-   d'une liste d'appelants autorisés configurée par l'opérateur. Pour
+   d'une liste d'autorisation des appelants configurée par l'opérateur. Pour
    les surfaces éditeur et IPC local (ACP, gateway TUI), la frontière
    est le compte utilisateur de l'hôte : l'autorisation consiste à
    s'appuyer sur le contrôle d'accès de l'OS (permissions de fichiers,
@@ -217,7 +217,7 @@ s'appliquent uniformément.
    explicite.
 2. **Une liste d'autorisation est requise pour chaque adaptateur exposé
    au réseau qui est activé.** Les adaptateurs doivent refuser de
-   déclencher du travail de l'agent, de résoudre des approbations ou de
+   déclencher du travail de l'agent, de statuer sur des approbations ou de
    relayer des sorties tant qu'aucune liste d'autorisation n'est
    définie. Les chemins de code qui laissent passer par défaut
    lorsqu'aucune liste n'est configurée sont des bugs de code dans le
@@ -251,13 +251,13 @@ s'appliquent uniformément.
 - L'accès non autorisé à une surface externe : un appelant hors de
   l'ensemble d'autorisation configuré (liste d'autorisation, ou
   équivalent au niveau de l'OS pour les surfaces IPC locales) qui
-  déclenche du travail, reçoit des sorties ou résout des approbations
+  déclenche du travail, reçoit des sorties ou statue sur des approbations
   (§2.6).
 - L'exfiltration d'identifiants : fuite d'identifiants de l'opérateur
   ou de matériel d'autorisation de session vers une destination hors de
   l'enveloppe de confiance, via un mécanisme qui aurait dû l'empêcher
   (bug de nettoyage de l'environnement, journalisation d'un adaptateur,
-  erreur de transport qui déverse des identifiants vers un amont,
+  erreur de transport qui déverse des identifiants vers un service en amont,
   etc.).
 - Les violations de la documentation du modèle de confiance : du code
   qui se comporte contrairement à ce que cette politique, la propre
@@ -291,7 +291,7 @@ sécurité.
   inhabituelle — via du contenu injecté, une hallucination, des
   artefacts d'entraînement ou toute autre cause — n'est pas en soi une
   vulnérabilité. « J'ai réussi une injection de prompt » sans
-  enchaînement vers un résultat du §3.1 n'est pas un signalement
+  aboutir à un résultat du §3.1 n'est pas un signalement
   exploitable au sens de cette politique.
 - **Les conséquences d'une posture d'isolation choisie.** Les
   signalements indiquant qu'un chemin de code opérant dans le périmètre
@@ -299,7 +299,7 @@ sécurité.
   vulnérabilités. Exemples : des outils shell ou fichiers atteignant
   l'état de l'hôte sous le backend local ; des sous-processus
   d'exécution de code ou MCP atteignant l'état de l'hôte sous une
-  isolation par backend de terminal qui ne sandboxe que le shell ; des
+  isolation par backend de terminal qui n'isole que le shell ; des
   signalements dont les préconditions exigent un accès en écriture
   préexistant à des fichiers de configuration ou d'identifiants
   appartenant à l'opérateur (ceux-ci sont déjà à l'intérieur de
@@ -340,12 +340,12 @@ l'agent va ingérer. Au-delà de cela :
 - Conservez les identifiants dans le fichier d'identifiants de
   l'opérateur avec des permissions strictes, jamais dans la
   configuration principale, jamais sous contrôle de version. Sous
-  OpenShell, utilisez le magasin Provider plutôt qu'un fichier
+  OpenShell, utilisez le store Provider plutôt qu'un fichier
   d'identifiants sur disque.
 - N'exposez pas le gateway ou l'API à l'internet public sans VPN,
   Tailscale ou protection par pare-feu. Sous OpenShell, utilisez la
   couche de politique réseau pour restreindre l'egress.
-- Configurez une liste d'appelants autorisés pour chaque adaptateur
+- Configurez une liste d'autorisation des appelants pour chaque adaptateur
   exposé au réseau que vous activez (§2.6).
 - Passez en revue les skills et plugins tiers avant installation
   (§2.4, §2.5). Pour les skills, cela signifie lire le Python et les

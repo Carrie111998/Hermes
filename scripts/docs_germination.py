@@ -200,6 +200,7 @@ def _scan(text: str) -> tuple[str, list[dict]]:
                     {
                         "marker": marker,
                         "lang": lang,
+                        "body": "\n".join(body),
                         "sha256": hashlib.sha256("\n".join(body).encode("utf-8")).hexdigest()[:16],
                     }
                 )
@@ -213,15 +214,90 @@ def _scan(text: str) -> tuple[str, list[dict]]:
             {
                 "marker": marker,
                 "lang": lang,
+                "body": "\n".join(body),
                 "sha256": hashlib.sha256("\n".join(body).encode("utf-8")).hexdigest()[:16],
             }
         )
     return "\n".join(masked), fences
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Fence comment localization. Code fences stay byte-identical EXCEPT comment
+# lines: a line-leading comment or a trailing ' # ...' comment is localizable
+# prose (translators render it in the target language) while every non-
+# comment byte of the body must match exactly. Code tokens inside comments
+# (backtick spans) still must survive — see _fence_comment_spans.
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TRAILING_COMMENT_RE = re.compile(r"(?<=\s)#(?=[ \t]|$)")
+
+
+def _comment_segments(line: str) -> list[tuple[int, int]]:
+    """(start, end) spans of comment text on a code line: a line-leading
+    comment (unless shebang) or a trailing ' # ...' comment. A '#' inside a
+    quoted string (e.g. '"# hi"') is not preceded by whitespace and is left
+    alone."""
+    s = line.lstrip()
+    lead = len(line) - len(s)
+    if s.startswith("#") and not s.startswith("#!"):
+        return [(lead, len(line))]
+    segs = []
+    for m in _TRAILING_COMMENT_RE.finditer(line):
+        if m.start() >= lead:
+            segs.append((m.start(), len(line)))
+            break  # only the first trailing comment per line
+    return segs
+
+
+def _comment_normalized(body: str) -> str:
+    """Body with every comment span blanked and trailing padding stripped
+    (positions preserved per line, padding length irrelevant). Two fences
+    whose non-comment bytes match compare equal."""
+    out = []
+    for line in body.split("\n"):
+        segs = _comment_segments(line)
+        if not segs:
+            out.append(line.rstrip())
+            continue
+        chars = list(line)
+        for a, b in segs:
+            chars[a:b] = " " * (b - a)
+        out.append("".join(chars).rstrip())
+    return "\n".join(out)
+
+
+def _fence_comment_spans(text: str) -> list[str]:
+    """Backtick spans inside fence comment lines — technical identifiers in
+    comments must survive translation too (e.g. `env -i` in a CI comment)."""
+    spans: list[str] = []
+    for f in _scan(text)[1]:
+        seg_texts = []
+        for line in (f.get("body") or "").split("\n"):
+            for a, b in _comment_segments(line):
+                seg_texts.append(line[a:b])
+        joined = "\n".join(seg_texts)
+        positions = [m.start() for m in re.finditer(r"`", joined)]
+        for i in range(0, len(positions) - 1, 2):
+            span = joined[positions[i] + 1 : positions[i + 1]]
+            if "\n" not in span:
+                spans.append(span)
+    return spans
+
+
 def extract_fences(text: str) -> list[dict]:
-    """Sequence of fenced code blocks: marker, language, body hash."""
-    _, fences = _scan(text)
+    """Sequence of fenced code blocks: marker, language, body hash.
+
+    Body hashes compare COMMENT-NORMALIZED bodies: comment lines (and
+    trailing comments) are localizable prose; every other byte of the body
+    must match exactly. Comment backtick spans are required separately via
+    _fence_comment_spans (code_span_parity)."""
+    fences = []
+    for f in _scan(text)[1]:
+        f = dict(f)
+        f["body_sha256"] = hashlib.sha256(
+            _comment_normalized(f["body"]).encode("utf-8")
+        ).hexdigest()[:16]
+        fences.append(f)
     return fences
 
 
@@ -327,11 +403,13 @@ def check_doc_parity(
     def warn(cls: str, detail: str) -> None:
         issues.append({"class": cls, "severity": "warning", "detail": detail})
 
-    # 1. Fence parity — identical code fence sequence, byte-identical bodies
-    #    (marker + language + body hash). Code is never translated.
+    # 1. Fence parity — identical code fence sequence (marker + language),
+    #    with COMMENT-NORMALIZED body hashes: command bytes must match
+    #    exactly; comment lines/trailing comments are localizable prose.
+    #    Comment code spans are required via code_span_parity below.
     en_f, loc_f = extract_fences(en_text), extract_fences(loc_text)
-    en_sig = [(f["marker"], f["lang"], f["sha256"]) for f in en_f]
-    loc_sig = [(f["marker"], f["lang"], f["sha256"]) for f in loc_f]
+    en_sig = [(f["marker"], f["lang"], f["body_sha256"]) for f in en_f]
+    loc_sig = [(f["marker"], f["lang"], f["body_sha256"]) for f in loc_f]
     if en_sig != loc_sig:
         err(
             "fence_parity",
@@ -345,6 +423,10 @@ def check_doc_parity(
     #    twin (``CONTRIBUTING.fr.md``) — same rewrite rule as link targets.
     en_spans = extract_code_spans(en_text)
     loc_spans = set(extract_code_spans(loc_text))
+    # Comment code spans inside fences are required too; they may be
+    # satisfied in the locale's prose OR in its fence comments.
+    en_spans += _fence_comment_spans(en_text)
+    loc_spans |= set(_fence_comment_spans(loc_text))
     missing = [
         s
         for s in dict.fromkeys(en_spans)

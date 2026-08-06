@@ -131,14 +131,36 @@ def test_fence_scanner_gfm_closing_rules():
     text = "```\nkey: value\n```yaml\n# comment inside the same block\nstill code\n```\n"
     fences = extract_fences(text)
     assert len(fences) == 1, f"expected ONE fence, got {fences}"
-    body_hashes = {f["sha256"] for f in fences}
-    # The single block contains all three body lines.
+    body_hashes = {f["body_sha256"] for f in fences}
+    # The single block contains all three body lines; the hash is of the
+    # COMMENT-NORMALIZED body (comments are localizable prose).
     import hashlib
-    expect = hashlib.sha256("key: value\n```yaml\n# comment inside the same block\nstill code".encode()).hexdigest()[:16]
+    norm_body = "key: value\n```yaml\n# comment inside the same block\nstill code"
+    from docs_germination import _comment_normalized  # noqa: E402
+    expect = hashlib.sha256(_comment_normalized(norm_body).encode()).hexdigest()[:16]
     assert body_hashes == {expect}
     # And the ```yaml interior line must not be scanned as prose.
     assert extract_code_spans(text) == []
     assert extract_headings(text) == []
+
+
+def test_fence_comments_are_localizable_commands_are_not():
+    """A translated comment inside a fence passes parity; an altered
+    command line fails. Comment code spans are still required."""
+    en = "```bash\n# Preferred — matches CI (hermetic `env -i`)\nscripts/run_tests.sh\n```\n"
+    # Comment translated to French, command byte-identical, `env -i` kept:
+    loc_ok = "```bash\n# Préféré — correspond à CI (hermétique `env -i`)\nscripts/run_tests.sh\n```\n"
+    issues = check_doc_parity(en, loc_ok, "README.md", "xx", "germinated")
+    hard = [i for i in issues if i["class"] in ("fence_parity", "code_span_parity")]
+    assert not hard, f"translated comment should pass: {hard}"
+    # Command altered -> fence_parity error:
+    loc_bad = "```bash\n# Préféré — correspond à CI (hermétique `env -i`)\nscripts/run_tests.sh --xdist\n```\n"
+    issues = check_doc_parity(en, loc_bad, "README.md", "xx", "germinated")
+    assert any(i["class"] == "fence_parity" for i in issues)
+    # Comment drops `env -i` -> code_span_parity error:
+    loc_missing = "```bash\n# Préféré — correspond à CI\nscripts/run_tests.sh\n```\n"
+    issues = check_doc_parity(en, loc_missing, "README.md", "xx", "germinated")
+    assert any(i["class"] == "code_span_parity" for i in issues)
 
 
 def test_extract_code_spans_verbatim():

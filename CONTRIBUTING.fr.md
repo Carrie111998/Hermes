@@ -22,7 +22,7 @@ Nous valorisons les contributions dans cet ordre :
 
 Une recherche rapide avant de vous lancer vous fait gagner du temps et garde la file des PR propre — les doublons sont fréquents ici, alors une minute en amont vaut le coup.
 
-- **Cherchez dans les PR et issues ouvertes *et* fusionnées** votre sujet ou le symptôme de votre erreur — la vérification de doublons du template de PR n'intervient qu'au moment de la revue, une fois le travail déjà fait :
+- **Cherchez dans les PR et issues ouvertes *et* fusionnées** votre sujet ou le symptôme de votre erreur — la vérification de doublons du gabarit de PR n'intervient qu'au moment de la revue, une fois le travail déjà fait :
   ```bash
   gh search issues --repo NousResearch/hermes-agent "<your terms>"
   gh search prs --repo NousResearch/hermes-agent --state all "<your terms>"
@@ -49,7 +49,7 @@ C'est la question la plus fréquente chez les nouveaux contributeurs. La répons
 
 ### Faites-en un outil quand :
 
-- Il exige une intégration de bout en bout avec clés API, flux d'authentification ou configuration multi-composants gérée par le harnais de l'agent
+- Il exige une intégration de bout en bout avec clés API, flux d'authentification ou configuration multi-composants gérée par l'infrastructure de l'agent
 - Il nécessite une logique de traitement sur mesure qui doit s'exécuter avec précision à chaque fois (pas du « au mieux » issu de l'interprétation du LLM)
 - Il manipule des données binaires, du streaming ou des événements temps réel qui ne peuvent pas passer par le terminal
 - Exemples : automatisation de navigateur (gestion de sessions Browserbase), TTS (encodage audio + livraison sur la plateforme), analyse de vision (manipulation d'images en base64)
@@ -61,7 +61,7 @@ Les compétences embarquées (dans `skills/`) sont livrées avec chaque installa
 - Traitement de documents, recherche web, workflows de développement courants, administration système
 - Utilisées régulièrement par un large éventail de personnes
 
-Si votre compétence est officielle et utile mais pas universellement nécessaire (par exemple l'intégration d'un service payant, une dépendance lourde), placez-la dans **`optional-skills/`** — elle est livrée avec le dépôt mais n'est pas activée par défaut. Les utilisateurs peuvent la découvrir via `hermes skills browse` (étiquetée « official ») et l'installer avec `hermes skills install` (sans avertissement tiers, confiance intégrée).
+Si votre compétence est officielle et utile mais pas universellement nécessaire (par exemple l'intégration d'un service payant, une dépendance lourde), placez-la dans **`optional-skills/`** — elle est livrée avec le dépôt mais n'est pas activée par défaut. Les utilisateurs peuvent la découvrir via `hermes skills browse` (étiquetée « officielle ») et l'installer avec `hermes skills install` (sans avertissement tiers, confiance intégrée).
 
 Si votre compétence est spécialisée, issue de la communauté ou de niche, elle a plus sa place sur un **Skills Hub** — téléversez-la sur un registre de compétences et partagez-la sur le [Discord de Nous Research](https://discord.gg/NousResearch). Les utilisateurs peuvent l'installer avec `hermes skills install`.
 
@@ -73,11 +73,11 @@ Si votre compétence est spécialisée, issue de la communauté ou de niche, ell
 
 Les plugins de mémoire autonomes :
 
-- Implémentent la même ABC `MemoryProvider` (`agent/memory_provider.py`) — `sync_turn`, `prefetch`, `shutdown`, et éventuellement `post_setup(hermes_home, config)` pour l'intégration avec l'assistant de configuration
+- Implémentent la même ABC `MemoryProvider` (`agent/memory_provider.py`) — `sync_turn`, `prefetch`, `shutdown`, et, en option, `post_setup(hermes_home, config)` pour l'intégration avec l'assistant de configuration
 - Utilisent le même système de découverte — `discover_memory_providers()` les récupère dans les répertoires de plugins utilisateur/projet et les entry points pip
 - S'intègrent à `hermes memory setup` via `post_setup()` — sans toucher au code du cœur
 - Peuvent enregistrer leurs propres sous-commandes CLI via `register_cli(subparser)` dans un fichier `cli.py`
-- Bénéficient des mêmes hooks de cycle de vie et de la même plomberie de configuration que les fournisseurs intégrés
+- Bénéficient des mêmes hooks de cycle de vie et de la même infrastructure de configuration que les fournisseurs intégrés
 
 Les PR qui ajoutent un nouveau répertoire sous `plugins/memory/` seront fermées avec un renvoi vers la publication du fournisseur dans son propre dépôt. Les fournisseurs déjà intégrés restent ; les corrections de bugs les concernant sont les bienvenues.
 
@@ -115,7 +115,7 @@ Un plugin de produit tiers bien construit peut passer la revue automatisée et �
 
 ### Installation avec l'installeur standard
 
-Pour la plupart des contributeurs, le meilleur amorçage de développement est le même
+Pour la plupart des contributeurs, la meilleure façon d'amorcer le développement est la même
 chemin que celui des utilisateurs : lancer l'installeur standard, puis travailler dans
 le dépôt qu'il a cloné. L'installeur crée le venv d'Hermes, câble la commande
 `hermes`, enregistre la méthode d'installation pour `hermes update` et clone le
@@ -128,10 +128,10 @@ paresseux de dépendances, le gateway et la documentation.
 curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash
 cd "${HERMES_HOME:-$HOME/.hermes}/hermes-agent"
 
-# Add dev/test extras on top of the standard install.
+# Ajoutez les extras dev/test par-dessus l'installation standard.
 uv pip install -e ".[all,dev]"
 
-# Optional: browser tools / docs site dependencies.
+# Optionnel : outils navigateur / dépendances du site de docs.
 npm install
 ```
 
@@ -161,15 +161,15 @@ l'espace de travail ne le résout.
 git clone https://github.com/NousResearch/hermes-agent.git
 cd hermes-agent
 
-# Create venv with Python 3.11, OUTSIDE the source tree
+# Créez le venv avec Python 3.11, HORS de l'arborescence source
 uv venv ~/.hermes/venvs/hermes-dev --python 3.11
 export VIRTUAL_ENV="$HOME/.hermes/venvs/hermes-dev"
 export PATH="$VIRTUAL_ENV/bin:$PATH"
 
-# Install with all extras (messaging, cron, CLI menus, dev tools)
+# Installez avec tous les extras (messagerie, cron, menus CLI, outils de dev)
 uv pip install -e ".[all,dev]"
 
-# Optional: browser tools
+# Optionnel : outils navigateur
 npm install
 ```
 
@@ -180,14 +180,14 @@ mkdir -p ~/.hermes/{cron,sessions,logs,memories,skills}
 cp cli-config.yaml.example ~/.hermes/config.yaml
 touch ~/.hermes/.env
 
-# Add at minimum an LLM provider key:
+# Ajoutez au minimum une clé de fournisseur LLM :
 echo "OPENROUTER_API_KEY=***" >> ~/.hermes/.env
 ```
 
 ### Lancer
 
 ```bash
-# The standard installer already put `hermes` on PATH.
+# L'installeur standard a déjà placé `hermes` sur le PATH.
 hermes doctor
 hermes chat -q "Hello"
 ```
@@ -203,12 +203,12 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 ### Lancer les tests
 
 ```bash
-# Preferred — matches CI (hermetic `env -i`, per-file subprocess isolation
-# via run_tests_parallel.py, worker count auto-scaled); see AGENTS.md
+# Préféré — correspond à la CI (hermétique `env -i`, isolation par sous-processus
+# via run_tests_parallel.py, nombre de workers auto-ajusté) ; voir AGENTS.md
 scripts/run_tests.sh
 
-# Alternative (activate the venv first). The wrapper is still recommended
-# for parity with GitHub Actions before you open a PR:
+# Alternative (activez d'abord le venv). Le wrapper reste recommandé
+# pour la parité avec GitHub Actions avant d'ouvrir une PR :
 pytest tests/ -v
 ```
 
@@ -413,8 +413,8 @@ Les compétences embarquées vivent dans `skills/`, organisées par catégorie. 
 skills/
 ├── research/
 │   └── arxiv/
-│       ├── SKILL.md              # Required: main instructions
-│       └── scripts/              # Optional: helper scripts
+│       ├── SKILL.md              # Requis : instructions principales
+│       └── scripts/              # Facultatif : scripts d'aide
 │           └── search_arxiv.py
 ├── productivity/
 │   └── ocr-and-documents/
@@ -433,10 +433,10 @@ description: Brief description (shown in skill search results)
 version: 1.0.0
 author: Your Name
 license: MIT
-platforms: [macos, linux]          # Optional — restrict to specific OS platforms
-                                   #   Valid: macos, linux, windows
-                                   #   Omit to load on all platforms (default)
-required_environment_variables:    # Optional — secure setup-on-load metadata
+platforms: [macos, linux]          # Facultatif — restreindre à des plateformes OS précises
+                                   #   Valide : macos, linux, windows
+                                   #   Omettre pour charger sur toutes les plateformes (défaut)
+required_environment_variables:    # Facultatif — métadonnées de configuration sécurisée au chargement
   - name: MY_API_KEY
     prompt: API key
     help: Where to get it
@@ -448,8 +448,8 @@ metadata:
   hermes:
     tags: [Category, Subcategory, Keywords]
     related_skills: [other-skill-name]
-    fallback_for_toolsets: [web]       # Optional — show only when toolset is unavailable
-    requires_toolsets: [terminal]      # Optional — show only when toolset is available
+    fallback_for_toolsets: [web]       # Facultatif — afficher seulement si le toolset est indisponible
+    requires_toolsets: [terminal]      # Facultatif — afficher seulement si le toolset est disponible
 ---
 
 # Skill Title
@@ -514,17 +514,17 @@ metadata:
 **Exemples :**
 
 ```yaml
-# DuckDuckGo search — shown when Firecrawl (web toolset) is unavailable
+# DuckDuckGo search — affichée quand Firecrawl (toolset web) est indisponible
 metadata:
   hermes:
     fallback_for_toolsets: [web]
 
-# Smart home skill — only useful when terminal is available
+# Smart home skill — utile uniquement quand le terminal est disponible
 metadata:
   hermes:
     requires_toolsets: [terminal]
 
-# Local browser fallback — shown when Browserbase is unavailable
+# Local browser fallback — affichée quand Browserbase est indisponible
 metadata:
   hermes:
     fallback_for_toolsets: [browser]
@@ -597,7 +597,7 @@ Toute compétence nouvelle ou modernisée — embarquée, optionnelle ou contrib
 
    Si la compétence dépend d'un serveur MCP, nommez-le et documentez son installation dans `## Prerequisites`. Les CLI tierces (par exemple `ffmpeg`, `gh`, un SDK particulier) peuvent être invoquées depuis les fichiers de script, mais la prose doit présenter l'interaction comme « invoquer via l'outil `terminal` », pas comme une session shell manuelle.
 
-3. **Le gating `platforms:` doit être audité contre les imports réels des scripts.** Les compétences qui utilisent des primitives exclusivement POSIX (`fcntl`, `termios`, `os.setsid`, `os.kill(pid, 0)` pour tester la vivacité, `/proc`, chemins `/tmp` codés en dur, `signal.SIGKILL`, heredocs bash, `osascript`, `apt`, `systemctl`) doivent déclarer leurs plateformes prises en charge via le frontmatter `platforms:`. La posture par défaut est de d'abord rendre le code multiplateforme — `tempfile.gettempdir()`, `pathlib.Path`, `psutil.pid_exists()`, filtrage au niveau Python plutôt que `grep`. Ne restreignez à un ensemble plus étroit que si la dépendance est réellement liée à une plateforme (par exemple `osascript` est propre à macOS, `/proc` à Linux).
+3. **Le verrouillage par `platforms:` doit être audité contre les imports réels des scripts.** Les compétences qui utilisent des primitives exclusivement POSIX (`fcntl`, `termios`, `os.setsid`, `os.kill(pid, 0)` pour tester la vivacité, `/proc`, chemins `/tmp` codés en dur, `signal.SIGKILL`, heredocs bash, `osascript`, `apt`, `systemctl`) doivent déclarer leurs plateformes prises en charge via le frontmatter `platforms:`. La posture par défaut est de d'abord rendre le code multiplateforme — `tempfile.gettempdir()`, `pathlib.Path`, `psutil.pid_exists()`, filtrage au niveau Python plutôt que `grep`. Ne restreignez à un ensemble plus étroit que si la dépendance est réellement liée à une plateforme (par exemple `osascript` est propre à macOS, `/proc` à Linux).
 
 4. **`author` crédite d'abord le contributeur humain.** Pour les contributions externes, le vrai nom du contributeur + son pseudo GitHub viennent en premier (`Jane Doe (jane-doe)`) ; « Hermes Agent » est le collaborateur secondaire. Si le commit du contributeur affiche « Hermes Agent » comme auteur parce qu'il a utilisé Hermes pour rédiger la compétence, remplacez-le par son nom réel — on crédite l'humain, pas l'outil.
 
@@ -700,12 +700,12 @@ emprunter votre chemin de code.
    processus sans rapport partageant sa console ». Voir [bpo-14484](https://bugs.python.org/issue14484)
    (ouvert depuis 2012 — ne sera jamais corrigé pour raisons de compatibilité).
 
-   **À privilégier :** utilisez `psutil` (une dépendance de base — toujours disponible) :
+   **À privilégier :** utilisez `psutil` (une dépendance du cœur — toujours disponible) :
 
    ```python
    import psutil
    if psutil.pid_exists(pid):
-       # process is alive — safe on every platform
+       # processus vivant — sûr sur toutes les plateformes
        ...
    ```
 
@@ -716,7 +716,7 @@ emprunter votre chemin de code.
    `OpenProcess + WaitForSingleObject` sous Windows, uniquement si psutil est
    introuvable.
 
-   Grep d'audit pour les nouveaux sites d'appel : `rg "os\.kill\([^,]+,\s*0\s*\)"`.
+   Pour l'audit, cherchez avec grep les nouveaux points d'appel : `rg "os\.kill\([^,]+,\s*0\s*\)"`.
    Tout résultat hors code de test est présumé être un bug de kill silencieux sous
    Windows.
 
@@ -740,7 +740,7 @@ emprunter votre chemin de code.
        menu = TerminalMenu(options)
        idx = menu.show()
    except (ImportError, NotImplementedError):
-       # Fallback: numbered menu for Windows
+       # Repli : menu numéroté pour Windows
        for i, opt in enumerate(options):
            print(f"  {i+1}. {opt}")
        idx = int(input("Choice: ")) - 1
@@ -776,7 +776,7 @@ emprunter votre chemin de code.
    import psutil
    try:
        parent = psutil.Process(pid)
-       # Kill children first (leaf-up), then the parent.
+       # Tuez d'abord les enfants (des feuilles vers la racine), puis le parent.
        for child in parent.children(recursive=True):
            child.kill()
        parent.kill()
@@ -925,18 +925,18 @@ Après la [compromission de la chaîne d'approvisionnement de litellm](https://g
 "openai>=2.21.0,<3"
 "pydantic>=2.12.5,<3"
 
-# ✅ Correct — pre-1.0 (tight minor window)
+# ✅ Correct — pre-1.0 (fenêtre de mineure serrée)
 "asyncpg>=0.29,<0.32"
 "aiosqlite>=0.20,<0.23"
 "hindsight-client>=0.4.22,<0.5"
 
-# ❌ Rejected — no upper bound
+# ❌ Rejeté — pas de borne supérieure
 "some-package>=1.2.3"
 
-# ❌ Rejected — too tight (blocks legitimate patches)
+# ❌ Rejeté — trop serré (bloque les correctifs légitimes)
 "some-package==1.2.3"
 
-# ❌ Rejected — too loose for pre-1.0 (allows 80 minor versions)
+# ❌ Rejeté — trop lâche pour pre-1.0 (autorise 80 versions mineures)
 "some-package>=0.20,<1"
 ```
 
@@ -949,17 +949,17 @@ Après la [compromission de la chaîne d'approvisionnement de litellm](https://g
 ### Nommage des branches
 
 ```
-fix/description        # Bug fixes
-feat/description       # New features
+fix/description        # Corrections de bugs
+feat/description       # Nouvelles fonctionnalités
 docs/description       # Documentation
 test/description       # Tests
-refactor/description   # Code restructuring
+refactor/description   # Restructuration du code
 ```
 
 ### Avant de soumettre
 
 1. **Lancez les tests** : `scripts/run_tests.sh` (recommandé ; identique à la CI) ou `pytest tests/ -v` avec le venv du projet activé
-2. **Testez manuellement** : lancez `hermes` et exercez le chemin de code que vous avez modifié
+2. **Testez manuellement** : lancez `hermes` et testez le chemin de code que vous avez modifié
 3. **Vérifiez l'impact multiplateforme** : si vous touchez aux E/S de fichiers, à la gestion des processus ou au terminal, pensez à macOS, Linux et WSL2
 4. **Gardez les PR ciblées** : un seul changement logique par PR. Ne mélangez pas une correction de bug avec un refactoring et une nouvelle fonctionnalité.
 

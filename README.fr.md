@@ -62,8 +62,8 @@ Si Git est déjà installé, l'installateur le détecte et l'utilise à la place
 Après l'installation :
 
 ```bash
-source ~/.bashrc    # reload shell (or: source ~/.zshrc)
-hermes              # start chatting!
+source ~/.bashrc    # rechargez le shell (ou : source ~/.zshrc)
+hermes              # lancez la discussion !
 ```
 
 ### Dépannage
@@ -75,13 +75,13 @@ Si votre antivirus (Bitdefender, Windows Defender, etc.) met en quarantaine `uv.
 **Pour vérifier que votre copie est authentique :**
 
 ```powershell
-# Install GitHub CLI if needed
+# Installez GitHub CLI si nécessaire
 winget install --id GitHub.cli
 
-# Login to GitHub
+# Connectez-vous à GitHub
 gh auth login
 
-# Run verification
+# Lancez la vérification
 $uv = "$env:LOCALAPPDATA\hermes\bin\uv.exe"
 $ver = (& $uv --version).Split(' ')[1]
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
@@ -94,10 +94,10 @@ Expand-Archive $zip "$env:TEMP\uv_x" -Force
 
 Si l'attestation affiche « Verification succeeded » et que la dernière ligne renvoie `True`, tout est en ordre.
 
-**Pour mettre Hermes en liste blanche :**
+**Pour mettre Hermes sur la liste d'autorisation :**
 - **Windows Defender :** lancez PowerShell en administrateur → `Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA\hermes\bin"`
 - **Bitdefender :** ajoutez une exception dans la console Bitdefender (Protection > Antivirus > Paramètres > Gérer les exceptions)
-- Mettez le **dossier** en liste blanche, pas le hash du fichier — Hermes met `uv` à jour et le hash change à chaque version
+- Ajoutez le **dossier** à la liste d'autorisation, pas le hash du fichier — Hermes met `uv` à jour et le hash change à chaque version
 
 Pour plus de contexte, consultez les rapports upstream chez Astral : [astral-sh/uv#13553](https://github.com/astral-sh/uv/issues/13553), [astral-sh/uv#15011](https://github.com/astral-sh/uv/issues/15011), [astral-sh/uv#10079](https://github.com/astral-sh/uv/issues/10079).
 
@@ -205,10 +205,10 @@ Ce qui est importé :
 - **SOUL.md** — fichier de persona
 - **Mémoires** — entrées de MEMORY.md et USER.md
 - **Compétences** — compétences créées par l'utilisateur → `~/.hermes/skills/openclaw-imports/`
-- **Liste blanche de commandes** — motifs d'approbation
+- **Liste d'autorisation de commandes** — motifs d'approbation
 - **Réglages de messagerie** — configuration des plateformes, utilisateurs autorisés, répertoire de travail
-- **Clés API** — secrets en liste blanche (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
-- **Assets TTS** — fichiers audio de l'espace de travail
+- **Clés API** — secrets sur liste d'autorisation (Telegram, OpenRouter, OpenAI, Anthropic, ElevenLabs)
+- **Ressources TTS** — fichiers audio de l'espace de travail
 - **Instructions d'espace de travail** — AGENTS.md (avec `--workspace-target`)
 
 Voir `hermes claw migrate --help` pour toutes les options, ou utilisez la compétence `openclaw-migration` pour une migration interactive guidée par l'agent, avec prévisualisation en dry-run.
@@ -222,7 +222,7 @@ Les contributions sont les bienvenues ! Consultez le [Guide de contribution](CON
 Démarrage rapide pour les contributeurs — utilisez l'installateur standard, puis
 travaillez depuis le checkout git complet qu'il crée dans `$HERMES_HOME/hermes-agent`
 (généralement `~/.hermes/hermes-agent`). C'est la disposition attendue par
-`hermes update`, le venv managé, les dépendances chargées à la demande, le gateway
+`hermes update`, le venv géré, les dépendances chargées à la demande, le gateway
 et l'outillage de la documentation.
 
 ```bash
@@ -233,7 +233,7 @@ scripts/run_tests.sh
 ```
 
 Solution de repli avec clone manuel (pour les clones jetables ou la CI, quand vous
-ne voulez volontairement pas de la disposition d'installation managée) :
+ne voulez volontairement pas de la disposition d'installation gérée) :
 
 Créez le venv en dehors de l'arborescence clonée — un venv placé dans le répertoire
 depuis lequel l'agent opère peut être effacé par une commande en chemin relatif que
