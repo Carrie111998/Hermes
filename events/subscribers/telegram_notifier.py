@@ -249,6 +249,33 @@ class TelegramNotifier(BaseSubscriber):
                 and event.payload.get("synthesized")):
             return
 
+        # Daily Brief declutter (2026-08-06). DIGEST_GENERATED is generation
+        # TELEMETRY, not the narrative: the human digest is delivered directly
+        # by DigestComposer._deliver_telegram and by the Scribe cron's
+        # NOTIFICATION mailbox_message (body in `summary`). The event carries
+        # only metadata (mode/path/body_length/items_surfaced) and has no
+        # formatter, so it rendered as a raw key:value dump in scribe_daily.
+        # Bus-only: ScribeActionTelemetry still consumes it to open its
+        # attribution window; chat never sees it.
+        if event.event_type == EventType.DIGEST_GENERATED:
+            return
+
+        # Daily Brief declutter (2026-08-06). A raw MAILBOX_MESSAGE is a
+        # transport envelope MailboxWatcher mirrors from the filesystem
+        # mailbox. MailboxTranslator already converts every actionable
+        # envelope into a typed domain event routed to its own topic
+        # (SCORE_RESULT->JOB_SCORED->JobFlow, ERROR->AGENT_ERROR->Alerts,
+        # PIPELINE_UPDATE->STAGE_TRANSITION, ...), so delivering the raw
+        # envelope too duplicated that signal into scribe_daily. The lone
+        # user-facing sub-type is NOTIFICATION (the Scribe narrative rides
+        # here, and classify() honours an explicit `to:` topic) — keep it,
+        # and keep USER_INBOUND_MESSAGE, which is a different event type.
+        # Bus-only for the rest: translator/audit/recovery consumers unchanged.
+        if (event.event_type == EventType.MAILBOX_MESSAGE
+                and isinstance(event.payload, dict)
+                and event.payload.get("message_type") != "NOTIFICATION"):
+            return
+
         # Infrastructure noise: lag alerts about the bus itself become a feedback
         # loop (digest -> agent_error -> digest). Suppress them from chat; they
         # remain in the bus for audit-logger and the gateway log.

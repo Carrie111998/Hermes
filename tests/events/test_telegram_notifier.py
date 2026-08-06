@@ -470,16 +470,11 @@ class TestTelegramNotifier:
     def test_non_notification_mailbox_message_falls_through_to_default(
         self, bus, topics_config, verbosity_config,
     ):
-        """Agent-to-agent mailbox messages (SCORE_RESULT, TAILOR_REQUEST, etc.)
-        fall through to the default mailbox routing — TOPIC_ROUTING
-        ``mailbox_message`` → ``scribe_daily`` post v2 cutover. Only
-        NOTIFICATION message_type triggers the explicit override branch in
-        resolve_target(); the override target is also ``scribe_daily`` in
-        v2 (the v1 ``digests`` vs ``agent_comms`` distinction collapsed at
-        the cutover, 20260424T233627Z), so both paths produce the same
-        thread_id. This test guards against the override branch firing
-        for non-NOTIFICATION messages or against TOPIC_ROUTING regressing
-        on the default.
+        """Routing classification remains total for raw machine mailbox
+        envelopes even though handle() now keeps them bus-only. The target is
+        still ``scribe_daily`` for shared policy consumers; Telegram's
+        delivery-layer guard prevents the duplicate chat message. Only a
+        NOTIFICATION message_type triggers the explicit override branch.
         """
         notifier = TelegramNotifier(
             bus, topics_path=topics_config, verbosity_path=verbosity_config,
@@ -2108,6 +2103,97 @@ class TestSynthesizedIterationSuppression:
         notifier.handle(self._make(synthesized=False))
         # AGENT_ITERATION is LOW priority => it lands in the batch buffer.
         assert any(msgs for msgs in notifier._batch_buffer.values())
+
+
+class TestDailyBriefTransportSuppression:
+    """Raw machine transport and digest telemetry stay on the bus without
+    cluttering Daily Brief; real Scribe and user narratives still deliver."""
+
+    def _notifier(self, bus, topics_config, verbosity_config, sent):
+        return TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+            send_fn=lambda *a, **k: sent.append(a),
+        )
+
+    def test_digest_generated_is_bus_only(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = self._notifier(bus, topics_config, verbosity_config, sent)
+        bus.emit(
+            event_type=EventType.DIGEST_GENERATED,
+            source="scribe",
+            payload={"mode": "pm", "body_length": 1200},
+        )
+        event = bus.query(event_type=EventType.DIGEST_GENERATED)[0]
+
+        notifier.handle(event)
+
+        assert sent == []
+        assert all(not msgs for msgs in notifier._batch_buffer.values()), \
+            "digest telemetry must not even be batched"
+        assert bus.query(event_type=EventType.DIGEST_GENERATED) == [event], \
+            "bus-only means retained on the bus, not discarded"
+
+    def test_machine_mailbox_message_is_bus_only(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = self._notifier(bus, topics_config, verbosity_config, sent)
+        event = Event.create(
+            EventType.MAILBOX_MESSAGE,
+            "matcher",
+            {
+                "message_type": "SCORE_RESULT",
+                "from": "matcher",
+                "to": "main",
+                "summary": "score 9.0 for Acme",
+            },
+        )
+
+        notifier.handle(event)
+
+        assert sent == []
+        assert all(not msgs for msgs in notifier._batch_buffer.values()), \
+            "machine mailbox transport must not even be batched"
+
+    def test_notification_mailbox_message_still_delivers(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = self._notifier(bus, topics_config, verbosity_config, sent)
+        event = Event.create(
+            EventType.MAILBOX_MESSAGE,
+            "scribe",
+            {
+                "message_type": "NOTIFICATION",
+                "from": "scribe",
+                "to": "main",
+                "summary": "Daily narrative",
+            },
+        )
+
+        notifier.handle(event)
+
+        assert len(sent) == 1
+        assert sent[0][1] == "105"
+        assert "Daily narrative" in sent[0][2]
+
+    def test_user_inbound_message_still_delivers(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = self._notifier(bus, topics_config, verbosity_config, sent)
+        event = Event.create(
+            EventType.USER_INBOUND_MESSAGE,
+            "telegram",
+            {"text": "Please review today's brief"},
+        )
+
+        notifier.handle(event)
+
+        assert len(sent) == 1
+        assert sent[0][1] == "105"
 
 
 class TestCronLifecycleRouting:
