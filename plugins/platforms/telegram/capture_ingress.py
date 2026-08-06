@@ -21,6 +21,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import re
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -30,8 +31,10 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 try:
     from telegram import Update
+    from telegram.error import TelegramError
 except ImportError:  # pragma: no cover - PTB always present alongside adapter.py
     Update = None  # type: ignore
+    TelegramError = Exception  # type: ignore
 
 # Matches TelegramAdapter._GENERAL_TOPIC_THREAD_ID. Telegram's implicit
 # General forum topic is addressed as thread id "1" but route-policy and the
@@ -60,10 +63,18 @@ def normalize_thread_id(raw_thread_id: Any) -> Optional[int]:
 
 
 def canonicalize_update(update: "Update") -> bytes:
-    """Compact sorted-key UTF-8 JSON over ``Update.to_dict()`` -- frozen wire shape."""
+    """Compact sorted-key UTF-8 JSON over ``Update.to_dict()`` -- frozen wire shape.
+
+    ``allow_nan=False``: NaN/Infinity are not valid JSON (RFC 8259), so a
+    canonical serialization must reject them rather than silently emitting
+    Python's non-standard ``NaN``/``Infinity``/``-Infinity`` literals, which
+    a compliant JSON parser elsewhere in the pipeline would fail to read
+    back -- fail loud here instead of producing a payload_hash over bytes
+    nothing else can parse.
+    """
     payload = update.to_dict()
     return json.dumps(
-        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False, allow_nan=False
     ).encode("utf-8")
 
 
@@ -90,17 +101,37 @@ def classify_event_type(message: Any) -> str:
     return "other"
 
 
-class RouteConflict(Exception):
+class CaptureAdmissionError(TelegramError):
+    """Base for capture-ingress failures raised from CaptureAwareQueue.put().
+
+    Deliberately a TelegramError subclass, not a plain Exception: PTB
+    22.6's own polling retry ladder (telegram.ext._utils.networkloop.
+    network_retry_loop, driving Updater.start_polling's real
+    polling_action_cb) wraps ``await update_queue.put(update)`` inside its
+    outer loop, whose except clauses only match RetryAfter / TimedOut /
+    InvalidToken / TelegramError -- a plain Exception here propagates
+    straight out on the very first attempt and kills the polling task
+    instead of entering PTB's bounded retry path. The webhook transport
+    doesn't need this (Tornado's default handler already returns a
+    non-2xx response for any uncaught exception), but subclassing
+    TelegramError here doesn't change that.
+    """
+
+
+class RouteConflict(CaptureAdmissionError):
     """Same event_id captured again with a different canonical payload/hash."""
 
 
-class CapturePersistenceError(Exception):
+class CapturePersistenceError(CaptureAdmissionError):
     """Ledger/payload commit failed for a reason that must fail closed (never a coding bug)."""
 
 
 logger = logging.getLogger(__name__)
 
 _VALID_ROUTE_MODES = ("capture_only", "agent", "drop")
+_ROUTE_FIELDS = {"chat_id", "thread_id", "mode", "sink", "policy_version"}
+_SINK_PATTERN = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+_POLICY_VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -124,28 +155,66 @@ class RoutePolicyTable:
 
     def __init__(self, entries: Optional[List[Dict[str, Any]]] = None):
         self._by_key: Dict[Tuple[int, Optional[int]], RouteEntry] = {}
-        for raw in entries or []:
-            mode = str(raw["mode"])
-            if mode not in _VALID_ROUTE_MODES:
-                # Fail closed on a misconfigured entry, but with a small
-                # blast radius: drop only this entry (so its chat/topic
-                # falls back to "no route configured," today's safe
-                # pass-through default) rather than raising and taking every
-                # other configured route down with it over one typo.
-                logger.error(
-                    "capture_routes: dropping entry with unrecognized mode %r "
-                    "(chat_id=%r, thread_id=%r) -- must be one of %s",
-                    mode, raw.get("chat_id"), raw.get("thread_id"), _VALID_ROUTE_MODES,
+        if entries is not None and not isinstance(entries, list):
+            raise ValueError("capture_routes must be a list")
+        for index, raw in enumerate(entries or []):
+            if not isinstance(raw, dict):
+                raise ValueError(f"capture_routes[{index}] must be an object")
+            missing = _ROUTE_FIELDS - set(raw)
+            if missing:
+                raise ValueError(
+                    f"capture_routes[{index}] missing required fields: {sorted(missing)}"
                 )
-                continue
+            unknown = set(raw) - _ROUTE_FIELDS
+            if unknown:
+                raise ValueError(
+                    f"capture_routes[{index}] has unknown fields: {sorted(unknown)}"
+                )
+
+            chat_id = raw["chat_id"]
+            if isinstance(chat_id, bool) or not isinstance(chat_id, int) or chat_id == 0:
+                raise ValueError(f"capture_routes[{index}].chat_id must be a nonzero integer")
+
+            raw_thread_id = raw["thread_id"]
+            if raw_thread_id is not None and (
+                isinstance(raw_thread_id, bool)
+                or not isinstance(raw_thread_id, int)
+                or raw_thread_id < 1
+            ):
+                raise ValueError(
+                    f"capture_routes[{index}].thread_id must be null or a positive integer"
+                )
+            thread_id = None if raw_thread_id in (None, 1) else raw_thread_id
+
+            mode = raw["mode"]
+            if mode not in _VALID_ROUTE_MODES:
+                raise ValueError(
+                    f"capture_routes[{index}].mode must be one of {_VALID_ROUTE_MODES}"
+                )
+
+            sink = raw["sink"]
+            if not isinstance(sink, str) or not _SINK_PATTERN.fullmatch(sink):
+                raise ValueError(f"capture_routes[{index}].sink violates the route-policy schema")
+
+            policy_version = raw["policy_version"]
+            if not isinstance(policy_version, str) or not _POLICY_VERSION_PATTERN.fullmatch(
+                policy_version
+            ):
+                raise ValueError(
+                    f"capture_routes[{index}].policy_version must be semantic X.Y.Z"
+                )
+
             entry = RouteEntry(
-                chat_id=int(raw["chat_id"]),
-                thread_id=normalize_thread_id(raw.get("thread_id")),
+                chat_id=chat_id,
+                thread_id=thread_id,
                 mode=mode,
-                sink=str(raw["sink"]),
-                policy_version=str(raw.get("policy_version", "1.0.0")),
+                sink=sink,
+                policy_version=policy_version,
             )
-            self._by_key[(entry.chat_id, entry.thread_id)] = entry
+            key = (entry.chat_id, entry.thread_id)
+            if key in self._by_key:
+                raise ValueError(f"capture_routes[{index}] has duplicate normalized route key {key}")
+            self._by_key[key] = entry
 
     def lookup(self, chat_id: Any, thread_id: Optional[int]) -> Optional[RouteEntry]:
         if chat_id is None:
@@ -179,12 +248,27 @@ CREATE TABLE IF NOT EXISTS ingress_ledger (
 CREATE TABLE IF NOT EXISTS ingress_payload (
     event_id TEXT PRIMARY KEY REFERENCES ingress_ledger(event_id),
     payload_hash TEXT NOT NULL,
+    payload_format TEXT NOT NULL,
     payload_json TEXT NOT NULL
 );
 """
 
+# The owner-selected canonical JSON v1 shape (compact sorted-key UTF-8 JSON
+# over Update.to_dict()) -- recorded on every payload row so a future
+# format change is self-describing instead of silently reinterpreting old
+# rows under a new convention.
+PAYLOAD_FORMAT_V1 = "telegram-update-json-v1"
+
 INSERTED = "inserted"
 DUPLICATE_SAME = "duplicate_same"
+
+# Fail fast on write-lock contention instead of SQLite's 5s busy-wait
+# default: commit_capture runs synchronously inside CaptureAwareQueue.put(),
+# an async method PTB awaits directly -- blocking the event loop for
+# multiple seconds on lock contention is worse than surfacing
+# CapturePersistenceError promptly so PTB's bounded retry ladder (see
+# CaptureAdmissionError) can back off and try again.
+_CONNECT_TIMEOUT_SECONDS = 1.0
 
 
 class CaptureIngressStore:
@@ -201,12 +285,25 @@ class CaptureIngressStore:
         parent = Path(self._db_path).parent
         if str(parent) not in ("", "."):
             parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(self._db_path, isolation_level=None, check_same_thread=False)
+        self._conn = sqlite3.connect(
+            self._db_path,
+            isolation_level=None,
+            check_same_thread=False,
+            timeout=_CONNECT_TIMEOUT_SECONDS,
+        )
         self._lock = threading.Lock()
+        self._closed = False
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # Per-connection, not persisted in the db file -- SQLite silently
+        # ignores REFERENCES clauses unless this is set on every connection
+        # that should enforce them.
+        self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.executescript(_SCHEMA)
 
     def close(self) -> None:
+        if self._closed:
+            return  # idempotent: safe to call more than once (e.g. disconnect() then GC)
+        self._closed = True
         self._conn.close()
 
     def commit_capture(
@@ -227,6 +324,7 @@ class CaptureIngressStore:
         route_mode: str,
         sink: str,
         payload_json: str,
+        payload_format: str = PAYLOAD_FORMAT_V1,
     ) -> str:
         """Idempotent atomic insert. Returns INSERTED or DUPLICATE_SAME.
 
@@ -267,12 +365,13 @@ class CaptureIngressStore:
                     ),
                 )
                 self._conn.execute(
-                    "INSERT INTO ingress_payload (event_id, payload_hash, payload_json) VALUES (?, ?, ?)",
-                    (event_id, payload_hash, payload_json),
+                    "INSERT INTO ingress_payload (event_id, payload_hash, payload_format, payload_json) "
+                    "VALUES (?, ?, ?, ?)",
+                    (event_id, payload_hash, payload_format, payload_json),
                 )
                 self._conn.execute("COMMIT")
             except sqlite3.IntegrityError as exc:
-                self._conn.execute("ROLLBACK")
+                self._safe_rollback()
                 # Only a genuine lost race against a concurrent insert of
                 # the same event_id -- confirmed by a row actually existing
                 # now -- is a RouteConflict. Any other IntegrityError (e.g.
@@ -291,9 +390,21 @@ class CaptureIngressStore:
                     f"event_id {event_id!r} already captured with a different payload_hash"
                 )
             except sqlite3.Error as exc:
-                self._conn.execute("ROLLBACK")
+                self._safe_rollback()
                 raise CapturePersistenceError(str(exc)) from exc
             return INSERTED
+
+    def _safe_rollback(self) -> None:
+        """ROLLBACK, but only if a transaction is actually open.
+
+        BEGIN IMMEDIATE itself can fail (lock contention, disk full before
+        any transaction ever opened) -- issuing ROLLBACK in that case raises
+        its own "cannot rollback - no transaction is active" error, which
+        would mask the real failure instead of letting it become
+        CapturePersistenceError.
+        """
+        if self._conn.in_transaction:
+            self._conn.execute("ROLLBACK")
 
 
 class CaptureAwareQueue(asyncio.Queue):
@@ -338,11 +449,6 @@ class CaptureAwareQueue(asyncio.Queue):
         if message is None:
             return await super().put(item)  # not message-like: callback_query/poll/chat_member/...
 
-        if self._is_own_message(message):
-            return await super().put(item)  # bot-authored: existing behavior preserved
-        if not self._is_authorized_sender(message):
-            return await super().put(item)  # unauthorized sender: existing behavior preserved
-
         chat = getattr(message, "chat", None)
         chat_id = getattr(chat, "id", None)
         thread_id = normalize_thread_id(self._thread_id_resolver(message))
@@ -354,22 +460,26 @@ class CaptureAwareQueue(asyncio.Queue):
         message_id = getattr(message, "message_id", None)
         sender = getattr(message, "from_user", None)
         sender_id = getattr(sender, "id", None)
-        if message_id is None or sender_id is None:
-            # No human-authored identity to key a ledger row on (e.g. a
-            # channel post, whose identity lives in sender_chat rather than
-            # from_user -- the ingress-ledger contract requires a non-null
-            # human sender_id, so this cannot be captured). The owner
-            # directive for a capture-only route is unconditional ("must
-            # never start an agent turn... for the capture-only topic"), not
-            # conditioned on whether a row could be produced -- so still
-            # terminally deny dispatch, just without a ledger row.
+        sender_is_bot = bool(getattr(sender, "is_bot", False))
+        sender_is_eligible = (
+            sender_id is not None
+            and not sender_is_bot
+            and not self._is_own_message(message)
+            and self._is_authorized_sender(message)
+        )
+        if message_id is None or not sender_is_eligible:
+            # The ledger contract is strictly human-authored and authorized.
+            # Capture-only denial is broader than ledger eligibility: commands,
+            # channel posts, service messages, bots, and unauthorized senders
+            # must still never reach PTB handlers on this route.
             if route.mode == "capture_only":
-                self._alert_failure(
-                    f"capture ingress: capture-only route matched update_id={item.update_id} "
-                    "with no human sender identity to key a ledger row on -- denying dispatch, not captured"
-                )
+                if message_id is None or sender_id is None:
+                    self._alert_failure(
+                        f"capture ingress: capture-only route matched update_id={item.update_id} "
+                        "with no human sender identity to key a ledger row on -- denying dispatch, not captured"
+                    )
                 return
-            return await super().put(item)  # agent/no-route: existing behavior unchanged
+            return await super().put(item)  # agent route preserves downstream auth/pairing behavior
 
         profile = self._profile_provider()
         account_id = self._account_id_provider()

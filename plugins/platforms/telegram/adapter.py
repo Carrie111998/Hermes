@@ -1100,17 +1100,17 @@ class TelegramAdapter(BasePlatformAdapter):
         extra = getattr(getattr(self, "config", None), "extra", None) or {}
         return str(extra.get("unauthorized_dm_behavior", "")).strip().lower() == "pair"
 
-    def _is_user_authorized_from_message(self, message: Message) -> bool:
-        """Check if the sender of a Telegram message is authorized.
+    def _resolve_sender_authorization(self, message: Message):
+        """Shared authorization resolution for ``_is_user_authorized_from_message``
+        and ``_is_capture_sender_authorized``.
 
-        Intake prefilter that runs BEFORE text batching, event construction,
-        and unmentioned-group observation, so a removed/unauthorized user
-        cannot inject prompt content into the agent path or the observed
-        transcript (fixes #40863). It only rejects when it can make the same
-        context-aware decision the runner would make. Unknown DMs with no
-        allowlist still pass through so the normal pairing flow can run.
-        Unknown DMs with an allowlist still pass through when pairing is the
-        effective unauthorized-DM behavior (explicit platform override).
+        Returns ``(early_result, authorized, source)``. When ``early_result``
+        is not ``None``, both callers return it directly as-is -- these are
+        "no authorization infrastructure configured at all, wide open"
+        cases (no identity, no runner + no env configured, no allowlist
+        CSV), not pairing-specific, so both callers treat them identically.
+        Otherwise ``authorized`` is the resolved True/False and each caller
+        applies its own policy for the False case.
         """
         source = self._source_from_message_for_auth(message)
         user_id = source.user_id
@@ -1120,7 +1120,7 @@ class TelegramAdapter(BasePlatformAdapter):
         # they carry no authorizable identity, so let the normal
         # _should_process_message gating handle them.
         if not user_id:
-            return True
+            return True, None, source
 
         authorized: Optional[bool] = None
 
@@ -1163,7 +1163,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # actually exists; otherwise unknown DMs must reach the pairing
                 # flow rather than being default-denied here.
                 if not self._telegram_auth_env_configured():
-                    return True
+                    return True, None, source
                 try:
                     authorized = bool(auth_fn(source))
                 except Exception:
@@ -1176,14 +1176,48 @@ class TelegramAdapter(BasePlatformAdapter):
         if authorized is None:
             allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
             if not allowed_csv:
-                return True
+                return True, None, source
             allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
             authorized = "*" in allowed_ids or user_id in allowed_ids
 
+        return None, authorized, source
+
+    def _is_user_authorized_from_message(self, message: Message) -> bool:
+        """Check if the sender of a Telegram message is authorized.
+
+        Intake prefilter that runs BEFORE text batching, event construction,
+        and unmentioned-group observation, so a removed/unauthorized user
+        cannot inject prompt content into the agent path or the observed
+        transcript (fixes #40863). It only rejects when it can make the same
+        context-aware decision the runner would make. Unknown DMs with no
+        allowlist still pass through so the normal pairing flow can run.
+        Unknown DMs with an allowlist still pass through when pairing is the
+        effective unauthorized-DM behavior (explicit platform override).
+        """
+        early, authorized, source = self._resolve_sender_authorization(message)
+        if early is not None:
+            return early
         if authorized:
             return True
         # Unauthorized DM that the gateway would pair: forward so pairing can run.
         return self._should_pass_unauthorized_dm_for_pairing(source)
+
+    def _is_capture_sender_authorized(self, message: Message) -> bool:
+        """Like ``_is_user_authorized_from_message``, but never treats an
+        unauthorized DM that is merely being let through for the gateway
+        pairing handshake as authorized.
+
+        Slice 1.1R-B: the capture-aware queue must not durably record an
+        unauthenticated stranger's DM into the ledger just because the
+        pairing flow needs to see that same message to run -- "letting a
+        message through to dispatch" and "this sender is authorized" are
+        two different questions, and capture must ask the second one, not
+        the first.
+        """
+        early, authorized, _source = self._resolve_sender_authorization(message)
+        if early is not None:
+            return early
+        return bool(authorized)
 
     @classmethod
     def _metadata_thread_id(cls, metadata: Optional[Dict[str, Any]]) -> Optional[str]:
@@ -3723,7 +3757,47 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.error("[%s] No bot token configured", self.name)
             self._set_fatal_error("missing_credentials", "No bot token configured", retryable=False)
             return False
-        
+
+        # Slice 1.1R-B fail-closed, both scoped to capture_is_configured():
+        # an adapter with no capture_routes at all (every platform except a
+        # deliberately capture-configured Telegram profile) never reaches
+        # CaptureAwareQueue.put()'s route-match branch, so it needs neither
+        # a validated route table nor a stamped profile to connect.
+        if self._capture_is_configured():
+            # 1) Reject a malformed capture_routes entry before dispatch/
+            # admission -- i.e. here, at connect() time, once -- rather
+            # than lazily re-validating (and potentially re-raising) on
+            # every single message deep inside CaptureAwareQueue.put().
+            try:
+                self._capture_route_table()
+            except ValueError as exc:
+                logger.error("[%s] invalid capture_routes configuration: %s", self.name, exc)
+                self._set_fatal_error("invalid_capture_routes", str(exc), retryable=False)
+                return False
+            # 2) The capture-aware queue's ledger rows are keyed in part by
+            # profile, so an adapter that was never stamped by gateway/
+            # run.py's startup path must never connect -- doing so silently
+            # would risk this adapter's captures (or, worse, its dispatch
+            # decisions) being attributed to no profile at all instead of
+            # refusing outright. No "or 'default'" fallback: a genuinely
+            # default-profile adapter is always stamped "default" explicitly
+            # by gateway/run.py's _active_profile_name(), so a None here
+            # means the startup path was skipped or failed, not that the
+            # profile really is "default".
+            if not self.receiving_profile:
+                logger.error(
+                    "[%s] capture_routes configured but receiving_profile was never "
+                    "stamped -- refusing to connect (Slice 1.1R-B fail-closed; see "
+                    "gateway/run.py's _stamp_receiving_profile)",
+                    self.name,
+                )
+                self._set_fatal_error(
+                    "missing_receiving_profile",
+                    "receiving_profile not stamped before connect() with capture_routes configured",
+                    retryable=False,
+                )
+                return False
+
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
@@ -4454,8 +4528,14 @@ class TelegramAdapter(BasePlatformAdapter):
                 )
         self._release_platform_lock()
 
+        # PTB admission has stopped, so no queue put can still be using the
+        # SQLite connection. Close it now and discard the queue bound to it;
+        # a later explicit reconnect constructs a fresh store and queue.
+        self._close_capture_store()
+
         self._app = None
         self._bot = None
+
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -8707,16 +8787,26 @@ class TelegramAdapter(BasePlatformAdapter):
         self._receiving_profile = str(value)
 
     def _capture_route_table(self) -> "RoutePolicyTable":
-        """(chat_id, thread_id) -> route entry, read fresh from config each call.
+        """(chat_id, thread_id) -> route entry. Built once and cached.
 
-        Matches this adapter's existing convention (``_telegram_allowed_topics``,
-        ``_telegram_ignored_threads``, etc.) of re-reading ``config.extra``
-        per call rather than caching -- the route list is small and static
-        per process, and this keeps the value correct for adapters
-        constructed via ``object.__new__`` in tests without requiring
-        ``__init__`` to have run.
+        RoutePolicyTable now validates the merged route-policy contract
+        strictly and raises ValueError on a malformed entry (Slice 1.1R-B:
+        "reject invalid configured entries before dispatch/admission") --
+        so this must be validated once, eagerly, at connect() time (see
+        connect()'s own guard, which calls this before installing the
+        capture queue), not re-attempted, and potentially re-raised, deep
+        inside per-message handling. ``getattr`` (not a plain ``__init__``
+        default) so adapters constructed via ``object.__new__`` in tests
+        (bypassing ``__init__``) still work without requiring it to have run.
         """
-        return RoutePolicyTable(self.config.extra.get("capture_routes"))
+        cached = getattr(self, "_capture_route_table_cache", None)
+        if cached is None:
+            cached = RoutePolicyTable(self.config.extra.get("capture_routes"))
+            self._capture_route_table_cache = cached
+        return cached
+
+    def _capture_is_configured(self) -> bool:
+        return bool(self.config.extra.get("capture_routes"))
 
     def _capture_route_for_message(self, message: Message):
         """The matching route-policy entry for ``message``, or None if unrouted."""
@@ -8739,6 +8829,14 @@ class TelegramAdapter(BasePlatformAdapter):
             self._capture_store = CaptureIngressStore(self._capture_db_path())
         return self._capture_store
 
+    def _close_capture_store(self) -> None:
+        """Close durable capture state after intake stops; reset for reconnect."""
+        store = getattr(self, "_capture_store", None)
+        if store is not None:
+            store.close()
+        self._capture_store = None
+        self._capture_queue = None
+
     def _alert_capture_failure(self, message: str) -> None:
         # Deliverable per the plan: "only deterministic failure is alerted,
         # and only to Hermes Hub General topic -- never a per-message
@@ -8748,21 +8846,44 @@ class TelegramAdapter(BasePlatformAdapter):
         # actually enforces fail-closed (blocks offset advance / webhook ack).
         logger.error("[%s] %s", self.name, message)
 
+    def _require_receiving_profile(self) -> str:
+        """Fail closed: no silent "default" fallback for an unstamped adapter.
+
+        A genuinely default-profile adapter is always stamped "default"
+        explicitly by gateway/run.py's ``_active_profile_name()`` -- this
+        only fires if the startup path was skipped entirely (a future call
+        path that forgets to stamp, or a test double), which must never be
+        allowed to masquerade as the default profile.
+        """
+        profile = self.receiving_profile
+        if not profile:
+            raise RuntimeError(
+                f"[{self.name}] receiving_profile was not stamped before capture-queue "
+                "use -- refusing (Slice 1.1R-B fail-closed)"
+            )
+        return profile
+
     def _build_capture_queue(self) -> CaptureAwareQueue:
         """Construct a fresh capture-aware queue bound to this adapter's own gating logic.
 
         Reuses ``_is_own_message`` and ``_is_user_authorized_from_message``
         (the same authorization decision the rest of the adapter already
         makes) rather than re-implementing sender gating in the queue seam.
+        Always built, capture-configured or not (one capture-aware queue
+        for every Application, per the plan) -- ``profile_provider`` is
+        only ever *called* from inside ``put()`` when a message actually
+        matches a configured route, so an adapter with no ``capture_routes``
+        at all never needs ``receiving_profile`` set (see connect()'s own
+        guard, scoped to ``_capture_is_configured()``, for the eager check).
         """
         return CaptureAwareQueue(
             store=self._ensure_capture_store(),
             route_table_provider=self._capture_route_table,
             account_id_provider=lambda: getattr(self._bot, "id", None),
-            profile_provider=lambda: self.receiving_profile or "default",
+            profile_provider=self._require_receiving_profile,
             thread_id_resolver=self._effective_message_thread_id,
             is_own_message=self._is_own_message,
-            is_authorized_sender=self._is_user_authorized_from_message,
+            is_authorized_sender=self._is_capture_sender_authorized,
             alert_failure=self._alert_capture_failure,
         )
 

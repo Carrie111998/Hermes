@@ -1,6 +1,7 @@
 """Phase 3: secondary-profile adapter registry + same-token conflict detection."""
 import logging
 import asyncio
+import re
 from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import AsyncMock
@@ -511,7 +512,9 @@ class _ImmutableProfileAdapter:
     def receiving_profile(self, value):
         if self._receiving_profile is not None:
             raise RuntimeError("receiving_profile is immutable once set")
-        self._receiving_profile = value
+        if not re.match(r"^[a-z][a-z0-9_-]{0,63}$", str(value)):
+            raise ValueError(f"invalid receiving_profile {value!r}")
+        self._receiving_profile = str(value)
 
     def set_message_handler(self, handler):
         pass
@@ -550,11 +553,31 @@ class TestReceivingProfileStamping:
         GatewayRunner._stamp_receiving_profile(adapter, "coder")  # must not raise
         assert not hasattr(adapter, "_receiving_profile")
 
-    def test_does_not_raise_when_adapter_setter_rejects_a_second_stamp(self):
+    def test_repeat_stamp_raises_not_swallowed(self):
+        """A second stamp attempt must propagate, not be silently logged
+        away: an unstamped/mis-stamped secondary-profile adapter must never
+        be left running as if it were the default profile (Slice 1.1R-B,
+        blocker 2 -- "gateway/run.py must not suppress ... stamp errors")."""
         adapter = _ImmutableProfileAdapter()
         adapter.receiving_profile = "coder"
-        GatewayRunner._stamp_receiving_profile(adapter, "different")  # logged, not raised
-        assert adapter.receiving_profile == "coder"  # first stamp wins
+        with pytest.raises(RuntimeError):
+            GatewayRunner._stamp_receiving_profile(adapter, "different")
+        assert adapter.receiving_profile == "coder"  # first stamp still wins, never overwritten
+
+    def test_missing_profile_name_raises_not_swallowed(self):
+        adapter = _ImmutableProfileAdapter()
+        with pytest.raises(ValueError):
+            GatewayRunner._stamp_receiving_profile(adapter, "")
+        assert adapter.receiving_profile is None
+        with pytest.raises(ValueError):
+            GatewayRunner._stamp_receiving_profile(adapter, None)
+        assert adapter.receiving_profile is None
+
+    def test_invalid_profile_name_raises_not_swallowed(self):
+        adapter = _ImmutableProfileAdapter()
+        with pytest.raises(ValueError):
+            GatewayRunner._stamp_receiving_profile(adapter, "Not Valid!")
+        assert adapter.receiving_profile is None
 
     def test_configure_profile_adapter_stamps_receiving_profile(self):
         runner = GatewayRunner.__new__(GatewayRunner)
@@ -570,5 +593,71 @@ class TestReceivingProfileStamping:
         runner._configure_profile_adapter(adapter, "coder", Platform.TELEGRAM)
 
         assert adapter.receiving_profile == "coder"
+
+
+class TestStampPrimaryAdapterOrDispose:
+    """gateway/run.py's ``_stamp_primary_adapter_or_dispose`` is the single
+    helper both the primary-profile startup loop (``start()``) and the
+    primary-profile reconnect loop (``_platform_reconnect_watcher``) call
+    before wiring handlers -- by construction, one test class covers both
+    call sites' stamp-failure handling, since they now share the exact
+    same code rather than two independent copies.
+    """
+
+    @staticmethod
+    def _runner():
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._active_profile_name = lambda: "coder"
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_primary_startup_stamps_successfully(self):
+        runner = self._runner()
+        adapter = _ImmutableProfileAdapter()
+
+        ok = await runner._stamp_primary_adapter_or_dispose(adapter, Platform.TELEGRAM)
+
+        assert ok is True
+        assert adapter.receiving_profile == "coder"
+
+    @pytest.mark.asyncio
+    async def test_primary_startup_stamp_failure_disposes_and_skips(self):
+        """A stamp failure (here: already stamped, simulating a double-
+        construction bug) must not be swallowed -- the platform is skipped
+        (False) and the half-wired adapter is disposed, not left running
+        unstamped as if it were correctly configured."""
+        runner = self._runner()
+        adapter = _ImmutableProfileAdapter()
+        adapter.receiving_profile = "already-set"
+
+        ok = await runner._stamp_primary_adapter_or_dispose(adapter, Platform.TELEGRAM)
+
+        assert ok is False
+        assert adapter.receiving_profile == "already-set"  # untouched, not overwritten
+
+    @pytest.mark.asyncio
+    async def test_primary_reconnect_stamp_failure_disposes_and_skips(self):
+        """Same helper, exercised the way the reconnect loop uses it: a
+        freshly re-created adapter for a platform that's retrying after an
+        earlier failure. Stamp failure must skip just this attempt, not
+        raise out of the reconnect watcher's scan loop."""
+        runner = self._runner()
+        adapter = _ImmutableProfileAdapter()
+        adapter.receiving_profile = "already-set"  # e.g. a reused/misrouted adapter object
+
+        ok = await runner._stamp_primary_adapter_or_dispose(adapter, Platform.DISCORD)
+
+        assert ok is False
+
+    @pytest.mark.asyncio
+    async def test_missing_active_profile_name_fails_closed(self):
+        runner = self._runner()
+        runner._active_profile_name = lambda: ""
+        adapter = _ImmutableProfileAdapter()
+
+        ok = await runner._stamp_primary_adapter_or_dispose(adapter, Platform.TELEGRAM)
+
+        assert ok is False
+        assert adapter.receiving_profile is None
 
 
