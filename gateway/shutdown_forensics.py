@@ -367,12 +367,20 @@ def check_systemd_timing_alignment(drain_timeout: float) -> Optional[Dict[str, A
     for flag in (["--user"], []):
         try:
             result = subprocess.run(
-                ["systemctl", *flag, "show", unit_name, "--property=TimeoutStopUSec"],
+                [
+                    "systemctl", *flag, "show", unit_name,
+                    "--property=LoadState", "--property=TimeoutStopUSec",
+                ],
                 capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=2.0,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             continue
         if result.returncode != 0:
+            continue
+        # A user manager can return its default TimeoutStopUSec even when the
+        # requested unit is absent.  Do not treat that default as this
+        # service's configured timeout; fall through to the system manager.
+        if any(line.strip() == "LoadState=not-found" for line in result.stdout.splitlines()):
             continue
         # Output: "TimeoutStopUSec=1min 30s" or "TimeoutStopUSec=90000000"
         for line in result.stdout.splitlines():

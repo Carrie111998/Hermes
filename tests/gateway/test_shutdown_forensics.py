@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import signal
@@ -142,3 +143,39 @@ class TestCheckSystemdTimingAlignment:
         # for whatever unit pytest IS in.  Both are valid; we just ensure
         # the function doesn't raise.
         assert result is None or isinstance(result, dict)
+
+    def test_skips_missing_user_unit_and_checks_system_service(self, monkeypatch):
+        monkeypatch.setenv("INVOCATION_ID", "abc")
+        monkeypatch.setattr(
+            "builtins.open",
+            lambda *args, **kwargs: io.StringIO("0::/system.slice/hermes-gateway.service\n"),
+        )
+
+        calls = []
+
+        class Result:
+            def __init__(self, stdout):
+                self.returncode = 0
+                self.stdout = stdout
+
+        def fake_run(command, **kwargs):
+            calls.append(command)
+            if "--user" in command:
+                # systemctl --user show returns manager defaults even when
+                # the requested unit does not exist.
+                return Result("TimeoutStopUSec=1min 30s\nLoadState=not-found\n")
+            return Result("TimeoutStopUSec=4min\nLoadState=loaded\n")
+
+        monkeypatch.setattr(sf.subprocess, "run", fake_run)
+
+        result = sf.check_systemd_timing_alignment(180.0)
+
+        assert result == {
+            "unit": "hermes-gateway.service",
+            "timeout_stop_sec": 240.0,
+            "drain_timeout": 180.0,
+            "expected_min": 210.0,
+            "mismatch": False,
+        }
+        assert any("--user" in command for command in calls)
+        assert any("--user" not in command for command in calls)
