@@ -196,6 +196,14 @@ def test_search_results_bit_identical_to_unhoisted(hoisted_retriever):
     for fact in old_results:
         fact.pop("hrr_vector", None)
 
+    # ``retrieval_count`` is bookkeeping, not scoring: the reference rows are
+    # re-read from the DB *after* search() has already recorded its retrievals,
+    # so they carry the incremented value while the returned dicts hold the
+    # pre-increment snapshot. Compare everything else — the hoist parity this
+    # test exists to prove is about the scored output.
+    for fact in (*new_results, *old_results):
+        fact.pop("retrieval_count", None)
+
     assert new_results == old_results
 
 
