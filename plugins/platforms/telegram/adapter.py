@@ -6743,7 +6743,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         from hermes_constants import get_hermes_home
 
-        script_path = get_hermes_home() / "scripts" / "gmail-triage" / script_name
+        script_path = Path(get_hermes_home()) / "scripts" / "gmail-triage" / script_name
         if not script_path.exists():
             await query.answer(text=f"❌ {script_name} missing")
             logger.error("[%s] gmail-triage script missing: %s", self.name, script_path)

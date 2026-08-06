@@ -720,10 +720,9 @@ class GoogleChatAdapter(BasePlatformAdapter):
         # multi-restart sessions).
         try:
             from hermes_constants import get_hermes_home as _get_hermes_home
-            _hermes_home = _get_hermes_home()
+            _hermes_home = Path(_get_hermes_home())
         except (ModuleNotFoundError, ImportError):
-            from hermes_constants import get_hermes_home
-            _hermes_home = get_hermes_home()
+            _hermes_home = Path.home() / ".hermes"
         self._thread_count_store = _ThreadCountStore(
             _hermes_home / "google_chat_thread_counts.json"
         )
