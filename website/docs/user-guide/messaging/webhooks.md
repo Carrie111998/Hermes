@@ -208,6 +208,37 @@ If no `prompt` template is configured for a route, the entire payload is dumped 
 
 The same dot-notation templates work in `deliver_extra` values.
 
+### Privileged Ticket-Automation Incidents
+
+`ticket-automation-incident` is deliberately not a configurable webhook route
+and cannot be created with `hermes webhook subscribe`. It is a static,
+loopback-only route for a separately administered ticketing service. The route
+accepts only a small, fixed Ed25519-signed envelope; unsigned, malformed,
+stale, replayed, and non-allowlisted events are rejected before an agent run is
+created. Payload fields are treated as untrusted evidence and cannot replace
+the fixed remediation workflow.
+
+The gateway must bind exactly to `127.0.0.1`, and the public verification key
+must be supplied as an inline base64/hex/PEM value or an absolute, non-symlink
+path. Keep the gateway configuration root-owned and read-only to the ordinary
+agent account.
+
+```yaml
+platforms:
+  webhook:
+    enabled: true
+    extra:
+      host: 127.0.0.1
+      port: 8644
+      ticket_automation_incident:
+        enabled: true
+        public_key_path: /Library/Application Support/dotpm-ticketing/incident-ed25519-public.key
+```
+
+The route is `POST /webhooks/ticket-automation-incident`. It does not use the
+dynamic route HMAC secret or dynamic prompt templates; existing dynamic routes
+keep their normal HMAC behavior unchanged.
+
 ### Forum Topic Delivery
 
 When delivering webhook responses to Telegram, you can target a specific forum topic by including `message_thread_id` (or `thread_id`) in `deliver_extra`:

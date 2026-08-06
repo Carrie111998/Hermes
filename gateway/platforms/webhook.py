@@ -59,6 +59,15 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.ticket_automation_incident import (
+    IncidentEnvelopeError,
+    IncidentReplayStore,
+    ROUTE_NAME as _TICKET_AUTOMATION_INCIDENT_ROUTE,
+    assert_fresh as _assert_ticket_incident_fresh,
+    fixed_prompt as _ticket_incident_prompt,
+    load_public_key as _load_ticket_incident_public_key,
+    verify_envelope as _verify_ticket_incident_envelope,
+)
 from gateway.platforms.webhook_filters import (
     DEFAULT_SCRIPT_TIMEOUT_SECONDS,
     WebhookRouteProcessor,
@@ -201,6 +210,18 @@ class WebhookAdapter(BasePlatformAdapter):
         # (once-per-route so a busy sender doesn't spam the log).
         self._v1_signature_warned: set[str] = set()
 
+        # This route is not a dynamic subscription. It is present only when a
+        # static administrator-supplied Ed25519 key is configured, and it
+        # deliberately bypasses template rendering and route configuration.
+        raw_ticket_incident = config.extra.get("ticket_automation_incident", {})
+        if raw_ticket_incident is None:
+            raw_ticket_incident = {}
+        if not isinstance(raw_ticket_incident, dict):
+            raise ValueError("[webhook] ticket_automation_incident must be a mapping")
+        self._ticket_incident_config = dict(raw_ticket_incident)
+        self._ticket_incident_public_key = None
+        self._ticket_incident_replays = None
+
         # Delivery info keyed by session chat_id.
         #
         # Read by every send() invocation for the chat_id (status messages
@@ -246,6 +267,7 @@ class WebhookAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        self._configure_ticket_automation_incident()
         # Load agent-created subscriptions before validating
         self._reload_dynamic_routes()
 
@@ -287,16 +309,7 @@ class WebhookAdapter(BasePlatformAdapter):
         # including Transfer-Encoding: chunked bodies that carry no
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
-        app.router.add_get("/health", self._handle_health)
-        app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
-        # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
-        # routes the inbound event to that profile. Same handler; the profile is
-        # captured from the path and stamped onto the SessionSource so the agent
-        # turn resolves that profile's config/skills/credentials. Only honored
-        # when gateway.multiplex_profiles is on (the handler validates).
-        app.router.add_post(
-            "/p/{profile}/webhooks/{route_name}", self._handle_webhook
-        )
+        self.register_routes(app)
 
         self._runner = web.AppRunner(app)
         await self._runner.setup()
@@ -471,6 +484,111 @@ class WebhookAdapter(BasePlatformAdapter):
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
 
+    def register_routes(self, app: "web.Application") -> None:
+        """Install HMAC routes plus the optional immutable incident route."""
+        app.router.add_get("/health", self._handle_health)
+        if self._ticket_incident_enabled:
+            if self._ticket_incident_public_key is None:
+                self._configure_ticket_automation_incident()
+            app.router.add_post(
+                f"/webhooks/{_TICKET_AUTOMATION_INCIDENT_ROUTE}",
+                self._handle_ticket_automation_incident,
+            )
+        app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
+        # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
+        # routes the inbound event to that profile. Same handler; the profile is
+        # captured from the path and stamped onto the SessionSource so the agent
+        # turn resolves that profile's config/skills/credentials. Only honored
+        # when gateway.multiplex_profiles is on (the handler validates).
+        app.router.add_post(
+            "/p/{profile}/webhooks/{route_name}", self._handle_webhook
+        )
+
+    @property
+    def _ticket_incident_enabled(self) -> bool:
+        return bool(self._ticket_incident_config.get("enabled", False))
+
+    def _configure_ticket_automation_incident(self) -> None:
+        """Validate the static route before opening any network listener."""
+        if not self._ticket_incident_enabled:
+            return
+        if self._host != "127.0.0.1":
+            raise ValueError(
+                "[webhook] ticket_automation_incident requires host 127.0.0.1; "
+                f"refusing bind to '{self._host}'"
+            )
+        if _TICKET_AUTOMATION_INCIDENT_ROUTE in self._static_routes:
+            raise ValueError(
+                "[webhook] ticket-automation-incident is reserved for the static Ed25519 route"
+            )
+        replay_state_path = self._ticket_incident_config.get("replay_state_path")
+        if replay_state_path is not None and (
+            not isinstance(replay_state_path, str) or not replay_state_path
+        ):
+            raise ValueError("[webhook] ticket_automation_incident replay_state_path must be a path string")
+        self._ticket_incident_public_key = _load_ticket_incident_public_key(
+            self._ticket_incident_config
+        )
+        self._ticket_incident_replays = IncidentReplayStore(replay_state_path)
+
+    async def _handle_ticket_automation_incident(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """Verify a fixed Ed25519 envelope before dispatching EnsoPrime."""
+        if not self._ticket_incident_enabled or self._ticket_incident_public_key is None:
+            return web.json_response({"error": "Route unavailable"}, status=404)
+        if request.content_length is not None and request.content_length > 16_384:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        try:
+            raw_body = await request.read()
+            if len(raw_body) > 16_384:
+                return web.json_response({"error": "Payload too large"}, status=413)
+            envelope = json.loads(raw_body)
+            event, timestamp = _verify_ticket_incident_envelope(
+                envelope, self._ticket_incident_public_key
+            )
+            _assert_ticket_incident_fresh(timestamp)
+        except (json.JSONDecodeError, IncidentEnvelopeError, ValueError):
+            logger.warning("[webhook] rejected malformed, unsigned, or stale ticket incident")
+            return web.json_response({"error": "Invalid ticket incident"}, status=400)
+        except Exception:
+            logger.exception("[webhook] ticket incident verification failed")
+            return web.json_response({"error": "Ticket incident unavailable"}, status=503)
+
+        assert self._ticket_incident_replays is not None
+        if self._ticket_incident_replays.seen(event):
+            logger.info("[webhook] skipping replayed ticket incident=%s", event["incident_id"])
+            return web.json_response(
+                {"status": "duplicate", "incident_id": event["incident_id"]}, status=200
+            )
+        # Persist before dispatch so a process restart after returning 202
+        # cannot turn a service retry into a second agent run.
+        self._ticket_incident_replays.record(event, timestamp)
+
+        delivery_id = f"ticket-incident:{event['nonce']}"
+        session_chat_id = f"webhook:{_TICKET_AUTOMATION_INCIDENT_ROUTE}:{event['incident_id']}"
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name="webhook/ticket-automation-incident",
+            chat_type="webhook",
+            user_id="webhook:ticket-automation-incident",
+            user_name="ticket-automation-incident",
+        )
+        message = MessageEvent(
+            text=_ticket_incident_prompt(event),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=event,
+            message_id=delivery_id,
+        )
+        task = asyncio.create_task(self.handle_message(message))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        logger.info("[webhook] accepted verified ticket incident=%s", event["incident_id"])
+        return web.json_response(
+            {"status": "accepted", "incident_id": event["incident_id"]}, status=202
+        )
+
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
         from hermes_constants import get_hermes_home
@@ -495,6 +613,12 @@ class WebhookAdapter(BasePlatformAdapter):
             # validation entirely, letting unauthenticated callers in.
             new_dynamic: Dict[str, dict] = {}
             for k, v in data.items():
+                if k == _TICKET_AUTOMATION_INCIDENT_ROUTE:
+                    logger.warning(
+                        "[webhook] Dynamic route '%s' skipped: reserved for static Ed25519 verification",
+                        k,
+                    )
+                    continue
                 if k in self._static_routes:
                     continue
                 effective_secret = v.get("secret", self._global_secret)
