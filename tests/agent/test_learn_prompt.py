@@ -38,6 +38,14 @@ class TestBuildLearnPrompt:
 
 
 
+    def test_checks_existing_skills_before_creation(self):
+        prompt = build_learn_prompt("distill the workflow we just completed")
+        low = prompt.lower()
+        assert "skills_list()" in prompt
+        assert "skill_view(name=...)" in prompt
+        assert "patching an existing skill" in low
+        assert "overlap_reason" in prompt
+
     def test_teaches_the_full_hardline_standards(self):
         # description length — otherwise distilled skills miss platform gating,
         # author credit, and the tool-framing table. Lock the coverage in.
