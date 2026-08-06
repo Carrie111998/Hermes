@@ -37,16 +37,34 @@ def read(p):
 
 
 def def_spans(src):
-    """name -> first module-level FunctionDef/Assign node (per name)."""
+    """name -> defining node (first per name), nested ones mapped outward.
+
+    Walks the whole module (ast.walk) instead of tree.body so annotated
+    constants (ast.AnnAssign) and names assigned inside a module-level
+    try/except or if block are found — both shapes never appear in
+    tree.body (SKILL.md traps; PR #79609). A nested assignment maps to
+    its enclosing TOP-LEVEL statement so span_text() compares the whole
+    moved unit (e.g. the entire try block) against live.
+    """
     tree = ast.parse(src)
     out = {}
-    for node in tree.body:
+    for node in ast.walk(tree):
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             out.setdefault(node.name, node)
         elif isinstance(node, ast.Assign):
             for t in node.targets:
                 if isinstance(t, ast.Name):
                     out.setdefault(t.id, node)
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name):
+                out.setdefault(node.target.id, node)
+    for name, node in out.items():
+        if node in tree.body:
+            continue
+        for stmt in tree.body:
+            if stmt.lineno <= node.lineno <= stmt.end_lineno:
+                out[name] = stmt
+                break
     return out
 
 
