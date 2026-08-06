@@ -12977,6 +12977,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._voice_start_recording()
         except Exception as e:
             _cprint(f"{_DIM}Wake capture failed: {e}{_RST}")
+            # Recording never started — roll back the continuous-voice flags so
+            # the watchdog doesn't read busy forever (it checks
+            # `_voice_continuous` to keep the detector paused during a live
+            # voice chat). Without this, a failed capture start leaves the
+            # listener suspended until the user toggles wake off/on.
+            with self._voice_lock:
+                self._voice_mode = False
+            self._voice_continuous = False
             # Leave _wake_suspended set; the watchdog resumes once idle.
 
     def _start_wake_watchdog(self):

@@ -688,6 +688,29 @@ def test_wake_enters_continuous_voice(monkeypatch):
     cli._voice_start_recording.assert_called_once()
 
 
+def test_wake_capture_failure_rolls_back_continuous_flags(monkeypatch):
+    """If recording can't start, _voice_continuous must be reset so the
+    watchdog doesn't read busy forever and keep the listener suspended.
+
+    Regression test for the AI-triage finding on PR #79696: the flag was set
+    before the try, and the except path returned with it stuck True — the
+    busy-check (`or self._voice_continuous`) then held the detector paused
+    until the user toggled wake off/on.
+    """
+    cli = _make_wake_cli()
+    monkeypatch.setattr("tools.wake_word.pause_listening", lambda **kw: True)
+    monkeypatch.setattr("tools.wake_word.get_last_match", lambda: None)
+
+    def boom():
+        raise RuntimeError("no input device")
+    cli._voice_start_recording = boom
+
+    cli._on_wake_word()
+
+    assert cli._voice_mode is False
+    assert cli._voice_continuous is False
+
+
 def test_wake_skips_when_agent_busy(monkeypatch):
     """Wake during an in-flight turn is ignored (single-flight guard)."""
     cli = _make_wake_cli(_agent_running=True)
