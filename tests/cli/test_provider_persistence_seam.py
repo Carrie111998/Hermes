@@ -119,13 +119,6 @@ def test_save_custom_provider_round_trip(monkeypatch, tmp_path):
     assert entry["models"] == {"qwen3-coder": {"context_length": 32768}}
 
 
-def _load_entries(tmp_path):
-    import yaml
-
-    cfg = yaml.safe_load((tmp_path / "config.yaml").read_text()) or {}
-    return cfg.get("custom_providers") or []
-
-
 def test_save_custom_provider_persists_across_calls_and_dedups(monkeypatch, tmp_path):
     """Persistence across calls: a second save of the same base_url updates
     the existing entry instead of appending; a new URL appends."""
