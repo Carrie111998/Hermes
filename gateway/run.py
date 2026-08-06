@@ -2828,6 +2828,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
     _session_reasoning_overrides: Dict[str, Dict[str, Any]] = {}
     _startup_restore_in_progress: bool = False
+    # Upper bound on the per-runner STT dedupe cache (see
+    # _transcribe_audio_deduped). One entry per recently transcribed audio
+    # file; small on purpose — it only has to span the few moments in which
+    # the interrupt path and the normal inbound path both handle one event.
+    _STT_RESULT_CACHE_MAX: int = 32
 
     def __init__(self, config: Optional[GatewayConfig] = None):
         global _gateway_runner_ref
@@ -15293,6 +15298,87 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return prefix
         return user_text
 
+    @staticmethod
+    def _stt_cache_key(path: str) -> tuple:
+        """Stable identity for a cached audio file.
+
+        Path alone is not enough: the media cache can reuse a name. Include the
+        inode identity plus size/mtime so a *different* file that happens to
+        land on the same path is transcribed on its own merits. When stat()
+        fails we fall back to the absolute path — the transcription attempt
+        then surfaces the real I/O error instead of us guessing here.
+        """
+        abs_path = os.path.abspath(path)
+        try:
+            st = os.stat(abs_path)
+        except OSError:
+            return (abs_path, None, None, None, None)
+        return (abs_path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+    async def _transcribe_audio_deduped(self, path: str) -> tuple[dict, bool]:
+        """Transcribe ``path`` once, even when two paths race on the same file.
+
+        A voice message that arrives during an active run is transcribed by the
+        interrupt/drain path AND again by the normal inbound preprocessing
+        pipeline, because both receive the same MessageEvent pointing at the
+        same cached audio file. That billed Whisper twice and echoed the 🎙️
+        transcript twice for one voice note.
+
+        Returns ``(result, is_first_delivery)``. ``is_first_delivery`` is True
+        only for the caller that first consumes this file's transcript; later
+        (or concurrently waiting) callers still get the transcript for the
+        agent prompt but must not echo it again.
+
+        Only successful results are retained: a failed or raising provider is
+        evicted so the next attempt genuinely retries, and the failure is
+        handed to every waiter rather than swallowed.
+        """
+        from tools.transcription_tools import transcribe_audio
+
+        cache = getattr(self, "_stt_result_cache", None)
+        if cache is None:
+            cache = OrderedDict()
+            self._stt_result_cache = cache
+
+        key = self._stt_cache_key(path)
+        entry = cache.get(key)
+        if entry is not None:
+            cache.move_to_end(key)
+            # shield(): a cancelled waiter must not cancel the shared future
+            # out from under the other callers.
+            result = await asyncio.shield(entry["future"])
+            first = not entry["delivered"]
+            entry["delivered"] = True
+            return result, first
+
+        loop = asyncio.get_running_loop()
+        entry = {"future": loop.create_future(), "delivered": False}
+        # No await between the get() above and this insert, so the event loop
+        # cannot interleave a second owner for the same key.
+        cache[key] = entry
+        while len(cache) > self._STT_RESULT_CACHE_MAX:
+            cache.popitem(last=False)
+
+        future = entry["future"]
+        try:
+            result = await asyncio.to_thread(transcribe_audio, path)
+        except BaseException as exc:
+            cache.pop(key, None)
+            if not future.done():
+                future.set_exception(exc)
+                # Mark retrieved: when nobody else is waiting, asyncio would
+                # otherwise log a spurious "exception was never retrieved".
+                future.exception()
+            raise
+
+        if not result.get("success"):
+            # Don't cache failures — the next call should hit the provider again.
+            cache.pop(key, None)
+        if not future.done():
+            future.set_result(result)
+        entry["delivered"] = True
+        return result, True
+
     async def _enrich_message_with_transcription(
         self,
         user_text: str,
@@ -15311,9 +15397,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
               - ``enriched_text``: the message string with transcription wrappers
                 prepended (same as before).
               - ``successful_transcripts``: the raw transcript strings for audio
-                clips that were successfully transcribed, in input order. Empty
-                list if every clip failed or STT is disabled. Callers can use
-                this to echo transcripts back to the user before the agent loop.
+                clips that were successfully transcribed *by this call*, in
+                input order. Empty list if every clip failed, STT is disabled,
+                or another path already transcribed the same file (see
+                ``_transcribe_audio_deduped``). Callers use this to echo
+                transcripts back to the user before the agent loop, so a clip
+                appears here exactly once no matter how many paths process it.
         """
         if not getattr(self.config, "stt_enabled", True):
             notes = []
@@ -15336,17 +15425,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return f"{prefix}\n\n{user_text}", []
             return prefix, []
 
-        from tools.transcription_tools import transcribe_audio
-
         enriched_parts = []
         successful_transcripts: List[str] = []
         for path in audio_paths:
             try:
                 logger.debug("Transcribing user voice: %s", path)
-                result = await asyncio.to_thread(transcribe_audio, path)
+                result, _is_first_delivery = await self._transcribe_audio_deduped(path)
                 if result["success"]:
                     transcript = result["transcript"]
-                    successful_transcripts.append(transcript)
+                    # Only the first consumer of a given file reports the
+                    # transcript as "new". Callers echo 🎙️ from this list, so
+                    # gating it here keeps one echo per voice note when the
+                    # interrupt path and the normal path both run.
+                    if _is_first_delivery:
+                        successful_transcripts.append(transcript)
                     # Pass the transcript through as a plain quoted line. The
                     # earlier wording ("The user sent a voice message~ Here's
                     # what they said: ...") read as a meta-instruction and made
