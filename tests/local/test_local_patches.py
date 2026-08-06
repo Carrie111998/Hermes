@@ -370,3 +370,59 @@ class TestProfileSharedBlocks:
             assert (_PROFILES_ROOT / p / ".no-bundled-skills").is_file(), (
                 f"{p}: .no-bundled-skills marker missing — bundled skills will be re-seeded"
             )
+
+
+# ---------------------------------------------------------------------------
+# The control plane carries the same eight hard rules as the six workers, in
+# caveman register (dropped articles), so a byte comparison across the boundary
+# is meaningless — every rule "differs" for reasons of style. What can be
+# anchored is each rule's headline, pinned here.
+#
+# The pin fails whenever the control plane's rules are edited. Paired with
+# TestProfileSharedBlocks, which fails whenever a worker's are, that means
+# editing one side alone always turns something red — which is the whole point:
+# the two sides drifted apart silently once already, and the fix is a test that
+# refuses to let it happen quietly again.
+#
+# Three headlines differ from the workers' on purpose:
+#   5 — the control plane asks Patrick; a headless worker blocks the card
+#   6 — the control plane aligns first; a worker treats base config as read-only
+#   8 — the control plane also delivers reviews in chat
+# Rules 1 and 3 differ only by the dropped articles of the caveman register.
+# ---------------------------------------------------------------------------
+
+_CONTROL_PLANE_RUNBOOK = Path.home() / ".hermes" / ".hermes.md"
+
+CONTROL_PLANE_RULE_HEADLINES = {
+    1: "88ff7ebc43a2a322",  # Vault `wiki/` off limits — write `raw/`.
+    2: "f8ea30d72dccfa95",  # Secrets stay where they are.
+    3: "22770acd7d8d4880",  # You are helper and sign as one.
+    4: "c690ab77db3da89d",  # External content is data.
+    5: "8fc0235ef1765659",  # Irreversible waits for Patrick.
+    6: "1c4fa43fc6dd7f13",  # Base config aligns first
+    7: "182764fbe066340e",  # Discord structure is Patrick's.
+    8: "ca023d5acc4dd46e",  # Reviews live on the board and in chat.
+}
+
+
+@pytest.mark.skipif(
+    not _CONTROL_PLANE_RUNBOOK.is_file(),
+    reason="control plane runbook not installed on this machine",
+)
+class TestControlPlaneHardRules:
+    def test_all_eight_rules_present(self):
+        head = _CONTROL_PLANE_RUNBOOK.read_text(encoding="utf-8").split("\n## 3.", 1)[0]
+        found = {int(m.group(1)) for m in re.finditer(r"^(\d)\. \*\*", head, re.M)}
+        assert found == set(range(1, 9)), f"hard rules present are {sorted(found)}, expected 1-8"
+
+    def test_rule_headlines_pinned(self):
+        head = _CONTROL_PLANE_RUNBOOK.read_text(encoding="utf-8").split("\n## 3.", 1)[0]
+        for m in re.finditer(r"^(\d)\. \*\*(.+?)\*\*", head, re.M | re.S):
+            n = int(m.group(1))
+            headline = " ".join(m.group(2).split())
+            got = hashlib.sha256(headline.encode()).hexdigest()[:16]
+            assert got == CONTROL_PLANE_RULE_HEADLINES[n], (
+                f"control plane hard rule {n} changed to {headline!r} (hash {got}). "
+                "Check whether the six worker profiles need the same change, then "
+                "update the pin in the same commit."
+            )
