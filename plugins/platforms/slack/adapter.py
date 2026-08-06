@@ -5640,6 +5640,7 @@ class SlackAdapter(BasePlatformAdapter):
                 if allow_bots == "mentions" and not is_mentioned:
                     return
 
+        is_free_response_routing = False
         if not is_one_to_one_dm and bot_uid:
             # Check allowed channels — if set, only respond in these channels (whitelist)
             allowed_channels = self._slack_allowed_channels()
@@ -5666,15 +5667,17 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return
 
-            if force_process:
-                pass  # Explicit internal routing path (reaction trigger).
-            elif (
+            is_free_response_routing = (
                 channel_id not in self._slack_require_mention_channels()
                 and (
                     channel_id in self._slack_free_response_channels()
                     or not self._slack_require_mention()
                 )
-            ):
+            )
+
+            if force_process:
+                pass  # Explicit internal routing path (reaction trigger).
+            elif is_free_response_routing:
                 # Free-response channel, or mention requirement disabled
                 # globally — unless the channel is force-mention-gated via
                 # require_mention_channels, which overrides both.
@@ -6298,11 +6301,13 @@ class SlackAdapter(BasePlatformAdapter):
             },
         )
 
-        # Only react when bot is directly addressed (1:1 DM or @mention).
-        # MPIMs are shared surfaces: reacting to every group-DM message (even
-        # when unmentioned) is visible noise to the whole group, so they must
-        # be @mentioned to earn a reaction — same as any channel.
-        _should_react = (is_one_to_one_dm or is_mentioned) and self._reactions_enabled()
+        # React when the bot is directly addressed (1:1 DM or @mention), or
+        # when the routing decision above accepted an unmentioned message.
+        # Reusing that decision keeps forced-mention and global mention
+        # settings consistent with the reaction lifecycle.
+        _should_react = (
+            is_one_to_one_dm or is_mentioned or is_free_response_routing
+        ) and self._reactions_enabled()
         if _should_react:
             self._reacting_message_ids.add(
                 self._workspace_message_marker(team_id, ts)

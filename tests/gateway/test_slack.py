@@ -2623,6 +2623,53 @@ class TestReactions:
         # Message ID should be cleaned up
         assert "1234567890.000001" not in adapter._reacting_message_ids
 
+    @pytest.mark.asyncio
+    async def test_reactions_registered_for_free_response_channel(self, adapter):
+        """Processed free-response channel messages should get ack reactions."""
+        adapter.config.extra["free_response_channels"] = "C123"
+        adapter._app.client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Tyler"}}}
+        )
+
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000002",
+        }
+        await adapter._handle_slack_message(event)
+
+        marker = adapter._workspace_message_marker(
+            "T_TEAM", "1234567890.000002"
+        )
+        assert marker in adapter._reacting_message_ids
+
+    @pytest.mark.asyncio
+    async def test_reactions_not_registered_when_require_mention_overrides_free_response(
+        self, adapter
+    ):
+        """Forced mention gating should suppress free-response reactions."""
+        adapter.config.extra["free_response_channels"] = "C123"
+        adapter.config.extra["require_mention_channels"] = "C123"
+        adapter._app.client.users_info = AsyncMock(
+            return_value={"user": {"profile": {"display_name": "Tyler"}}}
+        )
+
+        event = {
+            "text": "hello",
+            "user": "U_USER",
+            "channel": "C123",
+            "channel_type": "channel",
+            "team": "T_TEAM",
+            "ts": "1234567890.000003",
+        }
+        await adapter._handle_slack_message(event)
+
+        assert adapter._reacting_message_ids == set()
+        adapter.handle_message.assert_not_called()
+
 
 # ---------------------------------------------------------------------------
 # TestThreadReplyHandling
