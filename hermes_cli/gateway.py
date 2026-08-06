@@ -23,6 +23,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
     get_env_value,
     get_hermes_home,
@@ -391,6 +392,11 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                         encoding="utf-8",
                         errors="ignore",
                         timeout=10,
+                        # Without CREATE_NO_WINDOW this pops a console window
+                        # on every scan. ``hermes gateway status`` runs one,
+                        # and anything polling gateway liveness runs one per
+                        # poll, so the flash is constant on Windows.
+                        creationflags=windows_hide_flags(),
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     result = None
@@ -416,6 +422,9 @@ def _scan_gateway_pids(exclude_pids: set[int], all_profiles: bool = False) -> li
                         encoding="utf-8",
                         errors="ignore",
                         timeout=15,
+                        # Same as the wmic branch above — and this is the path
+                        # modern Windows 11 actually takes, since wmic is gone.
+                        creationflags=windows_hide_flags(),
                     )
                 except (OSError, subprocess.TimeoutExpired):
                     return []
