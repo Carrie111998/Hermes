@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import sqlite3
 from argparse import Namespace
+from types import SimpleNamespace
 
 import hermes_cli.memory_reset as memory_reset_module
 from hermes_cli.memory_reset import cmd_memory_reset
@@ -228,6 +229,33 @@ def test_reset_spans_multiple_session_pages_and_delete_batches(tmp_path, monkeyp
         assert db.message_count() == 0
     finally:
         db.close()
+
+
+def test_gateway_probe_checks_profile_and_root_for_multiplex_writer(
+    tmp_path, monkeypatch
+):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "coder"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    probed_homes = []
+
+    def fake_liveness(*, profile_dir, use_cache):
+        assert use_cache is False
+        probed_homes.append(profile_dir)
+        return SimpleNamespace(
+            running=profile_dir == root.resolve(),
+            pid=4242 if profile_dir == root.resolve() else None,
+            probe_error=False,
+        )
+
+    monkeypatch.setattr(
+        "gateway.status.resolve_gateway_liveness",
+        fake_liveness,
+    )
+
+    assert memory_reset_module._get_running_gateway_pid(profile) == 4242
+    assert probed_homes == [profile.resolve(), root.resolve()]
 
 
 def test_running_gateway_blocks_reset_without_touching_state(tmp_path, monkeypatch):
