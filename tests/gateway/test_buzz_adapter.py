@@ -752,6 +752,68 @@ class TestBuzzAutoJoin:
         assert adapter._channel_state[DM_CHANNEL]["last_ts"] == 970
 
 
+# ── WebSocket subscriptions ──────────────────────────────────────────────
+
+
+class TestBuzzWebSocketSubscriptions:
+
+    @pytest.mark.asyncio
+    async def test_each_channel_has_an_independent_paced_subscription(self, monkeypatch):
+        adapter = _make_adapter()
+        second_channel = "11111111-2222-3333-4444-555555555555"
+        adapter._channel_state = {
+            CHANNEL: {"last_ts": 1000},
+            second_channel: {"last_ts": 2000},
+        }
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+        sleep = AsyncMock()
+        monkeypatch.setattr(_buzz_mod.asyncio, "sleep", sleep)
+
+        subscriptions = await adapter._subscribe_websocket(websocket)
+
+        frames = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
+        channel_frames = [
+            frame for frame in frames
+            if frame[1].startswith("hermes-buzz-channel-")
+        ]
+        assert len(channel_frames) == 2
+        assert all(len(frame) == 3 for frame in channel_frames)
+        assert subscriptions[f"hermes-buzz-channel-{CHANNEL}"] == CHANNEL
+        assert subscriptions[f"hermes-buzz-channel-{second_channel}"] == second_channel
+        sleep.assert_awaited_once_with(_buzz_mod._WS_SUBSCRIBE_DELAY)
+
+    @pytest.mark.asyncio
+    async def test_sync_only_closes_removed_and_opens_added_channels(self):
+        adapter = _make_adapter()
+        removed_channel = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        added_channel = "11111111-2222-3333-4444-555555555555"
+        adapter._ws_subscribed_channels = {CHANNEL, removed_channel}
+        adapter._channel_state = {
+            CHANNEL: {"last_ts": 1000},
+            added_channel: {"last_ts": 2000},
+        }
+        subscriptions = {
+            f"hermes-buzz-channel-{CHANNEL}": CHANNEL,
+            f"hermes-buzz-channel-{removed_channel}": removed_channel,
+            "hermes-buzz-membership": None,
+        }
+        websocket = MagicMock()
+        websocket.send = AsyncMock()
+
+        await adapter._sync_ws_subscriptions(websocket, subscriptions)
+
+        frames = [json.loads(call.args[0]) for call in websocket.send.await_args_list]
+        assert ["CLOSE", f"hermes-buzz-channel-{removed_channel}"] in frames
+        assert any(
+            frame[0:2] == ["REQ", f"hermes-buzz-channel-{added_channel}"]
+            for frame in frames
+        )
+        assert subscriptions[f"hermes-buzz-channel-{CHANNEL}"] == CHANNEL
+        assert subscriptions[f"hermes-buzz-channel-{added_channel}"] == added_channel
+        assert f"hermes-buzz-channel-{removed_channel}" not in subscriptions
+
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 
 
