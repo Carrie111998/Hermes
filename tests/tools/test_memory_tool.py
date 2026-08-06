@@ -4,6 +4,9 @@ import json
 import pytest
 from pathlib import Path
 
+from hermes_cli.write_approval_commands import handle_pending_subcommand
+from hermes_constants import get_hermes_home
+from tools import write_approval as wa
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
@@ -817,3 +820,215 @@ class TestDetectPolicyClaim:
     def test_baichuan_provider_detected(self):
         """'disable baichuan entirely' should be detected."""
         assert self._detect("disable baichuan entirely") is not None
+
+
+# =========================================================================
+# Registered-provider coverage for the policy-claim classifier (#64681 review)
+# =========================================================================
+
+class TestPolicyClaimProviderCoverage:
+    """Every registered model-provider plugin identifier must be covered by
+    the policy-claim classifier.  The PR #72988 review flagged that 'never
+    use openrouter' bypassed the gate because the matcher only listed a
+    subset of registered providers.  Enumerating the plugin directory keeps
+    coverage self-maintaining: a provider added to plugins/model-providers/
+    fails this test until its identifier lands in _POLICY_CLAIM_MODEL_RE."""
+
+    PROVIDER_PLUGIN_DIR = (
+        Path(__file__).resolve().parents[2] / "plugins" / "model-providers"
+    )
+
+    def test_all_registered_providers_are_covered(self):
+        assert self.PROVIDER_PLUGIN_DIR.is_dir(), (
+            "provider plugin directory moved — update PROVIDER_PLUGIN_DIR"
+        )
+        providers = sorted(
+            p.name for p in self.PROVIDER_PLUGIN_DIR.iterdir() if p.is_dir()
+        )
+        assert providers, "no provider plugins found — layout changed?"
+        missing = [
+            name for name in providers
+            if _detect_policy_claim(f"never use {name}") is None
+        ]
+        assert missing == [], (
+            "registered provider identifier(s) missing from "
+            f"_POLICY_CLAIM_MODEL_RE: {missing}"
+        )
+
+    def test_compound_provider_names_covered_by_base_word(self):
+        """Hyphenated identifiers match via their base word (\\b...\\b)."""
+        for name in ("openai-codex", "kimi-coding", "qwen-oauth",
+                     "azure-foundry", "copilot-acp"):
+            assert _detect_policy_claim(f"never use {name}") is not None
+
+    def test_colloquial_base_forms_covered(self):
+        """Colloquial names must be caught, not just the exact plugin id:
+        users write 'never use ollama' / 'never use opencode', while the
+        registered identifiers are ollama-cloud / opencode-zen."""
+        assert _detect_policy_claim("never use ollama") is not None
+        assert _detect_policy_claim("never use opencode") is not None
+
+    def test_openrouter_regression(self):
+        """The exact case the review flagged must not bypass the gate."""
+        assert _detect_policy_claim("never use openrouter") is not None
+        assert _detect_policy_claim("never use openrouter/auto") is not None
+
+
+# =========================================================================
+# Policy-claim staging integration (PR #72988 review)
+# =========================================================================
+
+class TestPolicyClaimStagingIntegration:
+    """End-to-end: memory_tool() stages detected policy claims under the
+    default-off write-approval setting; nothing reaches disk before the user
+    approves via the pending handler; approval replays exactly once."""
+
+    def test_policy_claim_add_stages_and_skips_disk(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert result.get("policy_claim") is True
+        assert "pending_id" in result
+        # Nothing on disk / in the live store yet.
+        assert "User bans gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        # The staged record exists with the full replay payload.
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "add"
+        assert records[0]["payload"]["content"] == "User bans gpt-5.6-sol"
+
+    def test_approve_replays_exactly_once(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        pid = result["pending_id"]
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", pid], memory_store=store
+        )
+        assert "Approved 1" in out
+        # Landed exactly once.
+        assert store.memory_entries.count("User bans gpt-5.6-sol") == 1
+        memory_file = tmp_path / "MEMORY.md"
+        assert memory_file.read_text().count("User bans gpt-5.6-sol") == 1
+        # Record consumed.
+        assert wa.list_pending(wa.MEMORY) == []
+        # Re-approval is a no-op.
+        out2 = handle_pending_subcommand(
+            wa.MEMORY, ["approve", pid], memory_store=store
+        )
+        assert "No pending" in out2
+
+    def test_reject_never_lands(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        pid = result["pending_id"]
+        out = handle_pending_subcommand(wa.MEMORY, ["reject", pid])
+        assert "Rejected" in out
+        assert "gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_benign_write_passes_through_ungated(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User prefers compact responses",
+            store=store,
+        ))
+        assert result.get("success") is True
+        assert "staged" not in result
+        assert "User prefers compact responses" in store.memory_entries
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_benign_write_with_provider_word_passes_through(self, store):
+        """A provider identifier WITHOUT a directive/permanence cue is not a
+        policy claim — it must persist normally, not stage."""
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User prefers vertex themes in the dashboard",
+            store=store,
+        ))
+        assert result.get("success") is True
+        assert "staged" not in result
+        assert any("vertex themes" in e for e in store.memory_entries)
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_batch_with_policy_claim_stages_whole_batch(self, store, tmp_path):
+        result = json.loads(memory_tool(
+            target="memory",
+            operations=[
+                {"action": "add", "content": "User bans gpt-5.6-sol"},
+                {"action": "add", "content": "User prefers bullet points"},
+            ],
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert result.get("policy_claim") is True
+        # Neither op hit disk.
+        assert "gpt-5.6-sol" not in store.memory_entries
+        assert "bullet points" not in store.memory_entries
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "batch"
+        # Approve → the whole batch applies exactly once.
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", result["pending_id"]], memory_store=store
+        )
+        assert "Approved 1" in out
+        assert store.memory_entries.count("User bans gpt-5.6-sol") == 1
+        assert store.memory_entries.count("User prefers bullet points") == 1
+        assert wa.list_pending(wa.MEMORY) == []
+
+    def test_replace_with_policy_claim_stages(self, store, tmp_path):
+        store.add("memory", "use gpt-5.6-sol for code review")
+        result = json.loads(memory_tool(
+            action="replace", target="memory",
+            old_text="use gpt-5.6-sol for code review",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("staged") is True
+        assert "bans gpt-5.6-sol" not in str(store.memory_entries)
+        records = wa.list_pending(wa.MEMORY)
+        assert len(records) == 1
+        assert records[0]["payload"]["action"] == "replace"
+        # Approve → replace replays against the store.
+        out = handle_pending_subcommand(
+            wa.MEMORY, ["approve", result["pending_id"]], memory_store=store
+        )
+        assert "Approved 1" in out
+        assert "bans gpt-5.6-sol" in str(store.memory_entries)
+        assert "for code review" not in str(store.memory_entries)
+
+    def test_staging_failure_fails_closed(self, store, tmp_path, monkeypatch):
+        """If staging raises, a detected policy claim must NOT flow to disk
+        (fail-closed — the triage review's 'fail open' concern)."""
+        import tools.write_approval as wa_mod
+
+        def boom(*args, **kwargs):
+            raise RuntimeError("simulated staging failure")
+
+        monkeypatch.setattr(wa_mod, "stage_write", boom)
+        result = json.loads(memory_tool(
+            action="add", target="memory",
+            content="User bans gpt-5.6-sol",
+            store=store,
+        ))
+        assert result.get("success") is False
+        assert result.get("policy_claim") is True
+        assert "blocked" in result["error"]
+        # Nothing persisted, nothing staged.
+        assert "gpt-5.6-sol" not in store.memory_entries
+        memory_file = tmp_path / "MEMORY.md"
+        assert not memory_file.exists() or "gpt-5.6-sol" not in memory_file.read_text()
+        assert wa.list_pending(wa.MEMORY) == []
