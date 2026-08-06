@@ -28,7 +28,7 @@ from typing import BinaryIO, Iterable
 import unicodedata
 
 
-RESULT_SCHEMA_VERSION = 3
+RESULT_SCHEMA_VERSION = 4
 SANDBOX_EXEC = Path("/usr/bin/sandbox-exec")
 UNSUPPORTED_SANDBOX_EXIT = 4
 _OBJECT_ID_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
@@ -41,7 +41,14 @@ _COUNT_KEYS = (
     "xfailed",
     "xpassed",
     "deselected",
+    "warnings",
 )
+_WARNING_CATEGORY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}Warning\Z")
+_WARNING_CATEGORY_POSITION_RE = re.compile(
+    r"^\s*(?:.+:\d+:\s+)?(?P<category>[^\s:]+Warning):(?:\s|$)"
+)
+_WARNING_SUMMARY_HEADER_RE = re.compile(r"=+\s+warnings summary\s+=+\Z")
+_MAX_WARNING_CATEGORIES = 32
 
 _SANDBOX_PROBE = r"""
 import errno
@@ -790,11 +797,62 @@ def _parse_pytest_counts(stdout: str, stderr: str) -> dict[str, int]:
         if not summary.fullmatch(candidate):
             continue
         for amount, label in re.findall(rf"(\d+) ({labels})", candidate):
-            normalized = "errors" if label in {"error", "errors"} else label
+            normalized = (
+                "errors"
+                if label in {"error", "errors"}
+                else "warnings"
+                if label in {"warning", "warnings"}
+                else label
+            )
             if normalized in counts:
                 counts[normalized] = int(amount)
         break
     return counts
+
+
+def _parse_warning_categories(
+    stdout: str, stderr: str, *, warning_count: int
+) -> tuple[list[str], bool]:
+    """Return bounded warning class names without retaining warning content."""
+    if warning_count == 0:
+        return [], True
+
+    categories: set[str] = set()
+    classified_positions = 0
+    unclassified_positions = 0
+    in_warning_summary = False
+    for line in (stdout + "\n" + stderr).splitlines():
+        stripped = line.strip()
+        if _WARNING_SUMMARY_HEADER_RE.fullmatch(stripped):
+            in_warning_summary = True
+            continue
+        if not in_warning_summary:
+            continue
+        if stripped.startswith("-- Docs:"):
+            in_warning_summary = False
+            continue
+        if len(line) > 4096:
+            if "Warning:" in line:
+                unclassified_positions += 1
+            continue
+        match = _WARNING_CATEGORY_POSITION_RE.match(line)
+        if match is None:
+            continue
+        token = match.group("category")
+        if _WARNING_CATEGORY_RE.fullmatch(token):
+            classified_positions += 1
+            categories.add(token)
+        else:
+            unclassified_positions += 1
+
+    ordered = sorted(categories)
+    capped = ordered[:_MAX_WARNING_CATEGORIES]
+    complete = bool(
+        unclassified_positions == 0
+        and classified_positions >= warning_count
+        and len(ordered) <= _MAX_WARNING_CATEGORIES
+    )
+    return capped, complete
 
 
 def _content_safe_test_nodes(pytest_args: list[str]) -> list[str]:
@@ -839,6 +897,8 @@ def _common_result(
         "repo_dirty_at_start": repo_dirty,
         "pytest_exit_code": None,
         "test_counts": _empty_test_counts(),
+        "warning_categories": [],
+        "warning_categories_complete": True,
         "pytest_arg_count": len(pytest_args),
         "test_node_args": _content_safe_test_nodes(pytest_args),
     }
@@ -1067,6 +1127,13 @@ def main(argv: Iterable[str] | None = None) -> int:
             )
             duration_ms = max(0, round((time.monotonic() - started) * 1000))
             counts = _parse_pytest_counts(completed.stdout, completed.stderr)
+            warning_categories, warning_categories_complete = (
+                _parse_warning_categories(
+                    completed.stdout,
+                    completed.stderr,
+                    warning_count=counts["warnings"],
+                )
+            )
 
             stage = "verify_materialized_tree_after_pytest"
             try:
@@ -1099,6 +1166,8 @@ def main(argv: Iterable[str] | None = None) -> int:
                 "pytest_exit_code": completed.returncode,
                 "duration_ms": duration_ms,
                 "test_counts": counts,
+                "warning_categories": warning_categories,
+                "warning_categories_complete": warning_categories_complete,
                 "materialization": materialization,
                 "source_unchanged": unchanged,
                 "source_read_only": read_only_before and read_only_after,

@@ -49,6 +49,8 @@ CONTENT_FREE_RESULT_KEYS = {
     "interpreter_provenance",
     "pytest_arg_count",
     "test_node_args",
+    "warning_categories",
+    "warning_categories_complete",
 }
 
 
@@ -85,6 +87,110 @@ def _git(repo: Path, *args: str) -> str:
 def _selected_pytest_python() -> str:
     """Preserve the reviewer-selected venv across nested runner regressions."""
     return os.environ.get("HERMES_PYTHON", "").strip() or sys.executable
+
+
+def test_warning_schema_defaults_are_complete_and_content_free():
+    runner = _load_runner_module()
+
+    common = runner._common_result(
+        tree="a" * 40,
+        reviewed_head="b" * 40,
+        reviewed_head_tree="a" * 40,
+        repo_dirty=False,
+        pytest_args=["tests/test_example.py", "-q"],
+    )
+    counts = runner._parse_pytest_counts("1 passed in 0.01s\n", "")
+    categories, complete = runner._parse_warning_categories(
+        "1 passed in 0.01s\n", "", warning_count=counts["warnings"]
+    )
+
+    assert runner.RESULT_SCHEMA_VERSION == 4
+    assert counts["warnings"] == 0
+    assert common["test_counts"]["warnings"] == 0
+    assert common["warning_categories"] == []
+    assert common["warning_categories_complete"] is True
+    assert categories == []
+    assert complete is True
+
+
+def test_warning_schema_keeps_only_safe_class_not_secret_message_or_path():
+    runner = _load_runner_module()
+    sentinel = f"warning-secret-{uuid.uuid4().hex}"
+    secret_path = f"/private/{sentinel}/test_secret.py"
+    stdout = (
+        "=============================== warnings summary ===============================\n"
+        f"{secret_path}:17: SecretBearingWarning: {sentinel}\n"
+        "-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html\n"
+        "1 passed, 1 warning in 0.02s\n"
+    )
+
+    counts = runner._parse_pytest_counts(stdout, "")
+    categories, complete = runner._parse_warning_categories(
+        stdout, "", warning_count=counts["warnings"]
+    )
+    payload = {
+        "test_counts": counts,
+        "warning_categories": categories,
+        "warning_categories_complete": complete,
+    }
+    serialized = json.dumps(payload, sort_keys=True)
+
+    assert counts["warnings"] == 1
+    assert categories == ["SecretBearingWarning"]
+    assert complete is True
+    assert sentinel not in serialized
+    assert secret_path not in serialized
+
+
+def test_warning_categories_deduplicate_and_sort_safe_classes():
+    runner = _load_runner_module()
+    stdout = """================ warnings summary ================
+tests/test_one.py:2: ZebraWarning: first
+tests/test_two.py:3: AlphaWarning: second
+tests/test_three.py:4: ZebraWarning: repeated
+-- Docs: https://docs.pytest.org/
+3 passed, 3 warnings in 0.03s
+"""
+
+    counts = runner._parse_pytest_counts(stdout, "")
+    categories, complete = runner._parse_warning_categories(
+        stdout, "", warning_count=counts["warnings"]
+    )
+
+    assert counts["warnings"] == 3
+    assert categories == ["AlphaWarning", "ZebraWarning"]
+    assert complete is True
+
+
+def test_unsafe_warning_tokens_are_omitted_and_marked_incomplete():
+    runner = _load_runner_module()
+    sentinel = f"unsafe-warning-{uuid.uuid4().hex}"
+    overlong = "A" * 65 + "Warning"
+    stdout = (
+        "================ warnings summary ================\n"
+        f"tests/test_unsafe.py:9: {overlong}: {sentinel}\n"
+        "-- Docs: https://docs.pytest.org/\n"
+        "1 passed, 1 warning in 0.01s\n"
+    )
+
+    counts = runner._parse_pytest_counts(stdout, "")
+    categories, complete = runner._parse_warning_categories(
+        stdout, "", warning_count=counts["warnings"]
+    )
+    serialized = json.dumps(
+        {
+            "test_counts": counts,
+            "warning_categories": categories,
+            "warning_categories_complete": complete,
+        },
+        sort_keys=True,
+    )
+
+    assert counts["warnings"] == 1
+    assert categories == []
+    assert complete is False
+    assert overlong not in serialized
+    assert sentinel not in serialized
 
 
 def _tiny_repo(tmp_path: Path, default_home: Path) -> tuple[Path, str, str]:
@@ -446,7 +552,7 @@ def test_runner_tests_exact_tree_in_read_only_isolated_environment(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert set(payload) <= CONTENT_FREE_RESULT_KEYS
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["tree"] == tree_hash
     assert payload["reviewed_head"] == commit_hash
     assert payload["reviewed_head_tree"] == tree_hash
@@ -477,6 +583,9 @@ def test_runner_tests_exact_tree_in_read_only_isolated_environment(tmp_path):
     assert "quinn_network_guard" not in json.dumps(payload)
     assert payload["test_node_args"] == ["tests/test_environment.py"]
     assert payload["test_counts"]["passed"] == 5
+    assert payload["test_counts"]["warnings"] == 0
+    assert payload["warning_categories"] == []
+    assert payload["warning_categories_complete"] is True
     assert payload["materialization"]["method"] == "git_ls_tree_cat_file_batch"
     assert payload["materialization"]["verified_before_pytest"] is True
     assert payload["materialization"]["verified_after_pytest"] is True
@@ -537,7 +646,7 @@ def test_runner_fails_clearly_when_selected_interpreter_cannot_import_pytest(tmp
     assert "cannot import pytest and pytest_asyncio" in result.stderr
     payload = json.loads(output.read_text(encoding="utf-8"))
     assert set(payload) <= CONTENT_FREE_RESULT_KEYS
-    assert payload["schema_version"] == 3
+    assert payload["schema_version"] == 4
     assert payload["status"] == "interpreter_unavailable"
     assert payload["error_class"] == "pytest_import_failed"
     assert payload["sandbox_probe"]["enforced"] is True
