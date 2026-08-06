@@ -14,7 +14,8 @@ export type Locale =
   | "ga"
   | "pt"
   | "ru"
-  | "hu";
+  | "hu"
+  | "ar";
 
 export interface Translations {
   // ── Common ──
@@ -161,8 +162,14 @@ export interface Translations {
     title: string;
     history: string;
     overview: string;
+    filterChats: string;
+    filterAutomation: string;
+    filterAll: string;
+    sourceFilter: string;
+    anySource: string;
     searchPlaceholder: string;
     noSessions: string;
+    noSessionsInFilter: string;
     noMatch: string;
     startConversation: string;
     noMessages: string;
@@ -813,9 +820,9 @@ export interface Translations {
     confirmArchive: string;
     confirmBlocked: string;
     confirmScheduled?: string;
-    confirmDoneMany: string;
-    confirmArchiveMany: string;
-    confirmBlockedMany: string;
+    confirmDoneMany?: string;
+    confirmArchiveMany?: string;
+    confirmBlockedMany?: string;
     completionSummary: string;
     completionSummaryRequired: string;
     triagePlaceholder: string;
@@ -829,7 +836,27 @@ export interface Translations {
     workspacePathOptional: string;
     logTruncated: string;
     logAt: string;
-    trash: {
+    // Optional keys added with the modal create-task dialog, board-settings
+    // dialog, and comment workflow hint. Non-English locales fall back to
+    // the English literal in the plugin bundle until translated, so these
+    // are optional to avoid churning every locale file.
+    newTaskTitle?: string;
+    taskTitleLabel?: string;
+    assigneeLabel?: string;
+    assigneeLabelHint?: string;
+    skillsLabel?: string;
+    skillsLabelHint?: string;
+    parentLabel?: string;
+    parentLabelHint?: string;
+    create?: string;
+    boardSettings?: string;
+    boardSettingsTitle?: string;
+    boardSettingsTitleFor?: string;
+    projectDirectoryOverrideHint?: string;
+    saving?: string;
+    commentHint?: string;
+    commentHintTitle?: string;
+    trash?: {
       confirmTitle: string;
       confirmManyTitle: string;
     };

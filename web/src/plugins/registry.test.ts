@@ -11,10 +11,22 @@
 import { beforeEach, describe, expect, it } from "vitest";
 import { exposePluginSDK } from "./registry";
 
+interface PluginSdk {
+  components: Record<string, unknown>;
+  hooks: Record<string, unknown>;
+}
+
+interface SdkTestWindow {
+  __HERMES_PLUGINS__?: unknown;
+  __HERMES_PLUGIN_SDK__?: PluginSdk;
+}
+
+const testWindow = globalThis as unknown as { window: SdkTestWindow };
+
 describe("plugin SDK dialog/toast surface", () => {
   beforeEach(() => {
     // Reset window between tests so exposePluginSDK() writes fresh.
-    (globalThis as any).window = {
+    testWindow.window = {
       __HERMES_PLUGINS__: undefined,
       __HERMES_PLUGIN_SDK__: undefined,
     };
@@ -22,25 +34,25 @@ describe("plugin SDK dialog/toast surface", () => {
 
   it("exposes Dialog + subcomponents on components", () => {
     exposePluginSDK();
-    const sdk = (globalThis as any).window.__HERMES_PLUGIN_SDK__;
-    expect(sdk.components.Dialog).toBeDefined();
-    expect(sdk.components.DialogContent).toBeDefined();
-    expect(sdk.components.DialogHeader).toBeDefined();
-    expect(sdk.components.DialogTitle).toBeDefined();
-    expect(sdk.components.DialogDescription).toBeDefined();
-    expect(sdk.components.DialogFooter).toBeDefined();
-    expect(sdk.components.DialogClose).toBeDefined();
-    expect(sdk.components.ConfirmDialog).toBeDefined();
-    expect(sdk.components.Toast).toBeDefined();
+    const sdk = testWindow.window.__HERMES_PLUGIN_SDK__;
+    expect(sdk?.components.Dialog).toBeDefined();
+    expect(sdk?.components.DialogContent).toBeDefined();
+    expect(sdk?.components.DialogHeader).toBeDefined();
+    expect(sdk?.components.DialogTitle).toBeDefined();
+    expect(sdk?.components.DialogDescription).toBeDefined();
+    expect(sdk?.components.DialogFooter).toBeDefined();
+    expect(sdk?.components.DialogClose).toBeDefined();
+    expect(sdk?.components.ConfirmDialog).toBeDefined();
+    expect(sdk?.components.Toast).toBeDefined();
   });
 
   it("exposes useToast and useConfirmDelete on hooks", () => {
     exposePluginSDK();
-    const sdk = (globalThis as any).window.__HERMES_PLUGIN_SDK__;
-    expect(typeof sdk.hooks.useToast).toBe("function");
-    expect(typeof sdk.hooks.useConfirmDelete).toBe("function");
+    const sdk = testWindow.window.__HERMES_PLUGIN_SDK__;
+    expect(typeof sdk?.hooks.useToast).toBe("function");
+    expect(typeof sdk?.hooks.useConfirmDelete).toBe("function");
     // Original React hooks still present (no accidental removal).
-    expect(typeof sdk.hooks.useState).toBe("function");
-    expect(typeof sdk.hooks.useCallback).toBe("function");
+    expect(typeof sdk?.hooks.useState).toBe("function");
+    expect(typeof sdk?.hooks.useCallback).toBe("function");
   });
 });
