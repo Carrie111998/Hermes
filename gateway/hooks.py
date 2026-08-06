@@ -39,7 +39,8 @@ and ``thread_id`` is non-empty.
 import asyncio
 import importlib.util
 import sys
-from typing import Any, Callable, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 import yaml
 
@@ -78,6 +79,14 @@ class HookRegistry:
         """
         return
 
+    def _iter_hook_dirs(self) -> Iterable[Path]:
+        """Yield bundled hooks first, then profile-local hooks."""
+        roots = (Path(__file__).parent / "builtin_hooks", HOOKS_DIR)
+        for root in roots:
+            if not root.exists():
+                continue
+            yield from sorted(path for path in root.iterdir() if path.is_dir())
+
     def discover_and_load(self) -> None:
         """
         Scan the hooks directory for hook directories and load their handlers.
@@ -90,12 +99,7 @@ class HookRegistry:
         """
         self._register_builtin_hooks()
 
-        if not HOOKS_DIR.exists():
-            return
-
-        for hook_dir in sorted(HOOKS_DIR.iterdir()):
-            if not hook_dir.is_dir():
-                continue
+        for hook_dir in self._iter_hook_dirs():
 
             manifest_path = hook_dir / "HOOK.yaml"
             handler_path = hook_dir / "handler.py"

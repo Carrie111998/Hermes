@@ -5,6 +5,7 @@ The hook intentionally awaits the adapter operation so completion updates are
 not lost when the agent turn returns.
 """
 
+import inspect
 from typing import Any, Dict
 
 
@@ -16,6 +17,11 @@ async def handle(event_type: str, context: Dict[str, Any]) -> None:
     adapter = context.get("adapter")
     rename_thread = getattr(adapter, "rename_thread", None)
     if not thread_id or not callable(rename_thread):
+        return
+    try:
+        if "lifecycle_emoji" not in inspect.signature(rename_thread).parameters:
+            return
+    except (TypeError, ValueError):
         return
 
     emoji = "⏳" if event_type == "agent:start" else ("❌" if context.get("failed") else "✅")
