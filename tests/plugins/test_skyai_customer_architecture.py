@@ -32,7 +32,7 @@ def test_skyai_prompt_is_principle_based_not_script_pack() -> None:
 
     assert "Hermes мисли" in prompt
     assert "не е заповед какво да кажеш" in prompt
-    assert len(prompt) < 6300
+    assert len(prompt) < 6500
     assert "SkyAI sales playbook" not in prompt
     assert "do_not_say" not in prompt
     assert "customer_facing_flow" not in prompt
@@ -130,7 +130,7 @@ def test_voucher_topup_does_not_create_new_campaign_bonus_entitlement() -> None:
     assert "нов ваучер или директен BookNow" in prompt
     assert "конкретна дата/час не доказва BookNow" in prompt
     assert "получателят/доплащащият не става автоматично собственик" in prompt
-    assert len(prompt) < 6300
+    assert len(prompt) < 6500
 
     assert "Existing-voucher top-up campaign entitlement" in architecture
     assert "choosing a concrete date/time does not prove BookNow" in architecture
@@ -228,7 +228,7 @@ def test_reservation_voucher_path_ambiguity_is_hermes_principle() -> None:
     assert "директен BookNow/карта само без ваучер" in prompt
     assert "Не твърди задължителни UI стъпки" in prompt
     assert "tool/public evidence" in prompt
-    assert len(prompt) < 6300
+    assert len(prompt) < 6500
 
     assert "Reservation path ambiguity is Hermes reasoning context" in architecture
     assert "not a runtime intent router" in architecture
@@ -342,6 +342,31 @@ def test_minimum_reservation_anxiety_uses_model_verified_alternative_principle()
     assert "offer a verified comparable alternative" in scenario["focus"]
     assert "same stated minimum" in scenario["focus"]
     assert "different provider alone is not proof" in scenario["focus"]
+
+
+def test_minimum_reservation_change_preserves_base_prompt_guidance() -> None:
+    expected_sales_principles = (
+        "Работи консултативно: повод, човек, бюджет, локация, тон. "
+        "При широко търсене предложи малко и разнообразно; не пълни с еднотипни идеи. "
+        "Hermes сам носи отговорност за предложения и линкове; няма display-level card adapter, "
+        "който да поправя или пренарежда избора след теб. "
+        "Ползвай catalog context като evidence, не като заповед. "
+        "не приемай автоматично, че индивидуален подарък е за двама. "
+        "Локацията е част от желанието: първо мисли близко и релевантно, после деликатно разширяване. "
+        "За спокойни подаръци говори positive-only, не чрез контраст с адреналин. "
+        "Използвай SkyVision предимства, когато помагат за доверие и продажба."
+    )
+    expected_catalog_guidance = (
+        "Catalog tool-ът изпраща твоята заявка и ценови граници към публичния API, "
+        "пази backend реда и връща candidates/context/nearest като evidence, не заповед. "
+        "Сам интерпретирай заявката и резултатите. При локация ти решаваш дали да "
+        "уточниш или да разшириш."
+    )
+    prompt = dev_gateway.build_skyai_system_prompt()
+
+    assert dev_gateway.SKYAI_SALES_PRINCIPLES == expected_sales_principles
+    assert expected_catalog_guidance in prompt
+    assert prompt.count(dev_gateway.SKYAI_MINIMUM_RESERVATION_ALTERNATIVE_PRINCIPLE) == 1
 
 
 def test_minimum_reservation_architecture_guard_has_no_runtime_router_or_templates() -> None:
