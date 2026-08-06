@@ -106,19 +106,21 @@ _WORKER_MEMORY_MAX_CAP_BYTES = 4 * 1024 * 1024 * 1024
 def _worker_memory_max_bytes() -> int:
     """Return a finite per-worker cgroup limit without widening host risk.
 
-    The proposed local-memory-guard environment override is honored so this
-    isolation composes with PR #57121 instead of inventing a second knob.
+    The proposed local-memory-guard environment override is honored when it
+    tightens the safe bound, so this isolation composes with PR #57121 instead
+    of inventing a second knob.  An oversized override cannot widen host risk.
     Otherwise retain the tighter of the gateway's current cgroup-v2
     ``memory.max`` and half of physical RAM, capped at 4 GiB.  This keeps the
     sibling worker outside the gateway cgroup while ensuring the worker cannot
     consume memory up to the enclosing user slice or host limit.
     """
+    override_bound: Optional[int] = None
     override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
     if override:
         try:
             parsed = int(override) * 1024 * 1024
             if parsed >= _MIN_WORKER_MEMORY_MAX_BYTES:
-                return parsed
+                override_bound = parsed
         except ValueError:
             pass
         logger.warning(
@@ -156,7 +158,8 @@ def _worker_memory_max_bytes() -> int:
     except (OSError, ValueError, TypeError):
         pass
 
-    return min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
+    safe_bound = min(candidates) if candidates else _DEFAULT_WORKER_MEMORY_MAX_BYTES
+    return min(override_bound, safe_bound) if override_bound else safe_bound
 
 
 def _systemd_run_user_scope_available() -> bool:
@@ -967,6 +970,7 @@ class ProcessRegistry:
             started_at=time.time(),
         )
 
+        pty_scope_attempted = False
         if use_pty:
             # Try PTY mode for interactive CLI tools
             try:
@@ -1000,6 +1004,7 @@ class ProcessRegistry:
                         pty_argv, unit_suffix=session.id,
                     )
                     session.systemd_unit = f"hermes-worker-{session.id}.scope"
+                    pty_scope_attempted = True
                 elif not _IS_WINDOWS:
                     try:
                         from gateway.restart import is_gateway_supervisor_process as _sup
@@ -1044,6 +1049,9 @@ class ProcessRegistry:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
+                if pty_scope_attempted and session.systemd_unit:
+                    _stop_systemd_unit(session.systemd_unit)
+                    session.systemd_unit = ""
 
         # Standard Popen path (non-PTY or PTY fallback)
         # Use the user's login shell for consistency with LocalEnvironment --
@@ -1078,10 +1086,15 @@ class ProcessRegistry:
             use_systemd_scope = False
 
         if use_systemd_scope:
-            spawn_argv = _build_systemd_scope_argv(
-                shell_argv, unit_suffix=session.id,
+            unit_suffix = (
+                f"{session.id}-pipe-fallback"
+                if pty_scope_attempted
+                else session.id
             )
-            session.systemd_unit = f"hermes-worker-{session.id}.scope"
+            spawn_argv = _build_systemd_scope_argv(
+                shell_argv, unit_suffix=unit_suffix,
+            )
+            session.systemd_unit = f"hermes-worker-{unit_suffix}.scope"
             # systemd-run creates the new session/cgroup for us; do NOT also
             # set start_new_session (harmless, but redundant and it can mask
             # scope-creation failures in some systemd versions).
