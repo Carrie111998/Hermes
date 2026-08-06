@@ -8,8 +8,13 @@ Part of #78645 + #78647.
 """
 from __future__ import annotations
 
+import json
+import sqlite3
 import time
 from typing import Any, Dict, List, Optional
+
+
+PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 
 class ContextCompressorDurableGuardsMixin:
@@ -98,6 +103,7 @@ class ContextCompressorDurableGuardsMixin:
                     if isinstance(stored_streak, (int, float, str)):
                         previous_fallback_streak = max(0, int(stored_streak))
                 except (TypeError, ValueError, sqlite3.Error) as exc:
+                    from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                     logger.debug("compression parent fallback streak lookup failed: %s", exc)
                 except Exception as exc:
                     logger.debug(
@@ -151,6 +157,7 @@ class ContextCompressorDurableGuardsMixin:
                 else 0,
             )
         except (TypeError, ValueError, sqlite3.Error) as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression fallback streak lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
@@ -169,6 +176,7 @@ class ContextCompressorDurableGuardsMixin:
                 int(value) if isinstance(value, (int, float, str)) else 0,
             )
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
@@ -188,6 +196,7 @@ class ContextCompressorDurableGuardsMixin:
         try:
             patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
         except Exception as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("proactive prune runway clear failed: %s", exc)
 
     def _persist_fallback_compression_streak(self) -> None:
@@ -199,6 +208,7 @@ class ContextCompressorDurableGuardsMixin:
         try:
             setter(session_id, self._fallback_compression_streak)
         except sqlite3.Error as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression fallback streak persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
@@ -228,6 +238,7 @@ class ContextCompressorDurableGuardsMixin:
                 else 0,
             )
         except (TypeError, ValueError, sqlite3.Error) as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression ineffective count lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression ineffective count lookup failed (non-sqlite): %s", exc)
@@ -241,6 +252,7 @@ class ContextCompressorDurableGuardsMixin:
         try:
             setter(session_id, self._ineffective_compression_count)
         except sqlite3.Error as exc:
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression ineffective count persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
@@ -278,6 +290,7 @@ class ContextCompressorDurableGuardsMixin:
             # dropping the skip exists to reach) nor reset one (a skip proves
             # nothing about the summary model's health).
             if not self.quiet_mode:
+                from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                 logger.info(
                     "Compaction completed via pre-LLM feasibility skip; "
                     "fallback_compression_streak unchanged (%d)",
@@ -333,6 +346,7 @@ class ContextCompressorDurableGuardsMixin:
         except sqlite3.Error as exc:
             if refresh:
                 self._last_cooldown_refresh_was_authoritative = False
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression failure cooldown lookup failed: %s", exc)
             return local_state
         except Exception:
@@ -396,6 +410,7 @@ class ContextCompressorDurableGuardsMixin:
             self._cooldown_persist_failed = False
         except sqlite3.Error as exc:
             self._cooldown_persist_failed = True
+            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression failure cooldown persist failed: %s", exc)
         except Exception as exc:
             self._cooldown_persist_failed = True
@@ -429,6 +444,7 @@ class ContextCompressorDurableGuardsMixin:
         if callable(cancelled_check):
             try:
                 if cancelled_check():
+                    from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                     logger.info(
                         "Skipping compression cooldown clear: host already "
                         "cancelled this compression attempt"

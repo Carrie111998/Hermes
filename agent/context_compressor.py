@@ -107,7 +107,10 @@ from agent.context_compressor_summarizers import (  # noqa: E402
     _summarize_tool_result_unguarded,
 )
 from agent.context_compressor_threshold import ContextCompressorThresholdMixin  # noqa: E402
-from agent.context_compressor_durable_guards import ContextCompressorDurableGuardsMixin  # noqa: E402
+from agent.context_compressor_durable_guards import (  # noqa: E402
+    PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY,
+    ContextCompressorDurableGuardsMixin,
+)
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -213,7 +216,6 @@ COMPRESSED_SUMMARY_HAS_USER_TURN_KEY = "_compressed_summary_has_user_turn"
 # rolling summary, so dropping or rewriting one destroys history.
 MICRO_COMPACT_MARKER_KEY = "_micro_compact_marker"
 _DB_PERSISTED_MARKER = "_db_persisted"
-PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
