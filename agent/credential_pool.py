@@ -325,7 +325,7 @@ def _parse_absolute_timestamp(value: Any) -> Optional[float]:
     return None
 
 
-def _extract_retry_delay_seconds(message: str) -> Optional[float]:
+def _extract_retry_delay_seconds(message: str, status_code: Optional[int] = None) -> Optional[float]:
     if not message:
         return None
     delay_match = re.search(r"quotaResetDelay[:\s\"]+(\d+(?:\.\d+)?)(ms|s)", message, re.IGNORECASE)
@@ -350,12 +350,17 @@ def _extract_retry_delay_seconds(message: str) -> Optional[float]:
     # time is unknown. Use a short TTL: if the primary is still limited, the
     # 429 fires again and we rotate back to the fallback — one wasted request.
     # If the limit has cleared, we reclaim the primary immediately.
-    if "session usage limit" in message.lower():
+    # Gated on status_code == 429 per sweeper review (#68832): the phrase
+    # could appear in a non-429 body where a shorter cooldown is inappropriate.
+    if status_code == 429 and "session usage limit" in message.lower():
         return 30 * 60
     return None
 
 
-def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _normalize_error_context(
+    error_context: Optional[Dict[str, Any]],
+    status_code: Optional[int] = None,
+) -> Dict[str, Any]:
     if not isinstance(error_context, dict):
         return {}
     normalized: Dict[str, Any] = {}
@@ -372,7 +377,7 @@ def _normalize_error_context(error_context: Optional[Dict[str, Any]]) -> Dict[st
     )
     parsed_reset_at = _parse_absolute_timestamp(reset_at)
     if parsed_reset_at is None and isinstance(message, str):
-        retry_delay_seconds = _extract_retry_delay_seconds(message)
+        retry_delay_seconds = _extract_retry_delay_seconds(message, status_code=status_code)
         if retry_delay_seconds is not None:
             parsed_reset_at = time.time() + retry_delay_seconds
     if parsed_reset_at is not None:
@@ -660,7 +665,7 @@ class CredentialPool:
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
-        normalized_error = _normalize_error_context(error_context)
+        normalized_error = _normalize_error_context(error_context, status_code=status_code)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters
