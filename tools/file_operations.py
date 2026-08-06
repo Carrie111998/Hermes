@@ -903,8 +903,33 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
+            #
+            # HOWEVER: head -c N can cut UTF-8 multibyte sequences (CJK = 3
+            # bytes, emoji = 4 bytes) at the byte boundary, producing false
+            # U+FFFD from perfectly valid text.  A sample decodable only via
+            # errors="replace" is NOT reliable evidence of binary content.
+            #
+            # The reliable binary indicator is NUL (0x00): genuine binary
+            # files almost always contain NUL bytes, while text files
+            # (regardless of encoding) effectively never do.  When U+FFFD is
+            # detected, verify by checking raw bytes for NUL via Python.
+            # See: https://github.com/NousResearch/hermes-agent/issues/80308
             if "\ufffd" in content_sample[:1000]:
-                return True
+                # U+FFFD present -- could be binary OR truncation artifact.
+                # Verify by checking raw bytes for NUL.
+                try:
+                    null_check = self._exec(
+                        "python -c \"import sys;"
+                        " sys.exit(0 if b'\\x00' in"
+                        " open(sys.argv[1],'rb').read(8192) else 1)\""
+                        f" {self._escape_shell_arg(path)}"
+                    )
+                    if null_check.exit_code == 0:
+                        return True  # NUL found -> genuine binary
+                except Exception:
+                    pass
+                # No NUL found despite U+FFFD -> truncation artifact from
+                # head -c splitting a multibyte char.  Treat as text.
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
