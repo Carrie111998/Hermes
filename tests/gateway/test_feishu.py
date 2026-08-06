@@ -1676,7 +1676,7 @@ class TestSharedDedupAcrossProfiles(unittest.TestCase):
         # Windows cannot remove a directory containing one.
         self._tmp.cleanup()
 
-    def _adapter_for(self, profile, *, app_id="cli_shared"):
+    def _adapter_for(self, profile, *, app_id="cli_shared", prime=True):
         """An adapter whose HERMES_HOME is <root>/profiles/<profile>.
 
         That layout is what makes get_default_hermes_root() resolve to the
@@ -1697,8 +1697,10 @@ class TestSharedDedupAcrossProfiles(unittest.TestCase):
             adapter = FeishuAdapter(
                 PlatformConfig(extra={"app_id": app_id, "app_secret": "secret"})
             )
-            # The store is opened lazily on first use; resolve it under the
-            # same env the adapter was built with.
+        # The adapter resolves both dedup paths in __init__, so opening the
+        # store afterwards needs no env. `prime=False` leaves that to the code
+        # under test — connect(), or the lazy fallback in _is_duplicate.
+        if prime:
             adapter._shared_dedup_store()
         return adapter
 
@@ -1757,6 +1759,72 @@ class TestSharedDedupAcrossProfiles(unittest.TestCase):
         # No store → first sighting delivers, second is caught locally.
         self.assertFalse(adapter._is_duplicate("om_local_only"))
         self.assertTrue(adapter._is_duplicate("om_local_only"))
+
+    def test_legacy_window_publishes_even_when_the_first_message_is_a_local_hit(self):
+        """The seed must not be gated on a dedup MISS.
+
+        Priming lazily off the first inbound message meant a profile whose
+        first post-upgrade message was a redelivery of an id already in its
+        own cache returned early and never published that id — leaving the
+        sibling free to reprocess exactly the ids the seed exists to protect.
+        """
+        home = self.root / "profiles" / "fitness"
+        home.mkdir(parents=True)
+        (home / "feishu_seen_message_ids.json").write_text(
+            json.dumps({"message_ids": {"om_pre_upgrade": time.time()}}),
+            encoding="utf-8",
+        )
+
+        # Built WITHOUT priming, so the only thing that can publish the seed
+        # is the code path under test.
+        fitness = self._adapter_for("fitness", prime=False)
+
+        # Its first message is a local hit — the early-return case.
+        self.assertTrue(fitness._is_duplicate("om_pre_upgrade"))
+
+        sibling = self._adapter_for("llm-wiki")
+        self.assertTrue(sibling._is_duplicate("om_pre_upgrade"))
+
+    def test_connect_primes_the_shared_dedup_store(self):
+        """Priming happens at connect, before any transport can deliver."""
+        home = self.root / "profiles" / "fitness"
+        home.mkdir(parents=True)
+        (home / "feishu_seen_message_ids.json").write_text(
+            json.dumps({"message_ids": {"om_pre_upgrade": time.time()}}),
+            encoding="utf-8",
+        )
+
+        fitness = self._adapter_for("fitness", prime=False)
+        self.assertIsNone(fitness._shared_dedup)
+
+        # connect() bails at the lark-oapi import, which is *after* the prime
+        # — so a False return still proves the store was opened and seeded.
+        with patch("plugins.platforms.feishu.adapter._load_lark_oapi", return_value=False):
+            self.assertFalse(asyncio.run(fitness.connect()))
+
+        self.assertIsNotNone(fitness._shared_dedup)
+        self.assertTrue(fitness._shared_dedup.seen("om_pre_upgrade"))
+
+    def test_policy_rejection_does_not_suppress_a_sibling_profile(self):
+        """One profile's admission policy must not speak for another.
+
+        The dedup gate claims the id before `_admit` runs, so a rejection
+        would otherwise leave a shared claim standing for a message this
+        profile never handled — and a sibling whose group_rules would have
+        accepted it sees a duplicate.
+        """
+        fitness = self._adapter_for("fitness")
+        sibling = self._adapter_for("llm-wiki")
+
+        # Claim, then decline for a reason local to this profile.
+        self.assertFalse(fitness._is_duplicate("om_rejected"))
+        fitness._release_shared_dedup_claim("om_rejected")
+
+        # The sibling can still take it...
+        self.assertFalse(sibling._is_duplicate("om_rejected"))
+        # ...while a redelivery to the rejecting profile is still dropped,
+        # exactly as it was before the shared store existed.
+        self.assertTrue(fitness._is_duplicate("om_rejected"))
 
 
 class TestSharedMessageDedupStore(unittest.TestCase):

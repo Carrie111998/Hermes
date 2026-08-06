@@ -1509,10 +1509,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._seen_message_order: List[str] = []
         self._dedup_state_path = get_hermes_home() / "feishu_seen_message_ids.json"
         self._dedup_lock = threading.Lock()
-        # Cross-profile dedup (issue #78514). Opened lazily on the first
-        # inbound message: the app_id that keys it is only meaningful once
-        # settings are applied, and an adapter that never receives anything
-        # (tests, a profile whose bot is idle) should not create the file.
+        # Cross-profile dedup (issue #78514). The file is opened at connect,
+        # not here, so an adapter that never runs (tests, a profile whose bot
+        # is idle) does not create one — but the PATH is resolved now, beside
+        # _dedup_state_path, so the store cannot land somewhere else if the
+        # environment shifts between construction and first use.
+        self._shared_dedup_path = get_default_hermes_root() / "feishu_seen_messages.db"
         self._shared_dedup: Optional["SharedMessageDedupStore"] = None
         self._shared_dedup_ready = False
         self._sender_name_cache: Dict[str, tuple[str, float]] = {}  # sender_id → (name, expire_at)
@@ -1785,6 +1787,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 "[Feishu] Webhook mode requires FEISHU_VERIFICATION_TOKEN or FEISHU_ENCRYPT_KEY."
             )
             return False
+
+        # Open (and seed) the cross-profile dedup store before any transport
+        # can deliver an event, so the pre-upgrade window is published up
+        # front rather than during the first message. Called directly rather
+        # than via to_thread: it is one sqlite open plus a bounded insert, it
+        # happens once per adapter with nothing being served yet, and the SDK
+        # load below is the only thing here worth a worker thread.
+        self._shared_dedup_store()
+
         if not await asyncio.to_thread(_load_lark_oapi):
             logger.error("[Feishu] lark-oapi not installed")
             return False
@@ -2611,6 +2622,14 @@ class FeishuAdapter(BasePlatformAdapter):
 
         reason = self._admit(sender, message)
         if reason is not None:
+            # Admission is per-profile: sibling profiles on this bot have
+            # their own group_rules and allow-lists. The dedup gate above
+            # already claimed this id in the SHARED store, so leaving the
+            # claim in place would let one profile's policy rejection
+            # suppress a sibling's legitimate delivery. Release the shared
+            # claim; the local record stays, so a redelivery to THIS adapter
+            # is still dropped exactly as it was before the store existed.
+            self._release_shared_dedup_claim(message_id)
             logger.debug("[Feishu] dropping inbound event: %s", reason)
             return
 
@@ -4628,10 +4647,11 @@ class FeishuAdapter(BasePlatformAdapter):
             from plugins.platforms.feishu.dedup_store import SharedMessageDedupStore
 
             store = SharedMessageDedupStore(
-                # The Hermes ROOT, not get_hermes_home() — that resolves to
+                # Resolved in __init__ from the Hermes ROOT, not
+                # get_hermes_home() — the latter resolves to
                 # <root>/profiles/<name> under multiplexing, which is exactly
                 # the per-profile split this store exists to close (#78514).
-                get_default_hermes_root() / "feishu_seen_messages.db",
+                self._shared_dedup_path,
                 namespace=f"feishu:{self._app_id or 'unknown'}",
                 ttl_seconds=_FEISHU_DEDUP_TTL_SECONDS,
                 max_entries=self._dedup_cache_size,
@@ -4648,6 +4668,18 @@ class FeishuAdapter(BasePlatformAdapter):
             )
         return self._shared_dedup
 
+    def _release_shared_dedup_claim(self, message_id: str) -> None:
+        """Give a claimed message_id back to sibling profiles.
+
+        Called when this adapter claimed the id at the dedup gate but then
+        declined to process it for a reason that is local to this profile.
+        Uses the already-resolved store: if none was opened there is nothing
+        to release.
+        """
+        store = getattr(self, "_shared_dedup", None)
+        if store is not None:
+            store.release(message_id)
+
     def _is_duplicate(self, message_id: str) -> bool:
         """True when this message_id has already been processed.
 
@@ -4658,9 +4690,19 @@ class FeishuAdapter(BasePlatformAdapter):
         profile's adapter, whose cache lives in a different profile home
         (#78514).
         """
+        # Resolve the shared store BEFORE consulting the local cache. Opening
+        # it is what publishes this profile's pre-upgrade window, and gating
+        # that behind a local MISS meant the adapter that most needed the seed
+        # — one whose first post-upgrade message was a redelivery it already
+        # knew — returned early and never published anything. connect() primes
+        # this too; doing it here as well keeps the guarantee total for an
+        # adapter driven without a connect (#78514 review).
+        #
+        # Safe against re-seeding the id under test: the seed is a snapshot
+        # taken in __init__, not a live read of _seen_message_ids.
+        store = self._shared_dedup_store()
         if self._is_duplicate_locally(message_id):
             return True
-        store = self._shared_dedup_store()
         if store is None:
             return False
         return store.seen(message_id)

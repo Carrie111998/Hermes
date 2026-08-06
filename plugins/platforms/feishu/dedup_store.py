@@ -63,7 +63,13 @@ CREATE TABLE IF NOT EXISTS seen_messages (
 # Prune scans the namespace; amortize it instead of paying on every message.
 _PRUNE_EVERY = 200
 
-_CONNECT_TIMEOUT_SECONDS = 10.0
+# `seen()` runs synchronously on the adapter's asyncio loop, so a blocked
+# write blocks inbound handling for the whole gateway. Transactions here are
+# sub-millisecond and contention is two adapters landing the same redelivered
+# burst, so a low ceiling is enough — and a busy-timeout expiry degrades to
+# fail-open (deliver the message), the same trade the rest of this module
+# makes. Keep this small enough that the worst case is a hiccup, not a stall.
+_BUSY_TIMEOUT_SECONDS = 2.0
 
 
 class SharedMessageDedupStore:
@@ -113,13 +119,13 @@ class SharedMessageDedupStore:
         # competing writer at COMMIT (SQLITE_BUSY on upgrade).
         conn = sqlite3.connect(
             str(self._db_path),
-            timeout=_CONNECT_TIMEOUT_SECONDS,
+            timeout=_BUSY_TIMEOUT_SECONDS,
             isolation_level=None,
         )
         try:
             # Absorbs the brief write-lock overlap when two profiles receive
             # the same redelivered burst.
-            conn.execute("PRAGMA busy_timeout=10000")
+            conn.execute(f"PRAGMA busy_timeout={int(_BUSY_TIMEOUT_SECONDS * 1000)}")
             conn.execute("PRAGMA synchronous=NORMAL")
             yield conn
         finally:
@@ -222,7 +228,10 @@ class SharedMessageDedupStore:
         Without this, upgrading mid-window would reopen the replay hole the
         old cache was still covering: its ids would be absent here and the
         next redelivery inside the 24h TTL would be treated as new.
-        Idempotent — re-importing keeps the earliest recorded timestamp.
+        Idempotent — ``INSERT OR IGNORE`` keeps whichever row was written
+        first, not the oldest ``seen_at``. Retaining a later timestamp only
+        lengthens the TTL window for that id, which errs toward deduplicating,
+        so it is not worth an upsert to correct.
         """
         if self._disabled or not entries:
             return
@@ -257,6 +266,38 @@ class SharedMessageDedupStore:
                         )
             except sqlite3.Error:
                 self._fail("import legacy dedup state")
+
+    def release(self, message_id: str) -> None:
+        """Drop a previously claimed id so another caller may take it.
+
+        ``seen()`` claims an id before the caller knows whether it will act on
+        it. When the caller then declines for a reason of its own — a Feishu
+        profile whose admission policy rejects a message a sibling profile
+        would accept — the claim has to come back, or one profile's policy
+        silently suppresses another's delivery.
+
+        Claiming first and releasing on decline keeps the test-and-set atomic;
+        checking admission before claiming would let two adapters both pass
+        the check before either recorded.
+        """
+        if not message_id or self._disabled:
+            return
+
+        with self._lock:
+            try:
+                with self._connect() as conn:
+                    with self._transaction(conn):
+                        conn.execute(
+                            "DELETE FROM seen_messages "
+                            "WHERE namespace = ? AND message_id = ?",
+                            (self._namespace, message_id),
+                        )
+            except sqlite3.Error:
+                # Worst case the claim stands and a sibling skips one
+                # message — not worth disabling the store over.
+                logger.debug(
+                    "[Feishu] Shared dedup release failed for %s", message_id, exc_info=True
+                )
 
     def count(self) -> int:
         """Rows currently recorded for this namespace (diagnostics/tests)."""
