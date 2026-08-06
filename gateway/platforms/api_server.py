@@ -2,6 +2,7 @@
 OpenAI-compatible API server platform adapter.
 
 Exposes an HTTP server with endpoints:
+- POST /v1/audio/transcriptions   — OpenAI-compatible speech-to-text (multipart upload; delegates to tools.transcription_tools)
 - POST /v1/chat/completions        — OpenAI Chat Completions format (stateless; opt-in session continuity via X-Hermes-Session-Id header; opt-in long-term memory scoping via X-Hermes-Session-Key header)
 - POST /v1/responses               — OpenAI Responses API format (stateful via previous_response_id; X-Hermes-Session-Key supported)
 - GET  /v1/responses/{response_id} — Retrieve a stored response
@@ -45,7 +46,7 @@ import hashlib
 import hmac
 import itertools
 import json
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager, nullcontext, suppress
 from contextvars import ContextVar
 from functools import wraps
 import logging
@@ -2002,6 +2003,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat", self._handle_session_chat),
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
+            ("POST", "/v1/audio/transcriptions", self._handle_audio_transcriptions),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3060,7 +3062,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
-                "audio_api": False,
+                "audio_api": True,
+                "audio_transcriptions": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -3072,6 +3075,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "models": {"method": "GET", "path": "/v1/models"},
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
+                "audio_transcriptions": {"method": "POST", "path": "/v1/audio/transcriptions"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -3882,6 +3886,136 @@ class APIServerAdapter(BasePlatformAdapter):
             "session_id": session_id,
             "runtime": runtime,
         })
+    async def _handle_audio_transcriptions(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/audio/transcriptions — OpenAI-compatible speech-to-text.
+
+        Accepts multipart/form-data with a ``file`` field (audio bytes) and
+        optional ``model``, ``language``, and ``response_format`` fields, then
+        delegates to ``tools.transcription_tools.transcribe_audio`` so every
+        configured STT provider (local faster-whisper, groq, openai, mistral,
+        xai, elevenlabs, deepinfra, command providers) is available with zero
+        new dependencies. The audio bytes are spooled to a temp file so the
+        shared ``transcribe_audio`` entrypoint — which validates, preprocesses,
+        and dispatches — sees the same on-disk input the gateway voice-message
+        path already uses.
+
+        Returns OpenAI-style transcription JSON::
+
+            {"text": "...", "provider": "local", "model": "base"}
+
+        when ``response_format`` is ``json`` (default) or ``text``;
+        ``verbose_json`` and ``srt``/``vtt`` are accepted for forward
+        compatibility and fall back to the plain JSON shape (the shared
+        ``transcribe_audio`` helper returns text only; full segment/timestamp
+        data would require a provider that exposes it).
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        # multipart/form-data is the only OpenAI shape for audio uploads.
+        content_type = request.content_type
+        if not content_type.startswith("multipart/"):
+            return web.json_response(
+                _openai_error(
+                    "Content-Type must be multipart/form-data for audio uploads.",
+                    param="file",
+                ),
+                status=400,
+            )
+
+        reader = await request.multipart()
+        file_bytes: Optional[bytes] = None
+        file_name = "upload.bin"
+        model: Optional[str] = None
+        language: Optional[str] = None
+        response_format = "json"
+
+        try:
+            async for field in reader:
+                if field.name == "file":
+                    # aiohttp multipart fields must be drained before the
+                    # next field is iterated, so read the content now.
+                    file_bytes = await field.read()
+                    file_name = field.filename or "upload.bin"
+                elif field.name == "model":
+                    model = (await field.text()).strip() or None
+                elif field.name == "language":
+                    language = (await field.text()).strip() or None
+                elif field.name == "response_format":
+                    response_format = (await field.text()).strip() or "json"
+        except Exception:
+            return web.json_response(
+                _openai_error(
+                    "Failed to read multipart audio upload.",
+                    code="audio_read_failed",
+                ),
+                status=400,
+            )
+
+        if file_bytes is None:
+            return web.json_response(
+                _openai_error(
+                    "Missing required 'file' field in multipart upload.",
+                    param="file",
+                ),
+                status=400,
+            )
+
+        if not file_bytes:
+            return web.json_response(
+                _openai_error("Uploaded audio file is empty.", param="file"),
+                status=400,
+            )
+
+        # Spool the uploaded audio to a temp file. transcribe_audio validates
+        # the source path, preprocesses (transcode/strip), and cleans up its
+        # own work dir; we only own the initial spool.
+        import tempfile
+
+        suffix = os.path.splitext(file_name)[1] or ".bin"
+        spool = tempfile.NamedTemporaryFile(
+            prefix="hermes-stt-", suffix=suffix, delete=False
+        )
+        try:
+            spool.write(file_bytes)
+            spool.close()
+
+            # transcribe_audio is CPU/IO-bound (local whisper loads weights on
+            # first call). Run it off the aiohttp event loop.
+            from tools.transcription_tools import transcribe_audio
+
+            result = await asyncio.to_thread(transcribe_audio, spool.name, model)
+        finally:
+            with suppress(OSError):
+                os.unlink(spool.name)
+
+        if not result.get("success"):
+            return web.json_response(
+                _openai_error(
+                    result.get("error", "Transcription failed."),
+                    code="transcription_failed",
+                ),
+                status=500,
+            )
+
+        text = result.get("transcript", "")
+        # OpenAI response_format handling. transcription_tools returns plain
+        # text; we honor `text` verbatim and map the richer formats to the JSON
+        # envelope (segments/timestamps are not surfaced by the shared helper).
+        if response_format == "text":
+            return web.Response(text=text, content_type="text/plain")
+
+        return web.json_response(
+            {
+                "text": text,
+                "provider": result.get("provider", ""),
+                "model": result.get("model", model or ""),
+            }
+        )
+
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
         """POST /v1/chat/completions — OpenAI Chat Completions format."""
