@@ -63,7 +63,7 @@ interface SubmitPromptDeps {
     sessionId: string,
     attachments: ComposerAttachment[],
     options?: { updateComposerAttachments?: boolean }
-  ) => Promise<ComposerAttachment[]>
+  ) => Promise<{ attachments: ComposerAttachment[]; sessionId: string }>
   updateSessionState: (
     sessionId: string,
     updater: (state: ClientSessionState) => ClientSessionState,
@@ -584,23 +584,36 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
       }
 
       try {
-        const syncedAttachments = await syncAttachmentsForSubmit(sessionId, attachments, {
+        // Attach runs *before* prompt.submit. On sleep/wake the runtime id is
+        // already dead, so image.attach / file.attach must recover (and rebind
+        // sessionId) here — submit's recovery never runs if attach fails first.
+        const attachResult = await syncAttachmentsForSubmit(sessionId, attachments, {
           updateComposerAttachments: usingComposerAttachments
         })
+
+        const syncedAttachments = attachResult.attachments
+        // attachResult.sessionId is always a live string; pin it so TS narrows
+        // past the outer `string | null` sessionId binding for prompt.submit.
+        const liveSessionId = attachResult.sessionId
+        sessionId = liveSessionId
+
+        if (targetIsCurrentView() && activeSessionIdRef.current !== liveSessionId) {
+          activeSessionIdRef.current = liveSessionId
+        }
 
         const attachmentsDrift = sessionDriftReason()
 
         if (attachmentsDrift) {
           console.warn('[submit-drift-abort]', attachmentsDrift, { phase: 'post-attachments' })
 
-          return abortForSessionSwitch(sessionId)
+          return abortForSessionSwitch(liveSessionId)
         }
 
         // Rewrite the optimistic message + prompt text with the synced refs so
         // the gateway receives @file: paths that resolve in its workspace.
         // (Images keep their inline base64 preview — see optimisticAttachmentRef.)
         attachmentRefs = syncedAttachments.map(optimisticAttachmentRef).filter((r): r is string => Boolean(r))
-        rewriteOptimistic(sessionId)
+        rewriteOptimistic(liveSessionId)
         const text = buildContextText(syncedAttachments)
 
         const submitParams = (targetId: string) => ({
@@ -622,7 +635,7 @@ export function useSubmitPrompt(deps: SubmitPromptDeps) {
 
         try {
           await withSessionBusyRetry(() =>
-            requestGateway('prompt.submit', submitParams(sessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
+            requestGateway('prompt.submit', submitParams(liveSessionId), PROMPT_SUBMIT_REQUEST_TIMEOUT_MS)
           )
         } catch (firstErr) {
           const recoverStoredSessionId = targetStoredSessionId ?? selectedStoredSessionIdRef.current

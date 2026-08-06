@@ -53,6 +53,70 @@ export function isSessionNotFoundError(error: unknown): boolean {
 }
 
 /**
+ * Re-register a durable stored session after the gateway dropped its in-memory
+ * runtime id (sleep/wake, remote backend restart, long idle). Returns the fresh
+ * live id, or null when resume produces none.
+ *
+ * Same recovery class as prompt.submit after sleep — attach and /compress must
+ * use this too: those RPCs run *before* prompt.submit's recovery, so a stale
+ * runtime id surfaces "session not found" while plain text still works.
+ */
+export async function resumeStoredRuntimeSession(
+  requestGateway: GatewayRequest,
+  storedSessionId: string
+): Promise<string | null> {
+  // Lazy import keeps utils free of a hard cycle with session-actions on init.
+  const { resolveSessionProfile } = await import('../use-session-actions/utils')
+  const resumeProfile = await resolveSessionProfile(storedSessionId)
+
+  const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+    session_id: storedSessionId,
+    source: 'desktop',
+    omit_messages: true,
+    ...(resumeProfile ? { profile: resumeProfile } : {})
+  })
+
+  return resumed?.session_id ?? null
+}
+
+/**
+ * Run `call(sessionId)`; on "session not found" (optionally gateway timeout),
+ * resume the stored session once and retry with the recovered live id.
+ */
+export async function withSessionNotFoundResume<T>(
+  requestGateway: GatewayRequest,
+  storedSessionId: string | null | undefined,
+  sessionId: string,
+  call: (liveSessionId: string) => Promise<T>,
+  options?: { alsoTimeout?: boolean }
+): Promise<{ result: T; sessionId: string }> {
+  try {
+    return { result: await call(sessionId), sessionId }
+  } catch (err) {
+    const recoverable =
+      isSessionNotFoundError(err) || (Boolean(options?.alsoTimeout) && isGatewayTimeoutError(err))
+
+    if (!recoverable || !storedSessionId) {
+      throw err
+    }
+
+    let recoveredId: null | string
+
+    try {
+      recoveredId = await resumeStoredRuntimeSession(requestGateway, storedSessionId)
+    } catch {
+      throw err
+    }
+
+    if (!recoveredId) {
+      throw err
+    }
+
+    return { result: await call(recoveredId), sessionId: recoveredId }
+  }
+}
+
+/**
  * Is the session a prompt is about to run against currently mid-turn?
  *
  * The foreground `busyRef` is NOT the answer. It mirrors whatever chat is on

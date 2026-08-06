@@ -62,7 +62,8 @@ import {
   renderCommandsCatalog,
   renderRpcResult,
   slashStatusText,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionNotFoundResume
 } from './utils'
 
 // Manual compression is LLM-bound and routinely outlives the desktop's 30s
@@ -499,7 +500,8 @@ export function useSlashCommand(deps: SlashCommandDeps) {
             return
           }
 
-          const { render: renderSlashOutput, sessionId, storedSessionId } = resolved
+          const { render: renderSlashOutput, sessionId: initialSessionId, storedSessionId } = resolved
+          let sessionId = initialSessionId
           const focusTopic = ctx.arg.trim()
           const noticeId = `session-compress:${sessionId}`
 
@@ -518,14 +520,33 @@ export function useSlashCommand(deps: SlashCommandDeps) {
           })
 
           try {
-            const result = await requestGateway<SessionCompressResponse>(
-              'session.compress',
-              {
-                session_id: sessionId,
-                ...(focusTopic ? { focus_topic: focusTopic } : {})
-              },
-              SESSION_COMPRESS_TIMEOUT_MS
+            // Same sleep/wake recovery as prompt.submit: a dead runtime id
+            // 404s session.compress while plain chat still works (submit
+            // recovers; compress used to surface "session not found").
+            const { result, sessionId: liveSessionId } = await withSessionNotFoundResume(
+              requestGateway,
+              storedSessionId,
+              sessionId,
+              sid =>
+                requestGateway<SessionCompressResponse>(
+                  'session.compress',
+                  {
+                    session_id: sid,
+                    ...(focusTopic ? { focus_topic: focusTopic } : {})
+                  },
+                  SESSION_COMPRESS_TIMEOUT_MS
+                )
             )
+
+            if (liveSessionId !== sessionId) {
+              compressInFlightRef.current.delete(sessionId)
+              compressInFlightRef.current.add(liveSessionId)
+              sessionId = liveSessionId
+
+              if (activeSessionIdRef.current === initialSessionId) {
+                activeSessionIdRef.current = liveSessionId
+              }
+            }
 
             // Replace the transcript with the post-compress history so the
             // summarized bubbles actually disappear. `messages` is the same

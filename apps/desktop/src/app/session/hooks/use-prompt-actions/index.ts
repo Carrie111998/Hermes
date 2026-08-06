@@ -69,7 +69,8 @@ import {
   isSessionNotFoundError,
   readFileDataUrlForAttach,
   readImageForRemoteAttach,
-  type SubmitTextOptions
+  type SubmitTextOptions,
+  withSessionNotFoundResume
 } from './utils'
 
 interface HandoffResult {
@@ -98,88 +99,111 @@ function attachmentPathNeedsUpload(path: string, backendCwd?: null | string): bo
  */
 export async function uploadComposerAttachment(
   attachment: ComposerAttachment,
-  opts: { backendCwd?: null | string; remote: boolean; requestGateway: GatewayRequest; sessionId: string }
+  opts: {
+    backendCwd?: null | string
+    remote: boolean
+    requestGateway: GatewayRequest
+    sessionId: string
+    /** Durable id used to re-register after sleep/wake / backend restart. */
+    storedSessionId?: null | string
+    /** Called when attach recovered onto a fresh live id (rebind the foreground). */
+    onSessionRecovered?: (sessionId: string) => void
+  }
 ): Promise<ComposerAttachment> {
-  const { backendCwd, remote, requestGateway, sessionId } = opts
+  const { backendCwd, remote, requestGateway, storedSessionId, onSessionRecovered } = opts
   const path = attachment.path ?? ''
   const label = attachment.label || pathLabel(path)
   const uploadBytes = remote || attachmentPathNeedsUpload(path, backendCwd)
 
-  if (attachment.kind === 'image') {
-    let result: ImageAttachResponse
+  // Bytes / paths are read once; only the session-scoped RPC needs recovery.
+  let imagePayload: Awaited<ReturnType<typeof readImageForRemoteAttach>> | null = null
+  let fileDataUrl: string | null = null
 
-    if (uploadBytes) {
-      let payload: Awaited<ReturnType<typeof readImageForRemoteAttach>>
-
-      try {
-        payload = await readImageForRemoteAttach(path)
-      } catch (err) {
-        throw friendlyRemoteAttachError(err, label)
-      }
-
-      if (!payload) {
-        throw new Error(`Could not read ${label}`)
-      }
-
-      result = await requestGateway<ImageAttachResponse>('image.attach_bytes', {
-        session_id: sessionId,
-        content_base64: payload.contentBase64,
-        filename: payload.filename
-      })
-    } else {
-      result = await requestGateway<ImageAttachResponse>('image.attach', {
-        path,
-        session_id: sessionId
-      })
-    }
-
-    if (!result.attached) {
-      throw new Error(result.message || `Could not attach ${label}`)
-    }
-
-    const attachedPath = result.path || path
-
-    return {
-      ...attachment,
-      attachedSessionId: sessionId,
-      label: attachedPath ? pathLabel(attachedPath) : attachment.label,
-      path: attachedPath,
-      uploadState: undefined
-    }
-  }
-
-  // Non-image file.
-  let dataUrl: string | null = null
-
-  if (uploadBytes) {
+  if (attachment.kind === 'image' && uploadBytes) {
     try {
-      dataUrl = await readFileDataUrlForAttach(path)
+      imagePayload = await readImageForRemoteAttach(path)
     } catch (err) {
       throw friendlyRemoteAttachError(err, label)
     }
 
-    if (!dataUrl) {
+    if (!imagePayload) {
+      throw new Error(`Could not read ${label}`)
+    }
+  } else if (attachment.kind !== 'image' && uploadBytes) {
+    try {
+      fileDataUrl = await readFileDataUrlForAttach(path)
+    } catch (err) {
+      throw friendlyRemoteAttachError(err, label)
+    }
+
+    if (!fileDataUrl) {
       throw new Error(`Could not read ${label}`)
     }
   }
 
-  const result = await requestGateway<FileAttachResponse>('file.attach', {
-    name: label,
-    path,
-    session_id: sessionId,
-    ...(dataUrl ? { data_url: dataUrl } : {})
-  })
+  const stageForSession = async (sessionId: string): Promise<ComposerAttachment> => {
+    if (attachment.kind === 'image') {
+      let result: ImageAttachResponse
 
-  if (!result.attached || !result.ref_text) {
-    throw new Error(result.message || `Could not attach ${label}`)
+      if (imagePayload) {
+        result = await requestGateway<ImageAttachResponse>('image.attach_bytes', {
+          session_id: sessionId,
+          content_base64: imagePayload.contentBase64,
+          filename: imagePayload.filename
+        })
+      } else {
+        result = await requestGateway<ImageAttachResponse>('image.attach', {
+          path,
+          session_id: sessionId
+        })
+      }
+
+      if (!result.attached) {
+        throw new Error(result.message || `Could not attach ${label}`)
+      }
+
+      const attachedPath = result.path || path
+
+      return {
+        ...attachment,
+        attachedSessionId: sessionId,
+        label: attachedPath ? pathLabel(attachedPath) : attachment.label,
+        path: attachedPath,
+        uploadState: undefined
+      }
+    }
+
+    const result = await requestGateway<FileAttachResponse>('file.attach', {
+      name: label,
+      path,
+      session_id: sessionId,
+      ...(fileDataUrl ? { data_url: fileDataUrl } : {})
+    })
+
+    if (!result.attached || !result.ref_text) {
+      throw new Error(result.message || `Could not attach ${label}`)
+    }
+
+    return {
+      ...attachment,
+      attachedSessionId: sessionId,
+      refText: result.ref_text,
+      uploadState: undefined
+    }
   }
 
-  return {
-    ...attachment,
-    attachedSessionId: sessionId,
-    refText: result.ref_text,
-    uploadState: undefined
+  const { result, sessionId: usedSessionId } = await withSessionNotFoundResume(
+    requestGateway,
+    storedSessionId,
+    opts.sessionId,
+    stageForSession
+  )
+
+  if (usedSessionId !== opts.sessionId) {
+    onSessionRecovered?.(usedSessionId)
   }
+
+  return result
 }
 
 interface PromptActionsOptions {
@@ -300,10 +324,17 @@ export function usePromptActions({
       sessionId: string,
       attachments: ComposerAttachment[],
       options: { updateComposerAttachments?: boolean } = {}
-    ): Promise<ComposerAttachment[]> => {
+    ): Promise<{ attachments: ComposerAttachment[]; sessionId: string }> => {
       const updateComposerAttachments = options.updateComposerAttachments ?? true
       const remote = $connection.get()?.mode === 'remote'
+      const storedSessionId = selectedStoredSessionIdRef.current
+      let liveSessionId = sessionId
       const synced: ComposerAttachment[] = []
+
+      const onSessionRecovered = (recoveredId: string) => {
+        liveSessionId = recoveredId
+        activeSessionIdRef.current = recoveredId
+      }
 
       for (const original of attachments) {
         let attachment = original
@@ -323,7 +354,9 @@ export function usePromptActions({
         // Already-synced or pathless refs (terminal, url, etc.) pass through.
         // A drop-time eager upload may already have staged this one (matching
         // attachedSessionId) — don't re-upload it.
-        if (!attachment.path || attachment.attachedSessionId === sessionId) {
+        // After a mid-loop recovery, attachedSessionId may reference the old
+        // dead runtime — treat that as needing re-stage onto liveSessionId.
+        if (!attachment.path || attachment.attachedSessionId === liveSessionId) {
           synced.push(attachment)
 
           continue
@@ -334,7 +367,9 @@ export function usePromptActions({
             backendCwd: $currentCwd.get(),
             remote,
             requestGateway,
-            sessionId
+            sessionId: liveSessionId,
+            storedSessionId,
+            onSessionRecovered
           })
 
           // Update-only: never resurrect a chip the user removed mid-upload.
@@ -350,9 +385,9 @@ export function usePromptActions({
         synced.push(attachment)
       }
 
-      return synced
+      return { attachments: synced, sessionId: liveSessionId }
     },
-    [requestGateway]
+    [activeSessionIdRef, requestGateway, selectedStoredSessionIdRef]
   )
 
   // Stage a freshly dropped file as soon as it lands (when a session already
@@ -379,7 +414,11 @@ export function usePromptActions({
             backendCwd: $currentCwd.get(),
             remote,
             requestGateway,
-            sessionId
+            sessionId,
+            storedSessionId: selectedStoredSessionIdRef.current,
+            onSessionRecovered: recoveredId => {
+              activeSessionIdRef.current = recoveredId
+            }
           })
         )
       } catch (err) {
@@ -390,7 +429,7 @@ export function usePromptActions({
         notifyError(err, copy.dropFiles)
       }
     },
-    [copy.dropFiles, requestGateway]
+    [activeSessionIdRef, copy.dropFiles, requestGateway, selectedStoredSessionIdRef]
   )
 
   const composerAttachments = useStore($composerAttachments)
