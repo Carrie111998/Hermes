@@ -42,7 +42,7 @@ post_install: |
   GitHub today:
     hermes skills install revelata/deepkpi-agents/kpi
   Or, once merged, from the official optional catalog:
-    hermes skills install official/finance/kpi
+    hermes skills install official/finance/revelata-deepkpi/kpi
 
   You can re-run the tool checklist any time with:
     hermes mcp configure revelata
