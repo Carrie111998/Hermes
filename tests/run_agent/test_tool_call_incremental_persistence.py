@@ -532,3 +532,37 @@ def test_execute_tool_calls_concurrent_flushes_each_tool_result_in_order():
     # production flush call breaks one of these assertions.
     assert flushed_tool_ids == ["c1", "c2"]
     assert flush_lengths == [1, 2]
+
+
+def test_slack_history_result_is_live_for_model_but_marked_for_redaction():
+    agent = _make_agent()
+    tool_call = _mock_tool_call(name="slack_history", call_id="slack-call")
+    messages: list = []
+    assistant_message = SimpleNamespace(content="", tool_calls=[tool_call])
+    captured: list[list[dict]] = []
+
+    def capture_flush(current_messages, *_args, **_kwargs):
+        captured.append(copy.deepcopy(current_messages))
+        return True
+
+    agent._flush_messages_to_session_db = capture_flush
+    with (
+        patch("run_agent.handle_function_call", return_value="private Slack context"),
+        patch(
+            "agent.tool_executor.maybe_persist_tool_result",
+            side_effect=lambda **kwargs: kwargs["content"],
+        ),
+    ):
+        agent._execute_tool_calls_sequential(
+            assistant_message,
+            messages,
+            "task-1",
+        )
+
+    assert "private Slack context" in messages[-1]["content"]
+    assert messages[-1]["_persist_content_override"].startswith(
+        "[Ephemeral Slack context"
+    )
+    assert captured[-1][-1]["_persist_content_override"].startswith(
+        "[Ephemeral Slack context"
+    )

@@ -73,6 +73,33 @@ class TestFallbackChainAdvancement:
         agent = _make_agent(fallback_model=None)
         assert agent._try_activate_fallback() is False
 
+    def test_private_slack_turn_disables_fallback(self):
+        from gateway.session_context import (
+            clear_session_vars,
+            consume_slack_history_authorization,
+            set_session_vars,
+        )
+
+        agent = _make_agent(
+            fallback_model={"provider": "openai", "model": "gpt-4o"},
+        )
+        tokens = set_session_vars(
+            platform="slack",
+            chat_id="C12345678",
+            scope_id="T12345678",
+            slack_history_authorized=True,
+        )
+        try:
+            assert consume_slack_history_authorization() is True
+            with patch(
+                "agent.chat_completion_helpers.try_activate_fallback",
+            ) as activate:
+                assert agent._has_pending_fallback() is False
+                assert agent._try_activate_fallback() is False
+            activate.assert_not_called()
+        finally:
+            clear_session_vars(tokens)
+
     def test_advances_index(self):
         fbs = [
             {"provider": "openai", "model": "gpt-4o"},

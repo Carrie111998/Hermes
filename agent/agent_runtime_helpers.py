@@ -1838,6 +1838,16 @@ def dump_api_request_debug(
     retries are not useful.
     """
     try:
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        if slack_history_sensitive_context_active():
+            logger.warning(
+                "Skipping request dump because this turn contains ephemeral Slack history"
+            )
+            return None
+    except Exception:
+        pass
+    try:
         body = copy.deepcopy(api_kwargs)
         body.pop("timeout", None)
         body = {k: v for k, v in body.items() if v is not None}

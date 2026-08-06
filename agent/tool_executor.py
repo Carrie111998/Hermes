@@ -52,6 +52,19 @@ from tools.budget_config import BudgetConfig, DEFAULT_BUDGET, budget_for_context
 
 logger = logging.getLogger(__name__)
 
+_EPHEMERAL_TOOL_RESULT_NAMES = frozenset({"slack_history"})
+_EPHEMERAL_TOOL_RESULT_PLACEHOLDER = (
+    "[Ephemeral Slack context was used for this turn and was not retained.]"
+)
+
+
+def _observer_safe_tool_result(tool_name: str, result: Any) -> Any:
+    """Keep private one-turn tool output away from UI and observer surfaces."""
+
+    if tool_name in _EPHEMERAL_TOOL_RESULT_NAMES:
+        return _EPHEMERAL_TOOL_RESULT_PLACEHOLDER
+    return result
+
 
 def _ensure_file_checkpoint(
     agent,
@@ -531,6 +544,40 @@ def _run_agent_tool_execution_middleware(
 
         block_message = scope_block
         block_error_type = "tool_scope_block"
+        _multi_provider_history = (
+            str(getattr(agent, "provider", "") or "").strip().lower() == "moa"
+        )
+        if function_name == "slack_history":
+            try:
+                from gateway.session_context import moa_turn_active
+
+                _multi_provider_history = (
+                    _multi_provider_history or moa_turn_active()
+                )
+            except Exception:
+                pass
+        if block_message is None and function_name == "slack_history" and _multi_provider_history:
+            block_message = (
+                "Private Slack history cannot be read by a multi-provider MoA "
+                "runtime. Select one provider and ask again in a new message."
+            )
+            block_error_type = "slack_history_multi_provider_block"
+        if block_message is None and function_name != "slack_history":
+            try:
+                from gateway.session_context import (
+                    slack_history_sensitive_context_active,
+                )
+
+                if slack_history_sensitive_context_active():
+                    block_message = (
+                        "No further tools may run after private Slack history was "
+                        "read in this turn. Answer from the bounded context only; "
+                        "ask the user for a new explicit turn before any read, "
+                        "delegation, mutation, or external action."
+                    )
+                    block_error_type = "slack_history_turn_boundary"
+            except Exception:
+                pass
         if block_message is None:
             block_error_type = "plugin_block"
 
@@ -632,6 +679,20 @@ def _run_agent_tool_execution_middleware(
             tool_call_id=tool_call_id or "",
             turn_id=getattr(agent, "_current_turn_id", "") or "",
             api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+        )
+
+    # Private Slack history is a host-owned capability. Plugin middleware and
+    # Relay may observe or retain tool results, so this one tool bypasses those
+    # extension surfaces while retaining the normal guardrail/pre-tool gate in
+    # _authorized_dispatch().
+    if function_name == "slack_history":
+        result = _authorized_dispatch(dict(function_args))
+        return _ManagedToolResult(
+            result=result,
+            args=state["args"],
+            middleware_trace=[],
+            blocked=bool(state["blocked"]),
+            dispatched=bool(state["dispatched"]),
         )
 
     result, _relay_args = relay_tools.execute(
@@ -1436,14 +1497,16 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 )
 
             if is_error:
-                _err_text = _multimodal_text_summary(function_result)
+                _err_text = _multimodal_text_summary(
+                    _observer_safe_tool_result(function_name, function_result),
+                )
                 result_preview = _err_text[:200] if len(_err_text) > 200 else _err_text
                 logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
 
             # Track file-mutation outcome for the turn-end verifier.
             # `blocked` calls never actually ran — don't let a guardrail
             # block count as either a failure or a success.
-            if not blocked:
+            if not blocked and function_name not in _EPHEMERAL_TOOL_RESULT_NAMES:
                 try:
                     agent._record_file_mutation_result(
                         function_name, function_args, function_result, is_error,
@@ -1451,7 +1514,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 except Exception as _ver_err:
                     logging.debug("file-mutation verifier record failed: %s", _ver_err)
 
-            if agent.verbose_logging:
+            if agent.verbose_logging and function_name not in _EPHEMERAL_TOOL_RESULT_NAMES:
                 logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
                 logging.debug("Tool result (%d chars): %s", len(function_result), function_result)
 
@@ -1459,7 +1522,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if is_error else ""
         agent._touch_activity(f"tool completed: {name} ({tool_duration:.1f}s){_status_suffix}")
 
-        display_function_result = function_result
+        display_function_result = _observer_safe_tool_result(name, function_result)
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1492,6 +1555,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             tc.id,
             effect_disposition=effect_disposition,
         )
+        if name in _EPHEMERAL_TOOL_RESULT_NAMES:
+            tool_message["_persist_content_override"] = (
+                _EPHEMERAL_TOOL_RESULT_PLACEHOLDER
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2037,7 +2104,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                         middleware_trace=middleware_trace,
                     )
                 )
-                _spinner_result = function_result
+                _spinner_result = _observer_safe_tool_result(
+                    function_name,
+                    function_result,
+                )
             except KeyboardInterrupt:
                 function_result = _emit_cancelled_terminal_post_tool_call(
                     agent,
@@ -2048,7 +2118,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     start_time=tool_start_time,
                     middleware_trace=list(middleware_trace),
                 )
-                _spinner_result = function_result
+                _spinner_result = _observer_safe_tool_result(
+                    function_name,
+                    function_result,
+                )
                 try:
                     agent.interrupt("keyboard interrupt")
                 except Exception:
@@ -2143,14 +2216,20 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 logger.error("handle_function_call raised for %s: %s", function_name, tool_error, exc_info=True)
             tool_duration = time.time() - tool_start_time
 
-        if isinstance(function_result, str):
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+        _observer_result = _observer_safe_tool_result(
+            function_name,
+            function_result,
+        )
+        if isinstance(_observer_result, str):
+            result_preview = _observer_result if agent.verbose_logging else (
+                _observer_result[:200]
+                if len(_observer_result) > 200
+                else _observer_result
             )
             _result_len = len(function_result)
         else:
             # Multimodal dict result (_multimodal=True) — not sliceable as string
-            result_preview = function_result
+            result_preview = _observer_result
             _result_len = len(str(function_result))
 
         # Log tool errors to the persistent error log so [error] tags
@@ -2188,8 +2267,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 function_result,
                 failed=_is_error_result,
             )
-            result_preview = function_result if agent.verbose_logging else (
-                function_result[:200] if len(function_result) > 200 else function_result
+            _observer_result = _observer_safe_tool_result(
+                function_name,
+                function_result,
+            )
+            result_preview = _observer_result if agent.verbose_logging else (
+                _observer_result[:200]
+                if len(_observer_result) > 200
+                else _observer_result
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)
@@ -2200,7 +2285,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # the concurrent path for the rationale; both paths must feed
         # the same state so the footer reflects every tool call in the
         # turn, not just the parallel ones.
-        if not _execution_blocked:
+        if (
+            not _execution_blocked
+            and function_name not in _EPHEMERAL_TOOL_RESULT_NAMES
+        ):
             try:
                 agent._record_file_mutation_result(
                     function_name, function_args, function_result, _is_error_result,
@@ -2212,12 +2300,15 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         _status_suffix = " (error)" if _is_error_result else ""
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s){_status_suffix}")
 
-        if agent.verbose_logging:
+        if agent.verbose_logging and function_name not in _EPHEMERAL_TOOL_RESULT_NAMES:
             logging.debug("Tool %s completed in %.2fs", function_name, tool_duration)
             _log_result = _multimodal_text_summary(function_result)
             logging.debug("Tool result (%d chars): %s", len(_log_result), _log_result)
 
-        display_function_result = function_result
+        display_function_result = _observer_safe_tool_result(
+            function_name,
+            function_result,
+        )
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -2238,6 +2329,10 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         # (see parallel path for rationale). String results pass through.
         _tool_content = agent._tool_result_content_for_active_model(function_name, function_result)
         tool_message = make_tool_result_message(function_name, _tool_content, tool_call.id)
+        if function_name in _EPHEMERAL_TOOL_RESULT_NAMES:
+            tool_message["_persist_content_override"] = (
+                _EPHEMERAL_TOOL_RESULT_PLACEHOLDER
+            )
         messages.append(tool_message)
         risk_metadata = tool_message.get("_tool_output_risk")
         if not _flush_session_db_after_tool_progress(
@@ -2294,9 +2389,13 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         if not agent.quiet_mode and getattr(agent, "tool_progress_mode", "all") != "off":
             if agent.verbose_logging:
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s")
-                print(agent._wrap_verbose("Result: ", function_result))
+                print(agent._wrap_verbose("Result: ", display_function_result))
             else:
-                _fr_str = function_result if isinstance(function_result, str) else str(function_result)
+                _fr_str = (
+                    display_function_result
+                    if isinstance(display_function_result, str)
+                    else str(display_function_result)
+                )
                 response_preview = _fr_str[:agent.log_prefix_chars] + "..." if len(_fr_str) > agent.log_prefix_chars else _fr_str
                 print(f"  ✅ Tool {i} completed in {tool_duration:.2f}s - {response_preview}")
 

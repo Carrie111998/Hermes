@@ -382,6 +382,33 @@ Understanding how Hermes behaves in different contexts:
 In channels, always @mention the bot to start a conversation. Once the bot is active in a thread, you can reply in that thread without mentioning it. Outside of threads, messages without @mention are ignored to prevent noise in busy channels.
 :::
 
+### Reading the active conversation
+
+With Slack history scopes enabled, the read-only `slack_history` tool can read
+one small context window from the channel or thread that invoked the current
+turn. The current user message must explicitly ask Hermes to read prior Slack
+context, for example “read the questions above”; implicit references do not
+authorize a read. The grant is consumed after one call and cannot be paged,
+delegated, or redirected to another conversation. Returned content is bounded,
+treated as untrusted external data, and replaced by a non-sensitive marker on
+Hermes-owned transcript, trajectory, memory-review, and debug-dump surfaces.
+Mentions and replies do not automatically hydrate prior thread text, reply
+parents, or thread-root attachments into the model context.
+Channel reads use the most recent bounded page before the triggering message.
+Slack returns thread replies oldest-first, so a long thread may expose only its
+start; the tool marks that result as incomplete instead of implying that it is
+the latest or complete thread context.
+
+The raw history page is ephemeral, but Hermes' visible answer is an ordinary
+Slack reply and remains in Slack and the normal conversation transcript. Hermes
+must summarize only what the requester needs and must not quote secrets. To
+avoid secondary propagation, history turns are excluded from trajectory export,
+external memory, background review, and request-debug/observability payloads.
+After a history read, every further tool call in that turn is blocked; mutations
+or delegation require a new explicit user message. The provider is pinned for
+the rest of that turn: Relay interception and provider fallback are disabled,
+and multi-provider MoA runtimes cannot read Slack history at all.
+
 ---
 
 ## Configuration Options

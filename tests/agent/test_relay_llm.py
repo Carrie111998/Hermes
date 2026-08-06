@@ -143,6 +143,53 @@ def test_stream_uses_rewritten_request_and_post_intercept_chunks(relay_turn):
     assert turn.logical_llm_calls == {}
 
 
+def test_private_slack_stream_bypasses_relay(relay_turn):
+    relay, _turn = relay_turn
+    from gateway.session_context import (
+        clear_session_vars,
+        consume_slack_history_authorization,
+        set_session_vars,
+    )
+
+    captured_requests = []
+
+    def fail_if_relay_runs(*_args, **_kwargs):
+        pytest.fail("private Slack history reached Relay")
+
+    relay.intercepts.register_llm_request(
+        "reject-private-slack",
+        1,
+        False,
+        fail_if_relay_runs,
+    )
+    tokens = set_session_vars(
+        platform="slack",
+        chat_id="C12345678",
+        scope_id="T12345678",
+        slack_history_authorized=True,
+    )
+    try:
+        assert consume_slack_history_authorization() is True
+        stream = relay_llm.stream(
+            {
+                "model": "test-model",
+                "messages": [{"role": "tool", "content": "private history"}],
+            },
+            lambda request: captured_requests.append(request) or iter([{"ok": True}]),
+            session_id="session-1",
+            name="test-provider",
+            model_name="test-model",
+            finalizer=lambda: {"content": "done"},
+        )
+        assert list(stream) == [{"ok": True}]
+    finally:
+        clear_session_vars(tokens)
+        relay.intercepts.deregister_llm_request("reject-private-slack")
+
+    assert captured_requests[0]["messages"][0]["content"] == "private history"
+    assert stream.output_modified is False
+
+
 
 
 

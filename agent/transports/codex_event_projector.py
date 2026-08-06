@@ -250,9 +250,15 @@ class CodexEventProjector:
             content = ""
         tool_msg = {
             "role": "tool",
+            "name": tool,
+            "tool_name": tool,
             "tool_call_id": call_id,
             "content": content,
         }
+        if tool == "slack_history":
+            tool_msg["_persist_content_override"] = (
+                "[Ephemeral Slack context was used for this turn and was not retained.]"
+            )
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )
@@ -290,9 +296,15 @@ class CodexEventProjector:
             content = f"success={success}"
         tool_msg = {
             "role": "tool",
+            "name": tool,
+            "tool_name": tool,
             "tool_call_id": call_id,
             "content": content,
         }
+        if tool == "slack_history":
+            tool_msg["_persist_content_override"] = (
+                "[Ephemeral Slack context was used for this turn and was not retained.]"
+            )
         return ProjectionResult(
             messages=[assistant_msg, tool_msg], is_tool_iteration=True
         )

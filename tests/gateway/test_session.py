@@ -181,6 +181,31 @@ class TestBuildSessionContextPrompt:
         assert "current message's slack block/attachment payload" in prompt.lower()
         assert "you can" not in prompt.lower() or "you cannot" in prompt.lower()
 
+    def test_relay_slack_prompt_never_promises_native_history(self):
+        """A relay turn cannot use the in-process Slack SDK client."""
+        from unittest.mock import patch
+
+        config = GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+        source = SessionSource(
+            platform=Platform.SLACK,
+            chat_id="C123",
+            chat_name="general",
+            chat_type="group",
+            user_name="bob",
+            delivered_via_upstream_relay=True,
+        )
+        ctx = build_session_context(source, config)
+        with patch("gateway.session._slack_tools_loaded", return_value=True):
+            prompt = build_session_context_prompt(ctx)
+
+        assert "upstream relay" in prompt
+        assert "no native Slack history tool" in prompt
+        assert "read prior channel or thread history" in prompt
+
 
     def test_slack_tools_loaded_detects_real_mcp_registration(self):
         """Regression (review of #63234): a connected MCP server whose tools
@@ -1528,5 +1553,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

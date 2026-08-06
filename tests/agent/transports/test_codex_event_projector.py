@@ -71,6 +71,28 @@ class TestProjectionInvariants:
         r = p.project({"method": "totally/unknown", "params": {}})
         assert r.messages == []
 
+    def test_slack_history_dynamic_result_has_ephemeral_persistence_marker(self) -> None:
+        result = CodexEventProjector().project({
+            "method": "item/completed",
+            "params": {
+                "item": {
+                    "type": "dynamicToolCall",
+                    "id": "slack-1",
+                    "tool": "slack_history",
+                    "arguments": {},
+                    "status": "completed",
+                    "contentItems": [{"type": "text", "text": "private history"}],
+                    "success": True,
+                }
+            },
+        })
+
+        tool_message = result.messages[1]
+        assert tool_message["content"].find("private history") >= 0
+        assert tool_message["_persist_content_override"] == (
+            "[Ephemeral Slack context was used for this turn and was not retained.]"
+        )
+
 
 class TestCommandExecutionProjection:
     """Real captured notification → assistant tool_call + tool result."""

@@ -249,6 +249,12 @@ Registered on the `hermes-discord` platform toolset. Moderation actions require 
 |------|-------------|----------------------|
 | `discord_admin` | Manage a Discord server via the REST API: list guilds/channels/roles, create/edit/delete channels, manage role grants, timeouts, kicks, and bans. | `DISCORD_BOT_TOKEN` + bot permissions |
 
+## `slack` toolset
+
+| Tool | Description | Requires environment |
+|------|-------------|----------------------|
+| `slack_history` | Read one small, non-pageable context window from the active Slack channel or thread. One read is allowed only when the current user message explicitly requests history. Other conversations are rejected, content is marked untrusted, and the raw result is not retained in Hermes transcripts or traces. | Live native Slack adapter + history scopes |
+
 ## `spotify` toolset
 
 Registered by the bundled `spotify` plugin. Requires an OAuth token — run `hermes auth spotify` once to authorize.
@@ -274,5 +280,4 @@ Registered only on the `hermes-yuanbao` platform toolset. Yuanbao is Tencent's c
 | `yb_send_dm` | Send a private/direct message to a user in a group, with optional media files. | Yuanbao credentials |
 | `yb_search_sticker` | Search the built-in Yuanbao sticker (TIM face) catalogue by keyword. | Yuanbao credentials |
 | `yb_send_sticker` | Send a built-in sticker to the current Yuanbao chat. | Yuanbao credentials |
-
 

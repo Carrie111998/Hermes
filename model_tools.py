@@ -1100,11 +1100,16 @@ def _emit_post_tool_call_hook(
                 function_name,
                 result,
             )
+        observer_result = result
+        if function_name == "slack_history":
+            observer_result = (
+                "[Ephemeral Slack context was used for this turn and was not retained.]"
+            )
         invoke_hook(
             "post_tool_call",
             tool_name=function_name,
             args=function_args,
-            result=result,
+            result=observer_result,
             task_id=task_id or "",
             session_id=session_id or "",
             tool_call_id=tool_call_id or "",
@@ -1484,7 +1489,9 @@ def handle_function_call(
         # field derivation and the payload dispatch.
         try:
             from hermes_cli.lifecycle import has_hook, invoke_hook
-            if has_hook("transform_tool_result"):
+            # Slack history is ephemeral private context. It may be returned
+            # only to the selected model, never to plugin transformation hooks.
+            if function_name != "slack_history" and has_hook("transform_tool_result"):
                 status, error_type, error_message = _tool_result_observer_fields(
                     function_name,
                     result,

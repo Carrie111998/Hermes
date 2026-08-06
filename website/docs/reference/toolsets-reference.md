@@ -75,6 +75,7 @@ Or in-session:
 | `safe` | `image_generate`, `vision_analyze`, `web_extract`, `web_search` (via `includes`) | Read-only research + media generation. No file writes, no terminal, no code execution. |
 | `search` | `web_search` | Web search only (without extract). |
 | `session_search` | `session_search` | Search past conversation sessions. |
+| `slack` | `slack_history` | Read one explicitly requested, non-pageable context window from the active Slack conversation. |
 | `skills` | `skill_manage`, `skill_view`, `skills_list` | Skill CRUD and browsing. |
 | `spotify` | `spotify_albums`, `spotify_devices`, `spotify_library`, `spotify_playback`, `spotify_playlists`, `spotify_queue`, `spotify_search` | Native Spotify control (playback, queue, search, playlists, albums, library). Registered by the bundled `spotify` plugin. |
 | `terminal` | `close_terminal`, `focus_pane`, `open_preview`, `process`, `read_preview`, `read_terminal`, `terminal` | Shell command execution and background process management. `read_terminal`, `close_terminal`, `open_preview`, `read_preview`, and `focus_pane` drive the desktop GUI's embedded panes and are check_fn-gated — they only register in desktop-app sessions. |
@@ -98,7 +99,7 @@ Platform toolsets define the complete tool configuration for a deployment target
 | `hermes-cron` | Same as `hermes-cli`. |
 | `hermes-telegram` | Same as `hermes-cli`. |
 | `hermes-discord` | Adds `discord` and `discord_admin` on top of `hermes-cli`. |
-| `hermes-slack` | Same as `hermes-cli`. |
+| `hermes-slack` | Adds fail-closed, read-only `slack_history` on top of `hermes-cli`. The tool permits one active-conversation read only after explicit user intent. |
 | `hermes-whatsapp` | Same as `hermes-cli`. |
 | `hermes-signal` | Same as `hermes-cli`. |
 | `hermes-matrix` | Same as `hermes-cli`. |

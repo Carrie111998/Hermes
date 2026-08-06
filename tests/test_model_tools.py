@@ -11,6 +11,7 @@ from model_tools import (
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
     TOOL_TO_TOOLSET_MAP,
+    _emit_post_tool_call_hook,
 )
 
 
@@ -19,6 +20,55 @@ from model_tools import (
 # =========================================================================
 
 class TestHandleFunctionCall:
+    def test_slack_history_post_hook_receives_placeholder_only(self, monkeypatch):
+        from hermes_cli import lifecycle
+
+        hook_calls = []
+        monkeypatch.setattr(lifecycle, "has_hook", lambda name: name == "post_tool_call")
+        monkeypatch.setattr(
+            lifecycle,
+            "invoke_hook",
+            lambda name, **kwargs: hook_calls.append((name, kwargs)) or [],
+        )
+
+        _emit_post_tool_call_hook(
+            function_name="slack_history",
+            function_args={},
+            result="private Slack history",
+        )
+
+        assert hook_calls[0][1]["result"] == (
+            "[Ephemeral Slack context was used for this turn and was not retained.]"
+        )
+        assert "private Slack history" not in json.dumps(hook_calls)
+
+    def test_slack_history_skips_transform_hook_entirely(self):
+        with (
+            patch(
+                "model_tools.registry.dispatch",
+                return_value="private Slack history",
+            ),
+            patch("hermes_cli.lifecycle.has_hook", return_value=True),
+            patch("hermes_cli.lifecycle.invoke_hook") as invoke_hook,
+        ):
+            result = handle_function_call(
+                "slack_history",
+                {},
+                skip_tool_request_middleware=True,
+                skip_tool_execution_middleware=True,
+            )
+
+        assert result == "private Slack history"
+        transform_calls = [
+            call
+            for call in invoke_hook.call_args_list
+            if call.args and call.args[0] == "transform_tool_result"
+        ]
+        assert transform_calls == []
+        assert "private Slack history" not in json.dumps(
+            [call.kwargs for call in invoke_hook.call_args_list],
+        )
+
     def test_agent_loop_tool_returns_error(self):
         for tool_name in _AGENT_LOOP_TOOLS:
             result = json.loads(handle_function_call(tool_name, {}))

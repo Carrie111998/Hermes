@@ -29,6 +29,8 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.tool_dispatch_helpers import _durable_message_copy
+
 from hermes_constants import get_hermes_home
 
 logger = logging.getLogger(__name__)
@@ -85,7 +87,12 @@ def _slot_trace(acct: Any, label: str) -> dict[str, Any]:
         "model": getattr(acct, "model", None),
         "provider": getattr(acct, "provider", None),
         "temperature": getattr(acct, "temperature", None),
-        "input_messages": getattr(acct, "messages", None),
+        "input_messages": [
+            _durable_message_copy(message)
+            if isinstance(message, dict)
+            else message
+            for message in (getattr(acct, "messages", None) or [])
+        ],
         "output": getattr(acct, "output", None),
         "usage": usage_dict,
         "cost_usd": getattr(acct, "cost_usd", None),
@@ -120,6 +127,14 @@ def save_moa_turn(
     that resolved text was unavailable, it falls back to None and the record
     points at the session store via ``output_location``.
     """
+    try:
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        if slack_history_sensitive_context_active():
+            logger.info("Skipping MoA trace for turn containing ephemeral Slack history")
+            return
+    except Exception:
+        pass
     base = _traces_enabled_and_dir()
     if base is None:
         return
@@ -149,7 +164,12 @@ def save_moa_turn(
                 "model": aggregator_model,
                 "provider": aggregator_provider,
                 "temperature": aggregator_temperature,
-                "input_messages": aggregator_input_messages,
+                "input_messages": [
+                    _durable_message_copy(message)
+                    if isinstance(message, dict)
+                    else message
+                    for message in (aggregator_input_messages or [])
+                ],
                 "output": aggregator_output,
                 "streamed": aggregator_streamed,
                 # Where the aggregator's acting output lives for this record.

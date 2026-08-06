@@ -23,6 +23,10 @@ from types import SimpleNamespace
 from typing import Any, Callable, Dict, List
 
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
+from agent.tool_dispatch_helpers import (
+    _durable_message_copy,
+    _seal_ephemeral_tool_results,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -523,6 +527,10 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         elif prior is not None:
             duration = time.monotonic() - prior[2]
         result, is_error = _codex_item_completion_payload(item)
+        if name == "slack_history":
+            result = (
+                "[Ephemeral Slack context was used for this turn and was not retained.]"
+            )
         cb = getattr(agent, "tool_progress_callback", None)
         if cb is not None:
             try:
@@ -764,9 +772,20 @@ def run_codex_app_server_turn(
     # Splice projected messages into the conversation. The projector emits
     # standard {role, content, tool_calls, tool_call_id} entries, which
     # is exactly what curator.py / sessions DB expect.
+    try:
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        ephemeral_slack_turn = slack_history_sensitive_context_active()
+    except Exception:
+        ephemeral_slack_turn = False
     if turn.projected_messages:
         messages.extend(turn.projected_messages)
 
+    # This path bypasses the ordinary finalizer. Remove one-turn private tool
+    # output before direct persistence or any later observer path.
+    _seal_ephemeral_tool_results(messages)
+
+    if turn.projected_messages:
         # Persist the newly-projected assistant/tool messages ourselves.
         # This path is an early return that bypasses conversation_loop, whose
         # normal per-step _persist_session() calls would otherwise flush them.
@@ -829,15 +848,26 @@ def run_codex_app_server_turn(
         should_review_skills = True
         agent._iters_since_skill = 0
 
+    durable_messages = [
+        _durable_message_copy(message)
+        if isinstance(message, dict)
+        else message
+        for message in messages
+    ]
+
     # External memory provider sync (mirrors line ~15439). Skipped on
     # interrupt/error to avoid feeding partial transcripts to memory.
-    if not turn.interrupted and turn.error is None:
+    if (
+        not ephemeral_slack_turn
+        and not turn.interrupted
+        and turn.error is None
+    ):
         try:
             agent._sync_external_memory_for_turn(
                 original_user_message=original_user_message,
                 final_response=turn.final_text,
                 interrupted=False,
-                messages=messages,
+                messages=durable_messages,
             )
         except Exception:
             logger.debug("external memory sync raised", exc_info=True)
@@ -846,13 +876,14 @@ def run_codex_app_server_turn(
     # path (line ~15449). Only fires when a trigger actually tripped AND
     # we have a real final response.
     if (
-        turn.final_text
+        not ephemeral_slack_turn
+        and turn.final_text
         and not turn.interrupted
         and (should_review_memory or should_review_skills)
     ):
         try:
             agent._spawn_background_review(
-                messages_snapshot=list(messages),
+                messages_snapshot=list(durable_messages),
                 review_memory=should_review_memory,
                 review_skills=should_review_skills,
             )

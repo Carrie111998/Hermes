@@ -26,6 +26,10 @@ import os
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.message_content import flatten_message_text
+from agent.tool_dispatch_helpers import (
+    _durable_message_copy,
+    _seal_ephemeral_tool_results,
+)
 
 
 def _is_pure_tool_call_tail(msg: dict) -> bool:
@@ -244,13 +248,25 @@ def finalize_turn(
     # killing the turn.
     _cleanup_errors = []
 
+    try:
+        from gateway.session_context import slack_history_sensitive_context_active
+
+        _ephemeral_slack_turn = slack_history_sensitive_context_active()
+    except Exception:
+        _ephemeral_slack_turn = False
+
+    # The provider has completed the turn, so private one-turn tool output no
+    # longer belongs in live process memory or any subsequent observer path.
+    _seal_ephemeral_tool_results(messages)
+
     # Save trajectory if enabled.  ``user_message`` may be a multimodal
     # list of parts; the trajectory format wants a plain string.
-    try:
-        agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
-    except Exception as _save_err:
-        _cleanup_errors.append(f"save_trajectory: {_save_err}")
-        logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
+    if not _ephemeral_slack_turn:
+        try:
+            agent._save_trajectory(messages, _summarize_user_message_for_log(user_message), completed)
+        except Exception as _save_err:
+            _cleanup_errors.append(f"save_trajectory: {_save_err}")
+            logger.error("finalize_turn: _save_trajectory failed: %s", _save_err, exc_info=True)
 
     # Clean up VM and browser for this task after conversation completes
     try:
@@ -544,7 +560,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can transform the LLM's output text before it's returned.
     # First hook to return a string wins; None/empty return leaves text unchanged.
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _ephemeral_slack_turn:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _transform_results = _invoke_hook(
@@ -566,7 +582,7 @@ def finalize_turn(
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
     # to an external memory system).
-    if final_response and not interrupted:
+    if final_response and not interrupted and not _ephemeral_slack_turn:
         try:
             from hermes_cli.lifecycle import invoke_hook as _invoke_hook
             _invoke_hook(
@@ -596,18 +612,19 @@ def finalize_turn(
         # provider response (early failure / interrupt), which is exactly the
         # contract: real usage when available, ``None`` otherwise.
         _turn_usage = getattr(agent, "_last_turn_usage", None)
-        _notify_context_engine_turn_complete(
-            agent,
-            messages,
-            usage=_turn_usage,
-            logger=logger,
-            turn_id=turn_id,
-            task_id=effective_task_id,
-            api_call_count=api_call_count,
-            interrupted=interrupted,
-            failed=failed,
-            turn_exit_reason=_turn_exit_reason,
-        )
+        if not _ephemeral_slack_turn:
+            _notify_context_engine_turn_complete(
+                agent,
+                messages,
+                usage=_turn_usage,
+                logger=logger,
+                turn_id=turn_id,
+                task_id=effective_task_id,
+                api_call_count=api_call_count,
+                interrupted=interrupted,
+                failed=failed,
+                turn_exit_reason=_turn_exit_reason,
+            )
     except Exception as exc:
         logger.warning("on_turn_complete notification failed: %s", exc)
 
@@ -704,19 +721,31 @@ def finalize_turn(
         agent._iters_since_skill = 0
 
     # External memory provider: sync the completed turn + queue next prefetch.
-    agent._sync_external_memory_for_turn(
-        original_user_message=original_user_message,
-        final_response=final_response,
-        interrupted=interrupted,
-        messages=messages,
-    )
+    durable_messages = [
+        _durable_message_copy(message)
+        if isinstance(message, dict)
+        else message
+        for message in messages
+    ]
+    if not _ephemeral_slack_turn:
+        agent._sync_external_memory_for_turn(
+            original_user_message=original_user_message,
+            final_response=final_response,
+            interrupted=interrupted,
+            messages=durable_messages,
+        )
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    if (
+        not _ephemeral_slack_turn
+        and final_response
+        and not interrupted
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
-                messages_snapshot=list(messages),
+                messages_snapshot=list(durable_messages),
                 review_memory=_should_review_memory,
                 review_skills=_should_review_skills,
             )

@@ -516,6 +516,47 @@ class TestReasoningStreaming:
         assert response.choices[0].message.reasoning_content == "Let me think about this"
         assert response.choices[0].message.content == "The answer is 42"
 
+    def test_reasoning_callback_is_suppressed_after_slack_history(self):
+        from gateway.session_context import (
+            clear_session_vars,
+            consume_slack_history_authorization,
+            set_session_vars,
+        )
+        from run_agent import AIAgent
+
+        reasoning_deltas = []
+        interim_messages = []
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=True,
+            reasoning_callback=reasoning_deltas.append,
+        )
+        agent.interim_assistant_callback = (
+            lambda text, **_kwargs: interim_messages.append(text)
+        )
+        tokens = set_session_vars(
+            platform="slack",
+            chat_id="C12345678",
+            scope_id="T12345678",
+            slack_history_authorized=True,
+        )
+        try:
+            assert consume_slack_history_authorization() is True
+            agent._fire_reasoning_delta("private derived reasoning")
+            agent._fire_streamed_codex_commentary("private commentary")
+            agent._emit_interim_assistant_message(
+                {"role": "assistant", "content": "private interim answer"},
+            )
+        finally:
+            clear_session_vars(tokens)
+
+        assert reasoning_deltas == []
+        assert interim_messages == []
+
 
 # ── Test: _has_stream_consumers ──────────────────────────────────────────
 
@@ -1634,4 +1675,3 @@ class TestBedrockReasoningStaleFloor:
         from agent.chat_completion_helpers import _bedrock_reasoning_stale_floor
 
         assert _bedrock_reasoning_stale_floor(model_id) == expected
-

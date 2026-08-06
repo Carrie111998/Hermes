@@ -1339,8 +1339,8 @@ class TestBangPrefixCommands:
 
 
     @pytest.mark.asyncio
-    async def test_bang_queue_survives_first_thread_context_backfill(self, adapter):
-        """Backfill stays out of command text while remaining available."""
+    async def test_bang_queue_does_not_auto_hydrate_thread_context(self, adapter):
+        """Commands never receive implicit prior-thread context."""
         adapter._has_active_session_for_thread = MagicMock(return_value=False)
         adapter._fetch_thread_context = AsyncMock(
             return_value=(
@@ -1362,12 +1362,12 @@ class TestBangPrefixCommands:
         assert msg_event.message_type == MessageType.COMMAND
         assert msg_event.get_command() == "queue"
         assert msg_event.get_command_args() == "follow up after the current task"
-        assert msg_event.channel_context.startswith("[Slack thread context")
-        assert "prior request" in msg_event.channel_context
+        assert msg_event.channel_context is None
+        adapter._fetch_thread_context.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_non_command_thread_backfill_uses_channel_context(self, adapter):
-        """Normal thread text remains separate without losing its backfill."""
+    async def test_non_command_thread_does_not_auto_hydrate_context(self, adapter):
+        """Normal thread text also requires an explicit history request."""
         adapter._has_active_session_for_thread = MagicMock(return_value=False)
         adapter._fetch_thread_context = AsyncMock(
             return_value="[Slack thread context]\nAlice: earlier note\n"
@@ -1383,9 +1383,8 @@ class TestBangPrefixCommands:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "follow up"
         assert msg_event.message_type == MessageType.TEXT
-        assert msg_event.channel_context == (
-            "[Slack thread context]\nAlice: earlier note\n"
-        )
+        assert msg_event.channel_context is None
+        adapter._fetch_thread_context.assert_not_awaited()
 
 
     @pytest.mark.asyncio
@@ -1399,13 +1398,8 @@ class TestBangPrefixCommands:
 
 
     @pytest.mark.asyncio
-    async def test_thread_command_skips_context_prefix(self, adapter):
-        """Thread backfill must never prefix a mentioned command's text.
-
-        Post-#69320, thread context IS fetched on first thread entry, but it
-        rides MessageEvent.channel_context — the command token must stay at
-        character zero of ``text``.
-        """
+    async def test_thread_command_skips_automatic_context(self, adapter):
+        """A mention authorizes the command turn, not a history read."""
         adapter._has_active_session_for_thread = MagicMock(return_value=False)
         adapter._fetch_thread_context = AsyncMock(
             return_value="[Thread context]\nAlice: earlier\n"
@@ -1421,7 +1415,8 @@ class TestBangPrefixCommands:
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.text == "/new"
         assert msg_event.message_type == MessageType.COMMAND
-        assert msg_event.channel_context == "[Thread context]\nAlice: earlier\n"
+        assert msg_event.channel_context is None
+        adapter._fetch_thread_context.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_mention_command_drops_rich_text_command_arguments(self, adapter):
@@ -1738,6 +1733,8 @@ class TestIncomingDocumentHandling:
         assert "> Quoted line" in msg_event.text
         assert "• First bullet" in msg_event.text
         assert "• Second bullet" in msg_event.text
+        assert msg_event.metadata["slack_authored_text"] == "Can you summarize this?"
+        assert "Quoted line" not in msg_event.metadata["slack_authored_text"]
 
 
 # ---------------------------------------------------------------------------
@@ -2692,6 +2689,33 @@ class TestThreadReplyHandling:
         assert msg_event.text == "Follow-up question"
 
     @pytest.mark.asyncio
+    async def test_bot_authored_thread_root_reads_metadata_without_caching_history(
+        self, adapter_with_session_store
+    ):
+        adapter_with_session_store._app.client.conversations_replies = AsyncMock(
+            return_value={
+                "messages": [
+                    {
+                        "ts": "123.000",
+                        "user": "U_BOT",
+                        "text": "Sensitive prior bot response",
+                    }
+                ]
+            }
+        )
+
+        assert await adapter_with_session_store._bot_authored_thread_root(
+            "C123", "123.000", "T_TEAM"
+        )
+        adapter_with_session_store._app.client.conversations_replies.assert_awaited_once_with(
+            channel="C123",
+            ts="123.000",
+            limit=1,
+            inclusive=True,
+        )
+        assert adapter_with_session_store._thread_context_cache == {}
+
+    @pytest.mark.asyncio
     async def test_thread_reply_routes_when_parent_mentioned_bot(
         self, adapter_with_session_store, mock_session_store
     ):
@@ -2706,8 +2730,7 @@ class TestThreadReplyHandling:
         mock_session_store.get_session_metadata = MagicMock(return_value="")
         adapter_with_session_store._app.client.conversations_replies = AsyncMock(
             side_effect=[
-                # _bot_authored_thread_root miss path → full context fetch
-                # (parent is human-authored, so check 4 fails).
+                # Metadata-only bot-authorship check (human-authored root).
                 {
                     "messages": [
                         {
@@ -2717,7 +2740,8 @@ class TestThreadReplyHandling:
                         },
                     ],
                 },
-                # Any later fetch (cold-start context) reuses cache or refetches.
+                # Parent-mention routing check; content remains local and is
+                # never added to the model event or formatted-history cache.
                 {
                     "messages": [
                         {
@@ -2746,10 +2770,11 @@ class TestThreadReplyHandling:
         adapter_with_session_store.handle_message.assert_called_once()
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
         assert msg_event.text == "run"
-        # Cold-start context carries the parent so the agent sees the ask.
-        assert "check this and ask me for run" in msg_event.channel_context
+        # Parent text may be inspected for routing but is never injected into
+        # the model turn without explicit slack_history authorization.
+        assert msg_event.channel_context is None
         # Thread remembered so later replies skip the parent fetch.
-        assert "123.000" in adapter_with_session_store._mentioned_threads
+        assert ("T_TEAM", "123.000") in adapter_with_session_store._mentioned_threads
 
     @pytest.mark.asyncio
     async def test_top_level_mention_registers_thread_for_replies(
@@ -2783,12 +2808,10 @@ class TestThreadReplyHandling:
 
 
     @pytest.mark.asyncio
-    async def test_active_thread_explicit_mention_refreshes_context_delta(
+    async def test_active_thread_explicit_mention_does_not_refresh_context_delta(
         self, adapter_with_session_store, mock_session_store
     ):
-        """Explicit @mention on an active thread must re-fetch the thread and
-        inject only the delta past the stored watermark, as part of the NEW
-        turn (channel_context) — never rewriting prior history (#23918)."""
+        """A mention authorizes a turn, not an automatic history read."""
         mock_session_store._entries = {"any": MagicMock()}
         adapter_with_session_store._has_active_session_for_thread = MagicMock(
             return_value=True
@@ -2827,13 +2850,10 @@ class TestThreadReplyHandling:
             "team": "T_TEAM",
         })
 
-        adapter_with_session_store._app.client.conversations_replies.assert_awaited_once()
+        adapter_with_session_store._app.client.conversations_replies.assert_not_awaited()
         msg_event = adapter_with_session_store.handle_message.call_args[0][0]
-        # Delta arrives as new-turn channel_context, not baked into text.
         assert msg_event.text == "what changed?"
-        assert "Fresh update" in msg_event.channel_context
-        # Already-consumed messages must NOT be re-injected.
-        assert "Old context" not in msg_event.channel_context
+        assert msg_event.channel_context is None
         # Watermark advanced to the trigger ts.
         assert metadata["slack_thread_watermark:C123:123.000"] == "123.456"
 
@@ -3433,14 +3453,10 @@ class TestProgressMessageThread:
 
 
 class TestSlackReplyToText:
-    """Ensure MessageEvent.reply_to_text is populated on thread replies so
-    gateway.run can inject a ``[Replying to: "..."]`` prefix (parity with
-    Telegram/Discord/Feishu/WeCom)."""
+    """Slack reply parents stay behind explicit history authorization."""
 
     @pytest.mark.asyncio
-    async def test_slack_reply_to_text_set_on_thread_reply(self, adapter):
-        """When a thread reply arrives and the parent was posted by a bot
-        (e.g. cron summary), reply_to_text must carry the parent's text."""
+    async def test_slack_reply_to_text_not_auto_fetched(self, adapter):
         adapter._channel_team = {}  # primary workspace only
         adapter._team_bot_user_ids = {}
 
@@ -3478,10 +3494,8 @@ class TestSlackReplyToText:
         ), "handle_message must be invoked for thread-reply DM"
         msg_event = adapter.handle_message.call_args[0][0]
         assert msg_event.reply_to_message_id == "1000.0"
-        # The critical assertion: parent text is exposed as reply_to_text so the
-        # gateway can inject it when not already in the session history.
-        assert msg_event.reply_to_text is not None
-        assert "メール要約" in msg_event.reply_to_text
+        assert msg_event.reply_to_text is None
+        adapter._app.client.conversations_replies.assert_not_awaited()
 
 
 # ---------------------------------------------------------------------------
@@ -4365,12 +4379,10 @@ class TestThreadImageContext:
 
 
     @pytest.mark.asyncio
-    async def test_cold_start_delivers_thread_root_image(
+    async def test_cold_start_does_not_auto_deliver_thread_root_image(
         self, adapter_with_session_store
     ):
-        """The thread root's image (the artifact the mention is about) is
-        downloaded, cached, and delivered on the first turn; message type
-        upgrades to PHOTO so vision routing engages."""
+        """Prior thread attachments require an explicit history read."""
         a = self._prep(adapter_with_session_store)
         a._app.client.conversations_replies = self._replies(
             root_files=[
@@ -4387,19 +4399,17 @@ class TestThreadImageContext:
 
         a.handle_message.assert_awaited_once()
         msg_event = a.handle_message.call_args[0][0]
-        assert msg_event.media_urls == ["/tmp/hermes-cached.png"]
-        assert msg_event.media_types == ["image/png"]
-        assert msg_event.message_type == MessageType.PHOTO
-        # The context marker AND the delivered image coexist.
-        assert "[image: chart.png]" in msg_event.channel_context
-        a._download_slack_file.assert_awaited_once()
+        assert msg_event.media_urls == []
+        assert msg_event.media_types == []
+        assert msg_event.message_type == MessageType.TEXT
+        assert msg_event.channel_context is None
+        a._download_slack_file.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_root_image_download_failure_degrades_to_marker(
+    async def test_root_image_is_not_read_even_when_download_would_fail(
         self, adapter_with_session_store
     ):
-        """A failed root-image download must not block the turn — the agent
-        still sees the [image: ...] marker and can ask for a re-share."""
+        """The adapter never attempts a prior-thread download implicitly."""
         a = self._prep(adapter_with_session_store)
         a._download_slack_file = AsyncMock(side_effect=RuntimeError("boom"))
         a._app.client.conversations_replies = self._replies(
@@ -4419,7 +4429,8 @@ class TestThreadImageContext:
         msg_event = a.handle_message.call_args[0][0]
         assert msg_event.media_urls == []
         assert msg_event.message_type == MessageType.TEXT
-        assert "[image: chart.png]" in msg_event.channel_context
+        assert msg_event.channel_context is None
+        a._download_slack_file.assert_not_awaited()
 
 
 # =========================================================================
@@ -4558,4 +4569,3 @@ class TestSlackUserAgent:
         """Module constant matches the HermesAgent/<version> convention used
         elsewhere in the codebase for platform-partner attribution."""
         assert _slack_mod._HERMES_SLACK_USER_AGENT_PREFIX.startswith("HermesAgent/")
-
