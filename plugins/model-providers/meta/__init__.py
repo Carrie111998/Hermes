@@ -1,13 +1,13 @@
-"""Meta provider profile — Muse Spark via Meta Model API."""
+"""Meta provider profile — Meta Model API (OpenAI-compatible)."""
 
 from providers import register_provider
 from providers.base import ProviderProfile
 
 meta = ProviderProfile(
     name="meta",
-    aliases=("meta-ai", "muse-spark"),
+    aliases=("meta-ai",),
     display_name="Meta",
-    description="Meta — Muse Spark via Meta Model API",
+    description="Meta — Model API (OpenAI-compatible)",
     signup_url="https://dev.meta.ai/",
     env_vars=("META_API_KEY",),
     base_url="https://api.meta.ai/v1",

@@ -1367,7 +1367,6 @@ _PROVIDER_ALIASES = {
     "ollama": "custom",  # bare "ollama" = local; use "ollama-cloud" for cloud
     "ollama_cloud": "ollama-cloud",
     "meta-ai": "meta",
-    "muse-spark": "meta",
 }
 
 
