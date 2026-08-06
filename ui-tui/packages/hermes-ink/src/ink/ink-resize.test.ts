@@ -4,6 +4,7 @@ import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import Text from './components/Text.js'
+import { TerminalSizeContext } from './components/TerminalSizeContext.js'
 import Ink from './ink.js'
 import { CURSOR_HOME, ERASE_SCREEN } from './termio/csi.js'
 
@@ -80,6 +81,134 @@ describe('Ink resize healing', () => {
     }
   })
 
+  it('keeps the repaint guard active through the final React commit', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+    let commitUpdate: ((phase: string) => void) | undefined
+
+    const CommitUpdate = () => {
+      const [phase, setPhase] = React.useState('initial')
+
+      commitUpdate = nextPhase => setPhase(nextPhase)
+
+      return React.createElement(Text, null, phase)
+    }
+
+    try {
+      ink.setAltScreenActive(true)
+      ink.render(React.createElement(CommitUpdate))
+      ink.onRender()
+      stdout.chunks = []
+
+      stdout.columns = 12
+      stdout.rows = 8
+      stdout.emit('resize')
+      await vi.advanceTimersByTimeAsync(0)
+
+      const originalRender = ink.render.bind(ink)
+      let injectCommitUpdate = true
+
+      vi.spyOn(ink, 'render').mockImplementation(node => {
+        if (injectCommitUpdate) {
+          injectCommitUpdate = false
+          commitUpdate?.('intermediate')
+        }
+
+        originalRender(node)
+        commitUpdate?.('settled')
+      })
+
+      await vi.advanceTimersByTimeAsync(159)
+      expect(stdout.chunks.join('')).not.toContain('intermediate')
+
+      await vi.advanceTimersByTimeAsync(1)
+      await vi.runAllTimersAsync()
+
+      const out = stdout.chunks.join('')
+
+      expect(out).toContain(ERASE_SCREEN)
+      expect(out).toContain(CURSOR_HOME)
+      expect(out).not.toContain('intermediate')
+      expect(out).toContain('settled')
+      expect(out.indexOf(ERASE_SCREEN)).toBeLessThan(out.lastIndexOf('settled'))
+    } finally {
+      ink.unmount()
+    }
+  })
+
+  it('heals once more after a late terminal-host reflow', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+
+    try {
+      ink.setAltScreenActive(true)
+      ink.render(React.createElement(Text, null, 'hello'))
+      ink.onRender()
+      stdout.chunks = []
+
+      stdout.columns = 8
+      stdout.rows = 3
+      stdout.emit('resize')
+
+      await vi.advanceTimersByTimeAsync(160)
+      await vi.advanceTimersToNextTimerAsync()
+      expectCleanRepaint(stdout)
+
+      // The host can reflow its physical buffer after the fast heal. Ink has
+      // no terminal-side damage signal, so model that late drift by dropping
+      // the already-painted bytes and requiring one bounded follow-up heal.
+      stdout.chunks = []
+
+      await vi.advanceTimersByTimeAsync(499)
+      expect(stdout.chunks.join('')).not.toContain(ERASE_SCREEN)
+
+      await vi.advanceTimersByTimeAsync(1)
+      await vi.advanceTimersByTimeAsync(40)
+      expectCleanRepaint(stdout)
+
+      const writesAfterLateHeal = stdout.chunks.length
+
+      await vi.advanceTimersByTimeAsync(1000)
+      expect(stdout.chunks).toHaveLength(writesAfterLateHeal)
+    } finally {
+      ink.unmount()
+    }
+  })
+
+  it('resynchronizes missed terminal dimensions during a manual redraw', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+
+    const TerminalSize = () => {
+      const size = React.useContext(TerminalSizeContext)
+
+      return React.createElement(Text, null, `${size?.columns}x${size?.rows}`)
+    }
+
+    try {
+      ink.setAltScreenActive(true)
+      ink.render(React.createElement(TerminalSize))
+      ink.onRender()
+      stdout.chunks = []
+
+      // Model a terminal host that updates the PTY dimensions but drops the
+      // final resize event after a large shrink/grow and a skin repaint.
+      stdout.columns = 37
+      stdout.rows = 11
+
+      ink.forceRedraw()
+      await vi.advanceTimersByTimeAsync(40)
+
+      const out = stdout.chunks.join('')
+
+      expect(out).toContain(ERASE_SCREEN)
+      expect(out).toContain('37x11')
+      expect(out).not.toContain('20x5')
+    } finally {
+      ink.unmount()
+    }
+  })
+
   it('lets a manual redraw supersede a pending resize heal', async () => {
     const stdout = new FakeTty()
     const ink = makeInk(stdout)
@@ -94,6 +223,7 @@ describe('Ink resize healing', () => {
     await vi.advanceTimersByTimeAsync(0)
 
     ink.forceRedraw()
+    await vi.advanceTimersByTimeAsync(40)
     expectCleanRepaint(stdout)
 
     const writesAfterRedraw = stdout.chunks.length
@@ -102,6 +232,37 @@ describe('Ink resize healing', () => {
     expect(stdout.chunks).toHaveLength(writesAfterRedraw)
 
     ink.unmount()
+  })
+
+  it('resynchronizes application listeners even when Ink already matches the PTY', async () => {
+    const stdout = new FakeTty()
+    const ink = makeInk(stdout)
+    let applicationColumns = 7
+    const syncApplicationColumns = () => {
+      applicationColumns = stdout.columns
+    }
+
+    stdout.on('resize', syncApplicationColumns)
+
+    try {
+      ink.setAltScreenActive(true)
+      ink.render(React.createElement(Text, null, 'hello'))
+      ink.onRender()
+      stdout.chunks = []
+
+      // Ink and stdout both remain at 20 columns, but model an application
+      // listener whose coalesced state was stranded at an earlier width.
+      ink.forceRedraw()
+
+      expect(applicationColumns).toBe(20)
+      expect(stdout.chunks.join('')).not.toContain(ERASE_SCREEN)
+
+      await vi.advanceTimersByTimeAsync(40)
+      expectCleanRepaint(stdout)
+    } finally {
+      stdout.off('resize', syncApplicationColumns)
+      ink.unmount()
+    }
   })
 
   it('lets destructive alt-screen re-entry supersede a pending resize heal', async () => {

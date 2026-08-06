@@ -131,6 +131,11 @@ const ERASE_THEN_HOME_PATCH = Object.freeze({
   content: ERASE_SCREEN + CURSOR_HOME
 })
 
+// App-level resize listeners may coalesce for one 32ms frame. A recovery
+// redraw must run after their trailing update, not merely after Ink's own
+// terminalColumns field has converged.
+const REDRAW_RESYNC_DELAY_MS = 40
+
 const DEEP_ERASE_THEN_HOME_PATCH = Object.freeze({
   type: 'stdout' as const,
   content: ERASE_SCREEN + ERASE_SCROLLBACK + CURSOR_HOME
@@ -309,6 +314,8 @@ export default class Ink {
   // expensive tree rebuild defers.
   private pendingResizeRender = false
   private resizeSettleTimer: ReturnType<typeof setTimeout> | null = null
+  private resizeLateHealTimer: ReturnType<typeof setTimeout> | null = null
+  private redrawResyncTimer: ReturnType<typeof setTimeout> | null = null
 
   // Fold synchronous re-entry (selection fanout, onFrame callback)
   // into one follow-up microtask instead of stacking renders.
@@ -524,6 +531,16 @@ export default class Ink {
       this.resizeSettleTimer = null
     }
 
+    if (this.resizeLateHealTimer !== null) {
+      clearTimeout(this.resizeLateHealTimer)
+      this.resizeLateHealTimer = null
+    }
+
+    if (this.redrawResyncTimer !== null) {
+      clearTimeout(this.redrawResyncTimer)
+      this.redrawResyncTimer = null
+    }
+
     // Alt screen: reset frame buffers so the next render repaints from
     // scratch (prevFrameContaminated → every cell written, wrapped in
     // BSU/ESU — old content stays visible until the new frame swaps
@@ -578,6 +595,16 @@ export default class Ink {
       this.resizeSettleTimer = null
     }
 
+    if (this.resizeLateHealTimer !== null) {
+      clearTimeout(this.resizeLateHealTimer)
+      this.resizeLateHealTimer = null
+    }
+
+    if (this.redrawResyncTimer !== null) {
+      clearTimeout(this.redrawResyncTimer)
+      this.redrawResyncTimer = null
+    }
+
     // Mouse tracking — DISABLE first so we land in the exact preset state
     // even if an external app/terminal/tmux left DEC 1003 hover asserted.
     // DISABLE_MOUSE_TRACKING is idempotent (resets all four modes
@@ -587,21 +614,81 @@ export default class Ink {
     this.resetFramesForAltScreen()
     this.needsEraseBeforePaint = true
 
-    this.resizeSettleTimer = setTimeout(() => {
-      this.resizeSettleTimer = null
+    const settleTimer = setTimeout(() => {
+      if (this.resizeSettleTimer !== settleTimer) {
+        return
+      }
 
       if (!this.canAltScreenRepaint()) {
+        this.resizeSettleTimer = null
+
         return
       }
 
       this.resetFramesForAltScreen()
       this.needsEraseBeforePaint = true
-      this.render(this.currentNode!)
-      // React may bail out when the current tree is referentially unchanged.
-      // The physical terminal still needs the trailing erase+repaint, so do
-      // not depend on a reconciler commit to schedule it.
-      this.onRender()
+
+      try {
+        // Keep the settle sentinel armed while React commits and flushes
+        // synchronous layout effects. Those commits call onRender; letting
+        // them write would expose intermediate frames.
+        this.render(this.currentNode!)
+      } catch (error) {
+        if (this.resizeSettleTimer === settleTimer) {
+          this.resizeSettleTimer = null
+        }
+
+        throw error
+      }
+
+      // React may still have passive/state work queued in its scheduler after
+      // render() returns. Keep the sentinel armed through the next event-loop
+      // turn, then cancel the ordinary scheduled paint and publish one final
+      // full frame. A newer resize or manual recovery replaces/clears the
+      // sentinel and wins.
+      setTimeout(() => {
+        if (this.resizeSettleTimer !== settleTimer) {
+          return
+        }
+
+        this.scheduleRender.cancel?.()
+        this.resizeSettleTimer = null
+
+        if (!this.canAltScreenRepaint()) {
+          return
+        }
+
+        // React may bail out when the current tree is referentially unchanged.
+        // The physical terminal still needs the trailing erase+repaint, so do
+        // not depend on a reconciler commit to schedule it.
+        this.onRender()
+
+        if (this.resizeSettleTimer !== null) {
+          return
+        }
+
+        const lateHealTimer = setTimeout(() => {
+          if (this.resizeLateHealTimer !== lateHealTimer) {
+            return
+          }
+
+          this.resizeLateHealTimer = null
+
+          if (this.resizeSettleTimer !== null || !this.canAltScreenRepaint()) {
+            return
+          }
+
+          // Large terminal reflows can finish after the fast settle repaint.
+          // Reuse the proven manual recovery once, after a bounded quiet
+          // period, so the physical buffer converges without polling.
+          this.forceRedraw()
+        }, 500)
+
+        this.resizeLateHealTimer = lateHealTimer
+      }, 0)
     }, 160)
+
+    this.resizeSettleTimer = settleTimer
   }
 
   resolveExitPromise: () => void = () => {}
@@ -1278,6 +1365,52 @@ export default class Ink {
       this.resizeSettleTimer = null
     }
 
+    if (this.resizeLateHealTimer !== null) {
+      clearTimeout(this.resizeLateHealTimer)
+      this.resizeLateHealTimer = null
+    }
+
+    if (this.redrawResyncTimer !== null) {
+      clearTimeout(this.redrawResyncTimer)
+      this.redrawResyncTimer = null
+    }
+
+    // Ink can already match stdout.columns while application-level listeners
+    // are still stuck on an earlier coalesced width. Always rebroadcast the
+    // current PTY geometry; comparing only Ink's own fields misses that split.
+    this.options.stdout.emit('resize')
+
+    const resyncTimer = setTimeout(() => {
+      if (this.redrawResyncTimer !== resyncTimer) {
+        return
+      }
+
+      this.redrawResyncTimer = null
+
+      if (!this.options.stdout.isTTY || this.isUnmounted || this.isPaused) {
+        return
+      }
+
+      // The synthetic resize installed normal settle/late timers. This repaint
+      // supersedes them once downstream listeners have committed the current
+      // geometry after a full coalescing window.
+      if (this.resizeSettleTimer !== null) {
+        clearTimeout(this.resizeSettleTimer)
+        this.resizeSettleTimer = null
+      }
+
+      if (this.resizeLateHealTimer !== null) {
+        clearTimeout(this.resizeLateHealTimer)
+        this.resizeLateHealTimer = null
+      }
+
+      this.performFullRedraw()
+    }, REDRAW_RESYNC_DELAY_MS)
+
+    this.redrawResyncTimer = resyncTimer
+  }
+
+  private performFullRedraw(): void {
     this.options.stdout.write(ERASE_SCREEN + CURSOR_HOME)
 
     if (this.altScreenActive) {
@@ -1487,6 +1620,16 @@ export default class Ink {
     if (this.resizeSettleTimer !== null) {
       clearTimeout(this.resizeSettleTimer)
       this.resizeSettleTimer = null
+    }
+
+    if (this.resizeLateHealTimer !== null) {
+      clearTimeout(this.resizeLateHealTimer)
+      this.resizeLateHealTimer = null
+    }
+
+    if (this.redrawResyncTimer !== null) {
+      clearTimeout(this.redrawResyncTimer)
+      this.redrawResyncTimer = null
     }
 
     // DISABLE_MOUSE_TRACKING before enableMouseTrackingFor — same as
@@ -2514,6 +2657,16 @@ export default class Ink {
     if (this.resizeSettleTimer !== null) {
       clearTimeout(this.resizeSettleTimer)
       this.resizeSettleTimer = null
+    }
+
+    if (this.resizeLateHealTimer !== null) {
+      clearTimeout(this.resizeLateHealTimer)
+      this.resizeLateHealTimer = null
+    }
+
+    if (this.redrawResyncTimer !== null) {
+      clearTimeout(this.redrawResyncTimer)
+      this.redrawResyncTimer = null
     }
 
     reconciler.updateContainerSync(null, this.container, null, noop)

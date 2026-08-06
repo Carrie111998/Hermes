@@ -7,6 +7,7 @@ import { getGraphemeSegmenter } from '../utils/intl.js'
 import { lruEvict } from './lru.js'
 
 const EMOJI_REGEX = emojiRegex()
+const DEFAULT_EMOJI_PRESENTATION_REGEX = /\p{Emoji_Presentation}/u
 
 /**
  * Fallback JavaScript implementation of stringWidth when Bun.stringWidth is not available.
@@ -160,7 +161,29 @@ function getEmojiWidth(grapheme: string): number {
     }
   }
 
-  return 2
+  // emoji-regex also matches symbols whose Unicode default presentation is
+  // text (for example ⚔, ⚕, and ⚠). Treating every match as two cells makes
+  // Ink's virtual cursor drift from xterm-style terminals, which render those
+  // bare symbols as one cell. The drift becomes visible as stale right-edge
+  // border fragments after rows are scrolled.
+  if (grapheme.includes('\ufe0e')) {
+    return eastAsianWidth(first, { ambiguousAsWide: false })
+  }
+
+  if (
+    grapheme.includes('\ufe0f') ||
+    grapheme.includes('\u200d') ||
+    [...grapheme].some(char => {
+      const codePoint = char.codePointAt(0)!
+
+      return codePoint >= 0x1f3fb && codePoint <= 0x1f3ff
+    }) ||
+    DEFAULT_EMOJI_PRESENTATION_REGEX.test(grapheme)
+  ) {
+    return 2
+  }
+
+  return eastAsianWidth(first, { ambiguousAsWide: false })
 }
 
 function isZeroWidth(codePoint: number): boolean {

@@ -18,7 +18,8 @@ import {
   COMPOSER_PROMPT_GAP_WIDTH,
   composerPromptWidth,
   inputVisualHeight,
-  stableComposerColumns
+  stableComposerColumns,
+  transcriptContentColumns
 } from '../lib/inputMetrics.js'
 import { PerfPane } from '../lib/perfPane.js'
 import { composerPromptText } from '../lib/prompt.js'
@@ -144,14 +145,15 @@ const TranscriptPane = memo(function TranscriptPane({
   const ui = useStore($uiState)
   const petBox = useStore($petBox)
   const railCols = useAmbientRailWidth('left') + useAmbientRailWidth('right')
+  const transcriptCols = transcriptContentColumns(composer.cols, railCols)
 
   // Keep transcript text clear of the floating pet, responsively:
   //  - wide terminals: reserve a right gutter so lines wrap to the pet's left
   //    (as long as enough width is left for comfortable reading);
   //  - narrow terminals: keep full width and reserve bottom rows instead, so
   //    the newest lines sit above the pet rather than getting cramped.
-  const useGutter = !!petBox && composer.cols - railCols - petBox.width >= MIN_GUTTER_BODY_COLS
-  const bodyCols = Math.max(28, (useGutter && petBox ? composer.cols - petBox.width : composer.cols) - railCols)
+  const useGutter = !!petBox && transcriptCols - petBox.width >= MIN_GUTTER_BODY_COLS
+  const bodyCols = Math.max(1, useGutter && petBox ? transcriptCols - petBox.width : transcriptCols)
   const petBandRows = petBox && !useGutter ? petBox.height : 0
 
   // LiveTodoPanel rides as a child of the latest user-message row so it
@@ -205,12 +207,12 @@ const TranscriptPane = memo(function TranscriptPane({
 
               {row.msg.kind === 'intro' ? (
                 <Box flexDirection="column" paddingTop={1}>
-                  <Banner maxWidth={Math.max(1, composer.cols - 2)} t={ui.theme} />
+                  <Banner maxWidth={transcriptCols} t={ui.theme} />
 
                   {row.msg.info && (
                     <SessionPanel
                       info={row.msg.info}
-                      maxWidth={Math.max(1, composer.cols - 2)}
+                      maxWidth={transcriptCols}
                       sid={ui.sid}
                       t={ui.theme}
                     />
@@ -532,8 +534,12 @@ export const AppLayout = memo(function AppLayout({
 
   return (
     <Shell {...shellProps}>
-      <Box flexDirection="column" flexGrow={1} position="relative">
-        <Box flexDirection="row" flexGrow={1}>
+      {/* Keep the transcript scrollbar inside the app's safe layout width.
+          Without an explicit root width, flexGrow expands back into the final
+          physical terminal column and a visible scrollbar triggers xterm's
+          pending-wrap corruption even though composer.cols reserved it. */}
+      <Box flexDirection="column" flexGrow={1} position="relative" width={composer.cols}>
+        <Box flexDirection="row" flexGrow={1} flexShrink={1} minHeight={0}>
           {!overlay.agents && !overlay.journey && <AmbientRail side="left" />}
           {overlay.agents ? (
             <PerfPane id="agents">

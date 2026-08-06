@@ -3,6 +3,8 @@ import { stringWidth, wrapAnsi } from '@hermes/ink'
 import type { Role } from '../types.js'
 
 export const COMPOSER_PROMPT_GAP_WIDTH = 1
+const TRANSCRIPT_SCROLLBAR_GUTTER_COLUMNS = 2
+const TRANSCRIPT_INNER_PADDING_COLUMNS = 2
 
 let _seg: Intl.Segmenter | null = null
 const seg = () => (_seg ??= new Intl.Segmenter(undefined, { granularity: 'grapheme' }))
@@ -200,4 +202,15 @@ export function stableComposerColumns(totalCols: number, promptWidth: number, te
   const reserveScrollbar = afterPrompt >= (termuxMode ? 36 : 24) ? 2 : 0
 
   return Math.max(1, totalCols - promptWidth - 2 - reserveScrollbar)
+}
+
+/** Width available inside the transcript ScrollBox content viewport. */
+export function transcriptContentColumns(columns: number, railColumns: number): number {
+  const safeColumns = Number.isFinite(columns) ? Math.max(1, Math.floor(columns)) : 1
+  const safeRails = Number.isFinite(railColumns) ? Math.max(0, Math.floor(railColumns)) : 0
+
+  return Math.max(
+    1,
+    safeColumns - safeRails - TRANSCRIPT_SCROLLBAR_GUTTER_COLUMNS - TRANSCRIPT_INNER_PADDING_COLUMNS
+  )
 }

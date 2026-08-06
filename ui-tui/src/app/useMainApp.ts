@@ -139,10 +139,19 @@ export async function startPromptLiveSession({
   return sid
 }
 
+/**
+ * Keep the final physical terminal column blank. Writing a border into the
+ * last column leaves xterm-family hosts in pending-wrap state; after a resize
+ * that column can disappear or reappear as detached vertical-line ghosts.
+ */
+export function tuiLayoutColumns(columns: number): number {
+  return Number.isFinite(columns) ? Math.max(1, Math.floor(columns) - 1) : 1
+}
+
 export function useMainApp(gw: GatewayClient) {
   const { exit } = useApp()
   const { stdout } = useStdout()
-  const [cols, setCols] = useState(stdout?.columns ?? 80)
+  const [cols, setCols] = useState(() => tuiLayoutColumns(stdout?.columns ?? 80))
 
   useEffect(() => {
     if (!stdout) {
@@ -156,7 +165,10 @@ export function useMainApp(gw: GatewayClient) {
     // first event reflows immediately (the drag stays responsive), the rest
     // collapse to at most one reflow per RESIZE_COALESCE_MS, and the trailing
     // edge always applies the final width so the settled layout is exact.
-    const coalescer = createResizeCoalescer(() => setCols(stdout.columns ?? 80), RESIZE_COALESCE_MS)
+    const coalescer = createResizeCoalescer(
+      () => setCols(tuiLayoutColumns(stdout.columns ?? 80)),
+      RESIZE_COALESCE_MS
+    )
     const sync = () => coalescer.schedule()
 
     stdout.on('resize', sync)

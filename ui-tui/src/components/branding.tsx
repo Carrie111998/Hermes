@@ -490,7 +490,15 @@ export function SessionPanel({ info, maxWidth, sid, t }: SessionPanelProps) {
   )
 
   return (
-    <Box borderColor={t.color.border} borderStyle="round" marginBottom={1} paddingX={2} paddingY={1}>
+    <Box
+      alignSelf="flex-start"
+      borderColor={t.color.border}
+      borderStyle="round"
+      marginBottom={1}
+      maxWidth={cols}
+      paddingX={2}
+      paddingY={1}
+    >
       <WidgetGrid
         cols={wide ? leftW + 2 + w : w}
         columns={wide ? [leftW, { fr: 1 }] : 1}
