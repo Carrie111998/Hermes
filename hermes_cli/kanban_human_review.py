@@ -254,7 +254,7 @@ def _required_text(data: Mapping[str, Any], key: str) -> str:
 
 def _nonnegative_int(data: Mapping[str, Any], key: str) -> int:
     value = data.get(key)
-    if isinstance(value, bool):
+    if value is None or isinstance(value, bool):
         raise ValueError(f"approval packet field {key!r} must be an integer")
     try:
         parsed = int(value)
@@ -512,7 +512,7 @@ def _validate_pr_snapshot(
         raise ValueError(f"approval packet PR identity is invalid: {exc}") from exc
     for key, expected_value in expected.items():
         actual = pr_snapshot.get(key)
-        if key == "pr_number":
+        if key == "pr_number" and actual is not None:
             try:
                 actual = int(actual)
             except (TypeError, ValueError):
@@ -580,7 +580,7 @@ def _validate_lineage(
             (metadata[key] for key in metadata_keys if metadata.get(key) is not None),
             None,
         )
-        if packet_key == "pr_number":
+        if packet_key == "pr_number" and actual is not None:
             try:
                 actual = int(actual)
             except (TypeError, ValueError):

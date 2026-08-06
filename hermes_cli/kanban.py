@@ -2226,6 +2226,7 @@ def _cmd_linear_mcp(args: argparse.Namespace) -> int:
         raw_config["provider_timeout_seconds"] = args.timeout_seconds
     mcp_servers = runtime_config.get("mcp_servers")
     configured_servers = mcp_servers if isinstance(mcp_servers, dict) else {}
+    payload: dict[str, Any]
     try:
         config = linear_mcp.LinearMCPConfig.from_mapping(raw_config)
         payload = linear_mcp.diagnose_linear_mcp(

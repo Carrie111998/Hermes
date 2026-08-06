@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -125,6 +126,15 @@ def _trusted_snapshot(_packet):
     }
 
 
+def test_kanban_list_schema_covers_every_kernel_status():
+    from tools import kanban_tools as kt
+
+    parameters = cast(dict[str, Any], kt.KANBAN_LIST_SCHEMA["parameters"])
+    properties = cast(dict[str, Any], parameters["properties"])
+    status_schema = cast(dict[str, Any], properties["status"])
+    assert set(status_schema["enum"]) == kb.VALID_STATUSES
+
+
 def test_tool_is_disabled_by_default_and_profile_scoped(monkeypatch):
     from tools import kanban_tools as kt
 
@@ -162,7 +172,9 @@ def test_tool_uses_trusted_worker_run_and_advances_atomically(monkeypatch, tmp_p
     assert result["ok"] is True
     assert result["created"] is True
     with kb.connect(db_path) as conn:
-        assert kb.get_task(conn, qa_id).status == "done"
+        qa_task = kb.get_task(conn, qa_id)
+        assert qa_task is not None
+        assert qa_task.status == "done"
         human = kb.get_task(conn, result["task_id"])
         assert human is not None and human.status == "awaiting_human"
         gate = conn.execute(
@@ -190,5 +202,7 @@ def test_wrong_board_db_override_is_rejected_without_writes(monkeypatch, tmp_pat
     assert "error" in result
     assert "wrong-board" in result["error"]
     with kb.connect(db_path) as conn:
-        assert kb.get_task(conn, qa_id).status == "running"
+        qa_task = kb.get_task(conn, qa_id)
+        assert qa_task is not None
+        assert qa_task.status == "running"
         assert conn.execute("SELECT COUNT(*) FROM human_review_gates").fetchone()[0] == 0

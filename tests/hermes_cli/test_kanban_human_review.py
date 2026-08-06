@@ -199,8 +199,10 @@ def test_atomic_advance_creates_non_dispatchable_gate_outbox_and_completes_qa(wo
             ("slack", "pending"),
         ]
         completed = [e for e in kb.list_events(conn, workflow["qa_id"]) if e.kind == "completed"]
-        assert completed[-1].payload["verified_cards"] == [result.task_id]
-        assert completed[-1].payload["approval_packet_sha256"] == gate.approval_packet_sha256
+        payload = completed[-1].payload
+        assert payload is not None
+        assert payload["verified_cards"] == [result.task_id]
+        assert payload["approval_packet_sha256"] == gate.approval_packet_sha256
 
         with pytest.raises(RuntimeError, match="system-owned"):
             kb.assign_task(conn, result.task_id, "default")
@@ -271,7 +273,9 @@ def test_validation_failure_leaves_qa_running_and_writes_nothing(workflow, mutat
     with kb.connect(workflow["db_path"]) as conn:
         with pytest.raises(ValueError, match=error):
             _advance(conn, workflow, packet=packet, snapshot=snapshot)
-        assert kb.get_task(conn, workflow["qa_id"]).status == "running"
+        qa_task = kb.get_task(conn, workflow["qa_id"])
+        assert qa_task is not None
+        assert qa_task.status == "running"
         assert conn.execute("SELECT COUNT(*) FROM human_review_gates").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM review_gate_deliveries").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM tasks WHERE status='awaiting_human'").fetchone()[0] == 0
@@ -294,7 +298,9 @@ def test_wrong_run_and_untrusted_profile_are_rejected(workflow):
         )
         with pytest.raises(ValueError, match="echlon-qa"):
             _advance(conn, workflow)
-        assert kb.get_task(conn, workflow["qa_id"]).status == "running"
+        qa_task = kb.get_task(conn, workflow["qa_id"])
+        assert qa_task is not None
+        assert qa_task.status == "running"
 
 
 def test_two_concurrent_advances_converge_on_one_gate_task_and_outbox(workflow):
@@ -328,7 +334,9 @@ def test_partial_failure_rolls_back_gate_task_link_outbox_and_qa_completion(work
     with kb.connect(workflow["db_path"]) as conn:
         with pytest.raises(RuntimeError, match="injected"):
             _advance(conn, workflow)
-        assert kb.get_task(conn, workflow["qa_id"]).status == "running"
+        qa_task = kb.get_task(conn, workflow["qa_id"])
+        assert qa_task is not None
+        assert qa_task.status == "running"
         assert kb.child_ids(conn, workflow["qa_id"]) == []
         assert conn.execute("SELECT COUNT(*) FROM human_review_gates").fetchone()[0] == 0
         assert conn.execute("SELECT COUNT(*) FROM review_gate_deliveries").fetchone()[0] == 0

@@ -1719,8 +1719,8 @@ KANBAN_LIST_SCHEMA = {
             "status": {
                 "type": "string",
                 "enum": [
-                    "triage", "todo", "ready", "running",
-                    "blocked", "done", "archived",
+                    "triage", "scheduled", "todo", "ready", "running",
+                    "review", "awaiting_human", "blocked", "done", "archived",
                 ],
                 "description": "Optional task status filter.",
             },
