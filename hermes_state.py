@@ -6279,6 +6279,29 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             and session["ended_at"] is not None
             and session["end_reason"] == "compression"
         ):
+            # Orphan recovery: if the compression handoff was interrupted
+            # before a continuation session was persisted, the parent is
+            # permanently stuck.  Detect this by checking for a live child
+            # and, when none exists, reopen the session so writes can
+            # proceed.  (#80337)
+            child = conn.execute(
+                "SELECT 1 FROM sessions "
+                "WHERE parent_session_id = ? AND ended_at IS NULL "
+                "LIMIT 1",
+                (session_id,),
+            ).fetchone()
+            if child is None:
+                logger.warning(
+                    "Compression-closed session %s has no live continuation; "
+                    "auto-recovering orphan (clearing end_reason/ended_at)",
+                    session_id,
+                )
+                conn.execute(
+                    "UPDATE sessions SET ended_at = NULL, end_reason = NULL "
+                    "WHERE id = ?",
+                    (session_id,),
+                )
+                return
             raise CompressionSessionClosedError(session_id)
 
     @staticmethod
@@ -6902,7 +6925,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 and session["ended_at"] is not None
                 and session["end_reason"] == "compression"
             ):
-                raise CompressionSessionClosedError(session_id)
+                # Orphan recovery — same logic as _check_transcript_write_guards.
+                child = conn.execute(
+                    "SELECT 1 FROM sessions "
+                    "WHERE parent_session_id = ? AND ended_at IS NULL "
+                    "LIMIT 1",
+                    (session_id,),
+                ).fetchone()
+                if child is None:
+                    logger.warning(
+                        "Compression-closed session %s has no live "
+                        "continuation; auto-recovering orphan "
+                        "(clearing end_reason/ended_at)",
+                        session_id,
+                    )
+                    conn.execute(
+                        "UPDATE sessions SET ended_at = NULL, "
+                        "end_reason = NULL WHERE id = ?",
+                        (session_id,),
+                    )
+                else:
+                    raise CompressionSessionClosedError(session_id)
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),

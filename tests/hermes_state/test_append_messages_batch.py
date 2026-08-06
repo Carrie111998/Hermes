@@ -156,14 +156,38 @@ class TestAppendMessagesBatch:
         assert row["tool_call_count"] == 0
 
     def test_compression_closed_session_rejected(self, db):
+        """A compression-closed session with a live child still raises."""
+        db._conn.execute(
+            "UPDATE sessions SET ended_at = 1.0, end_reason = 'compression' "
+            "WHERE id = ?",
+            ("sess-batch",),
+        )
+        # Create a live continuation so the error is still raised.
+        db.create_session("sess-batch-child", source="cli")
+        db._conn.execute(
+            "UPDATE sessions SET parent_session_id = ? WHERE id = ?",
+            ("sess-batch", "sess-batch-child"),
+        )
+        db._conn.commit()
+        with pytest.raises(CompressionSessionClosedError):
+            db.append_messages_batch("sess-batch", _turn_messages())
+
+    def test_compression_orphan_auto_recovery(self, db):
+        """A compression-closed session with no live child is auto-recovered."""
         db._conn.execute(
             "UPDATE sessions SET ended_at = 1.0, end_reason = 'compression' "
             "WHERE id = ?",
             ("sess-batch",),
         )
         db._conn.commit()
-        with pytest.raises(CompressionSessionClosedError):
-            db.append_messages_batch("sess-batch", _turn_messages())
+        # No child session exists — should auto-recover and succeed.
+        db.append_messages_batch("sess-batch", _turn_messages())
+        row = db._conn.execute(
+            "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+            ("sess-batch",),
+        ).fetchone()
+        assert row["ended_at"] is None
+        assert row["end_reason"] is None
 
     def test_multimodal_content_encoded(self, db):
         msgs = [
