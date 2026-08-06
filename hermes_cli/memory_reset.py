@@ -24,11 +24,11 @@ def _close_db(db: Any) -> None:
         pass
 
 
-def _get_running_gateway_pid() -> int | None:
-    """Return the active gateway PID for the current Hermes home, if any."""
+def _get_running_gateway_pid(hermes_home: Path) -> int | None:
+    """Return the gateway PID associated with the target Hermes home."""
     from gateway.status import get_running_pid
 
-    return get_running_pid()
+    return get_running_pid(hermes_home / "gateway.pid")
 
 
 def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
@@ -127,8 +127,9 @@ def cmd_memory_reset(args: Any) -> int:
         print(f"\n  ✗ Unsupported conversation reset target: {target!r}\n")
         return 2
 
+    hermes_home = Path(get_hermes_home())
     try:
-        running_pid = _get_running_gateway_pid()
+        running_pid = _get_running_gateway_pid(hermes_home)
     except Exception as exc:
         print(f"\n  ✗ Could not verify gateway status: {exc}\n")
         return 1
@@ -140,7 +141,6 @@ def cmd_memory_reset(args: Any) -> int:
         )
         return 1
 
-    hermes_home = Path(get_hermes_home())
     memories_dir = hermes_home / "memories"
     sessions_dir = hermes_home / "sessions"
     db_path = hermes_home / "state.db"
