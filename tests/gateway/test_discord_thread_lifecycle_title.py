@@ -77,7 +77,7 @@ async def test_rename_thread_allows_hermes_lifecycle_title_transition(tmp_path):
 async def test_rename_thread_changes_only_lifecycle_emoji():
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     thread = SimpleNamespace(
-        name="thread-title",
+        name="✅ Done · thread-title",
         edit=AsyncMock(),
     )
     adapter._client = SimpleNamespace(

@@ -6896,7 +6896,14 @@ class DiscordAdapter(BasePlatformAdapter):
         current_name = getattr(thread, "name", None)
         if lifecycle_emoji:
             base_name = str(current_name or "").strip()
-            for prefix in ("⏳ ", "✅ ", "❌ "):
+            for prefix in (
+                "⏳ Working · ",
+                "✅ Done · ",
+                "❌ Failed · ",
+                "⏳ ",
+                "✅ ",
+                "❌ ",
+            ):
                 if base_name.startswith(prefix):
                     base_name = base_name[len(prefix):].lstrip()
                     break
