@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import importlib
 import json
+import ntpath
 import os
 import sqlite3
 import subprocess
@@ -15,6 +17,47 @@ def _point_ledger(monkeypatch, tmp_path):
 
     monkeypatch.setattr(executions, "EXECUTIONS_FILE", tmp_path / "cron" / "executions.db")
     return executions
+
+
+def test_executions_file_translates_raw_msys_home(monkeypatch):
+    # EXECUTIONS_FILE anchors on get_hermes_home(); a raw MSYS ``/c/...``
+    # HERMES_HOME must be unmangled so the ledger co-locates with the
+    # jobs/suggestions store (and is not re-mangled by Path.resolve()).
+    import cron.executions as executions
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/.hermes")
+    try:
+        reloaded = importlib.reload(executions)
+        assert ntpath.normpath(str(reloaded.EXECUTIONS_FILE)) == (
+            r"C:\Users\kevin\.hermes\cron\executions.db"
+        )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(executions)
+
+
+def test_executions_file_preserves_legit_duplicate_drive_home(monkeypatch):
+    # A legitimate native ``C:\c\...`` HERMES_HOME is preserved, not collapsed
+    # (regression for the reviewer's ``C:\c\work`` corruption case).
+    import cron.executions as executions
+    import hermes_constants
+
+    original_platform = hermes_constants.sys.platform
+    monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+    monkeypatch.setenv("HERMES_HOME", r"C:\c\work\hermes")
+    try:
+        reloaded = importlib.reload(executions)
+        assert ntpath.normpath(str(reloaded.EXECUTIONS_FILE)) == (
+            r"C:\c\work\hermes\cron\executions.db"
+        )
+    finally:
+        monkeypatch.setattr(hermes_constants.sys, "platform", original_platform)
+        monkeypatch.delenv("HERMES_HOME", raising=False)
+        importlib.reload(executions)
 
 
 def test_execution_transitions_are_durable(monkeypatch, tmp_path):

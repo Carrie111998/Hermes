@@ -1,6 +1,7 @@
 """Tests for gateway runtime status tracking."""
 
 import json
+import ntpath
 import os
 import sys
 import time
@@ -8,6 +9,50 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from gateway import status
+
+
+class TestWindowsMsysGatewayIdentityPaths:
+    """Gateway identity files (PID/lock/status) must land in the same native
+    tree the rest of Hermes uses when launched from MSYS/git-bash."""
+
+    def test_process_identity_paths_translate_raw_msys_home(self, monkeypatch):
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+        monkeypatch.setenv("HERMES_HOME", "/c/Users/kevin/.hermes")
+
+        assert ntpath.normpath(str(status._get_process_hermes_home())) == (
+            r"C:\Users\kevin\.hermes"
+        )
+        assert ntpath.normpath(str(status._get_pid_path())) == (
+            r"C:\Users\kevin\.hermes\gateway.pid"
+        )
+        assert ntpath.normpath(str(status._get_gateway_lock_path())) == (
+            r"C:\Users\kevin\.hermes\gateway.lock"
+        )
+        assert ntpath.normpath(str(status._get_runtime_status_path())) == (
+            r"C:\Users\kevin\.hermes\gateway_state.json"
+        )
+
+    def test_canonical_home_preserves_legit_duplicate_drive_without_resolve(
+        self, monkeypatch
+    ):
+        # Identity keying must not run Path.resolve() on Windows (it can
+        # re-mangle) and must preserve a legitimate ``C:\c\...`` directory.
+        import hermes_constants
+
+        monkeypatch.setattr(hermes_constants.sys, "platform", "win32")
+
+        def fail_resolve(*_args, **_kwargs):
+            raise AssertionError(
+                "Path.resolve must not run for Windows identity paths"
+            )
+
+        monkeypatch.setattr(Path, "resolve", fail_resolve)
+
+        assert ntpath.normpath(
+            str(status._canonical_hermes_home(r"C:\c\work\hermes"))
+        ) == r"C:\c\work\hermes"
 
 
 class TestGatewayPidState:
