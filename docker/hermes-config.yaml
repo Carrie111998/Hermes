@@ -89,6 +89,26 @@ dashboard:
     session_ttl_seconds: 86400
 
 # =============================================================================
+# Speech-to-Text (STT) — local faster-whisper (baked into Docker image)
+# Used by /v1/audio/transcriptions gateway endpoint and CLI voice.
+# =============================================================================
+stt:
+  enabled: true
+  provider: "local"
+  local:
+    model: "base"              # tiny | base | small | medium | large-v3 | turbo
+  language: "en"               # GLOBAL language hint; set "" for auto-detect
+
+# =============================================================================
+# Text-to-Speech (TTS) — edge-tts (free, baked into Docker image)
+# Used by /v1/audio/speech gateway endpoint and CLI /voice.
+# =============================================================================
+tts:
+  provider: "edge"
+  edge:
+    voice: "zh-CN-XiaoxiaoNeural"  # default voice; change per locale
+
+# =============================================================================
 # Gateway Platforms
 # =============================================================================
 platforms:
