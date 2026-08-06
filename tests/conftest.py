@@ -35,6 +35,8 @@ PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+from tests.collection_environment import OriginalCollectionEnvironment
+
 
 # ── Sandbox HERMES_HOME before ANY test module is imported ──────────────────
 # `hermes_cli/main.py` calls `setup_logging()` at MODULE level, which resolves
@@ -56,8 +58,9 @@ if str(PROJECT_ROOT) not in sys.path:
 # the REAL Hermes root — capture it BEFORE the sandbox rewires HERMES_HOME,
 # otherwise the deny-list would point at the throwaway tempdir and the guard
 # would silently stop protecting the operator's actual ~/.hermes (#69385).
+ORIGINAL_COLLECTION_ENVIRONMENT = OriginalCollectionEnvironment.capture(os.environ)
 _PRE_SANDBOX_KANBAN_OVERRIDE = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-_PRE_SANDBOX_HERMES_HOME = os.environ.get("HERMES_HOME", "")
+_PRE_SANDBOX_HERMES_HOME = ORIGINAL_COLLECTION_ENVIRONMENT.hermes_home or ""
 if not os.environ.get("HERMES_HOME"):
     _SESSION_HERMES_HOME = tempfile.mkdtemp(prefix="hermes-test-home-")
     os.environ["HERMES_HOME"] = _SESSION_HERMES_HOME
