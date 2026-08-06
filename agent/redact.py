@@ -433,9 +433,29 @@ _FORM_BODY_RE = re.compile(
     r"^[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*(?:&[A-Za-z_][A-Za-z0-9_.-]*=[^&\s]*)+$"
 )
 
-# Compile known prefix patterns into one alternation
+# Compile known prefix patterns into one alternation.
+#
+# DOTTED CONTINUATION: 53 of the 55 patterns above use a character class that
+# excludes `.`, and the trailing boundary permits a dot to end the match. Any
+# credential that carries dots INSIDE its body — Alibaba Token Plan
+# (sk-sp-<seg>.<seg>.<seg>), Google OAuth ya29., Google refresh 1//, SendGrid's
+# 3-part key, anything JWT-shaped — therefore matched only up to its first dot
+# and the remainder passed through in cleartext.
+#
+# A partial mask is worse than no mask: `sk-sp-…xxxx` reads as "redacted" to a
+# reviewer while the tail is still a working credential, and it reaches model
+# context, the session DB and the gateway transcript through 15 call sites.
+#
+# Consuming the dotted continuation is done HERE rather than by editing 53
+# character classes, so no vendor pattern can be missed. The continuation only
+# applies once a vendor prefix has already matched, so ordinary prose
+# ("file.txt", "1.2.3") is untouched.
+_DOTTED_CONTINUATION = r"(?:\.[A-Za-z0-9_-]+)*"
+
 _PREFIX_RE = re.compile(
-    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")(?![A-Za-z0-9_-])"
+    r"(?<![A-Za-z0-9_-])(" + "|".join(_PREFIX_PATTERNS) + r")"
+    + _DOTTED_CONTINUATION
+    + r"(?![A-Za-z0-9_-])"
 )
 
 
