@@ -62,6 +62,9 @@ OPAQUE_CREDENTIAL_BYTES = 64
 MAX_JSON_BYTES = 4 * 1024 * 1024
 MAX_GATE_TTL_SECONDS = 1_800
 MAX_CLAIM_TTL_SECONDS = 300
+# Owner and runtime validate each other's signed receipts on separate hosts.
+# Keep the allowance narrow while tolerating ordinary wall-clock drift.
+MAX_CLOCK_SKEW_SECONDS = 5
 
 GATE_SCHEMA = "muncho-canonical-writer-schema-upgrade-gate.v1"
 APPLY_CLAIM_SCHEMA = "muncho-canonical-writer-schema-upgrade-owner-apply.v1"
@@ -387,7 +390,8 @@ def _validate_ttl(
         type(now_unix) is not int
         or type(issued) is not int
         or type(expires) is not int
-        or not issued <= now_unix < expires
+        or issued > now_unix + MAX_CLOCK_SKEW_SECONDS
+        or now_unix >= expires
         or not 1 <= expires - issued <= maximum_seconds
     ):
         _fail(code)
@@ -928,7 +932,9 @@ def validate_intermediate_for_owner(
         or raw.get("services_stopped_sha256")
         != gate["services_stopped_sha256"]
         or type(raw.get("observed_at_unix")) is not int
-        or not gate["issued_at_unix"] <= raw["observed_at_unix"] <= now_unix
+        or not gate["issued_at_unix"]
+        <= raw["observed_at_unix"]
+        <= now_unix + MAX_CLOCK_SKEW_SECONDS
         or raw.get("secret_material_recorded") is not False
     ):
         _fail(code)
@@ -981,7 +987,7 @@ def validate_terminal_for_owner(
         or type(raw.get("completed_at_unix")) is not int
         or not intermediate.get("observed_at_unix", now_unix + 1)
         <= raw["completed_at_unix"]
-        <= now_unix
+        <= now_unix + MAX_CLOCK_SKEW_SECONDS
         or raw.get("secret_material_recorded") is not False
     ):
         _fail(code)

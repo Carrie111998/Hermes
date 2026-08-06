@@ -60,6 +60,9 @@ CLEANUP_MAGIC = b"MCC1"
 INSTALL_FRAME_SCHEMA = "MCB1-u32be-canonical-json-64byte-opaque.v1"
 CLEANUP_FRAME_SCHEMA = "MCC1-u32be-canonical-json-no-secret-eof.v1"
 OPAQUE_CREDENTIAL_BYTES = 64
+# Owner and runtime validate each other's signed receipts on separate hosts.
+# Keep the allowance narrow while tolerating ordinary wall-clock drift.
+MAX_CLOCK_SKEW_SECONDS = 5
 
 GATE_SCHEMA = (
     "muncho-canonical-writer-schema-reconciliation-control-bootstrap-gate.v1"
@@ -518,7 +521,8 @@ def _validate_ttl(
         type(now_unix) is not int
         or type(issued) is not int
         or type(expires) is not int
-        or not issued <= now_unix < expires
+        or issued > now_unix + MAX_CLOCK_SKEW_SECONDS
+        or now_unix >= expires
         or not 1 <= expires - issued <= maximum_seconds
         or (not_before is not None and issued < not_before)
         or (not_after is not None and expires > not_after)
@@ -1128,7 +1132,9 @@ def validate_intermediate_for_owner(
         or raw.get("services_stopped_sha256")
         != gate["services_stopped_sha256"]
         or type(raw.get("observed_at_unix")) is not int
-        or not gate["issued_at_unix"] <= raw["observed_at_unix"] <= now_unix
+        or not gate["issued_at_unix"]
+        <= raw["observed_at_unix"]
+        <= now_unix + MAX_CLOCK_SKEW_SECONDS
         or not gate["issued_at_unix"]
         <= before["observed_at_unix"]
         <= after["observed_at_unix"]
@@ -1408,7 +1414,7 @@ def validate_terminal_for_owner(
         or type(raw.get("completed_at_unix")) is not int
         or not intermediate["observed_at_unix"]
         <= raw["completed_at_unix"]
-        <= now_unix
+        <= now_unix + MAX_CLOCK_SKEW_SECONDS
         or raw.get("secret_material_recorded") is not False
     ):
         _fail(code)

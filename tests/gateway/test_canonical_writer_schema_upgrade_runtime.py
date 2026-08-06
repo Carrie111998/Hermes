@@ -4,6 +4,7 @@ import io
 import json
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Mapping
 
 import pytest
 
@@ -342,6 +343,142 @@ def test_gate_and_owner_claims_are_exact_and_canonical(
         "source_contract_sha256"
     ]
     assert cleanup["intermediate_sha256"] == intermediate["intermediate_sha256"]
+
+
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_gate_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    gate = _gate()
+    gate["issued_at_unix"] = 100 + future_seconds
+    gate = dict(
+        runtime._hashed(
+            {
+                name: value
+                for name, value in gate.items()
+                if name != "gate_sha256"
+            },
+            "gate_sha256",
+        )
+    )
+
+    def validate() -> Mapping[str, object]:
+        return runtime.validate_gate_for_owner(
+            gate,
+            expected_release_revision=REVISION,
+            expected_owner_subject_sha256=OWNER,
+            owner_public_key_ed25519_hex=(
+                reconciliation_runtime.OWNER_PUBLIC_KEY_ED25519_HEX
+            ),
+            owner_public_fingerprint=(
+                reconciliation_runtime.OWNER_PUBLIC_FINGERPRINT
+            ),
+            now_unix=100,
+        )
+
+    if accepted:
+        assert validate() == gate
+    else:
+        with pytest.raises(
+            runtime.SchemaUpgradeRuntimeError,
+            match="schema_upgrade_gate_invalid",
+        ):
+            validate()
+
+
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_intermediate_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    gate = _gate()
+    apply = _apply(gate)
+    intermediate = _intermediate(
+        gate,
+        apply,
+        observed_at_unix=100 + future_seconds,
+    )
+
+    def validate() -> Mapping[str, object]:
+        return runtime.validate_intermediate_for_owner(
+            intermediate,
+            gate=gate,
+            apply_claim=apply,
+            now_unix=100,
+        )
+
+    if accepted:
+        assert validate() == intermediate
+    else:
+        with pytest.raises(
+            runtime.SchemaUpgradeRuntimeError,
+            match="schema_upgrade_intermediate_invalid",
+        ):
+            validate()
+
+
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_terminal_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    gate = _gate()
+    apply = _apply(gate)
+    intermediate = _intermediate(gate, apply)
+    cleanup_unsigned = runtime.build_owner_cleanup_unsigned(
+        gate=gate,
+        apply_claim=apply,
+        intermediate=intermediate,
+        cloud_sql_absence_receipt=_absence(
+            gate,
+            apply["cloud_sql_authority_receipt"],
+        ),
+        issued_at_unix=100,
+        expires_at_unix=200,
+        nonce_sha256="e" * 64,
+    )
+    cleanup = {**cleanup_unsigned, "signature_sshsig": FAKE_SIGNATURE}
+    terminal = _terminal(gate, apply, intermediate, cleanup)
+    terminal["completed_at_unix"] = 100 + future_seconds
+    terminal = dict(
+        runtime._hashed(
+            {
+                name: value
+                for name, value in terminal.items()
+                if name != "terminal_sha256"
+            },
+            "terminal_sha256",
+        )
+    )
+
+    def validate() -> Mapping[str, object]:
+        return runtime.validate_terminal_for_owner(
+            terminal,
+            gate=gate,
+            apply_claim=apply,
+            intermediate=intermediate,
+            cleanup_claim=cleanup,
+            now_unix=100,
+        )
+
+    if accepted:
+        assert validate() == terminal
+    else:
+        with pytest.raises(
+            runtime.SchemaUpgradeRuntimeError,
+            match="schema_upgrade_terminal_invalid",
+        ):
+            validate()
 
 
 def test_two_frame_protocol_zeroizes_credential_and_finishes_terminal(

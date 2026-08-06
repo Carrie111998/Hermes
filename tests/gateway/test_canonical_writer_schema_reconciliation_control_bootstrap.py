@@ -157,6 +157,35 @@ def _validate_gate(gate: Mapping[str, Any]) -> Mapping[str, Any]:
     )
 
 
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_gate_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    gate["issued_at_unix"] = NOW + future_seconds
+    gate = _hashed(
+        {name: value for name, value in gate.items() if name != "gate_sha256"},
+        "gate_sha256",
+    )
+
+    def validate() -> Mapping[str, Any]:
+        return _validate_gate(gate)
+
+    if accepted:
+        assert validate() == gate
+    else:
+        with pytest.raises(
+            bootstrap.ControlBootstrapError,
+            match="schema_reconciliation_control_gate_invalid",
+        ):
+            validate()
+
+
 def _cloud_authority(gate: Mapping[str, Any]) -> dict[str, Any]:
     authority = [
         "a-authority",
@@ -762,6 +791,46 @@ def test_intermediate_accepts_cloud_sql_unmaterialized_creator_authority() -> No
     ) == intermediate
 
 
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_intermediate_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    key = Ed25519PrivateKey.generate()
+    gate = _gate(key)
+    install = _signed_install(key, gate)
+    intermediate = _intermediate(gate, install)
+    intermediate["observed_at_unix"] = NOW + future_seconds
+    intermediate = _hashed(
+        {
+            name: value
+            for name, value in intermediate.items()
+            if name != "intermediate_sha256"
+        },
+        "intermediate_sha256",
+    )
+
+    def validate() -> Mapping[str, Any]:
+        return bootstrap.validate_intermediate_for_owner(
+            intermediate,
+            gate=gate,
+            install_claim=install,
+            now_unix=NOW,
+        )
+
+    if accepted:
+        assert validate() == intermediate
+    else:
+        with pytest.raises(
+            bootstrap.ControlBootstrapError,
+            match="schema_reconciliation_control_intermediate_invalid",
+        ):
+            validate()
+
+
 def test_intermediate_accepts_exact_replay_creator_edge_until_cleanup() -> None:
     key = Ed25519PrivateKey.generate()
     gate = _gate(key)
@@ -920,6 +989,45 @@ def test_terminal_binds_fresh_writer_observation_after_cleanup() -> None:
                 cleanup_claim=cleanup,
                 now_unix=NOW,
             )
+
+
+@pytest.mark.parametrize(
+    ("future_seconds", "accepted"),
+    ((2, True), (6, False)),
+)
+def test_owner_terminal_tolerates_only_bounded_remote_clock_skew(
+    future_seconds: int,
+    accepted: bool,
+) -> None:
+    _key, gate, install, intermediate, cleanup, terminal = _protocol_fixture()
+    terminal["completed_at_unix"] = NOW + future_seconds
+    terminal = _hashed(
+        {
+            name: value
+            for name, value in terminal.items()
+            if name != "terminal_sha256"
+        },
+        "terminal_sha256",
+    )
+
+    def validate() -> Mapping[str, Any]:
+        return bootstrap.validate_terminal_for_owner(
+            terminal,
+            gate=gate,
+            install_claim=install,
+            intermediate=intermediate,
+            cleanup_claim=cleanup,
+            now_unix=NOW,
+        )
+
+    if accepted:
+        assert validate() == terminal
+    else:
+        with pytest.raises(
+            bootstrap.ControlBootstrapError,
+            match="schema_reconciliation_control_terminal_invalid",
+        ):
+            validate()
 
 
 def test_provider_managed_forward_role_closure_is_preserved_across_protocol() -> None:
