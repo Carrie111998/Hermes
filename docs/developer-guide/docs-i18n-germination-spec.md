@@ -52,7 +52,12 @@ languages** (Ethnologue 26th-edition order) plus the in-flight PRs for each
 2. `python scripts/docs_germination.py template --doc README.md --locale <xx>`
    — prose-placeholder template; translate the prose, keep every technical
    span and code block verbatim.
-3. Assemble the file (replace placeholders, fix headings in place).
+3. **Automatic path:** `python scripts/docs_germination.py germinate --locale
+   <xx> --doc README.md --llm "hermes chat -Q -q"` — renders the template,
+   pipes it to the LLM command (stdin → stdout), writes the locale file, and
+   runs the parity gate on the output. **The gate is the arbiter**: a
+   translation that drops a technical edge fails and is not shipped. (Manual
+   path: fill the template by hand, then assemble.)
 4. `python scripts/docs_germination.py check` — iterate until the locale
    passes every class. **Do not ship a locale that fails the gate.**
 5. Add the language badge to `README.md` (the gate enforces this).
