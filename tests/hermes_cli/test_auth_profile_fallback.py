@@ -3,7 +3,8 @@
 When ``HERMES_HOME`` points to a named profile, ``read_credential_pool()``
 and ``get_provider_auth_state()`` fall back to the global-root
 ``auth.json`` per-provider when the profile has no entries for that
-provider.  Writes still target the profile only.
+provider. Ordinary writes still target the profile; refreshes persist rotating
+credentials back to the store that supplied them.
 
 See the #18594 follow-up report: profile workers couldn't see providers
 authenticated only at the global root.
