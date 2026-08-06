@@ -4444,6 +4444,16 @@ class TurnRunner:
         if _rt_ctrl is not None and _rt_ctrl.consult_active:
             _rt_ctrl.narrate_tool(tool_name)
             return
+        # Any other turn (typed message) while a supervisor session is live:
+        # grok owns the speaker — skip the classic TTS ack entirely.
+        _rt_adapter = self._runner.adapters.get(Platform.DISCORD)
+        _rt_brain = getattr(_rt_adapter, "voice_realtime_brain", None)
+        if callable(_rt_brain):
+            try:
+                if _rt_brain(ctx._voice_ack_guild[0]) == "supervisor":
+                    return
+            except Exception:
+                pass
         if ctx._voice_ack_fired[0]:
             return
         ctx._voice_ack_fired[0] = True
@@ -20120,6 +20130,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None
         return controllers.get(guild_id)
 
+    def _voice_supervisor_owns_chat(self, source) -> bool:
+        """True when a live realtime-supervisor session owns this chat's
+        speaker. grok-voice speaks its own replies and consult summaries;
+        classic TTS (typed-message replies included) would talk over it and
+        cannot be interrupted by voice. The ears brain returns False — it
+        relies on classic TTS for every reply."""
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        adapter = self.adapters.get(Platform.DISCORD)
+        brain_getter = getattr(adapter, "voice_realtime_brain", None) if adapter else None
+        text_channels = getattr(adapter, "_voice_text_channels", None) if adapter else None
+        if not callable(brain_getter) or not isinstance(text_channels, dict):
+            return False
+        for guild_id, chat_id in text_channels.items():
+            if str(chat_id) == str(source.chat_id):
+                try:
+                    return brain_getter(guild_id) == "supervisor"
+                except Exception:
+                    return False
+        return False
+
     def _voice_consult_owns_turn(self, source, message_type, message) -> bool:
         """True when this turn is an active realtime-supervisor consult.
 
@@ -20165,6 +20196,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
           runner must handle it.
         """
         if not response or response.startswith("Error:"):
+            return False
+
+        # A live supervisor session owns the speaker for its bound chat —
+        # every classic voice reply (typed messages included) stays silent.
+        if self._voice_supervisor_owns_chat(event.source):
             return False
 
         chat_id = event.source.chat_id

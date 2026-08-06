@@ -15290,9 +15290,18 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             except Exception as e:
                 logger.debug("consult completion hook failed: %s", e)
 
-            # Speak response aloud if voice TTS is enabled
-            # Skip batch TTS when streaming TTS already handled it
-            if self._voice_tts and response and not use_streaming_tts and not _consult_handled:
+            # Speak response aloud if voice TTS is enabled.
+            # Skip batch TTS when streaming TTS already handled it — and skip
+            # entirely while the supervisor brain is live: grok owns the
+            # speaker for EVERY turn (typed input included), or its speech
+            # and classic TTS read the same reply on top of each other.
+            if (
+                self._voice_tts
+                and response
+                and not use_streaming_tts
+                and not _consult_handled
+                and not self._voice_realtime_supervisor_active()
+            ):
                 self._voice_speak_response_async(response)
 
 

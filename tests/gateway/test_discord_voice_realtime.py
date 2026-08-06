@@ -629,6 +629,37 @@ class TestControllerLifecycle:
             MessageType.VOICE, "list the repos",
         ) is False
 
+    def test_supervisor_session_silences_all_classic_voice_replies(self, bg_loop):
+        """While a supervisor session is live, no classic voice reply fires
+        for its bound chat — typed messages included (grok owns the speaker).
+        The ears brain keeps classic replies: it has no other voice."""
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageEvent, MessageType
+        from gateway.session import SessionSource
+
+        session = _fake_session()
+        runner, adapter = _make_gateway_runner(session, bg_loop)
+        runner._voice_mode = {"discord:900": "all"}
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id="900", user_id="77",
+            chat_type="channel",
+        )
+        typed_event = MessageEvent(
+            source=source, text="typed message",
+            message_type=MessageType.TEXT,
+            raw_message=SimpleNamespace(guild_id=5, guild=None),
+        )
+
+        adapter.voice_realtime_brain = lambda gid: "supervisor" if gid == 5 else ""
+        assert runner._should_send_voice_reply(typed_event, "a reply", []) is False
+
+        adapter.voice_realtime_brain = lambda gid: "ears"
+        assert runner._should_send_voice_reply(typed_event, "a reply", []) is True
+
+        # Dead/absent session (brain "") restores classic behavior too.
+        adapter.voice_realtime_brain = lambda gid: ""
+        assert runner._should_send_voice_reply(typed_event, "a reply", []) is True
+
     def test_controller_for_event_requires_discord_voice_event(self, bg_loop):
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, MessageType
