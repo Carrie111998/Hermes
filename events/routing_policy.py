@@ -220,6 +220,25 @@ JOBFLOW_PIPELINE_AGENTS = frozenset({
     'notifier', 'scout', 'sentinel', 'tailor', 'tracker',
 })
 
+# Plain-success cron runs whose output IS primary job-search signal, not
+# ops plumbing — their SUCCEEDED telemetry batches into the JobFlow topic
+# instead of the ops firehose (2026-08-06 operator request: JobFlow run-
+# summaries were piling into Ops Trace alongside postgres-sync and inbox
+# sweeps, producing one oversized mixed batch). NARROW by operator choice:
+# discoveries/scores/stage-moves already reach JobFlow as their own domain
+# events, so only the run-summary jobs Diego reads move. Shadow/enrich/
+# archive/soak/sweeper runs (jobflow-matcher-shadow, jobflow-archiver,
+# jobflow-*-soak-recheck, jaum-inbox-sweeper, jobflow-ats-url-resolve) are
+# housekeeping and stay in Ops Trace. Matched by RAW job name (event.source
+# / payload.job_name), NOT canonical_agent_source — the split is per-job,
+# not per-agent (tracker-cycle moves; tracker-followup/weekly do not).
+JOBFLOW_CRON_JOBS = frozenset({
+    "jobflow-scout",
+    "jobflow-matcher",
+    "jobflow-tracker-cycle",
+    "jaum-daytime-relay",
+})
+
 # watchdog_self_degraded reasons meaning "monitoring itself has gone dark"
 # → security_and_system (low-traffic, actually seen). Must match
 # watchdog_sweep.py's _emit_self_degraded() strings exactly.
@@ -428,6 +447,14 @@ def classify(
             # A RED/FAILED finding must read as an incident (amber dot),
             # not blend in at the cron default NORMAL.
             spec = dataclasses.replace(spec, priority_floor=Priority.HIGH)
+        elif (
+            event.source in JOBFLOW_CRON_JOBS
+            or payload.get("job_name") in JOBFLOW_CRON_JOBS
+        ):
+            # Plain-success summaries from the narrow set of JobFlow jobs
+            # Diego reads belong with JobFlow signal, not ops telemetry.
+            # Keep TRACE semantics: calm dot, batched, never phone-paged.
+            topic_key = JOBFLOW
 
     elif et == EventType.MAILBOX_MESSAGE:
         if payload.get("message_type") == "NOTIFICATION":

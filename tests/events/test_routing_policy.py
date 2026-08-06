@@ -479,6 +479,87 @@ class TestCronActionableOutput:
         assert not cron_output_is_actionable(None)
 
 
+# --------------------------------------------- jobflow cron telemetry split
+
+class TestJobflowCronTelemetrySplit:
+    """Plain-success JobFlow run-summaries belong in the JobFlow topic, not
+    the ops firehose (2026-08-06 operator request: an 11-event mixed batch
+    of JobFlow summaries + postgres-sync + inbox sweeps was landing in Ops
+    Trace). NARROW allowlist by operator choice — only the run-summary jobs
+    Diego reads move; shadow/enrich/archive/soak/sweeper runs stay in ops.
+
+    The redirect touches ONLY plain-success telemetry: the actionable and
+    error-content upgrades (→ Action Required / Alerts) still outrank it.
+    """
+
+    def _route(self, source, summary="run complete: 3 jobs scored, 0 errors"):
+        return classify(make_event(
+            EventType.CRON_COMPLETED,
+            {"job_name": source, "output_summary": summary},
+            source=source,
+        ))
+
+    @pytest.mark.parametrize("job", [
+        "jobflow-scout",
+        "jobflow-matcher",
+        "jobflow-tracker-cycle",
+        "jaum-daytime-relay",
+    ])
+    def test_jobflow_success_routes_to_jobflow_topic(self, job):
+        route = self._route(job)
+        assert route.topic_key == JOBFLOW
+        assert route.attention is Attention.TRACE
+        assert route.batch is True
+        assert route.wa_tier is None
+
+    @pytest.mark.parametrize("job", [
+        "postgres-sync",
+        "jaum-inbox-sweeper",
+        "jobflow-matcher-shadow",
+        "jobflow-archiver",
+        "jobflow-pipeline-worker-soak-recheck",
+        "jobflow-ats-url-resolve",
+        "langfuse-retention-sweep",
+    ])
+    def test_ops_and_housekeeping_stay_in_ops_trace(self, job):
+        route = self._route(job)
+        assert route.topic_key == OPS_TRACE
+        assert route.attention is Attention.TRACE
+
+    def test_jobflow_source_routes_even_without_job_name_in_payload(self):
+        """The redirect keys off event.source too, not only payload.job_name."""
+        route = classify(make_event(
+            EventType.CRON_COMPLETED,
+            {"output_summary": "8 jobs scored"},
+            source="jobflow-scout",
+        ))
+        assert route.topic_key == JOBFLOW
+
+    def test_actionable_beats_jobflow_redirect(self):
+        """A JobFlow run that asks a question is still ACT — the redirect
+        must not swallow an operator prompt into the JobFlow firehose."""
+        route = self._route(
+            "jobflow-scout",
+            summary="scout done.\nReply ALL to approve the 3 VIP finds.",
+        )
+        assert route.attention is Attention.ACT
+        assert route.topic_key == ACTION_REQUIRED
+
+    def test_error_content_beats_jobflow_redirect(self):
+        """A JobFlow run with error output is still WARN/Alerts."""
+        route = self._route(
+            "jobflow-matcher",
+            summary="matcher run: errors=3 — first error: GET /score rc=28",
+        )
+        assert route.attention is Attention.WARN
+        assert route.topic_key == ALERTS
+
+    def test_followup_and_weekly_stay_in_ops_trace(self):
+        """Narrow scope: only tracker-cycle moves; followup/weekly do not."""
+        assert self._route("jobflow-tracker-followup").topic_key == OPS_TRACE
+        assert self._route("jobflow-tracker-weekly").topic_key == OPS_TRACE
+
+
 # ----------------------------------------------------------- misc routing
 
 def test_agent_iteration_routes_per_agent():
