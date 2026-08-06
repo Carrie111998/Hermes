@@ -1695,7 +1695,7 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 
 
 class TestFallbackModelInheritance(unittest.TestCase):
-    """Subagents must inherit the parent's fallback provider chain."""
+    """Subagent fallback routing respects delegation-specific configuration."""
 
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
@@ -1703,7 +1703,10 @@ class TestFallbackModelInheritance(unittest.TestCase):
         fallback_entry = {"provider": "openrouter", "model": "gpt-4o-mini", "api_key": "sk-or-x"}
         parent._fallback_chain = [fallback_entry]
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={}),
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
@@ -1724,11 +1727,83 @@ class TestFallbackModelInheritance(unittest.TestCase):
         parent = _make_mock_parent(depth=0)
         parent._fallback_chain = []
 
-        with patch("run_agent.AIAgent") as MockAgent:
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch("tools.delegate_tool._load_config", return_value={}),
+        ):
             MockAgent.return_value = MagicMock()
             _build_child_agent(
                 task_index=0,
                 goal="test no fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertIsNone(kwargs["fallback_model"])
+
+    def test_child_uses_delegation_specific_fallback_chain(self):
+        """A configured worker chain must not silently use the parent's chain."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "head", "model": "head-fallback"}]
+        delegation_chain = [
+            {
+                "provider": " worker-provider ",
+                "model": " worker-fallback ",
+                "base_url": "https://worker.example/v1/",
+            },
+            {"provider": "", "model": "invalid"},
+        ]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"fallback_providers": delegation_chain},
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test delegation fallback",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        _, kwargs = MockAgent.call_args
+        self.assertEqual(
+            kwargs["fallback_model"],
+            [{
+                "provider": "worker-provider",
+                "model": "worker-fallback",
+                "base_url": "https://worker.example/v1",
+            }],
+        )
+
+    def test_explicit_empty_delegation_chain_disables_parent_inheritance(self):
+        """``delegation.fallback_providers: []`` means no child fallback."""
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "head", "model": "head-fallback"}]
+
+        with (
+            patch("run_agent.AIAgent") as MockAgent,
+            patch(
+                "tools.delegate_tool._load_config",
+                return_value={"fallback_providers": []},
+            ),
+        ):
+            MockAgent.return_value = MagicMock()
+            _build_child_agent(
+                task_index=0,
+                goal="test explicit empty fallback",
                 context=None,
                 toolsets=None,
                 model=None,
