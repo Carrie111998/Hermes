@@ -46,6 +46,7 @@ import threading
 import atexit
 import shutil
 import subprocess
+import inspect
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
@@ -535,6 +536,12 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45, command: str | None = N
     If a _sudo_password_callback is registered (by the CLI), delegates to it
     so the prompt integrates with prompt_toolkit's UI.  Otherwise reads
     directly from /dev/tty with echo disabled.
+
+    ``command`` is the sudo command being authorized; the registered callback
+    receives it when it accepts an argument (the gateway's sudo dialog shows
+    what the password is for, #79874).  Callbacks that take no arguments
+    (the legacy CLI prompt) are probed once via inspect.signature and called
+    without the argument.
     """
     import sys
     
@@ -550,10 +557,19 @@ def _prompt_for_sudo_password(timeout_seconds: int = 45, command: str | None = N
             # surprises; tools.terminal_tool already imports tools.approval.
             from tools.approval import human_wait_window
             with human_wait_window():
-                try:
-                    return _sudo_cb(command) or ""
-                except TypeError:
-                    return _sudo_cb() or ""
+                if command is not None:
+                    try:
+                        _sig = inspect.signature(_sudo_cb)
+                    except (TypeError, ValueError):
+                        _sig = None
+                    _accepts_arg = _sig is not None and any(
+                        p.kind
+                        in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                        for p in _sig.parameters.values()
+                    )
+                    if _accepts_arg:
+                        return _sudo_cb(command) or ""
+                return _sudo_cb() or ""
         except Exception:
             return ""
 
