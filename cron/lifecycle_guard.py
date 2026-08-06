@@ -72,7 +72,7 @@ _GATEWAY_LIFECYCLE_PATTERN = re.compile(
     # loop instead (#62891) — same foot-gun, indirect shape. Neutral-label
     # submissions that dodge this text anchor are caught separately by
     # `contains_launchctl_submit_command` (execution-aware, label-independent).
-    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap)\b[^\n]*\bhermes[.\-]?gateway)"
+    r"|(?:launchctl\s+(?:kickstart|unload|load|stop|restart|submit|bootstrap|bootout|remove|disable)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch C: systemctl ops on a hermes-gateway unit.
     r"|(?:systemctl\s+(?:-\S+\s+)*(?:restart|stop|start)\b[^\n]*\bhermes[.\-]?gateway)"
     # Branch D: pkill / kill targeting the hermes gateway process. Both
