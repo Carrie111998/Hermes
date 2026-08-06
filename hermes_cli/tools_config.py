@@ -631,6 +631,22 @@ def _pip_install(
     Returns the ``subprocess.CompletedProcess`` from whichever tier succeeded
     (or the last failure for the caller to inspect).
     """
+    # Immutable images redirect lazy installs to a durable target rather than
+    # their sealed venv. Reuse the shared installer here so post-setup gets
+    # the same ABI stamp/readiness and end-of-sys.path activation guarantees
+    # as runtime lazy installs. The normal path below remains unchanged when
+    # no durable target is configured.
+    from tools import lazy_deps
+
+    if lazy_deps._lazy_install_target() is not None:
+        result = lazy_deps._venv_pip_install(tuple(args), timeout=timeout)
+        return subprocess.CompletedProcess(
+            [sys.executable, "-m", "pip", "install", *args],
+            returncode=0 if result.success else 1,
+            stdout=result.stdout,
+            stderr=result.stderr,
+        )
+
     venv_root = Path(sys.executable).parent.parent
     uv_env = {**os.environ, "VIRTUAL_ENV": str(venv_root)}
 
@@ -1139,16 +1155,34 @@ def _run_post_setup(post_setup_key: str):
             try:
                 result = _pip_install(["-U", "ddgs", "--quiet"], timeout=300)
                 if result.returncode == 0:
+                    # A new durable target may not have existed when
+                    # hermes_bootstrap ran, so verify the package is
+                    # importable in this process after installation.
+                    import importlib
+                    importlib.invalidate_caches()
+                    try:
+                        __import__("ddgs")
+                    except ImportError as exc:
+                        _print_warning(
+                            "    ddgs install reported success, but the package "
+                            "is not importable in this process."
+                        )
+                        raise RuntimeError(
+                            "ddgs install reported success but ddgs is not importable"
+                        ) from exc
                     _print_success("    ddgs installed")
                 else:
                     _print_warning("    ddgs install failed:")
-                    _print_info(f"      {(result.stderr or '').strip()[:300]}")
+                    detail = (result.stderr or result.stdout or "").strip()
+                    _print_info(f"      {detail[:300]}")
                     _print_info("    Run manually: uv pip install -U ddgs")
-                    return
+                    raise RuntimeError(
+                        f"ddgs install failed: {detail[-2000:] or 'no error output'}"
+                    )
             except subprocess.TimeoutExpired:
                 _print_warning("    ddgs install timed out (>5min)")
                 _print_info("    Run manually: uv pip install -U ddgs")
-                return
+                raise RuntimeError("ddgs install timed out (>5min)")
         _print_info("    No API key required. DuckDuckGo enforces server-side rate limits.")
         _print_info("    Pair with an extract provider if you also need web_extract.")
 

@@ -1,6 +1,9 @@
 """Tests for hermes_cli.tools_config platform tool persistence."""
 
 import logging
+import subprocess
+import sys
+import types
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -16,6 +19,7 @@ from hermes_cli.tools_config import (
     _get_platform_tools,
     _platform_toolset_summary,
     _reconfigure_tool,
+    _pip_install,
     _run_post_setup,
     _save_platform_tools,
     _toolset_has_keys,
@@ -24,6 +28,7 @@ from hermes_cli.tools_config import (
     TOOL_CATEGORIES,
     gui_toolset_label,
     _visible_providers,
+    run_post_setup_command,
     tools_command,
 )
 
@@ -1098,6 +1103,93 @@ def test_computer_use_post_setup_missing_override_does_not_accept_default_binary
     run.assert_not_called()
     assert "custom-cua" in seen
     assert "curl" in seen
+
+
+def test_pip_install_durable_target_delegates_to_shared_installer(
+    monkeypatch, tmp_path
+):
+    """Post-setup uses the existing durable lazy-install path when configured."""
+    import tools.lazy_deps as lazy_deps
+
+    target = tmp_path / "lazy-packages"
+    calls = {}
+
+    def fake_install(specs, *, timeout):
+        calls["specs"] = specs
+        calls["timeout"] = timeout
+        calls["target"] = lazy_deps._lazy_install_target()
+        return SimpleNamespace(success=True, stdout="installed", stderr="")
+
+    monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(target))
+    monkeypatch.setattr(lazy_deps, "_venv_pip_install", fake_install)
+
+    result = _pip_install(["-U", "ddgs", "--quiet"], timeout=123)
+
+    assert result.returncode == 0
+    assert result.stdout == "installed"
+    assert calls == {
+        "specs": ("-U", "ddgs", "--quiet"),
+        "timeout": 123,
+        "target": target,
+    }
+
+
+def test_ddgs_post_setup_durable_install_is_importable_in_process(
+    monkeypatch, tmp_path
+):
+    """A successful durable install must be importable before post-setup exits."""
+    import hermes_cli.tools_config as tools_config
+
+    target = tmp_path / "lazy-packages"
+    fake_ddgs = types.ModuleType("ddgs")
+    fake_ddgs.__file__ = str(target / "ddgs" / "__init__.py")
+    calls = []
+
+    def fake_install(args, *, timeout):
+        calls.append((args, timeout))
+        package_dir = target / "ddgs"
+        package_dir.mkdir(parents=True)
+        (package_dir / "__init__.py").write_text("__version__ = 'test'\n")
+        sys.modules["ddgs"] = fake_ddgs
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setenv("HERMES_LAZY_INSTALL_TARGET", str(target))
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+    monkeypatch.setattr(tools_config, "_pip_install", fake_install)
+    monkeypatch.setattr(tools_config, "valid_post_setup_keys", lambda: {"ddgs"})
+
+    successes = []
+    monkeypatch.setattr(tools_config, "_print_success", successes.append)
+
+    assert run_post_setup_command(SimpleNamespace(post_setup_key="ddgs")) == 0
+    assert calls == [(["-U", "ddgs", "--quiet"], 300)]
+    assert (target / "ddgs" / "__init__.py").exists()
+    assert sys.modules["ddgs"] is fake_ddgs
+    assert successes[-1] == "Post-setup 'ddgs' complete"
+
+
+def test_ddgs_post_setup_install_failure_returns_nonzero(monkeypatch):
+    """A failed ddgs install must not be reported as completed."""
+    import hermes_cli.tools_config as tools_config
+
+    monkeypatch.setitem(sys.modules, "ddgs", None)
+    monkeypatch.setattr(
+        tools_config,
+        "_pip_install",
+        lambda *args, **kwargs: subprocess.CompletedProcess(
+            ["pip"], 1, "", "sealed venv is not writable"
+        ),
+    )
+    monkeypatch.setattr(tools_config, "valid_post_setup_keys", lambda: {"ddgs"})
+
+    errors = []
+    successes = []
+    monkeypatch.setattr(tools_config, "_print_error", errors.append)
+    monkeypatch.setattr(tools_config, "_print_success", successes.append)
+
+    assert run_post_setup_command(SimpleNamespace(post_setup_key="ddgs")) == 1
+    assert any("Post-setup failed" in message for message in errors)
+    assert not any("complete" in message for message in successes)
 
 
 class TestImagegenBackendRegistry:
