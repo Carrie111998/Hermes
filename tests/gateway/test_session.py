@@ -452,6 +452,36 @@ class TestLoadTranscriptDBOnly:
         assert result[0]["content"] == "db-q"
         assert result[1]["content"] == "db-a"
 
+    def test_fallback_append_preserves_origin_and_platform_message_id(self, tmp_path, monkeypatch):
+        import hermes_state
+
+        monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+        store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+        sid = "db_origin_session"
+        store._db.create_session(session_id=sid, source="discord", model="m")
+        origin = {
+            "platform": "discord",
+            "chat_id": "channel-42",
+            "chat_type": "channel",
+            "user_id": "person-7",
+        }
+
+        store.append_to_transcript(
+            sid,
+            {
+                "role": "user",
+                "content": "hello",
+                "platform_message_id": "message-99",
+                "display_metadata": {"origin": origin},
+            },
+        )
+
+        result = store.load_transcript(sid)
+        assert len(result) == 1
+        assert result[0]["content"] == "hello"
+        assert result[0]["message_id"] == "message-99"
+        assert result[0]["display_metadata"] == {"origin": origin}
+
 
 class TestSessionStoreSwitchSession:
     """Regression coverage for gateway /resume session switching semantics."""
@@ -1528,5 +1558,4 @@ class TestGatewayRoutingTable:
         recovered = restarted.get_or_create_session(self._source())
         assert recovered.session_id == entry.session_id
         restarted._db.close()
-
 

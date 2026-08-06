@@ -104,3 +104,27 @@ def test_a_real_user_turn_stays_untyped(agent_db):
 
     row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
     assert row.get("display_kind") is None
+
+
+def test_real_user_origin_metadata_and_platform_id_persist_without_display_kind(agent_db):
+    agent, db, sid = agent_db
+    origin = {
+        "platform": "discord",
+        "chat_id": "channel-42",
+        "chat_type": "channel",
+        "user_id": "person-7",
+        "user_name": "Alice",
+        "scope_id": "guild-1",
+    }
+
+    _build(
+        agent,
+        user_message="hello from Discord",
+        persist_user_display_metadata={"origin": origin},
+        persist_user_platform_message_id="message-99",
+    )
+
+    row, = [r for r in db.get_messages_as_conversation(sid) if r["role"] == "user"]
+    assert row.get("display_kind") is None
+    assert row["display_metadata"] == {"origin": origin}
+    assert row["message_id"] == "message-99"

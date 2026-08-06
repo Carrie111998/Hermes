@@ -2242,6 +2242,9 @@ class AIAgent:
                     "codex_message_items": msg.get("codex_message_items"),
                     "timestamp": _row_timestamp,
                     "api_content": _row_api_content,
+                    "platform_message_id": (
+                        msg.get("platform_message_id") or msg.get("message_id")
+                    ),
                     "display_kind": (
                         "hidden"
                         if msg.get(COMPRESSED_SUMMARY_METADATA_KEY)
@@ -7767,6 +7770,7 @@ class AIAgent:
         persist_user_timestamp: Optional[float] = None,
         persist_user_display_kind: Optional[str] = None,
         persist_user_display_metadata: Optional[Dict[str, Any]] = None,
+        persist_user_platform_message_id: Optional[str] = None,
         moa_config: Optional[dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
@@ -7861,6 +7865,7 @@ class AIAgent:
                     persist_user_timestamp=persist_user_timestamp,
                     persist_user_display_kind=persist_user_display_kind,
                     persist_user_display_metadata=persist_user_display_metadata,
+                    persist_user_platform_message_id=persist_user_platform_message_id,
                     moa_config=moa_config,
                 )
             terminal = result if isinstance(result, dict) else {}
