@@ -18,7 +18,8 @@ from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
 
 EXECUTIONS_FILE = get_hermes_home().resolve() / "cron" / "executions.db"
-MAX_TERMINAL_EXECUTIONS = 1000
+_DEFAULT_MAX_TERMINAL_EXECUTIONS = 1000
+MAX_TERMINAL_EXECUTIONS = _DEFAULT_MAX_TERMINAL_EXECUTIONS
 _TERMINAL_STATES = ("completed", "failed", "unknown")
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
@@ -120,8 +121,72 @@ def _owner_is_live(pid: int, started_at: Optional[int]) -> bool:
     return current is not None and current == started_at
 
 
+def _get_max_terminal_executions() -> Optional[int]:
+    """Resolve per-profile retention; return None when pruning is unsafe."""
+    if MAX_TERMINAL_EXECUTIONS != _DEFAULT_MAX_TERMINAL_EXECUTIONS:
+        return max(0, int(MAX_TERMINAL_EXECUTIONS))
+
+    try:
+        from hermes_cli import managed_scope
+        from hermes_cli.config import (
+            fast_safe_load,
+            load_config,
+            read_user_config_raw,
+        )
+
+        # Validate the raw files first. load_config() intentionally falls back
+        # to merged defaults on a fresh-process YAML parse failure, which is
+        # safe for ordinary runtime settings but unsafe for destructive
+        # retention pruning: the default 1,000 could erase a larger ledger.
+        read_user_config_raw()
+        managed_config = {}
+        managed_dir = managed_scope.get_managed_dir()
+        managed_path = managed_dir / "config.yaml" if managed_dir else None
+        if managed_path and managed_path.exists():
+            with open(managed_path, encoding="utf-8") as managed_file:
+                managed_config = fast_safe_load(managed_file) or {}
+            if not isinstance(managed_config, dict):
+                return None
+        config = load_config()
+    except Exception:
+        return None
+    if not isinstance(config, dict):
+        return None
+    cron_config = config.get("cron", {})
+    if not isinstance(cron_config, dict):
+        return None
+
+    # Administrator-managed leaf values win over process environment. Without
+    # this check, a service-level env override could silently defeat a pinned
+    # audit-retention policy. When the leaf is not managed, the documented env
+    # override remains higher priority than the user's profile config.
+    managed_cron = managed_config.get("cron", {})
+    is_managed = (
+        isinstance(managed_cron, dict)
+        and "max_terminal_executions" in managed_cron
+    )
+    raw = os.getenv("HERMES_CRON_MAX_TERMINAL_EXECUTIONS", "").strip()
+    if raw and not is_managed:
+        try:
+            return max(0, int(raw))
+        except (TypeError, ValueError):
+            # A malformed temporary env override must not hide a valid
+            # profile setting or trigger destructive fallback pruning.
+            pass
+
+    configured = cron_config.get(
+        "max_terminal_executions", _DEFAULT_MAX_TERMINAL_EXECUTIONS
+    )
+    try:
+        return max(0, int(configured))
+    except (TypeError, ValueError):
+        return None
+
+
 def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    limit = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    limit = _get_max_terminal_executions()
+    if limit is None:
+        return
     conn.execute(
         """DELETE FROM executions WHERE id IN (
              SELECT id FROM executions
