@@ -659,7 +659,7 @@ Self-hosted long-term memory on a single Neo4j — vector, full-text, graph, and
 | | |
 |---|---|
 | **Best for** | Self-hosted memory you can inspect and that actively forgets |
-| **Requires** | `pip install hermes-elephant` + `hermes-elephant install` + a running [elephant](https://github.com/kainappsinc/elephant) service (Docker + Neo4j) |
+| **Requires** | A running [elephant](https://github.com/kainappsinc/elephant) service (Docker + Neo4j), then the adapter installed from its checkout |
 | **Data storage** | Your own Neo4j |
 | **Cost** | Free (self-hosted; brings your own LLM/embedding keys) |
 
@@ -669,10 +669,14 @@ Captures subagent delegations against the parent session, and snapshots the conv
 
 **Setup:**
 ```bash
-pip install hermes-elephant
+git clone https://github.com/kainappsinc/elephant && cd elephant
+cp .env.example .env          # set MEMORY_SERVICE_TOKEN, NEO4J_PASSWORD, an LLM key
+docker compose up -d neo4j && pnpm install && pnpm migrate && pnpm serve
+
+pip install ./adapters/hermes
 hermes-elephant install
 hermes config set memory.provider elephant
-hermes memory setup
+hermes memory setup           # paste the same MEMORY_SERVICE_TOKEN
 ```
 
 ---
@@ -690,7 +694,7 @@ hermes memory setup
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
 | **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |
-| **Elephant** | Self-hosted | Free | 30+ | `hermes-elephant` + Neo4j | Single-store GraphRAG + bi-temporal facts + nightly consolidation and decay |
+| **Elephant** | Self-hosted | Free | 30+ | Neo4j (no pip deps) | Single-store GraphRAG + bi-temporal facts + nightly consolidation and decay |
 
 ## Profile Isolation
 
