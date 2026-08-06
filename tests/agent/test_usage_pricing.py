@@ -330,8 +330,67 @@ def test_proxy_provider_falls_back_to_snapshot_pricing_by_model_name():
     assert result.status == "estimated"
     assert result.source == "official_docs_snapshot"
     # 1M input @ $0.14/M + 1M output @ $0.28/M
-    assert result.amount_usd is not None and result.amount_usd > 0
-    assert result.amount_usd == pytest.approx(0.42, abs=1e-6)
+    amount = result.amount_usd
+    assert amount is not None and amount > 0
+    assert float(amount) == pytest.approx(0.42, abs=1e-6)
+
+
+def test_proxy_fallback_picks_vendor_prefix_when_rates_differ():
+    """Multi-provider model names must resolve by vendor prefix, not by the
+    first dict hit.
+
+    ``deepseek-v4-pro`` is keyed under ``deepseek`` AND ``fireworks`` with
+    rates 4x apart (in $0.435 vs $1.74, out $0.87 vs $3.48, cache-read
+    $0.003625 vs $0.145 per 1M). The bare-name fallback must pick the
+    ``deepseek`` entry — its provider name prefixes the model name — or the
+    estimate silently uses the wrong vendor's price. The cache-read bucket
+    is what makes the assertion discriminative for this model (in/out rates
+    happen to coincide for deepseek-v4-flash, so the flash case alone cannot
+    catch a first-hit bug).
+    """
+    result = estimate_usage_cost(
+        "deepseek-v4-pro",
+        CanonicalUsage(
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+        ),
+        provider="opencode-go",
+    )
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
+    # deepseek rates: 0.435 + 0.87 + 0.003625 = 1.308625.
+    # fireworks rates would give 5.365 — the assert fails if the fallback
+    # returns the first matching entry instead of the vendor prefix.
+    amount = result.amount_usd
+    assert amount is not None
+    assert float(amount) == pytest.approx(1.308625, abs=1e-6)
+
+
+def test_proxy_fallback_stays_unknown_without_vendor_prefix(monkeypatch):
+    """A model name keyed under multiple providers with NO vendor prefix is
+    ambiguous — the fallback must stay ``unknown`` instead of guessing.
+
+    (No real snapshot model hits this shape today; inject one to pin the
+    contract.)
+    """
+    from agent import usage_pricing as up
+
+    fake = {
+        ("vendor-a", "mystery-2x"): up._OFFICIAL_DOCS_PRICING[
+            ("deepseek", "deepseek-v4-flash")
+        ],
+        ("vendor-b", "mystery-2x"): up._OFFICIAL_DOCS_PRICING[
+            ("fireworks", "deepseek-v4-flash")
+        ],
+    }
+    monkeypatch.setattr(up, "_OFFICIAL_DOCS_PRICING", fake)
+    result = estimate_usage_cost(
+        "mystery-2x",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000),
+        provider="opencode-go",
+    )
+    assert result.status == "unknown"
 
 
 def test_known_provider_never_uses_model_name_fallback():

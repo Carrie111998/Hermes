@@ -1143,10 +1143,28 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
     # ("deepseek", "deepseek-v4-flash") entry). Skipped when the provider
     # itself owns snapshot entries, where a name collision could pick the
     # wrong price.
+    #
+    # Some model names are keyed under MULTIPLE snapshot providers with
+    # different rates (deepseek-v4-pro/flash under "deepseek" AND
+    # "fireworks", minimax-m2.7 under two vendors). Taking the first dict
+    # hit would pick whichever provider sorts first, not the one actually
+    # serving the model. Resolve by vendor prefix instead: among the
+    # snapshot providers carrying the model, keep those whose name is a
+    # prefix of the model name ("deepseek" prefixes "deepseek-v4-flash";
+    # "fireworks" does not). Exactly one candidate wins; anything else
+    # (none, or several) is ambiguous and stays unknown rather than guess.
     if route.provider not in _SNAPSHOT_PROVIDERS:
-        for _snap_provider, _snap_model in _OFFICIAL_DOCS_PRICING:
-            if _snap_model == model:
-                return _OFFICIAL_DOCS_PRICING[(_snap_provider, _snap_model)]
+        candidates = [
+            snap_provider
+            for snap_provider, snap_model in _OFFICIAL_DOCS_PRICING
+            if snap_model == model
+        ]
+        if len(candidates) == 1:
+            return _OFFICIAL_DOCS_PRICING[(candidates[0], model)]
+        if candidates:
+            prefixed = [p for p in candidates if p and model.startswith(p)]
+            if len(prefixed) == 1:
+                return _OFFICIAL_DOCS_PRICING[(prefixed[0], model)]
     return None
 
 
