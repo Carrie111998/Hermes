@@ -5,7 +5,7 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SKILL_MD = REPO_ROOT / "skills" / "social-media" / "dataverse" / "SKILL.md"
+SKILL_MD = REPO_ROOT / "optional-skills" / "social-media" / "dataverse" / "SKILL.md"
 
 REQUIRED_SECTIONS = [
     "## When to Use",
