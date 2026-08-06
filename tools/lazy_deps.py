@@ -599,9 +599,12 @@ def _is_satisfied(spec: str) -> bool:
 
     Checks both presence AND version. If the package is installed at a
     version outside the spec's range, returns False so the caller will
-    upgrade/downgrade to the pinned version. This is what makes
-    ``hermes update`` propagate pin bumps in :data:`LAZY_DEPS` to already-
-    installed backends instead of silently leaving stale versions in place.
+    upgrade/downgrade to the pinned version. This is the STRICT predicate
+    — exact-pin enforcement for callers that want it (e.g. the matrix
+    adapter's check, or any caller using :func:`feature_missing` with its
+    strict default). The runtime paths (:func:`ensure`, the ``hermes
+    update`` refresh pass) use :func:`_is_satisfied_runtime` instead, so a
+    newer-than-pin install is never downgraded (#80390).
 
     If ``packaging`` is unavailable for any reason (it's a transitive of
     pip so this should never happen), we fall back to a presence-only check
@@ -688,10 +691,11 @@ def _is_satisfied_runtime(spec: str) -> bool:
     pin back down). Only a genuinely absent package, or one installed BELOW
     the pin's floor, is treated as missing by the runtime install path.
 
-    Strict pin semantics stay the job of :func:`_is_satisfied` / the
-    ``hermes update`` propagation pass (:func:`refresh_active_features`),
-    which intentionally flag any version mismatch so stale installs get
-    upgraded to the pin.
+    Strict pin semantics stay the job of :func:`_is_satisfied` for callers
+    that explicitly ask for them (``feature_missing`` strict default);
+    the ``hermes update`` propagation pass (:func:`refresh_active_features`)
+    uses runtime semantics too, so it flags only genuinely-missing or
+    below-pin installs and upgrades those to the pin.
     """
     if _is_satisfied(spec):
         return True
@@ -938,8 +942,7 @@ def feature_missing(feature: str, *, runtime: bool = False) -> tuple[str, ...]:
     an installed version NEWER than the spec's pin counts as satisfied, so
     the runtime ``ensure`` path never downgrades an operator-installed newer
     backend (#80390). Strict pin semantics — the default — flag any version
-    mismatch so the ``hermes update`` propagation pass
-    (:func:`refresh_active_features`) can upgrade stale installs to the pin.
+    mismatch for callers that still want exact-pin enforcement.
     """
     check = _is_satisfied_runtime if runtime else _is_satisfied
     return tuple(s for s in feature_specs(feature) if not check(s))
@@ -1231,12 +1234,19 @@ def refresh_active_features(*, prompt: bool = False) -> dict[str, str]:
                                   whether to surface it (we don't raise)
         ``"skipped: <reason>"`` — gated off (config flag, user decline)
 
+    Uses the same runtime semantics as :func:`ensure` for the pre-check
+    (:func:`feature_missing` with ``runtime=True``): an installed version
+    NEWER than the pin counts as satisfied and is reported ``"current"``
+    — never "refreshed", which would claim a reinstall that never ran
+    (#80390). A version BELOW the pin is still missing and gets upgraded,
+    so pin-bump propagation is preserved.
+
     Intended for ``hermes update``. Never raises; lazy-install failures
     here must not block the rest of the update flow.
     """
     results: dict[str, str] = {}
     for feature in active_features():
-        missing = feature_missing(feature)
+        missing = feature_missing(feature, runtime=True)
         if not missing:
             results[feature] = "current"
             continue

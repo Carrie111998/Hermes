@@ -422,8 +422,10 @@ class TestInstallSpecs:
 # ensure()/feature_missing(runtime=True)/is_available() must treat an
 # installed version NEWER than the pinned floor as satisfied at runtime —
 # otherwise the memory hot path silently downgrades operator-installed
-# backends. The strict default of feature_missing() and the untouched
-# refresh_active_features() keep hermes update's pin propagation intact.
+# backends. The strict default of feature_missing() keeps exact-pin
+# enforcement available to callers that want it, while
+# refresh_active_features() uses the same runtime semantics as ensure() so
+# hermes update's pin propagation upgrades only genuine below-pin staleness.
 # ---------------------------------------------------------------------------
 
 import importlib.metadata as _md  # noqa: E402
@@ -545,7 +547,8 @@ class TestRuntimeNeverDowngrade:
         # The floor pin makes hindsight itself strict-satisfied on newer
         # (see test_floor_pinned_feature_newer_is_strict_satisfied), so the
         # strict-contract probe uses an ==-pinned feature: the default
-        # (strict) predicate is the update path's detector.
+        # (strict) predicate still flags any off-pin version for callers
+        # that request exact-pin enforcement.
         self._patch_env(monkeypatch, {"honcho-ai": "2.3.0"})
         assert ld.feature_missing("memory.honcho") == ("honcho-ai==2.2.0",)
         assert ld._is_satisfied("honcho-ai==2.2.0") is False
@@ -573,6 +576,7 @@ class TestRuntimeNeverDowngrade:
         result = ld.refresh_active_features(prompt=False)
         # ensure() (the only installer) no-ops on newer — nothing downgraded.
         assert fake.installed == []
-        # Strict pre-check still classifies the feature as needing a refresh
-        # (acceptance (c)); the refresh itself is a no-op thanks to ensure().
-        assert result["memory.honcho"] == "refreshed"
+        # The refresh pre-check uses runtime semantics too: a newer-than-pin
+        # install is "current" — claiming "refreshed" for a no-op would be
+        # the same dishonesty as issue #80388.
+        assert result["memory.honcho"] == "current"
