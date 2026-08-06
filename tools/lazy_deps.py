@@ -630,6 +630,71 @@ def _is_satisfied(spec: str) -> bool:
         return True
 
 
+def _spec_floor_version(spec: str):
+    """Return the lowest acceptable version implied by ``spec``, or None.
+
+    The floor is the max of the versions contributed by the spec's lower
+    bound operators (``==``, ``>=``, ``>``, ``~=``) — e.g. ``==0.6.1`` →
+    ``0.6.1``, ``>=0.20,<1`` → ``0.20``. Ceiling-only specs (``<2``) and
+    unparseable specs have no floor and return None.
+    """
+    spec_tail = _specifier_from_spec(spec)
+    if not spec_tail:
+        return None
+    try:
+        from packaging.specifiers import InvalidSpecifier, SpecifierSet
+        from packaging.version import InvalidVersion, Version
+        specifiers = SpecifierSet(spec_tail)
+    except (ImportError, InvalidSpecifier):
+        return None
+    floors = []
+    for specifier in specifiers:
+        if specifier.operator in ("==", ">=", ">", "~="):
+            try:
+                floors.append(Version(specifier.version))
+            except InvalidVersion:
+                continue
+    return max(floors) if floors else None
+
+
+def _is_satisfied_runtime(spec: str) -> bool:
+    """Is ``spec`` satisfied for the RUNTIME (``ensure``) path?
+
+    Delegates to the strict :func:`_is_satisfied` first — same cost on the
+    already-satisfied hot path. When the strict check fails, applies floor
+    semantics instead of giving up: an installed version NEWER than the
+    spec's pin still counts as satisfied, so ``ensure()`` never implicitly
+    DOWNGRADES a backend the operator installed at a newer version
+    (upstream issue #80390 — a data-ratcheted backend's DB can't follow a
+    pin back down). Only a genuinely absent package, or one installed BELOW
+    the pin's floor, is treated as missing by the runtime install path.
+
+    Strict pin semantics stay the job of :func:`_is_satisfied` / the
+    ``hermes update`` propagation pass (:func:`refresh_active_features`),
+    which intentionally flag any version mismatch so stale installs get
+    upgraded to the pin.
+    """
+    if _is_satisfied(spec):
+        return True
+    pkg = _pkg_name_from_spec(spec)
+    try:
+        from importlib.metadata import version as _md_version
+        installed = _md_version(pkg)
+    except Exception:
+        return False  # absent (or metadata broken) — genuinely missing
+    floor = _spec_floor_version(spec)
+    if floor is None:
+        # No parseable floor (ceiling-only / malformed): the package IS
+        # installed, so never churn it — treat as satisfied.
+        return True
+    try:
+        from packaging.version import Version
+        return Version(installed) >= floor
+    except Exception:
+        # Unparseable installed version — err on "don't churn".
+        return True
+
+
 def _is_present(spec: str) -> bool:
     """Cheap presence-only check (package name installed at any version).
 
@@ -826,9 +891,34 @@ def feature_specs(feature: str) -> tuple[str, ...]:
     return LAZY_DEPS[feature]
 
 
-def feature_missing(feature: str) -> tuple[str, ...]:
-    """Return the subset of specs for ``feature`` not currently installed."""
-    return tuple(s for s in feature_specs(feature) if not _is_satisfied(s))
+def _describe_missing(spec: str) -> str:
+    """Render a missing spec for messages, noting an off-pin installed version.
+
+    Distinguishes "absent" (plain spec) from "version mismatch" (spec plus
+    the installed version that failed the pin check) so the user isn't told
+    a package is missing when it's actually installed at the wrong version.
+    """
+    pkg = _pkg_name_from_spec(spec)
+    try:
+        from importlib.metadata import version as _md_version
+        installed = _md_version(pkg)
+    except Exception:
+        return spec  # genuinely absent
+    return f"{spec} (installed: {installed} — version mismatch)"
+
+
+def feature_missing(feature: str, *, runtime: bool = False) -> tuple[str, ...]:
+    """Return the subset of specs for ``feature`` not currently installed.
+
+    ``runtime=True`` applies runtime semantics (:func:`_is_satisfied_runtime`):
+    an installed version NEWER than the spec's pin counts as satisfied, so
+    the runtime ``ensure`` path never downgrades an operator-installed newer
+    backend (#80390). Strict pin semantics — the default — flag any version
+    mismatch so the ``hermes update`` propagation pass
+    (:func:`refresh_active_features`) can upgrade stale installs to the pin.
+    """
+    check = _is_satisfied_runtime if runtime else _is_satisfied
+    return tuple(s for s in feature_specs(feature) if not check(s))
 
 
 def ensure(feature: str, *, prompt: bool = True) -> None:
@@ -848,7 +938,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             feature, (), f"feature {feature!r} not in LAZY_DEPS allowlist"
         )
 
-    missing = feature_missing(feature)
+    missing = feature_missing(feature, runtime=True)
     if not missing:
         return
 
@@ -917,7 +1007,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
             _pt_active = False
 
     if prompt and not _pt_active and sys.stdin.isatty() and sys.stdout.isatty():
-        spec_list = ", ".join(missing)
+        spec_list = ", ".join(_describe_missing(s) for s in missing)
         try:
             answer = input(
                 f"\nFeature {feature!r} requires: {spec_list}\n"
@@ -953,7 +1043,7 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
     except Exception:
         pass
 
-    still_missing = feature_missing(feature)
+    still_missing = feature_missing(feature, runtime=True)
     if still_missing:
         raise FeatureUnavailable(
             feature, still_missing,
@@ -965,10 +1055,18 @@ def ensure(feature: str, *, prompt: bool = True) -> None:
 
 
 def is_available(feature: str) -> bool:
-    """Return True if the feature's deps are already satisfied."""
+    """Return True if the runtime can use this feature right now.
+
+    Uses runtime semantics: an installed version NEWER than the pinned floor
+    counts as available (never-downgrade, #80390), so this predicate agrees
+    with what :func:`ensure` would do — it never reports "not available" for
+    a working newer install (the wake_word readiness path depends on this).
+    Strict pin semantics remain the job of :func:`feature_missing` and the
+    ``hermes update`` refresh pass (:func:`refresh_active_features`).
+    """
     if feature not in LAZY_DEPS:
         return False
-    return not feature_missing(feature)
+    return not feature_missing(feature, runtime=True)
 
 
 def feature_install_command(feature: str) -> Optional[str]:

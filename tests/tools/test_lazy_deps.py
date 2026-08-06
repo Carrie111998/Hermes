@@ -414,3 +414,137 @@ class TestInstallSpecs:
         result = ld.install_specs(["honcho-ai==2.2.0"])
         assert result.ok is False
         assert "disk on fire" in result.stderr
+
+
+# ---------------------------------------------------------------------------
+# Runtime never-downgrade semantics (issue #80390)
+#
+# ensure()/feature_missing(runtime=True)/is_available() must treat an
+# installed version NEWER than the pinned floor as satisfied at runtime —
+# otherwise the memory hot path silently downgrades operator-installed
+# backends. The strict default of feature_missing() and the untouched
+# refresh_active_features() keep hermes update's pin propagation intact.
+# ---------------------------------------------------------------------------
+
+import importlib.metadata as _md  # noqa: E402
+
+
+class TestRuntimeNeverDowngrade:
+    """The runtime installer must never downgrade a newer install."""
+
+    _PKG = "hindsight-client"
+    _PIN = ld.LAZY_DEPS["memory.hindsight"][0]
+
+    class _FakeMetadata:
+        """Mutable stand-in for importlib.metadata.version + the pip installer."""
+
+        def __init__(self, versions: dict):
+            self.versions = dict(versions)
+            self.installed: list = []
+
+        def __call__(self, pkg: str) -> str:
+            if pkg in self.versions:
+                return self.versions[pkg]
+            from importlib.metadata import PackageNotFoundError
+            raise PackageNotFoundError(pkg)
+
+        def install(self, specs) -> ld._InstallResult:
+            self.installed.extend(specs)
+            for spec in specs:
+                pkg, _, want = spec.partition("==")
+                if want:
+                    self.versions[pkg] = want
+            return ld._InstallResult(True, "ok", "")
+
+    def _patch_env(self, monkeypatch, versions: dict):
+        fake = self._FakeMetadata(versions)
+        monkeypatch.setattr(_md, "version", fake)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(
+            ld, "_venv_pip_install", lambda specs, **kw: fake.install(specs)
+        )
+        return fake
+
+    # -- acceptance (a): newer-than-pin is satisfied at runtime -------------
+    def test_newer_installed_is_satisfied_at_runtime(self, monkeypatch):
+        fake = self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        assert ld.feature_missing("memory.hindsight", runtime=True) == ()
+        ld.ensure("memory.hindsight", prompt=False)  # must not touch pip
+        assert fake.installed == []
+
+    def test_newer_than_pin_is_available(self, monkeypatch):
+        # is_available is a runtime-readiness predicate: a working newer
+        # install must not report "not available" (wake_word path).
+        self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        assert ld.is_available("memory.hindsight") is True
+
+    def test_absent_is_not_available(self, monkeypatch):
+        self._patch_env(monkeypatch, {})
+        assert ld.is_available("memory.hindsight") is False
+
+    def test_unknown_feature_not_available(self, monkeypatch):
+        self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        assert ld.is_available("memory.no-such-backend") is False
+
+    def test_mismatch_message_distinguishes_version_mismatch(self, monkeypatch):
+        self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        desc = ld._describe_missing(self._PIN)
+        assert "0.8.6" in desc and "version mismatch" in desc
+
+    def test_spec_floor_version(self):
+        from packaging.version import Version
+        assert ld._spec_floor_version("hindsight-client==0.6.1") == Version("0.6.1")
+        assert ld._spec_floor_version("slack-bolt>=1.18.0,<2") == Version("1.18.0")
+        assert ld._spec_floor_version("honcho-ai~=1.4") == Version("1.4")
+        assert ld._spec_floor_version("bare-package") is None
+        assert ld._spec_floor_version("only-ceiling<2") is None
+
+    # -- acceptance (b): genuinely-missing still installs / errors ----------
+    def test_absent_is_missing_and_installs(self, monkeypatch):
+        fake = self._patch_env(monkeypatch, {})
+        assert ld.feature_missing("memory.hindsight", runtime=True) == (self._PIN,)
+        ld.ensure("memory.hindsight", prompt=False)
+        assert fake.installed == [self._PIN]
+
+    def test_older_than_pin_is_missing_and_upgrades(self, monkeypatch):
+        # Below the pin's floor is a real mismatch: ensure() installs the
+        # pin (an upgrade), never a downgrade.
+        fake = self._patch_env(monkeypatch, {self._PKG: "0.5.0"})
+        assert ld.feature_missing("memory.hindsight", runtime=True) == (self._PIN,)
+        ld.ensure("memory.hindsight", prompt=False)
+        assert fake.installed == [self._PIN]
+
+    def test_install_failure_still_raises(self, monkeypatch):
+        fake = self._FakeMetadata({})
+        monkeypatch.setattr(_md, "version", fake)
+        monkeypatch.setattr(ld, "_allow_lazy_installs", lambda: True)
+        monkeypatch.setattr(
+            ld, "_venv_pip_install",
+            lambda specs, **kw: ld._InstallResult(False, "", "network unreachable"),
+        )
+        with pytest.raises(ld.FeatureUnavailable, match="pip install failed"):
+            ld.ensure("memory.hindsight", prompt=False)
+
+    def test_post_install_verify_uses_runtime_semantics(self, monkeypatch):
+        # After the (mocked) install the pin is satisfied — no false
+        # "still not importable" failure for the version we just installed.
+        fake = self._patch_env(monkeypatch, {})
+        ld.ensure("memory.hindsight", prompt=False)  # must not raise
+        assert fake.versions[self._PKG] == "0.6.1"
+
+    # -- acceptance (c): hermes update keeps strict pin propagation ---------
+    def test_strict_feature_missing_still_flags_newer(self, monkeypatch):
+        self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        # Default (strict) predicate is the update path's detector.
+        assert ld.feature_missing("memory.hindsight") == (self._PIN,)
+        assert ld._is_satisfied(self._PIN) is False
+
+    def test_refresh_active_features_never_downgrades(self, monkeypatch):
+        fake = self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
+        monkeypatch.setattr(ld, "active_features", lambda: ["memory.hindsight"])
+        result = ld.refresh_active_features(prompt=False)
+        # ensure() (the only installer) no-ops on newer — nothing downgraded.
+        assert fake.installed == []
+        # Strict pre-check still classifies the feature as needing a refresh
+        # (acceptance (c)); the refresh itself is a no-op thanks to ensure().
+        assert result["memory.hindsight"] == "refreshed"
