@@ -13,6 +13,7 @@ dispatcher gating (future = skip, past = dispatch), and legacy-DB migration.
 from __future__ import annotations
 
 import os
+import sqlite3
 import sys
 import tempfile
 import time
@@ -116,21 +117,41 @@ def test_scheduled_at_column_exists_in_schema(kanban_home):
 def test_scheduled_at_migrated_on_legacy_db(tmp_path, monkeypatch):
     """Opening a legacy DB (no scheduled_at) must add the column."""
     legacy = tmp_path / "legacy.db"
-    # Build a pre-#80119 schema by creating a fresh DB, then dropping the
-    # scheduled_at column via table rebuild.
+    # Build a genuinely pre-#80119 schema: same tasks table but WITHOUT the
+    # scheduled_at column. Copying via `CREATE TABLE x AS SELECT *` would
+    # keep the column, so construct the legacy DDL from the fresh schema's
+    # column list minus scheduled_at.
     conn = kb.connect(db_path=legacy)
     cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
     assert "scheduled_at" in cols  # fresh schema has it
-    conn.execute("CREATE TABLE tasks_old AS SELECT * FROM tasks")
-    conn.execute("DROP TABLE tasks")
-    conn.execute("ALTER TABLE tasks_old RENAME TO tasks")
+    col_defs = [
+        (row["name"], row["type"], row["notnull"], row["dflt_value"])
+        for row in conn.execute("PRAGMA table_info(tasks)")
+        if row["name"] != "scheduled_at"
+    ]
+    conn.close()
+    legacy.unlink()
+
+    legacy_ddl = "CREATE TABLE tasks (\n" + ",\n".join(
+        f'"{name}" {typ}{" NOT NULL" if nn else ""}'
+        + (f' DEFAULT {dflt}' if dflt is not None else "")
+        for name, typ, nn, dflt in col_defs
+    ) + "\n)"
+    conn = sqlite3.connect(legacy)
+    conn.execute(legacy_ddl)
+    conn.execute("INSERT INTO tasks (id, title, status, created_at) VALUES ('t1', 'legacy', 'ready', 1)")
     conn.commit()
     conn.close()
 
     # Reopen via connect() -> init_db -> _migrate_add_optional_columns.
+    # _INITIALIZED_PATHS caches the fresh path; discard so the migration
+    # actually runs against the legacy schema (not skipped on the fast path).
+    kb._INITIALIZED_PATHS.discard(str(legacy.resolve()))
     conn = kb.connect(db_path=legacy)
     try:
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
         assert "scheduled_at" in cols
+        rows = conn.execute("SELECT id, title FROM tasks").fetchall()
+        assert [tuple(r) for r in rows] == [("t1", "legacy")]  # data preserved
     finally:
         conn.close()
