@@ -1161,6 +1161,42 @@ def _validate_failed_native_authority_bundle(
     return owner, iam
 
 
+def _validate_failed_activation_authority_bundle(
+    *,
+    root: Path,
+    activation: Mapping[str, Any],
+) -> tuple[OwnerApprovalReceipt, ExternalIAMReceipt]:
+    plan_sha256 = str(activation["activation_plan_sha256"])
+    owner_raw = _trusted_staged_artifact(
+        root,
+        DEFAULT_STAGED_OWNER_APPROVAL_PATH.name,
+    )
+    owner = OwnerApprovalReceipt.from_mapping(
+        _decode_canonical_mapping(owner_raw, label="staged owner approval")
+    )
+    if (
+        owner.value.get("scope") != "activation"
+        or owner.value.get("plan_sha256") != plan_sha256
+    ):
+        raise ValueError(
+            "staged owner approval is bound to another activation plan"
+        )
+    iam_raw = _trusted_staged_artifact(
+        root,
+        DEFAULT_STAGED_EXTERNAL_IAM_PATH.name,
+    )
+    iam = ExternalIAMReceipt.from_mapping(
+        _decode_canonical_mapping(iam_raw, label="staged external IAM receipt")
+    )
+    if (
+        iam.policy_sha256
+        != activation["digests"]["external_iam_policy_sha256"]
+        or iam.value.get("source_approval_sha256") != owner.sha256
+    ):
+        raise ValueError("staged external IAM receipt authority chain drifted")
+    return owner, iam
+
+
 def _host_identities_are_exact(value: Mapping[str, Any]) -> bool:
     return _pure_host_identities_are_exact(value)
 
@@ -1453,6 +1489,8 @@ def _validate_activation_failure_value(
     *,
     source_revision: str,
     activation: Mapping[str, Any],
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
 ) -> Path:
     plan_sha256 = str(activation["activation_plan_sha256"])
     failure_path = Path(str(value.get("failure_receipt_path")))
@@ -1478,13 +1516,18 @@ def _validate_activation_failure_value(
     ):
         raise ValueError("activation failure quarantine binding is invalid")
 
-    owner = OwnerApprovalReceipt.from_mapping(value.get("owner_approval_receipt"))
-    owner.require(
+    failure_owner = OwnerApprovalReceipt.from_mapping(
+        value.get("owner_approval_receipt")
+    )
+    failure_owner.require(
         scope="activation",
         plan_sha256=plan_sha256,
         now_unix=value["failed_at_unix"],
     )
-    if owner.sha256 != value.get("owner_approval_receipt_sha256"):
+    if (
+        failure_owner.to_mapping() != owner.to_mapping()
+        or failure_owner.sha256 != value.get("owner_approval_receipt_sha256")
+    ):
         raise ValueError("activation failure owner approval drifted")
 
     external = value.get("external_iam_evidence")
@@ -1512,13 +1555,14 @@ def _validate_activation_failure_value(
     ):
         raise ValueError("activation failure IAM archive binding drifted")
     iam_raw = _trusted_publication(expected_iam_path, maximum=64 * 1024)
-    iam = ExternalIAMReceipt.from_mapping(
+    archived_iam = ExternalIAMReceipt.from_mapping(
         _decode_canonical_mapping(iam_raw, label="activation archived IAM receipt")
     )
     if (
-        iam.sha256 != iam_sha256
-        or iam.policy_sha256 != external["policy_sha256"]
-        or iam.value.get("source_approval_sha256") != owner.sha256
+        archived_iam.to_mapping() != iam.to_mapping()
+        or archived_iam.sha256 != iam_sha256
+        or archived_iam.policy_sha256 != external["policy_sha256"]
+        or archived_iam.value.get("source_approval_sha256") != owner.sha256
     ):
         raise ValueError("activation failure IAM approval chain drifted")
 
@@ -1626,6 +1670,8 @@ def _activation_failure_binding(
     source_revision: str,
     collector_receipt_sha256: str,
     activation: Mapping[str, Any],
+    owner: OwnerApprovalReceipt,
+    iam: ExternalIAMReceipt,
 ) -> tuple[dict[str, str], str]:
     raw = _trusted_publication(
         DEFAULT_QUARANTINE_PATH,
@@ -1636,6 +1682,8 @@ def _activation_failure_binding(
         value,
         source_revision=source_revision,
         activation=activation,
+        owner=owner,
+        iam=iam,
     )
     failure_raw = _trusted_publication(
         failure_path,
@@ -1753,11 +1801,22 @@ def _validate_planner_bundle_bindings(
     ).encode("utf-8", errors="strict")
     if phase_b_raw != expected_phase_b:
         raise ValueError("staged Phase-B readiness unit binding drifted")
-    if names in {
-        _failed_native_bundle_names(),
-        _failed_activation_bundle_names(),
-    }:
+    if names == _failed_native_bundle_names():
         _validate_failed_native_authority_bundle(root=root, native=native)
+    elif names == _failed_activation_bundle_names():
+        activation = _decode_activation_plan_mapping(
+            _trusted_staged_artifact(
+                root,
+                DEFAULT_STAGED_ACTIVATION_PLAN_PATH.name,
+            ),
+            source_revision=source_revision,
+            native=native,
+            staged_artifacts=staged_artifacts,
+        )
+        _validate_failed_activation_authority_bundle(
+            root=root,
+            activation=activation,
+        )
 
 
 def _installed_native_plan_binding(
@@ -2189,10 +2248,6 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
                 DEFAULT_STAGED_NATIVE_PLAN_PATH.name,
             )
         )
-        owner, iam = _validate_failed_native_authority_bundle(
-            root=STAGING_ROOT,
-            native=native,
-        )
         if artifact_names == _failed_activation_bundle_names():
             activation = _decode_activation_plan_mapping(
                 _trusted_staged_artifact(
@@ -2203,12 +2258,18 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
                 native=native,
                 staged_artifacts=staged_artifacts,
             )
+            owner, iam = _validate_failed_activation_authority_bundle(
+                root=STAGING_ROOT,
+                activation=activation,
+            )
             failed_activation, _failed_activation_stage = (
                 _activation_failure_binding(
                     target_revision=target_revision,
                     source_revision=source_revision,
                     collector_receipt_sha256=collector.sha256,
                     activation=activation,
+                    owner=owner,
+                    iam=iam,
                 )
             )
             if os.path.lexists(failed_activation["archive_path"]):
@@ -2221,6 +2282,10 @@ def _plan_from_live(target_revision: str) -> dict[str, Any]:
                 )
             )
         else:
+            owner, iam = _validate_failed_native_authority_bundle(
+                root=STAGING_ROOT,
+                native=native,
+            )
             failed_native, failed_native_stage = _native_failure_binding(
                 target_revision=target_revision,
                 source_revision=source_revision,
@@ -2911,6 +2976,8 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
     else:
         native = None
     activation = None
+    activation_owner: OwnerApprovalReceipt | None = None
+    activation_iam: ExternalIAMReceipt | None = None
     if plan.get("schema") == FAILED_ACTIVATION_PLAN_SCHEMA:
         if native is None:
             raise RuntimeError("installed activation artifacts lack a native plan")
@@ -2922,6 +2989,12 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
             source_revision=str(plan["source_release_revision"]),
             native=native,
             staged_artifacts=current_artifacts,
+        )
+        activation_owner, activation_iam = (
+            _validate_failed_activation_authority_bundle(
+                root=current_root,
+                activation=activation,
+            )
         )
         live_bindings = plan.get("installed_activation_artifacts", [])
     else:
@@ -3033,12 +3106,18 @@ def _validate_current_state(plan: Mapping[str, Any]) -> str:
             label="activation failure quarantine",
         )
         if plan.get("schema") == FAILED_ACTIVATION_PLAN_SCHEMA:
-            if activation is None:
+            if (
+                activation is None
+                or activation_owner is None
+                or activation_iam is None
+            ):
                 raise RuntimeError("activation failure lacks its activation plan")
             _validate_activation_failure_value(
                 failure_value,
                 source_revision=str(plan["source_release_revision"]),
                 activation=activation,
+                owner=activation_owner,
+                iam=activation_iam,
             )
         else:
             native = _decode_native_plan(
