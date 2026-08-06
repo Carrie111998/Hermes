@@ -129,8 +129,10 @@ class AgentSandboxBackend(BaseEnvironment):
                 namespace=namespace,
                 labels={"hermes_task_id": task_id},
             )
+        self._hermes_path = f"{self.cwd}/.hermes"
+
         self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"/.hermes"),
+            get_files_fn=lambda: iter_sync_files(self._hermes_path),
             upload_fn=self._agent_sandbox_upload,
             delete_fn=self._agent_sandbox_delete,
             bulk_upload_fn=self._agent_sandbox_bulk_upload,
@@ -161,7 +163,7 @@ class AgentSandboxBackend(BaseEnvironment):
         tmp_tar_path = f"tmp/bundle_{uuid.uuid4().hex}.tar.gz"
         self._sandbox.files.write(path=tmp_tar_path, content=tar_buffer.getvalue())
 
-        extract_cmd = f"tar -xzf {tmp_tar_path} -C {self.cwd}"
+        extract_cmd = f"tar -xzf {tmp_tar_path} /"
         self._sandbox.commands.run(command=extract_cmd, timeout=self._timeout)
         self._agent_sandbox_delete([tmp_tar_path])
 
@@ -170,7 +172,7 @@ class AgentSandboxBackend(BaseEnvironment):
         rel_base = ".hermes"
         rel_remote_tar = f"{rel_base}_sync.{os.getpid()}.tar"
         self._sandbox.commands.run(
-            command=f"tar cf {shlex.quote(rel_remote_tar)} -C {self.cwd} {shlex.quote(rel_base)}",
+            command=f"tar cf {shlex.quote(rel_remote_tar)} {self._hermes_path}",
             timeout=self._timeout
         )
         content = self._sandbox.files.read(rel_remote_tar)

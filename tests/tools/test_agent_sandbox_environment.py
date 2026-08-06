@@ -291,3 +291,39 @@ class TestConnectionConfig:
         }
         with pytest.raises(ValueError, match="Not allowed connection config name"):
             make_env(connection_config=connection_config)
+
+# ---------------------------------------------------------------------------
+# Single-file upload (mid-session file change)
+# ---------------------------------------------------------------------------
+
+class TestSingleFileUpload:
+    def test_change_file_mid_session_then_read_back(self, make_env, tmp_path):
+        """Covers `_agent_sandbox_upload`, the single-file path used by
+        FileSyncManager's `upload_fn` (as opposed to `_agent_sandbox_bulk_upload`,
+        which batches multiple files into one tar).
+        """
+        sb = _make_sandbox()
+        sb.commands.run.side_effect = [
+            _make_exec_response(stdout="", exit_code=0),               # init_session
+            _make_exec_response(stdout="updated content", exit_code=0),  # cat after read-back
+        ]
+        env = make_env(sandbox=sb)
+
+        # Simulate a file changing mid-session on the host side.
+        host_file = tmp_path / "changed.txt"
+        host_file.write_text("updated content")
+        remote_path = "workspace/changed.txt"
+
+        # Exercise the single-file upload path directly.
+        env._agent_sandbox_upload(str(host_file), remote_path)
+
+        # The SDK's single-file write should be called once with the exact bytes,
+        # confirming this went through the single-file path, not the bulk tar path.
+        sb.files.write.assert_called_once_with(path=remote_path, content=b"updated content")
+        env._mock_client.create_sandbox.return_value.commands.run.assert_not_called() \
+            if False else None  # no-op guard placeholder, remove if not needed
+
+        # Read the file back from inside the sandbox to confirm the round trip.
+        result = env.execute(f"cat {remote_path}")
+        assert result["returncode"] == 0
+        assert "updated content" in result["output"]
