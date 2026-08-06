@@ -5702,7 +5702,7 @@ class TurnRunner:
                     maybe_auto_title_kwargs["title_callback"] = lambda title: self._runner._schedule_discord_semantic_thread_rename(
                         ctx.source,
                         effective_session_id,
-                        title,
+                        f"✅ Done · {title}",
                     )
                 maybe_auto_title(
                     getattr(self._runner._session_db, "_db", self._runner._session_db),
@@ -17538,6 +17538,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "message": message_text[:500],
             }
             await self.hooks.emit("agent:start", hook_ctx)
+            self._schedule_discord_thread_lifecycle_title(
+                source, "⏳ Working", message_text
+            )
 
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
@@ -17561,6 +17564,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
+            self._schedule_discord_thread_lifecycle_title(
+                source,
+                "❌ Failed" if agent_result.get("failed") else "✅ Done",
+                message_text,
+            )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -18176,6 +18184,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
+            self._schedule_discord_thread_lifecycle_title(
+                source, "❌ Failed", message_text if "message_text" in locals() else "Hermes task"
+            )
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
@@ -19963,6 +19974,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 prefer_connector_created=use_connector_guard,
                 only_if_current_name=guard_name,
                 parent_chat_id=parent_chat_id,
+                **(
+                    {}
+                    if use_connector_guard
+                    else {
+                        "allow_current_name_prefixes": (
+                            "⏳ Working · ",
+                            "✅ Done · ",
+                            "❌ Failed · ",
+                        )
+                    }
+                ),
             )
             logger.info(
                 "discord auto-thread rename result: thread=%s applied=%s",
@@ -19971,6 +19993,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             logger.debug("Failed to rename Discord auto-thread for generated session title", exc_info=True)
+
+    def _schedule_discord_thread_lifecycle_title(
+        self,
+        source: SessionSource,
+        status: str,
+        prompt: str,
+    ) -> None:
+        """Rename a native Hermes-created Discord thread at turn boundaries."""
+        if not self._is_discord_auto_thread_lane(source) or not prompt:
+            return
+        adapter = self._adapter_for_source(source)
+        rename_thread = getattr(adapter, "rename_thread", None) if adapter else None
+        if not callable(rename_thread):
+            return
+
+        base = self._sanitize_discord_thread_title(prompt)
+        working_title = self._sanitize_discord_thread_title(f"⏳ Working · {base}")
+        status_title = self._sanitize_discord_thread_title(
+            f"{status} · {base}"
+        )
+        expected_name = (
+            getattr(source, "auto_thread_initial_name", None)
+            if status == "⏳ Working"
+            else working_title
+        )
+        if not expected_name or not source.thread_id:
+            return
+
+        async def _rename() -> None:
+            try:
+                await rename_thread(
+                    str(source.thread_id),
+                    status_title,
+                    only_if_current_name=str(expected_name),
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to update Discord thread lifecycle title",
+                    exc_info=True,
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = getattr(self, "_gateway_loop", None)
+        if loop is not None and not loop.is_closed():
+            safe_schedule_threadsafe(
+                _rename(),
+                loop,
+                logger=logger,
+                log_message="Discord thread lifecycle rename failed to schedule",
+            )
 
     def _schedule_discord_semantic_thread_rename(
         self,

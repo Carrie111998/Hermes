@@ -26,7 +26,7 @@ import time
 import traceback
 from collections import defaultdict
 from contextlib import suppress
-from typing import Callable, Dict, List, Optional, Any, Tuple
+from typing import Callable, Dict, List, Optional, Any, Tuple, Sequence
 from urllib.parse import quote, urljoin
 
 from agent.async_utils import (
@@ -6869,6 +6869,7 @@ class DiscordAdapter(BasePlatformAdapter):
         name: str,
         *,
         only_if_current_name: Optional[str] = None,
+        allow_current_name_prefixes: Optional[Sequence[str]] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
@@ -6901,7 +6902,15 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
-        if only_if_current_name is not None and current_name != only_if_current_name:
+        if (
+            only_if_current_name is not None
+            and current_name != only_if_current_name
+            and not any(
+                current_name.startswith(prefix)
+                for prefix in (allow_current_name_prefixes or ())
+                if isinstance(current_name, str)
+            )
+        ):
             logger.info(
                 "[%s] Discord semantic thread rename skipped for %s: current name %r != expected %r",
                 self.name, thread_id, current_name, only_if_current_name,
