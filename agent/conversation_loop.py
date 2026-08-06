@@ -1007,7 +1007,10 @@ def _context_engine_overflow_recovery_failed(agent) -> bool:
         )
         if (
             _instance_checker is not None
-            or _class_checker is not ContextEngine.overflow_recovery_failed
+            or (
+                _class_checker is not None
+                and _class_checker is not ContextEngine.overflow_recovery_failed
+            )
         ):
             try:
                 return bool(_checker())

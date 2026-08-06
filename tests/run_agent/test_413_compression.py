@@ -855,6 +855,16 @@ class TestPreflightCompression:
             SimpleNamespace(context_compressor=engine)
         ) is True
 
+    def test_magicmock_compressor_does_not_invent_overflow_hook(self):
+        """Dynamically-created MagicMock attributes are not engine contracts."""
+        compressor = MagicMock()
+        compressor._last_overflow_recovery_failed = False
+
+        assert _context_engine_overflow_recovery_failed(
+            SimpleNamespace(context_compressor=compressor)
+        ) is False
+        compressor.overflow_recovery_failed.assert_not_called()
+
     def test_context_overflow_stops_when_engine_reports_fresh_tail_exhausted(self, agent):
         """Do not retry provider overflow after LCM says the protected tail cannot fit."""
         err_400 = Exception(
