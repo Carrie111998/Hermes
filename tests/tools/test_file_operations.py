@@ -673,3 +673,16 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_from_truncated_sample_not_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        sample = "中文内容\n" + ("这是合法 UTF-8 文本。" * 80) + "\ufffd"
+        assert ops._is_likely_binary(
+            "notes.txt", sample, sample_truncated=True
+        ) is False
+
+    def test_trailing_replacement_in_untruncated_sample_still_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        assert ops._is_likely_binary(
+            "notes.txt", "合法文本\ufffd", sample_truncated=False
+        ) is True
