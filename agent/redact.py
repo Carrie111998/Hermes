@@ -135,7 +135,7 @@ _PREFIX_PATTERNS = [
 # an all-caps key is almost never prose/code.
 _SECRET_ENV_NAMES = r"(?:API_?KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH)"
 _ENV_ASSIGN_RE = re.compile(
-    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(?!['\"]?(?:\$\(|`))(['\"]?)(\S+)\2",
+    rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(?!['\"]?(?:\$\([^)]*\)|`[^`]*`))(['\"]?)(\S+)\2",
 )
 
 # Lowercase / dotted / hyphenated config keys from config files
@@ -156,7 +156,7 @@ _ENV_ASSIGN_RE = re.compile(
 #      mid-sentence is left alone.
 # The colon-form URL guard (skip when ``://`` present) lives at the call site.
 _SECRET_CFG_NAMES = r"(?:api[ _.\-]?key|token|secret|passwd|password|credential|auth)"
-_CFG_VALUE = r"(?!['\"]?(?:\$\(|`))(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
+_CFG_VALUE = r"(?!['\"]?(?:\$\([^)]*\)|`[^`]*`))(['\"]?)([^\s&]+?)\2(?=[\s&]|$)"
 # Linear pre-gate for the _CFG_*_RE subs below: a text with no secret keyword
 # can never match either pattern, so the (potentially backtrack-heavy) subs
 # are skipped entirely for such text. See the call site in

@@ -129,9 +129,21 @@ class TestEnvAssignments:
         texts = [
             'TOKEN="$(grep HASS_TOKEN ~/.hermes/.env)"',
             "SECRET='`cat /run/secrets/db_password`'",
+            'TOKEN="$(id)"',
+            "SECRET='`hostname`'",
         ]
         for text in texts:
             assert redact_sensitive_text(text) == text
+
+    def test_unterminated_shell_substitution_still_matched(self):
+        # Fail-closed: a value starting with `$(` / backtick but with no
+        # closing delimiter is a literal, not a substitution — must redact.
+        for text in (
+            "TOKEN=$(not-a-substitution",
+            "SECRET=`not-a-substitution",
+        ):
+            result = redact_sensitive_text(text)
+            assert "not-a-substitution" not in result
 
     def test_literal_secret_still_matched_after_shell_substitution_carveout(self):
         text = "TOKEN=ordinary-literal-secret"
@@ -561,9 +573,17 @@ class TestLowercaseDottedConfigKeys:
             "app.token=`cat /run/secrets/app_token`",
             'password="$(cat /run/secrets/db_password)"',
             "app.token='`cat /run/secrets/app_token`'",
+            'password="$(id)"',
+            "app.token='`hostname`'",
         ]
         for text in texts:
             assert redact_sensitive_text(text) == text
+
+    def test_unterminated_config_substitution_still_redacted(self):
+        # Fail-closed: unterminated `$(` / backtick values are literals.
+        for secret in ("$(not-a-substitution", "`not-a-substitution"):
+            assert secret not in redact_sensitive_text(f"password={secret}")
+            assert secret not in redact_sensitive_text(f"app.token={secret}")
 
     def test_config_literals_with_shell_metacharacters_still_redacted(self):
         secrets = ["literal$secret", "literal`secret"]
