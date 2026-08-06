@@ -44,6 +44,48 @@ jobs:
       - name: Regenerate per-skill docs pages + catalogs
         run: python3 website/scripts/generate-skill-docs.py
 
+      # The two generators above are the source of truth for the per-skill
+      # pages, the catalogs and the sidebar — but their output is *committed*,
+      # and until now nothing compared the regenerated result against HEAD.
+      # Both this job and deploy-site.yml regenerate before building, so the
+      # published site was always right while the in-repo copies silently
+      # rotted: a skill could be added with no page, no catalog entry and no
+      # sidebar link, and every check stayed green. (Caught 2026-08 with
+      # optional-skills/devops/actual-setup missing entirely and three pages
+      # drifted from their SKILL.md.)
+      #
+      # Safe to gate on: the generators are deterministic — running them twice
+      # over an unchanged tree is byte-identical.
+      - name: Check generated skill docs are committed and current
+        run: |
+          # Scoped to website/: every generator output lands there (docs pages,
+          # both catalogs, sidebars.ts; the static/api/*.json blobs are
+          # gitignored). Diffing the whole tree would blame the generators for
+          # anything else a prior step happened to touch.
+          if git diff --quiet -- website/ && git diff --quiet --cached -- website/ && \
+             [ -z "$(git ls-files --others --exclude-standard website/)" ]; then
+            echo "::notice::Generated skill docs are current."
+            exit 0
+          fi
+          echo "::error::Generated skill docs are out of date — regenerate and commit them."
+          echo ""
+          echo "Modified by the generators:"
+          git --no-pager diff --stat -- website/
+          UNTRACKED="$(git ls-files --others --exclude-standard website/)"
+          if [ -n "$UNTRACKED" ]; then
+            echo ""
+            echo "Missing entirely (generator produced a page with no committed counterpart):"
+            printf '%s\n' "$UNTRACKED" | sed 's/^/  /'
+          fi
+          echo ""
+          echo "To fix, from the repo root:"
+          echo "  python3 website/scripts/extract-skills.py"
+          echo "  python3 website/scripts/generate-skill-docs.py"
+          echo "  git add website/ && git commit -m 'docs: regenerate skill pages'"
+          echo ""
+          echo "Do not hand-edit the generated pages — edit the skill's SKILL.md."
+          exit 1
+
       - name: Lint docs diagrams
         run: npm run lint:diagrams
         working-directory: website
