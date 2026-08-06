@@ -506,8 +506,16 @@ export function useGatewayBoot({
         // guard passes and the configured default project dir is applied
         // deterministically — it cannot lose a race with a session restore the
         // way the post-connect seed could on slow starts (#71873). A resumed
-        // session's own cwd supersedes this once its runtime arrives.
-        await ensureDefaultWorkspaceCwd()
+        // session's own cwd supersedes this once its runtime arrives. Best
+        // effort: a failed seed must not brick boot (the remembered cwd is a
+        // fine fallback, and the post-connect seed retries it).
+        try {
+          await ensureDefaultWorkspaceCwd()
+        } catch (err) {
+          // Non-fatal: the remembered cwd is the fallback and the post-connect
+          // seed retries the same sync.
+          console.warn('Failed to seed default workspace cwd pre-connect', err)
+        }
 
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into

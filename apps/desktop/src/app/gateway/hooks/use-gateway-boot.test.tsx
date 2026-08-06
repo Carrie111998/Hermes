@@ -361,9 +361,24 @@ describe('useGatewayBoot remote reconnect loop (real hook, fake socket)', () => 
     desktop.sanitizeWorkspaceCwd = vi.fn(async (cwd: string) => ({ cwd }))
     ;(window as { hermesDesktop?: unknown }).hermesDesktop = desktop
 
+    // Record the cwd at the exact moment the gateway opens its WebSocket: if
+    // the seed moved back post-connect, this would still be '' here and the
+    // end-state assertion would pass anyway (the seed would run later in the
+    // same flush). The construction-time snapshot is what proves ordering.
+    let cwdAtConnect = ''
+    class RecordingSocket extends FakeWebSocket {
+      constructor(url: string) {
+        super(url)
+        cwdAtConnect = $currentCwd.get()
+      }
+    }
+
+    ;(globalThis as { WebSocket: unknown }).WebSocket = RecordingSocket
+
     render(<Harness />)
     await flushAsync()
 
+    expect(cwdAtConnect).toBe('C:\\Hermes')
     expect($currentCwd.get()).toBe('C:\\Hermes')
   })
 })
