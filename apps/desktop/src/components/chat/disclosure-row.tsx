@@ -14,11 +14,10 @@ import { cn } from '@/lib/utils'
 //     title text, NOT the full row — and reaches just past the chevron with
 //     `-mx-1.5 px-1.5` so it reads as a soft hit-target rather than a slab
 //     stretching to the message edge.
-//   - `trailing` overlays the right edge (absolute) and must stay
-//     non-interactive (e.g. a duration timer) — an opacity-0-but-clickable
-//     control there steals clicks from the caret. Interactive controls go in
-//     `action`, which lays out *in flow* at the far right so it never sits on
-//     top of the caret's hit-target, no matter how long the title is.
+//   - `trailing` stays non-interactive (e.g. a duration timer) and occupies the
+//     far-right slot in flow. Keeping it in flow matters when the surrounding
+//     scaffold shrink-wraps: an absolute timer would otherwise reserve no width
+//     and paint over the title. Interactive controls go in `action`.
 export function DisclosureRow({
   action,
   children,
@@ -68,7 +67,14 @@ export function DisclosureRow({
         </span>
       )}
       {trailing && (
-        <span className="absolute right-1 top-0 flex h-(--conversation-line-height) items-center">{trailing}</span>
+        <span
+          className={cn(
+            'pointer-events-none flex h-(--conversation-line-height) shrink-0 items-center self-start pl-1.5',
+            !action && 'ml-auto'
+          )}
+        >
+          {trailing}
+        </span>
       )}
     </div>
   )
