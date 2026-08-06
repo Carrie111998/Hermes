@@ -656,6 +656,62 @@ def _mask_token_nonreusable(token: str) -> str:
     return f"«redacted:{label}…»" if label else "«redacted-secret»"
 
 
+# ── Literal secrets (opt-in exact-substring redaction) ────────────────────
+# Configured via redaction.literal_secrets in config.yaml. Each entry is
+# an exact string to mask by substring match, or a ${ENV_VAR} reference
+# whose runtime value is used instead. Runs before the enable-gate so it
+# covers ALL paths including file_read, where the ENV/JSON-assignment
+# regex passes are skipped.
+_literal_secrets: list[str] = []
+_literal_secrets_loaded: bool = False
+
+
+def _ensure_literal_secrets() -> None:
+    """One-time lazy load of literal_secrets from config.yaml.
+
+    Uses a deferred import of hermes_cli.config so that agent.redact
+    can be imported without the full config system being available yet (no
+    circular import risk at module level).
+    """
+    global _literal_secrets, _literal_secrets_loaded
+    if _literal_secrets_loaded:
+        return
+    _literal_secrets_loaded = True
+
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        raw = cfg.get("redaction", {}).get("literal_secrets", [])
+        if not raw or not isinstance(raw, list):
+            return
+
+        resolved: list[str] = []
+        for item in raw:
+            if not isinstance(item, str):
+                continue
+            if item.startswith("${") and item.endswith("}"):
+                env_val = os.environ.get(item[2:-1])
+                if env_val:
+                    resolved.append(env_val)
+            else:
+                resolved.append(item)
+        _literal_secrets = resolved
+    except Exception:
+        pass  # Config not available yet — no literal secrets to redact
+
+
+def set_literal_secrets(secrets: list[str]) -> None:
+    """Explicitly set literal secrets for redaction.
+
+    Alternative to config-based loading (redaction.literal_secrets).
+    Useful for tests or when the config system is not available.
+    """
+    global _literal_secrets, _literal_secrets_loaded
+    _literal_secrets = list(secrets)
+    _literal_secrets_loaded = True
+
+
 def redact_sensitive_text(
     text: str,
     *,
@@ -670,6 +726,12 @@ def redact_sensitive_text(
     Enabled by default. Disable via security.redact_secrets: false in config.yaml.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
+
+    redaction.literal_secrets in config.yaml (${ENV_VAR} references
+    supported) provides opt-in exact-substring masking that runs *before* the
+    enable-gate — it applies even when global redaction is disabled, covering
+    ALL paths including file_read (where the ENV/JSON-assignment regex
+    passes are skipped for false-positive avoidance).
 
     Set redact_url_credentials=True at non-navigation egress boundaries to
     additionally redact credential-named query parameters and ``user:pass@``
@@ -707,6 +769,18 @@ def redact_sensitive_text(
         text = str(text)
     if not text:
         return text
+
+    # ── Literal secrets (opt-in, exact-substring match, before enable-gate) ──
+    # This runs even when global redaction is disabled so explicitly-configured
+    # secrets are never exposed, regardless of the user's default preference.
+    # Covers ALL paths including file_read, where the ENV/JSON-assignment
+    # regex passes are skipped for false-positive avoidance.
+    _ensure_literal_secrets()
+    if _literal_secrets:
+        for secret in _literal_secrets:
+            if secret and secret in text:
+                text = text.replace(secret, _mask_token_nonreusable(secret))
+
     if not (force or _REDACT_ENABLED):
         return text
 

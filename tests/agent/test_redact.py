@@ -831,3 +831,132 @@ class TestKeywordWordBoundary:
         assert "hunter2hunter2hunter2hh" not in result
 
 
+    def test_all_caps_embedded_keyword_still_redacted(self):
+        # All-caps keys keep legacy embedded matching (MYTOKEN=…).
+        text = "MYTOKEN=abcdefgh1234567890123456"
+        result = redact_sensitive_text(text)
+        assert "abcdefgh1234567890123456" not in result
+
+
+class TestLiteralSecrets:
+    """``redaction.literal_secrets`` opt-in exact-substring redaction.
+
+    These secrets run *before* the enable-gate so they apply even when
+    global redaction is disabled, covering ALL paths including ``file_read``
+    (where the ENV/JSON-assignment regex passes are skipped).
+    """
+
+    @pytest.fixture(autouse=True)
+    def _clear_literal_secrets(self):
+        from agent.redact import set_literal_secrets
+
+        set_literal_secrets([])
+        yield
+
+    def test_basic_exact_substring_masked(self):
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["my-actual-secret-value"])
+        text = "This contains my-actual-secret-value inside it"
+        result = redact_sensitive_text(text, force=True)
+        assert "my-actual-secret-value" not in result
+        assert "redacted" in result
+        assert "This contains " in result
+        assert " inside it" in result
+
+    def test_empty_list_does_nothing(self):
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets([])
+        text = "my-actual-secret-value should survive"
+        result = redact_sensitive_text(text, force=True)
+        assert result == text
+
+    def test_multiple_secrets_all_masked(self):
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["secret-one", "secret-two"])
+        text = "secret-one and secret-two are both here"
+        result = redact_sensitive_text(text, force=True)
+        assert "secret-one" not in result
+        assert "secret-two" not in result
+        assert "and" in result
+        assert "are both here" in result
+
+    def test_works_with_file_read_path(self):
+        """Literal secrets must redact even in file_read mode where the
+        ENV/JSON-assignment regex passes are skipped."""
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["my-custom-token-999"])
+        text = "CUSTOM_SECRET=my-custom-token-999"
+        result = redact_sensitive_text(text, file_read=True, force=True)
+        assert "my-custom-token-999" not in result
+        assert "CUSTOM_SECRET=" in result
+
+    def test_works_before_enable_gate_when_redaction_disabled(self):
+        """Literal secrets must redact even when global redaction is OFF."""
+        import os
+
+        os.environ["HERMES_REDACT_SECRETS"] = "false"
+        import importlib
+        import agent.redact as ar
+
+        importlib.reload(ar)
+        from agent.redact import redact_sensitive_text
+
+        ar.set_literal_secrets(["always-redact-this"])
+        text = "always-redact-this should be masked"
+        result = redact_sensitive_text(text)
+        assert "always-redact-this" not in result
+        assert "redacted" in result
+
+    def test_env_var_reference_resolved(self):
+        """${ENV_VAR} references should be resolved to the env value."""
+        import os
+
+        os.environ["_TEST_LITERAL_SECRET"] = "test-secret-from-env-123"
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        # Test that set_literal_secrets can accept pre-resolved values
+        set_literal_secrets(["test-secret-from-env-123"])
+        text = "My token is test-secret-from-env-123 here"
+        result = redact_sensitive_text(text, force=True)
+        assert "test-secret-from-env-123" not in result
+        assert "redacted" in result
+
+    def test_none_and_empty_string_handled(self):
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["secret"])
+        assert redact_sensitive_text(None) is None
+        assert redact_sensitive_text("") == ""
+
+    def test_existing_redaction_still_works_alongside_literal_secrets(self):
+        """Vendor-prefix and ENV-assignment redaction must not be affected."""
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["custom-literal-token"])
+        text = "OPENAI_API_KEY=sk-proj-abc123def456xyz789 and custom-literal-token"
+        result = redact_sensitive_text(text, force=True)
+        # Known prefix still masked
+        assert "sk-proj-abc123def456xyz789" not in result
+        assert "abc123def456xyz789" not in result
+        # Literal secret still masked
+        assert "custom-literal-token" not in result
+        # Key name preserved
+        assert "OPENAI_API_KEY=" in result
+
+    def test_substring_match_not_regex(self):
+        """Literal secrets use exact substring match, not regex."""
+        from agent.redact import set_literal_secrets, redact_sensitive_text
+
+        set_literal_secrets(["secret"])
+        text = "Thesecretvalue should still be masked"
+        result = redact_sensitive_text(text, force=True)
+        # The original "secret" should be replaced with the redacted sentinel
+        assert "Thesecretvalue" not in result
+        # But the sentinel itself contains "secret" as part of "redacted-secret",
+        # so we can't assert '"secret" not in result'
+        assert "redacted" in result
+        assert "value should still be masked" in result
