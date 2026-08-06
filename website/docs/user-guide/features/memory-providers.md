@@ -1,7 +1,7 @@
 ---
 sidebar_position: 4
 title: "Memory Providers"
-description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory"
+description: "External memory provider plugins — Honcho, OpenViking, Mem0, Hindsight, Holographic, RetainDB, ByteRover, Supermemory, Memori, Elephant"
 ---
 
 # Memory Providers
@@ -652,6 +652,29 @@ hermes config set memory.provider memori
 hermes memory setup
 ```
 
+### Elephant
+
+Self-hosted long-term memory on a single Neo4j — vector, full-text, graph, and temporal in one store, with no separate vector database. Hybrid GraphRAG recall (reciprocal rank fusion, optional reranking and personalized PageRank), bi-temporal facts that separate when a claim held in the world from when it was recorded, and a nightly "dream" cycle that deduplicates facts, promotes insights, resolves duplicate entities, and prunes along an Ebbinghaus decay curve.
+
+| | |
+|---|---|
+| **Best for** | Self-hosted memory you can inspect and that actively forgets |
+| **Requires** | `pip install hermes-elephant` + `hermes-elephant install` + a running [elephant](https://github.com/kainappsinc/elephant) service (Docker + Neo4j) |
+| **Data storage** | Your own Neo4j |
+| **Cost** | Free (self-hosted; brings your own LLM/embedding keys) |
+
+**Tools:** `memory_recall`, `memory_save`, `memory_forget`, `memory_timeline`, `memory_entity`, `memory_preference_get` / `memory_preference_set`, `memory_observe`, plus knowledge-document, research, procedure, intention, and working-state surfaces.
+
+Captures subagent delegations against the parent session, and snapshots the conversation span before context compression. Prospective memory (`:Intention` nodes) is pull-only by design — pair it with `hermes cron` to surface what's due.
+
+**Setup:**
+```bash
+pip install hermes-elephant
+hermes-elephant install
+hermes config set memory.provider elephant
+hermes memory setup
+```
+
 ---
 
 ## Provider Comparison
@@ -667,6 +690,7 @@ hermes memory setup
 | **ByteRover** | Local/Cloud | Free/Paid | 3 | `brv` CLI | Pre-compression extraction |
 | **Supermemory** | Cloud/Self-hosted | Free/Paid | 4 | `supermemory` | Context fencing + session graph ingest + multi-container |
 | **Memori** | Cloud | Free/Paid | 5 | `hermes-memori` | Tool-aware memory + structured recall |
+| **Elephant** | Self-hosted | Free | 30+ | `hermes-elephant` + Neo4j | Single-store GraphRAG + bi-temporal facts + nightly consolidation and decay |
 
 ## Profile Isolation
 
