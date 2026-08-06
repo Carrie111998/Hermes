@@ -1006,6 +1006,56 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_transport_inherits_parent_priority(worker_env):
+    """Priority inheritance must survive the transport layer: a tool
+    call that omits ``priority`` must NOT be coerced to 0 before reaching
+    ``create_task`` (regression guard for the old ``else 0`` in
+    _handle_create). The child inherits the parent's priority; the
+    parent's own priority is untouched."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        # Give the spawning worker task a concrete priority (raw UPDATE
+        # — no helper mutates priority directly).
+        conn.execute("UPDATE tasks SET priority = 6 WHERE id = ?", (worker_env,))
+        assert kb.get_task(conn, worker_env).priority == 6
+    finally:
+        conn.close()
+
+    # Omitted priority -> child inherits the parent's 6.
+    d = json.loads(kt._handle_create({
+        "title": "inherit via transport",
+        "assignee": "peer",
+        "parents": [worker_env],
+    }))
+    assert d["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, d["task_id"])
+        assert child.priority == 6
+        # Parent never modified by the child's creation.
+        assert kb.get_task(conn, worker_env).priority == 6
+    finally:
+        conn.close()
+
+    # Explicit priority still wins over inheritance.
+    d2 = json.loads(kt._handle_create({
+        "title": "explicit wins via transport",
+        "assignee": "peer",
+        "parents": [worker_env],
+        "priority": 1,
+    }))
+    assert d2["ok"] is True
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, d2["task_id"]).priority == 1
+        assert kb.get_task(conn, worker_env).priority == 6
+    finally:
+        conn.close()
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen
