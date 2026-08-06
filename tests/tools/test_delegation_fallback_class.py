@@ -40,6 +40,7 @@ DELEGATION_CHAIN = [
 
 
 def _spawn_child(parent, cfg=None, **overrides):
+    # _load_config() returns the *delegation section* of the active config.
     with patch("tools.delegate_tool._load_config", return_value=cfg or {}):
         with patch("run_agent.AIAgent") as MockAgent:
             MockAgent.return_value = MagicMock()
@@ -82,7 +83,7 @@ class TestDelegationFallbackClass(unittest.TestCase):
         parent = _make_parent(chain=list(PARENT_CHAIN))
         kwargs = _spawn_child(
             parent,
-            cfg={"delegation": {"fallback_providers": list(DELEGATION_CHAIN)}},
+            cfg={"fallback_providers": list(DELEGATION_CHAIN)},
         )
         chain = kwargs["fallback_model"] or []
         providers = {entry.get("provider") for entry in chain}
@@ -97,7 +98,7 @@ class TestDelegationFallbackClass(unittest.TestCase):
     def test_explicit_empty_delegation_chain_disables_inheritance(self):
         parent = _make_parent(chain=list(PARENT_CHAIN))
         kwargs = _spawn_child(
-            parent, cfg={"delegation": {"fallback_providers": []}}
+            parent, cfg={"fallback_providers": []}
         )
         self.assertIsNone(kwargs["fallback_model"])
 
@@ -113,7 +114,7 @@ class TestDelegationFallbackClass(unittest.TestCase):
         parent = _make_parent(chain=list(PARENT_CHAIN))
         kwargs = _spawn_child(
             parent,
-            cfg={"delegation": {"fallback_providers": list(DELEGATION_CHAIN)}},
+            cfg={"fallback_providers": list(DELEGATION_CHAIN)},
             override_provider="deepseek",
         )
         chain = kwargs["fallback_model"] or []
