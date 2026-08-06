@@ -605,11 +605,26 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
 
     target = _lazy_install_target()
     constraints: Optional[Path] = None
+    uv_cache_dir: Optional[Path] = None
 
     if target is not None:
         err = _ensure_target_ready(target)
         if err:
             return _InstallResult(False, "", err)
+        # s6-setuidgid preserves the image's HOME=/root when dropping to the
+        # unprivileged Hermes uid. uv would therefore try /root/.cache/uv and
+        # fail before it reaches the writable --target. Keep its cache beside
+        # the durable packages instead; this is child-process-only state, not
+        # a new Hermes environment contract.
+        uv_cache_dir = target / ".uv-cache"
+        try:
+            uv_cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return _InstallResult(
+                False,
+                "",
+                f"uv cache directory {uv_cache_dir} is not writable: {e}",
+            )
         constraints = _core_constraints_file()
 
     target_args: list[str] = []
@@ -625,6 +640,8 @@ def _venv_pip_install(specs: tuple[str, ...], *, timeout: int = 300) -> _Install
         from tools.environments.local import hermes_subprocess_env
         uv_env = hermes_subprocess_env(inherit_credentials=False)
         uv_env["VIRTUAL_ENV"] = str(venv_root)
+        if uv_cache_dir is not None:
+            uv_env["UV_CACHE_DIR"] = str(uv_cache_dir)
 
         # Tier 1: uv (preferred — fast, doesn't need pip in the venv)
         uv_bin = shutil.which("uv")

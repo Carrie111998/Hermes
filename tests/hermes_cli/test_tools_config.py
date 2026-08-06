@@ -1188,7 +1188,9 @@ def test_ddgs_post_setup_install_failure_returns_nonzero(monkeypatch):
     monkeypatch.setattr(tools_config, "_print_success", successes.append)
 
     assert run_post_setup_command(SimpleNamespace(post_setup_key="ddgs")) == 1
-    assert any("Post-setup failed" in message for message in errors)
+    assert errors == [
+        "Post-setup failed: ddgs install failed: sealed venv is not writable"
+    ]
     assert not any("complete" in message for message in successes)
 
 

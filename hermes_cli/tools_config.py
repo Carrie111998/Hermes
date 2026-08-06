@@ -955,7 +955,6 @@ def _run_cua_driver_installer(label: str = "Installing", verbose: bool = True) -
 
 def _run_post_setup(post_setup_key: str):
     """Run post-setup hooks for tools that need extra installation steps."""
-    import shutil
     if post_setup_key in {"agent_browser", "browserbase"}:
         node_modules = PROJECT_ROOT / "node_modules" / "agent-browser"
         npm_bin = shutil.which("npm")
@@ -963,7 +962,6 @@ def _run_post_setup(post_setup_key: str):
         # Step 1: install the agent-browser npm package into node_modules/
         if not node_modules.exists() and npm_bin:
             _print_info("    Installing Node.js dependencies for browser tools...")
-            import subprocess
             # Use the resolved npm_bin absolute path so subprocess.Popen can
             # execute npm.cmd on Windows (CreateProcessW otherwise rejects
             # batch shims).  On POSIX npm_bin is the plain path — same
@@ -1031,7 +1029,6 @@ def _run_post_setup(post_setup_key: str):
             return
 
         _print_info("    Installing Chromium (~170MB one-time download)...")
-        import subprocess
         # Prefer the bundled agent-browser install subcommand so the
         # version of Chromium matches the CLI. Fall back to npx shim on
         # setups where the local bin stub isn't present.
@@ -1074,7 +1071,6 @@ def _run_post_setup(post_setup_key: str):
         _npm_bin = shutil.which("npm")
         if not camofox_dir.exists() and _npm_bin:
             _print_info("    Installing Camofox browser server...")
-            import subprocess
             # Absolute npm path so .cmd shim executes on Windows.
             result = subprocess.run(
                 # --workspaces=false avoids resolving apps/desktop. See #38772.

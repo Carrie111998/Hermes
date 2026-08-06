@@ -215,6 +215,46 @@ class TestInstallArgConstruction:
         # ...and the spec is last.
         assert cmd[-1] == "somepkg==1.2.3"
 
+    def test_target_uv_cache_does_not_follow_inherited_root_home(
+        self, tmp_path, monkeypatch
+    ):
+        target = tmp_path / "lazy-packages"
+        monkeypatch.setenv(ld._LAZY_TARGET_ENV, str(target))
+        monkeypatch.setattr(ld.shutil, "which", lambda _: "/usr/bin/uv")
+        monkeypatch.setattr(ld, "_core_constraints_file", lambda: None)
+        monkeypatch.setattr(ld, "_activate_target_on_syspath", lambda _t: None)
+
+        env_calls = []
+
+        def fake_subprocess_env(*, inherit_credentials):
+            env_calls.append(inherit_credentials)
+            return {"HOME": "/root", "PATH": "/usr/bin"}
+
+        monkeypatch.setattr(
+            "tools.environments.local.hermes_subprocess_env",
+            fake_subprocess_env,
+        )
+
+        captured = {}
+
+        def fake_run(cmd, *args, **kwargs):
+            captured["cmd"] = cmd
+            captured["env"] = kwargs["env"]
+            return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+        monkeypatch.setattr(ld.subprocess, "run", fake_run)
+
+        result = ld._venv_pip_install(("somepkg==1.2.3",))
+
+        assert result.success
+        assert env_calls == [False]
+        assert captured["env"]["HOME"] == "/root"
+        assert captured["env"]["UV_CACHE_DIR"] == str(target / ".uv-cache")
+        assert Path(captured["env"]["UV_CACHE_DIR"]).is_relative_to(target)
+        assert (target / ".uv-cache").is_dir()
+        assert "--target" in captured["cmd"]
+        assert str(target) in captured["cmd"]
+
     def test_no_target_args_in_venv_scoped_mode(self, monkeypatch):
         # Env unset → plain venv-scoped install, no --target / --constraint.
         monkeypatch.delenv(ld._LAZY_TARGET_ENV, raising=False)
