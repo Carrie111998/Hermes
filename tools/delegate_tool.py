@@ -2398,6 +2398,8 @@ def _run_single_child(
         # Extract token counts (safe for mock objects)
         _input_tokens = getattr(child, "session_prompt_tokens", 0)
         _output_tokens = getattr(child, "session_completion_tokens", 0)
+        _cache_read_tokens = getattr(child, "session_cache_read_tokens", 0)
+        _reasoning_tokens = getattr(child, "session_reasoning_tokens", 0)
         _model = getattr(child, "model", None)
 
         entry: Dict[str, Any] = {
@@ -2416,6 +2418,16 @@ def _run_single_child(
                     _output_tokens if isinstance(_output_tokens, (int, float)) else 0
                 ),
             },
+            "cache_read_tokens": (
+                _cache_read_tokens
+                if isinstance(_cache_read_tokens, (int, float))
+                else 0
+            ),
+            "reasoning_tokens": (
+                _reasoning_tokens
+                if isinstance(_reasoning_tokens, (int, float))
+                else 0
+            ),
             "tool_trace": tool_trace,
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
@@ -2477,7 +2489,6 @@ def _run_single_child(
         # pane + accordion rollups (features 1, 2, 4).  All fields are
         # optional — missing data degrades gracefully on the client.
         _cost_usd = getattr(child, "session_estimated_cost_usd", None)
-        _reasoning_tokens = getattr(child, "session_reasoning_tokens", 0)
         try:
             _files_read = list(file_state.known_reads(child_task_id))[:40]
         except Exception:
