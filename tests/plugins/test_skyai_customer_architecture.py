@@ -306,6 +306,73 @@ def test_confirmed_reservation_self_cancellation_is_general_principle() -> None:
     assert "no universal cancellation window" in architecture
 
 
+
+def test_minimum_reservation_anxiety_uses_model_verified_alternative_principle() -> None:
+    prompt = dev_gateway.build_skyai_system_prompt()
+    architecture = " ".join(ARCHITECTURE_PATH.read_text(encoding="utf-8").split())
+    cases = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert "минимум резервации/скокове/участници" in prompt
+    assert "най-близка проверена алтернатива" in prompt
+    assert "не пише същото minimum условие" in prompt
+    assert "различна локация/тип" in prompt
+    assert "времето пак влияе" in prompt
+    assert "друг изпълнител" in prompt
+    assert "само по себе си" in prompt
+    assert "няма проверена алтернатива" in prompt
+    assert len(prompt) < 6500
+
+    assert "Minimum-reservation anxiety is Hermes reasoning context" in architecture
+    assert "not a keyword classifier" in architecture
+    assert "not a deterministic product router" in architecture
+    assert "current public detail does not state the same minimum" in architecture
+
+    principle = next(case for case in cases if case["id"] == "minimum_reservation_alternative")
+    assert principle["source_threads"] == ["1534808319217107014"]
+    assert "minimum reservations/jumps/participants" in principle["principle"]
+    assert "closest purchasable comparable alternative" in principle["principle"]
+    assert "does not state the same minimum condition" in principle["principle"]
+    assert "Different provider alone is not proof" in principle["principle"]
+    assert "location, type, price, and weather caveats" in principle["principle"]
+
+    scenario = next(case for case in scenarios if case["id"] == "prohodna_bungee_minimum_anxiety")
+    assert "15 август" in scenario["message"]
+    assert "минимум 6" in scenario["history"][0]["content"]
+    assert "offer a verified comparable alternative" in scenario["focus"]
+    assert "same stated minimum" in scenario["focus"]
+    assert "different provider alone is not proof" in scenario["focus"]
+
+
+def test_minimum_reservation_architecture_guard_has_no_runtime_router_or_templates() -> None:
+    combined = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "plugins/skyai_customer/public_tools.py",
+            "plugins/skyai_customer/dev_gateway.py",
+        )
+    )
+    forbidden = (
+        "MINIMUM_RESERVATION_ROUTER",
+        "minimum_reservation_router",
+        "_minimum_reservation_requested",
+        "MINIMUM_RESERVATION_TERMS",
+        "MINIMUM_PARTICIPANT_TERMS",
+        "minimum_reservation_template",
+        "minimum_alternative_template",
+        "minimum_reservation_post_process",
+        "minimum_reservation_answer_rewrite",
+    )
+    for marker in forbidden:
+        assert marker not in combined
+
+    product = public_tools.handle_skyai_product_detail(product_path="")
+    payload_keys = _payload_keys(product)
+    assert "minimum_reservation_guidance" not in payload_keys
+    assert "alternative_guidance" not in payload_keys
+    assert "recommended_alternative" not in payload_keys
+    assert "customer_ready_answer" not in payload_keys
+
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()
     serialized = json.dumps(result, ensure_ascii=False)

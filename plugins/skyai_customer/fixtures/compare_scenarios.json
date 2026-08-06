@@ -32,6 +32,17 @@
     "focus": "existing voucher redemption with card top-up: reject categorical yes; no new free-flight campaign entitlement from top-up alone; qualifying new voucher/direct BookNow only under verified rules; date/time does not prove BookNow; original buyer/order email may own any pre-existing bonus; clarify unknown purchase origin"
   },
   {
+    "id": "prohodna_bungee_minimum_anxiety",
+    "message": "Много искам бънджи на Проходна на 15 август, но ме притеснява, че ако не се съберат хора, може да не стане. Какво да направя?",
+    "history": [
+      {
+        "role": "user",
+        "content": "Гледам Бънджи скок за един от пещера Проходна. В описанието пише, че за провеждане е необходимо да има резервации за минимум 6 скока."
+      }
+    ],
+    "focus": "minimum-reservations anxiety: preserve original minimum/weather/BookNow refund facts, proactively offer a verified comparable alternative whose product detail does not state the same stated minimum, identify material location/type/weather differences, and note that different provider alone is not proof. Do not spam unrelated catalog items or send only to support."
+  },
+  {
     "id": "massage_sofia_budget",
     "message": "Търся масаж за двама в София до 100 евро. Какво ще ми предложиш?",
     "focus": "catalog relevance, cards, EUR pricing, budget taste"
