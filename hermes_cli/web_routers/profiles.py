@@ -47,6 +47,7 @@ _cron_profile_home = late("_cron_profile_home")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
+_open_session_db_for_profile = late("_open_session_db_for_profile")
 _profile_setup_command = late("_profile_setup_command")
 _profile_to_dict = late("_profile_to_dict")
 _resolve_profile_dir = late("_resolve_profile_dir")
@@ -75,7 +76,7 @@ def get_profiles_sessions(
     exclude_sources: str = None,
     full: bool = False,
 ):
-    """Unified, read-only session list aggregated across ALL profiles.
+    """Unified session list aggregated across ALL profiles.
 
     Intentionally process-light: this opens each profile's ``state.db`` directly
     from disk — it does NOT spawn a dashboard backend per profile. Each returned
@@ -92,7 +93,6 @@ def get_profiles_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
@@ -132,10 +132,9 @@ def get_profiles_sessions(
         if not db_path.exists():
             continue
         try:
-            # Read-only: this loop runs on every sidebar refresh, so it must
-            # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Healthy stores stay read-only on every refresh. Older stores get
+            # one writable schema reconciliation before reopening read-only.
+            db = _open_session_db_for_profile(name, read_only=True)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue
@@ -217,8 +216,9 @@ def get_profiles_sessions_sidebar(
     ``/api/profiles/sessions`` calls they reopened every profile's ``state.db``
     three times and re-counted each refresh. This opens each DB once and runs
     the three filtered queries together, returning the three windows in one
-    payload. Read-only and process-light, same row projection and 300s active
-    heuristic as ``/api/profiles/sessions``.
+    payload. Healthy stores stay read-only and process-light; an older store
+    gets one schema reconciliation before the read is retried. Uses the same
+    row projection and 300s active heuristic as ``/api/profiles/sessions``.
 
     The caller passes the source taxonomy (``recents_exclude`` /
     ``messaging_exclude`` CSV, ``source=cron`` is implicit) so this stays
@@ -226,7 +226,6 @@ def get_profiles_sessions_sidebar(
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
     desktop's per-slice calls.
     """
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     # cron + messaging are cross-profile; recents is scoped to recents_profile.
@@ -290,7 +289,7 @@ def get_profiles_sessions_sidebar(
         if not db_path.exists():
             continue
         try:
-            db = SessionDB(db_path=db_path, read_only=True)
+            db = _open_session_db_for_profile(name, read_only=True)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue

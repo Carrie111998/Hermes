@@ -398,7 +398,10 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
-    @pytest.mark.parametrize("missing_column", ["archived", "pinned"])
+    @pytest.mark.parametrize(
+        "missing_column",
+        ["archived", "pinned", "last_read_at", "profile_name"],
+    )
     def test_get_sessions_heals_stale_schema_store(self, missing_column):
         import sqlite3
 
@@ -433,6 +436,63 @@ class TestWebServerEndpoints:
         finally:
             healed.close()
         assert missing_column in columns
+
+    @pytest.mark.parametrize(
+        "endpoint",
+        [
+            "/api/profiles/sessions?profile=legacy&limit=50&offset=0",
+            (
+                "/api/profiles/sessions/sidebar?recents_profile=legacy"
+                "&recents_limit=50"
+            ),
+        ],
+    )
+    def test_profile_session_lists_heal_stale_schema_store(self, endpoint):
+        import sqlite3
+
+        from hermes_cli import profiles as profiles_mod
+        from hermes_state import SessionDB
+
+        profile_home = profiles_mod.get_profile_dir("legacy")
+        profile_home.mkdir(parents=True)
+        db_path = profile_home / "state.db"
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session("stale-profile-schema", source="cli")
+            seed.append_message(
+                "stale-profile-schema",
+                role="user",
+                content="hello",
+            )
+        finally:
+            seed.close()
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            legacy.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+        response = self.client.get(endpoint)
+
+        assert response.status_code == 200
+        payload = response.json()
+        if "/sidebar" in endpoint:
+            sessions = payload["recents"]["sessions"]
+        else:
+            sessions = payload["sessions"]
+        assert [row["id"] for row in sessions] == ["stale-profile-schema"]
+        assert payload["errors"] == []
+
+        healed = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1] for row in healed.execute("PRAGMA table_info(sessions)")
+            }
+        finally:
+            healed.close()
+        assert "last_read_at" in columns
 
     def test_get_sessions_zero_byte_store_returns_empty_list(self):
         from hermes_constants import get_hermes_home

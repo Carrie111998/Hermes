@@ -11195,16 +11195,29 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 # query raises "no such table: sessions".
 _session_db_bootstrap_lock = threading.Lock()
 
-# Stale-schema probe for read-only opens: compiled against the newest columns
-# the dashboard read paths query. Reads at most one row per table. Read-only
-# opens skip _reconcile_columns(), so an older store would otherwise 500 on
-# every poll until something opened it writable.
-_SESSION_DB_READ_PROBE_SQL = (
-    "SELECT (SELECT archived FROM sessions LIMIT 1), "
-    "(SELECT pinned FROM sessions LIMIT 1), "
-    "(SELECT active FROM messages LIMIT 1), "
-    "(SELECT compacted FROM messages LIMIT 1)"
-)
+# Read-only opens skip _reconcile_columns(), so probe every table and column
+# declared in SCHEMA_SQL before serving dashboard reads. Deriving these probes
+# from the schema keeps future column additions on the existing self-heal path.
+@functools.lru_cache(maxsize=1)
+def _session_db_read_probe_sqls() -> Tuple[str, ...]:
+    from hermes_state_common import SCHEMA_SQL
+    from hermes_state_schema import SessionSchemaMixin
+
+    def _quote(identifier: str) -> str:
+        return '"' + identifier.replace('"', '""') + '"'
+
+    expected = SessionSchemaMixin._parse_schema_columns(SCHEMA_SQL)
+    probes: List[str] = []
+    for table_name, columns in expected.items():
+        safe_table = _quote(table_name)
+        safe_columns = [
+            f"{safe_table}.{_quote(column)}" for column in columns
+        ]
+        probes.append(
+            f"SELECT {', '.join(safe_columns)} "
+            f"FROM {safe_table} LIMIT 0"
+        )
+    return tuple(probes)
 
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
@@ -11250,7 +11263,8 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
         conn = getattr(db, "_conn", None)
         if conn is not None:
             try:
-                conn.execute(_SESSION_DB_READ_PROBE_SQL).fetchone()
+                for probe_sql in _session_db_read_probe_sqls():
+                    conn.execute(probe_sql)
             except BaseException:
                 db.close()
                 raise
