@@ -45,6 +45,59 @@ def rename_probe(path: Path) -> dict[str, Any]:
     return {"ok": True, "winerror": None, "message": "WINDOWS_ONLY_PROBE_NOT_REQUIRED"}
 
 
+def _rename_probe_without_current_cwd(path: Path) -> dict[str, Any]:
+    """Probe without letting this short-lived diagnostic own the target CWD."""
+
+    original_cwd = Path.cwd().resolve(strict=False)
+    if not _same_or_child(str(original_cwd), path):
+        return rename_probe(path)
+
+    from hermes_constants import get_hermes_home
+
+    candidates: list[Path] = []
+    try:
+        candidates.append(Path(get_hermes_home()).expanduser().resolve(strict=False))
+    except (OSError, RuntimeError):
+        pass
+    candidates.extend((Path(__file__).resolve().parent, Path.home().resolve(strict=False)))
+    stable_cwd = next(
+        (
+            candidate
+            for candidate in candidates
+            if candidate.is_dir() and not _same_or_child(str(candidate), path)
+        ),
+        None,
+    )
+    if stable_cwd is None:
+        return {
+            "ok": False,
+            "winerror": None,
+            "message": "SAFE_DIAGNOSTIC_CWD_UNAVAILABLE",
+        }
+
+    probe: dict[str, Any] | None = None
+    try:
+        os.chdir(stable_cwd)
+        probe = rename_probe(path)
+    except OSError as exc:
+        probe = {
+            "ok": False,
+            "winerror": getattr(exc, "winerror", None),
+            "message": f"SAFE_DIAGNOSTIC_CWD_FAILED: {exc}",
+        }
+    finally:
+        try:
+            os.chdir(original_cwd)
+        except OSError as exc:
+            probe = {
+                "ok": False,
+                "winerror": getattr(exc, "winerror", None),
+                "message": f"DIAGNOSTIC_CWD_RESTORE_FAILED: {exc}",
+            }
+    assert probe is not None
+    return probe
+
+
 def _process_role(row: dict[str, Any], hermes_pids: set[int]) -> str:
     if row["pid"] not in hermes_pids:
         return "child"
@@ -100,11 +153,21 @@ def _process_snapshot(path: Path) -> tuple[list[dict[str, Any]], list[dict[str, 
 def diagnose(path_value: str) -> dict[str, Any]:
     path = Path(path_value).expanduser().resolve(strict=False)
     hermes, holders, marker = _process_snapshot(path)
-    probe = rename_probe(path)
     current_cwd = Path.cwd().resolve(strict=False)
+    holders = [row for row in holders if row.get("pid") != os.getpid()]
+    probe = _rename_probe_without_current_cwd(path)
+    hermes_pids = {row.get("pid") for row in hermes}
+    hermes_holders = [row for row in holders if row.get("pid") in hermes_pids]
     action = "NONE"
     if not probe["ok"]:
-        action = "CLOSE_MATCHING_HERMES_TERMINAL_OR_RUN_RELEASE_PATH"
+        if not path.exists():
+            action = "CHECK_PATH"
+        elif hermes_holders:
+            action = "RUN_RELEASE_PATH_OR_CLOSE_MATCHING_HERMES_SESSION"
+        elif holders:
+            action = "CLOSE_OR_CHDIR_LISTED_PROCESS"
+        else:
+            action = "LOCK_OWNER_UNKNOWN_RESTART_HERMES_IF_STILL_LOCKED"
     return {
         "path": str(path),
         "path_exists": path.exists(),
