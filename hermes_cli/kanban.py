@@ -19,6 +19,7 @@ import contextlib
 import json
 import os
 import shlex
+import sqlite3
 import sys
 import time
 from pathlib import Path
@@ -589,6 +590,51 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit canonical JSON for script/cron consumption",
     )
 
+    p_migration = sub.add_parser(
+        "review-migration",
+        help="plan/apply exact-head human-review migration (dry-run by default)",
+    )
+    p_migration.add_argument(
+        "migration_action",
+        nargs="?",
+        choices=("plan", "apply", "rollback", "status"),
+        default="plan",
+        help="operation to perform (default: plan, which is read-only)",
+    )
+    p_migration.add_argument(
+        "--linear-issue-id",
+        action="append",
+        default=None,
+        help="limit planning to a Linear issue ID (repeatable)",
+    )
+    p_migration.add_argument(
+        "--plan-id",
+        help="content-addressed plan ID required by apply/rollback",
+    )
+    p_migration.add_argument(
+        "--confirm",
+        help="exact plan-specific APPLY/ROLLBACK confirmation token",
+    )
+    p_migration.add_argument(
+        "--operator",
+        help="durable operator identity recorded with write checkpoints",
+    )
+    p_migration.add_argument(
+        "--max-actions",
+        type=int,
+        help="apply/rollback at most this many actions, then resume later",
+    )
+    p_migration.add_argument(
+        "--report",
+        type=Path,
+        help="write the deterministic dry-run Markdown report to this path",
+    )
+    p_migration.add_argument(
+        "--json",
+        action="store_true",
+        help="print deterministic JSON instead of Markdown/text",
+    )
+
     # --- link / unlink ---
     p_link = sub.add_parser("link", help="Add a parent->child dependency")
     p_link.add_argument("parent_id")
@@ -1078,6 +1124,10 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # Dry-run planning clones the board into an in-memory database so it
+        # must run before normal auto-init can mutate an old schema.
+        if action == "review-migration":
+            return _cmd_review_migration(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1165,6 +1215,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "reclaim",
     "reassign",
     "review-runner",
+    "review-migration",
     "link",
     "unlink",
     "claim",
@@ -2120,6 +2171,141 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
             for error in payload["errors"]:
                 print(f"  error: {error}", file=sys.stderr)
     return 1 if receipt.status in {"failed", "timed_out"} else 0
+
+
+def _cmd_review_migration(args: argparse.Namespace) -> int:
+    """Plan by default; require exact plan confirmation before local writes."""
+    from hermes_cli import kanban_review_migration as migration
+
+    action = getattr(args, "migration_action", "plan")
+    db_path = kb.kanban_db_path()
+    provider = (
+        migration.migration_snapshot_provider()
+        or migration.UnavailableSnapshotProvider()
+    )
+    try:
+        if action == "plan":
+            with migration.open_read_only_snapshot(db_path) as conn:
+                inputs = migration.collect_migration_inputs(
+                    conn,
+                    snapshot_provider=provider,
+                    linear_issue_ids=getattr(args, "linear_issue_id", None),
+                )
+                plan = migration.build_migration_plan(inputs)
+            report_path = getattr(args, "report", None)
+            if report_path is not None:
+                written = migration.write_plan_report(plan, report_path)
+                print(f"Dry-run report: {written}", file=sys.stderr)
+            if getattr(args, "json", False):
+                print(plan.to_json())
+            else:
+                print(plan.to_markdown(), end="")
+            return 0
+
+        if action == "status":
+            with migration.open_read_only_snapshot(db_path) as conn:
+                rows = migration.migration_status(
+                    conn,
+                    plan_id=getattr(args, "plan_id", None),
+                )
+            if getattr(args, "json", False):
+                print(json.dumps(rows, ensure_ascii=False, sort_keys=True))
+            elif not rows:
+                print("No persisted review migration plans.")
+            else:
+                for row in rows:
+                    print(
+                        f"{row['id']}  {row['status']}  "
+                        f"actions={row['action_count']}  "
+                        f"checkpoints={row['checkpoint_count']}"
+                    )
+            return 0
+
+        plan_id = str(getattr(args, "plan_id", None) or "").strip()
+        confirmation = str(getattr(args, "confirm", None) or "")
+        operator = str(getattr(args, "operator", None) or "").strip()
+        if not plan_id:
+            print(
+                f"kanban review-migration {action}: --plan-id is required",
+                file=sys.stderr,
+            )
+            return 2
+        if not operator:
+            print(
+                f"kanban review-migration {action}: --operator is required",
+                file=sys.stderr,
+            )
+            return 2
+        expected_confirmation = f"{action.upper()} {plan_id}"
+        if confirmation != expected_confirmation:
+            print(
+                f"kanban review-migration {action}: --confirm must equal "
+                f"{expected_confirmation!r}",
+                file=sys.stderr,
+            )
+            return 2
+
+        kb.init_db(db_path)
+        with kb.connect_closing(db_path=db_path) as conn:
+            plan = migration.load_migration_plan(conn, plan_id)
+            if action == "apply":
+                if migration.migration_snapshot_provider() is None:
+                    print(
+                        "kanban review-migration apply: no authoritative read-only "
+                        "snapshot provider is registered; refusing write mode",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if plan is None:
+                    inputs = migration.collect_migration_inputs(
+                        conn,
+                        snapshot_provider=provider,
+                        linear_issue_ids=getattr(args, "linear_issue_id", None),
+                    )
+                    plan = migration.build_migration_plan(inputs)
+                    if plan.plan_id != plan_id:
+                        raise migration.MigrationConflict(
+                            "fresh exact-head plan ID differs from --plan-id; "
+                            "run a new dry-run"
+                        )
+                receipt = migration.apply_migration_plan(
+                    conn,
+                    plan,
+                    snapshot_provider=provider,
+                    confirmation=confirmation,
+                    operator=operator,
+                    max_actions=getattr(args, "max_actions", None),
+                )
+            else:
+                if plan is None:
+                    raise migration.MigrationBoundaryError(
+                        f"persisted migration plan {plan_id!r} does not exist"
+                    )
+                receipt = migration.rollback_migration_plan(
+                    conn,
+                    plan,
+                    confirmation=confirmation,
+                    operator=operator,
+                    max_actions=getattr(args, "max_actions", None),
+                )
+        payload = receipt.to_dict()
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        else:
+            print(
+                f"Review migration {action}: {payload['status']}; "
+                f"plan={payload['plan_id']}; "
+                f"checkpoints={payload['checkpoint_count']}; "
+                "external_side_effects=none"
+            )
+        return 0
+    except (
+        migration.MigrationBoundaryError,
+        sqlite3.Error,
+        OSError,
+    ) as exc:
+        print(f"kanban review-migration {action}: {exc}", file=sys.stderr)
+        return 1
 
 
 def _cmd_link(args: argparse.Namespace) -> int:

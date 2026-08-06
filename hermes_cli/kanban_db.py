@@ -1718,6 +1718,64 @@ CREATE TABLE IF NOT EXISTS reconciliation_findings (
     PRIMARY KEY (run_id, finding_key)
 );
 
+-- Dry-run-first exact-head human-review migration plans. Plans and actions
+-- are content-addressed; checkpoints are append-only local audit evidence.
+CREATE TABLE IF NOT EXISTS review_migration_plans (
+    id                            TEXT PRIMARY KEY,
+    idempotency_key               TEXT NOT NULL UNIQUE,
+    schema_version                INTEGER NOT NULL,
+    policy_version                TEXT NOT NULL,
+    reconciliation_input_sha256   TEXT NOT NULL,
+    reconciliation_report_sha256  TEXT NOT NULL,
+    plan_json                     TEXT NOT NULL,
+    plan_sha256                   TEXT NOT NULL,
+    status                        TEXT NOT NULL DEFAULT 'prepared'
+        CHECK(status IN ('prepared','in_progress','completed','rolled_back','rollback_blocked')),
+    action_count                  INTEGER NOT NULL DEFAULT 0,
+    checkpoint_count              INTEGER NOT NULL DEFAULT 0,
+    created_at                    INTEGER NOT NULL,
+    updated_at                    INTEGER NOT NULL,
+    completed_at                  INTEGER,
+    rollback_completed_at         INTEGER,
+    last_error                    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS review_migration_actions (
+    plan_id             TEXT NOT NULL REFERENCES review_migration_plans(id) ON DELETE CASCADE,
+    ordinal             INTEGER NOT NULL,
+    action_id           TEXT NOT NULL,
+    idempotency_key     TEXT NOT NULL UNIQUE,
+    action_kind         TEXT NOT NULL,
+    target_type         TEXT NOT NULL,
+    target_ids_json     TEXT NOT NULL,
+    repository          TEXT NOT NULL,
+    pr_number           INTEGER NOT NULL,
+    head_sha            TEXT NOT NULL,
+    action_json         TEXT NOT NULL,
+    action_sha256       TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','applied','rolled_back')),
+    applied_at          INTEGER,
+    rolled_back_at      INTEGER,
+    PRIMARY KEY(plan_id, action_id),
+    UNIQUE(plan_id, ordinal)
+);
+
+CREATE TABLE IF NOT EXISTS review_migration_checkpoints (
+    plan_id         TEXT NOT NULL REFERENCES review_migration_plans(id) ON DELETE CASCADE,
+    action_id       TEXT NOT NULL,
+    sequence        INTEGER NOT NULL,
+    phase           TEXT NOT NULL CHECK(phase IN ('apply','rollback')),
+    status          TEXT NOT NULL CHECK(status IN ('applied','rolled_back')),
+    operator        TEXT NOT NULL,
+    before_json     TEXT NOT NULL,
+    after_json      TEXT NOT NULL,
+    rollback_json   TEXT NOT NULL,
+    recorded_at     INTEGER NOT NULL,
+    PRIMARY KEY(plan_id, sequence),
+    UNIQUE(plan_id, action_id, phase)
+);
+
 -- One board-local scheduler/gateway lease prevents overlapping shadow/live
 -- reconciliation/outbox passes. Dry-run never touches this table. A crashed
 -- owner can be replaced only after expires_at, while per-intent outbox CAS and
@@ -1803,6 +1861,12 @@ CREATE INDEX IF NOT EXISTS idx_reconciliation_run_status
     ON reconciliation_runs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_finding_category
     ON reconciliation_findings(category, severity, repository, pr_number);
+CREATE INDEX IF NOT EXISTS idx_review_migration_plans_status
+    ON review_migration_plans(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_review_migration_actions_status
+    ON review_migration_actions(plan_id, status, ordinal);
+CREATE INDEX IF NOT EXISTS idx_review_migration_checkpoints_action
+    ON review_migration_checkpoints(plan_id, action_id, phase);
 CREATE INDEX IF NOT EXISTS idx_review_boundary_runner_lease_expiry
     ON review_boundary_runner_leases(expires_at);
 """
