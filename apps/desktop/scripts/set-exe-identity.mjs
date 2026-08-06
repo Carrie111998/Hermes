@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // set-exe-identity.mjs — stamp the Hermes icon + version metadata onto the
-// built Hermes.exe using rcedit, completely decoupled from electron-builder's
-// signing path.
+// built Hermes.exe using resedit (pure-JS PE resource editor), completely
+// decoupled from electron-builder's signing path.
 //
 // WHY THIS EXISTS
 // ---------------
@@ -13,10 +13,10 @@
 // try to extract winCodeSign.
 //
 // The cost of disabling signAndEditExecutable is that electron-builder also
-// skips rcedit, so the unpacked Hermes.exe keeps the stock Electron icon and
-// "Electron" taskbar name. This script restores the icon + identity by calling
-// rcedit DIRECTLY. rcedit is a pure PE resource editor: no signing, no certs,
-// no winCodeSign, no symlinks.
+// skips its own resource editing, so the unpacked Hermes.exe keeps the stock
+// Electron icon and "Electron" taskbar name. This script restores the icon +
+// identity by editing PE resources DIRECTLY. resedit is a pure-JS PE resource
+// editor: no signing, no certs, no winCodeSign, no symlinks, no native binary.
 //
 // HOW IT RUNS
 // -----------
@@ -36,38 +36,60 @@
 // otherwise-good build (worst case: stock icon, not a broken app).
 
 import { resolve, join } from 'node:path'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync, writeFileSync } from 'node:fs'
 
-import { rcedit } from 'rcedit'
+import { NtExecutable, NtExecutableResource, Data, Resource } from 'resedit'
 
 import { isMain } from './utils.mjs'
 
+const LANG_EN_US = { lang: 1033, codepage: 1200 }
+const ICON_GROUP_ID = 1
+
 // Stamp the Hermes icon + identity onto `exe`. Resolves on success, throws on
 // failure. `desktopRoot` defaults to this script's package root so the icon and
-// the rcedit dependency resolve regardless of cwd.
+// dependencies resolve regardless of cwd.
 async function stampExeIdentity(exe, desktopRoot = resolve(import.meta.dirname, '..')) {
   if (!exe || !existsSync(exe)) {
     throw new Error(`target exe not found: ${exe}`)
   }
 
-  // Icon lives at apps/desktop/assets/icon.ico
-  const icon = join(desktopRoot, 'assets', 'icon.ico')
-  if (!existsSync(icon)) {
-    throw new Error(`icon not found: ${icon}`)
+  const iconPath = join(desktopRoot, 'assets', 'icon.ico')
+  if (!existsSync(iconPath)) {
+    throw new Error(`icon not found: ${iconPath}`)
   }
 
   console.log(`[set-exe-identity] stamping ${exe}`)
-  console.log(`[set-exe-identity] icon: ${icon}`)
+  console.log(`[set-exe-identity] icon: ${iconPath}`)
 
-  await rcedit(exe, {
-    icon,
-    'version-string': {
+  const peExe = NtExecutable.from(readFileSync(exe))
+  const res = NtExecutableResource.from(peExe)
+
+  const iconFile = Data.IconFile.from(readFileSync(iconPath))
+  const icons = iconFile.icons.map(i => i.data)
+  const iconGroups = Resource.IconGroupEntry.fromEntries(res.entries)
+  const destinations = iconGroups.length > 0 ? iconGroups : [{ id: ICON_GROUP_ID, lang: 0 }]
+  for (const { id, lang } of destinations) {
+    Resource.IconGroupEntry.replaceIconsForResource(res.entries, id, lang, icons)
+  }
+
+  // Preserve Electron's fixed file/product versions and any existing strings;
+  // only replace the branding fields that rcedit previously changed.
+  const existing = Resource.VersionInfo.fromEntries(res.entries)
+  const vi = existing[0] ?? Resource.VersionInfo.createEmpty()
+  const languages = vi.getAllLanguagesForStringValues()
+  for (const language of languages.length > 0 ? languages : [LANG_EN_US]) {
+    vi.setStringValues(language, {
       ProductName: 'Hermes',
       FileDescription: 'Hermes',
       CompanyName: 'Nous Research',
       LegalCopyright: 'Copyright (c) 2026 Nous Research'
-    }
-  })
+    })
+  }
+  vi.outputToResourceEntries(res.entries)
+
+  res.outputResource(peExe)
+  const output = peExe.generate()
+  writeFileSync(exe, Buffer.from(output))
 
   console.log('[set-exe-identity] done — Hermes icon + identity stamped')
 }

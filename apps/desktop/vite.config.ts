@@ -4,6 +4,8 @@ import tailwindcss from '@tailwindcss/vite'
 import path from 'path'
 import fs from 'fs'
 
+const __dir = import.meta.dirname
+
 // `hgui` symlinks a worktree's node_modules to the main checkout. Vite realpaths
 // those before enforcing server.fs.allow, so codicon/font assets resolve outside
 // the worktree root and 404. Whitelist the real node_modules locations.
@@ -18,9 +20,9 @@ const real = (p: string): string | null => {
 const fsAllow = [
   ...new Set(
     [
-      path.resolve(__dirname, '../..'),
-      real(path.resolve(__dirname, 'node_modules')),
-      real(path.resolve(__dirname, '../../node_modules'))
+      path.resolve(__dir, '../..'),
+      real(path.resolve(__dir, 'node_modules')),
+      real(path.resolve(__dir, '../../node_modules'))
     ].filter((p): p is string => p !== null)
   )
 ]
@@ -33,16 +35,16 @@ const fsAllow = [
 // the perf harness opts a production build back in with VITE_PERF_PROBE=1.
 const debugEntry = (command: string, env: Record<string, string>) =>
   command === 'serve' || env.VITE_PERF_PROBE === '1'
-    ? path.resolve(__dirname, './src/debug/dev-only.ts')
-    : path.resolve(__dirname, './src/debug/dev-only.noop.ts')
+    ? path.resolve(__dir, './src/debug/dev-only.ts')
+    : path.resolve(__dir, './src/debug/dev-only.noop.ts')
 
 // The emoji picker (frimousse) fetches `<emojibaseUrl>/<locale>/data.json` at
 // runtime. Its default is a CDN; Electron must work offline, so serve the
 // bundled emojibase-data package at a stable local path instead — middleware
 // in dev, emitted assets in the build. Only the files a locale actually needs.
 const emojibaseDir =
-  real(path.resolve(__dirname, 'node_modules/emojibase-data')) ??
-  real(path.resolve(__dirname, '../../node_modules/emojibase-data'))
+  real(path.resolve(__dir, 'node_modules/emojibase-data')) ??
+  real(path.resolve(__dir, '../../node_modules/emojibase-data'))
 
 const EMOJIBASE_PATH = /^[a-z-]+\/(data|messages|shortcodes\/emojibase)\.json$/
 
@@ -92,20 +94,19 @@ export default defineConfig(({ command }) => ({
   },
   build: {
     // The renderer intentionally ships FEW chunks (not one, not thousands):
-    //   · `codeSplitting: false` (the old setup) inlines every `lazy()` /
-    //     dynamic import into the entry, so heavyweight lazy-only deps
-    //     (mermaid, shiki grammars, katex) are parsed + evaluated on every
-    //     cold start even though nothing rendered them. By the time the
-    //     bundle hit ~28 MB that eval was ~1s of launch on an M-series.
+    //   · `codeSplitting: false` inlines every `lazy()` / dynamic import
+    //     into the entry, so heavyweight lazy-only deps (mermaid, shiki
+    //     grammars, katex) are parsed + evaluated on every cold start even
+    //     though nothing rendered them. ~28 MB = ~1s of launch on M-series.
     //   · Default splitting emits a chunk per shiki grammar/theme — thousands
     //     of files, which electron-builder OOMs scanning (#38888).
-    // `advancedChunks` is the middle ground: heavyweight libraries merge into
-    // a handful of named vendor chunks loaded on first use, app-level dynamic
-    // imports stay lazy, and the file count stays in the tens.
+    // `codeSplitting.groups` is the middle ground: heavyweight libraries
+    // merge into a handful of named vendor chunks loaded on first use,
+    // app-level dynamic imports stay lazy, and the file count stays in tens.
     chunkSizeWarningLimit: 25000,
     rolldownOptions: {
       output: {
-        advancedChunks: {
+        codeSplitting: {
           groups: [
             // Shared foundations FIRST (first match wins): an unmatched
             // module shared by the entry and a heavy chunk gets merged INTO
@@ -143,14 +144,14 @@ export default defineConfig(({ command }) => ({
   resolve: {
     alias: {
       '@/debug/dev-only': debugEntry(command, process.env as Record<string, string>),
-      '@': path.resolve(__dirname, './src'),
-      '@hermes/plugin-sdk': path.resolve(__dirname, './src/sdk/index.ts'),
-      '@hermes/shared/billing': path.resolve(__dirname, '../shared/src/billing-types.ts'),
-      '@hermes/shared': path.resolve(__dirname, '../shared/src'),
-      react: path.resolve(__dirname, '../../node_modules/react'),
-      'react-dom': path.resolve(__dirname, '../../node_modules/react-dom'),
-      'react/jsx-dev-runtime': path.resolve(__dirname, '../../node_modules/react/jsx-dev-runtime.js'),
-      'react/jsx-runtime': path.resolve(__dirname, '../../node_modules/react/jsx-runtime.js')
+      '@': path.resolve(__dir, './src'),
+      '@hermes/plugin-sdk': path.resolve(__dir, './src/sdk/index.ts'),
+      '@hermes/shared/billing': path.resolve(__dir, '../shared/src/billing-types.ts'),
+      '@hermes/shared': path.resolve(__dir, '../shared/src'),
+      react: path.resolve(__dir, '../../node_modules/react'),
+      'react-dom': path.resolve(__dir, '../../node_modules/react-dom'),
+      'react/jsx-dev-runtime': path.resolve(__dir, '../../node_modules/react/jsx-dev-runtime.js'),
+      'react/jsx-runtime': path.resolve(__dir, '../../node_modules/react/jsx-runtime.js')
     },
     dedupe: ['react', 'react-dom']
   },
