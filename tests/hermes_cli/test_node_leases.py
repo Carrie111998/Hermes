@@ -1,7 +1,35 @@
 """POSIX physical-node lease regression tests."""
 
+import multiprocessing
+import os
+
+import pytest
+
 from hermes_cli import node_leases
 from hermes_cli import kanban_db as kb
+
+
+pytestmark = pytest.mark.skipif(
+    os.name != "posix",
+    reason="physical node leases require POSIX fcntl.flock",
+)
+
+
+def _acquire_in_child(root, start, release, results, owner):
+    """Contend for one slot from an independent OS process."""
+    pool = node_leases.PosixNodeLeasePool(root=root)
+    start.wait(timeout=10)
+    lease = pool.try_acquire(
+        profile="worker",
+        owner=owner,
+        profile_to_node={"worker": "shared-node"},
+        capacities={"shared-node": 1},
+        ttl_seconds=60,
+    )
+    results.put((owner, lease is not None))
+    if lease is not None:
+        release.wait(timeout=10)
+        lease.release()
 
 
 def _pool(tmp_path, now):
@@ -36,6 +64,31 @@ def test_profiles_on_same_capacity_one_node_cannot_both_acquire(tmp_path):
     assert lease is not None
     assert blocked is None
     assert first.snapshot()["m4-pro"]["in_use"] == 1
+
+
+def test_separate_processes_cannot_both_acquire_capacity_one_node(tmp_path):
+    ctx = multiprocessing.get_context("fork")
+    start = ctx.Event()
+    release = ctx.Event()
+    results = ctx.Queue()
+    processes = [
+        ctx.Process(
+            target=_acquire_in_child,
+            args=(str(tmp_path / "leases"), start, release, results, owner),
+        )
+        for owner in ("process-a", "process-b")
+    ]
+
+    for process in processes:
+        process.start()
+    start.set()
+    outcomes = [results.get(timeout=10), results.get(timeout=10)]
+    release.set()
+    for process in processes:
+        process.join(timeout=10)
+
+    assert sum(acquired for _owner, acquired in outcomes) == 1
+    assert all(process.exitcode == 0 for process in processes)
 
 
 def test_profiles_on_different_nodes_can_acquire_concurrently(tmp_path):
@@ -147,6 +200,39 @@ def test_dispatcher_allows_profiles_on_different_nodes(tmp_path, monkeypatch):
 
     assert len(result.spawned) == 2
     assert result.skipped_node_capped == []
+
+
+def test_spawn_failure_releases_node_for_next_ready_task(tmp_path, monkeypatch):
+    home = _fresh_board(tmp_path, monkeypatch)
+
+    def spawn(task, _workspace):
+        if task.assignee == "architect":
+            raise RuntimeError("synthetic spawn failure")
+        return 12345
+
+    pool = node_leases.PosixNodeLeasePool(root=home / "node-leases")
+    with kb.connect_closing() as conn:
+        failed_id = kb.create_task(conn, title="architecture", assignee="architect")
+        kb.create_task(conn, title="planning", assignee="planner")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=spawn,
+            node_leases={
+                "enabled": True,
+                "profile_to_node": {"architect": "m4-pro", "planner": "m4-pro"},
+                "capacities": {"m4-pro": 1},
+                "ttl_seconds": 60,
+            },
+            node_lease_pool=pool,
+        )
+
+    assert [assignee for _task_id, assignee, _workspace in result.spawned] == [
+        "planner"
+    ]
+    assert result.skipped_node_capped == []
+    assert pool.snapshot()["m4-pro"]["profiles"] == ["planner"]
+    with kb.connect_closing() as conn:
+        assert kb.get_task(conn, failed_id).status == "ready"
 
 
 def test_review_worker_respects_same_physical_node_capacity(tmp_path, monkeypatch):

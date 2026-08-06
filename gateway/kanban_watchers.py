@@ -1457,14 +1457,28 @@ class GatewayKanbanWatchersMixin:
                     await asyncio.to_thread(_auto_decompose_tick, _ad_per_tick)
                 results = await asyncio.to_thread(_tick_once)
                 any_spawned = False
+                node_capped_total = 0
                 for slug, res in (results or []):
+                    node_capped = (
+                        getattr(res, "skipped_node_capped", None) or []
+                        if res is not None
+                        else []
+                    )
+                    if node_capped:
+                        node_capped_total += len(node_capped)
+                        logger.debug(
+                            "kanban dispatcher [%s]: node-capped=%d",
+                            slug,
+                            len(node_capped),
+                        )
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually
                         # happened, so an idle gateway stays silent.
                         logger.info(
                             "kanban dispatcher [%s]: spawned=%d reclaimed=%d "
-                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d",
+                            "crashed=%d timed_out=%d promoted=%d auto_blocked=%d "
+                            "node_capped=%d",
                             slug,
                             len(res.spawned),
                             res.reclaimed,
@@ -1472,6 +1486,7 @@ class GatewayKanbanWatchersMixin:
                             len(res.timed_out) if hasattr(res.timed_out, "__len__") else 0,
                             res.promoted,
                             len(res.auto_blocked) if hasattr(res.auto_blocked, "__len__") else 0,
+                            len(node_capped),
                         )
                 # Health telemetry (aggregate across boards)
                 ready_pending = await asyncio.to_thread(_ready_nonempty)
@@ -1483,11 +1498,13 @@ class GatewayKanbanWatchersMixin:
                     now = int(time.time())
                     if now - last_warn_at >= 300:
                         logger.warning(
-                            "kanban dispatcher stuck: ready queue non-empty for "
+                            "kanban dispatcher deferred or stuck: ready queue non-empty for "
                             "%d consecutive ticks but 0 workers spawned. Check "
-                            "profile health (venv, PATH, credentials) and "
+                            "node lease capacity (last tick node-capped=%d), profile "
+                            "health (venv, PATH, credentials), and "
                             "`hermes kanban list --status ready`.",
                             bad_ticks,
+                            node_capped_total,
                         )
                         last_warn_at = now
             except asyncio.CancelledError:
