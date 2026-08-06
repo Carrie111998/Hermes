@@ -205,6 +205,64 @@ def test_failure_and_degradation_have_high_priority_floor():
     assert evaluate_outcome(_event({"status": "partial"})).priority_floor is Priority.HIGH
 
 
+def _burst(transitions, priority: Priority = Priority.HIGH) -> Event:
+    return _event(
+        {"transitions": transitions},
+        event_type=EventType.WATCHDOG_BURST,
+        priority=priority,
+    )
+
+
+def test_watchdog_burst_recovery_only_is_recovered():
+    """A burst whose every change is a recovery is good news, not UNKNOWN.
+
+    WATCHDOG_BURST carries its state in a ``transitions`` list, not a
+    top-level ``after``/``status``, so the plain recovery detector never
+    saw it and a recovery-only sweep fell through to UNKNOWN -> yellow.
+    """
+    verdict = evaluate_outcome(
+        _burst(
+            [
+                {"after": "healthy", "tier": "critical"},
+                {"after": "healthy", "tier": "optional"},
+            ]
+        )
+    )
+
+    assert verdict.state is OutcomeState.RECOVERED
+    assert any(item.path == "payload.transitions" for item in verdict.evidence)
+
+
+def test_watchdog_burst_recovery_only_marker_is_green():
+    verdict = evaluate_outcome(_burst([{"after": "healthy", "tier": "critical"}]))
+
+    assert marker_for_verdict(verdict, Priority.HIGH) == "🟢"
+
+
+def test_watchdog_burst_with_failure_is_not_recovered():
+    """A burst that still has a down probe must never read as recovered/green."""
+    verdict = evaluate_outcome(
+        _burst(
+            [
+                {"after": "down", "tier": "critical"},
+                {"after": "healthy", "tier": "optional"},
+            ]
+        )
+    )
+
+    assert verdict.state is not OutcomeState.RECOVERED
+    assert marker_for_verdict(verdict, Priority.HIGH) != "🟢"
+
+
+def test_watchdog_burst_skips_only_is_not_recovered():
+    """All-skipped sweeps (monitor over budget) are not a recovery."""
+    verdict = evaluate_outcome(
+        _burst([{"after": "unknown", "tier": "critical"}])
+    )
+
+    assert verdict.state is not OutcomeState.RECOVERED
+
+
 @pytest.mark.parametrize(
     ("payload", "priority", "expected"),
     [

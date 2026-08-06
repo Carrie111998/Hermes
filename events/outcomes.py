@@ -181,6 +181,18 @@ def _is_recovery_transition(event: Event, payload: dict[str, Any]) -> OutcomeEvi
     if event.event_type in _RECOVERY_EVENT_TYPES:
         return _evidence("recovery_event_type", "event.event_type", event.event_type.type_string)
 
+    if event.event_type is EventType.WATCHDOG_BURST:
+        # A burst carries state in a ``transitions`` list, not a top-level
+        # ``after``/``status``. When every real change is a recovery (none
+        # failing; "unknown" == probe skipped, not a verdict) the sweep is
+        # good news and must read green, mirroring formatting.watchdog_burst_body.
+        transitions = [t for t in (payload.get("transitions") or []) if isinstance(t, dict)]
+        failing = [t for t in transitions if t.get("after") not in ("healthy", "unknown")]
+        recovered = [t for t in transitions if t.get("after") == "healthy"]
+        if recovered and not failing:
+            return _evidence("watchdog_burst_recovered", "payload.transitions", len(recovered))
+        return None
+
     status = _normalized(payload.get("status", ""))
     after = _normalized(payload.get("after", ""))
     previous = next(
