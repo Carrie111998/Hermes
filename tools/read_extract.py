@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import posixpath
 import zipfile
 from pathlib import Path
@@ -32,6 +33,10 @@ ANYDOC_EXTENSIONS = frozenset({
     ".rtf", ".epub", ".pdf",
 })
 MAX_XLSX_BYTES = 50 * 1024 * 1024
+# Refuse to convert huge documents. anydoc loads the whole file through its
+# Rust core with no streaming, and the read_file char budget only applies
+# after conversion, so an unbounded input can pin a tool turn and spike RAM.
+MAX_ANYDOC_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -97,6 +102,14 @@ def _extract_anydoc(path: str) -> str:
     mod = _anydoc()
     if mod is None:
         raise ExtractionError(f"Unsupported document type: {path!r}")
+    try:
+        size = os.path.getsize(path)
+    except OSError as exc:
+        raise ExtractionError(str(exc)) from exc
+    if size > MAX_ANYDOC_BYTES:
+        raise ExtractionError(
+            f"Document too large to convert ({size:,} bytes, limit is {MAX_ANYDOC_BYTES:,})"
+        )
     try:
         text = mod.to_markdown(path)
     except OSError as exc:
