@@ -151,6 +151,7 @@ def _ensure_supervisor_subscription(
     metadata["_kanban_supervisor_event_id"] = int(event_id)
     metadata["_kanban_supervisor_gate_token"] = token
     metadata["_kanban_supervisor_mode"] = mode
+    metadata["_kanban_supervisor_recovery_limit"] = config.recovery_limit
     metadata["_kanban_supervisor_owned_subscription"] = bool(
         metadata.get("_kanban_supervisor_owned_subscription", existing is None)
     )
@@ -314,6 +315,15 @@ def render_supervisor_event(
         )
     if mode != "recovery_exhausted":
         return ""
+    try:
+        recovery_limit = int(metadata.get("_kanban_supervisor_recovery_limit", 1))
+    except (TypeError, ValueError):
+        recovery_limit = 1
+    if recovery_limit <= 0:
+        return (
+            f"Hermes did not retry {title} because its recovery budget is zero. "
+            "The task remains paused for engineering follow-up; no decision is requested."
+        )
     return (
         f"Hermes could not recover {title} after the bounded retry. "
         "The task remains paused for engineering follow-up; no decision is requested."

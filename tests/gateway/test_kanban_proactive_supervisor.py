@@ -455,6 +455,47 @@ def test_recovery_budget_is_durable_and_exhaustion_is_status_only(tmp_path, monk
         conn.close()
 
 
+def test_zero_recovery_budget_reports_that_no_retry_occurred(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Manual recovery only", assignee="forge")
+        assert kb.block_task(conn, task_id, reason="temporary backend failure", kind="transient")
+
+        result = reconcile_board(
+            conn,
+            board="default",
+            config=_config(recovery_limit=0),
+            notifier_profile="default",
+        )
+
+        assert result.recovered == []
+        assert result.recovery_exhausted == [task_id]
+        recovery_events = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? "
+            "AND kind = 'supervisor_recovery'",
+            (task_id,),
+        ).fetchone()[0]
+        assert recovery_events == 0
+        blocked = _latest_event(conn, task_id, "blocked")
+        task = kb.get_task(conn, task_id)
+        sub = kb.list_notify_subs(conn, task_id)[0]
+        message = render_supervisor_event(
+            board="default",
+            task=task,
+            event=SimpleNamespace(id=blocked["id"], payload=blocked["payload"]),
+            delivery_metadata=sub["delivery_metadata"],
+            current_event_id=blocked["id"],
+        )
+        assert message == (
+            "Hermes did not retry Manual recovery only because its recovery budget is zero. "
+            "The task remains paused for engineering follow-up; no decision is requested."
+        )
+    finally:
+        conn.close()
+
+
 def test_reply_to_protected_prompt_resumes_same_task_graph(tmp_path, monkeypatch):
     db_path = tmp_path / "kanban.db"
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
