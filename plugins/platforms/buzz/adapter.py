@@ -1330,9 +1330,6 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
     it is never sourced from config.yaml here.
     """
-    if _profile_scoped_config_load():
-        return None
-
     merged_extra: dict = {}
 
     def _merge_extra(candidate: Any) -> None:
@@ -1359,6 +1356,11 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     extra = merged_extra
     if not extra:
         return None
+    if _profile_scoped_config_load():
+        # Never publish a multiplex profile's YAML into process-global env.
+        # Return the merged legacy/canonical values so the gateway loader can
+        # seed this profile's PlatformConfig.extra instead.
+        return extra
     _str_keys = {
         "relay_url": "BUZZ_RELAY_URL",
         "cli_path": "BUZZ_CLI_PATH",

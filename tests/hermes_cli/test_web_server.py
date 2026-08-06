@@ -1911,7 +1911,7 @@ class TestConfigRoundTrip:
         save_config({
             "buzz": {
                 "extra": {
-                    "allowed_users": ["a" * 64],
+                    "allowed_users": "legacy-invalid-scalar",
                     "allow_all_users": True,
                     "require_mention": False,
                 },

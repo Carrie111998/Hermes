@@ -207,20 +207,22 @@ class TestBuzzAdapterInit:
     def test_scoped_multiplex_yaml_load_does_not_write_process_env(self):
         from agent import secret_scope as ss
 
+        legacy_extra = {
+            "relay_url": "https://profile.relay",
+            "allowed_users": [SELF_NPUB],
+            "allow_all_users": True,
+            "require_mention": False,
+        }
+        yaml_cfg = {"buzz": {"extra": legacy_extra}}
         ss.set_multiplex_active(True)
         token = ss.set_secret_scope({})
         try:
-            _apply_yaml_config({}, {
-                "extra": {
-                    "relay_url": "https://profile.relay",
-                    "allowed_users": [SELF_NPUB],
-                    "allow_all_users": True,
-                },
-            })
+            seeded = _apply_yaml_config(yaml_cfg, yaml_cfg["buzz"])
         finally:
             ss.reset_secret_scope(token)
             ss.set_multiplex_active(False)
 
+        assert seeded == legacy_extra
         assert "BUZZ_RELAY_URL" not in os.environ
         assert "BUZZ_ALLOWED_USERS" not in os.environ
         assert "BUZZ_ALLOW_ALL_USERS" not in os.environ
