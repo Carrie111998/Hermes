@@ -157,7 +157,7 @@ import { createKeepAwake } from './power-save'
 import { FirstRunSetupResetError, runPrimaryBackendStartup } from './primary-backend-startup'
 import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
-import { fetchPrimaryProfileSessions } from './profile-session-routing'
+import { fetchPrimaryProfileSessions, profilesTruncatedFrom } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
 import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
@@ -10082,6 +10082,7 @@ async function interceptSessionRequestForRemote(request) {
     }
 
     const recentsSp = sliceParams('recents_limit', '20', { profile: recentsProfile })
+    const recentsCap = Number(searchParams.get('recents_limit')) || 20
     const recentsExclude = searchParams.get('recents_exclude')
 
     if (recentsExclude) {
@@ -10107,7 +10108,16 @@ async function interceptSessionRequestForRemote(request) {
       recents: {
         sessions: rowsOf(recents),
         total: Number(recents?.total) || 0,
-        profile_totals: recents?.profile_totals || {}
+        profile_totals: recents?.profile_totals || {},
+        // The per-slice responses carry exact per-profile totals but no
+        // truncation flags (the batched route computes those server-side);
+        // derive them here so remote-profile setups keep the per-profile
+        // "Load more" affordance the local fast path gets for free.
+        profiles_truncated: profilesTruncatedFrom(
+          rowsOf(recents) as Array<{ profile?: string }>,
+          recentsCap,
+          (recents?.profile_totals || {}) as Record<string, number>
+        )
       },
       cron: { sessions: rowsOf(cron) },
       messaging: {
