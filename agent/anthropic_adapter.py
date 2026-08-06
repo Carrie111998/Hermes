@@ -1197,16 +1197,22 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
     try:
         refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        _write_claude_code_credentials(
+        write_result = _write_claude_code_credentials(
             refreshed["access_token"],
             refreshed["refresh_token"],
             refreshed["expires_at_ms"],
         )
+        if write_result is False:
+            return None
         logger.debug("Successfully refreshed Claude Code OAuth token")
         return refreshed["access_token"]
     except Exception as e:
         logger.debug("Failed to refresh Claude Code token: %s", e)
         return None
+
+
+def _claude_code_credentials_path() -> Path:
+    return Path.home() / ".claude" / ".credentials.json"
 
 
 def _write_claude_code_credentials(
@@ -1215,7 +1221,7 @@ def _write_claude_code_credentials(
     expires_at_ms: int,
     *,
     scopes: Optional[list] = None,
-) -> None:
+) -> bool:
     """Write refreshed credentials back to ~/.claude/.credentials.json.
 
     The optional *scopes* list (e.g. ``["user:inference", "user:profile", ...]``)
@@ -1223,7 +1229,7 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
-    cred_path = Path.home() / ".claude" / ".credentials.json"
+    cred_path = _claude_code_credentials_path()
     try:
         # Read existing file to preserve other fields
         existing = {}
@@ -1273,8 +1279,10 @@ def _write_claude_code_credentials(
             except OSError:
                 pass
             raise
+        return True
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)
+        return False
 
 
 def _resolve_claude_code_token_from_credentials(creds: Optional[Dict[str, Any]] = None) -> Optional[str]:

@@ -25,6 +25,7 @@ from pathlib import Path
 
 import pytest
 
+from agent import anthropic_adapter
 from agent import credential_pool as CP
 from agent.credential_pool import (
     AUTH_TYPE_OAUTH,
@@ -1973,14 +1974,15 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
     auth_path, pool = _anthropic_pool_for_lock_order_test(tmp_path, monkeypatch)
     io_lock_states = []
     real_write = CP.write_credential_pool
+    credentials = {
+        "accessToken": "fresh-access",
+        "refreshToken": "fresh-refresh",
+        "expiresAt": 9_999_999_999_999,
+    }
 
     def fresh_credentials():
         io_lock_states.append(("credentials_read", _pool_lock_owned_by_current_thread(pool)))
-        return {
-            "accessToken": "fresh-access",
-            "refreshToken": "fresh-refresh",
-            "expiresAt": 9_999_999_999_999,
-        }
+        return dict(credentials)
 
     def recording_write(provider, entries, *, removed_ids=None):
         io_lock_states.append(("pool_write", _pool_lock_owned_by_current_thread(pool)))
@@ -2005,6 +2007,12 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
             "rotated-refresh",
             9_999_999_999_999,
         )
+        credentials.update(
+            accessToken=access_token,
+            refreshToken=refresh_token,
+            expiresAt=expires_at_ms,
+        )
+        return True
 
     monkeypatch.setattr(
         anthropic_adapter,
@@ -2055,6 +2063,20 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
     assert disk == memory
     assert pool._dirty_entry_ids == set()
     assert pool._pending_removed_entries == []
+    if operation == "refresh":
+        monkeypatch.setattr(
+            A,
+            "is_provider_explicitly_configured",
+            lambda provider: provider == "anthropic",
+        )
+        reloaded = next(
+            entry
+            for entry in CP.load_pool("anthropic").entries()
+            if entry.source == "claude_code"
+        )
+        assert reloaded.access_token == "rotated-access"
+        assert reloaded.refresh_token == "rotated-refresh"
+        assert reloaded.last_status == CP.STATUS_OK
 
 
 @pytest.mark.parametrize("provider", ["xai-oauth", "nous"])
@@ -2819,4 +2841,361 @@ def test_write_through_fires_on_every_refresh_not_just_first(
         "The old code self-disabled write-through here (#74339)"
     )
     assert root_tokens["refresh_token"] == "rf2"
+
+
+@pytest.mark.parametrize("provider", ["anthropic", "xai-oauth", "nous"])
+def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
+    tmp_path,
+    monkeypatch,
+    provider,
+):
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: auth_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    monkeypatch.setattr(A, "is_provider_explicitly_configured", lambda _provider: True)
+    monkeypatch.setattr(CP, "load_env", lambda: {})
+    monkeypatch.setattr(CP, "_get_secret", lambda *_args: "")
+
+    old = replace(
+        _entry(
+            provider,
+            id=f"{provider}-source",
+            access_token="old-access",
+            refresh_token="old-refresh",
+        ),
+        expires_at_ms=1,
+        source="claude_code" if provider == "anthropic" else "device_code",
+    )
+    store = {
+        "version": 1,
+        "credential_pool": {provider: [old.to_dict()]},
+        "providers": {},
+    }
+    if provider == "xai-oauth":
+        store["providers"][provider] = {
+            "tokens": {
+                "access_token": "old-access",
+                "refresh_token": "old-refresh",
+            },
+            "discovery": {"token_endpoint": "https://auth.x.ai/oauth/token"},
+        }
+    elif provider == "nous":
+        store["providers"][provider] = {
+            "access_token": "old-access",
+            "refresh_token": "old-refresh",
+            "expires_at": "2000-01-01T00:00:00+00:00",
+        }
+    _write_store(auth_path, store)
+
+    claude_credentials = {}
+    if provider == "anthropic":
+        claude_credentials.update({
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": 1,
+        })
+        monkeypatch.setattr(
+            anthropic_adapter,
+            "read_claude_code_credentials",
+            lambda: dict(claude_credentials),
+        )
+        pool = CredentialPool(provider, [old])
+        monkeypatch.setattr(
+            anthropic_adapter,
+            "refresh_anthropic_oauth_pure",
+            lambda *_args, **_kwargs: {
+                "access_token": "orphan-access",
+                "refresh_token": "orphan-refresh",
+                "expires_at_ms": 9_999_999_999_999,
+            },
+        )
+        monkeypatch.setattr(
+            anthropic_adapter,
+            "_write_claude_code_credentials",
+            lambda *_args, **_kwargs: False,
+        )
+    elif provider == "xai-oauth":
+        pool = CredentialPool(provider, [old])
+        monkeypatch.setattr(
+            A,
+            "refresh_xai_oauth_pure",
+            lambda *_args, **_kwargs: {
+                "access_token": "orphan-access",
+                "refresh_token": "orphan-refresh",
+                "last_refresh": "2026-08-06T05:00:00Z",
+            },
+        )
+        pool._sync_device_code_entry_to_auth_store = lambda entry: False
+    else:
+        pool = CredentialPool(provider, [old])
+        nous_refreshed = False
+
+        def fake_nous_sync(entry, *, persist=True):
+            if not nous_refreshed:
+                return entry
+            return replace(
+                entry,
+                access_token="orphan-access",
+                refresh_token="orphan-refresh",
+                expires_at_ms=9_999_999_999_999,
+            )
+
+        def fake_nous_refresh(**_kwargs):
+            nonlocal nous_refreshed
+            nous_refreshed = True
+            return {"api_key": "orphan-access"}
+
+        monkeypatch.setattr(
+            A,
+            "resolve_nous_runtime_credentials",
+            fake_nous_refresh,
+        )
+        pool._sync_nous_entry_from_auth_store = fake_nous_sync
+        pool._sync_device_code_entry_to_auth_store = lambda entry: False
+
+    refreshed = pool._refresh_entry(old, force=True)
+    reloaded = CP.load_pool(provider)
+    source = "claude_code" if provider == "anthropic" else "device_code"
+    authoritative = next(
+        entry
+        for entry in reloaded.entries()
+        if entry.source == source
+    )
+
+    assert refreshed is None
+    assert authoritative.access_token == "old-access"
+    assert authoritative.refresh_token == "old-refresh"
+    assert authoritative.last_status == CP.STATUS_DEAD
+    assert reloaded.has_available() is False
+    assert all(entry.access_token != "orphan-access" for entry in reloaded.entries())
+
+    if provider == "anthropic":
+        claude_credentials.update(
+            accessToken="owner-access",
+            refreshToken="owner-refresh",
+            expiresAt=9_999_999_999_999,
+        )
+        adopted = next(
+            entry
+            for entry in CP.load_pool(provider).entries()
+            if entry.source == "claude_code"
+        )
+        assert adopted.access_token == "owner-access"
+        assert adopted.refresh_token == "owner-refresh"
+        assert adopted.last_status is None
+
+
+def test_two_profile_xai_refreshes_lock_the_shared_global_source(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    root_home = tmp_path / ".hermes"
+    root_path = root_home / "auth.json"
+    profile_paths = [
+        root_home / "profiles" / "alpha" / "auth.json",
+        root_home / "profiles" / "beta" / "auth.json",
+    ]
+    root_entry = replace(
+        _entry(
+            "xai-oauth",
+            id="root-xai",
+            access_token="root-old-access",
+            refresh_token="root-old-refresh",
+        ),
+        expires_at_ms=1,
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "root-old-access",
+                        "refresh_token": "root-old-refresh",
+                    },
+                    "discovery": {
+                        "token_endpoint": "https://auth.x.ai/oauth/token"
+                    },
+                }
+            },
+            "credential_pool": {"xai-oauth": [root_entry.to_dict()]},
+        },
+    )
+    for marker, profile_path in zip(("alpha", "beta"), profile_paths):
+        _write_store(
+            profile_path,
+            {
+                "version": 1,
+                "providers": {"anthropic": {"api_key": f"{marker}-key"}},
+                "credential_pool": {},
+            },
+        )
+
+    calls = []
+    calls_lock = threading.Lock()
+    second_post_entered = threading.Event()
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        with calls_lock:
+            calls.append((access_token, refresh_token))
+            call_number = len(calls)
+        if call_number == 1:
+            second_post_entered.wait(timeout=1)
+        else:
+            second_post_entered.set()
+        return {
+            "access_token": "root-new-access",
+            "refresh_token": "root-new-refresh",
+            "last_refresh": "2026-08-06T06:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    monkeypatch.setattr(
+        CredentialPool,
+        "_entry_needs_refresh",
+        lambda self, entry: (
+            self.provider == "xai-oauth"
+            and entry.access_token == "root-old-access"
+        ),
+    )
+    start = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def select_from_profile(profile_path):
+        token = set_hermes_home_override(profile_path.parent)
+        try:
+            pool = CP.load_pool("xai-oauth")
+            start.wait(timeout=5)
+            results.append(pool.select())
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            reset_hermes_home_override(token)
+
+    selectors = [
+        threading.Thread(target=select_from_profile, args=(path,))
+        for path in profile_paths
+    ]
+    for selector in selectors:
+        selector.start()
+    start.wait(timeout=5)
+    for selector in selectors:
+        selector.join(timeout=5)
+
+    assert all(not selector.is_alive() for selector in selectors)
+    assert errors == []
+    assert calls == [("root-old-access", "root-old-refresh")]
+    assert len(results) == 2 and all(result is not None for result in results)
+    assert {result.access_token for result in results} == {"root-new-access"}
+    assert {result.refresh_token for result in results} == {"root-new-refresh"}
+    root = _read_store(root_path)
+    assert root["providers"]["xai-oauth"]["tokens"] == {
+        "access_token": "root-new-access",
+        "refresh_token": "root-new-refresh",
+    }
+
+
+def test_refresh_persistence_does_not_invert_auth_store_lock(
+    monkeypatch,
+    tmp_path,
+):
+    auth_path = tmp_path / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: auth_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    entry = replace(
+        _entry(
+            "xai-oauth",
+            id="xai-source",
+            access_token="old-access",
+            refresh_token="old-refresh",
+        ),
+        expires_at_ms=1,
+    )
+    _write_store(
+        auth_path,
+        {
+            "version": 1,
+            "providers": {
+                "xai-oauth": {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    },
+                    "discovery": {
+                        "token_endpoint": "https://auth.x.ai/oauth/token"
+                    },
+                }
+            },
+            "credential_pool": {"xai-oauth": [entry.to_dict()]},
+        },
+    )
+    pool = CredentialPool("xai-oauth", [entry])
+    with pool._lock:
+        pool._record_entry_mutation_unlocked(entry.id, dirty=True)
+
+    post_entered = threading.Event()
+    persistence_has_lock = threading.Event()
+    allow_auth_attempt = threading.Event()
+    errors = []
+    results = []
+    real_write = CP.write_credential_pool
+
+    def fake_refresh(*_args, **_kwargs):
+        post_entered.set()
+        assert persistence_has_lock.wait(timeout=5)
+        allow_auth_attempt.set()
+        return {
+            "access_token": "new-access",
+            "refresh_token": "new-refresh",
+            "last_refresh": "2026-08-06T07:00:00Z",
+        }
+
+    def barrier_write(provider, entries, *, removed_ids=None):
+        if threading.current_thread().name == "persistence-owner":
+            persistence_has_lock.set()
+            assert allow_auth_attempt.wait(timeout=5)
+            with A._auth_store_lock(target_path=auth_path, timeout_seconds=1):
+                return real_write(provider, entries, removed_ids=removed_ids)
+        return real_write(provider, entries, removed_ids=removed_ids)
+
+    monkeypatch.setattr(A, "refresh_xai_oauth_pure", fake_refresh)
+    monkeypatch.setattr(CP, "write_credential_pool", barrier_write)
+
+    def refresh_worker():
+        try:
+            results.append(pool._refresh_entry(entry, force=True))
+        except BaseException as exc:
+            errors.append(("refresh", exc))
+
+    def persistence_worker():
+        try:
+            pool._persist_pending_changes()
+        except BaseException as exc:
+            errors.append(("persistence", exc))
+
+    refresher = threading.Thread(target=refresh_worker, name="refresh-owner")
+    persister = threading.Thread(target=persistence_worker, name="persistence-owner")
+    refresher.start()
+    assert post_entered.wait(timeout=5)
+    persister.start()
+    refresher.join(timeout=5)
+    persister.join(timeout=5)
+
+    assert not refresher.is_alive()
+    assert not persister.is_alive()
+    assert errors == []
+    assert len(results) == 1 and results[0] is not None
+    assert results[0].access_token == "new-access"
+    stored = _read_store(auth_path)
+    assert stored["providers"]["xai-oauth"]["tokens"]["refresh_token"] == (
+        "new-refresh"
+    )
+    assert stored["credential_pool"]["xai-oauth"][0]["refresh_token"] == (
+        "new-refresh"
+    )
 

@@ -196,6 +196,7 @@ def _install_claude_source(monkeypatch, initial):
             "refreshToken": refresh_token,
             "expiresAt": expires_at_ms,
         }
+        return True
 
     monkeypatch.setattr(
         anthropic_adapter,
@@ -514,6 +515,167 @@ def test_concurrent_selectors_refresh_rotating_chain_once(tmp_path, monkeypatch)
         "rotated-access",
         "rotated-refresh",
     )
+
+
+@pytest.mark.parametrize("mutation", ["remove", "replace"])
+def test_post_cas_lineage_mutation_cannot_write_or_return_stale_refresh(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    old = _anthropic_entry(
+        "claude-entry",
+        source="claude_code",
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    _auth_path, pool = _pool_with_store(tmp_path, monkeypatch, [old])
+    source = _install_claude_source(
+        monkeypatch,
+        {
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": 1,
+        },
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "refresh_anthropic_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "obsolete-access",
+            "refresh_token": "obsolete-refresh",
+            "expires_at_ms": 9_999_999_999_999,
+        },
+    )
+
+    cas_complete = threading.Event()
+    allow_write_boundary = threading.Event()
+    real_replace = pool._replace_entry
+
+    def pause_after_refresh_cas(previous, updated, **kwargs):
+        result = real_replace(previous, updated, **kwargs)
+        if (
+            threading.current_thread().name == "refresh-selector"
+            and result is not None
+            and updated.access_token == "obsolete-access"
+        ):
+            cas_complete.set()
+            assert allow_write_boundary.wait(timeout=5)
+        return result
+
+    pool._replace_entry = pause_after_refresh_cas
+    results = []
+    errors = []
+
+    def select_worker():
+        try:
+            results.append(pool.select())
+        except BaseException as exc:
+            errors.append(exc)
+
+    selector = threading.Thread(target=select_worker, name="refresh-selector")
+    selector.start()
+    assert cas_complete.wait(timeout=5)
+
+    if mutation == "remove":
+        assert pool.remove_index(1) is not None
+        expected = None
+    else:
+        current = pool.entries()[0]
+        winner = replace(
+            current,
+            access_token="winner-access",
+            refresh_token="winner-refresh",
+            expires_at_ms=9_999_999_999_999,
+        )
+        source["credentials"] = {
+            "accessToken": "winner-access",
+            "refreshToken": "winner-refresh",
+            "expiresAt": 9_999_999_999_999,
+        }
+        assert real_replace(current, winner) == winner
+        expected = winner
+
+    allow_write_boundary.set()
+    selector.join(timeout=5)
+
+    assert not selector.is_alive()
+    assert errors == []
+    assert source["writes"] == []
+    if expected is None:
+        assert results == [None]
+        assert pool.entries() == []
+        assert source["credentials"]["refreshToken"] == "old-refresh"
+    else:
+        assert len(results) == 1 and results[0] is not None
+        assert _tokens(results[0]) == _tokens(expected)
+        assert _tokens(pool.entries()[0]) == _tokens(expected)
+        assert source["credentials"]["refreshToken"] == "winner-refresh"
+
+
+def test_source_lineage_change_after_commit_read_wins_before_write(
+    tmp_path,
+    monkeypatch,
+):
+    old = _anthropic_entry(
+        "claude-entry",
+        source="claude_code",
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    _auth_path, pool = _pool_with_store(tmp_path, monkeypatch, [old])
+    source = _install_claude_source(
+        monkeypatch,
+        {
+            "accessToken": "old-access",
+            "refreshToken": "old-refresh",
+            "expiresAt": 1,
+        },
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "refresh_anthropic_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "obsolete-access",
+            "refresh_token": "obsolete-refresh",
+            "expires_at_ms": 9_999_999_999_999,
+        },
+    )
+
+    commit_read = threading.Event()
+    allow_commit = threading.Event()
+    reads = 0
+    real_sync = pool._sync_anthropic_entry_from_credentials_file
+
+    def pause_after_commit_read(entry, *, persist=True):
+        nonlocal reads
+        result = real_sync(entry, persist=persist)
+        reads += 1
+        if reads == 2:
+            commit_read.set()
+            assert allow_commit.wait(timeout=5)
+        return result
+
+    pool._sync_anthropic_entry_from_credentials_file = pause_after_commit_read
+    results = []
+    selector = threading.Thread(target=lambda: results.append(pool.select()))
+    selector.start()
+    assert commit_read.wait(timeout=5)
+
+    source["credentials"] = {
+        "accessToken": "winner-access",
+        "refreshToken": "winner-refresh",
+        "expiresAt": 9_999_999_999_999,
+    }
+    allow_commit.set()
+    selector.join(timeout=5)
+
+    assert not selector.is_alive()
+    assert source["writes"] == []
+    assert source["credentials"]["refreshToken"] == "winner-refresh"
+    assert len(results) == 1 and results[0] is not None
+    assert _tokens(results[0]) == ("winner-access", "winner-refresh")
+    assert _tokens(pool.entries()[0]) == ("winner-access", "winner-refresh")
 
 
 @pytest.mark.parametrize(
