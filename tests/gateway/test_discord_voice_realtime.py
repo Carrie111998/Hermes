@@ -596,6 +596,39 @@ class TestControllerLifecycle:
         assert _wait_until(lambda: submitted.await_count == 1)
         submitted.assert_awaited_once_with(5, 77, "list the repos")
 
+    def test_consult_turn_silences_classic_tts_paths(self, bg_loop):
+        """_voice_consult_owns_turn gates BOTH classic TTS paths (base
+        adapter auto-TTS + streaming TTS) for consult turns — the leak that
+        read the whole Hermes reply over the supervisor's spoken summary."""
+        from gateway.config import Platform
+        from gateway.platforms.base import MessageType
+
+        session = _fake_session()
+        runner, adapter = _make_gateway_runner(session, bg_loop)
+        runner._handle_voice_channel_function_call(
+            5, "consult_hermes", "call-1", '{"task": "list the repos"}'
+        )
+        source = SimpleNamespace(platform=Platform.DISCORD, chat_id="900")
+
+        assert runner._voice_consult_owns_turn(
+            source, MessageType.VOICE, "list the repos"
+        ) is True
+        # Merged steer text still belongs to the consult.
+        assert runner._voice_consult_owns_turn(
+            source, MessageType.VOICE, "list the repos\n\nalso sort them"
+        ) is True
+        # Unrelated utterances, typed messages, and other chats do not.
+        assert runner._voice_consult_owns_turn(
+            source, MessageType.VOICE, "what's the weather"
+        ) is False
+        assert runner._voice_consult_owns_turn(
+            source, MessageType.TEXT, "list the repos"
+        ) is False
+        assert runner._voice_consult_owns_turn(
+            SimpleNamespace(platform=Platform.DISCORD, chat_id="999"),
+            MessageType.VOICE, "list the repos",
+        ) is False
+
     def test_controller_for_event_requires_discord_voice_event(self, bg_loop):
         from gateway.config import Platform
         from gateway.platforms.base import MessageEvent, MessageType

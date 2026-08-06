@@ -179,6 +179,19 @@ class TestTurnComplete:
         assert ctrl.on_turn_complete(merged, "all good") is True
         assert session.outputs[-1] == ("c1", "all good")
 
+    def test_owns_turn_matches_without_consuming(self):
+        # Surfaces use owns_turn to silence classic TTS paths (including
+        # streaming TTS, which starts before completion) — it must never
+        # mutate consult state.
+        ctrl, session, runner, _ = _make()
+        assert ctrl.owns_turn("anything") is False  # no consult yet
+        _consult(ctrl, "c1", "check disk usage")
+        assert ctrl.owns_turn("check disk usage") is True
+        assert ctrl.owns_turn("check disk usage\n\nand inodes") is True
+        assert ctrl.owns_turn("unrelated typed message") is False
+        assert ctrl.owns_turn(None) is False
+        assert ctrl.consult_active  # unchanged by any of the above
+
     def test_no_consult_is_noop(self):
         ctrl, _, _, _ = _make()
         assert ctrl.on_turn_complete("anything", "reply") is False

@@ -18920,6 +18920,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _rt_consumed = _rt_controller.on_turn_complete(event.text, response)
                 except Exception:
                     logger.warning("realtime consult completion failed", exc_info=True)
+            if _rt_consumed:
+                # The base adapter's own auto-TTS delivery path (voice input +
+                # auto-TTS chat) must stay silent too, or the full reply gets
+                # read aloud OVER the supervisor's spoken summary — and classic
+                # playback can't be interrupted by voice.
+                event._hermes_voice_reply_consumed = True
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
@@ -20113,6 +20119,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not guild_id:
             return None
         return controllers.get(guild_id)
+
+    def _voice_consult_owns_turn(self, source, message_type, message) -> bool:
+        """True when this turn is an active realtime-supervisor consult.
+
+        The voice model speaks for that turn (ack, narration, summary) —
+        every classic TTS path must stay silent, including streaming TTS
+        which starts before the turn completes. Resolves the guild through
+        the adapter's text-channel binding since ``_run_agent_inner`` has no
+        event object.
+        """
+        controllers = getattr(self, "_voice_realtime_controllers", None)
+        if not controllers:
+            return False
+        if str(getattr(message_type, "value", message_type) or "").lower() != "voice":
+            return False
+        if getattr(source, "platform", None) != Platform.DISCORD:
+            return False
+        adapter = self.adapters.get(Platform.DISCORD)
+        text_channels = getattr(adapter, "_voice_text_channels", None) if adapter else None
+        if not isinstance(text_channels, dict):
+            return False
+        for guild_id, chat_id in text_channels.items():
+            if str(chat_id) == str(source.chat_id):
+                controller = controllers.get(guild_id)
+                return controller is not None and controller.owns_turn(message)
+        return False
 
     def _should_send_voice_reply(
         self,
@@ -26095,6 +26127,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _stts_adapter is not None
             and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
+            # A realtime-supervisor consult is spoken by the voice model;
+            # streaming the raw agent output to TTS would talk over it.
+            and not self._voice_consult_owns_turn(source, message_type, message)
         ):
             try:
                 from gateway.streaming_tts_consumer import StreamingTTSConsumer

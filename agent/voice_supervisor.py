@@ -176,18 +176,26 @@ class VoiceSupervisorController:
 
     # -- agent → voice session ------------------------------------------------
 
-    def on_turn_complete(self, message: Any, response: str) -> bool:
-        """Report a finished consult turn back to the voice session.
-        True → this turn was consumed (the surface must not TTS it).
+    def owns_turn(self, message: Any) -> bool:
+        """True when *message* is the active consult's turn.
 
-        Containment (not just equality) matches turns whose queued text was
-        merged with a steering instruction by the surface's pending-message
-        coalescing before it ran."""
+        The voice model owns that turn's speech end to end (instant ack,
+        progress narration, spoken summary) — surfaces must keep every
+        classic TTS path silent for it, including ones that fire before
+        completion (streaming TTS). Containment, not just equality, matches
+        turns whose queued text was merged with a steering instruction by
+        the surface's pending-message coalescing."""
         consult = self._consult
         if not consult or not isinstance(message, str):
             return False
         task = consult["task"]
-        if message != task and task not in message:
+        return message == task or task in message
+
+    def on_turn_complete(self, message: Any, response: str) -> bool:
+        """Report a finished consult turn back to the voice session.
+        True → this turn was consumed (the surface must not TTS it)."""
+        consult = self._consult
+        if not consult or not self.owns_turn(message):
             return False
         self._consult = None
         session = self._session
