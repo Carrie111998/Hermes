@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LaneResult",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "status", "summary"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["completed", "failed", "blocked"]},
+    "summary": {"type": "string", "minLength": 1},
+    "artifacts": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "verification": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "error": {"type": ["string", "null"]}
+  }
+}

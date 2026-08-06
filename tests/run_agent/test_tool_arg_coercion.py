@@ -139,6 +139,53 @@ class TestCoerceToolArgs:
 
 
 
+    def test_python_repr_list_string_parsed_via_literal_eval(self):
+        """A Python-repr list string (single quotes) is parsed correctly.
+
+        Open-weight local models occasionally emit ``"['a','b']"`` — valid
+        Python syntax but invalid JSON (single quotes) — for an array-typed
+        argument. ast.literal_eval should recover the real list instead of
+        wrapping the whole broken string as a single element.
+        """
+        schema = self._mock_schema({"tags": {"type": "array", "items": {"type": "string"}}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"tags": "['travel','home']"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["tags"] == ["travel", "home"]
+
+    def test_python_repr_list_string_with_mixed_quotes_and_spaces(self):
+        """Whitespace variants of Python-repr lists still parse."""
+        schema = self._mock_schema({"parents": {"type": "array", "items": {"type": "string"}}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"parents": " [ 'a' , 'b' ] "}
+            result = coerce_tool_args("test_tool", args)
+            assert result["parents"] == ["a", "b"]
+
+    def test_well_formed_json_array_still_parses_unchanged(self):
+        """Regression guard: valid JSON must still go through json.loads(),
+        not accidentally through literal_eval."""
+        schema = self._mock_schema({"parents": {"type": "array", "items": {"type": "string"}}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"parents": '["a", "b"]'}
+            result = coerce_tool_args("test_tool", args)
+            assert result["parents"] == ["a", "b"]
+
+    def test_non_list_bracket_string_falls_back_to_wrap(self):
+        """A string starting with '[' that isn't a valid list literal still
+        falls back to the single-element wrap."""
+        schema = self._mock_schema({"items": {"type": "array"}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"items": "[not valid anything"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["items"] == ["[not valid anything"]
+
+    def test_bare_string_wrapped_as_array(self):
+        """Bare string on array field → single-element list."""
+        schema = self._mock_schema({"urls": {"type": "array", "items": {"type": "string"}}})
+        with patch("model_tools.registry.get_schema", return_value=schema):
+            args = {"urls": "https://a.com"}
+            result = coerce_tool_args("test_tool", args)
+            assert result["urls"] == ["https://a.com"]
 
 
 

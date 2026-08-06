@@ -1190,6 +1190,15 @@ class GatewayKanbanWatchersMixin:
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
             """
+            # [hermes-v2 P-71] Board-scoped dispatch guard. FAIL-CLOSED:
+            # skip the entire tick (reclaim, auto-promote, spawn) for any
+            # board not explicitly marked ``dispatchable: true``. This is
+            # the precise fix for the 2026-07-20 spawn storm, where the
+            # embedded dispatcher auto-assigned + spawned workers on a
+            # planning board. Explicit `hermes kanban dispatcher --board X`
+            # is unaffected (that path does not run through this watcher).
+            if not _kb.board_is_dispatchable(slug):
+                return None
             conn = None
             fingerprint = _board_db_fingerprint(slug)
             disabled_entry = disabled_corrupt_boards.get(slug)
@@ -1231,6 +1240,12 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    # [hermes-v2 P-71] belt-and-suspenders: the early-skip
+                    # above already returns for non-dispatchable boards, but
+                    # opting the dispatch tick itself into the guard means a
+                    # future refactor that drops the early-skip still can't
+                    # spawn on a checklist board.
+                    respect_dispatchable=True,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):
@@ -1304,6 +1319,10 @@ class GatewayKanbanWatchersMixin:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
             for b in boards:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
+                # [hermes-v2 P-71] A non-dispatchable board's ready tasks
+                # are handled manually, so they must not fire the stuck-warn.
+                if not _kb.board_is_dispatchable(slug):
+                    continue
                 conn = None
                 try:
                     conn = _kb.connect(board=slug)
@@ -1362,6 +1381,12 @@ class GatewayKanbanWatchersMixin:
                 slug = b.get("slug") or _kb.DEFAULT_BOARD
                 if attempted >= auto_decompose_per_tick:
                     break
+                # [hermes-v2 P-71] Auto-decompose fans a triage task into a
+                # ready workgraph — a prelude to dispatch. A non-dispatchable
+                # board must not be decomposed either, or its triage tasks
+                # would silently sprout children the dispatcher then skips.
+                if not _kb.board_is_dispatchable(slug):
+                    continue
                 # Pin this board for the duration of the call — same
                 # pattern as the dashboard specify endpoint. The
                 # decomposer module connects with no board kwarg and

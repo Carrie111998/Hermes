@@ -326,6 +326,18 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
 
+    # --- set-dispatch (P-71: board-scoped dispatch guard) ---
+    b_set_disp = boards_sub.add_parser(
+        "set-dispatch",
+        help="Allow (on) or forbid (off) the gateway dispatcher from "
+             "spawning workers on this board. Default for every board is "
+             "off (fail-closed) — only coding/worker/swarm boards should "
+             "be turned on.",
+    )
+    b_set_disp.add_argument("slug")
+    b_set_disp.add_argument("state", choices=["on", "off"],
+                            help="on = board may auto-dispatch; off = never")
+
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
     p_create.add_argument("title", help="Task title")
@@ -1201,6 +1213,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-dispatch":
+        return _cmd_boards_set_dispatch(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1373,6 +1387,28 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_dispatch(args: argparse.Namespace) -> int:
+    """P-71: toggle the board-scoped gateway dispatch guard."""
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-dispatch: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards set-dispatch: board {args.slug!r} does not exist",
+              file=sys.stderr)
+        return 1
+    want = (args.state == "on")
+    meta = kb.write_board_metadata(normed, dispatchable=want)
+    if meta.get("dispatchable"):
+        print(f"Board {normed!r} dispatch ENABLED — the gateway dispatcher "
+              f"may now spawn workers for its ready+assigned tasks.")
+    else:
+        print(f"Board {normed!r} dispatch DISABLED — the gateway dispatcher "
+              f"will never spawn workers here (manual promotion only).")
     return 0
 
 

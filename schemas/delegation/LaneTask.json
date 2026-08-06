@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "LaneTask",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["task_id", "goal", "role"],
+  "properties": {
+    "task_id": {"type": "string", "minLength": 1},
+    "goal": {"type": "string", "minLength": 1},
+    "role": {"enum": ["leaf", "orchestrator"]},
+    "context": {"type": "string"},
+    "workdir": {"type": ["string", "null"]},
+    "parent_task_id": {"type": ["string", "null"]}
+  }
+}

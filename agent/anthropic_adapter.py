@@ -67,7 +67,15 @@ def _get_anthropic_sdk():
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# [CORE-PATCH] H-11 (hermes-v2, 2026-07-20): added "ultra" tier.
+# Hermes operators using ``reasoning_effort: ultra`` (Basti's default,
+# ~/.hermes/config.yaml:50) previously silently fell through to 8000 tokens
+# (= medium) because this dict had no "ultra" key and ``dict.get("ultra")``
+# returned None — the budget allocation path would then default to medium.
+# MiniMax-style agents driving extended multi-step tool chains lose most
+# reasoning headroom at 8k; 49152 matches Anthropic's documented 4.7+ max
+# tier ceiling (see comment block above ADAPTIVE_EFFORT_MAP).
+THINKING_BUDGET = {"ultra": 49152, "xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
 # Hermes effort → Anthropic adaptive-thinking effort (output_config.effort).
 # Anthropic exposes 5 levels on 4.7+: low, medium, high, xhigh, max.
 # Opus/Sonnet 4.6 only expose 4 levels: low, medium, high, max — no xhigh.
@@ -2517,6 +2525,26 @@ def _manage_thinking_signatures(
             pass
         elif _is_deepseek_anthropic_endpoint(base_url):
             # DeepSeek: strip signed, preserve unsigned.
+            new_content = []
+            for b in m["content"]:
+                if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:
+                    new_content.append(b)
+                    continue
+                if b.get("signature") or b.get("data"):
+                    # Signed (or redacted-with-data) — upstream can't validate, strip.
+                    continue
+                new_content.append(b)
+            m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
+        elif _is_minimax_anthropic_endpoint(base_url):
+            # [CORE-PATCH] H-10: MiniMax via Anthropic-compat.
+            # Same policy as DeepSeek: signed blocks are MiniMax-proprietary
+            # (originated from Anthropic-format emissions that MiniMax re-signed
+            # or doesn't understand) and must be stripped; unsigned thinking
+            # blocks synthesised from reasoning_content MUST be preserved so the
+            # reasoning round-trips on replayed assistant tool-call messages.
+            # Without this branch, MiniMax falls into the third-party catch-all
+            # below which strips ALL thinking blocks — destroying the
+            # interleaved-thinking trace that MiniMax M3 needs for quality.
             new_content = []
             for b in m["content"]:
                 if not isinstance(b, dict) or b.get("type") not in _THINKING_TYPES:

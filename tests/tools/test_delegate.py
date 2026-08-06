@@ -27,6 +27,8 @@ from tools.delegate_tool import (
     _build_child_agent,
     _build_child_progress_callback,
     _build_child_system_prompt,
+    _model_family_briefing,
+    _extract_output_tail,
     _strip_blocked_tools,
     _resolve_child_credential_pool,
     _resolve_delegation_credentials,
@@ -137,6 +139,94 @@ class TestChildSystemPrompt(unittest.TestCase):
         self.assertIn("Fix the tests", prompt)
         self.assertIn("YOUR TASK", prompt)
         self.assertNotIn("CONTEXT", prompt)
+
+    def test_goal_with_context(self):
+        prompt = _build_child_system_prompt("Fix the tests", "Error: assertion failed in test_foo.py line 42")
+        self.assertIn("Fix the tests", prompt)
+        self.assertIn("CONTEXT", prompt)
+        self.assertIn("assertion failed", prompt)
+
+    def test_empty_context_ignored(self):
+        prompt = _build_child_system_prompt("Do something", "  ")
+        self.assertNotIn("CONTEXT", prompt)
+
+
+class TestModelFamilyBriefing(unittest.TestCase):
+    """[hermes-v2] G-2 — model-family-tuned child prompt for the M3/GLM pair."""
+
+    # --- the pure classifier ---
+    def test_minimax_provider_returns_m3_block(self):
+        note = _model_family_briefing("minimax", "MiniMax-M3")
+        self.assertIsNotNone(note)
+        self.assertIn("MiniMax-M3", note)
+        self.assertIn("preserved across rounds", note)
+
+    def test_minimax_variants_detected(self):
+        for prov in ("minimax", "minimax-cn", "minimax-oauth"):
+            self.assertIsNotNone(_model_family_briefing(prov, None), prov)
+
+    def test_minimax_by_model_substring_only(self):
+        # provider unknown (e.g. custom relay) but model names MiniMax-M3
+        note = _model_family_briefing("custom", "MiniMax-M3")
+        self.assertIsNotNone(note)
+        self.assertIn("MiniMax-M3", note)
+
+    def test_glm_provider_returns_glm_block(self):
+        note = _model_family_briefing("zai", "glm-5.2")
+        self.assertIsNotNone(note)
+        self.assertIn("GLM", note)
+        # the GLM-specific arg-shape guidance (coerce_tool_args quirk)
+        self.assertIn("flat", note)
+        self.assertIn("['a','b']", note)
+
+    def test_glm_aliases_and_model_substring(self):
+        for prov, model in (
+            ("z-ai", "glm-5.2"),
+            ("zhipu", "glm-5"),
+            ("custom", "glm-4-9b"),
+        ):
+            self.assertIsNotNone(_model_family_briefing(prov, model), (prov, model))
+
+    def test_other_providers_return_none(self):
+        # Critical: no behaviour change for any non-M3/GLM child.
+        for prov, model in (
+            ("deepseek", "deepseek-v4-pro"),
+            ("nous", "stepfun/step-3.7-flash:free"),
+            ("anthropic", "claude-opus-4-8"),
+            ("moonshot", "kimi-k2.6"),
+            ("local-ollama", "qwen-dsv4-flash:latest"),
+            (None, None),
+            ("", ""),
+        ):
+            self.assertIsNone(_model_family_briefing(prov, model), (prov, model))
+
+    # --- end-to-end through the prompt builder ---
+    def test_prompt_appends_m3_note(self):
+        prompt = _build_child_system_prompt(
+            "do x", model_provider="minimax", model_name="MiniMax-M3"
+        )
+        self.assertIn("Model note (MiniMax-M3)", prompt)
+        self.assertIn("YOUR TASK", prompt)  # base scaffold intact
+
+    def test_prompt_appends_glm_note(self):
+        prompt = _build_child_system_prompt(
+            "do x", model_provider="zai", model_name="glm-5.2"
+        )
+        self.assertIn("Model note (GLM)", prompt)
+
+    def test_prompt_unchanged_for_other_models(self):
+        base = _build_child_system_prompt("do x")
+        ds = _build_child_system_prompt(
+            "do x", model_provider="deepseek", model_name="deepseek-v4-pro"
+        )
+        self.assertNotIn("Model note", ds)
+        # byte-for-byte identical to the no-provider prompt
+        self.assertEqual(base, ds)
+
+    def test_prompt_without_provider_is_neutral(self):
+        prompt = _build_child_system_prompt("do x")
+        self.assertNotIn("Model note", prompt)
+
 
 class TestStripBlockedTools(unittest.TestCase):
     def test_removes_blocked_toolsets(self):
