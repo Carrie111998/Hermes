@@ -1775,23 +1775,33 @@ class TestBuildSchemaFromConfig:
         # Fallback path: never returns an empty list.
         assert len(_timezone_options()) >= 1
 
-    def test_buzz_access_controls_are_exposed_with_secure_defaults(self):
+    def test_all_buzz_controls_are_exposed_with_compatible_defaults(self):
         from hermes_cli.config import DEFAULT_CONFIG
         from hermes_cli.web_server import CONFIG_SCHEMA, _CATEGORY_ORDER
 
         buzz_defaults = DEFAULT_CONFIG["gateway"]["platforms"]["buzz"]["extra"]
         assert buzz_defaults["allowed_users"] == []
         assert buzz_defaults["allow_all_users"] is False
+        assert buzz_defaults["require_mention"] is True
+        assert buzz_defaults["thread_require_mention"] is True
 
         prefix = "gateway.platforms.buzz.extra"
         allowed = CONFIG_SCHEMA[f"{prefix}.allowed_users"]
         allow_all = CONFIG_SCHEMA[f"{prefix}.allow_all_users"]
+        require_mention = CONFIG_SCHEMA[f"{prefix}.require_mention"]
+        thread_require_mention = CONFIG_SCHEMA[f"{prefix}.thread_require_mention"]
         assert allowed["type"] == "list"
         assert allow_all["type"] == "boolean"
+        assert require_mention["type"] == "boolean"
+        assert thread_require_mention["type"] == "boolean"
         assert allowed["category"] == "buzz"
         assert allow_all["category"] == "buzz"
+        assert require_mention["category"] == "buzz"
+        assert thread_require_mention["category"] == "buzz"
         assert "inbound" in allowed["description"].lower()
         assert "inbound" in allow_all["description"].lower()
+        assert "mention" in require_mention["description"].lower()
+        assert "thread" in thread_require_mention["description"].lower()
 
         discord_index = _CATEGORY_ORDER.index("discord")
         assert _CATEGORY_ORDER[discord_index:discord_index + 3] == [

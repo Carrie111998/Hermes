@@ -852,6 +852,14 @@ def _timezone_options() -> List[str]:
 
 
 _SCHEMA_OVERRIDES: Dict[str, Dict[str, Any]] = {
+    "gateway.platforms.buzz.extra.require_mention": {
+        "category": "buzz",
+        "description": "Require Mention",
+    },
+    "gateway.platforms.buzz.extra.thread_require_mention": {
+        "category": "buzz",
+        "description": "Require Mention in Active Threads",
+    },
     "gateway.platforms.buzz.extra.allowed_users": {
         "category": "buzz",
         "description": (

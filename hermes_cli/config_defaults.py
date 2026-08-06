@@ -2464,6 +2464,10 @@ DEFAULT_CONFIG = {
                     "allowed_users": [],
                     # Secure default: do not admit every community member implicitly.
                     "allow_all_users": False,
+                    # Require @mention in shared channels.
+                    "require_mention": True,
+                    # Preserve strict historical behavior for thread replies.
+                    "thread_require_mention": True,
                 },
             },
         },
