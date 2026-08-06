@@ -130,6 +130,15 @@ _POLICY_CLAIM_MODEL_RE = re.compile(
     r'|doubao|kimi|ernie|spark|hunyuan|bedrock|azure'
     r'|yi|glm|baichuan'
     r'|together|fireworks|replicate'
+    # Registered model-provider plugin identifiers (plugins/model-providers/).
+    # Word-boundary matching means compound names (openai-codex, kimi-coding,
+    # qwen-oauth, azure-foundry, copilot-acp) are covered by their base word.
+    # Base forms of compound identifiers (ollama, opencode) are included so
+    # colloquial usage like "never use ollama" is caught, not just the exact
+    # registered plugin name (ollama-cloud, opencode-zen).
+    r'|openrouter|huggingface|minimax|ollama(?:-cloud)?|vertex'
+    r'|copilot|stepfun|xiaomi|zai|kilocode|nous|novita'
+    r'|deepinfra|gmi|arcee|upstage|ai-gateway|custom|actual|alibaba|opencode(?:-zen)?'
     r')\b',
     re.IGNORECASE,
 )
@@ -1089,11 +1098,17 @@ def _check_policy_claim_gate(action: str, target: str, content: Optional[str],
     try:
         from tools import write_approval as wa
     except Exception as e:
-        logger.warning(
-            "Policy-claim gate: cannot import write_approval, "
-            "failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
+        # Fail CLOSED: a detected high-impact claim must never silently
+        # persist because the staging subsystem is unavailable.
+        logger.error("Policy-claim gate: cannot import write_approval, "
+                     "blocking write (%s)", e)
+        return tool_error(
+            "This write looks like an operational policy claim and was "
+            "blocked because the confirmation subsystem is unavailable. "
+            "Nothing was saved. Retry once the staging subsystem is healthy.",
+            success=False,
+            policy_claim=True,
         )
-        return None
 
     label = "user profile" if target == "user" else "memory"
     summary = f"policy claim in {label}: {reason[:80]}"
@@ -1111,10 +1126,17 @@ def _check_policy_claim_gate(action: str, target: str, content: Optional[str],
             origin=wa.current_origin(),
         )
     except Exception as e:
-        logger.warning(
-            "Policy-claim gate: stage_write failed, failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
+        # Fail CLOSED: stage_write is best-effort by contract and normally
+        # never raises; if it does, the claim must not flow through to disk.
+        logger.error("Policy-claim gate: stage_write failed, "
+                     "blocking write (%s)", e)
+        return tool_error(
+            "This write looks like an operational policy claim and was "
+            "blocked because staging failed. Nothing was saved. Retry once "
+            "the staging subsystem is healthy.",
+            success=False,
+            policy_claim=True,
         )
-        return None
 
     logger.info("Policy-claim gate: staged claim (pending_id=%s, reason=%s)",
                 record.get("id"), reason)
@@ -1163,11 +1185,18 @@ def _check_policy_claim_batch(
     try:
         from tools import write_approval as wa
     except Exception as e:
-        logger.warning(
-            "Policy-claim batch gate: cannot import write_approval, "
-            "failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
+        # Fail CLOSED: a detected high-impact claim must never silently
+        # persist because the staging subsystem is unavailable.
+        logger.error("Policy-claim batch gate: cannot import write_approval, "
+                     "blocking write (%s)", e)
+        return tool_error(
+            "This batch looks like it contains an operational policy claim "
+            "and was blocked because the confirmation subsystem is "
+            "unavailable. Nothing was saved. Retry once the staging "
+            "subsystem is healthy.",
+            success=False,
+            policy_claim=True,
         )
-        return None
 
     label = "user profile" if target == "user" else "memory"
     summary = f"policy claim(s) in batch to {label}: {'; '.join(reasons)[:120]}"
@@ -1184,10 +1213,17 @@ def _check_policy_claim_batch(
             origin=wa.current_origin(),
         )
     except Exception as e:
-        logger.warning(
-            "Policy-claim batch gate: stage_write failed, failing open (%s)", e,  # windows-footgun: ok — log phrase, not open()
+        # Fail CLOSED: stage_write is best-effort by contract and normally
+        # never raises; if it does, the claim must not flow through to disk.
+        logger.error("Policy-claim batch gate: stage_write failed, "
+                     "blocking write (%s)", e)
+        return tool_error(
+            "This batch looks like it contains an operational policy claim "
+            "and was blocked because staging failed. Nothing was saved. "
+            "Retry once the staging subsystem is healthy.",
+            success=False,
+            policy_claim=True,
         )
-        return None
 
     logger.info(
         "Policy-claim batch gate: staged batch (pending_id=%s, operations=%d)",
