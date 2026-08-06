@@ -2425,6 +2425,8 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
                     summary_kwargs.update(agent._max_tokens_param(agent.max_tokens))
                 if _lm_reasoning_effort is not None:
                     summary_kwargs["reasoning_effort"] = _lm_reasoning_effort
+                if _aliyun_reasoning_effort is not None:
+                    summary_kwargs["reasoning_effort"] = _aliyun_reasoning_effort
                 if summary_extra_body:
                     summary_kwargs["extra_body"] = summary_extra_body
 
