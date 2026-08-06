@@ -115,13 +115,13 @@ _JOBS_LOCK_TIMEOUT_SECONDS = 30.0
 _OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 OUTPUT_DIR = _OUTPUT_DIR
-# Seconds within which a next_run_at "now" is treated as a manual trigger
-# (trigger_job) rather than a stale cron-scheduled time. Used by the
-# migration-repair branch in _get_due_jobs_locked to avoid swallowing the
-# dashboard "Run now" button (#78516). 60s covers the worst case where the
-# scheduler tick and trigger_job race, but is small enough that a genuinely
-# missed run (hours stale) is never mistaken for a manual trigger.
-_MANUAL_TRIGGER_PROXIMITY_SECS = 60
+# Marker field set by trigger_job() to distinguish manual "Run now" from
+# migration-era stored instants. The migration-repair branch skips recomputation
+# only when this marker is present and still matches (see #78516).
+# Using a marker rather than a time-proximity heuristic avoids the fundamental
+# ambiguity where a ticker's 60s cadence makes a freshly-migrated instant
+# indistinguishable from a manual trigger by age alone.
+_MANUAL_TRIGGER_MARKER = "manual_run_now"
 
 
 @dataclass(frozen=True)
@@ -1667,6 +1667,7 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "paused_at": None,
             "paused_reason": None,
             "next_run_at": _hermes_now().isoformat(),
+            "_manual_trigger_at": _MANUAL_TRIGGER_MARKER,
         },
     )
 
@@ -2382,15 +2383,14 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
             # and DST-boundary collisions with a still-future stored wall clock are
             # rare relative to the double-fire bug this prevents (#28934).
             #
-            # Exception: if next_run_dt is within a few seconds of now, it is almost
-            # certainly a manual trigger from trigger_job() rather than a stored
-            # migration-era timestamp. In that case we let the job fire and skip the
-            # recomputation, which would otherwise swallow the manual trigger
-            # (see #78516).
+            # Exception: if _manual_trigger_at is set, it is a manual trigger from
+            # trigger_job() rather than a stored migration-era timestamp. In that
+            # case we let the job fire and skip the recomputation, which would
+            # otherwise swallow the manual trigger (see #78516).
             if (
                 kind == "cron"
                 and next_run_dt <= now
-                and (now - next_run_dt).total_seconds() > _MANUAL_TRIGGER_PROXIMITY_SECS
+                and raw_jobs[0].get("_manual_trigger_at") != _MANUAL_TRIGGER_MARKER
                 and _timezone_offset_mismatch(raw_next_run_dt, now)
                 and _stored_wall_clock_is_future(raw_next_run_dt, now)
             ):
