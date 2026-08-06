@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextvars
-import inspect
 import json
 import logging
 from collections.abc import Callable, Iterator

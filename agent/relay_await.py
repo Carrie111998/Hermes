@@ -30,6 +30,11 @@ Two layers, because one is not enough:
    executor's ``shutdown(wait=False)`` policy for hung workers, and
    ``TimeoutError`` is raised so the turn can continue.
 
+The same abandon policy applies to ``KeyboardInterrupt``: Ctrl-C interrupts
+the calling thread's wait promptly, but the worker (and the tool it is
+running) is abandoned rather than cancelled and may complete detached —
+matching how the concurrent executor treats its workers on interrupt.
+
 The worker is wrapped with ``tools.thread_context.propagate_context_to_thread``
 so the turn's ContextVars and the thread-local approval/sudo callbacks reach
 the tool callback despite the thread shift (same audited mechanism the
