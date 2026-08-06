@@ -925,7 +925,8 @@ export function ChatBar({
         onStart: startConversation,
         onStopTurn: conversation.stopTurn,
         onToggleMute: conversation.toggleMute,
-        status: conversation.status
+        status: conversation.status,
+        transcript: conversation.transcript
       }}
       disabled={disabled}
       hasComposerPayload={hasComposerPayload}

@@ -95,6 +95,10 @@ class WhatsAppOnboardingApply(BaseModel):
 class AudioTranscriptionRequest(BaseModel):
     data_url: str
     mime_type: Optional[str] = None
+    # Desktop voice composer: force on-device STT, and run a bounded
+    # best-effort preview pass whose result never overrides the final one.
+    local_only: bool = False
+    preview_only: bool = False
 
 
 class ManagedFileUpload(BaseModel):

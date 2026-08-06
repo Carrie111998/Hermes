@@ -29,6 +29,7 @@ import json
 import logging
 import math
 import mimetypes
+import multiprocessing
 import os
 import queue
 import re
@@ -1413,6 +1414,172 @@ _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
     "video/webm": ".webm",
 }
 _MAX_TRANSCRIPTION_UPLOAD_BYTES = 25 * 1024 * 1024
+_PARTIAL_TRANSCRIPTION_TIMEOUT_SECONDS = 12.0
+_PARTIAL_TRANSCRIPTION_LOCK = threading.Lock()
+_ACTIVE_PREVIEW_PROCESS_LOCK = threading.Lock()
+_ACTIVE_PREVIEW_PROCESS = None
+_ACTIVE_FINAL_TRANSCRIPTIONS = 0
+
+
+def _local_preview_process_worker(file_path: str, result_connection) -> None:
+    """Run best-effort local preview STT in a process that can be terminated."""
+    try:
+        from tools.transcription_tools import transcribe_audio
+
+        result_connection.send(
+            ("result", transcribe_audio(file_path, provider_override="local"))
+        )
+    except BaseException as exc:
+        result_connection.send(("error", f"{type(exc).__name__}: {exc}"))
+    finally:
+        result_connection.close()
+
+
+def _stop_preview_process(process, join_timeout: float = 1.0) -> None:
+    if process is None or not process.is_alive():
+        return
+    process.terminate()
+    process.join(join_timeout)
+    if process.is_alive() and hasattr(process, "kill"):
+        process.kill()
+        process.join(join_timeout)
+
+
+def _cleanup_preview_process(process) -> None:
+    """Best-effort cleanup, including a Process whose start partially failed."""
+    if process is None:
+        return
+    try:
+        _stop_preview_process(process)
+    except (AssertionError, OSError, ValueError):
+        pass
+    try:
+        process.join(1.0)
+    except (AssertionError, OSError, ValueError):
+        # multiprocessing raises AssertionError when start failed before the
+        # child was created. There is nothing to join in that case.
+        pass
+    try:
+        process.close()
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
+def _cancel_active_preview_process() -> None:
+    """Cancel and detach the active preview without waiting under its lock."""
+    global _ACTIVE_PREVIEW_PROCESS
+
+    with _ACTIVE_PREVIEW_PROCESS_LOCK:
+        process = _ACTIVE_PREVIEW_PROCESS
+        _ACTIVE_PREVIEW_PROCESS = None
+    _cleanup_preview_process(process)
+
+
+def _begin_final_transcription_priority() -> None:
+    """Atomically block new previews and detach the currently active one."""
+    global _ACTIVE_FINAL_TRANSCRIPTIONS, _ACTIVE_PREVIEW_PROCESS
+
+    with _ACTIVE_PREVIEW_PROCESS_LOCK:
+        _ACTIVE_FINAL_TRANSCRIPTIONS += 1
+        process = _ACTIVE_PREVIEW_PROCESS
+        _ACTIVE_PREVIEW_PROCESS = None
+    # Never wait for a child while holding the state lock. Its preview thread
+    # needs that lock in its own cleanup path.
+    try:
+        _cleanup_preview_process(process)
+    except BaseException:
+        _end_final_transcription_priority()
+        raise
+
+
+def _end_final_transcription_priority() -> None:
+    global _ACTIVE_FINAL_TRANSCRIPTIONS
+
+    with _ACTIVE_PREVIEW_PROCESS_LOCK:
+        _ACTIVE_FINAL_TRANSCRIPTIONS -= 1
+
+
+def _release_final_priority_after_acquisition(future) -> None:
+    """Release priority once a cancelled request's acquisition really finishes."""
+    try:
+        future.result()
+    except BaseException:
+        # A failed acquisition never transferred ownership to the request.
+        return
+    _end_final_transcription_priority()
+
+
+def _finish_cancelled_final_transcription(future, temp_path: str) -> None:
+    """Keep final priority and its input alive until executor work really ends."""
+    try:
+        future.exception()
+    except BaseException:
+        # The request is already gone; retrieve the result/exception only to
+        # avoid an unobserved-future warning. Endpoint behavior is unchanged.
+        pass
+    finally:
+        _end_final_transcription_priority()
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def _run_local_preview_isolated(
+    file_path: str,
+    timeout_seconds: float,
+    worker_target=None,
+) -> Dict[str, Any]:
+    """Run preview STT in bounded process isolation.
+
+    Python threads cannot cancel a hung faster-whisper call, so a timed-out
+    thread could retain the singleton model lock forever. A dedicated spawned
+    process owns its own model instance and is forcibly reaped on timeout or
+    when a final request arrives; the authoritative in-process model is never
+    locked by preview work.
+    """
+    global _ACTIVE_PREVIEW_PROCESS
+
+    receive_connection = None
+    send_connection = None
+    process = None
+    try:
+        context = multiprocessing.get_context("spawn")
+        receive_connection, send_connection = context.Pipe(duplex=False)
+        process = context.Process(
+            target=worker_target or _local_preview_process_worker,
+            args=(file_path, send_connection),
+            daemon=True,
+        )
+
+        # Launch and registration are one state transition with final-priority
+        # claiming. If a final request wins the lock, this preview never starts;
+        # if launch wins, the final request sees and reaps the registered child.
+        with _ACTIVE_PREVIEW_PROCESS_LOCK:
+            if _ACTIVE_FINAL_TRANSCRIPTIONS:
+                raise TimeoutError("Local preview transcription was cancelled")
+            process.start()
+            _ACTIVE_PREVIEW_PROCESS = process
+
+        send_connection.close()
+        if not receive_connection.poll(timeout_seconds):
+            raise TimeoutError("Local preview transcription timed out")
+        try:
+            kind, value = receive_connection.recv()
+        except EOFError as exc:
+            raise TimeoutError("Local preview transcription was cancelled") from exc
+        if kind == "error":
+            raise RuntimeError(value)
+        return value
+    finally:
+        with _ACTIVE_PREVIEW_PROCESS_LOCK:
+            if _ACTIVE_PREVIEW_PROCESS is process:
+                _ACTIVE_PREVIEW_PROCESS = None
+        _cleanup_preview_process(process)
+        if send_connection is not None:
+            send_connection.close()
+        if receive_connection is not None:
+            receive_connection.close()
 
 
 def _audio_extension_for_mime(mime_type: str) -> str:
@@ -4305,6 +4472,12 @@ async def check_hermes_update(force: bool = False):
 async def transcribe_audio_upload(
     payload: AudioTranscriptionRequest, profile: Optional[str] = None
 ):
+    if payload.preview_only and not payload.local_only:
+        raise HTTPException(
+            status_code=400,
+            detail="Preview transcription must use the local provider",
+        )
+
     data_url = (payload.data_url or "").strip()
     if not data_url.startswith("data:") or "," not in data_url:
         raise HTTPException(status_code=400, detail="Invalid audio payload")
@@ -4337,8 +4510,19 @@ async def transcribe_audio_upload(
     if len(audio_bytes) > _MAX_TRANSCRIPTION_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail="Audio recording is too large")
 
+    preview_lock_acquired = False
+    final_priority_acquired = False
     temp_path = ""
+    result: Dict[str, Any] = {}
     try:
+        if payload.preview_only:
+            preview_lock_acquired = _PARTIAL_TRANSCRIPTION_LOCK.acquire(blocking=False)
+            if not preview_lock_acquired:
+                raise HTTPException(
+                    status_code=429,
+                    detail="A local preview transcription is already running",
+                )
+
         suffix = _audio_extension_for_mime(mime_type)
         with tempfile.NamedTemporaryFile(
             prefix="hermes-desktop-voice-",
@@ -4361,16 +4545,65 @@ async def transcribe_audio_upload(
             # probe above). STT only needs config/.env resolution, which the
             # contextvar override provides inside this worker thread.
             with _config_profile_scope(profile):
+                # Pass provider_override only when the caller actually demands
+                # locality, so the ordinary path stays byte-identical to the
+                # plain transcribe_recording(path) call it has always been.
+                if payload.local_only:
+                    return transcribe_recording(temp_path, provider_override="local")
+
                 return transcribe_recording(temp_path)
 
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, _transcribe_scoped)
+        if payload.preview_only:
+            try:
+                result = await asyncio.to_thread(
+                    _run_local_preview_isolated,
+                    temp_path,
+                    _PARTIAL_TRANSCRIPTION_TIMEOUT_SECONDS,
+                )
+            except TimeoutError:
+                raise HTTPException(
+                    status_code=504,
+                    detail="Local preview transcription timed out",
+                )
+        else:
+            # Final transcription is authoritative. Claim priority before
+            # entering any provider/model path, then hold it until the final
+            # call completes so no new preview can overlap it.
+            priority_acquisition = asyncio.create_task(
+                asyncio.to_thread(_begin_final_transcription_priority)
+            )
+            try:
+                await asyncio.shield(priority_acquisition)
+            except asyncio.CancelledError:
+                priority_acquisition.add_done_callback(
+                    _release_final_priority_after_acquisition
+                )
+                raise
+            final_priority_acquired = True
+
+            final_transcription = loop.run_in_executor(None, _transcribe_scoped)
+            try:
+                result = await asyncio.shield(final_transcription)
+            except asyncio.CancelledError:
+                final_priority_acquired = False
+                cancelled_temp_path, temp_path = temp_path, ""
+                final_transcription.add_done_callback(
+                    lambda future, path=cancelled_temp_path: (
+                        _finish_cancelled_final_transcription(future, path)
+                    )
+                )
+                raise
     except HTTPException:
         raise
     except Exception as exc:
         _log.exception("Desktop voice transcription failed")
         raise HTTPException(status_code=500, detail=f"Transcription failed: {exc}")
     finally:
+        if final_priority_acquired:
+            _end_final_transcription_priority()
+        if preview_lock_acquired:
+            _PARTIAL_TRANSCRIPTION_LOCK.release()
         if temp_path:
             try:
                 os.unlink(temp_path)

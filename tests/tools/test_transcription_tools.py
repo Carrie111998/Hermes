@@ -506,6 +506,25 @@ class TestValidateAudioFileEdgeCases:
 # ============================================================================
 
 class TestTranscribeAudioDispatch:
+    def test_provider_override_forces_local_without_cloud_fallback(self, sample_ogg):
+        """A local-pinned call must never reach the configured cloud provider."""
+        local_result = {"success": True, "transcript": "local", "provider": "local"}
+
+        with patch(
+            "tools.transcription_tools._load_stt_config",
+            return_value={"provider": "groq", "local": {"model": "small"}},
+        ), patch("tools.transcription_tools._HAS_FASTER_WHISPER", True), patch(
+            "tools.transcription_tools._transcribe_local",
+            return_value=local_result,
+        ) as mock_local, patch("tools.transcription_tools._transcribe_groq") as mock_groq:
+            from tools.transcription_tools import transcribe_audio
+
+            result = transcribe_audio(sample_ogg, provider_override="local")
+
+        assert result == local_result
+        mock_local.assert_called_once_with(sample_ogg, "small")
+        mock_groq.assert_not_called()
+
     def test_oversized_local_file_reaches_dispatcher(self, oversized_wav):
         with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "local"}), \
              patch("tools.transcription_tools._get_provider", return_value="local"), \

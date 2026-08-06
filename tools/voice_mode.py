@@ -1328,7 +1328,12 @@ def voice_stop_hint() -> str:
 # ============================================================================
 # STT dispatch
 # ============================================================================
-def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def transcribe_recording(
+    wav_path: str,
+    model: Optional[str] = None,
+    *,
+    provider_override: Optional[str] = None,
+) -> Dict[str, Any]:
     """Transcribe a WAV recording using the existing Whisper pipeline.
 
     Delegates to ``tools.transcription_tools.transcribe_audio()``.
@@ -1337,13 +1342,15 @@ def transcribe_recording(wav_path: str, model: Optional[str] = None) -> Dict[str
     Args:
         wav_path: Path to the WAV file.
         model: Whisper model name (default: from config or ``whisper-1``).
+        provider_override: Force an STT provider (``"local"`` keeps audio on
+            the machine for the desktop composer's local-only voice mode).
 
     Returns:
         Dict with ``success``, ``transcript``, and optionally ``error``.
     """
     from tools.transcription_tools import MAX_FILE_SIZE, transcribe_audio
 
-    result = transcribe_audio(wav_path, model=model)
+    result = transcribe_audio(wav_path, model=model, provider_override=provider_override)
 
     # Only chunk when the provider itself reports "File too large" —
     # local providers (faster-whisper, whisper.cpp, etc.) have no upload

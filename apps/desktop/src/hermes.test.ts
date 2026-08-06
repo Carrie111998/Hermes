@@ -384,9 +384,15 @@ describe('Hermes REST helpers', () => {
     })
 
     expect(api).toHaveBeenCalledWith({
-      body: { data_url: 'data:audio/webm;base64,AA==', mime_type: 'audio/webm' },
+      body: {
+        data_url: 'data:audio/webm;base64,AA==',
+        local_only: false,
+        mime_type: 'audio/webm',
+        preview_only: false
+      },
       method: 'POST',
       path: '/api/audio/transcribe',
+      requireLocalBackend: false,
       timeoutMs: AUDIO_TRANSCRIBE_MIN_REQUEST_TIMEOUT_MS
     })
   })

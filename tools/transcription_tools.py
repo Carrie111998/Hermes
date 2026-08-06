@@ -1619,7 +1619,13 @@ def _join_confident_segments(segments: Any, local_cfg: Dict[str, Any]) -> str:
 
 
 def _transcribe_local(file_path: str, model_name: str) -> Dict[str, Any]:
-    """Transcribe using faster-whisper (local, free)."""
+    """Transcribe using the process-wide faster-whisper singleton.
+
+    Only the model *load* is serialized (see `_local_model_lock`), not the
+    transcription itself — desktop preview passes run in their own spawned
+    process (`_run_local_preview_isolated`), so they never contend for this
+    in-process model and must not be able to hold it hostage.
+    """
     global _local_model, _local_model_name
 
     if not _HAS_FASTER_WHISPER:
@@ -2351,7 +2357,12 @@ def _transcribe_deepinfra(file_path: str, model_name: str) -> Dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
+def _transcribe_prepared_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    *,
+    provider_override: Optional[str] = None,
+) -> Dict[str, Any]:
     """
     Transcribe an audio file using the configured STT provider.
 
@@ -2362,6 +2373,7 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
     Args:
         file_path: Absolute path to the audio file to transcribe.
         model:     Override the model. If None, uses config or provider default.
+        provider_override: Force a provider for privacy-sensitive call sites.
 
     Returns:
         dict with keys:
@@ -2395,7 +2407,11 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
             "error": "STT is disabled in config.yaml (stt.enabled: false).",
         }
 
-    provider = _get_provider(stt_config)
+    provider = _get_provider(
+        {**stt_config, "provider": provider_override}
+        if provider_override
+        else stt_config
+    )
     if not _is_local_stt_provider(provider, stt_config):
         error = _validate_audio_file_size(Path(file_path))
         if error:
@@ -2521,8 +2537,18 @@ def _transcribe_prepared_audio(file_path: str, model: Optional[str] = None) -> D
     }
 
 
-def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, Any]:
-    """Safely validate, preprocess supported inputs, and dispatch transcription."""
+def transcribe_audio(
+    file_path: str,
+    model: Optional[str] = None,
+    *,
+    provider_override: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Safely validate, preprocess supported inputs, and dispatch transcription.
+
+    ``provider_override`` forces a specific STT provider for privacy-sensitive
+    call sites (desktop voice preview passes ``"local"`` so audio never leaves
+    the machine), bypassing config/auto-detect provider selection.
+    """
     # Refuse to feed a credential / secret store (auth.json, .env, OAuth
     # tokens, mcp-tokens/, ...) to an STT provider — before ANY validation or
     # preprocessing, so the refusal names the real reason rather than a
@@ -2554,7 +2580,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         prepared_error = _validate_audio_file(prepared_path, enforce_size_limit=False)
         if prepared_error:
             return prepared_error
-        return _transcribe_prepared_audio(prepared_path, model)
+        return _transcribe_prepared_audio(
+            prepared_path, model, provider_override=provider_override
+        )
     finally:
         if cleanup_dir:
             shutil.rmtree(cleanup_dir, ignore_errors=True)
