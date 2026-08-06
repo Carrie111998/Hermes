@@ -6,11 +6,20 @@ Handler injected to avoid importing ``main``.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Callable
 
 
-def _cmd_memory_reset(args):
-    """Lazy import keeps the ordinary CLI startup path lightweight."""
+_LEGACY_RESET_TARGETS = frozenset({"all", "memory", "user"})
+
+
+def _dispatch_memory_reset(args, *, legacy_handler: Callable):
+    """Route existing targets to the legacy handler and new targets safely."""
+    target = getattr(args, "target", "all")
+    if target in _LEGACY_RESET_TARGETS:
+        return legacy_handler(args)
+
+    # Lazy import keeps the ordinary CLI startup path lightweight.
     from hermes_cli.memory_reset import cmd_memory_reset
 
     return cmd_memory_reset(args)
@@ -61,4 +70,6 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
             "'memory', 'user', 'conversations', or 'everything'"
         ),
     )
-    _reset_parser.set_defaults(func=_cmd_memory_reset)
+    _reset_parser.set_defaults(
+        func=partial(_dispatch_memory_reset, legacy_handler=cmd_memory)
+    )
