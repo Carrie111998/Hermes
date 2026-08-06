@@ -451,7 +451,13 @@ class TestRuntimeNeverDowngrade:
         def install(self, specs) -> ld._InstallResult:
             self.installed.extend(specs)
             for spec in specs:
-                pkg, _, want = spec.partition("==")
+                pkg = ld._pkg_name_from_spec(spec)
+                _, _, want = spec.partition("==")
+                if not want:
+                    # Range spec (e.g. "pkg>=0.6.1"): resolve to the floor so
+                    # the post-install verify sees a satisfying version.
+                    floor = ld._spec_floor_version(spec)
+                    want = str(floor[0]) if floor else ""
                 if want:
                     self.versions[pkg] = want
             return ld._InstallResult(True, "ok", "")
@@ -487,15 +493,17 @@ class TestRuntimeNeverDowngrade:
         assert ld.is_available("memory.no-such-backend") is False
 
     def test_mismatch_message_distinguishes_version_mismatch(self, monkeypatch):
-        self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
-        desc = ld._describe_missing(self._PIN)
-        assert "0.8.6" in desc and "version mismatch" in desc
+        self._patch_env(monkeypatch, {"honcho-ai": "2.3.0"})
+        desc = ld._describe_missing("honcho-ai==2.2.0")
+        assert "2.3.0" in desc and "version mismatch" in desc
 
     def test_spec_floor_version(self):
         from packaging.version import Version
-        assert ld._spec_floor_version("hindsight-client==0.6.1") == Version("0.6.1")
-        assert ld._spec_floor_version("slack-bolt>=1.18.0,<2") == Version("1.18.0")
-        assert ld._spec_floor_version("honcho-ai~=1.4") == Version("1.4")
+        assert ld._spec_floor_version("hindsight-client>=0.6.1") == (Version("0.6.1"), False)
+        assert ld._spec_floor_version("slack-bolt>=1.18.0,<2") == (Version("1.18.0"), False)
+        assert ld._spec_floor_version("honcho-ai~=1.4") == (Version("1.4"), False)
+        assert ld._spec_floor_version("pkg>1.0") == (Version("1.0"), True)
+        assert ld._spec_floor_version("pkg>1.0,<2") == (Version("1.0"), True)
         assert ld._spec_floor_version("bare-package") is None
         assert ld._spec_floor_version("only-ceiling<2") is None
 
@@ -534,17 +542,37 @@ class TestRuntimeNeverDowngrade:
 
     # -- acceptance (c): hermes update keeps strict pin propagation ---------
     def test_strict_feature_missing_still_flags_newer(self, monkeypatch):
+        # The floor pin makes hindsight itself strict-satisfied on newer
+        # (see test_floor_pinned_feature_newer_is_strict_satisfied), so the
+        # strict-contract probe uses an ==-pinned feature: the default
+        # (strict) predicate is the update path's detector.
+        self._patch_env(monkeypatch, {"honcho-ai": "2.3.0"})
+        assert ld.feature_missing("memory.honcho") == ("honcho-ai==2.2.0",)
+        assert ld._is_satisfied("honcho-ai==2.2.0") is False
+
+    def test_floor_pinned_feature_newer_is_strict_satisfied(self, monkeypatch):
+        # A floor pin (>=) expresses "any newer is acceptable" — even the
+        # strict predicate accepts 0.8.6, so no downgrade signal exists on
+        # ANY path for this feature (issue #80390, suggestion #4).
         self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
-        # Default (strict) predicate is the update path's detector.
-        assert ld.feature_missing("memory.hindsight") == (self._PIN,)
-        assert ld._is_satisfied(self._PIN) is False
+        assert ld._is_satisfied(self._PIN) is True
+        assert ld.feature_missing("memory.hindsight") == ()
+
+    def test_exclusive_floor_bound_is_honoured(self, monkeypatch):
+        # ``>1.0`` with exactly 1.0.0 installed is a genuine runtime
+        # mismatch (satisfying it is an upgrade, never a downgrade);
+        # one patch release past the bound is satisfied.
+        self._patch_env(monkeypatch, {"pkg-x": "1.0.0"})
+        assert ld._is_satisfied_runtime("pkg-x>1.0") is False
+        self._patch_env(monkeypatch, {"pkg-x": "1.0.1"})
+        assert ld._is_satisfied_runtime("pkg-x>1.0") is True
 
     def test_refresh_active_features_never_downgrades(self, monkeypatch):
-        fake = self._patch_env(monkeypatch, {self._PKG: "0.8.6"})
-        monkeypatch.setattr(ld, "active_features", lambda: ["memory.hindsight"])
+        fake = self._patch_env(monkeypatch, {"honcho-ai": "2.3.0"})
+        monkeypatch.setattr(ld, "active_features", lambda: ["memory.honcho"])
         result = ld.refresh_active_features(prompt=False)
         # ensure() (the only installer) no-ops on newer — nothing downgraded.
         assert fake.installed == []
         # Strict pre-check still classifies the feature as needing a refresh
         # (acceptance (c)); the refresh itself is a no-op thanks to ensure().
-        assert result["memory.hindsight"] == "refreshed"
+        assert result["memory.honcho"] == "refreshed"

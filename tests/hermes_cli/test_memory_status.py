@@ -99,7 +99,7 @@ class TestStatusUsesRuntimePredicate:
         out = self._run(capfd, "hindsight", _StubProvider(available=True), versions={})
         assert "available ✓" not in out
         assert "not available ✗" in out
-        assert "hindsight-client==0.6.1" in out  # reason surfaced
+        assert "hindsight-client>=0.6.1" in out  # reason surfaced
 
     def test_provider_with_off_pin_install_still_available(self, capfd):
         # Newer-than-pin installed: runtime is satisfied (never-downgrade),

@@ -191,7 +191,15 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Floor-pinned on purpose (issue #80390, suggestion #4, reporter-validated):
+    # the embedded hindsight stack is operator-installed from a MOVING PyPI
+    # train (hindsight-all resolves to 0.8.x today) outside the image's
+    # lockfile, and the backend's data dir ratchets forward with each release —
+    # the client must be allowed to ride that train. A bare floor still flags
+    # absent/below-pin installs; every other lazy feature stays exactly pinned
+    # (==) for deterministic installs. The `hindsight` extra in pyproject.toml
+    # keeps its == pin: that is the deterministic CI surface.
+    "memory.hindsight": ("hindsight-client>=0.6.1",),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -631,12 +639,18 @@ def _is_satisfied(spec: str) -> bool:
 
 
 def _spec_floor_version(spec: str):
-    """Return the lowest acceptable version implied by ``spec``, or None.
+    """Return ``(floor, exclusive)`` — the lowest acceptable version implied
+    by ``spec`` and whether that bound is exclusive (``>``) — or None when the
+    spec has no usable lower bound.
 
     The floor is the max of the versions contributed by the spec's lower
-    bound operators (``==``, ``>=``, ``>``, ``~=``) — e.g. ``==0.6.1`` →
-    ``0.6.1``, ``>=0.20,<1`` → ``0.20``. Ceiling-only specs (``<2``) and
-    unparseable specs have no floor and return None.
+    bound operators (``==``, ``>=``, ``>``, ``~=``) — e.g. ``>=0.6.1`` →
+    ``(0.6.1, False)``, ``>1.0`` → ``(1.0, True)``, ``>=0.20,<1`` →
+    ``(0.20, False)``. ``exclusive`` is True when the max floor came from a
+    ``>`` operator (a strict ``>`` wins a same-version tie with ``>=``/``==``),
+    so the runtime can treat ``>1.0`` with 1.0.0 installed as a genuine
+    mismatch — satisfying it is an upgrade, never a downgrade. Ceiling-only
+    specs (``<2``) and unparseable specs have no floor and return None.
     """
     spec_tail = _specifier_from_spec(spec)
     if not spec_tail:
@@ -651,10 +665,15 @@ def _spec_floor_version(spec: str):
     for specifier in specifiers:
         if specifier.operator in ("==", ">=", ">", "~="):
             try:
-                floors.append(Version(specifier.version))
+                floors.append(
+                    (Version(specifier.version), specifier.operator == ">")
+                )
             except InvalidVersion:
                 continue
-    return max(floors) if floors else None
+    if not floors:
+        return None
+    # (Version, bool) tuples: an exclusive ">" wins a same-version tie.
+    return max(floors)
 
 
 def _is_satisfied_runtime(spec: str) -> bool:
@@ -689,7 +708,12 @@ def _is_satisfied_runtime(spec: str) -> bool:
         return True
     try:
         from packaging.version import Version
-        return Version(installed) >= floor
+        floor_ver, exclusive = floor
+        if exclusive:
+            # ``>1.0`` with 1.0.0 installed is a genuine mismatch — fixing
+            # it is an upgrade, never a downgrade.
+            return Version(installed) > floor_ver
+        return Version(installed) >= floor_ver
     except Exception:
         # Unparseable installed version — err on "don't churn".
         return True
