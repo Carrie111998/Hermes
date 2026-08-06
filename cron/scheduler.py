@@ -162,6 +162,16 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+class CronSkillLoadError(Exception):
+    """Raised when every skill declared on a cron job fails to load.
+
+    Caught in ``run_job`` so the scheduler delivers a structured error
+    instead of invoking the LLM with a contextless prompt that often
+    returns ``[SILENT]`` and hides multi-week monitoring outages (#77362).
+    Partial load failures still proceed with a notice (loaded skills only).
+    """
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -2582,6 +2592,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
 
     parts = []
     skipped: list[str] = []
+    skip_errors: list[str] = []
     for skill_name in skill_names:
         # Cron jobs historically accepted only skill names here, but the CLI/gateway
         # slash-command path lets bundles shadow skills with the same slug. Mirror
@@ -2606,6 +2617,7 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 skill_name,
             )
             skipped.append(skill_name)
+            skip_errors.append(f"bundle '{skill_name}' could not load any skills")
             continue
 
         try:
@@ -2613,11 +2625,13 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
         except (json.JSONDecodeError, TypeError):
             logger.warning("Cron job '%s': skill '%s' returned invalid JSON, skipping", job.get("name", job.get("id")), skill_name)
             skipped.append(skill_name)
+            skip_errors.append(f"skill '{skill_name}' returned invalid JSON")
             continue
         if not loaded.get("success"):
             error = loaded.get("error") or f"Failed to load skill '{skill_name}'"
             logger.warning("Cron job '%s': skill not found, skipping — %s", job.get("name", job.get("id")), error)
             skipped.append(skill_name)
+            skip_errors.append(str(error))
             continue
 
         # Bump usage so the curator sees this skill as actively used.
@@ -2635,6 +2649,17 @@ def _build_job_prompt(job: dict, prerun_script: Optional[tuple] = None) -> str:
                 "",
                 content,
             ]
+        )
+
+    # All declared skills failed → hard-abort. A contextless LLM often returns
+    # [SILENT] and the failure is invisible for weeks (#77362). Partial failures
+    # still proceed with the loaded subset + a user-visible notice.
+    if skill_names and len(skipped) == len(skill_names) and not parts:
+        job_label = job.get("name") or job.get("id") or "cron-job"
+        detail = "; ".join(skip_errors) if skip_errors else ", ".join(skipped)
+        raise CronSkillLoadError(
+            f"Cron job '{job_label}' aborted: failed to load all declared "
+            f"skills ({', '.join(skipped)}). {detail}"
         )
 
     if skipped:
@@ -2992,6 +3017,27 @@ def run_job(
 
     try:
         prompt = _build_job_prompt(job, prerun_script=prerun_script)
+    except CronSkillLoadError as skill_exc:
+        # Every declared skill failed to load. Do not call the LLM with a
+        # contextless prompt (that path often returns [SILENT] and hides
+        # multi-week monitoring outages — #77362). Deliver a structured error.
+        logger.warning(
+            "Job '%s' (ID: %s): aborted — all skills failed to load — %s",
+            job_name, job_id, skill_exc,
+        )
+        failed_doc = (
+            f"# Cron Job: {job_name}\n\n"
+            f"**Job ID:** {job_id}\n"
+            f"**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"**Status:** ERROR\n\n"
+            "ERROR: Cron job aborted.\n"
+            "Failed to load all declared skills — the agent was NOT run "
+            "(no skill context would have been available).\n\n"
+            f"**Details:** {skill_exc}\n\n"
+            "Fix the skill path(s), resolve name collisions (flat file vs "
+            "directory), or remove the skills entry from this job."
+        )
+        return False, failed_doc, str(skill_exc), str(skill_exc)
     except CronPromptInjectionBlocked as block_exc:
         # Assembled prompt (user prompt + loaded skill content) tripped the
         # injection scanner. Refuse to run the agent this tick and surface

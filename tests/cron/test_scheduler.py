@@ -490,6 +490,41 @@ class TestRunJobSessionPersistence:
         fake_db.close.assert_called_once()
         mock_agent.close.assert_called_once()
 
+    def test_run_job_all_skills_failed_skips_agent_and_surfaces_skill_name(self, tmp_path):
+        """#77362: all skills missing → fail closed, no AIAgent, not [SILENT]."""
+        from cron.scheduler import SILENT_MARKER, _summarize_cron_failure_for_delivery
+
+        job = {
+            "id": "skill-fail-job",
+            "name": "weekly-monitor",
+            "prompt": "do the weekly report",
+            "skills": ["weekly-market-risk-monitor"],
+        }
+
+        with patch("cron.scheduler._hermes_home", tmp_path), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("hermes_cli.env_loader.load_hermes_dotenv"), \
+             patch("hermes_cli.env_loader.reset_secret_source_cache"), \
+             patch("hermes_state.SessionDB", return_value=MagicMock()), \
+             patch(
+                 "tools.skills_tool.skill_view",
+                 return_value='{"success": false, "error": "Skill not found."}',
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            success, output, final_response, error = run_job(job)
+
+        assert success is False
+        assert mock_agent_cls.call_count == 0
+        assert error is not None
+        assert "weekly-market-risk-monitor" in error
+        assert "aborted" in error.lower() or "failed to load" in error.lower()
+        # Failed jobs always deliver a failure summary — never silence.
+        assert not (final_response or "").strip().upper().startswith(SILENT_MARKER)
+        deliver_content = _summarize_cron_failure_for_delivery(job, error)
+        assert deliver_content.strip()
+        assert "weekly-monitor" in deliver_content or "weekly-market-risk-monitor" in deliver_content
+        assert SILENT_MARKER not in deliver_content
+
 
     @contextlib.contextmanager
     def _run_job_patches(self, tmp_path, extra=()):
@@ -1142,18 +1177,38 @@ class TestRunJobWakeGate:
 
 
 class TestBuildJobPromptMissingSkill:
-    """Verify that a missing skill logs a warning and does not crash the job."""
+    """All-skills-failed aborts; partial failure still proceeds with a notice."""
 
     def _missing_skill_view(self, name: str) -> str:
         return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
 
+    def test_all_skills_failed_raises_cron_skill_load_error(self):
+        """When every declared skill fails, refuse a contextless LLM run (#77362)."""
+        from cron.scheduler import CronSkillLoadError
 
-    def test_missing_skill_injects_user_notice_into_prompt(self):
-        """A system notice about the missing skill is injected into the prompt."""
         with patch("tools.skills_tool.skill_view", side_effect=self._missing_skill_view):
-            result = _build_job_prompt({"skills": ["ghost-skill"], "prompt": "do something"})
+            with pytest.raises(CronSkillLoadError) as exc_info:
+                _build_job_prompt(
+                    {"name": "weekly-monitor", "skills": ["ghost-skill"], "prompt": "do something"}
+                )
+        assert "ghost-skill" in str(exc_info.value)
+        assert "aborted" in str(exc_info.value).lower()
+
+    def test_partial_skill_failure_injects_notice_and_proceeds(self):
+        """Some skills loaded → keep going with a user-visible skip notice."""
+
+        def _view(name: str) -> str:
+            if name == "good-skill":
+                return json.dumps({"success": True, "content": "Do the good thing."})
+            return json.dumps({"success": False, "error": f"Skill '{name}' not found."})
+
+        with patch("tools.skills_tool.skill_view", side_effect=_view):
+            result = _build_job_prompt(
+                {"skills": ["good-skill", "ghost-skill"], "prompt": "do something"}
+            )
+        assert "Do the good thing." in result
         assert "ghost-skill" in result
-        assert "not found" in result.lower() or "skipped" in result.lower()
+        assert "skipped" in result.lower() or "not found" in result.lower()
 
 
 class TestBuildJobPromptAbsoluteSkillPath:

@@ -228,7 +228,8 @@ class TestBuildJobPromptScansSkillContent:
         with pytest.raises(scheduler.CronPromptInjectionBlocked):
             scheduler._build_job_prompt(job)
 
-    def test_missing_skill_does_not_crash(self, cron_env):
+    def test_all_missing_skills_abort_with_cron_skill_load_error(self, cron_env):
+        """All declared skills missing → hard-abort (no contextless LLM) (#77362)."""
         _, scheduler = cron_env
         job = {
             "id": "job-missing",
@@ -236,10 +237,26 @@ class TestBuildJobPromptScansSkillContent:
             "prompt": "run task",
             "skills": ["does-not-exist"],
         }
-        # Should not raise — missing skills are skipped with a notice.
+        with pytest.raises(scheduler.CronSkillLoadError) as exc_info:
+            scheduler._build_job_prompt(job)
+        assert "does-not-exist" in str(exc_info.value)
+        assert "aborted" in str(exc_info.value).lower()
+
+    def test_partial_missing_skill_still_injects_notice(self, cron_env):
+        """One good skill + one missing → proceed with skip notice."""
+        hermes_home, scheduler = cron_env
+        _plant_skill(hermes_home, "good-skill", "Do the good thing.")
+        job = {
+            "id": "job-partial",
+            "name": "partial",
+            "prompt": "run task",
+            "skills": ["good-skill", "does-not-exist"],
+        }
         prompt = scheduler._build_job_prompt(job)
         assert prompt is not None
-        assert "could not be found" in prompt
+        assert "Do the good thing." in prompt
+        assert "does-not-exist" in prompt
+        assert "could not be found" in prompt or "skipped" in prompt.lower()
 
 
     def test_bundle_name_shadows_skill_name_for_cron_jobs(self, cron_env):
