@@ -329,6 +329,17 @@ def _contains_unsafe_gateway_action(
         script_text, unsafe = _read_referenced_script(script_path)
         if unsafe:
             return True
+        if script_text is None and "\x00" in str(script_path):
+            # ``_read_referenced_script`` correctly refuses to open a path with
+            # an embedded NUL, but returning "nothing to scan" is exploitable
+            # here: a POSIX shell DROPS NUL bytes from a word, so the command
+            # ``bash danger\x00.sh`` actually executes ``danger.sh``. Scan the
+            # path the shell would resolve instead of skipping the reference.
+            stripped = Path(str(script_path).replace("\x00", ""))
+            if str(stripped):
+                script_text, unsafe = _read_referenced_script(stripped)
+                if unsafe:
+                    return True
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
