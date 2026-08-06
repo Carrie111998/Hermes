@@ -61,7 +61,8 @@ The terminal tool can execute commands in different environments:
 |---------|-------------|----------|
 | `local` | Run on your machine (default) | Development, trusted tasks |
 | `docker` | Isolated containers | Security, reproducibility |
-| `ssh` | Remote server | Sandboxing, keep agent away from its own code |
+| `ssh` | POSIX remote over SSH and Bash | Linux/macOS remote execution |
+| `ssh_pwsh` | Windows remote over SSH and PowerShell | Windows remote execution |
 | `singularity` | HPC containers | Cluster computing, rootless |
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
@@ -72,7 +73,7 @@ The terminal tool can execute commands in different environments:
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, singularity, modal, daytona, vercel_sandbox
+  backend: local    # or: docker, ssh, ssh_pwsh, singularity, modal, daytona, vercel_sandbox
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```

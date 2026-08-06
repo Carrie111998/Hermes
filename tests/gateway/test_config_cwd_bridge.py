@@ -12,6 +12,8 @@ asserting the expected env var outcomes.
 import os
 import json
 
+import pytest
+
 from gateway.cwd_placeholder import CWD_PLACEHOLDERS, resolve_placeholder_terminal_cwd
 from tools.terminal_tool import _is_ssh_remote_tilde_cwd
 
@@ -206,13 +208,26 @@ class TestTildeExpansion:
         assert result["TERMINAL_CWD"] == os.path.expanduser("~/projects")
 
 
-    def test_ssh_terminal_cwd_tilde_preserved_for_remote_shell(self, monkeypatch):
+    @pytest.mark.parametrize("backend", ("ssh", "ssh_pwsh"))
+    def test_ssh_terminal_cwd_tilde_preserved_for_remote_shell(
+        self, monkeypatch, backend
+    ):
         """SSH cwd '~' must mean the remote user's home, not the gateway host HOME."""
         monkeypatch.setenv("HOME", "/opt/data")
-        cfg = {"terminal": {"backend": "ssh", "cwd": "~"}}
+        cfg = {"terminal": {"backend": backend, "cwd": "~"}}
         result = _simulate_config_bridge(cfg)
-        assert result["TERMINAL_ENV"] == "ssh"
+        assert result["TERMINAL_ENV"] == backend
         assert result["TERMINAL_CWD"] == "~"
+
+    @pytest.mark.parametrize("backend", ("ssh", "ssh_pwsh"))
+    def test_ssh_terminal_cwd_tilde_child_preserved_for_remote_shell(
+        self, monkeypatch, backend
+    ):
+        """SSH cwd '~/x' must survive until the SSH shell expands remote HOME."""
+        monkeypatch.setenv("HOME", "/opt/data")
+        cfg = {"terminal": {"backend": backend, "cwd": "~/work"}}
+        result = _simulate_config_bridge(cfg)
+        assert result["TERMINAL_CWD"] == "~/work"
 
 
 class TestVercelTerminalBridge:
