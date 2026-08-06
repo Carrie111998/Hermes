@@ -32,3 +32,19 @@ def test_single_env_flag_keeps_grouped_assignments() -> None:
     args = _parse_mcp_add("--env", "FIRST=1", "SECOND=two")
 
     assert args.env == [["FIRST=1", "SECOND=two"]]
+
+
+def test_env_flags_before_args_preserve_command_remainder() -> None:
+    args = _parse_mcp_add(
+        "--env",
+        "FIRST=1",
+        "--args",
+        "mcp",
+        "gateway",
+        "run",
+        "--profile",
+        "research",
+    )
+
+    assert args.env == [["FIRST=1"]]
+    assert args.args == ["mcp", "gateway", "run", "--profile", "research"]
