@@ -11,6 +11,7 @@ import sys
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -150,7 +151,7 @@ def _make_queue(store, routes, *, is_own=False, is_authorized=True, alert=None):
         ),
         is_own_message=lambda message: is_own,
         is_authorized_sender=lambda message: is_authorized,
-        alert_failure=alert,
+        alert_failure=(lambda failure, _source: alert(failure)) if alert else None,
     )
 
 
@@ -296,6 +297,29 @@ class TestPureHelpers:
 
         adapter._close_capture_store()
         assert store.closed == 1
+
+    @pytest.mark.asyncio
+    async def test_capture_failure_alert_replies_in_capture_topic(self):
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        adapter = object.__new__(TelegramAdapter)
+        adapter.send = AsyncMock(return_value=SimpleNamespace(success=True))
+        source_message = _message(
+            chat=_chat(chat_id=CAPTURE_CHAT_ID),
+            thread_id=CAPTURE_THREAD_ID,
+            message_id=42,
+        )
+
+        await adapter._deliver_capture_failure_alert("disk full", source_message)
+
+        adapter.send.assert_awaited_once_with(
+            str(CAPTURE_CHAT_ID),
+            "Capture ingress failure: disk full",
+            metadata={
+                "thread_id": str(CAPTURE_THREAD_ID),
+                "telegram_reply_to_message_id": 42,
+            },
+        )
 
 
 class TestRoutePolicyTable:

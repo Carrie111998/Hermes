@@ -1214,6 +1214,27 @@ class TelegramAdapter(BasePlatformAdapter):
         two different questions, and capture must ask the second one, not
         the first.
         """
+        source = self._source_from_message_for_auth(message)
+        authorization_check = getattr(self, "_authorization_check", None)
+        if callable(authorization_check):
+            try:
+                return bool(
+                    authorization_check(
+                        source.user_id,
+                        source.chat_type,
+                        source.chat_id,
+                    )
+                )
+            except Exception:
+                logger.error(
+                    "[Telegram] Capture authorization check failed for user %s; denying capture",
+                    source.user_id,
+                    exc_info=True,
+                )
+                return False
+
+        # Standalone/test fallback when no gateway callback has been installed.
+        # Normal gateway startup always installs the profile-bound callback.
         early, authorized, _source = self._resolve_sender_authorization(message)
         if early is not None:
             return early
@@ -8782,7 +8803,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 f"[{self.name}] receiving_profile is immutable once set "
                 f"(already {self._receiving_profile!r}, refused {value!r})"
             )
-        if not re.match(r"^[a-z][a-z0-9_-]{0,63}$", str(value)):
+        if not re.fullmatch(r"[a-z][a-z0-9_-]{0,63}", str(value)):
             raise ValueError(f"invalid receiving_profile {value!r}")
         self._receiving_profile = str(value)
 
@@ -8801,12 +8822,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         cached = getattr(self, "_capture_route_table_cache", None)
         if cached is None:
-            cached = RoutePolicyTable(self.config.extra.get("capture_routes"))
+            extra = self.config.extra
+            raw_routes = extra["capture_routes"] if "capture_routes" in extra else []
+            if raw_routes is None:
+                raise ValueError("capture_routes must be a list")
+            cached = RoutePolicyTable(raw_routes)
             self._capture_route_table_cache = cached
         return cached
 
     def _capture_is_configured(self) -> bool:
-        return bool(self.config.extra.get("capture_routes"))
+        return "capture_routes" in self.config.extra
 
     def _capture_route_for_message(self, message: Message):
         """The matching route-policy entry for ``message``, or None if unrouted."""
@@ -8837,14 +8862,56 @@ class TelegramAdapter(BasePlatformAdapter):
         self._capture_store = None
         self._capture_queue = None
 
-    def _alert_capture_failure(self, message: str) -> None:
-        # Deliverable per the plan: "only deterministic failure is alerted,
-        # and only to Hermes Hub General topic -- never a per-message
-        # acknowledgment." Wiring an actual outbound alert send is out of
-        # scope for this envelope (excluded: no new outbound-send path, no
-        # live Telegram call) -- log loudly; the raised exception is what
-        # actually enforces fail-closed (blocks offset advance / webhook ack).
+    def _alert_capture_failure(self, message: str, source_message: Message) -> None:
+        """Log and asynchronously reply to the failed Capture-topic message."""
         logger.error("[%s] %s", self.name, message)
+        alerted = getattr(self, "_capture_alerted_failures", None)
+        if alerted is None:
+            alerted = set()
+            self._capture_alerted_failures = alerted
+        if message in alerted:
+            return
+        if len(alerted) >= 256:
+            alerted.clear()
+        alerted.add(message)
+        try:
+            asyncio.get_running_loop().create_task(
+                self._deliver_capture_failure_alert(message, source_message)
+            )
+        except RuntimeError:
+            logger.error("[%s] No event loop available for capture failure alert", self.name)
+
+    async def _deliver_capture_failure_alert(
+        self, message: str, source_message: Message
+    ) -> None:
+        chat_id = getattr(getattr(source_message, "chat", None), "id", None)
+        if not chat_id:
+            logger.error(
+                "[%s] Capture failure could not be delivered: source chat is unavailable",
+                self.name,
+            )
+            return
+        metadata: Dict[str, Any] = {}
+        thread_id = getattr(source_message, "message_thread_id", None)
+        if thread_id is not None:
+            metadata["thread_id"] = str(thread_id)
+        source_message_id = getattr(source_message, "message_id", None)
+        if source_message_id is not None:
+            metadata["telegram_reply_to_message_id"] = int(source_message_id)
+        try:
+            result = await self.send(
+                str(chat_id),
+                "Capture ingress failure: " + message,
+                metadata=metadata,
+            )
+            if not getattr(result, "success", False):
+                logger.error(
+                    "[%s] Capture failure alert send failed: %s",
+                    self.name,
+                    getattr(result, "error", "unknown error"),
+                )
+        except Exception:
+            logger.error("[%s] Capture failure alert send raised", self.name, exc_info=True)
 
     def _require_receiving_profile(self) -> str:
         """Fail closed: no silent "default" fallback for an unstamped adapter.

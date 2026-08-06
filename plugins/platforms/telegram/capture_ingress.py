@@ -336,15 +336,23 @@ class CaptureIngressStore:
         with self._lock:
             try:
                 existing = self._conn.execute(
-                    "SELECT payload_hash FROM ingress_ledger WHERE event_id = ?", (event_id,)
+                    """
+                    SELECT l.payload_hash, p.payload_hash, p.payload_format, p.payload_json
+                    FROM ingress_ledger AS l
+                    LEFT JOIN ingress_payload AS p ON p.event_id = l.event_id
+                    WHERE l.event_id = ?
+                    """,
+                    (event_id,),
                 ).fetchone()
             except sqlite3.Error as exc:
                 raise CapturePersistenceError(str(exc)) from exc
             if existing is not None:
-                if existing[0] == payload_hash:
-                    return DUPLICATE_SAME
-                raise RouteConflict(
-                    f"event_id {event_id!r} already captured with a different payload_hash"
+                return self._classify_duplicate(
+                    event_id=event_id,
+                    existing=existing,
+                    payload_hash=payload_hash,
+                    payload_format=payload_format,
+                    payload_json=payload_json,
                 )
             try:
                 self._conn.execute("BEGIN IMMEDIATE")
@@ -379,20 +387,59 @@ class CaptureIngressStore:
                 # behind and is a real persistence failure, not a duplicate;
                 # misreporting it as RouteConflict would mislead debugging
                 # even though both fail closed the same way.
-                existing = self._conn.execute(
-                    "SELECT payload_hash FROM ingress_ledger WHERE event_id = ?", (event_id,)
-                ).fetchone()
+                try:
+                    existing = self._conn.execute(
+                        """
+                        SELECT l.payload_hash, p.payload_hash, p.payload_format, p.payload_json
+                        FROM ingress_ledger AS l
+                        LEFT JOIN ingress_payload AS p ON p.event_id = l.event_id
+                        WHERE l.event_id = ?
+                        """,
+                        (event_id,),
+                    ).fetchone()
+                except sqlite3.Error as lookup_exc:
+                    raise CapturePersistenceError(str(lookup_exc)) from exc
                 if existing is None:
                     raise CapturePersistenceError(str(exc)) from exc
-                if existing[0] == payload_hash:
-                    return DUPLICATE_SAME
-                raise RouteConflict(
-                    f"event_id {event_id!r} already captured with a different payload_hash"
+                return self._classify_duplicate(
+                    event_id=event_id,
+                    existing=existing,
+                    payload_hash=payload_hash,
+                    payload_format=payload_format,
+                    payload_json=payload_json,
                 )
             except sqlite3.Error as exc:
                 self._safe_rollback()
                 raise CapturePersistenceError(str(exc)) from exc
             return INSERTED
+
+    @staticmethod
+    def _classify_duplicate(
+        *,
+        event_id: str,
+        existing: Any,
+        payload_hash: str,
+        payload_format: str,
+        payload_json: str,
+    ) -> str:
+        ledger_hash, companion_hash, companion_format, companion_json = existing
+        if ledger_hash != payload_hash:
+            raise RouteConflict(
+                f"event_id {event_id!r} already captured with a different payload_hash"
+            )
+        if companion_hash is None:
+            raise CapturePersistenceError(
+                f"event_id {event_id!r} has no companion payload row"
+            )
+        if (
+            companion_hash != payload_hash
+            or companion_format != payload_format
+            or companion_json != payload_json
+        ):
+            raise CapturePersistenceError(
+                f"event_id {event_id!r} has a corrupt or inconsistent companion payload"
+            )
+        return DUPLICATE_SAME
 
     def _safe_rollback(self) -> None:
         """ROLLBACK, but only if a transaction is actually open.
@@ -404,7 +451,12 @@ class CaptureIngressStore:
         CapturePersistenceError.
         """
         if self._conn.in_transaction:
-            self._conn.execute("ROLLBACK")
+            try:
+                self._conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                # Preserve the original storage exception being normalized by
+                # the caller; rollback failure is secondary diagnostic context.
+                logger.error("capture ingress rollback failed", exc_info=True)
 
 
 class CaptureAwareQueue(asyncio.Queue):
@@ -429,7 +481,7 @@ class CaptureAwareQueue(asyncio.Queue):
         thread_id_resolver: Callable[[Any], Optional[str]],
         is_own_message: Callable[[Any], bool],
         is_authorized_sender: Callable[[Any], bool],
-        alert_failure: Optional[Callable[[str], None]] = None,
+        alert_failure: Optional[Callable[[str, Any], None]] = None,
     ) -> None:
         super().__init__()
         self._store = store
@@ -439,7 +491,7 @@ class CaptureAwareQueue(asyncio.Queue):
         self._thread_id_resolver = thread_id_resolver
         self._is_own_message = is_own_message
         self._is_authorized_sender = is_authorized_sender
-        self._alert_failure = alert_failure or (lambda _msg: None)
+        self._alert_failure = alert_failure or (lambda _failure, _source: None)
 
     async def put(self, item: Any) -> None:
         if Update is None or not isinstance(item, Update):
@@ -476,7 +528,8 @@ class CaptureAwareQueue(asyncio.Queue):
                 if message_id is None or sender_id is None:
                     self._alert_failure(
                         f"capture ingress: capture-only route matched update_id={item.update_id} "
-                        "with no human sender identity to key a ledger row on -- denying dispatch, not captured"
+                        "with no human sender identity to key a ledger row on -- denying dispatch, not captured",
+                        message,
                     )
                 return
             return await super().put(item)  # agent route preserves downstream auth/pairing behavior
@@ -490,7 +543,7 @@ class CaptureAwareQueue(asyncio.Queue):
         event_type = classify_event_type(message)
 
         try:
-            self._store.commit_capture(
+            commit_result = self._store.commit_capture(
                 event_id=eid,
                 platform="telegram",
                 account_id=account_id,
@@ -508,11 +561,16 @@ class CaptureAwareQueue(asyncio.Queue):
                 payload_json=payload_bytes.decode("utf-8"),
             )
         except RouteConflict:
-            self._alert_failure(f"capture ingress: conflicting duplicate for {eid}")
+            self._alert_failure(f"capture ingress: conflicting duplicate for {eid}", message)
             raise
         except CapturePersistenceError:
-            self._alert_failure(f"capture ingress: persistence failure for {eid}")
+            self._alert_failure(f"capture ingress: persistence failure for {eid}", message)
             raise
+
+        if commit_result == DUPLICATE_SAME:
+            # PTB retries a whole polling batch when a later update fails.
+            # A previously admitted agent update must not be delegated again.
+            return
 
         if route.mode == "capture_only":
             return  # terminal deny: consumed here, never delegated to the underlying queue
