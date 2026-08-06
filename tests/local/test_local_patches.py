@@ -15,6 +15,8 @@ The hermetic test environment (tests/conftest.py, autouse) already redirects
 HERMES_HOME to a per-test tempdir — no extra env patching needed here.
 """
 
+import hashlib
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -259,3 +261,112 @@ class TestSamplingWire:
 
         with pytest.raises(ValueError, match="unsupported field"):
             _preflight_codex_api_kwargs({**base, "top_p": 0.95})
+
+
+# ---------------------------------------------------------------------------
+# Profile shared blocks — not a fork patch, a config invariant.
+#
+# The six worker profiles each carry two blocks that only work if they are
+# identical everywhere: the caveman-ultra compression spec (SOUL.md) and the
+# eight hard rules (.hermes.md). Nobody re-reads six files to check, which is
+# exactly how the old profiles ended up with three divergent SOUL clones
+# (md5 3c803868 on 13 of them, d2739b13 on two more) without anyone noticing.
+#
+# Three divergences ARE authorised, decided in the 2026-08-06 grill:
+#   - writer  rule 1 — vault wiki/ is writable while executing INGEST
+#   - ops     rule 5 — squash-merge on all-green gates is its one integration
+#   - ops     rule 6 — project config inside a repo is its work
+# Everything else must match byte for byte.
+# ---------------------------------------------------------------------------
+
+WORKER_PROFILES = ("implementer", "reviewer", "explorer", "analyst", "writer", "ops")
+
+#: The three authorised divergences, pinned to their content. Asserting only
+#: "differs from the base" would let a divergence be rewritten into something
+#: else entirely and still pass — and these are hard rules, so a reword is
+#: exactly what must not slip through unnoticed. Editing one of these three on
+#: purpose means updating the hash here, in the same commit.
+DIVERGENT = {
+    ("writer", 1): "a064abc33f068656",  # vault wiki/ writable while executing INGEST
+    ("ops", 5): "26b1ee04e5b2de84",     # squash-merge on all-green gates
+    ("ops", 6): "df114d516db78160",     # project config inside a repo is its work
+}
+
+_PROFILES_ROOT = Path.home() / ".hermes" / "profiles"
+
+pytestmark_profiles = pytest.mark.skipif(
+    not all((_PROFILES_ROOT / p / "SOUL.md").is_file() for p in WORKER_PROFILES),
+    reason="six worker profiles not installed on this machine",
+)
+
+
+def _caveman_block(profile: str) -> str:
+    text = (_PROFILES_ROOT / profile / "SOUL.md").read_text(encoding="utf-8")
+    m = re.search(
+        r"\*\*Caveman ultra\*\*.*?exactly as the tool printed them\.", text, re.S
+    )
+    assert m, f"{profile}: caveman block not found in SOUL.md"
+    return m.group(0)
+
+
+def _hard_rules(profile: str) -> dict[int, str]:
+    """Return {rule_number: rule_text} for the eight hard rules."""
+    text = (_PROFILES_ROOT / profile / ".hermes.md").read_text(encoding="utf-8")
+    head = text.split("\n# Card contract", 1)[0]
+    rules: dict[int, str] = {}
+    matches = list(re.finditer(r"^(\d)\. \*\*", head, re.M))
+    for i, m in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(head)
+        rules[int(m.group(1))] = head[m.start():end].strip()
+    return rules
+
+
+@pytestmark_profiles
+class TestProfileSharedBlocks:
+    """The caveman spec and the hard rules are copied into six files on
+    purpose; the copies only work while they stay identical."""
+
+    def test_caveman_block_identical_across_profiles(self):
+        blocks = {p: _caveman_block(p) for p in WORKER_PROFILES}
+        distinct = set(blocks.values())
+        assert len(distinct) == 1, (
+            "caveman block diverged: "
+            + ", ".join(
+                f"{p}={hashlib.md5(b.encode()).hexdigest()[:8]}"
+                for p, b in blocks.items()
+            )
+        )
+
+    def test_every_profile_has_all_eight_hard_rules(self):
+        for p in WORKER_PROFILES:
+            assert set(_hard_rules(p)) == set(range(1, 9)), (
+                f"{p}: hard rules present are {sorted(_hard_rules(p))}, expected 1-8"
+            )
+
+    def test_hard_rules_identical_except_authorised_divergences(self):
+        base = _hard_rules("implementer")
+        for p in WORKER_PROFILES:
+            rules = _hard_rules(p)
+            for n in range(1, 9):
+                if (p, n) in DIVERGENT:
+                    assert rules[n] != base[n], (
+                        f"{p} rule {n} is an authorised divergence but now matches "
+                        "the base — either the divergence was lost or DIVERGENT is stale"
+                    )
+                    got = hashlib.sha256(rules[n].encode()).hexdigest()[:16]
+                    assert got == DIVERGENT[(p, n)], (
+                        f"{p} rule {n} was rewritten (hash {got}, pinned "
+                        f"{DIVERGENT[(p, n)]}). Update the pin in the same commit "
+                        "as the rule, or restore the rule."
+                    )
+                    continue
+                assert rules[n] == base[n], f"{p}: hard rule {n} diverged from the base"
+
+    def test_no_bundled_skills_marker_present(self):
+        """--no-skills is what keeps the skills index at ~470 tokens instead of
+        ~10,500. A profile that loses the marker gets re-seeded on the next
+        `hermes update`."""
+        for p in WORKER_PROFILES:
+            assert (_PROFILES_ROOT / p / ".no-bundled-skills").is_file(), (
+                f"{p}: .no-bundled-skills marker missing — bundled skills will be re-seeded"
+            )
