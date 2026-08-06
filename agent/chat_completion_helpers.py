@@ -1847,11 +1847,16 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         fb_api_mode = "chat_completions"
         if fb.get("api_mode"):
             fb_api_mode = str(fb.get("api_mode")).strip()
+        elif fb_provider == "anthropic":
+            # Provider-name check must not be gated on fb_base_url_hint:
+            # an entry that names provider: anthropic without an explicit
+            # base_url uses the provider's default endpoint and must still
+            # resolve to anthropic_messages, not chat_completions.
+            fb_api_mode = "anthropic_messages"
         elif fb_base_url_hint:
             _orig_url = fb_base_url_hint.rstrip("/").lower()
             if (
-                fb_provider == "anthropic"
-                or _orig_url.endswith("/anthropic")
+                _orig_url.endswith("/anthropic")
                 or base_url_hostname(fb_base_url_hint) == "api.anthropic.com"
             ):
                 fb_api_mode = "anthropic_messages"
