@@ -541,6 +541,48 @@ class TestVaultRoutesInjection:
         assert "outgrew its router budget" in out
         assert len(out) < _VAULT_ROUTER_MAX_CHARS * 2
 
+    def test_invalid_utf8_router_does_not_kill_the_session(self, monkeypatch, tmp_path):
+        """UnicodeDecodeError subclasses ValueError, not OSError. The first
+        version caught only OSError, so one corrupt byte in a router file
+        raised through build_system_prompt and killed every session — the
+        blast radius of a file the ingest cron rewrites unattended."""
+        import hermes_cli.config as cfg_mod
+        from agent.prompt_builder import build_vault_routes_prompt
+
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "_index.md").write_bytes(b"\xff\xfe ROUTE-SURVIVES-MARKER \x80")
+
+        monkeypatch.setattr(
+            cfg_mod, "load_config_readonly", lambda: {"vault": {"routes_dir": str(wiki)}}
+        )
+
+        out = build_vault_routes_prompt()  # must not raise
+        assert "ROUTE-SURVIVES-MARKER" in out, (
+            "the readable part of a partly-corrupt router should still route"
+        )
+
+    def test_oversized_router_is_not_read_whole(self, monkeypatch, tmp_path):
+        """The cap is applied at read time, not after. A runaway router must
+        not become the slowest read at startup nor the largest thing in the
+        prompt."""
+        import hermes_cli.config as cfg_mod
+        from agent.prompt_builder import build_vault_routes_prompt, _VAULT_ROUTER_MAX_CHARS
+
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "_index.md").write_text("y" * 500_000, encoding="utf-8")
+
+        monkeypatch.setattr(
+            cfg_mod, "load_config_readonly", lambda: {"vault": {"routes_dir": str(wiki)}}
+        )
+        out = build_vault_routes_prompt()
+
+        assert "outgrew its router budget" in out
+        assert len(out) < _VAULT_ROUTER_MAX_CHARS + 1000, (
+            f"output is {len(out)} chars — the cap stopped bounding the read"
+        )
+
     def test_reachable_through_the_call_path_system_prompt_uses(self):
         """system_prompt.py reaches the builder through ``_ra()`` -- the
         run_agent module -- not through prompt_builder directly. Calling the
