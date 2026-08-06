@@ -51,6 +51,7 @@ The long-document skill belongs to the same contribution family as the Hermes sk
 - **Sibling architecture PR:** `#80391` — cross-language docs germination.
 - **Sibling meta-issue:** `#80392` — cross-language docs germination EPIC.
 - **French seed issue/PR:** `#60535` / `#63660` — provenance and attribution receipts.
+- **Current contribution:** `#80551` — long-document production + unified doctrine publication.
 
 When this skill is contributed to Hermes-agent, its PR body must carry `Part of #78647`, `Related #79609`, `Related #79779`, `Related #79898`, `Related #80391`, and `Related #80392`; the literal PR number must be posted on the EPIC and sibling issue/PR threads as required by the interlock audit. Do not claim those sibling PRs are merged unless live GitHub says so.
 

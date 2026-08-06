@@ -13,7 +13,7 @@ This publication and its long-document production skill are part of the Hermes c
 | Sibling architecture PR | #80391 | Cross-language docs germination pipeline |
 | Sibling EPIC | #80392 | Cross-language docs germination campaign |
 | Seed issue / PR | #60535 / #63660 | French documentation provenance and contributor authorship |
-| Current contribution | this PR | Long-document production + unified doctrine publication |
+| Current contribution | #80551 | Long-document production + unified doctrine publication |
 
 ## Required edges
 
