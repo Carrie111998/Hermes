@@ -784,7 +784,11 @@ def normalize_converse_response(response: Dict) -> SimpleNamespace:
         role="assistant",
         content="\n".join(text_parts) if text_parts else None,
         tool_calls=tool_calls if tool_calls else None,
-        reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
+        # Bedrock exposes a mutable text projection of reasoningContent. The
+        # adapter does not retain provider-owned replay material here, so this
+        # must not be labeled as an exact reasoning_content echo.
+        reasoning="\n\n".join(reasoning_parts) if reasoning_parts else None,
+        reasoning_content=None,
     )
 
     # Build usage stats. Converse's inputTokens excludes cache read/write
@@ -979,7 +983,8 @@ def stream_converse_with_callbacks(
         role="assistant",
         content="\n".join(text_parts) if text_parts else None,
         tool_calls=tool_calls if tool_calls else None,
-        reasoning_content="\n\n".join(reasoning_parts) if reasoning_parts else None,
+        reasoning="\n\n".join(reasoning_parts) if reasoning_parts else None,
+        reasoning_content=None,
     )
 
     input_tokens = usage_data.get("inputTokens", 0)

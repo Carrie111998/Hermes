@@ -244,6 +244,39 @@ class TestNormalizeConverseResponse:
         assert result.usage.completion_tokens == 5
         assert result.usage.total_tokens == 15
 
+    def test_reasoning_is_not_mislabeled_as_provider_replay_content(self):
+        from agent.bedrock_adapter import normalize_converse_response
+        from agent.moa_loop import _completed_response_as_stream_chunk
+
+        result = normalize_converse_response(
+            {
+                "output": {
+                    "message": {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "reasoningContent": {
+                                    "text": "ordinary Bedrock reasoning"
+                                }
+                            },
+                            {"text": "done"},
+                        ],
+                    }
+                },
+                "stopReason": "end_turn",
+            }
+        )
+
+        message = result.choices[0].message
+        assert message.reasoning == "ordinary Bedrock reasoning"
+        assert message.reasoning_content is None
+
+        # MoA wraps a completed aggregator response as a stream chunk. Keep
+        # the provenance marker intact across that otherwise separate path.
+        delta = _completed_response_as_stream_chunk(result).choices[0].delta
+        assert delta.reasoning == "ordinary Bedrock reasoning"
+        assert delta.reasoning_content is None
+
     def test_cache_tokens_folded_into_prompt_tokens(self):
         """Converse's inputTokens excludes cache read/write tokens (unlike
         OpenAI's prompt_tokens). normalize_converse_response must add them
@@ -325,6 +358,31 @@ class TestNormalizeConverseStreamEvents:
         assert result.choices[0].finish_reason == "stop"
         assert result.usage.prompt_tokens == 5
         assert result.usage.completion_tokens == 3
+
+    def test_reasoning_stream_uses_mutable_reasoning_field(self):
+        from agent.bedrock_adapter import normalize_converse_stream_events
+
+        result = normalize_converse_stream_events(
+            {
+                "stream": [
+                    {
+                        "contentBlockDelta": {
+                            "contentBlockIndex": 0,
+                            "delta": {
+                                "reasoningContent": {
+                                    "text": "ordinary streamed reasoning"
+                                }
+                            },
+                        }
+                    },
+                    {"messageStop": {"stopReason": "end_turn"}},
+                ]
+            }
+        )
+
+        message = result.choices[0].message
+        assert message.reasoning == "ordinary streamed reasoning"
+        assert message.reasoning_content is None
 
     def test_tool_use_stream(self):
         from agent.bedrock_adapter import normalize_converse_stream_events

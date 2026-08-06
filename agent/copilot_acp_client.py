@@ -487,7 +487,10 @@ class CopilotACPClient:
             content=cleaned_text,
             tool_calls=tool_calls,
             reasoning=reasoning_text or None,
-            reasoning_content=reasoning_text or None,
+            # ACP exposes a mutable reasoning transcript, not provider-owned
+            # replay state. Keep it out of reasoning_content so persistence
+            # masking cannot be bypassed by a synthetic duplicate.
+            reasoning_content=None,
             reasoning_details=None,
         )
         finish_reason = "tool_calls" if tool_calls else "stop"

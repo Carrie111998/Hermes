@@ -54,6 +54,30 @@ class CopilotACPClientSafetyTests(unittest.TestCase):
         )
         self.assertEqual(chunks[1].choices, [])
 
+    def test_reasoning_is_not_mislabeled_as_provider_replay_content(self) -> None:
+        with patch.object(
+            self.client,
+            "_run_prompt",
+            return_value=("answer", "ordinary ACP reasoning"),
+        ):
+            completion = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "question"}],
+                stream=False,
+            )
+            stream = self.client._create_chat_completion(
+                model="copilot-acp",
+                messages=[{"role": "user", "content": "question"}],
+                stream=True,
+            )
+
+        message = completion.choices[0].message
+        self.assertEqual(message.reasoning, "ordinary ACP reasoning")
+        self.assertIsNone(message.reasoning_content)
+        delta = list(stream)[0].choices[0].delta
+        self.assertEqual(delta.reasoning, "ordinary ACP reasoning")
+        self.assertIsNone(delta.reasoning_content)
+
 
     def _dispatch(self, message: dict, *, cwd: str) -> dict:
         process = _FakeProcess()

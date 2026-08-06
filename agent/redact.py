@@ -329,18 +329,38 @@ _PRIVATE_KEY_RE = re.compile(
     r"-----BEGIN[A-Z ]*PRIVATE KEY-----[\s\S]*?-----END[A-Z ]*PRIVATE KEY-----"
 )
 
-# Database connection strings: protocol://user:PASSWORD@host
-# Catches postgres, mysql, mongodb, redis, amqp URLs and redacts the password.
-# The userinfo and password groups forbid whitespace ([^:\s]+ / [^@\s]+) so the
-# match can never span a line break. A real DSN password never contains
-# whitespace; without this bound the greedy [^@]+ would scan past the end of a
-# code line to the next stray "@" (e.g. a Python decorator), swallowing
-# intervening lines and corrupting tool OUTPUT for any source containing a
-# postgresql:// f-string template. See issue #33801.
+# Database connection strings: dialect[+driver]://[user]:PASSWORD@host
+# Catches common SQL, document, cache, and queue database URI schemes and
+# redacts the password. The optional driver segment covers SQLAlchemy-style
+# schemes such as postgresql+psycopg, snowflake+connector, and db2+ibm_db.
+# The username may be empty for URI forms such as redis://:password@host.
+#
+# The username and password groups stop at quotes and structured-text
+# delimiters as well as URI authority delimiters. That prevents a passwordless
+# host:port string in one JSON/YAML value from scanning into a later email
+# address. URI punctuation such as commas, semicolons, and parentheses remains
+# valid inside a password; quote/bracket characters must be percent-encoded.
+#
+# A permissive password group used to scan past the end of a code line to the
+# next stray "@" (e.g. a Python decorator), swallowing intervening lines and
+# corrupting tool output for source containing a postgresql:// f-string
+# template. The leading guard also keeps a database name from matching inside
+# a longer custom scheme. See issues #33801 and #43666.
 _DB_CONNSTR_RE = re.compile(
-    r"((?:postgres(?:ql)?|mysql|mongodb(?:\+srv)?|redis|amqp)://[^:\s]+:)([^@\s]+)(@)",
+    r"(?<![a-z0-9+.-])"
+    r"((?:postgres(?:ql)?|mysqlx?|mariadb|mongodb|mssql|oracle|clickhouse|"
+    r"cockroachdb|snowflake|trino|db2|rediss?|amqps?)"
+    r"(?:\+[a-z0-9_.-]+)?://[^:/?#\s@,;'\"<>\[\]{}()\\|]*:)"
+    r"([^@/?#\s'\"<>\[\]{}\\|]+)(@)",
     re.IGNORECASE,
 )
+
+
+def _redact_db_connstr_match(match: re.Match, *, code_file: bool) -> str:
+    password = match.group(2)
+    if code_file and password.startswith("{") and password.endswith("}"):
+        return match.group(0)
+    return f"{match.group(1)}***{match.group(3)}"
 
 # Bare-token credential in a web/transport URL: ``scheme://TOKEN@host``.
 # This is the ``git remote set-url origin https://PASSWORD@github.com/...``
@@ -822,15 +842,13 @@ def redact_sensitive_text(
     # forbids whitespace in the password group, so a single-line template's
     # group(2) is exactly the brace expression. See issue #33801.
     if "://" in text:
-        if code_file:
-            def _redact_db(m):
-                pw = m.group(2)
-                if pw.startswith("{") and pw.endswith("}"):
-                    return m.group(0)
-                return f"{m.group(1)}***{m.group(3)}"
-            text = _DB_CONNSTR_RE.sub(_redact_db, text)
-        else:
-            text = _DB_CONNSTR_RE.sub(lambda m: f"{m.group(1)}***{m.group(3)}", text)
+        text = _DB_CONNSTR_RE.sub(
+            lambda match: _redact_db_connstr_match(
+                match,
+                code_file=code_file,
+            ),
+            text,
+        )
 
         # Bare-token userinfo in web/transport URLs: ``scheme://TOKEN@host``.
         # The git-remote-with-embedded-password shape from #6396. Only the
