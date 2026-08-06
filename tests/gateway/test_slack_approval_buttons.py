@@ -59,8 +59,9 @@ def _make_adapter():
 
 
 class _AuthRunner:
-    def __init__(self, auth_fn=None):
+    def __init__(self, auth_fn=None, profile_fn=None):
         self._auth_fn = auth_fn or (lambda _source: True)
+        self._profile_fn = profile_fn or (lambda _source: None)
         self.seen_sources = []
 
     async def handle(self, event):
@@ -69,6 +70,9 @@ class _AuthRunner:
     def _is_user_authorized(self, source):
         self.seen_sources.append(source)
         return self._auth_fn(source)
+
+    def _profile_name_for_source(self, source):
+        return self._profile_fn(source)
 
 
 def _attach_auth_runner(adapter, auth_fn=None):
@@ -226,6 +230,45 @@ class TestSlackInteractiveAuth:
         assert runner.seen_sources[0].platform == Platform.SLACK
         assert runner.seen_sources[0].chat_id == "C1"
         assert runner.seen_sources[0].chat_type == "group"
+
+    def test_multiplex_closure_uses_gateway_runner_and_routed_source(self, monkeypatch):
+        adapter = _make_adapter()
+        runner = _AuthRunner(
+            auth_fn=lambda source: source.user_id == "U_OK" and source.profile == "karen",
+            profile_fn=lambda source: "karen" if source.chat_id == "C1" else None,
+        )
+        adapter.gateway_runner = runner  # type: ignore[assignment]
+
+        async def multiplex_handler(_event):
+            return None
+
+        # Multiplex handlers are closures, not bound runner methods. Interactive
+        # auth must use the adapter's explicit gateway_runner back-reference.
+        adapter.set_message_handler(multiplex_handler)
+        assert getattr(adapter._message_handler, "__self__", None) is None
+
+        for name in (
+            "SLACK_ALLOWED_USERS",
+            "SLACK_ALLOW_ALL_USERS",
+            "GATEWAY_ALLOWED_USERS",
+            "GATEWAY_ALLOW_ALL_USERS",
+        ):
+            monkeypatch.delenv(name, raising=False)
+
+        assert adapter._is_interactive_user_authorized(
+            "U_OK",
+            channel_id="C1",
+            user_name="operator",
+            team_id="T1",
+        ) is True
+
+        assert len(runner.seen_sources) == 1
+        source = runner.seen_sources[0]
+        assert source.platform == Platform.SLACK
+        assert source.chat_id == "C1"
+        assert source.chat_type == "group"
+        assert source.scope_id == "T1"
+        assert source.profile == "karen"
 
 
 class TestSlackSlashConfirmAction:

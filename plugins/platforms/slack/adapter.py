@@ -6650,15 +6650,22 @@ class SlackAdapter(BasePlatformAdapter):
         if not normalized_user_id:
             return False
 
-        runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+        # Multiplex gateways install closure-based message handlers, so
+        # ``_message_handler.__self__`` cannot recover the runner there. Every
+        # adapter receives an explicit gateway_runner back-reference; prefer it
+        # and retain the bound-handler lookup for older/test integrations.
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
         auth_fn = getattr(runner, "_is_user_authorized", None)
         if callable(auth_fn):
             try:
-                from gateway.session import SessionSource
-
-                source = SessionSource(
-                    platform=Platform.SLACK,
+                # Use the standard source builder so profile_routes stamps the
+                # routed profile. Interactive authorization must consult the
+                # same per-profile pairing store as normal message intake.
+                source = self.build_source(
                     chat_id=str(channel_id or normalized_user_id),
+                    chat_name="",
                     chat_type="dm" if str(channel_id or "").startswith("D") else "group",
                     user_id=normalized_user_id,
                     user_name=str(user_name).strip() if user_name else None,
