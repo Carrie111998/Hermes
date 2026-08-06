@@ -479,20 +479,21 @@ def to_agent_visible_cache_path(
     host_path: str,
     container_base: str = "/root/.hermes",
 ) -> str:
-    """Translate a host cache path to its mounted path inside the sandbox.
+    """Translate a host cache path to the active backend's visible cache path.
 
-    Returns the input unchanged if it is not under any auto-mounted cache
-    directory, or if the active terminal backend does not require path
-    translation (only Docker for now).
+    Docker bind-mounts caches under ``container_base``. SSH mirrors the active
+    profile's cache files under the remote user's ``~/.hermes`` directory.
+    Unsupported/local backends keep the gateway-local path unchanged.
     """
-    # Only Docker backend requires translation at this time.  Other backends
-    # (Modal, Daytona, Vercel) use different mount semantics and will be
-    # addressed separately if needed.  Backend is identified by TERMINAL_ENV
-    # (same env var tools/terminal_tool.py reads in _get_environment_config).
-    if os.environ.get("TERMINAL_ENV", "local") != "docker":
+    backend = os.environ.get("TERMINAL_ENV", "local")
+    if backend == "docker":
+        target_base = container_base
+    elif backend == "ssh":
+        target_base = "~/.hermes"
+    else:
         return host_path
 
-    mapped = map_cache_path_to_container(host_path, container_base=container_base)
+    mapped = map_cache_path_to_container(host_path, container_base=target_base)
     return mapped if mapped is not None else host_path
 
 
