@@ -18,6 +18,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNNER = ROOT / "scripts" / "quinn_readonly_pytest.py"
+GATEWAY_CONFTEST = ROOT / "tests" / "gateway" / "conftest.py"
 
 CONTENT_FREE_RESULT_KEYS = {
     "schema_version",
@@ -53,6 +54,16 @@ CONTENT_FREE_RESULT_KEYS = {
 
 def _load_runner_module():
     spec = importlib.util.spec_from_file_location("quinn_readonly_pytest", RUNNER)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_gateway_conftest_module():
+    name = f"gateway_conftest_for_cache_test_{uuid.uuid4().hex}"
+    spec = importlib.util.spec_from_file_location(name, GATEWAY_CONFTEST)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -204,6 +215,166 @@ def test_isolated_pytest_home_and_hermes_outputs_remain_writable(tmp_path):
         _git(repo, "rev-parse", "HEAD"),
         _git(repo, "rev-parse", "HEAD^{tree}"),
     )
+
+
+def _tiny_gateway_guard_repo(
+    tmp_path: Path, default_home: Path
+) -> tuple[Path, str, str]:
+    repo = tmp_path / "gateway-guard-source"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    gateway_tests = repo / "tests" / "gateway"
+    gateway_tests.mkdir(parents=True)
+    (gateway_tests / "conftest.py").write_bytes(GATEWAY_CONFTEST.read_bytes())
+    test_source = """import errno
+import importlib.util
+import os
+from pathlib import Path
+import socket
+
+
+DENIED = {errno.EPERM, errno.EACCES}
+HOST_DEFAULT_HOME = Path(__HOST_DEFAULT_HOME__)
+
+
+def test_gateway_guard_cache_redirect_is_sandbox_local():
+    source_root = Path(__file__).resolve().parents[2]
+    cache_dir = Path(os.environ[\"PYTEST_GATEWAY_GUARD_CACHE_DIR\"])
+    writable_root = Path(os.environ[\"TMPDIR\"]).resolve().parent
+    cache_dir.relative_to(writable_root)
+    assert cache_dir.name == \"gateway-guard-cache\"
+    assert cache_dir.is_dir()
+    names = {path.name for path in cache_dir.iterdir()}
+    cache_names = {
+        name for name in names if name.startswith(\"gw-adapter-guard-\")
+    }
+    assert cache_names
+    if importlib.util.find_spec(\"filelock\") is not None:
+        assert {
+            f\".{cache_name}.lock\" for cache_name in cache_names
+        }.issubset(names)
+    assert not (source_root / \".pytest-cache\").exists()
+    assert source_root.stat().st_mode & 0o222 == 0
+    assert Path(__file__).stat().st_mode & 0o222 == 0
+    assert Path.home() != HOST_DEFAULT_HOME
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        assert sock.connect_ex((\"127.0.0.1\", 9)) in DENIED
+    finally:
+        sock.close()
+""".replace("__HOST_DEFAULT_HOME__", json.dumps(str(default_home.resolve())))
+    (gateway_tests / "test_gateway_guard_cache_redirect.py").write_text(
+        test_source,
+        encoding="utf-8",
+    )
+    _git(repo, "add", "tests/gateway/conftest.py")
+    _git(repo, "add", "tests/gateway/test_gateway_guard_cache_redirect.py")
+    _git(
+        repo,
+        "-c",
+        "user.name=Quinn Test",
+        "-c",
+        "user.email=quinn-test@example.invalid",
+        "commit",
+        "-q",
+        "-m",
+        "gateway guard fixture",
+    )
+    return (
+        repo,
+        _git(repo, "rev-parse", "HEAD"),
+        _git(repo, "rev-parse", "HEAD^{tree}"),
+    )
+
+
+@pytest.mark.parametrize("override", [None, "", "   "])
+def test_gateway_guard_cache_redirect_default_preserves_cwd(
+    monkeypatch, tmp_path, override
+):
+    gateway_conftest = _load_gateway_conftest_module()
+    monkeypatch.chdir(tmp_path)
+    if override is None:
+        monkeypatch.delenv("PYTEST_GATEWAY_GUARD_CACHE_DIR", raising=False)
+    else:
+        monkeypatch.setenv("PYTEST_GATEWAY_GUARD_CACHE_DIR", override)
+
+    assert gateway_conftest._gateway_guard_cache_dir() == tmp_path / ".pytest-cache"
+
+
+def test_gateway_guard_cache_redirect_accepts_absolute_scratch(monkeypatch, tmp_path):
+    gateway_conftest = _load_gateway_conftest_module()
+    scratch = tmp_path / "writable" / "gateway-guard-cache"
+    monkeypatch.setenv("PYTEST_GATEWAY_GUARD_CACHE_DIR", str(scratch))
+
+    assert gateway_conftest._gateway_guard_cache_dir() == scratch
+
+
+def test_gateway_guard_cache_redirect_rejects_relative_before_write(
+    monkeypatch, tmp_path
+):
+    gateway_conftest = _load_gateway_conftest_module()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("PYTEST_GATEWAY_GUARD_CACHE_DIR", "relative-cache")
+
+    with pytest.raises(pytest.UsageError, match="must be an absolute path"):
+        gateway_conftest.pytest_configure(object())
+    assert not (tmp_path / "relative-cache").exists()
+
+
+def test_gateway_guard_cache_redirect_runner_uses_only_writable_scratch(tmp_path):
+    default_home = tmp_path / "default-home"
+    default_home.mkdir()
+    marker = default_home / "marker"
+    marker.write_text("unchanged", encoding="utf-8")
+    repo, commit_hash, tree_hash = _tiny_gateway_guard_repo(tmp_path, default_home)
+    output = tmp_path / "gateway-guard-result.json"
+    wrapper = _python_wrapper(tmp_path / "gateway-guard-python-wrapper")
+    env = os.environ.copy()
+    env["HERMES_PYTHON"] = str(wrapper)
+    env["HOME"] = str(default_home)
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(RUNNER),
+            "--repo",
+            str(repo),
+            "--tree",
+            tree_hash,
+            "--output",
+            str(output),
+            "--",
+            "tests/gateway/test_gateway_guard_cache_redirect.py",
+            "-q",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    payload = json.loads(output.read_text(encoding="utf-8"))
+    assert payload["status"] == "passed"
+    assert payload["return_code"] == 0
+    assert payload["pytest_exit_code"] == 0
+    assert payload["test_counts"]["passed"] == 1
+    assert payload["tree"] == tree_hash
+    assert payload["reviewed_head"] == commit_hash
+    assert payload["test_node_args"] == [
+        "tests/gateway/test_gateway_guard_cache_redirect.py"
+    ]
+    assert payload["source_read_only_before"] is True
+    assert payload["source_read_only_after"] is True
+    assert payload["source_unchanged"] is True
+    assert payload["materialization"]["verified_before_pytest"] is True
+    assert payload["materialization"]["verified_after_pytest"] is True
+    assert payload["sandbox_probe"]["enforced"] is True
+    assert payload["sandbox_policy"]["network_denied"] is True
+    assert payload["sandbox_policy"]["writes_isolated"] is True
+    assert marker.read_text(encoding="utf-8") == "unchanged"
+    assert sorted(path.name for path in default_home.iterdir()) == ["marker"]
 
 
 def _python_wrapper(path: Path, *, reject_pytest_import: bool = False) -> Path:

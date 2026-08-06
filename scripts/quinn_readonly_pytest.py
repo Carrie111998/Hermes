@@ -751,6 +751,9 @@ def _sanitized_environment(
         "XDG_DATA_HOME": str(home / ".local" / "share"),
         "PYTHONPATH": str(source),
         "PYTHONPYCACHEPREFIX": str(writable_root / "pycache"),
+        "PYTEST_GATEWAY_GUARD_CACHE_DIR": str(
+            writable_root / "gateway-guard-cache"
+        ),
         "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONHASHSEED": "0",
         "PYTHONNOUSERSITE": "1",

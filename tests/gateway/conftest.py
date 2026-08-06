@@ -32,6 +32,7 @@ incident.
 """
 
 import ast
+import os
 import sys
 from pathlib import Path
 from unittest.mock import MagicMock
@@ -336,6 +337,7 @@ _ensure_discord_mock()
 # ---------------------------------------------------------------------------
 
 _GATEWAY_DIR = Path(__file__).resolve().parent
+_GATEWAY_GUARD_CACHE_DIR_ENV = "PYTEST_GATEWAY_GUARD_CACHE_DIR"
 _GUARD_HINT = (
     "Plugin adapter tests must use "
     "``from tests.gateway._plugin_adapter_loader import load_plugin_adapter`` "
@@ -435,6 +437,19 @@ def _fingerprint_gateway_tests() -> str:
     return h.hexdigest()[:16]
 
 
+def _gateway_guard_cache_dir() -> Path:
+    """Return the gateway guard cache root, rejecting unsafe overrides."""
+    override = os.environ.get(_GATEWAY_GUARD_CACHE_DIR_ENV, "").strip()
+    if not override:
+        return Path.cwd() / ".pytest-cache"
+    cache_dir = Path(override)
+    if not cache_dir.is_absolute():
+        raise pytest.UsageError(
+            f"{_GATEWAY_GUARD_CACHE_DIR_ENV} must be an absolute path"
+        )
+    return cache_dir
+
+
 def _run_adapter_antipattern_scan() -> list[str]:
     """Scan gateway test files for the plugin-adapter anti-pattern.
 
@@ -497,7 +512,7 @@ def pytest_configure(config):
         return
 
     fp = _fingerprint_gateway_tests()
-    cache_dir = Path.cwd() / ".pytest-cache"
+    cache_dir = _gateway_guard_cache_dir()
     cache_file = cache_dir / f"gw-adapter-guard-{fp}"
     lock_file = cache_dir / f".gw-adapter-guard-{fp}.lock"
 
