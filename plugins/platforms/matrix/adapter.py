@@ -3076,8 +3076,11 @@ class MatrixAdapter(BasePlatformAdapter):
                     timeout=45.0,
                 )
 
-                # nio returns SyncError objects (not exceptions) for auth
-                # failures like M_UNKNOWN_TOKEN.  Detect and stop immediately.
+                # mautrix's Client.sync() returns a plain dict on success but
+                # an object carrying a "message" string (not a raised
+                # exception) for auth failures like M_UNKNOWN_TOKEN. Detect
+                # and stop immediately rather than falling through to the
+                # dict-shaped handling below.
                 _sync_msg = getattr(sync_data, "message", None)
                 if _sync_msg and isinstance(_sync_msg, str):
                     _lower = _sync_msg.lower()
