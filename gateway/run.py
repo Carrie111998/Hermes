@@ -19801,13 +19801,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return cleaned
 
     def _is_discord_auto_thread_lane(self, source: SessionSource) -> bool:
-        """Return True only for Discord threads Hermes just auto-created."""
+        """Return True for Discord threads receiving an agent turn.
+
+        This includes both threads Hermes auto-created and threads created
+        manually by a user. The lifecycle title feature is intentionally based
+        on the active Discord thread context, not on who created the thread.
+        """
         return (
             source.platform == Platform.DISCORD
             and source.chat_type == "thread"
-            and bool(getattr(source, "auto_thread_created", False))
             and bool(source.thread_id)
-            and bool(getattr(source, "auto_thread_initial_name", None))
         )
 
     def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:
@@ -20018,7 +20021,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if status == "⏳ Working"
             else working_title
         )
-        if not expected_name or not source.thread_id:
+        if not source.thread_id:
             return
 
         async def _rename() -> None:

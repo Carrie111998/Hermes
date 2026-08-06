@@ -320,7 +320,20 @@ def _relay_channel_source():
     )
 
 
-def test_relay_channel_lane_shape_gate():
+def test_discord_thread_title_lane_includes_manual_threads():
+    stub = _mk_runner_stub()(adapter=None)
+    from types import SimpleNamespace
+
+    source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_type="thread",
+        thread_id="manual-thread",
+        auto_thread_created=False,
+        auto_thread_initial_name=None,
+    )
+    assert stub._is_discord_auto_thread_lane(source) is True
+
+
     from types import SimpleNamespace
     from gateway.config import Platform as P
 
