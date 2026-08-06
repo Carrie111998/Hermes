@@ -108,11 +108,22 @@ export function PersistentTerminal({ onAddSelectionToChat }: PersistentTerminalP
 
       markRightPanePerf('terminal-measure', reason)
       const r = slot.getBoundingClientRect()
+      // A kept-alive pane hidden as an inactive tab keeps its layout box
+      // (visibility:hidden — see pane-shell/pane-visibility.ts), so its rect is
+      // indistinguishable from the active tab's. The ancestor marker is the
+      // only reliable signal: treat a hidden slot as 0×0 so the fixed overlay
+      // can't keep painting over the pane that replaced it.
+      const paneHidden = slot.closest('[data-pane-hidden]') !== null
       // floor top/left + ceil right/bottom: overlay always covers the slot's
       // full pixel footprint, so half-pixel rects can't leak page bg through.
       const top = Math.floor(r.top)
       const left = Math.floor(r.left)
-      const next: Rect = { top, left, width: Math.ceil(r.right) - left, height: Math.ceil(r.bottom) - top }
+      const next: Rect = {
+        top,
+        left,
+        width: paneHidden ? 0 : Math.ceil(r.right) - left,
+        height: paneHidden ? 0 : Math.ceil(r.bottom) - top
+      }
 
       if (!sameRect(prev, next)) {
         prev = next
