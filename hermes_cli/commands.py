@@ -622,7 +622,9 @@ def _telegram_command_menu_config() -> dict[str, Any]:
         max_commands = int(max_commands)
     except (TypeError, ValueError):
         max_commands = _DEFAULT_TELEGRAM_MENU_MAX_COMMANDS
-    max_commands = max(1, min(_TELEGRAM_BOT_API_MAX_COMMANDS, max_commands))
+    # 0 is allowed: operators clear the Telegram BotCommand menu entirely
+    # (customer-facing bots that only use natural-language ops).
+    max_commands = max(0, min(_TELEGRAM_BOT_API_MAX_COMMANDS, max_commands))
 
     priority_mode = str(menu_cfg.get("priority_mode") or "prepend").strip().lower()
     if priority_mode not in _TELEGRAM_PRIORITY_MODES:

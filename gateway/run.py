@@ -10396,6 +10396,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _evt_cmd = event.get_command()
             _cmd_def_inner = _resolve_cmd_inner(_evt_cmd) if _evt_cmd else None
 
+            # Opt-in passthrough: treat listed core commands as plain text so
+            # they queue/interrupt like a normal message (mirrors cold path).
+            if (
+                _cmd_def_inner is not None
+                and _cmd_def_inner.name in self._agent_passthrough_commands(source)
+            ):
+                logger.info(
+                    "Passthrough /%s to busy-session path for %s",
+                    _cmd_def_inner.name,
+                    _quick_key,
+                )
+                _evt_cmd = None
+                _cmd_def_inner = None
+
             # Slash command access control on the running-agent fast-path.
             # Mirrors the cold-path gate further below so non-admin users
             # can't bypass gating just because an agent happens to be busy.
@@ -10409,7 +10423,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent
-            # interrupt, no queued text.
+            # interrupt, no queued text. Skipped when start is in
+            # agent_passthrough_commands (handled above).
             if _cmd_def_inner and _cmd_def_inner.name == "start":
                 logger.info("Ignoring /start platform ping for active session %s", _quick_key)
                 return ""
@@ -10796,6 +10811,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # don't depend on the exact alias the user typed.
         _cmd_def = _resolve_cmd(command) if command else None
         canonical = _cmd_def.name if _cmd_def else command
+
+        # Opt-in: send selected core slash commands to the agent as plain
+        # text (e.g. /start → onboarding). Default remains silent /start.
+        if command and canonical and canonical in self._agent_passthrough_commands(source):
+            logger.info(
+                "Passthrough /%s to agent for session %s",
+                canonical,
+                _quick_key,
+            )
+            command = None
+            _cmd_def = None
+            canonical = None
 
         # Expand alias quick commands before built-in dispatch so targets like
         # /model openai/gpt-5.5 --provider openrouter reach the /model handler.
@@ -13829,6 +13856,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
 
 
+
+    def _agent_passthrough_commands(self, source: SessionSource) -> frozenset:
+        """Canonical slash names that skip core handlers and reach the agent.
+
+        Configured per platform via
+        ``platforms.<platform>.extra.agent_passthrough_commands`` (list or
+        comma-separated string; leading ``/`` and case ignored). Empty by
+        default so stock Hermes keeps treating ``/start`` as a silent
+        platform ping.
+        """
+        from gateway.slash_access import _coerce_command_list, _platform_extra
+
+        if self.config is None or source is None:
+            return frozenset()
+        platforms = getattr(self.config, "platforms", None)
+        if platforms is None:
+            return frozenset()
+        try:
+            platform_config = platforms.get(source.platform)
+        except Exception:
+            return frozenset()
+        extra = _platform_extra(platform_config)
+        return _coerce_command_list(extra.get("agent_passthrough_commands"))
 
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str

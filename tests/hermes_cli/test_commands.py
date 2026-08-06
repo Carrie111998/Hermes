@@ -1364,7 +1364,10 @@ class TestTelegramMenuCommands:
             "      command_menu:\n"
             "        max_commands: 0\n"
         )
-        assert telegram_menu_max_commands() == 1
+        assert telegram_menu_max_commands() == 0
+        menu, hidden = telegram_menu_commands(max_commands=0)
+        assert menu == []
+        assert hidden > 0
 
         (tmp_path / "config.yaml").write_text(
             "platforms:\n"
