@@ -51,6 +51,13 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+class TestDoctorBedrockDiscovery:
+    def test_probe_disabled_when_bedrock_discovery_is_disabled(self):
+        config = {"bedrock": {"discovery": {"enabled": False}}}
+
+        assert doctor._bedrock_discovery_enabled_for_doctor(config) is False
+
+
 class TestDoctorToolAvailabilitySummary:
     def test_missing_api_key_summary_ignores_disabled_toolsets(self, monkeypatch):
         unavailable = [

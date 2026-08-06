@@ -35,7 +35,16 @@ class _FakeEnv:
         self.calls: list[dict] = []
 
     def execute(self, command: str, cwd: str = None, **kwargs) -> dict:
+        import os
         import subprocess
+        shell = "bash"
+        if os.name == "nt":
+            # ``CreateProcess('bash')`` may resolve Windows' WSL launcher even
+            # when Git Bash is earlier on PATH. File operations use the
+            # explicitly discovered Git Bash, so the test must do the same.
+            from tools.environments.local import _find_bash
+
+            shell = _find_bash()
         self.calls.append({"command": command, "cwd": cwd})
         # Simulate cd by updating self.cwd (the real env does the same
         # via _extract_cwd_from_output after a successful command)
@@ -45,15 +54,15 @@ class _FakeEnv:
             return {"output": "", "returncode": 0}
         # Actually run the command — handle stdin via subprocess
         stdin_data = kwargs.get("stdin_data")
+        input_bytes = stdin_data.encode("utf-8") if isinstance(stdin_data, str) else stdin_data
         proc = subprocess.run(
-            ["bash", "-c", command],
+            [shell, "-c", command],
             cwd=cwd or self.cwd,
-            input=stdin_data,
+            input=input_bytes,
             capture_output=True,
-            text=True,
         )
         return {
-            "output": proc.stdout + proc.stderr,
+            "output": (proc.stdout + proc.stderr).decode("utf-8", errors="replace"),
             "returncode": proc.returncode,
         }
 
@@ -127,3 +136,42 @@ class TestShellFileOpsCwdTracking:
         assert target.read_text() == "new content\n", (
             "patch_replace claimed success but file wasn't written correctly"
         )
+
+    def test_ripgrep_keeps_native_windows_drive_path_when_msys_conversion_is_disabled(
+        self, monkeypatch
+    ):
+        """Native rg.exe cannot open /d/... when MSYS arg conversion is disabled.
+
+        The local terminal intentionally sets ``MSYS2_ARG_CONV_EXCL=*``.  File
+        operations must therefore pass a native ``D:\\...`` path to ripgrep,
+        even though shell builtins continue to use Git-Bash-safe ``/d/...``.
+        """
+        import tools.environments.local as local_env
+
+        class _CaptureEnv:
+            cwd = r"D:\Git"
+
+            def __init__(self):
+                self.calls = []
+
+            def execute(self, command, cwd=None, **kwargs):
+                self.calls.append(command)
+                return {"output": "", "returncode": 1}
+
+        monkeypatch.setattr(local_env, "_IS_WINDOWS", True)
+        env = _CaptureEnv()
+        ops = ShellFileOperations(env, cwd=env.cwd)
+
+        ops._search_with_rg(
+            "needle",
+            "/d/Git/semantic-research",
+            None,
+            50,
+            0,
+            "content",
+            0,
+        )
+
+        command = env.calls[-1]
+        assert "'/d/Git/semantic-research'" not in command
+        assert "'D:\\Git\\semantic-research'" in command

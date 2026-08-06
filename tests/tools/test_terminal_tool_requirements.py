@@ -1,6 +1,7 @@
 """Tests for terminal/file tool availability in local dev environments."""
 
 import importlib
+import logging
 
 import pytest
 
@@ -112,6 +113,100 @@ class TestCheckFnTransientFailureSuppression:
         t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
         # Different fn so last-good for `good` doesn't apply; bad has no success.
         assert reg._check_fn_cached(bad) is False
+
+    def test_expected_false_availability_probe_is_debug_not_warning(
+        self, caplog
+    ):
+        """Optional tool absence is normal and must not pollute errors.log."""
+        import tools.registry as reg
+
+        def unavailable():
+            return False
+
+        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+            assert reg._check_fn_cached(unavailable) is False
+
+        records = [r for r in caplog.records if "unavailable" in r.getMessage()]
+        assert records
+        assert all(r.levelno < logging.WARNING for r in records)
+
+    def test_persistent_false_after_previous_success_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A real availability transition remains visible without log spam."""
+        import tools.registry as reg
+
+        state = {"ok": True}
+
+        def probe():
+            return state["ok"]
+
+        t = {"now": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
+
+        assert reg._check_fn_cached(probe) is True
+        state["ok"] = False
+        t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
+
+        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+            assert reg._check_fn_cached(probe) is False
+
+        outage_warnings = [
+            record
+            for record in caplog.records
+            if "probe" in record.getMessage() and record.levelno >= logging.WARNING
+        ]
+        assert len(outage_warnings) == 1
+
+        # Once the transition has been reported, later persistent failures are
+        # ordinary unavailable-state diagnostics and must not warn every TTL.
+        caplog.clear()
+        t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
+        assert reg._check_fn_cached(probe) is False
+        assert not [
+            record
+            for record in caplog.records
+            if "probe" in record.getMessage() and record.levelno >= logging.WARNING
+        ]
+
+    def test_persistent_exception_after_success_warns_once(
+        self, monkeypatch, caplog
+    ):
+        """A persistent probe exception reports one transition, not every TTL."""
+        import tools.registry as reg
+
+        state = {"ok": True}
+
+        def probe():
+            if state["ok"]:
+                return True
+            raise RuntimeError("persistent probe failure")
+
+        t = {"now": 1000.0}
+        monkeypatch.setattr(reg.time, "monotonic", lambda: t["now"])
+
+        assert reg._check_fn_cached(probe) is True
+        state["ok"] = False
+        t["now"] += reg._CHECK_FN_FAILURE_GRACE_SECONDS + 1
+
+        with caplog.at_level(logging.DEBUG, logger="tools.registry"):
+            assert reg._check_fn_cached(probe) is False
+
+        outage_warnings = [
+            record
+            for record in caplog.records
+            if "probe" in record.getMessage() and record.levelno >= logging.WARNING
+        ]
+        assert len(outage_warnings) == 1
+
+        caplog.clear()
+        t["now"] += reg._CHECK_FN_TTL_SECONDS + 1
+        assert reg._check_fn_cached(probe) is False
+        assert not [
+            record
+            for record in caplog.records
+            if "probe" in record.getMessage() and record.levelno >= logging.WARNING
+        ]
 
 
     def test_grace_expiry_lets_real_outage_through(self, monkeypatch):

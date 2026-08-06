@@ -16,6 +16,8 @@ chosen ``user_peer_id`` can be asserted without touching the network.
 
 import hashlib
 import json
+import os
+from pathlib import Path
 from unittest.mock import MagicMock
 
 
@@ -528,6 +530,131 @@ class TestPinTransition:
         sig_unpinned = GatewayRunner._extract_cache_busting_config({"memory": {"provider": "honcho"}})
 
         assert sig_pinned["honcho.pin_peer_name"] != sig_unpinned["honcho.pin_peer_name"]
+
+    def test_cache_busting_detects_same_size_same_mtime_rewrite(self, tmp_path, monkeypatch):
+        """Rapid config rewrites must not reuse a stale gateway agent."""
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "alice"}))
+        original = cfg_path.stat()
+        sig_alice = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        cfg_path.write_text(json.dumps({"apiKey": "k", "peerName": "bobby"}))
+        assert cfg_path.stat().st_size == original.st_size
+        os.utime(cfg_path, ns=(original.st_atime_ns, original.st_mtime_ns))
+
+        sig_bobby = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+        assert sig_alice["honcho.peer_name"] != sig_bobby["honcho.peer_name"]
+
+    def test_cache_busting_parses_the_same_snapshot_it_fingerprints(
+        self, tmp_path, monkeypatch
+    ):
+        """A rewrite between fingerprinting and parsing must not poison memo state."""
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        alice = json.dumps({"apiKey": "k", "peerName": "alice"})
+        bobby = json.dumps({"apiKey": "k", "peerName": "bobby"})
+        assert len(alice) == len(bobby)
+        cfg_path.write_text(alice)
+        original_stat = cfg_path.stat()
+        original_read_bytes = Path.read_bytes
+        switched = False
+
+        def read_then_rewrite(path):
+            nonlocal switched
+            snapshot = original_read_bytes(path)
+            if path == cfg_path and not switched:
+                switched = True
+                path.write_text(bobby)
+                os.utime(
+                    path,
+                    ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+                )
+            return snapshot
+
+        monkeypatch.setattr(Path, "read_bytes", read_then_rewrite)
+        first = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        monkeypatch.setattr(Path, "read_bytes", original_read_bytes)
+        cfg_path.write_text(alice)
+        os.utime(
+            cfg_path,
+            ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+        )
+        restored = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert first["honcho.peer_name"] == "alice"
+        assert restored["honcho.peer_name"] == "alice"
+
+    def test_cache_busting_is_scoped_to_active_honcho_host(self, tmp_path, monkeypatch):
+        """Profiles sharing one file must not reuse another host's identity."""
+        from gateway.run import GatewayRunner
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg_path.write_text(json.dumps({
+            "hosts": {
+                "hermes_a": {"apiKey": "k", "peerName": "alice"},
+                "hermes_b": {"apiKey": "k", "peerName": "bobby"},
+            }
+        }))
+
+        monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes_a")
+        sig_a = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+        monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes_b")
+        sig_b = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert sig_a["honcho.peer_name"] == "alice"
+        assert sig_b["honcho.peer_name"] == "bobby"
+
+    def test_cache_busting_uses_one_resolved_host_for_key_and_parse(
+        self, tmp_path, monkeypatch
+    ):
+        """The memo key and parsed values must share one host snapshot."""
+        from gateway.run import GatewayRunner
+        from plugins.memory.honcho import client as honcho_client
+
+        cfg_path = tmp_path / "honcho.json"
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        cfg_path.write_text(json.dumps({
+            "hosts": {
+                "hermes_a": {"apiKey": "k", "peerName": "alice"},
+                "hermes_b": {"apiKey": "k", "peerName": "bobby"},
+            }
+        }))
+
+        resolved = []
+
+        def changing_active_host():
+            host = "hermes_a" if not resolved else "hermes_b"
+            resolved.append(host)
+            return host
+
+        monkeypatch.setattr(honcho_client, "resolve_active_host", changing_active_host)
+
+        sig = GatewayRunner._extract_cache_busting_config(
+            {"memory": {"provider": "honcho"}}
+        )
+
+        assert sig["honcho.peer_name"] == "alice"
+        assert resolved == ["hermes_a"]
 
 
 class TestProfilePeerUniqueness:

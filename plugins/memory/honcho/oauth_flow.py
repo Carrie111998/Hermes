@@ -49,7 +49,10 @@ def _display_config_path(path: object) -> str:
 
     p = _Path(str(path))
     try:
-        return "~/" + str(p.relative_to(_Path.home()))
+        # Consent text is platform-neutral and may leave the machine; always
+        # render its home-relative portion with forward slashes. ``str(Path)``
+        # leaks Windows separators and broke the documented display contract.
+        return "~/" + p.relative_to(_Path.home()).as_posix()
     except ValueError:
         return p.name
 

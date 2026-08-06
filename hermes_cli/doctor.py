@@ -132,6 +132,15 @@ def _has_provider_env_config(content: str) -> bool:
     return any(key in content for key in _PROVIDER_ENV_HINTS)
 
 
+def _bedrock_discovery_enabled_for_doctor(config: dict) -> bool:
+    """Return whether doctor should call Bedrock's model-discovery API."""
+    bedrock = config.get("bedrock") if isinstance(config, dict) else {}
+    bedrock = bedrock if isinstance(bedrock, dict) else {}
+    discovery = bedrock.get("discovery")
+    discovery = discovery if isinstance(discovery, dict) else {}
+    return discovery.get("enabled", True) is not False
+
+
 def _honcho_is_configured_for_doctor() -> bool:
     """Return True when Honcho is configured, even if this process has no active session."""
     try:
@@ -2338,6 +2347,12 @@ def run_doctor(args):
             )
 
     def _probe_bedrock() -> _ConnectivityResult:
+        try:
+            from hermes_cli.config import load_config
+            if not _bedrock_discovery_enabled_for_doctor(load_config()):
+                return _ConnectivityResult("AWS Bedrock", [], [])
+        except Exception:
+            pass
         try:
             from agent.bedrock_adapter import (
                 has_aws_credentials,

@@ -10881,7 +10881,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             os.getenv(v, "").lower() in {"true", "1", "yes"}
             for v in _builtin_allow_all_vars + _plugin_allow_all_vars
         )
-        if not _any_allowlist and not _allow_all:
+        # An allowlist is relevant only when at least one messaging adapter is
+        # enabled. Cron-only gateway installations intentionally have none and
+        # should not emit a security warning on every clean startup.
+        _has_enabled_messaging = any(
+            bool(getattr(platform_cfg, "enabled", False))
+            for platform_cfg in self.config.platforms.values()
+        )
+        if _has_enabled_messaging and not _any_allowlist and not _allow_all:
             logger.warning(
                 "No env user allowlists configured. Messaging platforms default to "
                 "pairing/allowlist policies and will deny unknown senders unless you "
@@ -11339,7 +11346,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_platform_count,
                 )
             else:
-                logger.warning("No messaging platforms enabled.")
+                logger.info("No messaging platforms enabled.")
                 logger.info("Gateway will continue running for cron job execution.")
         
         # Update delivery router with adapters
@@ -22525,7 +22532,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         "honcho.runtime_peer_prefix",
         "honcho.user_peer_aliases",
     )
-    _HONCHO_CACHE_BUSTING_MEMO: dict[tuple[str, int | None], dict[str, Any]] = {}
+    _HONCHO_CACHE_BUSTING_MEMO: dict[
+        tuple[str, str, int | None, int | None, str | None], dict[str, Any]
+    ] = {}
 
     @classmethod
     def _empty_honcho_cache_busting_config(cls) -> dict[str, Any]:
@@ -22533,21 +22542,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     @classmethod
     def _extract_honcho_cache_busting_config(cls) -> dict[str, Any]:
-        """Extract Honcho identity keys, memoized by honcho.json mtime."""
+        """Extract Honcho identity keys, memoized by honcho.json content."""
         try:
-            from plugins.memory.honcho.client import HonchoClientConfig, resolve_config_path
+            import hashlib
+
+            from plugins.memory.honcho.client import (
+                HonchoClientConfig,
+                resolve_active_host,
+                resolve_config_path,
+            )
 
             path = resolve_config_path()
+            active_host = resolve_active_host()
+            raw_config = None
             try:
-                mtime_ns = path.stat().st_mtime_ns
+                snapshot = path.read_bytes()
+                stat = path.stat()
+                # Metadata alone can remain unchanged across rapid same-tick
+                # rewrites (including equal-length edits) on Windows/network
+                # filesystems. Include a content fingerprint so an identity
+                # change can never reuse a stale gateway agent.
+                digest = hashlib.sha256(snapshot).hexdigest()
+                parsed_snapshot = json.loads(snapshot.decode("utf-8"))
+                if not isinstance(parsed_snapshot, dict):
+                    raise ValueError("Honcho config root must be a JSON object")
+                raw_config = parsed_snapshot
+                file_stamp = (stat.st_mtime_ns, stat.st_size, digest)
             except OSError:
-                mtime_ns = None
-            memo_key = (str(path), mtime_ns)
+                file_stamp = (None, None, None)
+            # The same config file can serve multiple Hermes profiles/hosts;
+            # host selection changes the resolved peer values without changing
+            # the file itself, so it must participate in the memo key.
+            mtime_ns, file_size, content_digest = file_stamp
+            memo_key = (
+                str(path),
+                active_host,
+                mtime_ns,
+                file_size,
+                content_digest,
+            )
             cached = cls._HONCHO_CACHE_BUSTING_MEMO.get(memo_key)
             if cached is not None:
                 return dict(cached)
 
-            hcfg = HonchoClientConfig.from_global_config(config_path=path)
+            hcfg = HonchoClientConfig.from_global_config(
+                config_path=path,
+                host=active_host,
+                raw_config=raw_config,
+            )
             aliases = hcfg.user_peer_aliases or {}
             values = {
                 "honcho.peer_name": hcfg.peer_name,
@@ -26677,7 +26719,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # is one line, key=value, parent_cmdline last (often long).
         if _shutdown_ctx is not None:
             try:
-                logger.warning(
+                log_shutdown_context = (
+                    logger.info if (planned_stop or planned_takeover) else logger.warning
+                )
+                log_shutdown_context(
                     "Shutdown context: %s", format_context_for_log(_shutdown_ctx)
                 )
             except Exception as _e:
