@@ -1362,6 +1362,8 @@ def _extract_agent_iteration(final_response: str):
       - ``counters`` (if present) must be a dict mapping str → number.
       - ``anomalies`` (if present) must be a list.
       - ``reason`` (if present) must be a string.
+      - ``brief`` is optional; when present it must be a string or schema-mismatch,
+        is trimmed, dropped if blank, and capped at 1500 chars with an ellipsis.
 
     The marker is OPTIONAL — _missing_ is signaled but ALSO silent (no
     AGENT_ERROR) for non-contracted jobs. Only PRESENT-but-malformed cases
@@ -1407,13 +1409,13 @@ def _extract_agent_iteration(final_response: str):
     if reason is not None and not isinstance(reason, str):
         return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
 
-    brief = parsed.get("brief")
-    if brief is not None:
+    if "brief" in parsed:
+        brief = parsed["brief"]
         if not isinstance(brief, str):
             return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
         stripped = brief.strip()
         if not stripped:
-            parsed.pop("brief", None)
+            parsed.pop("brief")
         else:
             if len(stripped) > AGENT_ITERATION_BRIEF_MAX_CHARS:
                 stripped = stripped[: AGENT_ITERATION_BRIEF_MAX_CHARS - 1] + "…"

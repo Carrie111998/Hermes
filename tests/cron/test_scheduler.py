@@ -4998,6 +4998,20 @@ class TestExtractAgentIteration:
         assert parsed is None
         assert err == "agent_iteration_schema_mismatch"
 
+    def test_brief_explicit_null_is_schema_mismatch(self):
+        from cron.scheduler import (
+            _extract_agent_iteration,
+            AGENT_ITERATION_REASON_SCHEMA_MISMATCH,
+        )
+        block = (
+            '<AGENT_ITERATION_JSON>\n'
+            '{"agent": "critic", "summary": "x", "brief": null}\n'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(block)
+        assert parsed is None
+        assert err == AGENT_ITERATION_REASON_SCHEMA_MISMATCH
+
     def test_brief_whitespace_only_treated_as_absent(self):
         from cron.scheduler import _extract_agent_iteration
         block = (
