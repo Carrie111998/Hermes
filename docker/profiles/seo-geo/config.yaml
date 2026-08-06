@@ -75,6 +75,17 @@ skills:
     - whatsapp-decision-report
     - yuanbao
 
+# Cron-only : ne pas connecter Discord. Sans ce bloc, _apply_env_overrides()
+# (gateway/config.py) active Discord automatiquement dès que DISCORD_BOT_TOKEN
+# est présent dans l'env, et le gateway seo-geo échoue en boucle sur le lock
+# du token déjà détenu par le gateway default (PID 1). Le `enabled: false`
+# explicite pose le marqueur `_enabled_explicit` qui bloque cette
+# auto-activation. Les crons seo-geo continuent de tourner ; la livraison
+# Discord des rapports passe par le gateway default.
+platforms:
+  discord:
+    enabled: false
+
 mcp_servers:
   # WordPress tanorient.com — plugin AI Engine (Streamable HTTP, accès admin).
   # Même endpoint que le Desktop mais SANS mcp-remote : Hermes parle HTTP natif.
