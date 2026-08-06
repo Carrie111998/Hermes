@@ -106,14 +106,30 @@ _MAX_REFERENCED_SCRIPT_BYTES = 1024 * 1024
 _MAX_REFERENCED_SCRIPT_DEPTH = 8
 _CONTROL_CHARS = frozenset(";&|()")
 
-
+# Bounded scan budget for the shlex tokenizer. shlex reads one char at a time
+# in pure Python and its cost is superlinear on pathological input (a single
+# multi-megabyte token makes the string append quadratic — a 2MB scan took ~70s
+# in the field). The referenced-script reader caps files at
+# _MAX_REFERENCED_SCRIPT_BYTES; applying the same budget to every tokenization
+# keeps a decoded binary or an oversized command line from wedging the gateway
+# inside shlex for minutes-to-hours.
+_MAX_SCAN_CHARS = _MAX_REFERENCED_SCRIPT_BYTES  # 1 MiB
+_MAX_SCAN_TOKENS = 50_000
 
 
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
-    """Yield shell-tokenized command segments, honoring quotes and comments."""
+    """Yield shell-tokenized command segments, honoring quotes and comments.
+
+    Inputs larger than ``_MAX_SCAN_CHARS``, or yielding more than
+    ``_MAX_SCAN_TOKENS`` tokens, are treated as un-scanable and skipped —
+    tokenizing unbounded text is pathologically slow and buys nothing for
+    lifecycle detection.
+    """
+    if not command or len(command) > _MAX_SCAN_CHARS:
+        return
     normalized = command.replace("\\\n", "")
     for line in normalized.splitlines() or [normalized]:
         try:
@@ -124,7 +140,11 @@ def _iter_command_segments(command: str) -> Iterator[list[str]]:
             )
             lexer.whitespace_split = True
             lexer.commenters = "#"
-            tokens = list(lexer)
+            tokens: list[str] = []
+            for token in lexer:
+                tokens.append(token)
+                if len(tokens) >= _MAX_SCAN_TOKENS:
+                    raise ValueError("command scan token budget exceeded")
         except ValueError:
             continue
 

@@ -2503,6 +2503,7 @@ def terminal_tool(
         # but applies unconditionally (force=True cannot help here).
         if os.environ.get("_HERMES_GATEWAY") == "1":
             from cron.lifecycle_guard import (
+                _MAX_REFERENCED_SCRIPT_BYTES,
                 contains_gateway_lifecycle_command_or_referenced_script,
                 contains_launchctl_submit_command,
             )
@@ -2542,18 +2543,31 @@ def terminal_tool(
                         local_path = Path(guard_cwd) / local_path
                     if local_path.is_file():
                         metadata = local_path.stat()
-                        if stat.S_ISREG(metadata.st_mode) and metadata.st_size <= 1024 * 1024:
+                        if (
+                            stat.S_ISREG(metadata.st_mode)
+                            and metadata.st_size <= _MAX_REFERENCED_SCRIPT_BYTES
+                        ):
                             data = local_path.read_bytes()
-                            if len(data) <= 1024 * 1024:
+                            if len(data) <= _MAX_REFERENCED_SCRIPT_BYTES:
                                 if b"\x00" in data:
-                                    # Binary (ELF/Mach-O/PE), not a shell script:
-                                    # feeding its decoded bytes back into the guard
-                                    # tokenizes machine code into bogus NUL-bearing
-                                    # paths and crashes the scanner (#77703). Mirror
-                                    # lifecycle_guard._read_referenced_script and
-                                    # treat it as nothing to scan.
+                                    # NUL bytes -> a binary (ELF/Mach-O/PE), not a
+                                    # shell script. Feeding its decoded bytes back
+                                    # into the guard tokenizes machine code into
+                                    # bogus NUL-bearing paths and crashes the
+                                    # scanner (#77703); it is also pathologically
+                                    # slow. Mirror lifecycle_guard.
+                                    # _read_referenced_script and treat it as
+                                    # nothing to scan.
                                     return None
                                 return data.decode("utf-8", errors="replace")
+                        else:
+                            # A local regular file that is oversized (or not
+                            # regular) must not be slurped via `cat`: a large
+                            # executable referenced by absolute path (e.g.
+                            # `kimi`, `node`) would otherwise be dumped whole
+                            # into the guard's tokenizer and wedge the gateway
+                            # for tens of minutes or longer.
+                            return None
                 except Exception:
                     pass
                 # Remote / sandboxed backend: read via the environment's shell.
@@ -2561,9 +2575,10 @@ def terminal_tool(
                     result = env.execute(f"cat {shlex.quote(script_path)}")
                     if result.get("returncode", -1) == 0:
                         output = result.get("output", "")
-                        if output and "\x00" in output:
-                            # Binary content from a remote `cat`: skip for the
-                            # same reason as the local branch above (#77703).
+                        # Same guards as the local read: a remote binary or an
+                        # oversized file is not a scanable shell script
+                        # (NUL-skip mirrors #77703).
+                        if "\x00" in output or len(output) > _MAX_REFERENCED_SCRIPT_BYTES:
                             return None
                         return output
                 except Exception:

@@ -560,6 +560,38 @@ class TestTerminalToolGatewayLifecycleGuard:
         assert result["exit_code"] == 0
         assert calls == ["systemctl status nginx"]
 
+    def test_oversized_local_binary_not_slurped_via_cat_fallback(
+        self, monkeypatch, tmp_path
+    ):
+        """A large binary executable referenced by absolute path (e.g. `kimi`)
+        must NOT be `cat`-ed whole into the lifecycle guard — the decoded
+        machine code would be tokenized for tens of minutes, wedging the
+        gateway and stalling the session."""
+        import tools.terminal_tool as tt
+
+        blob = tmp_path / "big.bin"
+        blob.write_bytes(b"\x00ELF" * 300 * 1024)  # ~1.2MB binary with NUL bytes
+
+        calls = []
+
+        class _FakeEnv:
+            env = {}
+            def execute(self, command, **kwargs):
+                calls.append(command)
+                return {"output": "", "returncode": 0}
+
+        self._patch_env(monkeypatch, _FakeEnv(), inside_gateway=True)
+        monkeypatch.setattr(
+            tt, "_check_all_guards", lambda cmd, env, **kwargs: {"approved": True}
+        )
+
+        command = f"{blob} --version"
+        result = json.loads(tt.terminal_tool(command=command))
+
+        assert result["exit_code"] == 0
+        # The ONLY execute call is the real command — never a `cat <binary>`.
+        assert calls == [command]
+
 
 # ---------------------------------------------------------------------------
 # cron.lifecycle_guard module — the shared checker create_job/CLI/terminal use
@@ -913,3 +945,63 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+# ---------------------------------------------------------------------------
+# Regression: the lifecycle guard must never wedge the gateway in shlex on
+# pathological input (binary / oversized "script" content). Real incident: a
+# terminal_tool command referencing `/data/homes/star/.kimi-code/bin/kimi` (a
+# 166MB ELF) by absolute path — the guard's referenced-script reader fell back
+# to `env.execute("cat <path>")`, dumped the whole binary back as decoded text,
+# and the shlex tokenizer chewed on it for tens of minutes (superlinear cost),
+# stalling the session and tripping the stall watchdog.
+# ---------------------------------------------------------------------------
+
+class TestLifecycleGuardScanBounds:
+    """The shlex-based scan is bounded: oversized or token-flood inputs are
+    skipped instead of tokenized for minutes."""
+
+    def test_iter_command_segments_skips_oversized_input(self):
+        from cron.lifecycle_guard import _iter_command_segments
+        oversized = "x " * 700_000  # 1.4MB single line
+        assert list(_iter_command_segments(oversized)) == []
+
+    def test_iter_command_segments_bounds_token_flood(self):
+        from cron.lifecycle_guard import _iter_command_segments
+        flood = "a " * 60_000  # 120KB but >50K tokens
+        assert list(_iter_command_segments(flood)) == []
+
+    def test_iter_command_segments_still_tokenizes_normal_commands(self):
+        from cron.lifecycle_guard import _iter_command_segments
+        segments = list(_iter_command_segments("echo hi && cat /tmp/x.sh"))
+        assert ["echo", "hi"] in segments
+        assert ["cat", "/tmp/x.sh"] in segments
+
+    def test_guard_returns_without_wedging_on_oversized_binary_script_text(self):
+        import signal
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+        # 3.4MB of NUL-separated symbol-table junk: one huge single line with
+        # no shlex punctuation — exactly the shape that makes the tokenizer
+        # superlinear. The scan must be skipped, not chew CPU for minutes.
+        blob = "ZSTD_symbol_name\x00" * 200_000
+
+        class _Alarm(Exception):
+            pass
+
+        def _alarm_handler(signum, frame):
+            raise _Alarm()
+
+        old_handler = signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(5)
+        try:
+            result = contains_gateway_lifecycle_command_or_referenced_script(
+                "/some/abs/path",
+                cwd="/tmp",
+                read_remote_script=lambda path: blob,
+            )
+            assert result is False
+        finally:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
