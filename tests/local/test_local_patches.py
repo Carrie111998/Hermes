@@ -476,3 +476,93 @@ class TestKanbanGuidanceCompletes:
 
         monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
         assert kanban_tools._check_kanban_orchestrator_mode() is False
+
+
+# ---------------------------------------------------------------------------
+# Vault router injection. The runbook told the agent for months that the vault
+# index "arrives injected" while nothing injected it -- the claim outlived the
+# code that would have made it true. This patch makes it true and pins the two
+# properties that matter: it is opt-in, and it lands in its own slot.
+# ---------------------------------------------------------------------------
+
+
+class TestVaultRoutesInjection:
+    def test_absent_config_injects_nothing(self, monkeypatch):
+        """A profile that never opted in pays nothing. This is what keeps the
+        six workers from carrying ~1,600 tokens of routes they never follow."""
+        import hermes_cli.config as cfg_mod
+        from agent.prompt_builder import build_vault_routes_prompt
+
+        monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: {})
+        assert build_vault_routes_prompt() == ""
+
+        monkeypatch.setattr(cfg_mod, "load_config_readonly", lambda: {"vault": {"routes_dir": ""}})
+        assert build_vault_routes_prompt() == ""
+
+    def test_routers_load_and_context_files_stay_out(self, monkeypatch, tmp_path):
+        import hermes_cli.config as cfg_mod
+        from agent.prompt_builder import build_vault_routes_prompt
+
+        wiki = tmp_path / "wiki"
+        (wiki / "ai").mkdir(parents=True)
+        (wiki / "_active.md").write_text("ACTIVE-ROUTES-MARKER\n", encoding="utf-8")
+        (wiki / "_index.md").write_text("INDEX-MARKER\n", encoding="utf-8")
+        (wiki / "ai" / "_context.md").write_text("CATEGORY-MARKER\n", encoding="utf-8")
+
+        monkeypatch.setattr(
+            cfg_mod, "load_config_readonly", lambda: {"vault": {"routes_dir": str(wiki)}}
+        )
+        out = build_vault_routes_prompt()
+
+        assert "ACTIVE-ROUTES-MARKER" in out
+        assert "INDEX-MARKER" in out
+        assert "CATEGORY-MARKER" not in out, (
+            "a per-category _context.md reached the prompt: the nine of them are "
+            "~8,800 tokens against the routers' ~1,600, and the layering exists so "
+            "a category is opened only when a route points at it"
+        )
+        assert out.index("_active.md") < out.index("_index.md"), "reading order lost"
+
+    def test_router_is_capped(self, monkeypatch, tmp_path):
+        """A router that outgrows its budget gets truncated rather than
+        quietly becoming the largest thing in the prompt."""
+        import hermes_cli.config as cfg_mod
+        from agent.prompt_builder import build_vault_routes_prompt, _VAULT_ROUTER_MAX_CHARS
+
+        wiki = tmp_path / "wiki"
+        wiki.mkdir()
+        (wiki / "_index.md").write_text("x" * (_VAULT_ROUTER_MAX_CHARS * 3), encoding="utf-8")
+
+        monkeypatch.setattr(
+            cfg_mod, "load_config_readonly", lambda: {"vault": {"routes_dir": str(wiki)}}
+        )
+        out = build_vault_routes_prompt()
+
+        assert "outgrew its router budget" in out
+        assert len(out) < _VAULT_ROUTER_MAX_CHARS * 2
+
+    def test_reachable_through_the_call_path_system_prompt_uses(self):
+        """system_prompt.py reaches the builder through ``_ra()`` -- the
+        run_agent module -- not through prompt_builder directly. Calling the
+        function under test by its real name passed while Hermes itself died
+        with ``module 'run_agent' has no attribute 'build_vault_routes_prompt'``;
+        only the smoke test caught it. This asserts the re-export exists."""
+        import run_agent
+
+        assert hasattr(run_agent, "build_vault_routes_prompt"), (
+            "run_agent no longer re-exports build_vault_routes_prompt — "
+            "system_prompt.py calls it as _r.build_vault_routes_prompt and will "
+            "raise AttributeError on every session"
+        )
+
+    def test_injected_after_the_context_files(self):
+        """Cache ordering: the ingest cron rewrites the routers, so anything
+        ahead of them keeps its cached prefix. If this assertion moves, check
+        that the routers did not end up in front of SOUL or .hermes.md."""
+        import inspect
+        from agent import system_prompt
+
+        src = inspect.getsource(system_prompt.build_system_prompt_parts)
+        assert src.index("context_parts.append(context_files_prompt)") < src.index(
+            "build_vault_routes_prompt"
+        ), "vault routers moved ahead of the context files — cached prefix now churns"

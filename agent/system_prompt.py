@@ -762,6 +762,14 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         if context_files_prompt:
             context_parts.append(context_files_prompt)
 
+    # Vault routers (opt-in via vault.routes_dir). Last in the context tier on
+    # purpose: the ingest cron rewrites these files, and anything ahead of them
+    # — SOUL, .hermes.md, the project context — keeps its cached prefix when
+    # they change.
+    _vault_routes = _r.build_vault_routes_prompt(context_length=_ctx_len)
+    if _vault_routes:
+        context_parts.append(_vault_routes)
+
     # ── Volatile tier (most likely to differ on a rebuild; kept last so the stable prefix stays reusable) ──
     volatile_parts: List[str] = []
     # Skills are runtime-mutable: the agent adds and patches them across a
