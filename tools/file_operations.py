@@ -1171,7 +1171,18 @@ class ShellFileOperations(FileOperations):
         """
         from tools.environments.local import _bash_safe_path
 
-        arg = _bash_safe_path(arg)
+        return self._escape_shell_literal(_bash_safe_path(arg))
+
+    @staticmethod
+    def _escape_shell_literal(arg: str) -> str:
+        """Quote *arg* for the shell WITHOUT any path translation.
+
+        For arguments that are not paths — a search regex, a glob filter —
+        where a backslash is syntax rather than a separator.
+        ``_escape_shell_arg`` rewrites every backslash to ``/`` on Windows
+        via ``_bash_safe_path``, which is what ``C:\\Users\\x`` needs and
+        what turns ``\\d+`` into ``/d+``.
+        """
         # Use single quotes and escape any single quotes in the string
         return "'" + arg.replace("'", "'\"'\"'") + "'"
 
@@ -2770,10 +2781,10 @@ class ShellFileOperations(FileOperations):
         """
         if not self._has_command('rg'):
             return None
-        glob_expr = f" --glob {self._escape_shell_arg(file_glob)}" if file_glob else ""
+        glob_expr = f" --glob {self._escape_shell_literal(file_glob)}" if file_glob else ""
         probe = self._exec(
             f"rg -i --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
+            f"{self._escape_shell_literal(pattern)} {self._quote_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2795,7 +2806,7 @@ class ShellFileOperations(FileOperations):
         # missing from results).
         hidden = self._exec(
             f"rg --hidden --no-ignore --count-matches{glob_expr} "
-            f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
+            f"{self._escape_shell_literal(pattern)} {self._quote_rg_path(path)} "
             f"2>/dev/null | head -50",
             timeout=30,
         )
@@ -2815,7 +2826,7 @@ class ShellFileOperations(FileOperations):
         if re.search(r"[.\[\](){}?*+^$\\|]", pattern):
             fixed = self._exec(
                 f"rg -F --count-matches{glob_expr} "
-                f"{self._escape_shell_arg(pattern)} {self._quote_rg_path(path)} "
+                f"{self._escape_shell_literal(pattern)} {self._quote_rg_path(path)} "
                 f"2>/dev/null | head -50",
                 timeout=30,
             )
@@ -3036,7 +3047,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file glob filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--glob", self._escape_shell_literal(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3045,12 +3056,14 @@ class ShellFileOperations(FileOperations):
             cmd_parts.append("-c")  # Count per file
         
         # Add pattern and path (path via _quote_rg_path: Windows-native rg
-        # needs D:/... — the MSYS /d/... form yields os error 3).
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # needs D:/... — the MSYS /d/... form yields os error 3). The
+        # pattern uses _escape_shell_literal so the Windows path translator
+        # never rewrites regex metacharacters like \\d+ or \\b.
+        cmd_parts.append(self._escape_shell_literal(pattern))
         # rg is a native Windows binary when installed via winget/cargo/choco:
         # it needs the C:/... path form, not the MSYS /c/... form (which
         # nothing converts back — Hermes sets MSYS_NO_PATHCONV for its bash).
-        cmd_parts.append(self._escape_native_tool_arg(path))
+        cmd_parts.append(self._quote_rg_path(path))
         
         # Fetch extra rows so we can report the true total before slicing.
         # For context mode, rg emits separator lines ("--") between groups,
@@ -3176,7 +3189,7 @@ class ShellFileOperations(FileOperations):
         
         # Add file pattern filter (must be quoted to prevent shell expansion)
         if file_glob:
-            cmd_parts.extend(["--include", self._escape_shell_arg(file_glob)])
+            cmd_parts.extend(["--include", self._escape_shell_literal(file_glob)])
         
         # Output mode handling
         if output_mode == "files_only":
@@ -3188,8 +3201,10 @@ class ShellFileOperations(FileOperations):
         # search root too, so passing the default relative root ``.`` causes
         # ``.*`` to exclude the entire search. Anchor relative paths at the
         # shell's live cwd; quoting $PWD separately keeps user paths escaped
-        # while working across local, container, and remote backends.
-        cmd_parts.append(self._escape_shell_arg(pattern))
+        # while working across local, container, and remote backends. The
+        # pattern uses _escape_shell_literal so the Windows path translator
+        # never rewrites regex metacharacters.
+        cmd_parts.append(self._escape_shell_literal(pattern))
         is_absolute = path.startswith(("/", "\\\\")) or bool(
             re.match(r"^[A-Za-z]:[\\/]", path)
         )
