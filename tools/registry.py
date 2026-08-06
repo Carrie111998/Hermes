@@ -163,12 +163,13 @@ class ToolEntry:
     __slots__ = (
         "name", "toolset", "schema", "handler", "check_fn",
         "requires_env", "is_async", "description", "emoji",
-        "max_result_size_chars", "dynamic_schema_overrides",
+        "max_result_size_chars", "dynamic_schema_overrides", "result_contracts",
     )
 
     def __init__(self, name, toolset, schema, handler, check_fn,
                  requires_env, is_async, description, emoji,
-                 max_result_size_chars=None, dynamic_schema_overrides=None):
+                 max_result_size_chars=None, dynamic_schema_overrides=None,
+                 result_contracts=None):
         self.name = name
         self.toolset = toolset
         self.schema = schema
@@ -187,6 +188,7 @@ class ToolEntry:
         # on every get_definitions() call; results are merged shallow on top
         # of the base schema before the {"type": "function", ...} wrap.
         self.dynamic_schema_overrides = dynamic_schema_overrides
+        self.result_contracts = frozenset(result_contracts or ())
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +533,7 @@ class ToolRegistry:
         emoji: str = "",
         max_result_size_chars: int | float | None = None,
         dynamic_schema_overrides: Callable = None,
+        result_contracts: Set[str] | None = None,
         override: bool = False,
     ):
         """Register a tool.  Called at module-import time by each tool file.
@@ -591,6 +594,7 @@ class ToolRegistry:
                 emoji=emoji,
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides,
+                result_contracts=result_contracts,
             )
             # Availability is now derived per-tool (_toolset_has_exposable_tools),
             # so this map no longer gates a toolset. It is still consumed by
@@ -820,6 +824,20 @@ class ToolRegistry:
         """Return the toolset a tool belongs to, or None."""
         entry = self.get_entry(name)
         return entry.toolset if entry else None
+
+    def declare_result_contract(self, name: str, contract: str) -> None:
+        """Declare one host-consumed result contract for a registered tool."""
+        with self._lock:
+            entry = self._tools.get(name)
+            if entry is None:
+                raise KeyError(f"Tool is not registered: {name}")
+            entry.result_contracts = frozenset((*entry.result_contracts, contract))
+            self._generation += 1
+
+    def has_result_contract(self, name: str, contract: str) -> bool:
+        """Return whether a tool explicitly opted into a host result contract."""
+        entry = self.get_entry(name)
+        return bool(entry and contract in entry.result_contracts)
 
     def get_emoji(self, name: str, default: str = "⚡") -> str:
         """Return the emoji for a tool, or *default* if unset."""

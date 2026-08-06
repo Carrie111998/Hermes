@@ -960,6 +960,40 @@ class TestPreLlmCallTargetRouting:
         assert "plain text C" in _plugin_user_context
 
 
+class TestPluginToolResultContracts:
+    def test_plugin_can_declare_contract_only_for_its_registered_tool(self):
+        from tools.registry import registry
+
+        manager = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="test-plugin", source="user"),
+            manager,
+        )
+        ctx.register_tool(
+            name="test_media_result_tool",
+            toolset="test_plugin",
+            schema={
+                "description": "test",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args: "",
+        )
+        try:
+            ctx.declare_tool_result_contract(
+                "test_media_result_tool",
+                "media_tag_v1",
+            )
+
+            assert registry.has_result_contract(
+                "test_media_result_tool",
+                "media_tag_v1",
+            )
+            with pytest.raises(ValueError, match="unowned tool"):
+                ctx.declare_tool_result_contract("shell_exec", "media_tag_v1")
+        finally:
+            registry.deregister("test_media_result_tool")
+
+
 # ── TestPluginCommands ────────────────────────────────────────────────────
 
 

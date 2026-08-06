@@ -345,6 +345,7 @@ class PluginContext:
     def __init__(self, manifest: PluginManifest, manager: "PluginManager"):
         self.manifest = manifest
         self._manager = manager
+        self._registered_tool_names: Set[str] = set()
         # Lazy-built host-owned LLM facade — see ctx.llm property below.
         self._llm: Any = None
         self._subagent_lifecycle: Any = None
@@ -461,11 +462,25 @@ class PluginContext:
             emoji=emoji,
             override=override,
         )
+        entry = registry.get_entry(name)
+        if entry is not None and entry.handler is handler:
+            self._registered_tool_names.add(name)
         self._manager._plugin_tool_names.add(name)
         logger.debug(
             "Plugin %s registered tool: %s%s",
             self.manifest.name, name, " (override)" if override else "",
         )
+
+    def declare_tool_result_contract(self, name: str, contract: str) -> None:
+        """Opt one tool from this plugin into a host-consumed result contract."""
+        if name not in self._registered_tool_names:
+            raise ValueError(
+                f"Plugin {self.manifest.name!r} cannot declare a result contract "
+                f"for unowned tool {name!r}"
+            )
+        from tools.registry import registry
+
+        registry.declare_result_contract(name, contract)
 
     # -- override trust gate ------------------------------------------------
 

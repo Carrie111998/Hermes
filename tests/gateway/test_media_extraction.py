@@ -11,6 +11,7 @@ make_image tool several turns earlier must not leak onto a later
 text-only reply, even when the path-based dedup set fails to capture it.
 """
 
+import json
 import re
 from unittest.mock import MagicMock
 
@@ -137,6 +138,211 @@ caption
         tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
         assert tags == []
         assert voice is False
+
+    def test_gateway_auto_append_keeps_typed_plugin_media_tag(self):
+        """A successful plugin media result survives later housekeeping calls."""
+        from gateway.run import _collect_auto_append_media_tags
+        from tools.registry import registry
+
+        messages = [
+            {"role": "user", "content": "Make and send the video"},
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_video", "function": {"name": "plugin_video_status"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_video",
+                "content": (
+                    '{"ok": true, "data": {'
+                    '"media_tag": "MEDIA:/opt/data/videos/generated/result.mp4"}}'
+                ),
+            },
+            {
+                "role": "assistant",
+                "content": "Logging the completed render.",
+                "tool_calls": [
+                    {"id": "call_log", "function": {"name": "plugin_log_event"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_log",
+                "content": '{"success": true}',
+            },
+            {"role": "assistant", "content": "Done."},
+        ]
+
+        registry.register(
+            name="plugin_video_status",
+            toolset="test_plugin_media",
+            schema={"description": "test", "parameters": {"type": "object"}},
+            handler=lambda _args: "",
+            result_contracts={"media_tag_v1"},
+        )
+        try:
+            tags, voice = _collect_auto_append_media_tags(messages, history_offset=1)
+        finally:
+            registry.deregister("plugin_video_status")
+
+        assert tags == ["MEDIA:/opt/data/videos/generated/result.mp4"]
+        assert voice is False
+
+    def test_gateway_auto_append_rejects_untrusted_plugin_media_text(self):
+        """Plugin MEDIA text needs a successful, explicit data.media_tag contract."""
+        from gateway.run import _collect_auto_append_media_tags
+
+        for content in (
+            '{"ok": false, "data": {"media_tag": "MEDIA:/tmp/failed.mp4"}}',
+            '{"ok": true, "data": {"note": "MEDIA:/tmp/example.mp4"}}',
+            '{"ok": true, "data": {"media_tag": "MEDIA:/tmp/no-extension"}}',
+        ):
+            messages = [
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {"id": "call_plugin", "function": {"name": "plugin_tool"}}
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call_plugin",
+                    "content": content,
+                },
+            ]
+
+            tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+
+            assert tags == []
+            assert voice is False
+
+    def test_gateway_auto_append_uses_delivery_grammar_for_typed_plugin_media(self):
+        """Typed plugin media accepts the same quoted paths as native delivery."""
+        from gateway.run import _collect_auto_append_media_tags
+        from tools.registry import registry
+
+        messages = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "call_plugin", "function": {"name": "plugin_media_tool"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call_plugin",
+                "content": (
+                    '{"success": true, "data": {'
+                    '"media_tag": "MEDIA:\\\"/tmp/rendered clips/final cut.mp4\\\""}}'
+                ),
+            },
+        ]
+
+        registry.register(
+            name="plugin_media_tool",
+            toolset="test_plugin_media",
+            schema={"description": "test", "parameters": {"type": "object"}},
+            handler=lambda _args: "",
+            result_contracts={"media_tag_v1"},
+        )
+        try:
+            tags, voice = _collect_auto_append_media_tags(messages, history_offset=0)
+        finally:
+            registry.deregister("plugin_media_tool")
+
+        assert tags == ['MEDIA:/tmp/rendered clips/final cut.mp4']
+        assert voice is False
+
+    def test_gateway_auto_append_rejects_undeclared_or_ambiguous_media_contracts(self):
+        """Only declared producers with one exact media tag can auto-attach."""
+        from gateway.run import _collect_auto_append_media_tags
+        from tools.registry import registry
+
+        registry.register(
+            name="declared_media_tool",
+            toolset="test_plugin_media",
+            schema={"description": "test", "parameters": {"type": "object"}},
+            handler=lambda _args: "",
+            result_contracts={"media_tag_v1"},
+        )
+        try:
+            for tool_name, media_tag in (
+                ("undeclared_tool", "MEDIA:/tmp/private.pdf"),
+                (
+                    "declared_media_tool",
+                    "MEDIA:/tmp/render.mp4 MEDIA:/tmp/private.pdf",
+                ),
+                ("declared_media_tool", "MEDIA:/tmp/render.mp4 finished"),
+            ):
+                messages = [
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {"id": "call_plugin", "function": {"name": tool_name}}
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call_plugin",
+                        "content": (
+                            '{"success": true, "data": {'
+                            f'"media_tag": {json.dumps(media_tag)}' + "}}"
+                        ),
+                    },
+                ]
+
+                tags, voice = _collect_auto_append_media_tags(messages)
+
+                assert tags == []
+                assert voice is False
+        finally:
+            registry.deregister("declared_media_tool")
+
+    def test_gateway_auto_append_does_not_replay_typed_media_from_history(self):
+        """Declared plugin media is limited to a trusted current-turn slice."""
+        from gateway.run import _collect_auto_append_media_tags
+        from tools.registry import registry
+
+        history = [
+            {
+                "role": "assistant",
+                "tool_calls": [
+                    {"id": "old_call", "function": {"name": "declared_media_tool"}}
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "old_call",
+                "content": (
+                    '{"success": true, "data": {'
+                    '"media_tag": "MEDIA:/tmp/old-render.mp4"}}'
+                ),
+            },
+        ]
+        messages = [*history, {"role": "assistant", "content": "Done."}]
+        registry.register(
+            name="declared_media_tool",
+            toolset="test_plugin_media",
+            schema={"description": "test", "parameters": {"type": "object"}},
+            handler=lambda _args: "",
+            result_contracts={"media_tag_v1"},
+        )
+        try:
+            sliced_tags, _ = _collect_auto_append_media_tags(
+                messages,
+                history_offset=len(history),
+            )
+            fallback_tags, _ = _collect_auto_append_media_tags(
+                messages,
+                history_offset=9999,
+            )
+        finally:
+            registry.deregister("declared_media_tool")
+
+        assert sliced_tags == []
+        assert fallback_tags == []
 
 
     def test_collect_history_media_paths_includes_image_generate_json(self):

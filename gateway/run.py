@@ -1568,6 +1568,51 @@ _TOOL_MEDIA_RE = re.compile(
     r'txt|csv|apk|ipa))',
     re.IGNORECASE,
 )
+_MEDIA_TAG_RESULT_CONTRACT = "media_tag_v1"
+
+
+def _typed_tool_result_media_tags(tool_name: str, content: str) -> tuple[List[str], bool]:
+    """Extract an explicit media contract from a successful plugin result.
+
+    Plugin tools are not part of the core producer allowlist, but they can
+    declare a deliverable attachment without relying on prose by returning
+    ``data.media_tag`` in their success envelope. Restricting this path to the
+    named field avoids treating MEDIA examples elsewhere in arbitrary tool
+    output as outbound attachments.
+    """
+    if not tool_name or '"media_tag"' not in content or "MEDIA:" not in content:
+        return [], False
+    try:
+        from tools.registry import registry
+
+        declared = registry.has_result_contract(
+            tool_name,
+            _MEDIA_TAG_RESULT_CONTRACT,
+        )
+    except Exception:
+        declared = False
+    if not declared:
+        return [], False
+    try:
+        payload = json.loads(content)
+    except Exception:
+        return [], False
+    if not isinstance(payload, dict) or not (
+        payload.get("ok") is True or payload.get("success") is True
+    ):
+        return [], False
+    data = payload.get("data")
+    if not isinstance(data, dict):
+        return [], False
+    media_tag = data.get("media_tag")
+    if not isinstance(media_tag, str):
+        return [], False
+
+    media_files, remainder = BasePlatformAdapter.extract_media(media_tag)
+    if len(media_files) != 1 or remainder.strip():
+        return [], False
+    path, is_voice = media_files[0]
+    return [f"MEDIA:{path}"], is_voice
 
 
 def _collect_auto_append_media_tags(
@@ -1577,13 +1622,16 @@ def _collect_auto_append_media_tags(
 ) -> tuple[List[str], bool]:
     """Collect real media tags from current-turn producer-tool results only.
 
-    Two layered guards keep stale/example MEDIA: strings out of the reply:
+    Three layered guards keep stale/example MEDIA: strings out of the reply:
 
-    1. Producer-tool allowlist: only tools that intentionally emit deliverable
-       artifacts (TTS) are eligible. Documentation, logs, and search results can
-       contain example strings such as MEDIA:/absolute/path/to/file, which must
-       never be delivered as attachments. (Fixes the original report behind #16721.)
-    2. Current-turn isolation: only messages produced this turn are scanned, so a
+    1. Explicit plugin contract: a successful tool result may declare an exact
+       ``data.media_tag`` field. MEDIA examples elsewhere in its output are ignored.
+    2. Producer-tool allowlist: legacy built-ins that intentionally emit
+       deliverable artifacts (TTS/image generation) remain eligible.
+       Documentation, logs, and search results can contain example strings such
+       as MEDIA:/absolute/path/to/file, which must never be delivered as
+       attachments. (Fixes the original report behind #16721.)
+    3. Current-turn isolation: only messages produced this turn are scanned, so a
        tool result from an earlier turn (still present in the full message list)
        cannot leak onto a later text-only reply (#34608).
 
@@ -1596,7 +1644,8 @@ def _collect_auto_append_media_tags(
     history_media_paths = history_media_paths or set()
     # Only trust the slice boundary when the message list still contains the
     # full history prefix. Otherwise scan everything (compression-safe fallback).
-    if history_offset and len(messages) >= history_offset:
+    slice_trusted = not history_offset or len(messages) >= history_offset
+    if history_offset and slice_trusted:
         new_messages = messages[history_offset:]
     else:
         new_messages = messages
@@ -1618,10 +1667,22 @@ def _collect_auto_append_media_tags(
         if msg.get("role") not in ("tool", "function"):
             continue
         call_id = str(msg.get("tool_call_id") or msg.get("call_id") or "")
-        if tool_name_by_call_id.get(call_id) not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
-            continue
         content = str(msg.get("content") or "")
-        tool_name = tool_name_by_call_id.get(call_id)
+        tool_name = tool_name_by_call_id.get(call_id) or ""
+        typed_tags, typed_voice = (
+            _typed_tool_result_media_tags(tool_name, content)
+            if slice_trusted
+            else ([], False)
+        )
+        if typed_tags:
+            media_tags.extend(
+                tag for tag in typed_tags
+                if tag.removeprefix("MEDIA:") not in history_media_paths
+            )
+            has_voice_directive = has_voice_directive or typed_voice
+            continue
+        if tool_name not in _AUTO_APPEND_MEDIA_TOOL_NAMES:
+            continue
         # JSON-payload tools (image_generate) return a local-file path in a
         # known field rather than a MEDIA: tag. Extract it so delivery is
         # deterministic even when the model omits the path from its reply.

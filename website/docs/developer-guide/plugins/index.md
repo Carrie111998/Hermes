@@ -586,6 +586,21 @@ auditable in `~/.hermes/logs/agent.log`. Plugins load after built-in
 tools, so the registration order is correct: your handler replaces the
 built-in one.
 
+### Declaring a media result
+
+A plugin tool that intentionally returns one native attachment can opt into
+Hermes' final-response recovery after it registers the tool:
+
+```python
+ctx.declare_tool_result_contract("render_status", "media_tag_v1")
+```
+
+On success, return exactly one deliverable tag in `data.media_tag`, such as
+`{"ok": true, "data": {"media_tag": "MEDIA:/absolute/result.mp4"}}`.
+Hermes ignores this field for undeclared tools, failed results, ambiguous
+multi-tag values, and stale history. This prevents arbitrary tool output from
+being interpreted as an outbound local-file attachment.
+
 ### Register multiple hooks
 
 ```python
