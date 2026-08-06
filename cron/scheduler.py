@@ -6292,7 +6292,9 @@ def run_job(
                         "pin it explicitly: "
                         f"`hermes cron edit {job_id} --provider <provider> "
                         "--model <model>` (or pin the original values to keep "
-                        "them)."
+                        "them), OR adopt the current global default without "
+                        f"pinning: `cronjob action=resnap job_id={job_id}` "
+                        "(or `action=resnap all=true` for every unpinned job)."
                     )
                 logger.warning(
                     "Job '%s': SKIPPED — global inference config drifted since "
