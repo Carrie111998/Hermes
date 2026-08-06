@@ -424,6 +424,65 @@ class TestCodexBuildKwargs:
         assert names == ["hermes_web_search", "hermes_web_search_2"]
         assert request.xai_client_web_search_alias == "hermes_web_search_2"
 
+    def test_xai_client_web_search_alias_avoids_canonicalized_collision(self, transport, monkeypatch):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setattr(codex_mod, "_xai_prefers_native_web_search", lambda: False)
+        monkeypatch.setitem(
+            sys.modules,
+            "run_agent",
+            SimpleNamespace(DEFAULT_AGENT_IDENTITY="You are Hermes."),
+        )
+        request = transport.build_kwargs(
+            model="grok-4.5",
+            messages=[{"role": "user", "content": "Search."}],
+            tools=[
+                {"type": "function", "function": {
+                    "name": " hermes_web_search ", "description": "Custom search.",
+                    "parameters": {"type": "object", "properties": {}}}},
+                {"type": "function", "function": {
+                    "name": "web_search", "description": "Search the web.",
+                    "parameters": {"type": "object", "properties": {}}}},
+            ],
+            is_xai_responses=True,
+        )
+
+        normalized = transport.preflight_kwargs(request)
+        names = [
+            tool.get("name")
+            for tool in normalized["tools"]
+            if tool.get("type") == "function"
+        ]
+        assert names == ["hermes_web_search", "hermes_web_search_2"]
+        assert request.xai_client_web_search_alias == "hermes_web_search_2"
+
+    def test_xai_tools_override_invalidates_generated_web_search_alias(self, transport, monkeypatch):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setattr(codex_mod, "_xai_prefers_native_web_search", lambda: False)
+        monkeypatch.setitem(
+            sys.modules,
+            "run_agent",
+            SimpleNamespace(DEFAULT_AGENT_IDENTITY="You are Hermes."),
+        )
+        request = transport.build_kwargs(
+            model="grok-4.5",
+            messages=[{"role": "user", "content": "Search."}],
+            tools=[{"type": "function", "function": {
+                "name": "web_search", "description": "Search the web.",
+                "parameters": {"type": "object", "properties": {}}}}],
+            is_xai_responses=True,
+            request_overrides={"tools": [{
+                "type": "function",
+                "name": "hermes_web_search",
+                "description": "Custom tool.",
+                "parameters": {"type": "object", "properties": {}},
+            }]},
+        )
+
+        assert request["tools"][0]["name"] == "hermes_web_search"
+        assert request.xai_client_web_search_alias is None
+
     def test_xai_normalize_maps_request_alias_back(self, transport, monkeypatch):
         """Alias used on the wire must become ``web_search`` for Hermes dispatch."""
         import agent.transports.codex as codex_mod
@@ -607,6 +666,43 @@ class TestCodexBuildKwargs:
 
 class TestXaiWebSearchBackendPreference:
     """``_xai_prefers_native_web_search`` must honor web backend config."""
+
+    def test_configured_firecrawl_from_real_config_prefers_client(self, monkeypatch, tmp_path):
+        import agent.transports.codex as codex_mod
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "web:\n  search_backend: firecrawl\n",
+            encoding="utf-8",
+        )
+
+        assert codex_mod._xai_prefers_native_web_search() is False
+
+    def test_configured_firecrawl_wins_with_partial_provider_registry(
+        self, monkeypatch, tmp_path, request
+    ):
+        import agent.transports.codex as codex_mod
+        from agent.web_search_provider import WebSearchProvider
+        from agent.web_search_registry import register_provider, _reset_for_tests
+
+        class XaiProvider(WebSearchProvider):
+            @property
+            def name(self):
+                return "xai"
+
+            def is_available(self):
+                return True
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "web:\n  search_backend: firecrawl\n",
+            encoding="utf-8",
+        )
+        _reset_for_tests()
+        register_provider(XaiProvider())
+        request.addfinalizer(_reset_for_tests)
+
+        assert codex_mod._xai_prefers_native_web_search() is False
 
     def test_explicit_firecrawl_prefers_client(self, monkeypatch):
         import agent.transports.codex as codex_mod

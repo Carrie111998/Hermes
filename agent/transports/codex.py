@@ -98,7 +98,7 @@ def _rename_client_web_search_for_xai(
 ) -> tuple[List[Dict[str, Any]], str]:
     """Rename client ``web_search`` to a collision-free xAI wire alias."""
     existing_names = {
-        tool.get("name")
+        tool.get("name").strip()
         for tool in response_tools
         if isinstance(tool, dict) and isinstance(tool.get("name"), str)
     }
@@ -474,6 +474,10 @@ class ResponsesApiTransport(ProviderTransport):
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
+            if "tools" in request_overrides:
+                # The override replaces the generated tool set, so the alias
+                # can no longer be assumed to identify Hermes web_search.
+                kwargs.xai_client_web_search_alias = None
 
         if "prompt_cache_key" in kwargs:
             bounded_cache_key = _bounded_prompt_cache_key(kwargs["prompt_cache_key"])
