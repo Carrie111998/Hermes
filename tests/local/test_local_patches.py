@@ -385,6 +385,24 @@ class TestProfileSharedBlocks:
             )
             data = json.loads(hs.read_text())
             assert data.get("bank_id"), f"{p}: hindsight config has no bank_id"
+
+            # The daemon is picked by the hindsight *profile* name, not the
+            # bank name. Writing the worker's own name here spins up a fresh
+            # embedded daemon on its own port with an empty bank that happens
+            # to share the bank_id — the worker connects, reports the right
+            # bank, and recalls nothing. Observed: implementer reached
+            # 127.0.0.1:9683 instead of the shared 8984.
+            root_cfg = json.loads(
+                (Path.home() / ".hermes" / "hindsight" / "config.json").read_text()
+            )
+            assert data.get("profile") == root_cfg.get("profile"), (
+                f"{p}: hindsight profile is {data.get('profile')!r}, control plane "
+                f"uses {root_cfg.get('profile')!r} — the worker would get its own "
+                "empty daemon instead of the shared bank"
+            )
+            assert data.get("bank_id") == root_cfg.get("bank_id"), (
+                f"{p}: bank_id diverged from the control plane's"
+            )
             assert data.get("auto_retain") is False, (
                 f"{p}: auto_retain is on — a worker's card output would land in "
                 "Patrick's curated personal bank. Workers read memory; they do not write it"
