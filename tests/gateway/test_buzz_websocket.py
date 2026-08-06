@@ -8,6 +8,7 @@ lifecycle as wired into BuzzAdapter.
 
 import asyncio
 import json
+import sys
 import time
 from types import SimpleNamespace
 
@@ -284,21 +285,43 @@ async def test_activity_auto_fallback_reports_websocket_requirement(
 
 
 @pytest.mark.asyncio
-async def test_publish_activity_fails_open_when_websocket_send_fails():
+async def test_terminal_send_failure_retries_once_on_same_live_socket(monkeypatch):
     owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
     adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    monkeypatch.setattr(_buzz_mod, "_ACTIVITY_TERMINAL_RETRY_DELAY", 0.01)
 
-    class BrokenWebSocket:
+    event_counter = 0
+
+    def build_event(**kwargs):
+        nonlocal event_counter
+        event_counter += 1
+        return {
+            "id": f"terminal-event-{event_counter}",
+            "kind": 24200,
+            "payload": kwargs["payload"],
+        }
+
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_load_nostr_auth",
+        lambda: SimpleNamespace(build_observer_event=build_event),
+    )
+
+    class FlakyWebSocket:
         def __init__(self):
             self.send_count = 0
+            self.delivered = []
 
         async def send(self, raw):
             self.send_count += 1
-            raise ConnectionError("relay unavailable")
+            if self.send_count == 1:
+                raise TimeoutError("relay backpressure")
+            self.delivered.append(json.loads(raw))
 
-    websocket = BrokenWebSocket()
+    websocket = FlakyWebSocket()
     adapter._ws_active = True
     adapter._ws_connection = websocket
+    generation = adapter._activity_ws_generation
 
     assert await adapter.publish_activity(
         "turn_completed",
@@ -307,13 +330,70 @@ async def test_publish_activity_fails_open_when_websocket_send_fails():
         turn_id="turn-1",
     ) is True
     await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
-    await asyncio.sleep(0.05)
     assert websocket.send_count == 1
-    assert not adapter._activity_pending_event_ids
     assert list(adapter._activity_terminal_replay) == ["turn-1"]
-    adapter._activity_sender_task.cancel()
+    assert not adapter._activity_pending_event_ids
+
+    await asyncio.sleep(0.03)
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert websocket.send_count == 2
+    assert adapter._ws_connection is websocket
+    assert adapter._activity_ws_generation == generation
+    assert [frame[1]["payload"]["kind"] for frame in websocket.delivered] == [
+        "turn_completed"
+    ]
+    assert not adapter._activity_terminal_replay
+
+    await adapter._reset_activity_transport()
+
+
+@pytest.mark.asyncio
+async def test_reset_activity_transport_propagates_cancellation():
+    adapter = _make_adapter()
+    sender_blocked = asyncio.Event()
+    adapter._activity_sender_task = asyncio.create_task(sender_blocked.wait())
+
+    reset_task = asyncio.create_task(adapter._reset_activity_transport())
+    await asyncio.sleep(0)
+    reset_task.cancel()
+
     with pytest.raises(asyncio.CancelledError):
-        await adapter._activity_sender_task
+        await reset_task
+    assert reset_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_disconnect_completes_while_websocket_loop_is_resetting():
+    adapter = _make_adapter()
+    reset_entered = asyncio.Event()
+    sender_blocked = asyncio.Event()
+    adapter._activity_sender_task = asyncio.create_task(sender_blocked.wait())
+
+    async def reconnecting_websocket_loop():
+        while True:
+            try:
+                raise ConnectionError("relay disconnected")
+            except Exception:
+                reset_entered.set()
+                await adapter._reset_activity_transport()
+                await asyncio.sleep(3600)
+
+    adapter._ws_task = asyncio.create_task(reconnecting_websocket_loop())
+    await asyncio.wait_for(reset_entered.wait(), timeout=1)
+    await asyncio.sleep(0)
+
+    disconnect_task = asyncio.create_task(adapter.disconnect())
+    try:
+        await asyncio.wait_for(asyncio.shield(disconnect_task), timeout=0.1)
+    finally:
+        if not disconnect_task.done():
+            if adapter._ws_task and not adapter._ws_task.done():
+                adapter._ws_task.cancel()
+            disconnect_task.cancel()
+        try:
+            await disconnect_task
+        except asyncio.CancelledError:
+            pass
 
 
 @pytest.mark.asyncio
@@ -346,6 +426,61 @@ async def test_observer_relay_rejection_is_correlated_and_logged(caplog):
     adapter._activity_sender_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_rejected_terminal_is_retained_and_retried_once(monkeypatch, caplog):
+    owner_pubkey = nostr_auth.public_key_hex("2".zfill(64))
+    adapter = _make_adapter(extra={"activity_owner_pubkey": owner_pubkey})
+    websocket = _FakeWebSocket()
+    adapter._ws_connection = websocket
+    adapter._ws_active = True
+    monkeypatch.setattr(_buzz_mod, "_ACTIVITY_TERMINAL_RETRY_DELAY", 0.01)
+
+    event_counter = 0
+
+    def build_event(**kwargs):
+        nonlocal event_counter
+        event_counter += 1
+        return {
+            "id": f"terminal-event-{event_counter}",
+            "kind": 24200,
+            "payload": kwargs["payload"],
+        }
+
+    monkeypatch.setattr(
+        _buzz_mod,
+        "_load_nostr_auth",
+        lambda: SimpleNamespace(build_observer_event=build_event),
+    )
+
+    assert await adapter.publish_activity(
+        "turn_completed",
+        channel_id=CHANNEL,
+        session_id="session-1",
+        turn_id="turn-1",
+    )
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+
+    with caplog.at_level("WARNING"):
+        assert adapter._handle_activity_ack(
+            ["OK", "terminal-event-1", False, "rate-limited: slow down"]
+        ) is True
+
+    assert list(adapter._activity_terminal_replay) == ["turn-1"]
+    await asyncio.sleep(0.03)
+    await asyncio.wait_for(adapter._activity_queue.join(), timeout=1)
+    assert len(websocket.sent) == 2
+
+    assert adapter._handle_activity_ack(
+        ["OK", "terminal-event-2", False, "rate-limited: slow down"]
+    ) is True
+    await asyncio.sleep(0.03)
+    assert len(websocket.sent) == 2
+    assert list(adapter._activity_terminal_replay) == ["turn-1"]
+    assert "rate-limited: slow down" in caplog.text
+
+    await adapter._reset_activity_transport()
 
 
 @pytest.mark.asyncio
@@ -431,6 +566,85 @@ async def test_terminal_during_disconnect_replays_once_after_reconnect(monkeypat
     adapter._activity_sender_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await adapter._activity_sender_task
+
+
+@pytest.mark.asyncio
+async def test_websocket_loop_replays_terminal_after_real_reconnect(monkeypatch):
+    owner_pubkey = nostr_auth.public_key_hex("00" * 31 + "02")
+    adapter = _make_adapter({"activity_owner_pubkey": owner_pubkey})
+    second_delivery = asyncio.Event()
+
+    class RelaySocket(_FakeWebSocket):
+        def __init__(self, *, disconnect_after_terminal):
+            super().__init__()
+            self.disconnect_after_terminal = disconnect_after_terminal
+            self.terminal_sent = asyncio.Event()
+
+        async def send(self, raw):
+            frame = json.loads(raw)
+            self.sent.append(frame)
+            if frame[0] == "EVENT" and frame[1].get("kind") == 24200:
+                self.terminal_sent.set()
+
+        def __aiter__(self):
+            async def frames():
+                await self.terminal_sent.wait()
+                if not self.disconnect_after_terminal:
+                    second_delivery.set()
+                    await asyncio.Future()
+                if False:
+                    yield ""
+
+            return frames()
+
+    first_socket = RelaySocket(disconnect_after_terminal=True)
+    second_socket = RelaySocket(disconnect_after_terminal=False)
+    sockets = iter((first_socket, second_socket))
+
+    class RelayConnection:
+        def __init__(self, websocket):
+            self.websocket = websocket
+
+        async def __aenter__(self):
+            return self.websocket
+
+        async def __aexit__(self, exc_type, exc, traceback):
+            return False
+
+    def connect(*args, **kwargs):
+        return RelayConnection(next(sockets))
+
+    monkeypatch.setitem(sys.modules, "websockets", SimpleNamespace(connect=connect))
+    terminal_payload = {
+        "kind": "turn_completed",
+        "seq": 1,
+        "timestamp": "2026-08-03T14:00:00.000Z",
+        "channelId": CHANNEL,
+        "sessionId": "session-1",
+        "turnId": "turn-1",
+        "payload": {},
+    }
+    assert adapter._cache_terminal_activity(terminal_payload)
+
+    websocket_task = asyncio.create_task(adapter._websocket_loop())
+    try:
+        await asyncio.wait_for(second_delivery.wait(), timeout=3)
+        first_terminal = [
+            frame for frame in first_socket.sent if frame[0] == "EVENT"
+        ]
+        second_terminal = [
+            frame for frame in second_socket.sent if frame[0] == "EVENT"
+        ]
+        assert len(first_terminal) == 1
+        assert len(second_terminal) == 1
+        assert adapter._activity_ws_generation >= 3
+    finally:
+        if not websocket_task.done():
+            websocket_task.cancel()
+        try:
+            await websocket_task
+        except asyncio.CancelledError:
+            pass
 
 
 def test_terminal_replay_is_bounded_and_keeps_latest_turns(monkeypatch):

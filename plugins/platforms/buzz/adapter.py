@@ -113,8 +113,10 @@ _ACTIVITY_ACK_TIMEOUT = 30.0
 _ACTIVITY_PENDING_CAP = 1024
 _ACTIVITY_TERMINAL_REPLAY_CAP = 256
 _ACTIVITY_TERMINAL_ACK_RETRY_CAP = 1
+_ACTIVITY_TERMINAL_RETRY_DELAY = 1.0
 _ACTIVITY_TERMINAL_KINDS = frozenset({"turn_completed", "turn_error"})
 _ACTIVITY_INTERNAL_RETRY_KEY = "_hermesAckRetry"
+_ACTIVITY_QUEUE_STOP = object()
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -476,6 +478,7 @@ class BuzzAdapter(BasePlatformAdapter):
         ] = OrderedDict()
         self._activity_queue: asyncio.Queue = asyncio.Queue(maxsize=_ACTIVITY_QUEUE_SIZE)
         self._activity_sender_task: Optional[asyncio.Task] = None
+        self._activity_terminal_retry_handle: Optional[asyncio.TimerHandle] = None
         self._activity_terminal_replay: OrderedDict[str, Dict[str, Any]] = (
             OrderedDict()
         )
@@ -755,6 +758,39 @@ class BuzzAdapter(BasePlatformAdapter):
             self._activity_terminal_replay.popitem(last=False)
         return True
 
+    def _schedule_terminal_activity_retry(
+        self, observer_payload: Dict[str, Any], generation: int
+    ) -> None:
+        """Retain a terminal and schedule at most one delayed retry."""
+
+        if not self._cache_terminal_activity(observer_payload):
+            return
+        retry_count = int(
+            observer_payload.get(_ACTIVITY_INTERNAL_RETRY_KEY, 0) or 0
+        )
+        if retry_count >= _ACTIVITY_TERMINAL_ACK_RETRY_CAP:
+            return
+        observer_payload[_ACTIVITY_INTERNAL_RETRY_KEY] = retry_count + 1
+        handle = self._activity_terminal_retry_handle
+        if handle is not None and not handle.cancelled():
+            return
+        self._activity_terminal_retry_handle = asyncio.get_running_loop().call_later(
+            _ACTIVITY_TERMINAL_RETRY_DELAY,
+            self._drain_terminal_activity_retry,
+            generation,
+        )
+
+    def _drain_terminal_activity_retry(self, generation: int) -> None:
+        """Replay retained terminals only on the still-current live socket."""
+
+        self._activity_terminal_retry_handle = None
+        if (
+            self._ws_active
+            and self._ws_connection is not None
+            and generation == self._activity_ws_generation
+        ):
+            self._replay_terminal_activity()
+
     def _replay_terminal_activity(self) -> None:
         """Move bounded terminal frames onto the current WebSocket generation."""
 
@@ -864,7 +900,11 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _activity_sender_loop(self) -> None:
         """Encrypt and send queued observer frames without blocking Gateway turns."""
         while True:
-            generation, observer_payload = await self._activity_queue.get()
+            queued_item = await self._activity_queue.get()
+            if queued_item is _ACTIVITY_QUEUE_STOP:
+                self._activity_queue.task_done()
+                return
+            generation, observer_payload = queued_item
             event_id: Optional[str] = None
             sent = False
             try:
@@ -909,7 +949,7 @@ class BuzzAdapter(BasePlatformAdapter):
             except Exception:
                 if event_id is not None:
                     self._drop_activity_ack(event_id)
-                self._cache_terminal_activity(observer_payload)
+                self._schedule_terminal_activity_retry(observer_payload, generation)
                 logger.debug("Buzz: observer activity publication failed", exc_info=True)
             finally:
                 self._activity_queue.task_done()
@@ -922,14 +962,22 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _reset_activity_transport(self) -> None:
         """Invalidate one WebSocket generation and drop all of its activity."""
         self._activity_ws_generation += 1
+        retry_handle = self._activity_terminal_retry_handle
+        self._activity_terminal_retry_handle = None
+        if retry_handle is not None:
+            retry_handle.cancel()
         task = self._activity_sender_task
         self._activity_sender_task = None
         if task and not task.done():
-            task.cancel()
             try:
-                await task
-            except asyncio.CancelledError:
-                pass
+                self._activity_queue.put_nowait(_ACTIVITY_QUEUE_STOP)
+            except asyncio.QueueFull:
+                queued = self._activity_queue.get_nowait()
+                if isinstance(queued, tuple) and len(queued) == 2:
+                    self._cache_terminal_activity(queued[1])
+                self._activity_queue.task_done()
+                self._activity_queue.put_nowait(_ACTIVITY_QUEUE_STOP)
+            await task
         while True:
             try:
                 queued = self._activity_queue.get_nowait()
@@ -1158,9 +1206,14 @@ class BuzzAdapter(BasePlatformAdapter):
         if len(message) < 3 or message[0] != "OK":
             return False
         event_id = str(message[1])
+        terminal_payload = self._activity_pending_terminal_payloads.get(event_id)
         if not self._drop_activity_ack(event_id):
             return False
         if message[2] is not True:
+            if terminal_payload is not None:
+                self._schedule_terminal_activity_retry(
+                    terminal_payload, self._activity_ws_generation
+                )
             detail = str(message[3]) if len(message) > 3 else "relay rejected event"
             logger.warning("Buzz: observer activity rejected by relay: %s", detail)
         return True
