@@ -21,6 +21,7 @@ x-hermes-common: &hermes-common
   environment:
     - HERMES_UID=1000
     - HERMES_GID=1000
+    - HERMES_LAZY_INSTALL_TARGET=/opt/data/lazy-packages
     - OPENAI_API_KEY=ollama
     # Ollama lives on the Docker host. host.docker.internal resolves via the
     # extra_hosts entry below — works on Docker Desktop (Win/macOS) and on
@@ -45,7 +46,7 @@ services:
     # Host-side binding is 127.0.0.1 (see ports below) so it's not LAN-exposed.
     # Upstream 0.17+ requires auth for non-loopback binds — basic_auth is
     # configured in data/config.yaml (username=admin, password=hermes).
-    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
+    command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes dashboard --host 0.0.0.0 --port 9119 --no-open"]
     environment:
       - GATEWAY_HEALTH_URL=http://hermes-gateway:8642
     volumes:
@@ -70,7 +71,7 @@ services:
     # Runs the gateway with the weixin (WeChat personal / iLink) platform enabled
     # per docker/hermes-config.yaml. weixin uses outbound long-poll to
     # ilinkai.weixin.qq.com — no inbound host port needed.
-    command: ["gateway", "run"]
+    command: ["sh", "-lc", "(/opt/hermes/.venv/bin/python3 -m pip show edge-tts >/dev/null 2>&1 && /opt/hermes/.venv/bin/python3 -m pip show piper-tts >/dev/null 2>&1) || /opt/hermes/.venv/bin/python3 -m pip install -q edge-tts==7.2.7 piper-tts==1.6.0; exec /opt/hermes/.venv/bin/hermes gateway run"]
     environment:
       - API_SERVER_KEY=${API_SERVER_KEY:-28765d337208aa3c0b6671cb1969e8cad9c22d7b7967b216}
       - API_SERVER_HOST=0.0.0.0
