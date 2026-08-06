@@ -512,8 +512,9 @@ export function useGatewayBoot({
         try {
           await ensureDefaultWorkspaceCwd()
         } catch (err) {
-          // Non-fatal: the remembered cwd is the fallback and the post-connect
-          // seed retries the same sync.
+          // Non-fatal: the remembered cwd is the fallback, and either the
+          // post-connect seed retries the sync or a resumed session's own cwd
+          // takes over.
           console.warn('Failed to seed default workspace cwd pre-connect', err)
         }
 
@@ -543,7 +544,12 @@ export function useGatewayBoot({
         })
 
         await Promise.all([
-          seedDefaultCwd(),
+          // The pre-connect seed already applied the configured default; this
+          // post-connect pass covers the remote backend default. Non-fatal: a
+          // failed sync must not abort boot (the remembered cwd remains).
+          seedDefaultCwd().catch(err =>
+            console.warn('Failed to sync default workspace cwd post-connect', err)
+          ),
           callbacksRef.current.refreshHermesConfig(),
           // Session-list population is never boot-fatal. The gateway WS is
           // already open by this point — a failed sidebar fetch (transient

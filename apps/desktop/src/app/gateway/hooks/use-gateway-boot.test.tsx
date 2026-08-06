@@ -181,6 +181,7 @@ afterEach(() => {
   ;(globalThis as { WebSocket: unknown }).WebSocket = originalWebSocket
   delete (window as { hermesDesktop?: unknown }).hermesDesktop
   window.localStorage.removeItem('hermes.desktop.workspace-cwd')
+  $currentCwd.set('')
 })
 
 // Let pending microtasks (awaits) AND the queued 0ms socket open/error fire.
