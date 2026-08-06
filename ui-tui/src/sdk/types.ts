@@ -67,10 +67,13 @@ export interface WidgetApp<S = unknown> {
  * same corner stack vertically. Content under a float stays live — floats
  * suit sparse corners; prefer docks for anything tall.
  *
- * Users phrase placement loosely ("top right", "pin it above the status
- * bar") — map words to the nearest zone; corners mean floats.
+ * `transcript-bottom` reserves rows at the bottom of the transcript, directly
+ * above the prompt/composer. Users phrase placement loosely ("top right",
+ * "pin it above the status bar") — map words to the nearest zone; corners
+ * mean floats.
  */
-export type AmbientZone = 'bottom-left' | 'bottom-right' | 'dock-bottom' | 'dock-top' | 'top-left' | 'top-right'
+export type AmbientZone =
+  'bottom-left' | 'bottom-right' | 'dock-bottom' | 'dock-top' | 'top-left' | 'top-right' | 'transcript-bottom'
 
 /** The host's serializable record of the active app. */
 export interface ActiveWidget {

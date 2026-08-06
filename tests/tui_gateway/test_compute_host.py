@@ -126,3 +126,72 @@ def test_compute_host_interrupt_uses_explicit_stop_compatibility(kind):
 
     assert calls == ["hard" if kind == "hard-only" else "legacy"]
     assert emitted[-1]["applied"] is True
+
+
+def test_compute_host_binds_exact_frame_identity_before_agent_build(monkeypatch, tmp_path):
+    seen = {}
+    profile_home = tmp_path / "profiles" / "work"
+    profile_home.mkdir(parents=True)
+
+    class FakeDB:
+        def close(self):
+            seen["db_closed"] = True
+
+    monkeypatch.setattr("hermes_state.SessionDB", lambda db_path=None: FakeDB())
+
+    class FakeServer:
+        _sessions = {}
+
+        @staticmethod
+        def _set_session_context(key, **kwargs):
+            seen["context"] = (key, kwargs)
+            return ["token"]
+
+        @staticmethod
+        def _clear_session_context(tokens):
+            seen["cleared"] = tokens
+
+        @staticmethod
+        def _make_agent(sid, key, **kwargs):
+            seen["agent"] = (sid, key, kwargs)
+            return object()
+
+        @classmethod
+        def _init_session(cls, sid, key, agent, history, **kwargs):
+            seen["init_kwargs"] = kwargs
+            cls._sessions[sid] = {
+                "agent": agent,
+                "session_key": key,
+                "history": history,
+                "cwd": kwargs.get("cwd"),
+            }
+
+    frame = {
+        "sid": "ui-compute",
+        "session_key": "durable-compute",
+        "cwd": "/work/compute",
+        "profile_home": str(profile_home),
+        "source": "tui",
+        "history": [],
+    }
+    host = ComputeHost(heartbeat_secs=0)
+    try:
+        host._ensure_server_session(FakeServer, frame)
+    finally:
+        host.close()
+
+    assert seen["context"] == (
+        "durable-compute",
+        {
+            "ui_session_id": "ui-compute",
+            "session": {
+                "session_key": "durable-compute",
+                "cwd": "/work/compute",
+                "profile_home": str(profile_home),
+                "source": "tui",
+            },
+        },
+    )
+    assert seen["init_kwargs"]["profile_home"] == str(profile_home)
+    assert seen["agent"][0:2] == ("ui-compute", "durable-compute")
+    assert seen["cleared"] == ["token"]

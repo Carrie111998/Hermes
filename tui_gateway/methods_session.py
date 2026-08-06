@@ -151,6 +151,7 @@ def _(rid, params: dict) -> dict:
                 "cwd": _sessions[sid]["cwd"],
                 "branch": _git_branch_for_cwd(_sessions[sid]["cwd"]),
                 "project": _project_info_for_cwd(_sessions[sid]["cwd"]),
+                "stored_session_id": key,
                 "lazy": True,
                 "desktop_contract": DESKTOP_BACKEND_CONTRACT,
                 "profile_name": _response_profile_name(profile),
@@ -464,7 +465,11 @@ def _(rid, params: dict) -> dict:
                 "message_count": len(display_history) if omit_messages else len(messages),
                 "messages": messages,
                 "messages_omitted": omit_messages,
-                "info": _lazy_resume_info(cwd, profile=profile),
+                "info": _lazy_resume_info(
+                    cwd,
+                    profile=profile,
+                    stored_session_id=target,
+                ),
                 "inflight": None,
                 "running": child_running,
                 "session_key": target,
@@ -554,6 +559,7 @@ def _(rid, params: dict) -> dict:
                 model=model_override.get("model") or "",
                 provider=overrides.get("provider_override") or "",
                 profile=profile,
+                stored_session_id=target,
             ),
             "inflight": None,
             "running": False,
@@ -605,7 +611,17 @@ def _(rid, params: dict) -> dict:
         )
         history = sanitize_replay_history(raw_history)
         messages = [] if omit_messages else _history_to_messages(display_history)
-        tokens = _set_session_context(target)
+        provisional_session = {
+            "session_key": target,
+            "cwd": profile_resume_cwd,
+            "profile_home": str(profile_home) if profile_home is not None else None,
+            "source": source,
+        }
+        tokens = _set_session_context(
+            target,
+            ui_session_id=sid,
+            session=provisional_session,
+        )
         try:
             # Pass the profile's db so the agent persists turns to the right
             # state.db; home override is active here so config/skills/model
@@ -678,6 +694,7 @@ def _(rid, params: dict) -> dict:
                     cwd=profile_resume_cwd,
                     session_db=db,
                     source=source,
+                    profile_home=str(profile_home) if profile_home is not None else None,
                 )
             finally:
                 if init_home_token is not None:
@@ -737,12 +754,15 @@ def _(rid, params: dict) -> dict:
     except ValueError as e:
         return _err(rid, 4017, str(e))
     agent = session.get("agent")
-    info = _session_info(agent, session) if agent is not None else {
-        "cwd": cwd,
-        "branch": _git_branch_for_cwd(cwd),
-        "project": _project_info_for_cwd(cwd),
-        "lazy": True,
-    }
+    info = (
+        _session_info(agent, session)
+        if agent is not None
+        else _lazy_resume_info(
+            cwd,
+            profile=_profile_name_for_session(session),
+            stored_session_id=_session_lookup_key(session),
+        )
+    )
     _emit("session.info", params.get("session_id", ""), info)
     return _ok(rid, info)
 
@@ -810,12 +830,15 @@ def _(rid, params: dict) -> dict:
         except ValueError as e:
             return _err(rid, 4017, str(e))
         agent = live.get("agent")
-        info = _session_info(agent, live) if agent is not None else {
-            "cwd": resolved,
-            "branch": branch,
-            "project": _project_info_for_cwd(resolved),
-            "lazy": True,
-        }
+        info = (
+            _session_info(agent, live)
+            if agent is not None
+            else _lazy_resume_info(
+                resolved,
+                profile=_profile_name_for_session(live),
+                stored_session_id=_session_lookup_key(live),
+            )
+        )
         _emit("session.info", live_sid, info)
 
     return _ok(rid, {"cwd": resolved, "branch": branch, "git_repo_root": root})
@@ -2773,7 +2796,17 @@ def _(rid, params: dict) -> dict:
             else None
         )
         try:
-            tokens = _set_session_context(new_key)
+            provisional_session = {
+                "session_key": new_key,
+                "cwd": _session_cwd(session),
+                "profile_home": parent_home,
+                "source": source,
+            }
+            tokens = _set_session_context(
+                new_key,
+                ui_session_id=new_sid,
+                session=provisional_session,
+            )
             try:
                 agent = _make_agent(
                     new_sid,

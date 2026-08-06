@@ -66,6 +66,10 @@ npm test         # single run
 npm run test:watch
 ```
 
+## User widget session identity
+
+Plain ESM files under `$HERMES_HOME/tui-widgets/*.mjs` receive the public SDK in `register(sdk)`....[truncated]
+
 ## App model
 
 `src/app.tsx` is the center of the UI. Heavy logic is split into `src/app/`:

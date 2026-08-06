@@ -50,6 +50,11 @@ def clear_session_cwd() -> None:
     _SESSION_CWD.set("")
 
 
+def get_session_cwd() -> str:
+    """Return the cwd bound to the current execution context, if any."""
+    return _session_cwd_override()
+
+
 def _session_cwd_override() -> str:
     value = _SESSION_CWD.get()
     if value is _UNSET:
