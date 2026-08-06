@@ -199,7 +199,12 @@ async def test_text_image_paths_deduplicated_with_media_urls(tmp_path, monkeypat
 
 @pytest.mark.asyncio
 async def test_text_url_deduplicated_with_media_url():
-    """A URL already present in event.media_urls is not double-buffered."""
+    """A URL already present in event.media_urls is buffered exactly once.
+
+    Attached media that is already a remote URL rides the URL collection
+    (native attachment passes URLs through verbatim), so the same URL found
+    by the text scan is deduplicated against it.
+    """
     url = "https://example.com/dup.png"
     runner = _make_runner()
     source = _source("chat-10")
@@ -221,11 +226,11 @@ async def test_text_url_deduplicated_with_media_url():
     key = build_session_key(source)
     paths = runner._consume_pending_native_image_paths(key)
     urls = runner._consume_pending_native_image_urls(key)
-    # Buffered exactly once, via the media classification path (URLs in the
-    # media collection stay in the local-path bucket like any other
-    # attachment; only TEXT-scan URLs use the URL bucket).
-    assert paths.count(url) == 1
-    assert urls == []
+    # Buffered exactly once, via the URL collection — not doubled across the
+    # path and URL buckets, and not dropped into the local-path bucket where
+    # native attachment would reject it as a non-file.
+    assert paths == []
+    assert urls.count(url) == 1
 
 
 @pytest.mark.asyncio

@@ -15817,7 +15817,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # non-image) sent alongside an image in the same message gets
                 # mis-routed here as an image and the provider 400s.
                 if _event_media_is_image(event, i):
-                    image_paths.append(path)
+                    # Attached media that is already a remote URL must ride the
+                    # URL collection, not the local-path one: native attachment
+                    # embeds local files as base64 but passes URLs through
+                    # verbatim, so a URL left in image_paths would be dropped
+                    # by build_native_content_parts' Path.exists() check.
+                    if str(path).startswith(("http://", "https://")):
+                        image_urls.append(path)
+                    else:
+                        image_paths.append(path)
                 # MessageType.AUDIO = audio file attachment (e.g. .mp3, .m4a) — never STT
                 # MessageType.VOICE = voice message (Opus/OGG) — always STT
                 if event.message_type == MessageType.AUDIO:
