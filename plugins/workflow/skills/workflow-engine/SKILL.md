@@ -101,6 +101,22 @@ The engine auto-injects a context header telling the reviewer which node it's re
 
 Do NOT manually reset reviewer cards with SQL after a FAIL — the engine handles re-dispatch. Manual resets are only needed if a supervisor crashed mid-loop (see `workflow_status` / resume).
 
+### What happens on PASS — the `post_pass` attribute
+
+When a reviewer PASSes, the engine adds a "Review Passed" comment on the upstream card with the review results. What happens next depends on the `post_pass` attribute on the review entry:
+
+```yaml
+reviews:
+  - review: qa-verify
+    post_pass: re_dispatch    # or "accept" (default)
+```
+
+**`post_pass: accept` (default)** — Ideation-style. The upstream work is accepted and stays `done`. The engine advances to the next layer. Use this when the reviewer's PASS is the final word and the workflow should proceed to downstream nodes (e.g. spec review: PASS → spec is accepted, move to implementation).
+
+**`post_pass: re_dispatch`** — Implementation-style. The upstream card is reset to `ready` so the dispatcher re-dispatches the author to perform the post-PASS action (e.g. pull the QA branch and open the PR). The "Review Passed" comment contains the QA branch name from the reviewer's summary. Use this when the author needs to do more work after the review passes.
+
+The review entry can be a dict (with `review`, `post_pass`, `max_retries` fields) or a plain string (shorthand for `{review: name, post_pass: accept}`). The dict format is recommended for clarity.
+
 ### Review Workspace Inheritance
 
 Default: reviewer runs in scratch (blind review). Set `inherit_workspace: true` to start in the same project directory:
