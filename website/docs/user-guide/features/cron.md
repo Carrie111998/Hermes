@@ -94,6 +94,41 @@ global defaults. A switch to a paid provider or model can therefore spend money
 on every scheduled run.
 :::
 
+## Interactive reminder feedback
+
+Cron jobs can include structured feedback choices. Telegram renders them as inline
+buttons on the final message chunk; platforms without interactive controls ignore
+the optional metadata and deliver the message normally.
+
+Clearly reminder-style jobs get a conservative default set when `feedback` is
+omitted: **Done**, **Not yet**, and **Didn't do it**. Detection is limited to the
+job name and the opening of its prompt. Pass `feedback={}` at creation to suppress
+automatic buttons, or provide explicit choices to replace the defaults.
+
+```python
+cronjob(
+    action="create",
+    prompt="Remind me to follow up with Eric.",
+    schedule="0 9 * * 1",
+    deliver="telegram",
+    feedback={
+        "prompt": "What happened?",
+        "choices": [
+            {"code": "call", "label": "📞 Called"},
+            {"code": "email", "label": "✉️ Emailed"},
+            {"code": "skip", "label": "Skipped"},
+        ],
+    },
+)
+```
+
+Choice codes must contain 1–24 lowercase letters, digits, underscores, or hyphens.
+A job supports up to eight choices. Telegram callback payloads contain the job ID
+and choice code, so buttons remain valid across gateway restarts. Accepted responses
+are appended to `~/.hermes/reminder-feedback/events.jsonl`, including the response
+time and Telegram message/user identifiers. Repeated taps on the same reminder are
+recorded once.
+
 ## Skill-backed cron jobs
 
 A cron job can load one or more skills before it runs the prompt.
