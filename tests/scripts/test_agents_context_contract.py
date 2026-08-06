@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 import subprocess
 from pathlib import Path
 
@@ -265,11 +266,14 @@ def test_documented_test_isolation_preserves_real_home_and_redirects_hermes_home
 
     assert "real `HOME` remains stable" in root_contract
     assert "Direct `Path.home() / \".hermes\"` access is a bug" in root_contract
+    assert "hermetic HOME" not in root_contract
     assert "Real home (stable); profile state redirected by `HERMES_HOME`" in testing_reference
     assert "does **not** redirect `HOME`" in testing_reference
 
 
-def test_configuration_reference_names_default_definition_and_reexport():
+def test_configuration_reference_names_config_data_definitions_and_reexports():
+    from hermes_cli import config, config_defaults
+
     repo_root = Path(__file__).resolve().parents[2]
     reference = " ".join(
         (repo_root / "docs/development/configuration.md")
@@ -277,9 +281,51 @@ def test_configuration_reference_names_default_definition_and_reexport():
         .split()
     )
 
-    assert "defined in `hermes_cli/config_defaults.py`" in reference
-    assert "re-exported from `hermes_cli/config.py`" in reference
+    assert (
+        "Both `DEFAULT_CONFIG` and `OPTIONAL_ENV_VARS` are defined in "
+        "`hermes_cli/config_defaults.py` and re-exported from "
+        "`hermes_cli/config.py`"
+    ) in reference
     assert "`_EXTRA_KNOWN_ROOT_KEYS` and `read_user_config_raw()`" in reference
+    assert config.DEFAULT_CONFIG is config_defaults.DEFAULT_CONFIG
+    assert config.OPTIONAL_ENV_VARS is config_defaults.OPTIONAL_ENV_VARS
+
+
+def test_plugin_reference_uses_noncontradictory_discovery_taxonomy():
+    repo_root = Path(__file__).resolve().parents[2]
+    reference = " ".join(
+        (repo_root / "docs/development/plugins.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "three primary discovery systems" in reference
+    assert "two plugin surfaces" not in reference
+    assert "General plugins (`hermes_cli/plugins.py`" in reference
+    assert "Memory-provider plugins (`plugins/memory/<name>/`)" in reference
+    assert "Model-provider plugins (`plugins/model-providers/<name>/`)" in reference
+    assert "Additional provider families" in reference
+
+
+def test_kanban_reference_matches_non_success_outcomes_counted_by_dispatcher():
+    from hermes_cli.kanban_db import _record_task_failure
+
+    repo_root = Path(__file__).resolve().parents[2]
+    reference = " ".join(
+        (
+            repo_root
+            / "skills/autonomous-ai-agents/hermes-agent/references/background-systems.md"
+        )
+        .read_text(encoding="utf-8")
+        .split()
+    )
+    runtime_contract = inspect.getdoc(_record_task_failure) or ""
+
+    assert "consecutive non-success outcomes" in reference
+    assert "consecutive spawn failures" not in reference
+    for outcome in ("spawn_failed", "crashed", "timed_out"):
+        assert outcome in reference
+        assert outcome in runtime_contract
 
 
 def test_curator_reference_documents_builtin_pruning_safeguards():

@@ -8,9 +8,12 @@ and working-directory resolution.
 ---
 
 ### config.yaml options:
-1. Add documented/defaulted keys to `DEFAULT_CONFIG`, defined in
-   `hermes_cli/config_defaults.py` and re-exported from `hermes_cli/config.py`.
-   It is the primary known-root/default source, not a universal schema:
+
+Both `DEFAULT_CONFIG` and `OPTIONAL_ENV_VARS` are defined in
+`hermes_cli/config_defaults.py` and re-exported from `hermes_cli/config.py`.
+
+1. Add documented/defaulted keys to `DEFAULT_CONFIG`. It is the primary
+   known-root/default source, not a universal schema:
    `_EXTRA_KNOWN_ROOT_KEYS` and `read_user_config_raw()` in `hermes_cli/config.py`
    cover intentionally absent, dynamic, or presence-sensitive roots.
 2. Bump `_config_version` (check the current value at the top of `DEFAULT_CONFIG`)
@@ -39,7 +42,10 @@ its own provider/model/base_url/max_tokens/reasoning_effort. See
 
 New credentials (API keys, tokens, passwords) are declared in
 `OPTIONAL_ENV_VARS`; do not add new env-only behavioral configuration:
-1. Add to `OPTIONAL_ENV_VARS` in `hermes_cli/config.py` with metadata:
+1. Add static entries to `OPTIONAL_ENV_VARS` in
+   `hermes_cli/config_defaults.py` with metadata. `hermes_cli/config.py`
+   re-exports that object and augments it at runtime from discovered model
+   providers and platform plugin manifests:
 ```python
 "NEW_API_KEY": {
     "description": "What it's for",

@@ -232,7 +232,8 @@ installs use exact pins. Run `uv lock` after `pyproject.toml` changes.
 ### Testing and evidence
 
 - Always run Python tests through `scripts/run_tests.sh`; it strips credentials,
-  sets hermetic HOME/TZ/locale, and runs each file in a fresh subprocess.
+  preserves the stable real `HOME`, redirects only `HERMES_HOME` to per-test
+  temporary state, pins TZ/locale, and runs each file in a fresh subprocess.
 - Test behavior/invariants, not expected-to-change data or source-text proxies
   for executable behavior. Reading an artifact whose content is itself the
   contract (for example AGENTS/docs/lock/config artifacts) is valid in its

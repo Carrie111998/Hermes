@@ -7,9 +7,12 @@ Read this before adding or reviewing anything under `plugins/`.
 
 ---
 
-Hermes has two plugin surfaces. Both live under `plugins/` in the repo so
-repo-shipped plugins can be discovered alongside user-installed ones in
-`~/.hermes/plugins/` and pip-installed entry points.
+Hermes has three primary discovery systems: general plugins, memory-provider
+plugins, and model-provider plugins. Their bundled implementations live under
+`plugins/`; the loaders described below also cover the applicable project,
+user, legacy, or pip entry-point locations. Additional provider families use
+their own ABC/orchestrator paths, so do not infer one global plugin-surface
+count from these three primary systems.
 
 ### General plugins (`hermes_cli/plugins.py` + `plugins/<name>/`)
 
@@ -111,12 +114,15 @@ without an explicit `kind:` get auto-coerced via a source-text heuristic
 
 Full authoring guide: `website/docs/developer-guide/model-provider-plugin.md`.
 
-### Dashboard / context-engine / image-gen plugin directories
+### Additional provider families
 
-`plugins/context_engine/`, `plugins/image_gen/`, etc. follow the same
-pattern (ABC + orchestrator + per-plugin directory). Context engines
-plug into `agent/context_engine.py`; image-gen providers into
-`agent/image_gen_provider.py`. Reference / docs-companion plugins
+Dashboard/backend integrations, `plugins/context_engine/`,
+`plugins/image_gen/`, and similar families follow an ABC + orchestrator +
+per-plugin-directory pattern where supported. Context engines plug into
+`agent/context_engine.py`; image-gen providers into
+`agent/image_gen_provider.py`. These are extension families beyond the three
+primary discovery systems above, not evidence for a single exhaustive surface
+count. Reference / docs-companion plugins
 (`example-dashboard`, `strike-freedom-cockpit`, `plugin-llm-example`,
 `plugin-llm-async-example`) live in the
 [`hermes-example-plugins`](https://github.com/NousResearch/hermes-example-plugins)
