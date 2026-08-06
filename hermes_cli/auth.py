@@ -862,135 +862,44 @@ def _normalize_lmstudio_runtime_base_url(base_url: str) -> str:
 
 
 # =============================================================================
-# Error Types
+# Error Types (compatibility facade)
 # =============================================================================
 
-# Error code marking upstream rate-limit / usage-quota exhaustion (HTTP 429).
-# Such failures are transient and re-authenticating cannot resolve them, so
-# they must be kept distinct from missing/expired-credential errors.
-CODEX_RATE_LIMITED_CODE = "codex_rate_limited"
+import hermes_cli.auth_errors as _auth_errors
+import types as _types
+
+CODEX_RATE_LIMITED_CODE = _auth_errors.CODEX_RATE_LIMITED_CODE
+AuthError = _auth_errors.AuthError
 
 
-class AuthError(RuntimeError):
-    """Structured auth error with UX mapping hints."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        provider: str = "",
-        code: Optional[str] = None,
-        relogin_required: bool = False,
-    ) -> None:
-        super().__init__(message)
-        self.provider = provider
-        self.code = code
-        self.relogin_required = relogin_required
-
-
-def is_rate_limited_auth_error(error: Exception) -> bool:
-    """True when an :class:`AuthError` represents upstream rate-limiting / quota
-    exhaustion rather than missing or invalid credentials.
-
-    These failures are transient — re-authenticating cannot resolve them — so
-    callers should surface a "retry later" notice and prefer a fallback chain
-    instead of prompting the operator to run ``hermes auth``.
-    """
-    return (
-        isinstance(error, AuthError)
-        and not error.relogin_required
-        and error.code == CODEX_RATE_LIMITED_CODE
+def _bind_auth_error_function(name: str):
+    """Expose moved error code with the legacy auth.py global namespace."""
+    implementation = getattr(_auth_errors, name)
+    facade = _types.FunctionType(
+        implementation.__code__,
+        globals(),
+        name=implementation.__name__,
+        argdefs=implementation.__defaults__,
+        closure=implementation.__closure__,
     )
+    facade.__kwdefaults__ = implementation.__kwdefaults__
+    facade.__annotations__ = implementation.__annotations__
+    facade.__doc__ = implementation.__doc__
+    facade.__qualname__ = implementation.__qualname__
+    facade.__module__ = __name__
+    facade.__dict__.update(implementation.__dict__)
+    return facade
 
 
-def _parse_retry_after_seconds(headers: Any) -> Optional[int]:
-    """Best-effort parse of a ``Retry-After`` header into whole seconds.
-
-    Thin wrapper around :func:`agent.retry_utils.parse_retry_after_seconds`
-    (delta-seconds and HTTP-date forms; negatives clamp to 0; missing or
-    unparseable values return ``None``).
-    """
-    from agent.retry_utils import parse_retry_after_seconds
-
-    seconds = parse_retry_after_seconds(headers)
-    return None if seconds is None else int(seconds)
-
-
-def format_auth_error(error: Exception) -> str:
-    """Map auth failures to concise user-facing guidance."""
-    if not isinstance(error, AuthError):
-        return str(error)
-
-    # Rate-limit / quota errors are not credential problems — never append the
-    # "re-authenticate" remediation, which would mislead the operator.
-    if is_rate_limited_auth_error(error):
-        return str(error)
-
-    if error.relogin_required:
-        return f"{error} Run `hermes model` to re-authenticate."
-
-    if error.code == "subscription_required":
-        if error.provider == "nous":
-            return _format_nous_entitlement_auth_error(error)
-        return "No active paid subscription found. Please purchase/activate a subscription, then retry."
-
-    if error.code == "insufficient_credits":
-        if error.provider == "nous":
-            return _format_nous_entitlement_auth_error(error)
-        return "Subscription credits are exhausted. Top up/renew credits, then retry."
-
-    if error.code in {"subscription_expired", "no_usable_credits", "account_missing"}:
-        if error.provider == "nous":
-            return _format_nous_entitlement_auth_error(error)
-
-    if error.code == "temporarily_unavailable":
-        return f"{error} Please retry in a few seconds."
-
-    return str(error)
-
-
-def _format_nous_entitlement_auth_error(error: AuthError) -> str:
-    try:
-        from hermes_cli.nous_account import (
-            format_nous_portal_entitlement_message,
-            get_nous_portal_account_info,
-        )
-
-        account_info = get_nous_portal_account_info(force_fresh=True)
-        message = format_nous_portal_entitlement_message(
-            account_info,
-            capability="Nous model access",
-        )
-        if message:
-            return message
-    except Exception:
-        pass
-    return f"{error} Check credits or billing in Nous Portal, then retry."
-
-
-def _token_fingerprint(token: Any) -> Optional[str]:
-    """Return a short hash fingerprint for telemetry without leaking token bytes."""
-    if not isinstance(token, str):
-        return None
-    cleaned = token.strip()
-    if not cleaned:
-        return None
-    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
-
-
-def _oauth_trace_enabled() -> bool:
-    raw = os.getenv("HERMES_OAUTH_TRACE", "").strip().lower()
-    return raw in {"1", "true", "yes", "on"}
-
-
-def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any) -> None:
-    if not _oauth_trace_enabled():
-        return
-    payload: Dict[str, Any] = {"event": event}
-    if sequence_id:
-        payload["sequence_id"] = sequence_id
-    payload.update(fields)
-    logger.info("oauth_trace %s", json.dumps(payload, sort_keys=True, ensure_ascii=False))
+is_rate_limited_auth_error = _bind_auth_error_function("is_rate_limited_auth_error")
+_parse_retry_after_seconds = _bind_auth_error_function("_parse_retry_after_seconds")
+format_auth_error = _bind_auth_error_function("format_auth_error")
+_format_nous_entitlement_auth_error = _bind_auth_error_function(
+    "_format_nous_entitlement_auth_error"
+)
+_token_fingerprint = _bind_auth_error_function("_token_fingerprint")
+_oauth_trace_enabled = _bind_auth_error_function("_oauth_trace_enabled")
+_oauth_trace = _bind_auth_error_function("_oauth_trace")
 
 
 # =============================================================================
