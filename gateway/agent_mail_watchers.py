@@ -19,10 +19,9 @@ from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.wake import deliver_wake
 
-logger = logging.getLogger("gateway.run")
+logger = logging.getLogger(__name__)
 
-_MAIL_DB = Path.home() / ".cc-workspace" / "Resources" / "external" / "mcp_agent_mail" / "storage.sqlite3"
-_DEFAULT_PROJECT = "/Users/zt_mini/.cc-workspace"
+_MAIL_DB_RELATIVE_PATH = Path("Resources/external/mcp_agent_mail/storage.sqlite3")
 
 
 def _state_path(profile: str) -> Path:
@@ -31,18 +30,28 @@ def _state_path(profile: str) -> Path:
 
 def _load_state(path: Path) -> dict[str, Any]:
     try:
-        return json.loads(path.read_text())
+        return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"last_seen_message_id": 0}
 
 
 def _save_state(path: Path, state: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(state, sort_keys=True, indent=2) + "\n")
+    path.write_text(json.dumps(state, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def _mail_db_path(project_key: str) -> Path:
+    path = Path(project_key).expanduser() / _MAIL_DB_RELATIVE_PATH
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"agent-mail watcher storage is missing for configured project_key {project_key!r}: {path}"
+        )
+    return path
 
 
 def _fetch_unread(identity: str, project_key: str, after_id: int, limit: int) -> list[dict[str, Any]]:
-    con = sqlite3.connect(f"file:{_MAIL_DB}?mode=ro", uri=True, timeout=5)
+    mail_db = _mail_db_path(project_key)
+    con = sqlite3.connect(f"file:{mail_db}?mode=ro", uri=True, timeout=5)
     con.row_factory = sqlite3.Row
     try:
         rows = con.execute(
@@ -63,24 +72,6 @@ def _fetch_unread(identity: str, project_key: str, after_id: int, limit: int) ->
     finally:
         con.close()
     return [dict(row) for row in rows]
-
-
-def _mark_read(identity: str, project_key: str, message_id: int) -> None:
-    con = sqlite3.connect(_MAIL_DB, timeout=5)
-    try:
-        con.execute(
-            """
-            update message_recipients set read_ts = coalesce(read_ts, ?)
-             where message_id = ? and agent_id = (
-                select a.id from agents a join projects p on p.id = a.project_id
-                 where p.human_key = ? and a.name = ? and a.retired_at is null
-             )
-            """,
-            (time.strftime("%Y-%m-%dT%H:%M:%S%z"), message_id, project_key, identity),
-        )
-        con.commit()
-    finally:
-        con.close()
 
 
 def _wake_text(identity: str, message: dict[str, Any]) -> str:
@@ -144,15 +135,15 @@ class GatewayAgentMailWatchersMixin:
         identity = str(cfg.get("identity") or "").strip()
         channel_id = str(cfg.get("channel_id") or "").strip()
         user_id = str(cfg.get("user_id") or "").strip()
-        if not identity or not channel_id or not user_id:
-            logger.warning("agent-mail watcher disabled: identity, channel_id, or user_id missing")
+        project_key = str(cfg.get("project_key") or "").strip()
+        if not identity or not channel_id or not user_id or not project_key:
+            logger.warning("agent-mail watcher disabled: identity, channel_id, user_id, or project_key missing")
             return
         try:
             interval = max(2.0, float(cfg.get("poll_seconds", 10)))
             batch_size = max(1, min(10, int(cfg.get("batch_size", 3))))
         except (TypeError, ValueError):
             interval, batch_size = 10.0, 3
-        project_key = str(cfg.get("project_key") or _DEFAULT_PROJECT)
         profile = self._active_profile_name() or "default"
         state_file = _state_path(profile)
         adapter = self.adapters.get(Platform.DISCORD)
