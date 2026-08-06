@@ -25,6 +25,7 @@ Usage:
     result = file_ops.search("TODO", path=".", file_glob="*.py")
 """
 
+import base64
 import os
 import re
 import difflib
@@ -127,6 +128,8 @@ def _normalize_line_endings(text: str, target: str) -> str:
 # write when the original file had one — exactly mirroring the line-ending
 # preservation above (detect on disk, preserve across the edit).
 _UTF8_BOM = "\ufeff"
+_BINARY_SAMPLE_BYTES = 1000
+_UTF8_LOOKAHEAD_BYTES = 4
 
 
 def _strip_bom(text: str) -> tuple[str, bool]:
@@ -881,8 +884,49 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
+
+    def _read_binary_sample(self, path: str) -> Optional[bytes]:
+        """Read raw sample bytes through an ASCII-safe terminal transport."""
+        sample_size = _BINARY_SAMPLE_BYTES + _UTF8_LOOKAHEAD_BYTES
+        result = self._exec(
+            "if command -v base64 >/dev/null 2>&1; then "
+            f"head -c {sample_size} < {self._escape_shell_arg(path)} 2>/dev/null "
+            "| base64 | tr -d '\\n'; else exit 127; fi"
+        )
+        if result.exit_code != 0:
+            return None
+        encoded = _strip_terminal_fence_leaks(result.stdout).strip()
+        if not encoded:
+            return None
+        try:
+            return base64.b64decode(encoded, validate=True)
+        except (ValueError, TypeError):
+            return None
+
+    def _decode_binary_sample(
+        self, sample: bytes, *, boundary_may_continue: bool
+    ) -> Optional[str]:
+        """Decode UTF-8, tolerating only a cut beyond the inspected bytes."""
+        try:
+            return sample.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            if (
+                boundary_may_continue
+                and exc.start >= _BINARY_SAMPLE_BYTES
+                and exc.reason == "unexpected end of data"
+                and exc.end == len(sample)
+            ):
+                return sample[:exc.start].decode("utf-8")
+            return None
     
-    def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
+    def _is_likely_binary(
+        self,
+        path: str,
+        content_sample: Optional[str] = None,
+        *,
+        sample_bytes: Optional[bytes] = None,
+        boundary_may_continue: bool = False,
+    ) -> bool:
         """
         Check if a file is likely binary.
         
@@ -891,6 +935,13 @@ class ShellFileOperations(FileOperations):
         ext = os.path.splitext(path)[1].lower()
         if ext in BINARY_EXTENSIONS:
             return True
+
+        if sample_bytes is not None:
+            content_sample = self._decode_binary_sample(
+                sample_bytes, boundary_may_continue=boundary_may_continue
+            )
+            if content_sample is None:
+                return True
         
         # Content analysis: >30% non-printable chars = binary
         if content_sample:
@@ -903,11 +954,11 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            if sample_bytes is None and "\ufffd" in content_sample[:_BINARY_SAMPLE_BYTES]:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in content_sample[:_BINARY_SAMPLE_BYTES]
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(content_sample), _BINARY_SAMPLE_BYTES) > 0.30
         
         return False
     
@@ -1188,12 +1239,22 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        
-        if self._is_likely_binary(path, sample_output):
+        # Read a sample to check for binary content. Base64 preserves raw bytes
+        # across terminal backends that otherwise decode stdout lossily.
+        sample_bytes = self._read_binary_sample(path)
+        if sample_bytes is None:
+            sample_cmd = f"head -c {_BINARY_SAMPLE_BYTES} {self._escape_shell_arg(path)} 2>/dev/null"
+            sample_result = self._exec(sample_cmd)
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+        else:
+            is_binary = self._is_likely_binary(
+                path,
+                sample_bytes=sample_bytes,
+                boundary_may_continue=file_size > len(sample_bytes),
+            )
+
+        if is_binary:
             return ReadResult(
                 is_binary=True,
                 file_size=file_size,
@@ -1307,9 +1368,20 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
-        if self._is_likely_binary(path, sample_output):
+        sample_bytes = self._read_binary_sample(path)
+        if sample_bytes is None:
+            sample_result = self._exec(
+                f"head -c {_BINARY_SAMPLE_BYTES} {self._escape_shell_arg(path)} 2>/dev/null"
+            )
+            sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+            is_binary = self._is_likely_binary(path, sample_output)
+        else:
+            is_binary = self._is_likely_binary(
+                path,
+                sample_bytes=sample_bytes,
+                boundary_may_continue=file_size > len(sample_bytes),
+            )
+        if is_binary:
             return ReadResult(
                 is_binary=True, file_size=file_size,
                 error="Binary file — cannot display as text."

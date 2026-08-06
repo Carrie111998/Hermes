@@ -242,7 +242,11 @@ def file_ops(mock_env):
     return ShellFileOperations(mock_env)
 
 
-def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMock:
+def make_real_subprocess_env(
+    cwd: str,
+    include_stderr: bool = False,
+    decode_errors: str = "strict",
+) -> MagicMock:
     """Mock env whose execute() runs the command in a real subprocess.
 
     For tests that need the generated shell scripts to actually run
@@ -255,16 +259,29 @@ def make_real_subprocess_env(cwd: str, include_stderr: bool = False) -> MagicMoc
     env.cwd = cwd
 
     def execute(command, **kwargs):
-        completed = subprocess.run(
-            command,
-            shell=True,
-            text=True,
-            capture_output=True,
-            input=kwargs.get("stdin_data"),
-        )
-        output = completed.stdout
-        if include_stderr:
-            output += completed.stderr
+        stdin_data = kwargs.get("stdin_data")
+        if decode_errors == "strict":
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=True,
+                capture_output=True,
+                input=stdin_data,
+            )
+            output = completed.stdout
+            if include_stderr:
+                output += completed.stderr
+        else:
+            completed = subprocess.run(
+                command,
+                shell=True,
+                text=False,
+                capture_output=True,
+                input=stdin_data.encode("utf-8") if stdin_data is not None else None,
+            )
+            output = completed.stdout.decode("utf-8", errors=decode_errors)
+            if include_stderr:
+                output += completed.stderr.decode("utf-8", errors=decode_errors)
         return {
             "output": output,
             "returncode": completed.returncode,
@@ -318,9 +335,14 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
-        assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
+        assert commands[1] == (
+            "if command -v base64 >/dev/null 2>&1; then "
+            "head -c 1004 < '/c/Users/alice/notes.txt' 2>/dev/null "
+            "| base64 | tr -d '\\n'; else exit 127; fi"
+        )
+        assert commands[2] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[3] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
+        assert commands[4] == "wc -l < '/c/Users/alice/notes.txt'"
 
     def test_is_likely_binary_by_extension(self, file_ops):
         assert file_ops._is_likely_binary("photo.png") is True
@@ -673,3 +695,44 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+class TestReadFileUtf8SampleBoundary:
+    def test_read_file_allows_utf8_codepoint_crossing_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), decode_errors="replace")
+        )
+        path = tmp_path / "boundary.txt"
+        path.write_text(("a" * 999) + "€\nsecond\n", encoding="utf-8")
+
+        result = ops.read_file(str(path))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert "€" in result.content
+
+    def test_read_file_raw_allows_utf8_codepoint_crossing_sample_boundary(self, tmp_path):
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), decode_errors="replace")
+        )
+        path = tmp_path / "boundary.txt"
+        expected = ("a" * 999) + "€\nsecond\n"
+        path.write_text(expected, encoding="utf-8")
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.error is None
+        assert result.is_binary is False
+        assert result.content == expected
+
+    def test_incomplete_lead_byte_before_boundary_is_still_binary(self, tmp_path):
+        ops = ShellFileOperations(
+            make_real_subprocess_env(str(tmp_path), decode_errors="replace")
+        )
+        path = tmp_path / "invalid.txt"
+        path.write_bytes((b"a" * 999) + b"\xc3\n")
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
+        assert result.error is not None
