@@ -6953,6 +6953,42 @@ def _validate_buzz_allowed_users(config: Dict[str, Any]) -> None:
                     )
 
 
+def _remove_shadowed_legacy_buzz_access(
+    merged: Dict[str, Any], incoming: Dict[str, Any]
+) -> None:
+    """Remove legacy access keys superseded by a canonical Dashboard save.
+
+    ``buzz.extra`` remains supported for unrelated legacy Buzz settings, but
+    its access keys otherwise override the Dashboard-owned canonical path at
+    gateway startup.  Remove only canonical keys explicitly supplied by the
+    caller so a successful Dashboard save cannot leave an invisible policy in
+    force.
+    """
+    try:
+        canonical_extra = incoming["gateway"]["platforms"]["buzz"]["extra"]
+    except (KeyError, TypeError):
+        return
+    if not isinstance(canonical_extra, dict):
+        return
+
+    supplied = {"allowed_users", "allow_all_users"}.intersection(canonical_extra)
+    if not supplied:
+        return
+
+    legacy_buzz = merged.get("buzz")
+    if not isinstance(legacy_buzz, dict):
+        return
+    legacy_extra = legacy_buzz.get("extra")
+    if not isinstance(legacy_extra, dict):
+        return
+    for key in supplied:
+        legacy_extra.pop(key, None)
+    if not legacy_extra:
+        legacy_buzz.pop("extra", None)
+    if not legacy_buzz:
+        merged.pop("buzz", None)
+
+
 @app.put("/api/config")
 async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
     try:
@@ -6966,7 +7002,9 @@ async def update_config(body: ConfigUpdate, profile: Optional[str] = None):
             existing = read_raw_config()
             incoming = _denormalize_config_from_web(body.config)
             _validate_buzz_allowed_users(incoming)
-            save_config(_deep_merge(existing, incoming))
+            merged = _deep_merge(existing, incoming)
+            _remove_shadowed_legacy_buzz_access(merged, incoming)
+            save_config(merged)
         return {"ok": True}
     except HTTPException:
         raise

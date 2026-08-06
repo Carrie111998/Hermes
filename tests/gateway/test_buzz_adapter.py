@@ -176,6 +176,55 @@ class TestBuzzAdapterInit:
         assert os.environ["BUZZ_ALLOW_ALL_USERS"] == ""
         assert adapter._allowed_pubkeys == set()
 
+    def test_multiplex_profile_extra_isolated_from_process_allowlist(self, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", OTHER_PUBKEY)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            adapter = _make_adapter({"allowed_users": [SELF_NPUB]})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert adapter._allowed_pubkeys == {SELF_PUBKEY}
+
+    def test_multiplex_explicit_empty_scope_overrides_profile_extra(self, monkeypatch):
+        from agent import secret_scope as ss
+
+        monkeypatch.setenv("BUZZ_ALLOWED_USERS", OTHER_PUBKEY)
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({"BUZZ_ALLOWED_USERS": ""})
+        try:
+            adapter = _make_adapter({"allowed_users": [SELF_NPUB]})
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert adapter._allowed_pubkeys == set()
+
+    def test_scoped_multiplex_yaml_load_does_not_write_process_env(self):
+        from agent import secret_scope as ss
+
+        ss.set_multiplex_active(True)
+        token = ss.set_secret_scope({})
+        try:
+            _apply_yaml_config({}, {
+                "extra": {
+                    "relay_url": "https://profile.relay",
+                    "allowed_users": [SELF_NPUB],
+                    "allow_all_users": True,
+                },
+            })
+        finally:
+            ss.reset_secret_scope(token)
+            ss.set_multiplex_active(False)
+
+        assert "BUZZ_RELAY_URL" not in os.environ
+        assert "BUZZ_ALLOWED_USERS" not in os.environ
+        assert "BUZZ_ALLOW_ALL_USERS" not in os.environ
+
     def test_nested_access_config_survives_unrelated_top_level_buzz_config(self):
         yaml_cfg = {
             "buzz": {"extra": {"require_mention": False}},
@@ -303,6 +352,13 @@ class TestMentionGating:
         adapter._allowed_pubkeys = {"b" * 64}
         await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
         assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_allow_all_bypasses_existing_allowlist(self, adapter):
+        adapter._allowed_pubkeys = {"b" * 64}
+        adapter._allow_all_users = True
+        await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
+        assert len(adapter._dispatched) == 1
 
 
 # ── DM classification via p-tags (issue #68871) ──────────────────────────

@@ -74,6 +74,25 @@ def _get_scoped_secret(name, default=None):
     return val if val is not None else default
 
 
+_MISSING_GATE_VALUE = object()
+
+
+def _profile_scoped_config_load() -> bool:
+    """Return whether config is loading inside a multiplex profile scope.
+
+    Buzz's YAML bridge is process-global and first-writer-wins.  Scoped
+    profile loads must therefore keep their values in ``PlatformConfig.extra``
+    instead of publishing them through ``os.environ`` where another profile
+    could inherit them.
+    """
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+        return bool(is_multiplex_active() and current_secret_scope() is not None)
+    except Exception:
+        return False
+
+
 logger = logging.getLogger(__name__)
 
 from gateway.platforms.base import (
@@ -407,10 +426,11 @@ class BuzzAdapter(BasePlatformAdapter):
         self.transport = _transport if _transport in ("auto", "websocket", "poll") else "auto"
 
         # Auth: entries may be hex pubkeys or npubs; normalized to hex
-        raw_allowed = (
-            os.environ["BUZZ_ALLOWED_USERS"]
-            if "BUZZ_ALLOWED_USERS" in os.environ
-            else extra.get("allowed_users", [])
+        scoped_allowed = _get_scoped_secret("BUZZ_ALLOWED_USERS", _MISSING_GATE_VALUE)
+        raw_allowed: Any = (
+            extra.get("allowed_users", [])
+            if scoped_allowed is _MISSING_GATE_VALUE
+            else scoped_allowed
         )
         if isinstance(raw_allowed, str):
             raw_allowed = raw_allowed.split(",")
@@ -419,6 +439,17 @@ class BuzzAdapter(BasePlatformAdapter):
             for entry in raw_allowed
             if isinstance(entry, str) and (normalized := _normalize_user_ref(entry))
         }
+        scoped_allow_all = _get_scoped_secret("BUZZ_ALLOW_ALL_USERS", _MISSING_GATE_VALUE)
+        raw_allow_all = (
+            extra.get("allow_all_users", False)
+            if scoped_allow_all is _MISSING_GATE_VALUE
+            else scoped_allow_all
+        )
+        self._allow_all_users = (
+            raw_allow_all
+            if isinstance(raw_allow_all, bool)
+            else str(raw_allow_all).strip().lower() in {"true", "1", "yes", "on"}
+        )
 
         # Secret — resolved lazily (never at import/registration time and
         # never logged).  connect() re-resolves it to fail fast with a clear
@@ -1047,7 +1078,11 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
         # BUZZ_ALLOW_ALL_USERS centrally as well; empty list = no filter here).
-        if self._allowed_pubkeys and pubkey not in self._allowed_pubkeys:
+        if (
+            not self._allow_all_users
+            and self._allowed_pubkeys
+            and pubkey not in self._allowed_pubkeys
+        ):
             logger.debug("Buzz: ignoring message from unauthorized pubkey %s…", pubkey[:8])
             return
 
@@ -1295,6 +1330,9 @@ def _apply_yaml_config(yaml_cfg: dict, buzz_cfg: dict) -> Optional[dict]:
     config.yaml update.  ``BUZZ_PRIVATE_KEY`` is a secret and stays in ``.env``;
     it is never sourced from config.yaml here.
     """
+    if _profile_scoped_config_load():
+        return None
+
     merged_extra: dict = {}
 
     def _merge_extra(candidate: Any) -> None:
