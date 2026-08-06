@@ -4237,20 +4237,28 @@ def refresh_launchd_plist_if_needed() -> bool:
         # Unique per reload so concurrent/repeated reloads never collide.
         submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
         reload_script = (
+            # Capture old PID before bootout so we can distinguish a stale
+            # (still-tearing-down) registration from a fresh bootstrap.  See #80395.
+            f"_old_pid=$(launchctl list {shlex.quote(label)} 2>/dev/null "
+            f"| sed -n 's/.*\"PID\" *= *\\([0-9]*\\).*/\\1/p'); "
             f"sleep 2; "
             f"launchctl bootout {shlex.quote(target)} 2>/dev/null; "
             f"sleep 1; "
             f"_deadline=$(($(date +%s) + {_reload_budget})); "
             f"while :; do "
             f"  launchctl bootstrap {shlex.quote(domain)} {shlex.quote(str(plist_path))} 2>/dev/null; "
-            f"  if launchctl list {shlex.quote(label)} >/dev/null 2>&1; then break; fi; "
-            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet registered for {shlex.quote(target)} — retrying\" >> {shlex.quote(str(reload_log_path))}; "
+            f"  _new_info=$(launchctl list {shlex.quote(label)} 2>/dev/null); "
+            f"  if [ -n \"$_new_info\" ]; then "
+            f"    _new_pid=$(echo \"$_new_info\" | sed -n 's/.*\\\"PID\\\" *= *\\([0-9]*\\).*/\\1/p'); "
+            f"    if [ -n \"$_new_pid\" ] && [ \"$_new_pid\" != \"$_old_pid\" ]; then break; fi; "
+            f"  fi; "
+            f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] bootstrap not yet settled for {shlex.quote(target)} (old=$_old_pid) — retrying\" >> {shlex.quote(str(reload_log_path))}; "
             f"  if [ $(date +%s) -ge $_deadline ]; then break; fi; "
             f"  sleep 2; "
             f"done; "
             f"if ! launchctl list {shlex.quote(label)} >/dev/null 2>&1; then "
             f"  echo \"[$(date '+%Y-%m-%d %H:%M:%S %z')] FAILED launchd reload for {shlex.quote(target)} — service NOT registered after {_reload_budget}s of retries\" >> {shlex.quote(str(reload_log_path))}; "
-            f"fi; "
+            f"fi; " 
             # Submitted jobs stay registered with launchd after the script
             # exits; without this, every reload leaks one dead label. Removing
             # our own label is the documented way to end a one-shot submit job
