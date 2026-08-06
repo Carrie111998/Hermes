@@ -1224,6 +1224,11 @@ class TestKilocodePricingFetcher:
                 # (the kilo-auto/free router case).
                 "pricing": {"prompt": "0.000002", "completion": "0.000010"},
             },
+            {
+                "id": "vendor/model-zero-numeric",
+                # Custom proxy reporting numeric zeros — must surface as "0".
+                "pricing": {"prompt": 0, "completion": 0.0},
+            },
             # Malformed records must be skipped, not crash the parser.
             {"id": "vendor/no-pricing"},
             {"id": ""},
@@ -1239,7 +1244,7 @@ class TestKilocodePricingFetcher:
 
         # get_pricing_for_provider → _fetch_kilocode_pricing dispatch path
         result = get_pricing_for_provider("kilocode")
-        assert set(result) == {"vendor/model-paid", "vendor/model-free"}
+        assert set(result) == {"vendor/model-paid", "vendor/model-free", "vendor/model-zero-numeric"}
         # Paid: per-token strings pass through unchanged.
         assert result["vendor/model-paid"]["prompt"] == "0.000005"
         assert result["vendor/model-paid"]["completion"] == "0.000025"
@@ -1247,6 +1252,10 @@ class TestKilocodePricingFetcher:
         # isFree: explicit zero mapping.
         assert result["vendor/model-free"]["prompt"] == "0"
         assert result["vendor/model-free"]["completion"] == "0"
+        # Numeric zero pricing (custom proxy) is surfaced, not dropped; the
+        # shared formatter maps both "0" and "0.0" to "free" downstream.
+        assert result["vendor/model-zero-numeric"]["prompt"] == "0"
+        assert result["vendor/model-zero-numeric"]["completion"] == "0.0"
 
     def test_catalog_fetchable_without_api_key(self, monkeypatch):
         """The Kilo catalog endpoint is public — no key, no gate."""
