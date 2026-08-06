@@ -1312,6 +1312,7 @@ def test_post_install_failure_recovery_requires_exact_live_artifacts(
         "start_writer",
         "start_gateway",
         "collect_native",
+        "projection_export",
         "stop_services",
     ],
 )
@@ -1361,7 +1362,10 @@ def test_post_install_failure_rejects_preserved_native_stage(
         recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
-@pytest.mark.parametrize("failure_stage", ["install", "start_gateway"])
+@pytest.mark.parametrize(
+    "failure_stage",
+    ["install", "start_gateway", "projection_export"],
+)
 def test_install_failure_recovery_archives_exact_live_artifacts_and_reloads(
     recovery_tree: dict[str, Any],
     monkeypatch: pytest.MonkeyPatch,

@@ -260,6 +260,7 @@ _RECOVERABLE_POST_INSTALL_NATIVE_FAILURE_STAGES = frozenset({
     "start_writer",
     "start_gateway",
     "collect_native",
+    "projection_export",
     "stop_services",
 })
 
