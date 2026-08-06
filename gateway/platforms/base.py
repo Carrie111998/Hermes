@@ -5039,6 +5039,7 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        suppressed_system_error = False
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5097,6 +5098,18 @@ class BasePlatformAdapter(ABC):
             # string, and remember the TTL + platform capability so the
             # post-send block can schedule the deletion.
             response, _ephemeral_ttl = self._unwrap_ephemeral(response)
+
+            if self.config.suppress_system_errors:
+                from gateway.response_filters import is_internal_gateway_error_response
+
+                if is_internal_gateway_error_response(response):
+                    logger.error(
+                        "[%s] Suppressed internal gateway error on customer-safe channel %s",
+                        self.name,
+                        event.source.chat_id,
+                    )
+                    response = None
+                    suppressed_system_error = True
 
             # Send response if any.  A None/empty response is normal when
             # streaming already delivered the text (already_sent=True) or
@@ -5446,7 +5459,11 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            processing_ok = (
+                False
+                if suppressed_system_error
+                else delivery_succeeded if delivery_attempted else not bool(response)
+            )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,
@@ -5508,24 +5525,25 @@ class BasePlatformAdapter(ABC):
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             # Send the error to the user so they aren't left with radio silence
-            try:
-                error_type = type(e).__name__
-                error_detail = str(e)[:300] if str(e) else "no details available"
-                _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
-                await self.send(
-                    chat_id=event.source.chat_id,
-                    content=(
-                        f"Sorry, I encountered an error ({error_type}).\n"
-                        f"{error_detail}\n"
-                        "Try again or use /reset to start a fresh session."
-                    ),
-                    metadata=_thread_metadata,
-                )
-            except Exception as notify_err:
-                logger.error(
-                    "[%s] Failed to send error notification to user: %s",
-                    self.name, notify_err, exc_info=True,
-                )  # Last resort — don't let error reporting crash the handler
+            if not self.config.suppress_system_errors:
+                try:
+                    error_type = type(e).__name__
+                    error_detail = str(e)[:300] if str(e) else "no details available"
+                    _thread_metadata = _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+                    await self.send(
+                        chat_id=event.source.chat_id,
+                        content=(
+                            f"Sorry, I encountered an error ({error_type}).\n"
+                            f"{error_detail}\n"
+                            "Try again or use /reset to start a fresh session."
+                        ),
+                        metadata=_thread_metadata,
+                    )
+                except Exception as notify_err:
+                    logger.error(
+                        "[%s] Failed to send error notification to user: %s",
+                        self.name, notify_err, exc_info=True,
+                    )  # Last resort — don't let error reporting crash the handler
         finally:
             # Stop typing before any deferred callback work.  Post-delivery
             # callbacks may perform platform I/O; a stuck callback must not

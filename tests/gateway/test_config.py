@@ -77,6 +77,11 @@ class TestPlatformConfigRoundtrip:
         restored = PlatformConfig.from_dict({"gateway_restart_notification": "false"})
         assert restored.gateway_restart_notification is False
 
+    def test_suppress_system_errors_roundtrip_true(self):
+        pc = PlatformConfig(enabled=True, suppress_system_errors=True)
+        restored = PlatformConfig.from_dict(pc.to_dict())
+        assert restored.suppress_system_errors is True
+
     def test_typing_indicator_defaults_true(self):
         assert PlatformConfig().typing_indicator is True
         assert PlatformConfig.from_dict({}).typing_indicator is True
@@ -1923,6 +1928,30 @@ class TestHomeChannelEnvOverrides:
             home = config.platforms[platform].home_channel
             assert home is not None, f"{platform.value}: home_channel should not be None"
             assert (home.chat_id, home.name) == expected, platform.value
+
+
+def test_explicit_sms_disable_is_not_overridden_by_twilio_environment():
+    config = GatewayConfig(
+        platforms={
+            Platform.SMS: PlatformConfig(
+                enabled=False,
+                extra={"_enabled_explicit": True},
+            )
+        }
+    )
+
+    with patch.dict(
+        os.environ,
+        {
+            "TWILIO_ACCOUNT_SID": "AC_test",
+            "TWILIO_AUTH_TOKEN": "secret",
+            "TWILIO_PHONE_NUMBER": "+15550001111",
+        },
+        clear=True,
+    ):
+        _apply_env_overrides(config)
+
+    assert config.platforms[Platform.SMS].enabled is False
 
 
 class TestMultiplexProfilesEnvOverride:

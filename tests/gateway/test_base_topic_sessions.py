@@ -205,6 +205,52 @@ class TestBasePlatformTopicSessions:
         ]
 
     @pytest.mark.asyncio
+    async def test_customer_safe_adapter_suppresses_internal_gateway_error_response(self):
+        adapter = DummyTelegramAdapter()
+        adapter.config.suppress_system_errors = True
+
+        async def handler(_event):
+            return "⚠️ The model provider failed after retries. Check gateway logs."
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
+    async def test_customer_safe_adapter_suppresses_uncaught_exception_notice(self):
+        adapter = DummyTelegramAdapter()
+        adapter.config.suppress_system_errors = True
+
+        async def handler(_event):
+            raise RuntimeError("private provider failure")
+
+        async def hold_typing(_chat_id, interval=2.0, metadata=None):
+            await asyncio.Event().wait()
+
+        adapter.set_message_handler(handler)
+        adapter._keep_typing = hold_typing
+
+        event = _make_event("-1001", "17585")
+        await adapter._process_message_background(event, build_session_key(event.source))
+
+        assert adapter.sent == []
+        assert adapter.processing_hooks == [
+            ("start", "1"),
+            ("complete", "1", ProcessingOutcome.FAILURE),
+        ]
+
+    @pytest.mark.asyncio
     async def test_process_message_background_marks_cancellation_unsuccessful(self):
         adapter = DummyTelegramAdapter()
         release = asyncio.Event()

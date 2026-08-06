@@ -581,6 +581,10 @@ class PlatformConfig:
     # noise; keep True for back-channels where the operator wants them.
     gateway_restart_notification: bool = True
 
+    # Suppress Hermes/provider diagnostics on customer-facing channels. Errors
+    # remain in gateway logs and processing hooks still receive FAILURE.
+    suppress_system_errors: bool = False
+
     # Whether the gateway shows a "typing…" / "is thinking…" status indicator
     # while the agent processes a message on this platform. Default True
     # preserves prior behavior. Set False on platforms where the indicator is
@@ -611,6 +615,7 @@ class PlatformConfig:
             "extra": self.extra,
             "reply_to_mode": self.reply_to_mode,
             "gateway_restart_notification": self.gateway_restart_notification,
+            "suppress_system_errors": self.suppress_system_errors,
             "typing_indicator": self.typing_indicator,
         }
         if self.typing_status_text is not None:
@@ -643,6 +648,10 @@ class PlatformConfig:
         if _grn is None:
             _grn = extra.get("gateway_restart_notification")
 
+        _sse = data.get("suppress_system_errors")
+        if _sse is None:
+            _sse = extra.get("suppress_system_errors")
+
         # typing_indicator mirrors gateway_restart_notification: it may arrive
         # top-level or bridged into extra by the shared-key loop in
         # load_gateway_config(), so check both.
@@ -670,6 +679,7 @@ class PlatformConfig:
             home_channel=home_channel,
             reply_to_mode=data.get("reply_to_mode", "first"),
             gateway_restart_notification=_coerce_bool(_grn, True),
+            suppress_system_errors=_coerce_bool(_sse, False),
             typing_indicator=_coerce_bool(_typing, True),
             typing_status_text=_typing_text,
             channel_overrides=channel_overrides,
@@ -1493,6 +1503,8 @@ def load_gateway_config() -> GatewayConfig:
                         bridged["channel_prompts"] = channel_prompts
                 if "gateway_restart_notification" in platform_cfg:
                     bridged["gateway_restart_notification"] = platform_cfg["gateway_restart_notification"]
+                if "suppress_system_errors" in platform_cfg:
+                    bridged["suppress_system_errors"] = platform_cfg["suppress_system_errors"]
                 if "typing_indicator" in platform_cfg:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
@@ -1988,13 +2000,23 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
 
     # SMS (Twilio)
     twilio_sid = getenv("TWILIO_ACCOUNT_SID")
-    if twilio_sid:
+    sms_config = config.platforms.get(Platform.SMS)
+    sms_explicitly_disabled = bool(
+        sms_config is not None
+        and not sms_config.enabled
+        and sms_config.extra.get("_enabled_explicit", False)
+    )
+    if twilio_sid and not sms_explicitly_disabled:
         if Platform.SMS not in config.platforms:
             config.platforms[Platform.SMS] = PlatformConfig()
         config.platforms[Platform.SMS].enabled = True
         config.platforms[Platform.SMS].api_key = getenv("TWILIO_AUTH_TOKEN", "")
     sms_home = getenv("SMS_HOME_CHANNEL")
-    if sms_home and Platform.SMS in config.platforms:
+    if (
+        sms_home
+        and Platform.SMS in config.platforms
+        and config.platforms[Platform.SMS].enabled
+    ):
         config.platforms[Platform.SMS].home_channel = HomeChannel(
             platform=Platform.SMS,
             chat_id=sms_home,

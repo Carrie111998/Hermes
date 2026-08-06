@@ -23,6 +23,17 @@ LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "NO REPLY",
 })
 
+_INTERNAL_GATEWAY_ERROR_PREFIXES = (
+    "Provider authentication failed",
+    "The model provider failed",
+    "The model provider rejected",
+    "The model provider is rate-limiting",
+    "The model returned no response",
+    "Session too large for the model's context window",
+    "Sorry, I encountered an unexpected error",
+    "Codex gpt-5.",
+)
+
 
 def _canonical_silence_candidate(text: str) -> str:
     return " ".join(text.strip().upper().split())
@@ -77,6 +88,18 @@ def is_intentional_silence_agent_result(agent_result: dict | None, response: Any
     if agent_result.get("failed"):
         return False
     return is_intentional_silence_response(response)
+
+
+def is_internal_gateway_error_response(response: Any) -> bool:
+    """Return True for Hermes infrastructure notices that customers must not see.
+
+    Prefix matching is intentionally narrow. Business-facing warnings remain
+    deliverable even when a platform enables customer-safe error suppression.
+    """
+    if not isinstance(response, str):
+        return False
+    text = response.strip().lstrip("⚠️ℹ ")
+    return text.startswith(_INTERNAL_GATEWAY_ERROR_PREFIXES)
 
 
 def is_partial_silence_marker(text: Any) -> bool:
