@@ -1278,7 +1278,10 @@ async def vision_analyze_tool(
         # (issue #80025). "auto" (or unset) means omit; any other value is
         # an explicit user-configured cap.
         if _vmax is not None and str(_vmax).strip().lower() != "auto":
-            call_kwargs["max_tokens"] = int(_vmax)
+            try:
+                call_kwargs["max_tokens"] = int(_vmax)
+            except (TypeError, ValueError):
+                pass  # malformed config value -- omit rather than crash the call
         if model:
             call_kwargs["model"] = model
         _load_auxiliary_client()
@@ -1790,7 +1793,10 @@ async def video_analyze_tool(
         # Omit max_tokens by default -- see the image analysis call site
         # above for the full rationale (issue #80025).
         if _vmax is not None and str(_vmax).strip().lower() != "auto":
-            call_kwargs["max_tokens"] = int(_vmax)
+            try:
+                call_kwargs["max_tokens"] = int(_vmax)
+            except (TypeError, ValueError):
+                pass  # malformed config value -- omit rather than crash the call
         if model:
             call_kwargs["model"] = model
 

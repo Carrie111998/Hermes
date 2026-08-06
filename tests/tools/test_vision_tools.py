@@ -332,6 +332,11 @@ class TestVisionConfig:
         kwargs = await call_with({"auxiliary": {"vision": {"max_tokens": 8000}}})
         assert kwargs["max_tokens"] == 8000
 
+        # Malformed config value (non-numeric string): must not crash the
+        # call -- omit max_tokens rather than raise ValueError from int().
+        kwargs = await call_with({"auxiliary": {"vision": {"max_tokens": "not-a-number"}}})
+        assert "max_tokens" not in kwargs
+
 
 class TestVisionSafetyGuards:
     @pytest.mark.asyncio
