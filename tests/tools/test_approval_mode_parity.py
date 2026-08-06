@@ -154,3 +154,28 @@ def test_tui_loader_delegates_to_core(hermes_home, tui_server):
         approval_mod, "_get_approval_mode", return_value="weird"
     ):
         assert tui_server._load_approval_mode() == "manual"
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        pytest.param(None, "deny", id="unset-defaults-deny"),
+        pytest.param("deny", "deny", id="explicit-deny"),
+        pytest.param("wait", "wait", id="wait"),
+        pytest.param("never", "wait", id="never-alias"),
+        pytest.param("block", "wait", id="block-alias"),
+        pytest.param("unlimited", "wait", id="unlimited-alias"),
+        pytest.param("  WAIT  ", "wait", id="whitespace-case"),
+        pytest.param("bogus-value", "deny", id="unknown-falls-back-deny"),
+    ],
+)
+def test_approval_expiry_behavior_normalization(hermes_home, raw, expected):
+    """expiry_behavior normalizes to deny|wait with a safe deny default."""
+    approval_mod = _approval_module()
+
+    config = {"approvals": {}}
+    if raw is not None:
+        config["approvals"]["expiry_behavior"] = raw
+
+    with patch.object(approval_mod, "_get_approval_config", return_value=config["approvals"]):
+        assert approval_mod._get_approval_expiry_behavior() == expected

@@ -213,6 +213,7 @@ def approval_callback(cli, command: str, description: str) -> str:
     with lock:
         from cli import CLI_CONFIG
         timeout = CLI_CONFIG.get("approvals", {}).get("timeout", 300)
+        from tools.approval import _get_approval_expiry_behavior
         response_queue = queue.Queue()
         choices = ["once", "session", "always", "deny"]
         if len(command) > 70:
@@ -225,7 +226,13 @@ def approval_callback(cli, command: str, description: str) -> str:
             "selected": 0,
             "response_queue": response_queue,
         }
-        cli._approval_deadline = _time.monotonic() + timeout
+        # expiry_behavior="wait" → never expire: a None deadline keeps the
+        # prompt up until an explicit answer (#76235), mirroring clarify's
+        # unlimited-timeout convention.
+        cli._approval_deadline = (
+            None if _get_approval_expiry_behavior() == "wait"
+            else _time.monotonic() + timeout
+        )
 
         if hasattr(cli, "_app") and cli._app:
             cli._app.invalidate()
@@ -239,6 +246,11 @@ def approval_callback(cli, command: str, description: str) -> str:
                     cli._app.invalidate()
                 return result
             except queue.Empty:
+                # None deadline = unlimited; keep polling (#76235).
+                if cli._approval_deadline is None:
+                    if hasattr(cli, "_app") and cli._app:
+                        cli._app.invalidate()
+                    continue
                 remaining = cli._approval_deadline - _time.monotonic()
                 if remaining <= 0:
                     break
