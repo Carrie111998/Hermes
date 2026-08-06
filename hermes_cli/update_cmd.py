@@ -3027,9 +3027,8 @@ def _leftover_pausable_gateway_pids(
     to exempt them (``_is_pausable_gateway``), so the preflight's exemption
     and this guard's tolerance cannot drift apart — matcher drift between
     two views of the same process table is what produced the launcher/worker
-    dead-end fixed above. The scan captures only a 120-char cmdline prefix,
-    so the live argv is re-read where psutil allows; an unreadable argv
-    falls back to the captured prefix.
+    dead-end fixed above. The detector preserves the full command line so
+    classification does not depend on a second process-table read.
 
     Returns ``None`` when any holder is not a pausable gateway — an operator
     REPL, a stray script, or the Desktop backend has no pause machinery
@@ -3037,20 +3036,9 @@ def _leftover_pausable_gateway_pids(
     """
     from hermes_cli._scan_venv_blockers import _is_pausable_gateway
 
-    try:
-        import psutil  # type: ignore
-    except Exception:
-        psutil = None
-
     pids: list[int] = []
     for pid, _name, cmdline in matches:
-        argv = cmdline
-        if psutil is not None:
-            try:
-                argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-            except Exception:
-                pass
-        if not _is_pausable_gateway(argv):
+        if not _is_pausable_gateway(cmdline):
             return None
         pids.append(int(pid))
     return pids
