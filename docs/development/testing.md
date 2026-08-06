@@ -38,7 +38,7 @@ one test file therefore cannot leak into another.
 | | Without wrapper | With wrapper |
 |---|---|---|
 | Provider API keys | Whatever is in the environment | All except a specific few unset |
-| HOME / `~/.hermes/` | Real config and auth state | Temp directory per test |
+| HOME / `~/.hermes/` | Real config and auth state | Real home (stable); profile state redirected by `HERMES_HOME` |
 | Timezone | Local timezone | UTC |
 | Locale | Host locale | C.UTF-8 |
 
@@ -124,10 +124,12 @@ signal to extract a small pure/DI-testable function rather than regex the file.
 
 ## Profile tests
 
-`scripts/run_tests.sh` isolates `HOME` along with credentials, timezone, and
-locale; the `_isolate_hermes_home` autouse fixture separately redirects
-`HERMES_HOME`. Never write to the real `~/.hermes`. Profile-path tests also mock
-`Path.home()` so normal and custom/Docker default-root behavior stay isolated:
+`scripts/run_tests.sh` preserves the real `HOME` while stripping credentials and
+pinning timezone and locale. The `_hermetic_environment` autouse fixture redirects
+`HERMES_HOME` per test but does **not** redirect `HOME`, because subprocess tests
+depend on a stable home. Never write to the real `~/.hermes`; direct
+`Path.home() / ".hermes"` access is a bug. Tests specifically exercising default
+root discovery may mock `Path.home()`, but must also set `HERMES_HOME`:
 
 ```python
 @pytest.fixture

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 from pathlib import Path
 from typing import Sequence
@@ -40,12 +41,20 @@ def _is_escaped(text: str, index: int) -> bool:
     return backslashes % 2 == 1
 
 
+def _backtick_run_length(text: str, index: int) -> int:
+    end = index
+    while end < len(text) and text[end] == "`":
+        end += 1
+    return end - index
+
+
 def _mask_excluded_markdown(markdown: str, *, source: str) -> str:
-    """Mask fenced/inline code and HTML comments while preserving positions."""
+    """Mask non-navigable Markdown regions while preserving positions."""
     output: list[str] = []
     fence_char: str | None = None
     fence_len = 0
     in_comment = False
+    html_code_tag: str | None = None
     inline_ticks = 0
 
     for line in markdown.splitlines(keepends=True):
@@ -58,15 +67,30 @@ def _mask_excluded_markdown(markdown: str, *, source: str) -> str:
 
         if fence_char is not None:
             output.append("\n" if line.endswith("\n") else "")
-            if marker_char == fence_char and marker_len >= fence_len:
+            marker_tail = stripped[marker_len:].strip()
+            if (
+                marker_char == fence_char
+                and marker_len >= fence_len
+                and not marker_tail
+            ):
                 fence_char = None
                 fence_len = 0
             continue
-        if not in_comment and inline_ticks == 0 and marker_len >= 3:
+        if (
+            not in_comment
+            and html_code_tag is None
+            and inline_ticks == 0
+            and marker_len >= 3
+        ):
             fence_char = marker_char
             fence_len = marker_len
             output.append("\n" if line.endswith("\n") else "")
             continue
+
+        if not in_comment and html_code_tag is None and inline_ticks == 0:
+            if line.startswith("\t") or indent >= 4:
+                output.append("\n" if line.endswith("\n") else "")
+                continue
 
         i = 0
         masked = list(line)
@@ -85,19 +109,37 @@ def _mask_excluded_markdown(markdown: str, *, source: str) -> str:
                 i = end + 3
                 continue
 
-            if inline_ticks:
-                delimiter = "`" * inline_ticks
-                end = line.find(delimiter, i)
-                if end < 0:
+            if html_code_tag is not None:
+                closing = re.search(
+                    rf"</\s*{html_code_tag}\s*>", line[i:], flags=re.IGNORECASE
+                )
+                if closing is None:
                     for j in range(i, len(line)):
                         if line[j] != "\n":
                             masked[j] = " "
                     i = len(line)
                     continue
-                for j in range(i, end + inline_ticks):
+                end = i + closing.end()
+                for j in range(i, end):
                     masked[j] = " "
-                inline_ticks = 0
-                i = end + len(delimiter)
+                html_code_tag = None
+                i = end
+                continue
+
+            if inline_ticks:
+                # Backslash escapes are literal inside a code span; only the
+                # exact run length determines whether this is the closer.
+                if line[i] == "`":
+                    ticks = _backtick_run_length(line, i)
+                    for j in range(i, i + ticks):
+                        masked[j] = " "
+                    i += ticks
+                    if ticks == inline_ticks:
+                        inline_ticks = 0
+                    continue
+                if line[i] != "\n":
+                    masked[i] = " "
+                i += 1
                 continue
 
             if line.startswith("<!--", i):
@@ -114,8 +156,17 @@ def _mask_excluded_markdown(markdown: str, *, source: str) -> str:
                 i = end + 3
                 continue
 
+            html_open = re.match(r"<\s*(pre|code)\b[^>]*>", line[i:], re.IGNORECASE)
+            if html_open is not None:
+                html_code_tag = html_open.group(1).lower()
+                end = i + html_open.end()
+                for j in range(i, end):
+                    masked[j] = " "
+                i = end
+                continue
+
             if line[i] == "`" and not _is_escaped(line, i):
-                ticks = len(line[i:]) - len(line[i:].lstrip("`"))
+                ticks = _backtick_run_length(line, i)
                 inline_ticks = ticks
                 for j in range(i, i + ticks):
                     masked[j] = " "
@@ -128,9 +179,39 @@ def _mask_excluded_markdown(markdown: str, *, source: str) -> str:
         raise ValueError(f"{source}: unterminated fenced code block")
     if in_comment:
         raise ValueError(f"{source}: unterminated HTML comment")
+    if html_code_tag is not None:
+        raise ValueError(f"{source}: unterminated HTML <{html_code_tag}> block")
     if inline_ticks:
         raise ValueError(f"{source}: unterminated inline code span")
     return "".join(output)
+
+
+def _closing_label_index(text: str, opener: int) -> int | None:
+    depth = 1
+    cursor = opener + 1
+    while cursor < len(text):
+        if text[cursor] == "[" and not _is_escaped(text, cursor):
+            depth += 1
+        elif text[cursor] == "]" and not _is_escaped(text, cursor):
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    return None
+
+
+def _closing_destination_index(text: str, opener: int, *, source: str) -> int:
+    depth = 1
+    cursor = opener + 1
+    while cursor < len(text):
+        if text[cursor] == "(" and not _is_escaped(text, cursor):
+            depth += 1
+        elif text[cursor] == ")" and not _is_escaped(text, cursor):
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    raise ValueError(f"{source}: unterminated Markdown link at character {opener}")
 
 
 def extract_navigable_links(markdown: str, *, source: str) -> list[str]:
@@ -143,6 +224,18 @@ def extract_navigable_links(markdown: str, *, source: str) -> list[str]:
     links: list[str] = []
     i = 0
     while i < len(text):
+        if text.startswith("![", i) and not _is_escaped(text, i):
+            close_label = _closing_label_index(text, i + 1)
+            if close_label is None:
+                i = len(text)
+                continue
+            if close_label + 1 < len(text) and text[close_label + 1] == "(":
+                i = _closing_destination_index(
+                    text, close_label + 1, source=source
+                ) + 1
+            else:
+                i = close_label + 1
+            continue
         if text[i] != "[" or _is_escaped(text, i):
             i += 1
             continue
@@ -150,29 +243,19 @@ def extract_navigable_links(markdown: str, *, source: str) -> list[str]:
             i += 1
             continue
 
-        close_label = i + 1
-        while close_label < len(text):
-            if text[close_label] == "]" and not _is_escaped(text, close_label):
-                break
-            close_label += 1
-        if close_label >= len(text) or close_label + 1 >= len(text) or text[close_label + 1] != "(":
+        close_label = _closing_label_index(text, i)
+        if (
+            close_label is None
+            or close_label + 1 >= len(text)
+            or text[close_label + 1] != "("
+        ):
             i += 1
             continue
 
         cursor = close_label + 2
-        depth = 1
-        destination_end = cursor
-        while destination_end < len(text):
-            char = text[destination_end]
-            if char == "(" and not _is_escaped(text, destination_end):
-                depth += 1
-            elif char == ")" and not _is_escaped(text, destination_end):
-                depth -= 1
-                if depth == 0:
-                    break
-            destination_end += 1
-        if depth:
-            raise ValueError(f"{source}: unterminated Markdown link at character {i}")
+        destination_end = _closing_destination_index(
+            text, close_label + 1, source=source
+        )
 
         raw = text[cursor:destination_end].strip()
         if raw.startswith("<"):
@@ -209,7 +292,11 @@ def _resolve_relative_target(
     source_path: Path,
     destination: str,
 ) -> tuple[str | None, str | None]:
-    parsed = urlsplit(destination)
+    try:
+        parsed = urlsplit(destination)
+    except ValueError:
+        relative_source = source_path.relative_to(repo_root)
+        return None, f"{relative_source} link {destination!r} has malformed URL destination"
     if parsed.scheme or parsed.netloc or destination.startswith("#"):
         return None, None
     relative = unquote(parsed.path)

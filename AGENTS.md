@@ -199,7 +199,9 @@ Applies to desktop, TUI, website, and future TypeScript packages.
 - Module-level `get_hermes_home()` values are safe because profile override runs
   before imports. Profile discovery is anchored to `get_default_hermes_root()`:
   normally `~/.hermes`, while custom/Docker roots remain honored.
-- Tests that mock `Path.home()` must also set `HERMES_HOME`. Platform adapters
+- Canonical tests isolate profile state through `HERMES_HOME`; the real `HOME`
+  remains stable. Direct `Path.home() / ".hermes"` access is a bug. Tests that
+  deliberately mock `Path.home()` must also set `HERMES_HOME`. Platform adapters
   using unique credentials must acquire/release scoped token locks.
 
 ### Tools and plugins

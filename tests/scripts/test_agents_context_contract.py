@@ -65,15 +65,32 @@ def test_contract_rejects_one_character_above_root_limit(tmp_path):
     "replacement",
     [
         "![target](target.md)",
+        "![nested [target](target.md)](image.png)",
         "`[target](target.md)`",
         "``[target](target.md)``",
         r"\[target](target.md)",
         "<!-- [target](target.md) -->",
+        "    [target](target.md)",
+        "<pre>\n[target](target.md)\n</pre>",
+        "<code>\n[target](target.md)\n</code>",
         "```markdown\n[target](target.md)\n```",
         "````markdown\n```\n[target](target.md)\n```\n````",
         "~~~~markdown\n[target](target.md)\n~~~~",
     ],
-    ids=["image", "inline-code", "long-inline-code", "escaped", "comment", "fence", "long-fence", "tilde-fence"],
+    ids=[
+        "image",
+        "nested-image-label",
+        "inline-code",
+        "long-inline-code",
+        "escaped",
+        "comment",
+        "indented-code",
+        "html-pre",
+        "html-code",
+        "fence",
+        "long-fence",
+        "tilde-fence",
+    ],
 )
 def test_required_reference_must_be_an_ordinary_navigable_link(tmp_path, replacement):
     repo = _contract_repo(tmp_path)
@@ -105,6 +122,52 @@ def test_link_extractor_ignores_non_links_and_keeps_ordinary_links():
         "https://example.com/x",
         "#local",
     ]
+
+
+def test_invalid_fence_closer_does_not_expose_links_from_fenced_code():
+    markdown = """```
+``` trailing text is not a closer
+[hidden](hidden.md)
+```
+[ordinary](ordinary.md)
+"""
+
+    assert extract_navigable_links(markdown, source="AGENTS.md") == ["ordinary.md"]
+
+
+def test_fence_markers_inside_raw_html_code_do_not_change_parser_state():
+    markdown = """<pre>
+```
+[hidden](hidden.md)
+</pre>
+[ordinary](ordinary.md)
+"""
+
+    assert extract_navigable_links(markdown, source="AGENTS.md") == ["ordinary.md"]
+
+
+@pytest.mark.parametrize("delimiter_length", [1, 2, 3])
+def test_inline_code_closes_only_on_an_exact_backtick_run(delimiter_length):
+    delimiter = "`" * delimiter_length
+    longer_length = 3 if delimiter_length == 1 else delimiter_length + 1
+    longer_run = "`" * longer_length
+    leftover_run = "`" * (longer_length - delimiter_length)
+    markdown = (
+        f"prose {delimiter}opener {longer_run}internal{leftover_run}"
+        f"[hidden](hidden.md) closer{delimiter}\n[ordinary](ordinary.md)\n"
+    )
+
+    assert extract_navigable_links(markdown, source="AGENTS.md") == ["ordinary.md"]
+
+
+@pytest.mark.parametrize("delimiter_length", [1, 2, 3])
+def test_inline_code_exact_closer_is_not_escaped_inside_span(delimiter_length):
+    delimiter = "`" * delimiter_length
+    markdown = (
+        f"prose {delimiter}code\\{delimiter}\n[ordinary](ordinary.md)\n"
+    )
+
+    assert extract_navigable_links(markdown, source="AGENTS.md") == ["ordinary.md"]
 
 
 def test_relative_link_query_and_fragment_are_stripped_for_resolution(tmp_path):
@@ -145,6 +208,17 @@ def test_contract_rejects_invalid_relative_links(tmp_path, target, expected):
     assert any(expected in error and target in error for error in errors)
 
 
+@pytest.mark.parametrize("target", ["http://[", "//["])
+def test_contract_reports_malformed_url_destinations_without_raising(tmp_path, target):
+    repo = _contract_repo(tmp_path)
+    with (repo / "AGENTS.md").open("a", encoding="utf-8") as handle:
+        handle.write(f"\n[bad]({target})\n")
+
+    errors = validate_repository(repo)
+
+    assert f"AGENTS.md link {target!r} has malformed URL destination" in errors
+
+
 def test_contract_requires_root_and_desktop_governing_files(tmp_path):
     repo = _contract_repo(tmp_path)
     (repo / "AGENTS.md").unlink()
@@ -176,3 +250,44 @@ def test_repository_agents_context_contract():
     repo_root = Path(__file__).resolve().parents[2]
 
     assert validate_repository(repo_root) == []
+
+
+def test_documented_test_isolation_preserves_real_home_and_redirects_hermes_home():
+    repo_root = Path(__file__).resolve().parents[2]
+    root_contract = " ".join(
+        (repo_root / "AGENTS.md").read_text(encoding="utf-8").split()
+    )
+    testing_reference = " ".join(
+        (repo_root / "docs/development/testing.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "real `HOME` remains stable" in root_contract
+    assert "Direct `Path.home() / \".hermes\"` access is a bug" in root_contract
+    assert "Real home (stable); profile state redirected by `HERMES_HOME`" in testing_reference
+    assert "does **not** redirect `HOME`" in testing_reference
+
+
+def test_configuration_reference_names_default_definition_and_reexport():
+    repo_root = Path(__file__).resolve().parents[2]
+    reference = " ".join(
+        (repo_root / "docs/development/configuration.md")
+        .read_text(encoding="utf-8")
+        .split()
+    )
+
+    assert "defined in `hermes_cli/config_defaults.py`" in reference
+    assert "re-exported from `hermes_cli/config.py`" in reference
+    assert "`_EXTRA_KNOWN_ROOT_KEYS` and `read_user_config_raw()`" in reference
+
+
+def test_curator_reference_documents_builtin_pruning_safeguards():
+    repo_root = Path(__file__).resolve().parents[2]
+    reference = (
+        repo_root
+        / "skills/autonomous-ai-agents/hermes-agent/references/background-systems.md"
+    ).read_text(encoding="utf-8")
+
+    assert "`curator.prune_builtins: true` (the default)" in reference
+    assert "protected, pinned, or referenced by cron jobs" in reference
