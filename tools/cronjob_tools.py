@@ -1576,7 +1576,10 @@ def cronjob(
 
             # Validate monitor source (same containment rules as script).
             if monitor_script:
-                monitor_error = _validate_cron_script_path(monitor_script)
+                # Monitor sources run through the scheduler-side monitor path,
+                # not the job's script target; keep their existing containment
+                # contract explicit after target-aware script validation landed.
+                monitor_error = _validate_cron_script_path(monitor_script, "scheduler")
                 if monitor_error:
                     return tool_error(monitor_error, success=False)
 
@@ -1889,7 +1892,7 @@ def cronjob(
             if monitor_script is not None:
                 # Pass empty string to clear an existing monitor_script
                 if monitor_script:
-                    monitor_error = _validate_cron_script_path(monitor_script)
+                    monitor_error = _validate_cron_script_path(monitor_script, "scheduler")
                     if monitor_error:
                         return tool_error(monitor_error, success=False)
                 updates["monitor_script"] = (
@@ -1968,7 +1971,7 @@ def cronjob(
                     return tool_error("Cron target must be either 'scheduler' or 'backend'.", success=False)
                 updates["target"] = normalized_target
             effective_script = updates.get("script") if "script" in updates else job.get("script")
-            if effective_script and (script is not None or target is not None):
+            if effective_script and (script is not None or target is not None or workdir is not None):
                 effective_target = str(
                     updates.get("target", job.get("target", "scheduler"))
                 ).strip().lower()
