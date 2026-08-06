@@ -38,8 +38,9 @@ def _load_cli_config(home):
     this only matters for tests that swap HERMES_HOME.)
     """
     import cli
+    import cli_config
 
-    cli._hermes_home = home
+    cli_config._hermes_home = home
     return cli.load_cli_config()
 
 
