@@ -58,6 +58,7 @@ import {
   useRef,
   useState
 } from 'react'
+import { useLocation } from 'react-router'
 
 import {
   $boardSlug,
@@ -1099,6 +1100,32 @@ export function KanbanBoardPage() {
   const [tenant, setTenant] = useState('')
   const [assignee, setAssignee] = useState('')
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+
+  // Deep link: /kanban?task=<id> opens that card's drawer. The router location
+  // (hash route) is the source of truth, so this reacts to in-app navigation
+  // too, not just first mount. Consumed once per param value — a board refetch
+  // must never re-open a drawer the user closed while the param is unchanged.
+  const location = useLocation()
+  const deepLinkTask = useMemo(() => new URLSearchParams(location.search).get('task'), [location.search])
+  const consumedDeepLinkRef = useRef<null | string>(null)
+
+  // eslint-disable-next-line no-restricted-syntax -- one-shot consumed-deep-link sentinel, not an atom mirror
+  useEffect(() => {
+    if (!deepLinkTask || deepLinkTask === consumedDeepLinkRef.current || !board) {
+      return
+    }
+
+    // Only open when the id actually lives on the board being shown — a
+    // foreign id (other board, deleted, archived) would just draw a 404 drawer.
+    const exists = board.columns.some(col => col.tasks.some(task => task.id === deepLinkTask))
+
+    if (!exists) {
+      return
+    }
+
+    consumedDeepLinkRef.current = deepLinkTask
+    setOpenId(deepLinkTask)
+  }, [board, deepLinkTask])
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
