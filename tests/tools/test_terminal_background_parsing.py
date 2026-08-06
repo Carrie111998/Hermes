@@ -46,11 +46,8 @@ class TestHeredocDeclarations:
         assert _heredoc_declarations("echo hello") == []
 
     def test_herestring_not_matched(self):
-        # <<< is a herestring, not a heredoc — content is on the same line
-        # and never spans subsequent lines, so it carries no multi-line & risk.
-        # Known limitation: the parser re-encounters the 2nd < in <<< and
-        # incorrectly matches it as a heredoc opener. Skipping until fixed.
-        pytest.skip("known: _heredoc_declarations matches the 2nd < in <<< as a heredoc")
+        # <<< is a herestring, not a heredoc — must not be parsed as one.
+        assert _heredoc_declarations("cat <<< 'foo'") == []
 
     def test_amp_before_heredoc_not_confused(self):
         # Bit-op or redirect before << must not suppress heredoc detection.
