@@ -334,12 +334,53 @@ class TestSessionLifecycle:
         assert "browser_model_lock" not in model_config
         assert model_config["_branched_from"] == "parent-session"
 
+    def test_update_session_model_persists_provider_in_model_config(self, db):
+        """update_session_model with provider= persists provider+model into model_config (#79536)."""
+        db.create_session(
+            session_id="s-prov",
+            source="cli",
+            model="primary-model",
+            model_config={
+                "provider": "nvidia",
+                "reasoning_config": {"effort": "low"},
+            },
+        )
 
+        # Switch model with a different provider
+        db.update_session_model(
+            "s-prov", "deepseek-v4-flash-free",
+            provider="custom:opencode-zen",
+        )
 
+        session = db.get_session("s-prov")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "deepseek-v4-flash-free"
+        assert model_config["provider"] == "custom:opencode-zen"
+        assert model_config["model"] == "deepseek-v4-flash-free"
+        # Existing keys preserved
+        assert model_config["reasoning_config"] == {"effort": "low"}
 
+    def test_update_session_model_without_provider_preserves_existing_behavior(self, db):
+        """update_session_model without provider= keeps backward-compatible behavior."""
+        db.create_session(
+            session_id="s-noprov",
+            source="cli",
+            model="old-model",
+            model_config={
+                "provider": "nvidia",
+                "browser_model_lock": {"model": "x"},
+            },
+        )
 
+        db.update_session_model("s-noprov", "new-model")
 
-
+        session = db.get_session("s-noprov")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "new-model"
+        # browser_model_lock removed
+        assert "browser_model_lock" not in model_config
+        # provider NOT overwritten (backward compat)
+        assert model_config["provider"] == "nvidia"
 
     def test_first_accounted_route_replaces_all_route_fields_atomically(self, db):
         db.create_session(session_id="route", source="cli", model="primary")

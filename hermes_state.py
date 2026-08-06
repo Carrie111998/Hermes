@@ -4328,7 +4328,13 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def update_session_model(self, session_id: str, model: str) -> None:
+    def update_session_model(
+        self,
+        session_id: str,
+        model: str,
+        *,
+        provider: Optional[str] = None,
+    ) -> None:
         """Update the model for a session after a mid-session switch.
 
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
@@ -4338,6 +4344,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         footer metadata is rebuilt on the next turn. A successful /model
         switch explicitly replaces any confirmed Browser runtime lock while
         preserving unrelated lineage markers in ``model_config``.
+
+        When *provider* is given, the provider and model are also persisted
+        into the ``model_config`` JSON blob so that session resume can
+        recombine the correct provider + model pair (#79536).
         """
         # This write bypasses the token queue, so deltas enqueued before the
         # switch must land first: a still-queued first delta carries the
@@ -4347,21 +4357,47 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # model/provider. Flushing here restores the pre-queue ordering.
         self.flush_token_counts()
 
+        _provider = str(provider).strip() if provider else None
+
         def _do(conn):
-            conn.execute(
-                """UPDATE sessions SET
-                   model = ?,
-                   model_config = CASE
-                       WHEN model_config IS NULL THEN NULL
-                       WHEN json_valid(model_config)
-                           THEN json_remove(model_config, '$.browser_model_lock')
-                       ELSE model_config
-                   END,
-                   system_prompt = NULL,
-                   system_prompt_hash = NULL
-                   WHERE id = ?""",
-                (model, session_id),
-            )
+            if _provider:
+                # Persist provider + model into model_config so session
+                # resume recombines the correct provider/model pair even
+                # when the fallback provider differs from the primary
+                # config (#79536).
+                conn.execute(
+                    """UPDATE sessions SET
+                       model = ?,
+                       model_config = CASE
+                           WHEN model_config IS NULL THEN NULL
+                           WHEN json_valid(model_config)
+                               THEN json_set(
+                                   json_remove(model_config, '$.browser_model_lock'),
+                                   '$.provider', ?,
+                                   '$.model', ?
+                               )
+                           ELSE model_config
+                       END,
+                       system_prompt = NULL,
+                       system_prompt_hash = NULL
+                       WHERE id = ?""",
+                    (model, _provider, model, session_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE sessions SET
+                       model = ?,
+                       model_config = CASE
+                           WHEN model_config IS NULL THEN NULL
+                           WHEN json_valid(model_config)
+                               THEN json_remove(model_config, '$.browser_model_lock')
+                           ELSE model_config
+                       END,
+                       system_prompt = NULL,
+                       system_prompt_hash = NULL
+                       WHERE id = ?""",
+                    (model, session_id),
+                )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
