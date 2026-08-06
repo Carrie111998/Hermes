@@ -55,6 +55,27 @@ LAZY_REFRESH_REPAIR_PACKAGES: dict[str, str] = {
     "jwt": "PyJWT",
 }
 
+TOP_LEVEL_VALUE_FLAGS = frozenset({
+    "-p", "--profile", "-z", "--oneshot", "-m", "--model",
+    "--provider", "-t", "--toolsets", "-r", "--resume",
+    "-s", "--skills", "--usage-file", "-c", "--continue",
+})
+
+
+def early_cli_subcommand(argv: list[str]) -> str:
+    """Find the top-level command without importing the full CLI parser."""
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in TOP_LEVEL_VALUE_FLAGS:
+            index += 2
+            continue
+        if argument.startswith("--profile=") or argument.startswith("-"):
+            index += 1
+            continue
+        return argument
+    return ""
+
 
 def _project_root() -> Path:
     return Path(__file__).resolve().parent.parent
@@ -139,6 +160,83 @@ def _probe_broken_packages() -> list[str]:
     return broken
 
 
+def _emit_health_dependency_failure(args: list[str], broken: list[str]) -> None:
+    """Exit through the health contract before importing broken dependencies."""
+    explicit_profile = None
+    for index, argument in enumerate(args):
+        if argument in {"-p", "--profile"} and index + 1 < len(args):
+            explicit_profile = args[index + 1]
+        elif argument.startswith("--profile="):
+            explicit_profile = argument.split("=", 1)[1]
+
+    if sys.platform == "win32":
+        local_appdata = os.environ.get("LOCALAPPDATA", "").strip()
+        root = Path(local_appdata) if local_appdata else Path.home() / "AppData" / "Local"
+        root /= "hermes"
+    else:
+        root = Path.home() / ".hermes"
+
+    inherited_home = os.environ.get("HERMES_HOME", "").strip()
+    if inherited_home:
+        inherited_path = Path(inherited_home)
+        root = (
+            inherited_path.parent.parent
+            if inherited_path.parent.name == "profiles"
+            else inherited_path
+        )
+
+    profile = explicit_profile or os.environ.get("HERMES_PROFILE", "").strip()
+    if not profile and inherited_home and Path(inherited_home).parent.name == "profiles":
+        profile = Path(inherited_home).name
+    if not profile and not os.environ.get("HERMES_S6_SUPERVISED_CHILD"):
+        try:
+            sticky = (root / "active_profile").read_text(encoding="utf-8").strip()
+            if sticky and sticky != "default":
+                profile = sticky
+        except (OSError, UnicodeError):
+            pass
+    profile = profile or "default"
+
+    if explicit_profile or not inherited_home or Path(inherited_home).parent.name != "profiles":
+        home_path = root if profile == "default" else root / "profiles" / profile
+    else:
+        home_path = Path(inherited_home)
+
+    package = sys.modules.get("hermes_cli")
+    version = str(getattr(package, "__version__", "unknown"))
+    home = str(home_path)
+    detail = f"core runtime dependencies unavailable: {', '.join(broken)}"
+    result = {
+        "schema_version": 1,
+        "status": "critical",
+        "exit_code": 2,
+        "profile": profile,
+        "hermes_home": home,
+        "hermes_version": version,
+        "checks": [
+            {
+                "id": "runtime_dependencies",
+                "subsystem": "runtime dependencies",
+                "status": "critical",
+                "detail": detail,
+                "action": "run: hermes update",
+            }
+        ],
+    }
+    if "--json" in args:
+        import json
+
+        print(json.dumps(result, sort_keys=True))
+    else:
+        print()
+        print("Hermes Health")
+        print("Status: critical (exit 2)")
+        print(f"Profile: {profile}")
+        print(f"CRITICAL runtime dependencies: {detail}")
+        print("Action: run: hermes update")
+    raise SystemExit(2)
+
+
 def _run_repair_install(specs: list[str], project_root: Path) -> bool:
     """ensurepip + ``pip install --force-reinstall`` the given specs.
 
@@ -204,6 +302,12 @@ def recover_if_needed(
     """
     try:
         args = sys.argv[1:] if argv is None else argv
+        # Health must report broken dependencies, not mutate the venv with pip.
+        if early_cli_subcommand(args) == "health":
+            broken = _probe_broken_packages()
+            if broken:
+                _emit_health_dependency_failure(args, broken)
+            return
         # Same deliberately-loose match as main(): the real update flow writes
         # and clears its own markers — a recovery install must not race it.
         if "update" in args:
