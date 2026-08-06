@@ -463,6 +463,11 @@ export interface ProfilesResponse {
   profiles: ProfileInfo[]
 }
 
+export interface ActiveProfileResponse {
+  active: string
+  current: string
+}
+
 export interface SkillInfo {
   category: string
   description: string

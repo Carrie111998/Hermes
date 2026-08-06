@@ -3,6 +3,7 @@ import { JsonRpcGatewayClient } from '@hermes/shared'
 import type {
   ActionResponse,
   ActionStatusResponse,
+  ActiveProfileResponse,
   AnalyticsResponse,
   AudioSpeakResponse,
   AudioTranscriptionResponse,
@@ -45,6 +46,7 @@ const DEFAULT_GATEWAY_REQUEST_TIMEOUT_MS = 30_000
 export type {
   ActionResponse,
   ActionStatusResponse,
+  ActiveProfileResponse,
   AnalyticsDailyEntry,
   AnalyticsModelEntry,
   AnalyticsResponse,
@@ -445,6 +447,20 @@ export function deleteCronJob(jobId: string): Promise<{ ok: boolean }> {
 export function getProfiles(): Promise<ProfilesResponse> {
   return window.hermesDesktop.api<ProfilesResponse>({
     path: '/api/profiles'
+  })
+}
+
+export function getActiveProfile(): Promise<ActiveProfileResponse> {
+  return window.hermesDesktop.api<ActiveProfileResponse>({
+    path: '/api/profiles/active'
+  })
+}
+
+export function setActiveProfile(name: string): Promise<{ active: string; ok: boolean }> {
+  return window.hermesDesktop.api<{ active: string; ok: boolean }>({
+    path: '/api/profiles/active',
+    method: 'POST',
+    body: { name }
   })
 }
 

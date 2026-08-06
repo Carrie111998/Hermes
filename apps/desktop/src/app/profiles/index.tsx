@@ -17,11 +17,13 @@ import { Textarea } from '@/components/ui/textarea'
 import {
   createProfile,
   deleteProfile,
+  getActiveProfile,
   getProfiles,
   getProfileSetupCommand,
   getProfileSoul,
   type ProfileInfo,
   renameProfile,
+  setActiveProfile,
   updateProfileSoul
 } from '@/hermes'
 import { AlertTriangle, Pencil, Save, Terminal, Trash2, Users } from '@/lib/icons'
@@ -47,14 +49,17 @@ interface ProfilesViewProps {
 export function ProfilesView({ onClose }: ProfilesViewProps) {
   const [profiles, setProfiles] = useState<null | ProfileInfo[]>(null)
   const [selectedName, setSelectedName] = useState<null | string>(null)
+  const [activeProfileName, setActiveProfileName] = useState('default')
   const [createOpen, setCreateOpen] = useState(false)
   const [pendingDelete, setPendingDelete] = useState<null | ProfileInfo>(null)
   const [deleting, setDeleting] = useState(false)
+  const [activating, setActivating] = useState(false)
 
   const refresh = useCallback(async () => {
     try {
-      const { profiles: list } = await getProfiles()
+      const [{ profiles: list }, active] = await Promise.all([getProfiles(), getActiveProfile()])
       setProfiles(list)
+      setActiveProfileName(active.active)
       setSelectedName(current => {
         if (current && list.some(p => p.name === current)) {
           return current
@@ -137,6 +142,24 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
     }
   }, [pendingDelete, refresh])
 
+  const handleActivate = useCallback(async (name: string) => {
+    setActivating(true)
+
+    try {
+      const result = await setActiveProfile(name)
+      setActiveProfileName(result.active)
+      notify({
+        kind: 'success',
+        title: 'Profile activated for next launch',
+        message: `${name} will be used when Hermes Desktop is restarted.`
+      })
+    } catch (err) {
+      notifyError(err, 'Failed to activate profile')
+    } finally {
+      setActivating(false)
+    }
+  }, [])
+
   return (
     <OverlayView closeLabel="Close profiles" onClose={onClose}>
       {!profiles ? (
@@ -172,7 +195,10 @@ export function ProfilesView({ onClose }: ProfilesViewProps) {
           <OverlayMain className="px-0">
             {selected ? (
               <ProfileDetail
+                activating={activating}
+                activeProfileName={activeProfileName}
                 key={selected.name}
+                onActivate={() => void handleActivate(selected.name)}
                 onDelete={() => setPendingDelete(selected)}
                 onRename={newName => handleRename(selected.name, newName)}
                 profile={selected}
@@ -247,10 +273,16 @@ function ProfileRow({ active, onSelect, profile }: { active: boolean; onSelect: 
 }
 
 function ProfileDetail({
+  activeProfileName,
+  activating,
+  onActivate,
   onDelete,
   onRename,
   profile
 }: {
+  activeProfileName: string
+  activating: boolean
+  onActivate: () => void
   onDelete: () => void
   onRename: (newName: string) => Promise<void>
   profile: ProfileInfo
@@ -289,6 +321,14 @@ function ProfileDetail({
                 </p>
               </div>
               <div className="flex shrink-0 items-center gap-3">
+                <Button
+                  disabled={activating || activeProfileName === profile.name}
+                  onClick={onActivate}
+                  size="sm"
+                  variant="text"
+                >
+                  {activeProfileName === profile.name ? 'Active for next launch' : 'Activate'}
+                </Button>
                 {!profile.is_default && (
                   <Button onClick={() => setRenameOpen(true)} size="sm" variant="text">
                     <Pencil />
