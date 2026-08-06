@@ -392,6 +392,7 @@ export function CapRow({
           <span
             className="shrink-0 rounded bg-(--ui-bg-quinary) px-1 py-px text-[0.6rem] tabular-nums leading-3.5 text-(--ui-text-tertiary)"
             title={metaTitle}
+            aria-label={metaTitle}
           >
             {meta}
           </span>
