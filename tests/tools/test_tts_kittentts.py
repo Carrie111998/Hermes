@@ -232,6 +232,9 @@ def legacy_kittentts(monkeypatch):
 
     _LegacyKittenModel.instances = []
     monkeypatch.setattr(tts_tool, "_import_kittentts", lambda: _LegacyKittenModel)
+    # Reset the module-level model cache so every test constructs through
+    # its own monkeypatched resolution/constructor stubs.
+    monkeypatch.setattr(tts_tool, "_kittentts_model_cache", {})
     # Stub soundfile (not installed in CI venv).
     fake_sf = MagicMock()
     fake_sf.write = lambda path, audio, samplerate: (
@@ -257,7 +260,7 @@ class TestKittenTtsLegacyCompatibility:
         monkeypatch.setattr(
             tts_tool,
             "_resolve_kittentts_model_files",
-            lambda name: (str(local_model), str(local_voices)),
+            lambda name: (str(local_model), str(local_voices), {}),
         )
 
         config = {
@@ -282,14 +285,75 @@ class TestKittenTtsLegacyCompatibility:
 
         # Let construction succeed via resolved local paths (no "/" in the
         # fake names so the legacy ctor accepts them), then the voice check
-        # must reject 'Jasper' using the legacy available_voices attribute.
+        # must reject an explicit 'Jasper' when the resolution carried no
+        # alias metadata.
         monkeypatch.setattr(
-            tts_tool, "_resolve_kittentts_model_files", lambda name: ("model.onnx", "voices.npz")
+            tts_tool,
+            "_resolve_kittentts_model_files",
+            lambda name: ("model.onnx", "voices.npz", {}),
         )
         config = {"kittentts": {"voice": "Jasper"}}  # not in legacy voice table
         with pytest.raises(RuntimeError) as excinfo:
             tts_tool._generate_kittentts("Hi", str(tmp_path / "out.wav"), config)
         assert "expr-voice-2-f" in str(excinfo.value)
+
+    def test_legacy_default_voice_normalized_via_repo_aliases(
+        self, tmp_path, monkeypatch, legacy_kittentts
+    ):
+        """The no-config default (Jasper) must keep working on the legacy
+        0.1.x stack: the repo config.json voice_aliases mapping carried by
+        the HF resolution normalizes it to a raw voice the model accepts,
+        instead of the validation rejecting it (review on #79581)."""
+        from tools import tts_tool
+
+        aliases = {"Jasper": "expr-voice-2-m", "Luna": "expr-voice-2-f"}
+        monkeypatch.setattr(
+            tts_tool,
+            "_resolve_kittentts_model_files",
+            lambda name: ("model.onnx", "voices.npz", aliases),
+        )
+        # No voice configured anywhere -> DEFAULT_KITTENTTS_VOICE (Jasper)
+        result = tts_tool._generate_kittentts("Hi", str(tmp_path / "out.wav"), {})
+
+        assert result == str(tmp_path / "out.wav")
+        inst = _LegacyKittenModel.instances[-1]
+        assert inst.last_generate["voice"] == "expr-voice-2-m"
+
+    def test_legacy_configured_alias_normalized_before_generate(
+        self, tmp_path, monkeypatch, legacy_kittentts
+    ):
+        """An explicitly configured alias voice is normalized too, so users
+        can keep alias names across library versions."""
+        from tools import tts_tool
+
+        aliases = {"Luna": "expr-voice-2-f"}
+        monkeypatch.setattr(
+            tts_tool,
+            "_resolve_kittentts_model_files",
+            lambda name: ("model.onnx", "voices.npz", aliases),
+        )
+        config = {"kittentts": {"voice": "Luna"}}
+        tts_tool._generate_kittentts("Hi", str(tmp_path / "out.wav"), config)
+
+        assert _LegacyKittenModel.instances[-1].last_generate["voice"] == "expr-voice-2-f"
+
+    def test_legacy_alias_mapping_to_unknown_voice_still_fails(
+        self, tmp_path, monkeypatch, legacy_kittentts
+    ):
+        """Alias normalization must not mask misconfiguration: an alias whose
+        target is absent from the loaded model still fails loudly."""
+        from tools import tts_tool
+
+        aliases = {"Mystery": "expr-voice-9-z"}  # target not in available_voices
+        monkeypatch.setattr(
+            tts_tool,
+            "_resolve_kittentts_model_files",
+            lambda name: ("model.onnx", "voices.npz", aliases),
+        )
+        config = {"kittentts": {"voice": "Mystery"}}
+        with pytest.raises(RuntimeError) as excinfo:
+            tts_tool._generate_kittentts("Hi", str(tmp_path / "out.wav"), config)
+        assert "expr-voice-9-z" in str(excinfo.value)
 
     def test_unresolvable_failure_surfaces_upgrade_hint(self, monkeypatch):
         """Constructor failure + impossible resolution = actionable error."""
@@ -318,7 +382,14 @@ class TestResolveKittenTtsModelFiles:
 
         config_path = tmp_path / "config.json"
         config_path.write_text(
-            json.dumps({"type": "ONNX2", "model_file": "model.onnx", "voices": "voices.npz"}),
+            json.dumps(
+                {
+                    "type": "ONNX2",
+                    "model_file": "model.onnx",
+                    "voices": "voices.npz",
+                    "voice_aliases": {"Jasper": "expr-voice-2-m", "Empty": ""},
+                }
+            ),
             encoding="utf-8",
         )
         files = {
@@ -332,7 +403,31 @@ class TestResolveKittenTtsModelFiles:
         monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
 
         resolved = tts_tool._resolve_kittentts_model_files("KittenML/kitten-tts-nano-0.8-int8")
-        assert resolved == (str(tmp_path / "model.onnx"), str(tmp_path / "voices.npz"))
+        assert resolved == (
+            str(tmp_path / "model.onnx"),
+            str(tmp_path / "voices.npz"),
+            {"Jasper": "expr-voice-2-m"},  # empty-valued entries dropped
+        )
+
+    def test_resolves_repo_without_aliases_field(self, tmp_path, monkeypatch):
+        from tools import tts_tool
+
+        config_path = tmp_path / "config.json"
+        config_path.write_text(
+            json.dumps({"type": "ONNX2", "model_file": "model.onnx"}),
+            encoding="utf-8",
+        )
+        files = {
+            "config.json": str(config_path),
+            "model.onnx": str(tmp_path / "model.onnx"),
+        }
+        fake_hub = types.SimpleNamespace(
+            hf_hub_download=lambda repo_id, filename, **kw: files[filename]
+        )
+        monkeypatch.setitem(sys.modules, "huggingface_hub", fake_hub)
+
+        resolved = tts_tool._resolve_kittentts_model_files("KittenML/legacy-model")
+        assert resolved == (str(tmp_path / "model.onnx"), None, {})
 
     def test_repo_without_model_file_returns_none(self, tmp_path, monkeypatch):
         from tools import tts_tool
