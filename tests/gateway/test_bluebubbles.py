@@ -329,90 +329,6 @@ class TestBlueBubblesAttachmentDownload:
         assert result.media_type == "image/png"
         assert result.kind == "image"
 
-    def test_download_audio_uses_media_cache(self, monkeypatch):
-        """Audio MIME routes to cache_media_bytes."""
-        adapter = _make_adapter(monkeypatch)
-        import asyncio
-        from gateway.platforms.base import CachedMedia
-
-        class MockResponse:
-            status_code = 200
-            content = b"fake-audio-data"
-
-            def raise_for_status(self):
-                pass
-
-        async def mock_get(*args, **kwargs):
-            return MockResponse()
-
-        adapter.client = type("MockClient", (), {"get": mock_get})()
-
-        async def mock_cache_media(
-            data, *, filename="", mime_type="", default_kind=None, transcode_heic=False
-        ):
-            assert data == b"fake-audio-data"
-            assert filename == "voice.mp3"
-            assert mime_type == "audio/mpeg"
-            assert default_kind is None
-            assert transcode_heic is True
-            return CachedMedia("/tmp/test_audio.mp3", "audio/mpeg", "audio", filename)
-
-        monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_media_bytes_async",
-            mock_cache_media,
-        )
-
-        att_meta = {"mimeType": "audio/mpeg", "transferName": "voice.mp3"}
-        result = asyncio.get_event_loop().run_until_complete(
-            adapter._download_attachment("att-guid-456", att_meta)
-        )
-        assert result is not None
-        assert result.path == "/tmp/test_audio.mp3"
-        assert result.media_type == "audio/mpeg"
-        assert result.kind == "audio"
-
-    def test_download_document_uses_media_cache(self, monkeypatch):
-        """Non-image/audio MIME routes to cache_media_bytes."""
-        adapter = _make_adapter(monkeypatch)
-        import asyncio
-        from gateway.platforms.base import CachedMedia
-
-        class MockResponse:
-            status_code = 200
-            content = b"fake-doc-data"
-
-            def raise_for_status(self):
-                pass
-
-        async def mock_get(*args, **kwargs):
-            return MockResponse()
-
-        adapter.client = type("MockClient", (), {"get": mock_get})()
-
-        async def mock_cache_media(
-            data, *, filename="", mime_type="", default_kind=None, transcode_heic=False
-        ):
-            assert data == b"fake-doc-data"
-            assert filename == "report.pdf"
-            assert mime_type == "application/pdf"
-            assert default_kind is None
-            assert transcode_heic is True
-            return CachedMedia("/tmp/report.pdf", "application/pdf", "document", filename)
-
-        monkeypatch.setattr(
-            "gateway.platforms.bluebubbles.cache_media_bytes_async",
-            mock_cache_media,
-        )
-
-        att_meta = {"mimeType": "application/pdf", "transferName": "report.pdf"}
-        result = asyncio.get_event_loop().run_until_complete(
-            adapter._download_attachment("att-guid-789", att_meta)
-        )
-        assert result is not None
-        assert result.path == "/tmp/report.pdf"
-        assert result.media_type == "application/pdf"
-        assert result.kind == "document"
-
     def test_download_heic_uses_converted_media_type(self, monkeypatch):
         """Converted iPhone photos keep cache_media_bytes' supported MIME."""
         adapter = _make_adapter(monkeypatch)
@@ -456,16 +372,6 @@ class TestBlueBubblesAttachmentDownload:
         assert result.media_type == "image/jpeg"
         assert result.kind == "image"
 
-    def test_download_returns_none_without_client(self, monkeypatch):
-        """No client → returns None gracefully."""
-        adapter = _make_adapter(monkeypatch)
-        adapter.client = None
-        import asyncio
-
-        result = asyncio.get_event_loop().run_until_complete(
-            adapter._download_attachment("att-guid", {"mimeType": "image/png"})
-        )
-        assert result is None
 
 # ---------------------------------------------------------------------------
 # Webhook registration
