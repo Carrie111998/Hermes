@@ -254,23 +254,18 @@ KANBAN_GUIDANCE = (
     "infer (missing credentials, UX choice, paywalled source, peer output you "
     "need first), call `kanban_block(reason=\"...\")` and stop. Don't guess. "
     "The user will unblock with context and the dispatcher will respawn you.\n"
-    "5. **Finish with the review model encoded by the task graph.** Always "
-    "include the structured handoff (`summary`, `metadata`) on the lifecycle "
-    "transition itself; never put secrets, tokens, or raw PII in these durable "
-    "fields. If `kanban_show()` lists child IDs, inspect those cards with "
-    "`kanban_show(task_id=...)` before choosing the terminal action. When any "
-    "pre-created review, QA, or release child depends on your task, call "
-    "`kanban_complete`: your implementation phase is done, and completion is "
-    "what releases those children. Never sticky-block that parent for "
-    "`review-required` and never request same-card review as well — either "
-    "choice would strand or duplicate the downstream lane. Otherwise, when "
-    "this same task needs review before it is final, call "
-    "`kanban_request_review(summary=..., metadata=..., "
-    "reviewer=<optional-profile>)`. The reviewer approves with "
-    "`kanban_complete`, returns actionable rework with "
-    "`kanban_request_changes`, or uses `kanban_block` only for a genuine "
-    "external escalation. Review is not a block, so repeated review cycles do "
-    "not trip unblock-loop detection.\n"
+    "5. **Complete with structured handoff.** Call `kanban_complete(summary=..., "
+    "metadata=...)`. `summary` is 1–3 human-readable sentences naming concrete "
+    "artifacts. `metadata` is machine-readable facts "
+    "(`{changed_files: [...], tests_run: N, decisions: [...]}`). Downstream "
+    "workers read both via their own `kanban_show`. Never put secrets / "
+    "tokens / raw PII in either field — run rows are durable forever. "
+    "A code change completes too: put the facts (changed_files / tests_run / "
+    "diff_path) in the handoff and call `kanban_complete`. Review is the "
+    "downstream card, not a block on yours — no worker can unblock (the tool "
+    "is not in a task worker's schema), and a card blocked for review stops "
+    "until a human opens it by hand, which then re-runs you instead of "
+    "approving you.\n"
     "6. **If follow-up work appears, create it; don't do it.** Use "
     "`kanban_create(title=..., assignee=<right-profile>, parents=[your-task-id])` "
     "to spawn a child task for the appropriate specialist profile instead of "
@@ -2249,6 +2244,84 @@ def _truncate_content(
         f"{target}]\n\n"
     )
     return head + marker + tail
+
+
+#: Vault router files, in reading order. ``_active.md`` is the hot-route
+#: overlay, ``_index.md`` the catalogue; both are small and both are routers,
+#: not content. The per-category ``_context.md`` files stay out — together they
+#: are ~8,800 tokens against these two's ~1,600, and the whole point of the
+#: layering is that a category is opened only when a route points at it.
+_VAULT_ROUTER_FILES = ("_active.md", "_index.md")
+
+#: Cap per router file. A router that outgrows this stopped being a router.
+_VAULT_ROUTER_MAX_CHARS = 8000
+
+
+def build_vault_routes_prompt(context_length: Optional[int] = None) -> str:
+    """Load the vault's router files, or return "" when none are configured.
+
+    Opt-in per profile via ``vault.routes_dir`` in ``config.yaml``: a worker
+    that never touches the vault should not pay ~1,600 tokens a turn for
+    routes it will not follow.
+
+    Injected as its own slot at the end of the context tier, deliberately
+    *after* the context files. The ingest cron rewrites these two on every
+    run, and putting them ahead of ``.hermes.md`` would invalidate the cached
+    prefix of a file that did not change.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly, cfg_get
+
+        routes_dir = cfg_get(load_config_readonly(), "vault", "routes_dir")
+    except Exception as e:
+        logger.debug("vault routes: config unavailable (%s)", e)
+        return ""
+
+    if not routes_dir or not str(routes_dir).strip():
+        return ""
+
+    base = Path(os.path.expanduser(str(routes_dir).strip()))
+    sections: list[str] = []
+    for name in _VAULT_ROUTER_FILES:
+        path = base / name
+        try:
+            if not path.is_file():
+                continue
+            # Read the budget plus one char, never the whole file: a router is
+            # small by definition, and a runaway file must not become the
+            # largest thing in the prompt (or the slowest read in startup).
+            # The extra char is what tells truncated from exactly-at-budget.
+            with path.open(encoding="utf-8", errors="replace") as fh:
+                raw = fh.read(_VAULT_ROUTER_MAX_CHARS + 1)
+            content = raw.strip()
+            if not content:
+                continue
+            if len(raw) > _VAULT_ROUTER_MAX_CHARS:
+                content = (
+                    content[:_VAULT_ROUTER_MAX_CHARS]
+                    + f"\n\n[...truncated at {_VAULT_ROUTER_MAX_CHARS} chars — "
+                    f"{name} outgrew its router budget]"
+                )
+            content = _scan_context_content(content, name)
+            sections.append(f"## {name}\n\n{content}")
+        except (OSError, ValueError) as e:
+            # ValueError covers UnicodeDecodeError, which is NOT an OSError.
+            # errors="replace" already makes that unreachable for decoding, but
+            # a router file must never be able to kill a session, and this is
+            # the last frame between a corrupt file and every startup.
+            logger.debug("vault routes: could not read %s (%s)", path, e)
+
+    if not sections:
+        return ""
+
+    return (
+        "# Second brain routes\n\n"
+        "Routers for the vault at "
+        f"`{base}` — where knowledge lives, not the knowledge itself. Follow a "
+        "route to the category's `_context.md`, then to the page. Read directed; "
+        "never bulk-load.\n\n" + "\n\n".join(sections)
+    )
+
 
 
 def load_soul_md(

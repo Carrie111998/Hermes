@@ -426,3 +426,53 @@ class TestControlPlaneHardRules:
                 "Check whether the six worker profiles need the same change, then "
                 "update the pin in the same commit."
             )
+
+
+# ---------------------------------------------------------------------------
+# KANBAN_GUIDANCE is injected into every dispatcher-spawned worker's system
+# prompt, so it outranks a profile's .hermes.md in practice: it is more
+# specific and it arrives from the harness itself. Upstream's version told a
+# code worker to finish with kanban_block("review-required: ...") "so a
+# reviewer can approve+unblock".
+#
+# No task worker can unblock -- _check_kanban_orchestrator_mode() returns False
+# whenever HERMES_KANBAN_TASK is set, so kanban_unblock is not in the schema.
+# Worse, a review block is *sticky*: recompute_ready() refuses to auto-recover
+# it (kanban_db.py:4177), so the card sits until a human opens it by hand, and
+# unblocking re-runs the worker rather than approving it.
+#
+# Observed 2026-08-06: the implementer did correct TDD work, then blocked
+# instead of completing, and the three-card graph stalled at node one.
+# ---------------------------------------------------------------------------
+
+
+class TestKanbanGuidanceCompletes:
+    """A code worker completes; review is the downstream card."""
+
+    def test_guidance_does_not_tell_workers_to_block_for_review(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        for banned in ("review-required", "approve+unblock"):
+            assert banned not in KANBAN_GUIDANCE, (
+                f"KANBAN_GUIDANCE tells workers to {banned!r} again — an upstream "
+                "merge restored the review-block instruction. A blocked card is "
+                "sticky (kanban_db.py:4177) and no worker can unblock, so the graph "
+                "stalls at whichever node produced code."
+            )
+
+    def test_guidance_still_points_code_work_at_complete(self):
+        from agent.prompt_builder import KANBAN_GUIDANCE
+
+        assert "A code change completes too" in KANBAN_GUIDANCE, (
+            "the positive instruction is gone: workers are left with no guidance "
+            "on how a code card ends, and the block path is the intuitive one"
+        )
+
+    def test_workers_really_cannot_unblock(self, monkeypatch):
+        """The premise the whole patch rests on. If this ever fails, upstream
+        gave task workers board-routing tools and the block path becomes
+        survivable again."""
+        from tools import kanban_tools
+
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_probe")
+        assert kanban_tools._check_kanban_orchestrator_mode() is False
