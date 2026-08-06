@@ -1556,7 +1556,47 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
+class _SourceOwnedCredentialPoolRow(dict):
+    """Dictionary payload with trusted, runtime-only owner provenance."""
+
+    _source_store_path: Path
+
+
+def _source_owned_pool_rows(
+    provider_id: str,
+    entries: List[Any],
+    source_path: Optional[Path],
+) -> List[Any]:
+    """Annotate trusted global Codex fallback rows without changing JSON data."""
+    if provider_id != "openai-codex" or source_path is None:
+        return list(entries)
+    annotated: List[Any] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            annotated.append(entry)
+            continue
+        row = _SourceOwnedCredentialPoolRow(entry)
+        row._source_store_path = source_path
+        annotated.append(row)
+    return annotated
+
+
+def _credential_pool_row_source_path(payload: Any) -> Optional[Path]:
+    """Return provenance only for rows created by the trusted fallback reader."""
+    if not isinstance(payload, _SourceOwnedCredentialPoolRow):
+        return None
+    source_path = getattr(payload, "_source_store_path", None)
+    global_path = _global_auth_file_path()
+    if (
+        not isinstance(source_path, Path)
+        or global_path is None
+        or not _same_path(source_path, global_path)
+    ):
+        return None
+    return global_path
+
+
+def read_credential_pool(provider_id: Optional[str] = None) -> Any:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1578,6 +1618,7 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         pool = {}
 
     global_pool: Dict[str, Any] = {}
+    global_path = _global_auth_file_path()
     global_store = _load_global_auth_store()
     maybe_global_pool = global_store.get("credential_pool") if global_store else None
     if isinstance(maybe_global_pool, dict):
@@ -1592,7 +1633,11 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
             existing = merged.get(gp_key)
             if isinstance(existing, list) and existing:
                 continue
-            merged[gp_key] = list(gp_entries)
+            merged[gp_key] = _source_owned_pool_rows(
+                gp_key,
+                gp_entries,
+                global_path,
+            )
         return merged
 
     provider_entries = pool.get(provider_id)
@@ -1600,7 +1645,11 @@ def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
         return list(provider_entries)
     # Profile has no entries for this provider — fall back to global.
     global_entries = global_pool.get(provider_id)
-    return list(global_entries) if isinstance(global_entries, list) else []
+    return (
+        _source_owned_pool_rows(provider_id, global_entries, global_path)
+        if isinstance(global_entries, list)
+        else []
+    )
 
 
 _POOL_STATUS_FIELDS = (
@@ -1624,11 +1673,12 @@ def _merge_disk_cooldown_state(
     predate another process marking the same credential exhausted or dead
     (last-writer-wins lost update).  Without this merge, process B's later
     rewrite resurrects a rate-limited key as healthy and both processes
-    resume hammering it.  Adopt the on-disk status fields only when they are
-    strictly more recent (by ``last_status_at``) AND still binding — a DEAD
-    marker, or an EXHAUSTED cooldown that has not yet expired.  Expired
-    cooldowns are not resurrected, so the pool's own expiry-clear (which
-    resets ``last_status_at`` to None) is never overridden.
+    resume hammering it. Adopt on-disk status fields when they are still
+    binding and either newer (by ``last_status_at``) or terminal for the same
+    token chain: a DEAD marker, or an EXHAUSTED cooldown that has not yet
+    expired. Expired cooldowns are not
+    resurrected, so the pool's own expiry-clear (which resets
+    ``last_status_at`` to None) is never overridden.
     """
     if not isinstance(disk_entry, dict):
         return entry
@@ -1652,9 +1702,23 @@ def _merge_disk_cooldown_state(
         disk_access = disk_entry.get("access_token") or ""
         if mem_access and disk_access and mem_access != disk_access:
             return entry
+        mem_refresh = entry.get("refresh_token") or ""
+        disk_refresh = disk_entry.get("refresh_token") or ""
+        if mem_refresh and disk_refresh and mem_refresh != disk_refresh:
+            return entry
         disk_ts = _parse_absolute_timestamp(disk_entry.get("last_status_at")) or 0.0
         mem_ts = _parse_absolute_timestamp(entry.get("last_status_at")) or 0.0
-        if disk_ts <= mem_ts:
+        mem_status = entry.get("last_status")
+        # DEAD is terminal for one token chain. A later non-terminal snapshot
+        # cannot downgrade it; only fresh credentials (handled above) or an
+        # explicit reset path may clear it.
+        if disk_status == STATUS_DEAD and mem_status != STATUS_DEAD:
+            keep_disk = True
+        elif mem_status == STATUS_DEAD and disk_status != STATUS_DEAD:
+            return entry
+        else:
+            keep_disk = disk_ts > mem_ts
+        if not keep_disk:
             return entry
         if disk_status == STATUS_EXHAUSTED:
             until = _exhausted_until(

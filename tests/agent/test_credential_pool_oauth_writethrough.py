@@ -129,6 +129,39 @@ def _profile_codex_store(marker: str):
     }
 
 
+def _profile_without_codex_store(marker: str):
+    return {
+        "version": 1,
+        "active_provider": "anthropic",
+        "providers": {
+            "anthropic": {"api_key": f"profile-{marker}-provider"},
+        },
+        "credential_pool": {
+            "anthropic": [{"id": f"profile-{marker}-unrelated"}],
+        },
+        "profile_marker": marker,
+    }
+
+
+def _healthy_root_manual_store():
+    store = _root_codex_store()
+    manual = next(
+        item
+        for item in store["credential_pool"]["openai-codex"]
+        if item["id"] == "root-independent"
+    )
+    for field in (
+        "last_status",
+        "last_status_at",
+        "last_error_code",
+        "last_error_reason",
+        "last_error_message",
+        "last_error_reset_at",
+    ):
+        manual.pop(field, None)
+    return store
+
+
 @pytest.fixture
 def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
@@ -176,12 +209,13 @@ def test_borrowed_root_alias_status_routes_to_owner_without_profile_shadow(
     _write_store(root_path, _root_codex_store())
     _write_store(profile_path, _profile_codex_store("work"))
     pool = CP.load_pool("openai-codex")
+    profile_before = profile_path.read_bytes()
     borrowed = next(item for item in pool.entries() if item.id == "root-device")
     assert borrowed.source_store_path == root_path
 
-    pool.mark_exhausted_and_rotate(
-        status_code=429,
-        credential_id="root-device",
+    pool._mark_exhausted(
+        borrowed,
+        429,
         failure_reason="rate_limit",
     )
 
@@ -197,6 +231,7 @@ def test_borrowed_root_alias_status_routes_to_owner_without_profile_shadow(
     assert [
         item["id"] for item in profile["credential_pool"]["openai-codex"]
     ] == ["profile-work-manual"]
+    assert profile_path.read_bytes() == profile_before
 
 
 def test_load_pool_refresh_serializes_root_source_across_processes(
@@ -312,6 +347,372 @@ def test_load_pool_refresh_serializes_root_source_across_processes(
         assert path.read_bytes() == profile_before[path]
 
 
+def test_root_manual_refresh_serializes_across_profile_processes(
+    monkeypatch, tmp_path
+):
+    """Every root-fallback Codex row keeps root ownership, not just singleton."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork so patched fake refresh stays network-free")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    root_home = tmp_path / ".hermes"
+    root_path = root_home / "auth.json"
+    profile_paths = [
+        root_home / "profiles" / "alpha" / "auth.json",
+        root_home / "profiles" / "beta" / "auth.json",
+    ]
+    _write_store(root_path, _healthy_root_manual_store())
+    for marker, profile_path in zip(("alpha", "beta"), profile_paths):
+        _write_store(profile_path, _profile_without_codex_store(marker))
+    profile_before = {path: path.read_bytes() for path in profile_paths}
+
+    ctx = multiprocessing.get_context("fork")
+    start = ctx.Event()
+    second_post_entered = ctx.Event()
+    post_count = ctx.Value("i", 0)
+    reports = ctx.Queue()
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        assert access_token == "root-independent-access"
+        assert refresh_token == "root-independent-refresh"
+        with post_count.get_lock():
+            post_count.value += 1
+            call_number = post_count.value
+        if call_number == 1:
+            second_post_entered.wait(timeout=1)
+        else:
+            second_post_entered.set()
+        return {
+            "access_token": "root-manual-new-access",
+            "refresh_token": "root-manual-new-refresh",
+            "last_refresh": "2026-08-06T01:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+
+    def refresh_from_profile(profile_path):
+        token = set_hermes_home_override(profile_path.parent)
+        try:
+            pool = CP.load_pool("openai-codex")
+            entry = next(item for item in pool.entries() if item.id == "root-independent")
+            reports.put(
+                (
+                    "loaded",
+                    entry.id,
+                    str(entry.source_store_path) if entry.source_store_path else None,
+                )
+            )
+            assert start.wait(timeout=5)
+            refreshed = pool._refresh_entry(entry, force=True)
+            reports.put(
+                (
+                    "result",
+                    refreshed.id if refreshed else None,
+                    refreshed.access_token if refreshed else None,
+                    refreshed.refresh_token if refreshed else None,
+                )
+            )
+        except BaseException as exc:
+            reports.put(("error", repr(exc)))
+        finally:
+            reset_hermes_home_override(token)
+
+    processes = [
+        ctx.Process(target=refresh_from_profile, args=(path,))
+        for path in profile_paths
+    ]
+    for process in processes:
+        process.start()
+    loaded = [reports.get(timeout=5), reports.get(timeout=5)]
+    assert all(report[0] == "loaded" for report in loaded), loaded
+    start.set()
+    results = [reports.get(timeout=5), reports.get(timeout=5)]
+    for process in processes:
+        process.join(timeout=5)
+
+    assert all(process.exitcode == 0 for process in processes)
+    assert all(report[0] == "result" for report in results), results
+    assert {report[1] for report in loaded} == {"root-independent"}
+    assert {report[2] for report in loaded} == {str(root_path)}
+    assert post_count.value == 1
+    assert {report[1] for report in results} == {"root-independent"}
+    assert {report[2] for report in results} == {"root-manual-new-access"}
+    assert {report[3] for report in results} == {"root-manual-new-refresh"}
+
+    root = _read_store(root_path)
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "root-old-access",
+        "refresh_token": "root-old-refresh",
+    }
+    root_entries = {
+        item["id"]: item for item in root["credential_pool"]["openai-codex"]
+    }
+    assert root_entries["root-device"]["access_token"] == "root-old-access"
+    assert root_entries["root-device"]["refresh_token"] == "root-old-refresh"
+    assert root_entries["root-independent"]["access_token"] == (
+        "root-manual-new-access"
+    )
+    assert root_entries["root-independent"]["refresh_token"] == (
+        "root-manual-new-refresh"
+    )
+    for path in profile_paths:
+        assert path.read_bytes() == profile_before[path]
+
+
+def test_root_manual_waiter_adopts_rotated_exact_alias_without_post(
+    profile_and_root, monkeypatch
+):
+    """A stale borrower adopts the exact manual alias and leaves singleton alone."""
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, _healthy_root_manual_store())
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+
+    pool = CP.load_pool("openai-codex")
+    stale = next(item for item in pool.entries() if item.id == "root-independent")
+    assert stale.source_store_path == root_path
+
+    root = _read_store(root_path)
+    exact = next(
+        item
+        for item in root["credential_pool"]["openai-codex"]
+        if item["id"] == "root-independent"
+    )
+    exact["access_token"] = "winner-access"
+    exact["refresh_token"] = "winner-refresh"
+    exact["last_refresh"] = "2026-08-06T02:00:00Z"
+    _write_store(root_path, root)
+
+    post_count = 0
+
+    def unexpected_post(*_args, **_kwargs):
+        nonlocal post_count
+        post_count += 1
+        raise AssertionError("waiter replayed the already-rotated refresh token")
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_post)
+    refreshed = pool._refresh_entry(stale, force=True)
+
+    assert refreshed is not None
+    assert refreshed.id == "root-independent"
+    assert refreshed.access_token == "winner-access"
+    assert refreshed.refresh_token == "winner-refresh"
+    assert post_count == 0
+    root_after = _read_store(root_path)
+    assert root_after["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "root-old-access",
+        "refresh_token": "root-old-refresh",
+    }
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_root_manual_status_persists_exact_alias_without_profile_churn(
+    profile_and_root,
+):
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, _healthy_root_manual_store())
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+    singleton_before = _read_store(root_path)["providers"]["openai-codex"]
+
+    pool = CP.load_pool("openai-codex")
+    rotated = pool.mark_exhausted_and_rotate(
+        status_code=429,
+        error_context={"reason": "rate_limit", "message": "fake root manual limit"},
+        credential_id="root-independent",
+    )
+
+    assert rotated is not None
+    assert rotated.id == "root-device"
+    root_after = _read_store(root_path)
+    manual = next(
+        item
+        for item in root_after["credential_pool"]["openai-codex"]
+        if item["id"] == "root-independent"
+    )
+    assert manual["last_status"] == "exhausted"
+    assert manual["last_error_code"] == 429
+    assert manual["last_error_reason"] == "rate_limit"
+    assert root_after["providers"]["openai-codex"] == singleton_before
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_root_manual_terminal_refresh_removes_only_exact_alias(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    root_store = _healthy_root_manual_store()
+    root_store["credential_pool"]["openai-codex"].append(
+        {
+            "id": "root-manual-survivor",
+            "label": "independent manual survivor",
+            "source": "manual:device_code",
+            "auth_type": "oauth",
+            "priority": 2,
+            "access_token": "manual-survivor-access",
+            "refresh_token": "manual-survivor-refresh",
+        }
+    )
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+    singleton_before = _read_store(root_path)["providers"]["openai-codex"]
+
+    def reject_refresh(*_args, **_kwargs):
+        raise A.AuthError(
+            "fake invalid grant",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", reject_refresh)
+    pool = CP.load_pool("openai-codex")
+    target = next(item for item in pool.entries() if item.id == "root-independent")
+    assert pool._refresh_entry(target, force=True) is None
+
+    root_after = _read_store(root_path)
+    root_ids = {
+        item["id"]
+        for item in root_after["credential_pool"]["openai-codex"]
+    }
+    assert "root-independent" not in root_ids
+    assert {"root-device", "root-manual-survivor"} <= root_ids
+    assert root_after["providers"]["openai-codex"] == singleton_before
+    assert profile_path.read_bytes() == profile_before
+
+    reloaded = CP.load_pool("openai-codex")
+    reloaded_ids = {item.id for item in reloaded.entries()}
+    assert "root-independent" not in reloaded_ids
+    assert {"root-device", "root-manual-survivor"} <= reloaded_ids
+
+
+@pytest.mark.parametrize(
+    ("status_code", "error_context", "expected_status"),
+    [
+        (429, {"reason": "rate_limit"}, "exhausted"),
+        (401, {"reason": "invalid_grant"}, "dead"),
+    ],
+)
+def test_stale_profile_local_write_preserves_newer_root_status(
+    monkeypatch,
+    tmp_path,
+    status_code,
+    error_context,
+    expected_status,
+):
+    """A stale borrower changing only local rows cannot rewrite root metadata."""
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("requires fork for deterministic stale-process coverage")
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+    root_home = tmp_path / ".hermes"
+    root_path = root_home / "auth.json"
+    profile_a = root_home / "profiles" / "alpha" / "auth.json"
+    profile_b = root_home / "profiles" / "beta" / "auth.json"
+    _write_store(root_path, _healthy_root_manual_store())
+    _write_store(profile_a, _profile_without_codex_store("alpha"))
+    _write_store(profile_b, _profile_without_codex_store("beta"))
+    profile_a_before = profile_a.read_bytes()
+
+    ctx = multiprocessing.get_context("fork")
+    loaded = ctx.Event()
+    allow_local_write = ctx.Event()
+    reports = ctx.Queue()
+
+    def stale_profile_writer():
+        token = set_hermes_home_override(profile_b.parent)
+        try:
+            pool = CP.load_pool("openai-codex")
+            root_entry = next(item for item in pool.entries() if item.id == "root-device")
+            reports.put(
+                (
+                    "loaded",
+                    root_entry.last_status,
+                    str(root_entry.source_store_path)
+                    if root_entry.source_store_path
+                    else None,
+                )
+            )
+            loaded.set()
+            assert allow_local_write.wait(timeout=5)
+            pool.add_entry(
+                PooledCredential(
+                    provider="openai-codex",
+                    id="profile-beta-added",
+                    label="profile beta added",
+                    auth_type=AUTH_TYPE_OAUTH,
+                    priority=99,
+                    source="manual:device_code",
+                    access_token="profile-beta-access",
+                    refresh_token="profile-beta-refresh",
+                )
+            )
+            reports.put(("written", [item.id for item in pool.entries()]))
+        except BaseException as exc:
+            reports.put(("error", repr(exc)))
+        finally:
+            reset_hermes_home_override(token)
+
+    writer = ctx.Process(target=stale_profile_writer)
+    writer.start()
+    assert loaded.wait(timeout=5)
+    loaded_report = reports.get(timeout=5)
+    assert loaded_report == ("loaded", None, str(root_path))
+
+    token = set_hermes_home_override(profile_a.parent)
+    try:
+        owner_pool = CP.load_pool("openai-codex")
+        owner_pool.mark_exhausted_and_rotate(
+            status_code=status_code,
+            error_context=error_context,
+            credential_id="root-device",
+        )
+    finally:
+        reset_hermes_home_override(token)
+
+    marked_root = _read_store(root_path)
+    marked_alias = next(
+        item
+        for item in marked_root["credential_pool"]["openai-codex"]
+        if item["id"] == "root-device"
+    )
+    assert marked_alias["last_status"] == expected_status
+    marked_at = marked_alias["last_status_at"]
+
+    allow_local_write.set()
+    written_report = reports.get(timeout=5)
+    writer.join(timeout=5)
+    assert writer.exitcode == 0
+    assert written_report[0] == "written", written_report
+
+    root_after = _read_store(root_path)
+    root_alias = next(
+        item
+        for item in root_after["credential_pool"]["openai-codex"]
+        if item["id"] == "root-device"
+    )
+    assert root_alias["last_status"] == expected_status
+    assert root_alias["last_status_at"] == marked_at
+    root_manual = next(
+        item
+        for item in root_after["credential_pool"]["openai-codex"]
+        if item["id"] == "root-independent"
+    )
+    assert root_manual["access_token"] == "root-independent-access"
+    assert root_manual["refresh_token"] == "root-independent-refresh"
+    profile_b_ids = {
+        item["id"]
+        for item in _read_store(profile_b)["credential_pool"]["openai-codex"]
+    }
+    assert profile_b_ids == {"profile-beta-added"}
+    assert profile_a.read_bytes() == profile_a_before
+
+
 def test_load_pool_terminal_refresh_quarantines_only_root_source(
     profile_and_root, monkeypatch
 ):
@@ -359,6 +760,184 @@ def test_load_pool_terminal_refresh_quarantines_only_root_source(
     root_pool = CP.load_pool("openai-codex")
     assert all(item.source != "device_code" for item in root_pool.entries())
     assert post_count == 1
+
+
+def test_terminal_singleton_quarantine_removes_only_matching_device_aliases(
+    profile_and_root, monkeypatch
+):
+    """Duplicate aliases on one dead chain disappear; independent rows survive."""
+    profile_path, root_path = profile_and_root
+    root_store = _healthy_root_manual_store()
+    root_store["credential_pool"]["openai-codex"].extend(
+        [
+            {
+                "id": "root-device-duplicate",
+                "label": "duplicate singleton alias",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "priority": 2,
+                "access_token": "root-old-access",
+                "refresh_token": "root-old-refresh",
+            },
+            {
+                "id": "root-device-unrelated",
+                "label": "different device chain",
+                "source": "device_code",
+                "auth_type": "oauth",
+                "priority": 3,
+                "access_token": "different-access",
+                "refresh_token": "different-refresh",
+            },
+            {
+                "id": "root-manual-same-chain",
+                "label": "manual row sharing token literals",
+                "source": "manual:device_code",
+                "auth_type": "oauth",
+                "priority": 4,
+                "access_token": "root-old-access",
+                "refresh_token": "root-old-refresh",
+            },
+        ]
+    )
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+
+    def reject_refresh(*_args, **_kwargs):
+        raise A.AuthError(
+            "fake invalid grant",
+            provider="openai-codex",
+            code="invalid_grant",
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", reject_refresh)
+    pool = CP.load_pool("openai-codex")
+    selected = next(item for item in pool.entries() if item.id == "root-device")
+
+    assert pool._refresh_entry(selected, force=True) is None
+
+    root_after = _read_store(root_path)
+    remaining_ids = {
+        item["id"]
+        for item in root_after["credential_pool"]["openai-codex"]
+    }
+    assert "root-device" not in remaining_ids
+    assert "root-device-duplicate" not in remaining_ids
+    assert {
+        "root-device-unrelated",
+        "root-independent",
+        "root-manual-same-chain",
+    } <= remaining_ids
+    assert profile_path.read_bytes() == profile_before
+
+    monkeypatch.setattr(A, "_auth_file_path", lambda: root_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    root_pool = CP.load_pool("openai-codex")
+    reloaded_ids = {item.id for item in root_pool.entries()}
+    assert "root-device" not in reloaded_ids
+    assert "root-device-duplicate" not in reloaded_ids
+    assert {
+        "root-device-unrelated",
+        "root-independent",
+        "root-manual-same-chain",
+    } <= reloaded_ids
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["status", "reset", "rotation", "selection", "persistence"],
+)
+def test_removed_source_revokes_cached_borrower_on_every_pool_path(
+    profile_and_root, operation
+):
+    """A cached root row cannot survive once its exact owning source is gone."""
+    profile_path, root_path = profile_and_root
+    root_store = _healthy_root_manual_store()
+    if operation == "reset":
+        root_device = next(
+            item
+            for item in root_store["credential_pool"]["openai-codex"]
+            if item["id"] == "root-device"
+        )
+        root_device.update(
+            {
+                "last_status": "exhausted",
+                "last_status_at": "2026-08-06T03:00:00+00:00",
+                "last_error_code": 429,
+            }
+        )
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+
+    pool = CP.load_pool("openai-codex")
+    cached = next(item for item in pool.entries() if item.id == "root-device")
+    assert cached.source_store_path == root_path
+
+    removed = _read_store(root_path)
+    removed["providers"].pop("openai-codex")
+    removed["credential_pool"]["openai-codex"] = [
+        item
+        for item in removed["credential_pool"]["openai-codex"]
+        if item["id"] != "root-device"
+    ]
+    _write_store(root_path, removed)
+    root_after_removal = root_path.read_bytes()
+
+    selected = None
+    if operation == "status":
+        pool._mark_exhausted(cached, 429)
+    elif operation == "reset":
+        pool.reset_statuses()
+    elif operation == "rotation":
+        selected = pool.mark_exhausted_and_rotate(
+            status_code=429,
+            credential_id="root-device",
+        )
+    elif operation == "selection":
+        selected = pool.select()
+    else:
+        pool.add_entry(
+            PooledCredential(
+                provider="openai-codex",
+                id="profile-work-added",
+                label="profile work added",
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=99,
+                source="manual:device_code",
+                access_token="profile-work-added-access",
+                refresh_token="profile-work-added-refresh",
+            )
+        )
+
+    assert "root-device" not in {item.id for item in pool.entries()}
+    current = pool.current()
+    assert current is None or current.id != "root-device"
+    peeked = pool.peek()
+    assert peeked is None or peeked.id != "root-device"
+    assert pool.acquire_lease("root-device") is None
+    if selected is not None:
+        assert selected.id == "root-independent"
+    assert root_path.read_bytes() == root_after_removal
+
+    profile_after = _read_store(profile_path)
+    profile_ids = {
+        item["id"]
+        for item in profile_after.get("credential_pool", {}).get(
+            "openai-codex", []
+        )
+    }
+    if operation == "persistence":
+        assert profile_ids == {"profile-work-added"}
+    else:
+        assert profile_path.read_bytes() == profile_before
+
+    remaining_root_ids = {
+        item["id"]
+        for item in _read_store(root_path)["credential_pool"]["openai-codex"]
+    }
+    assert remaining_root_ids == {"root-independent"}
 
 
 def test_load_pool_waiter_treats_removed_root_source_as_revoked(
