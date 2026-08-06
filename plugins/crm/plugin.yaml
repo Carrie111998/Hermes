@@ -1,0 +1,5 @@
+name: crm
+version: 0.1.0
+description: "Personal relationship manager (Dex-style) — contacts, keep-in-touch cadences, interaction timeline, due board, and cron-ready daily digests."
+author: NousResearch
+kind: standalone

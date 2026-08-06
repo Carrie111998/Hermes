@@ -121,6 +121,13 @@ class TestSlackFullManifest:
 
 
 
+    def test_public_channel_join_scope_is_included(self):
+        # channels:join lets the bot self-join public channels via
+        # conversations.join (powering `hermes slack invite --all`).
+        manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
+
+        assert "channels:join" in manifest["oauth_config"]["scopes"]["bot"]
+
     def test_assistant_features_remain_enabled(self):
         manifest = _build_full_manifest("Hermes", "Your Hermes agent on Slack")
 

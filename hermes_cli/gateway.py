@@ -4078,8 +4078,18 @@ def generate_launchd_plist() -> str:
         )
     )
 
-    # Build ProgramArguments array, including --profile when using a named profile
-    prog_args = [
+    # Build ProgramArguments array, including --profile when using a named
+    # profile. When gateway-wrapper.sh is present and executable, route launchd
+    # through it so ~/.hermes/.env is sourced into the process environment
+    # (launchd has no native EnvironmentFile) and the preflight stale-gateway
+    # reaper runs before every start. The wrapper execs the python + module args
+    # we pass after it, so --profile etc. are preserved end-to-end. If the
+    # wrapper is ever missing/non-executable, fall back to the direct-python
+    # form so the gateway never fails to start under KeepAlive (self-heal).
+    wrapper_path = PROJECT_ROOT / "gateway-wrapper.sh"
+    use_wrapper = wrapper_path.is_file() and os.access(str(wrapper_path), os.X_OK)
+
+    core_args = [
         f"<string>{python_path}</string>",
         "<string>-m</string>",
         "<string>hermes_cli.main</string>",
@@ -5246,6 +5256,61 @@ _PLATFORMS = [
     # discovered dynamically via the platform registry entries registered by
     # plugins/platforms/{email,sms}/adapter.py::register(). #41112.
     {
+        "key": "mattermost",
+        "label": "Mattermost",
+        "emoji": "💬",
+        "token_var": "MATTERMOST_TOKEN",
+        "setup_instructions": [
+            "1. In Mattermost: Integrations → Bot Accounts → Add Bot Account",
+            "   (System Console → Integrations → Bot Accounts must be enabled)",
+            "2. Give it a username (e.g. hermes) and copy the bot token",
+            "3. Works with any self-hosted Mattermost instance — enter your server URL",
+            "4. To find your user ID: click your avatar (top-left) → Profile",
+            "   Your user ID is displayed there — click it to copy.",
+            "   ⚠ This is NOT your username — it's a 26-character alphanumeric ID.",
+            "5. To get a channel ID: click the channel name → View Info → copy the ID",
+        ],
+        "vars": [
+            {
+                "name": "MATTERMOST_URL",
+                "prompt": "Server URL (e.g. https://mm.example.com)",
+                "password": False,
+                "help": "Your Mattermost server URL. Works with any self-hosted instance.",
+            },
+            {
+                "name": "MATTERMOST_TOKEN",
+                "prompt": "Bot token",
+                "password": True,
+                "help": "Paste the bot token from step 2 above.",
+            },
+            {
+                "name": "MATTERMOST_ALLOWED_USERS",
+                "prompt": "Allowed user IDs (comma-separated)",
+                "password": False,
+                "is_allowlist": True,
+                "help": "Your Mattermost user ID from step 4 above.",
+            },
+            {
+                "name": "MATTERMOST_HOME_CHANNEL",
+                "prompt": "Home channel ID (for cron/notification delivery, or empty to set later with /set-home)",
+                "password": False,
+                "help": "Channel ID where Hermes delivers cron results and notifications.",
+            },
+            {
+                "name": "MATTERMOST_REPLY_MODE",
+                "prompt": "Reply mode — 'off' for flat messages, 'thread' for threaded replies (default: off)",
+                "password": False,
+                "help": "off = flat channel messages, thread = replies nest under your message.",
+            },
+        ],
+    },
+    {
+        "key": "signal",
+        "label": "Signal",
+        "emoji": "📡",
+        "token_var": "SIGNAL_HTTP_URL",
+    },
+    {
         "key": "weixin",
         "label": "Weixin / WeChat",
         "emoji": "💬",
@@ -5646,8 +5711,14 @@ def _setup_standard_platform(platform: dict):
         print()
         print_info(f"  {var['help']}")
         existing = get_env_value(var["name"])
-        if existing and var["name"] != token_var:
+        if existing and var["name"] != token_var and not var.get("password"):
             print_info(f"  Current: {existing}")
+        elif existing and var.get("password"):
+            print_info("  Current: (already set — leave blank to keep it)")
+
+        if auto_token_saved and var["name"] == token_var:
+            print_info("  Token saved by automatic setup.")
+            continue
 
         if auto_token_saved and var["name"] == token_var:
             print_info("  Token saved by automatic setup.")
@@ -5741,12 +5812,20 @@ def _setup_standard_platform(platform: dict):
             continue
 
         value = prompt(f"  {var['prompt']}", password=var.get("password", False))
+        if value and var.get("numeric") and not (value.isdigit() and 1 <= int(value) <= 65535):
+            print_warning(f"  \"{value}\" isn't a valid port (1-65535) — skipping (default will be used).")
+            value = ""
         if value:
             save_env_value(var["name"], value)
             print_success(f"  Saved {var['name']}")
         elif var["name"] == token_var:
             print_warning(f"  Skipped — {label} won't work without this.")
             return
+        elif var.get("required") and not existing:
+            print_warning(f"  Skipped — {label} won't work without this.")
+            return
+        elif var.get("required"):
+            print_info("  Keeping existing value.")
         else:
             print_info("  Skipped (can configure later)")
 
@@ -5846,6 +5925,13 @@ def _is_service_running() -> bool:
             return len(find_gateway_pids()) > 0
     # Check for manual processes
     return len(find_gateway_pids()) > 0
+
+
+def _setup_whatsapp():
+    """Delegate to the existing WhatsApp setup flow."""
+    from hermes_cli.main import cmd_whatsapp
+    import argparse
+    cmd_whatsapp(argparse.Namespace())
 
 
 def _setup_weixin():

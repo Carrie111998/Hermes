@@ -245,6 +245,11 @@ class TestGatewayStopCleanup:
         monkeypatch.setattr(gateway_cli, "is_termux", lambda: False)
         monkeypatch.setattr(gateway_cli, "is_macos", lambda: False)
         monkeypatch.setattr(gateway_cli, "get_systemd_unit_path", lambda system=False: unit_path)
+        # Importing gateway.run (e.g. via `monkeypatch.setattr("gateway.run....")`
+        # elsewhere) sets this in real os.environ as a module-level side
+        # effect that outlives monkeypatch's per-test rollback; make sure
+        # this test isn't accidentally "inside the gateway process".
+        monkeypatch.delenv("_HERMES_GATEWAY", raising=False)
 
         service_calls = []
         kill_calls = []
@@ -494,6 +499,7 @@ class TestGatewaySystemServiceRouting:
         calls = []
 
         monkeypatch.setattr(gateway_cli, "_select_systemd_scope", lambda system=False: False)
+        monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda: None)
         monkeypatch.setattr(gateway_cli, "_require_service_installed", lambda action, system=False: None)
         monkeypatch.setattr(gateway_cli, "_preflight_user_systemd", lambda **kwargs: None)
         monkeypatch.setattr(gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: calls.append(("refresh", system)))
@@ -808,6 +814,11 @@ class TestGeneratedUnitIncludesLocalBin:
 
 
     def test_system_unit_includes_local_bin_in_path(self, monkeypatch):
+        monkeypatch.setattr(
+            gateway_cli,
+            "_system_service_identity",
+            lambda run_as_user=None: ("alice", "alice", "/home/alice"),
+        )
         monkeypatch.setattr(
             gateway_cli,
             "_build_user_local_paths",

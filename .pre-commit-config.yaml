@@ -1,0 +1,19 @@
+# Optional local hooks. Nothing here runs until you opt in:
+#
+#     uv tool install pre-commit   # or: pipx install pre-commit
+#     pre-commit install
+#
+# CI is the enforcement boundary (.github/workflows/secret-scan.yml). This
+# config only moves the same check earlier, so a secret is caught before it
+# reaches a remote — where removing it means a history rewrite, not an amend.
+#
+# The hook reads the repo's .gitleaks.toml automatically (config precedence:
+# --config > GITLEAKS_CONFIG > <target>/.gitleaks.toml > built-in default), so
+# local and CI results agree.
+
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    # Pinned to a commit SHA per the Dependency Pinning Policy in AGENTS.md.
+    rev: ee6b38352380ce52369d16b7873093c4b8bf829b # v8.24.3
+    hooks:
+      - id: gitleaks

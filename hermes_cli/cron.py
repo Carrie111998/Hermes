@@ -6,6 +6,7 @@ pause/resume/run/remove, status, and tick.
 """
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Iterable, List, Optional
@@ -403,6 +404,7 @@ def cron_edit(args):
             if skill not in final_skills:
                 final_skills.append(skill)
 
+    _warn_if_gateway_lifecycle(getattr(args, "prompt", None), getattr(args, "script", None))
     result = _cron_api(
         action="update",
         job_id=args.job_id,

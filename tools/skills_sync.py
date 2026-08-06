@@ -934,6 +934,13 @@ def sync_skills(quiet: bool = False) -> dict:
     _write_manifest(manifest)
     optional_provenance_backfilled = _backfill_optional_provenance(quiet=quiet)
 
+    # Deploy scripts from skill scripts/ subdirectories to ~/.hermes/scripts/
+    _scripts_home = HERMES_HOME / "scripts"
+    try:
+        deploy_skill_scripts(SKILLS_DIR, _scripts_home)
+    except Exception:
+        pass  # non-fatal
+
     return {
         "copied": copied,
         "updated": updated,

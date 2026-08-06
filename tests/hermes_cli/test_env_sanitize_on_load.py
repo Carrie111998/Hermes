@@ -14,7 +14,6 @@ def test_load_env_preserves_concatenated_text_as_value_data():
     from hermes_cli.config import load_env
 
     token = "0123456789:test"
-    # Simulate concatenated line: TOKEN=xxx followed immediately by another key
     corrupted = f"TELEGRAM_BOT_TOKEN={token}ANTHROPIC_API_KEY=sk-ant-test123\n"
 
     with tempfile.NamedTemporaryFile(

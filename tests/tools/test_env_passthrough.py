@@ -1,5 +1,6 @@
 """Tests for tools.env_passthrough — skill and config env var passthrough."""
 
+import logging
 import os
 import pytest
 import yaml

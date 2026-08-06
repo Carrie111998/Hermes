@@ -2316,6 +2316,15 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if Platform.WECOM_CALLBACK not in config.platforms:
             config.platforms[Platform.WECOM_CALLBACK] = PlatformConfig()
         config.platforms[Platform.WECOM_CALLBACK].enabled = True
+        wecom_callback_port_raw = os.getenv("WECOM_CALLBACK_PORT", "8645")
+        try:
+            wecom_callback_port = int(wecom_callback_port_raw)
+        except ValueError:
+            logger.warning(
+                "Invalid WECOM_CALLBACK_PORT=%r; falling back to 8645.",
+                wecom_callback_port_raw,
+            )
+            wecom_callback_port = 8645
         config.platforms[Platform.WECOM_CALLBACK].extra.update({
             "corp_id": wecom_callback_corp_id,
             "corp_secret": wecom_callback_corp_secret,

@@ -267,6 +267,8 @@ otlp = ["opentelemetry-sdk==1.39.1", "opentelemetry-exporter-otlp-proto-http==1.
 bedrock = ["boto3==1.42.89"]
 vertex = ["google-auth==2.55.1"]
 azure-identity = ["azure-identity==1.25.3"]
+# 1Password Secrets Manager integration (pre-1.0 package — minor-pinned per AGENTS.md §versioning)
+onepassword = ["onepassword-sdk>=0.1.0,<0.2.0"]
 termux = [
   # Baseline Android / Termux path for reliable fresh installs.
   "python-telegram-bot[webhooks]==22.6",
@@ -447,3 +449,8 @@ select = ["PLW1514"]
 "skills/**" = ["PLW1514"]
 "optional-skills/**" = ["PLW1514"]
 "plugins/**" = ["PLW1514"]
+
+[dependency-groups]
+dev = [
+    "pytest-timeout>=2.4.0,<3",
+]

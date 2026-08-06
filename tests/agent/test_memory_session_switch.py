@@ -37,13 +37,13 @@ class _RecordingProvider(MemoryProvider):
     def get_tool_schemas(self):
         return []
 
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id="", user_id=""):
         self.sync_calls.append(
-            {"user": user_content, "asst": assistant_content, "session_id": session_id}
+            {"user": user_content, "asst": assistant_content, "session_id": session_id, "user_id": user_id}
         )
 
-    def queue_prefetch(self, query, *, session_id=""):
-        self.queue_calls.append({"query": query, "session_id": session_id})
+    def queue_prefetch(self, query, *, session_id="", user_id=""):
+        self.queue_calls.append({"query": query, "session_id": session_id, "user_id": user_id})
 
     def on_session_switch(
         self,

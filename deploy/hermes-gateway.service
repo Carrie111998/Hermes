@@ -1,0 +1,79 @@
+# hermes-gateway.service — run the Hermes gateway 24/7 as a system service.
+#
+# For a single-user desktop/laptop, prefer the built-in installer, which
+# manages a systemd *user* unit (or launchd agent on macOS) for you:
+#
+#     hermes gateway install
+#
+# This unit is for dedicated hosts (VPS, homelab server) where the gateway
+# should run under its own unprivileged service account and start at boot
+# without anyone logged in.
+#
+# Setup (as root):
+#   1. Create the service user and install Hermes as that user:
+#        useradd -r -m -d /home/hermes -s /bin/bash hermes
+#        sudo -iu hermes bash -c \
+#          'curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash'
+#   2. Configure interactively once (platforms, model, 1Password bootstrap):
+#        sudo -iu hermes hermes setup
+#        sudo -iu hermes hermes gateway setup
+#        sudo -iu hermes env OP_SERVICE_ACCOUNT_TOKEN=... \
+#          hermes secrets onepassword setup --vault "Private" --item "Hermes Gateway"
+#      (or merge deploy/config.example.yaml into /home/hermes/.hermes/config.yaml)
+#   3. Create the environment file (root-owned, mode 600):
+#        install -d -m 750 /etc/hermes
+#        install -m 600 deploy/gateway.env.example /etc/hermes/gateway.env
+#        $EDITOR /etc/hermes/gateway.env   # paste the real service account token
+#   4. Install and start the unit:
+#        cp deploy/hermes-gateway.service /etc/systemd/system/
+#        systemctl daemon-reload
+#        systemctl enable --now hermes-gateway
+#   5. Verify:
+#        systemctl status hermes-gateway
+#        journalctl -u hermes-gateway -f
+#        sudo -iu hermes env $(cat /etc/hermes/gateway.env) hermes secrets onepassword status
+
+[Unit]
+Description=Hermes Agent messaging gateway (Telegram, Discord, Slack, WhatsApp, ...)
+Documentation=https://hermes-agent.nousresearch.com/docs/guides/persistent-hosting
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+Environment=HOME=/home/hermes
+WorkingDirectory=/home/hermes
+# /etc/hermes/gateway.env should contain ONLY the 1Password bootstrap token
+# (OP_SERVICE_ACCOUNT_TOKEN=...).  Everything else — Slack tokens, provider
+# API keys — is fetched from 1Password at startup or lives in
+# /home/hermes/.hermes/.env.  Keep the file root-owned, chmod 600.
+EnvironmentFile=/etc/hermes/gateway.env
+# The one-line installer symlinks the CLI to ~/.local/bin/hermes.
+ExecStart=/home/hermes/.local/bin/hermes gateway run
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-gateway
+
+# --- Hardening ---
+NoNewPrivileges=yes
+PrivateTmp=yes
+# Mount the whole filesystem read-only for this service, except the paths
+# listed in ReadWritePaths.  The gateway writes state under ~/.hermes and
+# the agent's local terminal backend (plus lazy dependency installs into the
+# venv) write elsewhere under the service user's home, so the home directory
+# is the minimal practical read-write surface.  If you run the agent's
+# terminal in a Docker/SSH sandbox instead of the local backend, you can
+# narrow this to /home/hermes/.hermes.
+ProtectSystem=strict
+ReadWritePaths=/home/hermes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

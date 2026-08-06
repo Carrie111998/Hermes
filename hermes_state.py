@@ -56,7 +56,6 @@ from hermes_state_common import (  # noqa: F401  (re-exported for back-compat)
     _shape_preview,
     _sql_session_last_active,
     _sql_session_last_active_by_id,
-    escape_like as _escape_like,
     DEFERRED_INDEX_SQL,
     FTS_CJK_STALE_KEY,
     FTS_SQL,
@@ -171,24 +170,9 @@ def _delegate_from_json(col: str = "model_config") -> str:
     return f"json_extract(COALESCE({col}, '{{}}'), '$._delegate_from')"
 
 
-# Sentinel returned by SessionDB._merge_model_config_json when the session row
-# doesn't exist and on_missing="skip" — distinguishes "no row" from the legal
-# None result ("merged config is empty → store NULL").
-_MODEL_CONFIG_ROW_MISSING = object()
-
-
 def _cwd_prefix_clause(cwd_prefix: str) -> Tuple[str, List[str]]:
     prefix = cwd_prefix.rstrip("/\\") or cwd_prefix
-    # ``_`` and ``%`` are LIKE wildcards but ordinary characters in a path
-    # (``my_project``), so an unescaped prefix also matches sibling directories.
-    # Escape the needle and pair it with ESCAPE; the literal separator
-    # backslash in the Windows pattern needs escaping for the same reason. The
-    # ``=`` arm is an exact compare and keeps the raw prefix.
-    esc = _escape_like(prefix)
-    return (
-        "(s.cwd = ? OR s.cwd LIKE ? ESCAPE '\\' OR s.cwd LIKE ? ESCAPE '\\')",
-        [prefix, f"{esc}/%", f"{esc}\\\\%"],
-    )
+    return "(s.cwd = ? OR s.cwd LIKE ? OR s.cwd LIKE ?)", [prefix, f"{prefix}/%", f"{prefix}\\%"]
 
 
 def _workspace_key_clause(key: str) -> Tuple[str, List[str]]:
@@ -2802,7 +2786,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         try:
             with self._lock:
                 result = self._conn.execute(
-                    "PRAGMA wal_checkpoint(PASSIVE)"
+                    "PRAGMA wal_checkpoint(TRUNCATE)"
                 ).fetchone()
                 if result and result[1] > 0:
                     logger.debug(
@@ -4365,97 +4349,6 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
 
-    def _merge_model_config_json(
-        self,
-        conn,
-        session_id: str,
-        patch: Dict[str, Any],
-        *,
-        on_missing: str = "skip",
-    ):
-        """SELECT + tolerant-parse + merge ``patch`` into a session's model_config.
-
-        Shared by every model_config writer (``update_session_runtime_lock``,
-        ``set_session_yolo``, ``archive_and_compact``,
-        ``patch_session_model_config``) so the merge discipline that keeps
-        lineage markers like ``_branched_from`` / ``_delegate_from`` alive
-        lives in exactly one place. A ``None`` patch value deletes that key.
-        Must run inside an open write transaction (callers own the UPDATE).
-
-        Returns the serialized merged JSON — ``None`` when the merged dict is
-        empty (matching ``create_session``'s NULL convention) — or the
-        ``_MODEL_CONFIG_ROW_MISSING`` sentinel when the row doesn't exist and
-        ``on_missing == "skip"``; ``on_missing == "raise"`` raises ValueError.
-        """
-        row = conn.execute(
-            "SELECT model_config FROM sessions WHERE id = ?",
-            (session_id,),
-        ).fetchone()
-        if row is None:
-            if on_missing == "raise":
-                raise ValueError(f"Session not found: {session_id}")
-            return _MODEL_CONFIG_ROW_MISSING
-        raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
-        config: Dict[str, Any] = {}
-        if isinstance(raw, str) and raw.strip():
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    config = parsed
-            except (json.JSONDecodeError, TypeError):
-                config = {}
-        elif isinstance(raw, dict):
-            config = dict(raw)
-        for key, value in patch.items():
-            if value is None:
-                config.pop(key, None)
-            else:
-                config[key] = value
-        return json.dumps(config) if config else None
-
-    def patch_session_model_config(
-        self, session_id: str, patch: Dict[str, Any]
-    ) -> None:
-        """Merge ``patch`` into a session's model_config JSON atomically.
-
-        A ``None`` patch value removes that key. No-op when the session row
-        doesn't exist or the patch is empty. This is the standalone setter for
-        callers that need to update model_config *without* rewriting the
-        transcript (the transcript-coupled path is ``archive_and_compact``'s
-        ``model_config_patch``, which shares the same merge helper).
-        """
-        if not session_id or not patch:
-            return
-
-        def _do(conn):
-            merged = self._merge_model_config_json(conn, session_id, patch)
-            if merged is _MODEL_CONFIG_ROW_MISSING:
-                return
-            conn.execute(
-                "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (merged, session_id),
-            )
-
-        self._execute_write(_do)
-
-    def get_session_model_config_value(
-        self, session_id: str, key: str, default: Any = None
-    ) -> Any:
-        """Read one key out of a session's model_config JSON (tolerant parse)."""
-        session = self.get_session(session_id) or {}
-        raw = session.get("model_config")
-        config: Dict[str, Any] = {}
-        if isinstance(raw, str) and raw.strip():
-            try:
-                parsed = json.loads(raw)
-                if isinstance(parsed, dict):
-                    config = parsed
-            except (json.JSONDecodeError, TypeError):
-                config = {}
-        elif isinstance(raw, dict):
-            config = raw
-        return config.get(key, default)
-
     def update_session_runtime_lock(
         self,
         session_id: str,
@@ -4482,11 +4375,24 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         }
 
         def _do(conn):
-            merged = self._merge_model_config_json(
-                conn, session_id, {"browser_model_lock": lock}
-            )
-            if merged is _MODEL_CONFIG_ROW_MISSING:
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
                 return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except Exception:
+                    config = {}
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            config["browser_model_lock"] = lock
             conn.execute(
                 """UPDATE sessions SET
                    model_config = ?,
@@ -4494,7 +4400,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                    system_prompt = NULL,
                    system_prompt_hash = NULL
                    WHERE id = ?""",
-                (merged, model, session_id),
+                (json.dumps(config), model, session_id),
             )
             self._delete_unreferenced_system_prompts(conn)
         self._execute_write(_do)
@@ -4515,14 +4421,27 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return
 
         def _do(conn):
-            merged = self._merge_model_config_json(
-                conn, session_id, {"yolo_mode": bool(enabled)}
-            )
-            if merged is _MODEL_CONFIG_ROW_MISSING:
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
                 return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except Exception:
+                    config = {}
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            config["yolo_mode"] = bool(enabled)
             conn.execute(
                 "UPDATE sessions SET model_config = ? WHERE id = ?",
-                (merged, session_id),
+                (json.dumps(config), session_id),
             )
         self._execute_write(_do)
 
@@ -5276,7 +5195,12 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         if exact:
             return exact["id"]
 
-        escaped = _escape_like(session_id_or_prefix)
+        escaped = (
+            session_id_or_prefix
+            .replace("\\", "\\\\")
+            .replace("%", "\\%")
+            .replace("_", "\\_")
+        )
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT id FROM sessions WHERE id LIKE ? ESCAPE '\\' ORDER BY started_at DESC LIMIT 2",
@@ -5665,7 +5589,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Also search for numbered variants: "title #2", "title #3", etc.
         # Escape SQL LIKE wildcards (%, _) in the title to prevent false matches
-        escaped = _escape_like(title)
+        escaped = title.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._read_ctx() as conn:
             cursor = conn.execute(
                 "SELECT id, title, started_at FROM sessions "
@@ -5696,7 +5620,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         # Find all existing numbered variants
         # Escape SQL LIKE wildcards (%, _) in the base to prevent false matches
-        escaped = _escape_like(base)
+        escaped = base.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
         with self._lock:
             cursor = self._conn.execute(
                 "SELECT title FROM sessions WHERE title = ? OR title LIKE ? ESCAPE '\\'",
@@ -5949,7 +5873,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             filter_clauses: List[str] = []
 
             def _like_pattern(needle: str) -> str:
-                return f"%{_escape_like(needle)}%"
+                escaped = (
+                    needle.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+                )
+                return f"%{escaped}%"
 
             if id_needle:
                 # Admit a surfaced row if its own id or any id in its forward
@@ -6936,10 +6863,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             return cursor.fetchone() is not None
 
     def archive_and_compact(
-        self,
-        session_id: str,
-        compacted_messages: List[Dict[str, Any]],
-        model_config_patch: Optional[Dict[str, Any]] = None,
+        self, session_id: str, compacted_messages: List[Dict[str, Any]]
     ) -> int:
         """Non-destructive in-place compaction for a single durable session id.
 
@@ -6962,22 +6886,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         This is the durability-preserving alternative to :meth:`replace_messages`
         for compaction. ``message_count`` is set to the ACTIVE (compacted) count,
-        matching what the live load returns. ``model_config_patch`` is merged
-        into the session's JSON config in the same transaction; a ``None``
-        value removes that key. Returns the new active count.
+        matching what the live load returns. Returns the new active count.
         """
 
         def _do(conn):
-            patched_model_config = None
-            if model_config_patch is not None:
-                # on_missing="raise": a prune/compaction must not commit
-                # against a vanished session row (the compressor's caller
-                # converts the raised error into a safe keep-the-original
-                # no-op), unlike the flag setters which tolerate missing rows.
-                patched_model_config = self._merge_model_config_json(
-                    conn, session_id, model_config_patch, on_missing="raise"
-                )
-
             # Soft-archive the live turns: active=0 hides them from the live
             # context load, compacted=1 marks them as "summarized away" (vs
             # rewind/undo's active=0+compacted=0, which means "user took it
@@ -6994,17 +6906,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
             # message_count / tool_call_count reflect the LIVE (active) set —
             # the archived rows are still on disk but not part of the live count.
-            if model_config_patch is None:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
-                    (inserted, tool_calls_total, session_id),
-                )
-            else:
-                conn.execute(
-                    "UPDATE sessions SET message_count = ?, tool_call_count = ?, "
-                    "model_config = ? WHERE id = ?",
-                    (inserted, tool_calls_total, patched_model_config, session_id),
-                )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (inserted, tool_calls_total, session_id),
+            )
             return inserted
 
         return self._execute_write(_do)
@@ -7722,6 +7627,53 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
     # Search
     # =========================================================================
 
+    def search_sessions_by_id(
+        self,
+        query: str,
+        limit: int = 20,
+        include_archived: bool = True,
+    ) -> List[Dict[str, Any]]:
+        """Search surfaced sessions by exact/prefix/substring session id.
+
+        Desktop search uses this alongside FTS message search so users can paste
+        a session id from logs, CLI output, or another Hermes surface and jump
+        straight to that conversation.  Matching also checks ``_lineage_root_id``
+        for projected compression-chain tips, so an old root id still resolves to
+        the live continuation row.
+        """
+        needle = (query or "").strip().lower()
+        if not needle or limit <= 0:
+            return []
+
+        # SQL-bounded: list_sessions_rich pushes the id LIKE filter into the
+        # query (matching the row's own id AND any id in its forward
+        # compression chain), so we only materialize matching rows instead of
+        # scanning every session. Fetch a small multiple of `limit` so the
+        # in-Python exact/prefix/substring ranking below has enough candidates
+        # to order, then truncate.
+        candidates = self.list_sessions_rich(
+            limit=max(limit * 4, limit),
+            offset=0,
+            include_archived=include_archived,
+            order_by_last_active=True,
+            id_query=needle,
+        )
+
+        def score(row: Dict[str, Any]) -> int:
+            ids = [str(row.get("id") or ""), str(row.get("_lineage_root_id") or "")]
+            normalized = [value.lower() for value in ids if value]
+            if any(value == needle for value in normalized):
+                return 0
+            if any(value.startswith(needle) for value in normalized):
+                return 1
+            return 2
+
+        ranked = sorted(
+            enumerate(candidates),
+            key=lambda item: (score(item[1]), item[0]),
+        )
+        return [row for _, row in ranked[:limit]]
+
     def search_sessions(
         self,
         source: str = None,
@@ -8404,8 +8356,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.source = ?")
             params.append(source)
         if title_like:
-            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ? ESCAPE '\\'")
-            params.append(f"%{_escape_like(title_like.lower())}%")
+            clauses.append("LOWER(COALESCE(s.title, '')) LIKE ?")
+            params.append(f"%{title_like.lower()}%")
         if end_reason:
             clauses.append("s.end_reason = ?")
             params.append(end_reason)
@@ -8420,8 +8372,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.message_count <= ?")
             params.append(max_messages)
         if model_like:
-            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ? ESCAPE '\\'")
-            params.append(f"%{_escape_like(model_like.lower())}%")
+            clauses.append("LOWER(COALESCE(s.model, '')) LIKE ?")
+            params.append(f"%{model_like.lower()}%")
         if provider:
             clauses.append("LOWER(COALESCE(s.billing_provider, '')) = ?")
             params.append(provider.lower())
@@ -8435,8 +8387,8 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             clauses.append("s.chat_type = ?")
             params.append(chat_type)
         if branch_like:
-            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ? ESCAPE '\\'")
-            params.append(f"%{_escape_like(branch_like.lower())}%")
+            clauses.append("LOWER(COALESCE(s.git_branch, '')) LIKE ?")
+            params.append(f"%{branch_like.lower()}%")
         if min_tokens is not None:
             clauses.append(
                 "(COALESCE(s.input_tokens, 0) + COALESCE(s.output_tokens, 0)) >= ?"
@@ -8838,7 +8790,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             cursor = conn.execute(
                 "UPDATE sessions SET source = 'kanban' "
                 "WHERE source = 'cli' AND (cwd = ? OR cwd LIKE ? ESCAPE '\\')",
-                (prefix, _escape_like(prefix) + "/%"),
+                (prefix, prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"),
             )
             # Read rowcount before set_meta reuses this cursor for its INSERT,
             # which would otherwise overwrite it with the meta write's count.

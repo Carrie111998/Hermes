@@ -34,6 +34,16 @@ from typing import Dict, Any, Optional, List, Tuple, Set
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.secret_prompt import masked_secret_prompt
 
+try:
+    import fcntl as _fcntl
+except Exception:
+    _fcntl = None  # type: ignore[invalid-assignment]
+
+try:
+    import msvcrt as _msvcrt
+except Exception:
+    _msvcrt = None  # type: ignore[invalid-assignment]
+
 logger = logging.getLogger(__name__)
 
 # Track which (config_path, mtime_ns, size) tuples we've already warned about
@@ -5279,6 +5289,21 @@ def config_command(args):
         
         print()
     
+    elif subcmd == "seal":
+        from hermes_cli.config_integrity_cli import cmd_seal
+        rc = cmd_seal(args)
+        sys.exit(rc)
+
+    elif subcmd == "verify":
+        from hermes_cli.config_integrity_cli import cmd_verify
+        rc = cmd_verify(args)
+        sys.exit(rc)
+
+    elif subcmd == "restore":
+        from hermes_cli.config_integrity_cli import cmd_restore
+        rc = cmd_restore(args)
+        sys.exit(rc)
+
     else:
         print(f"Unknown config command: {subcmd}")
         print()
@@ -5292,6 +5317,9 @@ def config_command(args):
         print("  hermes config migrate   Update config with new options")
         print("  hermes config path      Show config file path")
         print("  hermes config env-path  Show .env file path")
+        print("  hermes config seal      Hash config.yaml into integrity log")
+        print("  hermes config verify    Check config.yaml against sealed baseline")
+        print("  hermes config restore   Revert config.yaml to sealed baseline")
         sys.exit(1)
 
 

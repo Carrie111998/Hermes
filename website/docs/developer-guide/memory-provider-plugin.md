@@ -83,6 +83,12 @@ class MyMemoryProvider(MemoryProvider):
 | `on_memory_write(action, target, content)` | Built-in memory writes | Mirror to your backend |
 | `shutdown()` | Process exit | Clean up connections |
 
+Providers used by messaging gateways may also receive `session_id` and `user_id`
+keyword arguments on `queue_prefetch()` and `sync_turn()`. Use these for
+multi-user scoping instead of deriving identity from global process state. The
+`memgw` provider is the reference pattern for an MCP-backed provider that bridges
+an async client behind synchronous memory-provider hooks.
+
 ## Config Schema
 
 `get_config_schema()` returns a list of field descriptors used by `hermes memory setup`:

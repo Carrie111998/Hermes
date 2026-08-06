@@ -362,7 +362,11 @@ hermes slack manifest              # print manifest to stdout
 hermes slack manifest --write      # write to ~/.hermes/slack-manifest.json
 hermes slack manifest --long-description-file AGENTS.md --write
 hermes slack manifest --slashes-only  # just the features.slash_commands array
+hermes slack channels              # list channels + membership gaps
+hermes slack invite --all          # join every public channel the bot is missing
 ```
+
+### `hermes slack manifest`
 
 Generates a Slack app manifest that registers every gateway command in
 `COMMAND_REGISTRY` (`/btw`, `/stop`, `/model`, …) as a first-class
@@ -374,7 +378,8 @@ reinstall if scopes or slash commands changed.
 
 | Flag | Default | Purpose |
 |------|---------|---------|
-| `--write [PATH]` | stdout | Write to a file instead of stdout. Bare `--write` writes `$HERMES_HOME/slack-manifest.json`. |
+| `--write [PATH]` | stdout | Write to a file instead of stdout. Bare `--write` writes `$HERMES_HOME/slack-manifest.{json,yaml}`. |
+| `--yaml` | off | Emit YAML instead of JSON (Slack accepts both). |
 | `--name NAME` | `Hermes` | Bot display name in Slack. |
 | `--description DESC` | default blurb | Bot description shown in the Slack app directory. |
 | `--long-description TEXT` | unset | Set `display_information.long_description` inline (175–4,000 characters). Incompatible with `--slashes-only`. |
@@ -383,6 +388,34 @@ reinstall if scopes or slash commands changed.
 
 Run `hermes slack manifest --write` again after `hermes update` to pick
 up any new commands.
+
+### `hermes slack channels`
+
+Lists every channel the bot token can see and reports which ones the bot
+is and isn't a member of. A Slack bot only sees and posts in channels it
+has joined, so this audits "all channels" coverage. Requires
+`SLACK_BOT_TOKEN`.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--no-private` | off | Only list public channels (skip private groups). |
+| `--json` | off | Machine-readable JSON instead of a human summary. |
+
+### `hermes slack invite`
+
+Adds the bot to channels so it can read and post. Public channels are
+joined directly with the bot token (`conversations.join`, needs the
+`channels:join` scope). Private channels can't be self-joined — run
+`/invite @<bot>` inside each one, or pass a user token so Hermes can call
+`conversations.invite`. Requires `SLACK_BOT_TOKEN`.
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--all` | off | Target every channel the bot isn't already in. |
+| `--channel NAME/ID` | — | Target a specific channel (repeatable). |
+| `--no-private` | off | Only consider public channels. |
+| `--user-token xoxp-…` | `SLACK_USER_TOKEN` | User token used to invite the bot to private channels. |
+| `--dry-run` | off | Show what would happen without calling Slack. |
 
 
 ## `hermes send`
@@ -1296,7 +1329,7 @@ See [Hooks](../user-guide/features/hooks.md) for event signatures and payload sh
 hermes memory <subcommand>
 ```
 
-Set up and manage external memory provider plugins. Available providers: honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory. Only one external provider can be active at a time. Built-in memory (MEMORY.md/USER.md) is always active.
+Set up and manage external memory provider plugins. Available providers: memgw, honcho, openviking, mem0, hindsight, holographic, retaindb, byterover, supermemory. Only one external provider can be active at a time. Built-in memory (MEMORY.md/USER.md) is always active.
 
 Subcommands:
 

@@ -269,7 +269,7 @@ class ByteRoverMemoryProvider(MemoryProvider):
             "important facts, brv_status to check state."
         )
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> str:
         """Run brv query synchronously before the agent's first LLM call.
 
         Blocks until the query completes (up to _QUERY_TIMEOUT seconds), ensuring
@@ -287,11 +287,11 @@ class ByteRoverMemoryProvider(MemoryProvider):
                 return f"## ByteRover Context\n{output}"
         return ""
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> None:
         """No-op: prefetch() now runs synchronously at turn start."""
         pass
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", user_id: str = "") -> None:
         """Curate the conversation turn in background (non-blocking)."""
         self._turn_count += 1
         if not self._auto_extract:

@@ -221,6 +221,28 @@ source .venv/bin/activate   # or: source venv/bin/activate
 `$HOME/.hermes/hermes-agent/venv` (for worktrees that share a venv with the
 main checkout).
 
+### MCP servers for Claude Code (`.mcp.json`)
+
+`.mcp.json` is **gitignored**, same as `.env` — an MCP `env` block can hold API
+keys, and this repo ships credential-bootstrap paths, so MCP config stays
+untracked. Copy the template on each machine:
+
+```bash
+cp .mcp.json.example .mcp.json
+```
+
+- **Don't put MCP servers in `.claude/settings.json`.** Claude Code documents
+  `${VAR}` / `${VAR:-default}` expansion for `command`, `args`, `env`, `url` and
+  `headers` in **`.mcp.json`** and `~/.claude.json` — *not* in
+  `settings.json`. A `${VAR}` path there is liable to be taken literally, and the
+  server then silently fails to start. `settings.json` keeps `hooks` only.
+- The template uses `${HOME}/.local/bin/…` rather than an absolute path so it
+  resolves on any machine, not just the one it was written on.
+- **First-use approval:** project-scoped `.mcp.json` servers prompt once per
+  machine before Claude Code will use them. Expected, not a misconfiguration.
+- Hook commands are unaffected — `~` and `$CLAUDE_PROJECT_DIR` do expand in
+  `settings.json` hooks, so leave those where they are.
+
 ## Project Structure
 
 File counts shift constantly — don't treat the tree below as exhaustive.
@@ -248,7 +270,7 @@ hermes-agent/
 │   │                     #   yuanbao, webhook, api_server, ...). See ADDING_A_PLATFORM.md.
 │   └── builtin_hooks/    # Extension point for always-registered gateway hooks (none shipped)
 ├── plugins/              # Plugin system (see "Plugins" section below)
-│   ├── memory/           # Memory-provider plugins (honcho, mem0, supermemory, ...)
+│   ├── memory/           # Memory-provider plugins (honcho, memgw, mem0, supermemory, ...)
 │   ├── context_engine/   # Context-engine plugins
 │   ├── model-providers/  # Inference backend plugins (openrouter, anthropic, gmi, ...)
 │   ├── kanban/           # Multi-agent board dispatcher + worker plugin
@@ -579,6 +601,56 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 
 ---
 
+## Secret Scanning
+
+`.github/workflows/secret-scan.yml` runs gitleaks on every push and PR. It
+scans the **diff**, not history — pre-existing placeholder credentials in test
+fixtures therefore never fire on unrelated changes, which is what keeps the
+check worth reading.
+
+Tuning lives in `.gitleaks.toml`:
+
+- **Custom rules** for `sk-ant-api*` / `sk-ant-admin*` (Anthropic) and
+  `sk-or-v1-*` (OpenRouter). The stock gitleaks ruleset has **no** Anthropic
+  rule and routes OpenRouter through the entropy-based `generic-api-key`, which
+  misses a key that appears without a nearby keyword. Those are the two
+  credentials this repo is most likely to leak.
+- **Allowlists** for vendored upstream docs, published OAuth client IDs
+  (`*_OAUTH_CLIENT_ID`, gemini-cli's public desktop client secret), and
+  placeholders carrying an explicit marker word.
+
+**If the scan fires on your PR:**
+
+1. Real credential → rotate it first, then remove it from history.
+2. Placeholder → give it an obvious marker (`fake`, `dummy`, `example`,
+   `placeholder`, `sk-test-…`) so the existing allowlist covers it, or add a
+   narrow, commented entry to `.gitleaks.toml`.
+
+Do **not** add a blanket `tests/` or `**/*.md` exemption. Test fixtures are
+exactly where a real key gets pasted by accident. Same principle as
+`supply-chain-audit.yml`: a scanner that fires on every PR trains reviewers to
+ignore it, so keep the allowlist narrow and give every entry a reason.
+
+### Catching it before it leaves your machine (optional)
+
+`.pre-commit-config.yaml` runs the same gitleaks against your **staged** diff.
+It's opt-in — nothing happens until you install the hook:
+
+```bash
+uv tool install pre-commit   # or: pipx install pre-commit
+pre-commit install
+```
+
+Worth the two commands: once a secret reaches a remote, removing it is a
+history rewrite and a rotation, not an amend. The hook reads the same
+`.gitleaks.toml`, so local and CI verdicts agree. First run builds gitleaks
+from source (the upstream hook is `language: golang`) and is then cached.
+
+CI remains the enforcement boundary — the hook is a convenience, and a
+contributor who hasn't installed it is not doing anything wrong.
+
+---
+
 ## Adding Configuration
 
 ### config.yaml options:
@@ -640,6 +712,43 @@ versa), you're on the wrong loader. Check `DEFAULT_CONFIG` coverage.
   removed** — the config loader prints a deprecation warning if it's set in
   `.env`. Same for `TERMINAL_CWD` in `.env`; the canonical setting is
   `terminal.cwd` in `config.yaml`.
+
+### Config integrity seal and interprocess lock
+
+`save_config()` in `hermes_cli/config.py` automatically:
+- Acquires an exclusive OS file lock (`config_write_lock()`) on `~/.hermes/config.yaml.lock`
+- Writes `~/.hermes/config.yaml` atomically
+- Updates the SHA256 sidecar at `~/.hermes/config.yaml.sha256` via `seal_config()`
+- Releases the lock
+
+**Never bypass `save_config()` when writing config.** If you must write config directly (e.g. a restore script), use `restore_config()` so the lock and sidecar stay in sync.
+
+Low-level helpers (internal use by `save_config()` and `restore_config()` — for new scripts use the CLI commands below):
+- `seal_config()` — recompute and write the SHA256 sidecar
+- `verify_config_integrity(locked=False)` — returns `(ok, current_digest, sealed_digest)`; pass `locked=True` to acquire a shared read lock first
+- `restore_config(content, *, reason="")` — lock → backup → write → reseal
+- `config_read_lock()` — shared lock context manager for external readers
+
+### Git-backed config integrity
+
+PR #67 shipped a git-backed integrity system that supersedes the mutable `.sha256` sidecar for external verification. Seals are stored as an append-only log at `$HERMES_DOTFILES_DIR/hermes/config_integrity.jsonl` and committed to the dotfiles git repo — a commit cannot be silently forged by any process that can write `config.yaml`.
+
+**CLI commands** (dispatched via `hermes config`, implemented in `hermes_cli/config_integrity_cli.py`):
+- `hermes config seal` — hash config, append to log, commit to dotfiles git
+- `hermes config verify` — compare current hash to latest seal; exits 0=ok, 1=tampered, 2=log tampered, 3=no baseline
+- `hermes config restore` — `git checkout HEAD` to revert config, back up tampered file, re-seal
+
+**Skill:** `skills/devops/config-integrity-watchdog/` — ships `scripts/seal.py`, `scripts/verify.py`, `scripts/restore.py` (auto-deployed to `~/.hermes/scripts/` on startup) and `config_integrity.py` (shared core module).
+
+**Auto-reseal:** `save_config()`/`restore_config()` (via `_write_config_to_disk()` → `_reseal_git_backed_integrity_baseline()`) automatically re-seal this git-backed baseline too, not just the local `.sha256` sidecar — whenever `$HERMES_DOTFILES_DIR` is a git repo on the machine. This closes the gap where an authorized write (model scanner, `/model` command, platform setup flows) desynced the git-backed baseline and the watchdog cron job flagged the legitimate change as tampering. A manual `hermes config seal` is only needed for out-of-band edits that bypass `save_config()` entirely (e.g. hand-editing `config.yaml` in an editor).
+
+**Env vars:**
+| Variable | Default | Purpose |
+|---|---|---|
+| `HERMES_CONFIG` | `~/.hermes/config.yaml` | Config file to protect |
+| `HERMES_DOTFILES_DIR` | `~/Dev/dotfiles` | Dotfiles git repo root |
+
+**Use `hermes config verify` (not `verify_config_integrity()`) in new cron jobs, watchdog prompts, and restore scripts.**
 
 ---
 
@@ -761,7 +870,7 @@ explicitly (it's idempotent).
 ### Memory-provider plugins (`plugins/memory/<name>/`)
 
 Separate discovery system for pluggable memory backends. Current built-in
-providers include **honcho, mem0, supermemory, byterover, hindsight,
+providers include **honcho, memgw, mem0, supermemory, byterover, hindsight,
 holographic, openviking, retaindb**.
 
 Each provider implements the `MemoryProvider` ABC (see `agent/memory_provider.py`)
@@ -940,10 +1049,7 @@ violate them.
    `## Prerequisites`.
 
 6. **Scripts go in `scripts/`, references in `references/`,
-   templates in `templates/`.** Don't expect the model to inline-write
-   parsers, XML walkers, or non-trivial logic every call — ship a
-   helper script. Reference it from SKILL.md by path relative to the
-   skill directory.
+   templates in `templates/`.** Ship helper scripts rather than expecting the model to inline-write non-trivial logic. Reference by path relative to the skill directory. `*.py` files in `scripts/` are automatically deployed to `~/.hermes/scripts/` on every Hermes startup (via `deploy_skill_scripts()` in `tools/skills_sync.py`) — use this for standalone scripts that cron jobs or users need to invoke by path (e.g. health-check scripts, restore utilities).
 
 7. **Tests live at `tests/skills/test_<skill>_skill.py`** and use only
    stdlib + pytest + `unittest.mock`. No live network calls. Run via
