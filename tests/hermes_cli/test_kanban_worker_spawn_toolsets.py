@@ -161,3 +161,55 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+def test_default_spawn_resumes_only_dispatcher_selected_session(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "elias"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    selected = {}
+
+    def resolve_resume(task, workspace, profile_home, *, board=None):
+        selected.update(
+            task=task.id,
+            workspace=workspace,
+            profile_home=profile_home,
+            board=board,
+        )
+        return "sess-compatible"
+
+    monkeypatch.setattr(kb, "_resolve_worker_resume_session", resolve_resume)
+    captured = {}
+
+    class FakeProc:
+        pid = 4245
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        captured["env"] = dict(kwargs["env"])
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    kb._default_spawn(
+        _make_task(kb, assignee="elias"), str(workspace), board="project-a"
+    )
+
+    assert selected == {
+        "task": "t_spawn_tools",
+        "workspace": str(workspace),
+        "profile_home": str(profile),
+        "board": "project-a",
+    }
+    resume_idx = captured["cmd"].index("--resume")
+    assert captured["cmd"][resume_idx + 1] == "sess-compatible"
+    assert "--no-restore-cwd" in captured["cmd"]
+    assert captured["env"]["HERMES_SESSION_SOURCE"] == "kanban"
