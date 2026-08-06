@@ -625,6 +625,84 @@ class TestAutoTtsDisabled:
         assert A2AAdapter._should_auto_tts_for_chat is not BasePlatformAdapter._should_auto_tts_for_chat
 
 
+class TestCcForwarding:
+    """A2A replies that match A2A_CC_KEYWORDS are forwarded to a human chat
+    (opt-in). Nothing happens when keywords are unset, content misses, or no
+    bot token / chat id is configured."""
+
+    def _adapter(self, monkeypatch, **env):
+        for k in ("A2A_CC_KEYWORDS", "A2A_CC_CHAT_ID", "A2A_CC_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"):
+            monkeypatch.delenv(k, raising=False)
+        for k, v in env.items():
+            monkeypatch.setenv(k, v)
+        return _bare_adapter()
+
+    def test_no_forward_when_disabled(self, monkeypatch):
+        adapter = self._adapter(monkeypatch)
+        calls = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+        adapter._maybe_cc_to_human("ctx-1", "我们商量了一下，决定明天见")
+        assert calls == []
+
+    def test_no_forward_when_keyword_misses(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, A2A_CC_KEYWORDS="需要Rui")
+        calls = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+        adapter._maybe_cc_to_human("ctx-1", "已经搞定了，不用管")
+        assert calls == []
+
+    def test_forwards_when_keyword_hits(self, monkeypatch):
+        adapter = self._adapter(
+            monkeypatch,
+            A2A_CC_KEYWORDS="商量,决定",
+            A2A_CC_CHAT_ID="12345",
+            A2A_CC_BOT_TOKEN="bot:secret",
+        )
+        calls = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+        adapter._maybe_cc_to_human("ctx-9", "我们商量了一下，决定明天见")
+        assert len(calls) == 1
+        req = calls[0][0]
+        assert "api.telegram.org/botbot:secret/sendMessage" in req.full_url
+        body = json.loads(req.data.decode("utf-8"))
+        assert body["chat_id"] == "12345"
+        assert "ctx-9" in body["text"]
+        assert "商量" in body["text"]
+
+    def test_forwards_with_fallback_bot_token(self, monkeypatch):
+        adapter = self._adapter(
+            monkeypatch,
+            A2A_CC_KEYWORDS="需要Rui",
+            A2A_CC_CHAT_ID="999",
+            TELEGRAM_BOT_TOKEN="bot:fallback",
+        )
+        calls = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+        adapter._maybe_cc_to_human("ctx-2", "这个需要Rui拍板")
+        assert len(calls) == 1
+        assert "botbot:fallback" in calls[0][0].full_url
+
+    def test_no_forward_without_chat_id(self, monkeypatch):
+        adapter = self._adapter(monkeypatch, A2A_CC_KEYWORDS="决定", A2A_CC_BOT_TOKEN="bot:x")
+        calls = []
+        monkeypatch.setattr(urllib.request, "urlopen", lambda *a, **k: calls.append(a))
+        adapter._maybe_cc_to_human("ctx-3", "这事决定好了")
+        assert calls == []
+
+    def test_forward_failure_is_silent(self, monkeypatch):
+        adapter = self._adapter(
+            monkeypatch,
+            A2A_CC_KEYWORDS="决定",
+            A2A_CC_CHAT_ID="1",
+            A2A_CC_BOT_TOKEN="bot:x",
+        )
+        def boom(*a, **k):
+            raise OSError("network down")
+        monkeypatch.setattr(urllib.request, "urlopen", boom)
+        # Must not raise — CC is best-effort.
+        adapter._maybe_cc_to_human("ctx-4", "决定了")
+
+
 class TestReplyCapture:
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""
