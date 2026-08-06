@@ -21,6 +21,7 @@ class OutcomeState(Enum):
     PENDING = "pending"
     SUCCEEDED = "succeeded"
     RECOVERED = "recovered"
+    NO_WORK = "no_work"
     UNKNOWN = "unknown"
 
 
@@ -259,6 +260,8 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
             pending.append(_evidence("explicit_pending", path, value))
         elif normalized in _RECOVERED_VALUES:
             succeeded.append(_evidence("explicit_recovery", path, value))
+        elif normalized == "no_work":
+            succeeded.append(_evidence("explicit_no_work", path, value))
         elif normalized in _SUCCESS_VALUES:
             succeeded.append(_evidence("explicit_success", path, value))
 
@@ -308,8 +311,15 @@ def evaluate_outcome(event: Event) -> OutcomeVerdict:
 
     if succeeded:
         recovered = [item for item in succeeded if item.code == "explicit_recovery"]
+        no_work = [item for item in succeeded if item.code == "explicit_no_work"]
+        if no_work:
+            state = OutcomeState.NO_WORK
+        elif recovered:
+            state = OutcomeState.RECOVERED
+        else:
+            state = OutcomeState.SUCCEEDED
         return OutcomeVerdict(
-            state=OutcomeState.RECOVERED if recovered else OutcomeState.SUCCEEDED,
+            state=state,
             priority_floor=None,
             evidence=tuple(succeeded),
             failure_kind=None,
@@ -331,6 +341,6 @@ def marker_for_verdict(verdict: OutcomeVerdict, effective_priority: Priority) ->
         return "🔴" if effective_priority is Priority.CRITICAL else "🟠"
     if verdict.state is OutcomeState.DEGRADED:
         return "🟠"
-    if verdict.state in {OutcomeState.SUCCEEDED, OutcomeState.RECOVERED}:
+    if verdict.state in {OutcomeState.SUCCEEDED, OutcomeState.RECOVERED, OutcomeState.NO_WORK}:
         return "🟢"
     return "🟡"

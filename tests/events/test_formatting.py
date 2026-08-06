@@ -101,6 +101,7 @@ def test_format_whatsapp_header_gateway_health_up_is_green():
         ({"status": "healthy", "before": "down"}, Priority.HIGH,
          "🟢 RECOVERED "),
         ({"summary": "tick"}, Priority.LOW, "🟡 UNKNOWN "),
+        ({"reason": "no_work"}, Priority.LOW, "🟢 NO WORK "),
     ],
 )
 def test_verdict_header_has_consistent_marker_and_text_label(
@@ -115,6 +116,23 @@ def test_verdict_header_has_consistent_marker_and_text_label(
 
     assert format_header(e, verdict=route.verdict).startswith(expected)
     assert format_whatsapp_header(e, verdict=route.verdict).startswith(expected)
+
+
+def test_no_work_header_label_has_no_underscore():
+    event = _make_event(
+        EventType.AGENT_ITERATION,
+        priority=Priority.LOW,
+        source="critic",
+        payload={"agent": "critic", "reason": "no_work"},
+    )
+    route = classify(event)
+    header = format_header(event, verdict=route.verdict)
+    whatsapp_header = format_whatsapp_header(event, verdict=route.verdict)
+
+    for rendered in (header, whatsapp_header):
+        assert rendered.startswith("🟢 NO WORK ")
+        assert "NO_WORK" not in rendered
+        assert "UNKNOWN" not in rendered
 
 
 def test_failure_evidence_blocks_recovery_green():

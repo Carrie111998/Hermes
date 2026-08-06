@@ -106,6 +106,12 @@ def _event(
             "payload.status",
         ),
         (
+            {"reason": "no_work"},
+            OutcomeState.NO_WORK,
+            None,
+            "payload.reason",
+        ),
+        (
             {"summary": "ordinary telemetry"},
             OutcomeState.UNKNOWN,
             None,
@@ -215,3 +221,16 @@ def test_marker_table(payload, priority, expected):
     verdict = evaluate_outcome(_event(payload, priority=priority))
 
     assert marker_for_verdict(verdict, priority) == expected
+
+
+def test_no_work_reason_is_green_not_unknown():
+    verdict = evaluate_outcome(_event({"agent": "critic", "reason": "no_work"}))
+    assert verdict.state is OutcomeState.NO_WORK
+    assert marker_for_verdict(verdict, Priority.LOW) == "🟢"
+
+
+def test_no_work_yields_to_failure_evidence():
+    verdict = evaluate_outcome(
+        _event({"agent": "critic", "reason": "no_work", "status": "error"})
+    )
+    assert verdict.state is OutcomeState.FAILED

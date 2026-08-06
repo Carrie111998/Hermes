@@ -10,7 +10,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from events.outcomes import OutcomeVerdict, marker_for_verdict
+from events.outcomes import OutcomeState, OutcomeVerdict, marker_for_verdict
 from events.schema import Event, EventType, Priority
 
 # Priority -> colored dot (matches severity)
@@ -245,6 +245,11 @@ def _short_time(iso_ts: str) -> str:
         return iso_ts
 
 
+_STATE_LABELS = {
+    OutcomeState.NO_WORK: "NO WORK",
+}
+
+
 def format_header(
     event: Event,
     verdict: OutcomeVerdict | None = None,
@@ -256,7 +261,11 @@ def format_header(
     Legacy callers that omit ``verdict`` retain the historical unlabeled header.
     """
     dot = header_dot(event, verdict)
-    label = f" {verdict.state.value.upper()}" if verdict is not None else ""
+    label = (
+        f" {_STATE_LABELS.get(verdict.state, verdict.state.value.upper())}"
+        if verdict is not None
+        else ""
+    )
     icon = event_icon(event)
     ts = _short_time(event.timestamp)
 
