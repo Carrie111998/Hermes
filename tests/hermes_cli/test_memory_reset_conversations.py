@@ -21,6 +21,13 @@ def _seed_home(tmp_path, monkeypatch):
     db.append_message("session-1", "user", "hello")
     db.create_session("session-2", "telegram")
     db.append_message("session-2", "assistant", "world")
+    db.set_session_archived("session-2", True)
+    db.create_session(
+        "session-child",
+        "tool",
+        parent_session_id="session-1",
+    )
+    db.append_message("session-child", "assistant", "delegated work")
     db.set_meta("memory-reset-preservation", "keep")
     db.save_gateway_routing_entry(
         "route-1",
@@ -104,8 +111,8 @@ def test_confirmation_denied_leaves_everything_untouched(
 
     db = SessionDB(home / "state.db")
     try:
-        assert db.session_count(include_archived=True) == 2
-        assert db.message_count() == 2
+        assert db.session_count(include_archived=True) == 3
+        assert db.message_count() == 3
         assert db.get_meta("memory-reset-preservation") == "keep"
     finally:
         db.close()
