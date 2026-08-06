@@ -45,6 +45,7 @@ from agent.turn_context import (
     reanchor_current_turn_user_idx,
 )
 from agent.turn_retry_state import TurnRetryState
+from agent.memory_manager import neutralize_user_forged_memory_context
 from agent.runtime_cwd import resolve_agent_cwd
 from agent.message_sanitization import (
     close_interrupted_tool_sequence,
@@ -1615,22 +1616,42 @@ def run_conversation(
             # never mutated beyond the api_content stamp, so nothing leaks
             # into the clean transcript content.
             if idx == current_turn_user_idx and msg.get("role") == "user":
-                if isinstance(_api_content, str) and _api_content:
+                _base = api_msg.get("content", "")
+                _composed = compose_user_api_content(
+                    (
+                        neutralize_user_forged_memory_context(_base)
+                        if isinstance(_base, str)
+                        else _base
+                    ),
+                    _ext_prefetch_cache,
+                    _plugin_user_context,
+                )
+                if _composed is not None:
+                    api_msg["content"] = _composed
+                    # The prologue stamps its composition before this outbound
+                    # fencing step. Keep the persisted sidecar equal to the
+                    # actual wire bytes so a resumed turn preserves the cache
+                    # prefix; MoA deliberately has no stable sidecar.
+                    if not moa_config and _composed != _api_content:
+                        msg["api_content"] = _composed
+                        _db = getattr(agent, "_session_db", None)
+                        if _db is not None:
+                            try:
+                                _db.set_latest_user_api_content(
+                                    agent.session_id, msg.get("content"), _composed
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "memory-context api_content backfill failed "
+                                    "for session=%s",
+                                    agent.session_id or "none",
+                                    exc_info=True,
+                                )
+                elif isinstance(_api_content, str) and _api_content:
                     # Stamped by the prologue from the same composition —
                     # reuse it so the persisted sidecar and the wire cannot
-                    # drift, and so every pass this turn sends identical
-                    # bytes (composed from msg["content"], never from a
-                    # previously-injected copy).
+                    # drift, and so every pass this turn sends identical bytes.
                     api_msg["content"] = _api_content
-                else:
-                    # Callers that bypass the prologue stamping: compose live.
-                    _composed = compose_user_api_content(
-                        api_msg.get("content", ""),
-                        _ext_prefetch_cache,
-                        _plugin_user_context,
-                    )
-                    if _composed is not None:
-                        api_msg["content"] = _composed
             elif (
                 isinstance(_api_content, str)
                 and _api_content
