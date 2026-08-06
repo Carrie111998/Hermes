@@ -903,7 +903,13 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            #
+            # One exception: the sample comes from `head -c 1000` (bytes), so
+            # when the 1000-byte cut lands mid-way through a multi-byte UTF-8
+            # char the partial char decodes to a trailing U+FFFD — a sampling
+            # artifact, not evidence of binary content (every CJK-heavy file
+            # would otherwise false-positive). Scan everything but the tail.
+            if content_sample and "\ufffd" in content_sample[:-1]:
                 return True
             non_printable = sum(1 for c in content_sample[:1000]
                                if ord(c) < 32 and c not in '\n\r\t')

@@ -673,3 +673,14 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_char_is_truncation_artifact(self, tmp_path):
+        """A U+FFFD only at the END of the sample is a `head -c 1000` cut
+        landing mid-way through a multi-byte UTF-8 char — a sampling artifact,
+        not evidence of binary content. CJK-heavy files hit this constantly."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Multi-byte content whose final char got truncated by the byte cut.
+        truncated = "单价" * 300 + "\ufffd"
+        assert ops._is_likely_binary("menu.md", truncated) is False
+        # Sanity: the same file's REAL corruption is still caught (mid-sample).
+        assert ops._is_likely_binary("menu.md", "正常\ufffd后半") is True
