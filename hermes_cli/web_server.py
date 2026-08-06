@@ -11202,6 +11202,7 @@ _session_db_bootstrap_lock = threading.Lock()
 _SESSION_DB_READ_PROBE_SQL = (
     "SELECT (SELECT archived FROM sessions LIMIT 1), "
     "(SELECT pinned FROM sessions LIMIT 1), "
+    "(SELECT last_read_at FROM sessions LIMIT 1), "
     "(SELECT active FROM messages LIMIT 1), "
     "(SELECT compacted FROM messages LIMIT 1)"
 )
