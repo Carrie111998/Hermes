@@ -239,6 +239,19 @@ class TestSystemdServiceRefresh:
 
         monkeypatch.setattr("gateway.run.start_gateway", fake_start_gateway)
 
+        # run_gateway() ALWAYS ends in _exit_after_graceful_shutdown(), which is
+        # os._exit() by design (#53107 — don't join wedged non-daemon threads).
+        # Unstubbed, that terminates the pytest process itself with status 0:
+        # the rest of the file silently never runs and the suite still reports
+        # success. Neutralize it like tests/hermes_cli/test_gateway.py does.
+        def _fake_exit(code):
+            if code:
+                raise SystemExit(code)
+
+        monkeypatch.setattr(
+            "gateway.run._exit_after_graceful_shutdown", _fake_exit
+        )
+
         gateway_cli.run_gateway()
 
         assert unit_path.read_text(encoding="utf-8") == "new unit\n"
