@@ -2,6 +2,7 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
+import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -297,6 +298,13 @@ export function useSessionActions({
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
+      // A fresh chat takes the screen: the terminal's persisted takeover flag
+      // (⌃` / the statusbar toggle) must not keep the pane fronted over the
+      // new session — otherwise New Session / ⌘N bounces straight back to the
+      // terminal. The terminal itself stays alive (tool panels collapse to a
+      // rail, PTYs are never torn down); only the fronting flag is cleared.
+      setTerminalTakeover(false)
+      revealTreePane('workspace')
       // Clear the durable route intent synchronously, before React Router
       // publishes /new. Submit uses that intent to heal an existing-session
       // rebind race, so leaving the old id here could revive it on a very fast

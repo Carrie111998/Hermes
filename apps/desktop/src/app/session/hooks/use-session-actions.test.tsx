@@ -3,6 +3,7 @@ import type { MutableRefObject } from 'react'
 import { useEffect } from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { $terminalTakeover, setTerminalTakeover } from '@/app/right-sidebar/store'
 import { noteActiveTreeGroup, revealTreePane } from '@/components/pane-shell/tree/store'
 import { getSession, getSessionMessages, type SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
@@ -431,6 +432,26 @@ describe('startFreshSessionDraft', () => {
     expect(navigate).not.toHaveBeenCalled()
     expect($currentCwd.get()).toBe('')
     expect($newChatWorkspaceTarget.get()).toBeNull()
+  })
+
+  it('clears the terminal takeover so the fresh chat takes the screen', async () => {
+    // Regression: a persisted terminal takeover (⌃` / statusbar toggle) kept
+    // the terminal pane fronted after New Session / ⌘N, bouncing the user
+    // straight back to the terminal. A fresh chat must collapse the pane to
+    // its rail (PTYs stay alive) and surface the new session.
+    const navigate = vi.fn()
+    const requestGateway = vi.fn(async () => ({}) as never)
+    let handle: HarnessHandle | null = null
+
+    setTerminalTakeover(true)
+    expect($terminalTakeover.get()).toBe(true)
+
+    render(<Harness navigate={navigate} onReady={value => (handle = value)} requestGateway={requestGateway} />)
+    await waitFor(() => expect(handle).not.toBeNull())
+
+    act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
+
+    expect($terminalTakeover.get()).toBe(false)
   })
 })
 
