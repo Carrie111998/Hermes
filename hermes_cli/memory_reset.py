@@ -30,27 +30,39 @@ def _close_db(db: Any) -> None:
 
 
 def _get_running_gateway_pid(hermes_home: Path) -> int | None:
-    """Return the live gateway PID associated with the target Hermes home.
+    """Return a gateway PID that may be using the target profile's state.
 
-    Use the repository's complete liveness ladder rather than checking only
-    ``gateway.pid``: launch-service-managed gateways can remain live with only
-    ``gateway_state.json`` available. ``profile_dir`` also prevents one
-    profile's reset from being blocked by another profile's gateway.
+    Check both the target profile home and the Hermes root. A root gateway can
+    multiplex several isolated profiles while keeping its PID/runtime-status
+    files at the root, so checking only ``<profile>/gateway.pid`` can miss the
+    exact writer this destructive command needs to exclude.
 
-    A running gateway whose liveness source cannot expose a host PID returns
-    ``_UNKNOWN_RUNNING_PID`` so the destructive command still fails closed.
+    The repository's full liveness ladder catches launch-service-managed
+    gateways that have runtime status but no usable PID file. A running gateway
+    whose liveness source cannot expose a host PID returns
+    ``_UNKNOWN_RUNNING_PID`` so reset still fails closed.
     """
     from gateway.status import resolve_gateway_liveness
+    from hermes_constants import get_default_hermes_root
 
-    liveness = resolve_gateway_liveness(
-        profile_dir=hermes_home,
-        use_cache=False,
-    )
-    if liveness.probe_error and not liveness.running:
-        raise RuntimeError("gateway liveness probe was inconclusive")
-    if not liveness.running:
-        return None
-    return liveness.pid if liveness.pid is not None else _UNKNOWN_RUNNING_PID
+    homes: list[Path] = []
+    for candidate in (hermes_home, get_default_hermes_root()):
+        canonical = candidate.expanduser().resolve(strict=False)
+        if canonical not in homes:
+            homes.append(canonical)
+
+    for candidate in homes:
+        liveness = resolve_gateway_liveness(
+            profile_dir=candidate,
+            use_cache=False,
+        )
+        if liveness.running:
+            return liveness.pid if liveness.pid is not None else _UNKNOWN_RUNNING_PID
+        if liveness.probe_error:
+            raise RuntimeError(
+                f"gateway liveness probe was inconclusive for {candidate}"
+            )
+    return None
 
 
 def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
@@ -186,7 +198,7 @@ def cmd_memory_reset(args: Any) -> int:
     if running_pid is not None:
         pid_detail = f" (PID {running_pid})" if running_pid else ""
         print(
-            f"\n  ✗ The gateway is running{pid_detail}. "
+            f"\n  ✗ A gateway that may use this profile is running{pid_detail}. "
             "Stop it before clearing conversation history:\n"
             "      hermes gateway stop\n"
         )
