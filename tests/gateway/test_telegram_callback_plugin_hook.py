@@ -9,6 +9,18 @@ from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+class _RaisingEq:
+    def __eq__(self, other):
+        raise RuntimeError("malformed action comparison")
+
+
+class _PostValidationActionDict(dict):
+    def __getitem__(self, key):
+        if key == "action":
+            raise RuntimeError("post-validation action access")
+        return super().__getitem__(key)
+
+
 def _make_adapter() -> TelegramAdapter:
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     adapter._bot = AsyncMock()
@@ -175,12 +187,16 @@ async def test_remove_keyboard_only_uses_reply_markup_edit(monkeypatch, message)
     "result",
     [
         "handled",
+        {"action": _RaisingEq()},
+        _PostValidationActionDict(action="handled"),
         {"action": "handled", "answer": 123},
         {"action": "handled", "answer": None},
+        {"action": "handled", "answer": "\ud800"},
         {"action": "handled", "remove_keyboard": "yes"},
         {"action": "handled", "remove_keyboard": None},
         {"action": "handled", "edit_text": ""},
         {"action": "handled", "edit_text": None},
+        {"action": "handled", "edit_text": "\ud800"},
         {"action": "handled", "unexpected": True},
         {"action": "allow", "answer": "nope"},
     ],

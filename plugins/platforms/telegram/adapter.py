@@ -6310,9 +6310,11 @@ class TelegramAdapter(BasePlatformAdapter):
     @staticmethod
     def _valid_plugin_callback_result(result: Any) -> bool:
         """Validate the narrow result contract for callback-query plugins."""
-        if not isinstance(result, dict):
+        if type(result) is not dict:
             return False
         action = result.get("action")
+        if type(action) is not str:
+            return False
         if action == "unhandled":
             return set(result) == {"action"}
         if action != "handled":
@@ -6323,15 +6325,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         if "answer" in result:
             answer = result["answer"]
-            if not isinstance(answer, str) or utf16_len(answer) > 200:
+            if type(answer) is not str:
+                return False
+            try:
+                if utf16_len(answer) > 200:
+                    return False
+            except Exception:
                 return False
         if "edit_text" in result:
             edit_text = result["edit_text"]
-            if (
-                not isinstance(edit_text, str)
-                or not edit_text
-                or utf16_len(edit_text) > TelegramAdapter.MAX_MESSAGE_LENGTH
-            ):
+            if type(edit_text) is not str or not edit_text:
+                return False
+            try:
+                if utf16_len(edit_text) > TelegramAdapter.MAX_MESSAGE_LENGTH:
+                    return False
+            except Exception:
                 return False
         if "remove_keyboard" in result and type(result["remove_keyboard"]) is not bool:
             return False
@@ -6403,7 +6411,15 @@ class TelegramAdapter(BasePlatformAdapter):
 
         handled = None
         for result in results:
-            if not self._valid_plugin_callback_result(result):
+            try:
+                valid_result = self._valid_plugin_callback_result(result)
+            except Exception:
+                valid_result = False
+                logger.warning(
+                    "[Telegram] Plugin callback result validation failed",
+                    exc_info=True,
+                )
+            if not valid_result:
                 logger.warning(
                     "[Telegram] Ignoring malformed telegram_callback_query result"
                 )
