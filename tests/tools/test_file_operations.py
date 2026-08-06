@@ -304,7 +304,7 @@ class TestShellFileOpsHelpers:
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
-            if command.startswith("head -c"):
+            if command.startswith("python -c"):
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
@@ -318,7 +318,11 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        # Binary sampling now goes through a Python snippet (character-safe
+        # UTF-8 head) instead of `head -c 1000` (byte-truncating, misjudged
+        # CJK files whose 1000-byte boundary split a 3-byte char).
+        assert commands[1].startswith("python -c ")
+        assert "C:/Users/alice/notes.txt" in commands[1]
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 

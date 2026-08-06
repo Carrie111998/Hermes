@@ -881,7 +881,60 @@ class ShellFileOperations(FileOperations):
             result = self._exec(f"command -v {cmd} >/dev/null 2>&1 && echo 'yes'")
             self._command_cache[cmd] = result.stdout.strip() == 'yes'
         return self._command_cache[cmd]
-    
+
+    def _sample_text_head(self, path: str) -> str:
+        """Sample the head of a file for binary detection without cutting a
+        multi-byte character in half.
+
+        The old ``head -c 1000`` sampled raw bytes; for UTF-8 files whose
+        byte-1000 boundary lands inside a 3-byte CJK char, the terminal env
+        decodes stdout with errors="replace", turning the dangling tail into
+        U+FFFD — and _is_likely_binary's U+FFFD guard then misclassified a
+        perfectly valid text file as binary. Reading via Python's text
+        decode backs off up to 3 bytes on a truncated sequence so the
+        sample always ends on a character boundary. Genuinely non-UTF-8
+        files (GBK etc.) still fail decode and yield U+FFFD, so the
+        existing binary protection holds. Mirrors _python_delete's
+        repr-embedded cross-shell snippet pattern.
+        """
+        if path.startswith("/") and len(path) > 2 and path[1].isalpha() \
+                and path[2] == "/":
+            # bash-style /c/Users/... → C:/Users/... for the native Windows
+            # interpreter; pathlib on Windows doesn't understand MSYS mounts.
+            path = path[1].upper() + ":/" + path[3:]
+        # Forward slashes only: _escape_shell_arg runs the snippet through
+        # _bash_safe_path, which rewrites backslashes (breaking repr'd
+        # paths AND the '\ufffd' escape). chr(0xFFFD) keeps the fallback
+        # marker backslash-free too.
+        snippet = (
+            "import pathlib, sys\n"
+            f"p = pathlib.Path({path.replace(chr(92), '/')!r})\n"
+            "try:\n"
+            "    data = p.read_bytes()[:1000]\n"
+            "except OSError:\n"
+            "    sys.exit(2)\n"
+            "s = None\n"
+            "for cut in range(4):\n"
+            "    try:\n"
+            "        s = data[:len(data) - cut].decode('utf-8')\n"
+            "        break\n"
+            "    except UnicodeDecodeError:\n"
+            "        continue\n"
+            "if s is None:\n"
+            "    s = chr(0xFFFD)\n"
+            # buffer.write bypasses any locale-dependent stdout encoding
+            "sys.stdout.buffer.write(s.encode('utf-8'))\n"
+        )
+        result = self._exec(f"python -c {self._escape_shell_arg(snippet)}")
+        if result.exit_code != 0:
+            result = self._exec(f"python3 -c {self._escape_shell_arg(snippet)}")
+        if result.exit_code != 0:
+            # Sampling failed entirely (missing interpreter, unreadable
+            # file…). Return U+FFFD so _is_likely_binary errs toward
+            # binary (safe) — never silently treat an unknown file as text.
+            return "\ufffd"
+        return _strip_terminal_fence_leaks(result.stdout)
+
     def _is_likely_binary(self, path: str, content_sample: str = None) -> bool:
         """
         Check if a file is likely binary.
@@ -1189,9 +1242,7 @@ class ShellFileOperations(FileOperations):
             )
         
         # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
-        sample_result = self._exec(sample_cmd)
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._sample_text_head(path)
         
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
@@ -1307,8 +1358,7 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
-        sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
+        sample_output = self._sample_text_head(path)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(
                 is_binary=True, file_size=file_size,
