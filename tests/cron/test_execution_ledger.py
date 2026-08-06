@@ -165,6 +165,53 @@ def test_restart_marks_interrupted_execution_unknown_without_requeue(tmp_path):
     assert [r["status"] for r in records] == ["unknown"]
 
 
+def test_execution_create_failure_releases_guard_and_job_refires(monkeypatch, caplog):
+    import concurrent.futures
+
+    import cron.scheduler as scheduler
+
+    class ImmediatePool:
+        def submit(self, callback):
+            future = concurrent.futures.Future()
+            try:
+                future.set_result(callback())
+            except BaseException as exc:
+                future.set_exception(exc)
+            return future
+
+    attempts = []
+
+    def create_execution(job_id, *, source):
+        attempts.append((job_id, source))
+        if len(attempts) == 1:
+            raise OSError("disk I/O error")
+        return {"id": "exec-after-recovery"}
+
+    job = {"id": "ledger-create-fail", "name": "ledger-create-fail"}
+    monkeypatch.setattr(scheduler, "create_execution", create_execution)
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: [job])
+    monkeypatch.setattr(scheduler, "advance_next_run", lambda _job_id: None)
+    monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda _workers: ImmediatePool())
+    monkeypatch.setattr(scheduler, "run_one_job", lambda *_args, **_kwargs: True)
+    scheduler._running_job_ids.discard(job["id"])
+
+    try:
+        with caplog.at_level("ERROR", logger="cron.scheduler"):
+            assert scheduler.tick(verbose=False, sync=False) == 0
+
+        assert job["id"] not in scheduler.get_running_job_ids()
+        assert "execution record could not be created" in caplog.text
+        assert "disk I/O error" in caplog.text
+
+        assert scheduler.tick(verbose=False, sync=False) == 1
+        assert attempts == [
+            (job["id"], "builtin"),
+            (job["id"], "builtin"),
+        ]
+    finally:
+        scheduler._running_job_ids.discard(job["id"])
+
+
 def test_generic_submit_failure_finishes_attempt_and_releases_guard(monkeypatch):
     import cron.scheduler as scheduler
 
