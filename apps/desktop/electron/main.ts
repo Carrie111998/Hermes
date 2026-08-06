@@ -564,8 +564,30 @@ function resolveHermesHome() {
     const localappdata = path.join(process.env.LOCALAPPDATA, 'hermes')
     const legacy = path.join(app.getPath('home'), '.hermes')
 
-    // Migrate transparently to LOCALAPPDATA, but honour an existing legacy
-    // ~/.hermes setup (no LOCALAPPDATA install yet) so users don't lose state.
+    // Decide by actual data, not bare directory existence. The installer
+    // creates %LOCALAPPDATA%\hermes before the Electron app first runs,
+    // so directoryExists(localappdata) is always true post-install and the
+    // legacy branch is never reached — silently orphaning an existing CLI
+    // setup with sessions, config, skills and memories (#40178).
+    //
+    // An established desktop install (state.db present) always wins — never
+    // hijack back to legacy. If only legacy has real data, honour the
+    // CLI-first user's setup. Fresh installs preserve the original
+    // heuristic (legacy dir without LOCALAPPDATA, else LOCALAPPDATA).
+    const localDb = path.join(localappdata, 'state.db')
+    const legacyDb = path.join(legacy, 'state.db')
+    const localHasData = fileExists(localDb)
+    const legacyHasData = fileExists(legacyDb)
+
+    if (localHasData) {
+      return localappdata
+    }
+
+    if (legacyHasData) {
+      return legacy
+    }
+
+    // Neither has real data — fresh install. Preserve original heuristic.
     if (!directoryExists(localappdata) && directoryExists(legacy)) {
       return legacy
     }
