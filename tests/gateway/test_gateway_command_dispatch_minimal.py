@@ -129,3 +129,18 @@ async def test_idle_queue_sends_payload_as_next_turn(command_text):
     assert runner._running_agents == {}
 
 
+@pytest.mark.asyncio
+async def test_rename_resolves_through_real_gateway_dispatch():
+    runner, adapter = _make_runner()
+    adapter.rename_dm_topic = AsyncMock()
+    event = _make_event("/rename Fleet topic")
+    event.source.thread_id = "thread-9"
+
+    result = await runner._handle_message(event)
+
+    assert result == "Renamed this Telegram topic to “Fleet topic”."
+    adapter.rename_dm_topic.assert_awaited_once_with(
+        chat_id="c1",
+        thread_id="thread-9",
+        name="Fleet topic",
+    )

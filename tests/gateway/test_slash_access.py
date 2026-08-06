@@ -32,7 +32,6 @@ class TestPolicyFromExtra:
         assert p.is_admin("anyone") is True
         assert p.can_run("anyone", "stop") is True
 
-
     def test_id_coercion_ints_become_strings(self):
         # YAML often loads numeric IDs as ints; we stringify on ingest.
         p = policy_from_extra({"allow_admin_from": [12345, 67890]}, "dm")
