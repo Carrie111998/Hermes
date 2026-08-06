@@ -32,7 +32,6 @@ import {
   $connection,
   $currentCwd,
   $sessions,
-  ensureBootCwdDeterminism,
   ensureDefaultWorkspaceCwd,
   setConnection,
   setCurrentBranch,
@@ -269,21 +268,8 @@ export function useGatewayBoot({
 
     // Seed the working dir from the backend default on a fresh view (nothing
     // open yet). Shared by boot + soft switch.
-    async function seedDefaultCwd({ boot = false }: { boot?: boolean } = {}) {
+    async function seedDefaultCwd() {
       await ensureDefaultWorkspaceCwd()
-
-      // Boot determinism: route-resume can set $activeSessionId before this
-      // seed runs on slow starts, which makes ensureDefaultWorkspaceCwd skip
-      // the configured default (its guard protects LIVE sessions — settings
-      // saves, soft gateway switches). At boot nothing is live yet, so apply
-      // the configured default when the cwd is still the remembered value —
-      // the boot workspace is deterministic instead of race-dependent. A
-      // resumed session's own cwd supersedes this when its runtime arrives.
-      // Local mode only — a remote backend owns its own default workspace.
-      if (boot && $connection.get()?.mode !== 'remote') {
-        ensureBootCwdDeterminism()
-      }
-
       const remoteDefault = await desktopDefaultCwd().catch(() => null)
 
       if (remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
@@ -514,6 +500,15 @@ export function useGatewayBoot({
           progress: 95
         })
         publish(conn)
+        // Seed the workspace BEFORE the gateway opens. route-resume (and every
+        // other session-restore path) is gated on gatewayState === 'open', so
+        // no session can be active yet: ensureDefaultWorkspaceCwd's live-session
+        // guard passes and the configured default project dir is applied
+        // deterministically — it cannot lose a race with a session restore the
+        // way the post-connect seed could on slow starts (#71873). A resumed
+        // session's own cwd supersedes this once its runtime arrives.
+        await ensureDefaultWorkspaceCwd()
+
         // Mint a fresh WS URL right before connecting. For OAuth gateways the
         // ticket is single-use with a short TTL, so the ticket baked into
         // conn.wsUrl is stale; resolveGatewayWsUrl() re-mints it rather than
@@ -540,7 +535,7 @@ export function useGatewayBoot({
         })
 
         await Promise.all([
-          seedDefaultCwd({ boot: true }),
+          seedDefaultCwd(),
           callbacksRef.current.refreshHermesConfig(),
           // Session-list population is never boot-fatal. The gateway WS is
           // already open by this point — a failed sidebar fetch (transient
