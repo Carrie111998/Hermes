@@ -56,6 +56,8 @@ class StatusBarMixin:
         ``/battery status`` reports the current setting plus a live reading.
         The choice is persisted to ``display.battery`` so it survives restarts.
         """
+        from cli import save_config_value
+
         parts = (cmd_original or "").split()
         arg = parts[1].strip().lower() if len(parts) > 1 else ""
 
