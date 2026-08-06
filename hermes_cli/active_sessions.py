@@ -384,6 +384,56 @@ def _prune_dead(
     return live
 
 
+def current_repo_root(start: Optional[Path] = None) -> Optional[str]:
+    """Return the enclosing git checkout for ``start``, or None if there is none.
+
+    Walks up looking for ``.git`` rather than shelling out to ``git``: this runs
+    on every session start, and a subprocess per session is a poor trade for a
+    field that is advisory.  ``.git`` is a file (not a directory) inside linked
+    worktrees, which is why this tests existence rather than is_dir -- sessions
+    in two worktrees of one repo are exactly the case #46303 is about.
+    """
+    try:
+        current = (start or Path.cwd()).resolve()
+    except OSError:
+        return None
+    for candidate in (current, *current.parents):
+        if (candidate / ".git").exists():
+            return str(candidate)
+    return None
+
+
+def find_sessions_for_repo(
+    repo_root: Any, *, exclude_lease_id: Optional[str] = None
+) -> list[dict[str, Any]]:
+    """Return live registry entries attached to the same checkout.
+
+    Answers the question #46303 opens with -- "is another session already
+    working in this repo?" -- which no caller could ask before, because the
+    registry was only written when ``max_concurrent_sessions`` was set.
+    """
+    try:
+        wanted = str(Path(repo_root).resolve())
+    except (OSError, TypeError):
+        return []
+    matches = []
+    for entry in active_session_registry_snapshot():
+        if exclude_lease_id and str(entry.get("lease_id") or "") == exclude_lease_id:
+            continue
+        metadata = entry.get("metadata")
+        if not isinstance(metadata, dict):
+            continue
+        recorded = metadata.get("repo_root")
+        if not recorded:
+            continue
+        try:
+            if str(Path(recorded).resolve()) == wanted:
+                matches.append(entry)
+        except OSError:
+            continue
+    return matches
+
+
 @dataclass
 class ActiveSessionLease:
     lease_id: str
@@ -427,10 +477,16 @@ def _lease_entry(
     }
     if track_liveness:
         entry["track_liveness"] = True
-    if metadata:
-        entry["metadata"] = {
-            str(k): v for k, v in metadata.items() if isinstance(k, str)
-        }
+    entry_metadata = {
+        str(k): v for k, v in (metadata or {}).items() if isinstance(k, str)
+    }
+    # Repo attribution is what makes "is another session already attached to
+    # this checkout?" answerable at all (#46303).  Recorded by default rather
+    # than by caller opt-in so every surface gets it without threading it
+    # through three separate call sites; an explicit metadata repo_root wins.
+    entry_metadata.setdefault("repo_root", current_repo_root())
+    if entry_metadata:
+        entry["metadata"] = entry_metadata
     return entry
 
 
@@ -442,18 +498,23 @@ def try_acquire_active_session(
     metadata: Optional[dict[str, Any]] = None,
     registry_home: str | Path | None = None,
     track_liveness: bool = False,
+    record_presence: bool = False,
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot.
 
-    Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()`` unless
-    ``track_liveness`` is true.  Liveness tracking keeps a real lease without
-    imposing a concurrency cap; ``registry_home`` lets profile-scoped backends
-    share the owning profile's registry even when launched from another home.
+    For a surface that opts in with ``record_presence``, a ``None`` cap means
+    "reject nobody", not "know nobody" (#46303): the lease entry is recorded
+    either way and only *enforcement* stays conditional on the cap, so the
+    registry can answer "is another session already attached to this checkout?"
+    even where no cap is set.  Unlike ``track_liveness`` this is advisory --
+    it never makes an ownership decision, so it stays best-effort rather than
+    failing closed.  ``track_liveness`` additionally makes ownership decisions
+    fail closed, and ``registry_home`` lets profile-scoped backends share the
+    owning profile's registry even when launched from another home.
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None and not track_liveness:
+    if max_sessions is None and not track_liveness and not record_presence:
         return ActiveSessionLease(
             lease_id=lease_id,
             session_id=session_id,
@@ -470,42 +531,59 @@ def try_acquire_active_session(
     )
 
     state_path, lock_path = _lease_paths(registry_home=registry_home)
-    with _FileLock(lock_path):
-        try:
-            raw_entries = _read_entries(state_path, strict=True)
-            entries = _prune_dead(raw_entries, strict=track_liveness)
-        except ActiveSessionRegistryError:
-            if track_liveness:
-                raise
-            logger.warning(
-                "Active-session registry is unavailable; allowing an "
-                "untracked session without overwriting it"
-            )
-            return ActiveSessionLease(
-                lease_id=lease_id,
-                session_id=session_id,
-                surface=surface,
-                enabled=False,
-                state_path=state_path,
-                lock_path=lock_path,
-            ), None
-        pruned = len(raw_entries) - len(entries)
-        if pruned:
-            logger.info("Pruned %d stale active session lease(s)", pruned)
-        active_count = len(entries)
-        if max_sessions is not None and active_count >= max_sessions:
+    try:
+        with _FileLock(lock_path):
+            try:
+                raw_entries = _read_entries(state_path, strict=True)
+                entries = _prune_dead(raw_entries, strict=track_liveness)
+            except ActiveSessionRegistryError:
+                if track_liveness:
+                    raise
+                logger.warning(
+                    "Active-session registry is unavailable; allowing an "
+                    "untracked session without overwriting it"
+                )
+                return ActiveSessionLease(
+                    lease_id=lease_id,
+                    session_id=session_id,
+                    surface=surface,
+                    enabled=False,
+                    state_path=state_path,
+                    lock_path=lock_path,
+                ), None
+            pruned = len(raw_entries) - len(entries)
+            if pruned:
+                logger.info("Pruned %d stale active session lease(s)", pruned)
+            active_count = len(entries)
+            if max_sessions is not None and active_count >= max_sessions:
+                _write_entries(state_path, entries)
+                logger.info(
+                    "Active session limit reached: active=%d max=%d surface=%s",
+                    active_count,
+                    max_sessions,
+                    surface,
+                )
+                return None, active_session_limit_message(
+                    active_count, max_sessions, entries
+                )
+            entries.append(entry)
             _write_entries(state_path, entries)
-            logger.info(
-                "Active session limit reached: active=%d max=%d surface=%s",
-                active_count,
-                max_sessions,
-                surface,
-            )
-            return None, active_session_limit_message(
-                active_count, max_sessions, entries
-            )
-        entries.append(entry)
-        _write_entries(state_path, entries)
+    except OSError as exc:
+        # Presence tracking is strictly best-effort: it now runs for surfaces
+        # that set no cap at all, so a read-only or otherwise unwritable
+        # registry must never keep a user from starting a session.
+        # Liveness tracking is the one caller that must still fail closed --
+        # it makes ownership decisions, so a silent no-op lease there would be
+        # worse than an error.
+        if track_liveness:
+            raise
+        logger.warning("Failed to record active session presence: %s", exc)
+        return ActiveSessionLease(
+            lease_id=lease_id,
+            session_id=str(session_id),
+            surface=str(surface),
+            enabled=False,
+        ), None
 
     return ActiveSessionLease(
         lease_id=lease_id,

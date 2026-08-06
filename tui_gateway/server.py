@@ -662,6 +662,7 @@ def _claim_active_session_slot(
             metadata={"live_session_id": live_session_id},
             registry_home=profile_home,
             track_liveness=track_liveness,
+            record_presence=True,
         )
     except Exception as exc:
         logger.warning("Failed to claim active session slot: %s", exc)

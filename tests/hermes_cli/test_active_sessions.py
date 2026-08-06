@@ -560,3 +560,142 @@ def test_release_wins_against_transfer_waiting_on_same_lease_lock(
     assert lease.released is True
     assert active_sessions.active_session_registry_snapshot() == []
 
+
+def test_registry_records_presence_when_cap_is_unset(tmp_path, monkeypatch):
+    """Presence tracking must not be gated on the session cap (#46303).
+
+    ``max_concurrent_sessions`` defaults to ``None``, so gating the registry
+    write on it means the registry is empty for almost every user -- and
+    "is another session attached to this repo?" is unanswerable exactly when
+    it matters. A ``None`` cap means "reject nobody", not "know nobody".
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="solo", surface="cli", config={}, record_presence=True
+    )
+
+    assert message is None
+    assert lease is not None
+    snapshot = active_sessions.active_session_registry_snapshot()
+    assert [entry["session_id"] for entry in snapshot] == ["solo"]
+
+    lease.release()
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
+def test_presence_recording_is_opt_in_for_uncapped_surfaces(tmp_path, monkeypatch):
+    """Uncapped surfaces that do not opt in keep the historical no-op lease.
+
+    Recording presence is a per-surface decision, not a global default: a
+    caller that neither sets a cap nor asks for presence must still get the
+    cheap no-op lease and write nothing, which is what
+    ``tests/tui_gateway/test_cross_process_orphan_ownership.py`` pins for the
+    tui gateway's own untracked path.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="untracked", surface="tui", config={}
+    )
+
+    assert message is None
+    assert lease is not None and lease.enabled is False
+    assert active_sessions.active_session_registry_snapshot() == []
+
+
+def test_uncapped_sessions_are_recorded_but_never_rejected(tmp_path, monkeypatch):
+    """Recording presence must not start enforcing a limit that isn't set."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    leases = []
+    for index in range(5):
+        lease, message = active_sessions.try_acquire_active_session(
+            session_id=f"s{index}", surface="cli", config={}, record_presence=True
+        )
+        assert message is None, f"uncapped session {index} was rejected"
+        assert lease is not None
+        leases.append(lease)
+
+    assert len(active_sessions.active_session_registry_snapshot()) == 5
+
+
+def test_entries_carry_repo_root_so_sessions_are_attributable(tmp_path, monkeypatch):
+    """A registry entry with no repo dimension cannot answer the #46303 question."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    repo_a = tmp_path / "repo_a"
+    (repo_a / ".git").mkdir(parents=True)
+    repo_b = tmp_path / "repo_b"
+    (repo_b / ".git").mkdir(parents=True)
+
+    monkeypatch.chdir(repo_a)
+    active_sessions.try_acquire_active_session(
+        session_id="in_a", surface="cli", config={}, record_presence=True
+    )
+    monkeypatch.chdir(repo_b)
+    active_sessions.try_acquire_active_session(
+        session_id="in_b", surface="desktop", config={}, record_presence=True
+    )
+
+    found = active_sessions.find_sessions_for_repo(repo_a)
+    assert [entry["session_id"] for entry in found] == ["in_a"]
+
+
+def test_registry_failure_never_blocks_session_start(tmp_path, monkeypatch):
+    """Presence tracking is best-effort: a broken registry must not stop a session."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+
+    def _boom(*args, **kwargs):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(active_sessions, "_write_entries", _boom)
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="degraded", surface="cli", config={}, record_presence=True
+    )
+
+    assert message is None
+    assert lease is not None
+    lease.release()
+
+
+def test_uncapped_lease_under_profile_home_override_releases_from_root(
+    tmp_path, monkeypatch
+):
+    """The two changes compose: presence is now recorded even with no cap
+    (#46303), and a lease must release from the registry it was acquired
+    against (#85431). Each existing test pins its own invariant with the other
+    lever off — the profile-override test sets ``max_concurrent_sessions``, and
+    the uncapped tests never enter a profile scope — so the case where an
+    UNCAPPED lease is released under a profile home override is untested by
+    both. Before #46303 it could not arise: an uncapped acquire returned a
+    no-op lease that recorded nothing and released nothing.
+    """
+    from hermes_constants import (
+        reset_hermes_home_override,
+        set_hermes_home_override,
+    )
+
+    root = tmp_path / "hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    # No cap at all — the lever the #85431 test leaves off.
+    lease, error = active_sessions.try_acquire_active_session(
+        session_id="agent:worker:telegram:dm:uncapped",
+        surface="gateway:telegram",
+        config={},
+        record_presence=True,
+    )
+    assert lease is not None and error is None
+
+    root_registry = root / "runtime" / "active_sessions.json"
+    assert root_registry.exists(), "uncapped acquire must still record presence"
+    assert len(active_sessions._read_entries(root_registry)) == 1
+
+    token = set_hermes_home_override(str(profile))
+    try:
+        lease.release()
+    finally:
+        reset_hermes_home_override(token)
+
+    assert lease.released is True
+    assert active_sessions._read_entries(root_registry) == []
+    assert not (profile / "runtime" / "active_sessions.json").exists()
