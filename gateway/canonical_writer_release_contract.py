@@ -517,6 +517,10 @@ def render_systemd_units(
         "",
         "[Service]",
         "Type=oneshot",
+        # Keep the successful invocation queryable until activation captures its
+        # exact journal identity.  The activation executor stops and removes this
+        # temporary unit in its mandatory cleanup path.
+        "RemainAfterExit=yes",
         f"User={spec.writer_user}",
         f"Group={spec.writer_group}",
         f"SupplementaryGroups={spec.projector_group}",
