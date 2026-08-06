@@ -903,11 +903,25 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            sample = content_sample[:1000]
+            # Sampling artifact carve-out: read_file samples with
+            # `head -c 1000`, which cuts at a BYTE boundary. A multibyte
+            # UTF-8 char split across that cut decodes to 1-3 U+FFFD at the
+            # END of the sample (4-byte char → ≤3 dangling bytes), so a
+            # trailing run of ≤3 is not evidence of binary content — Japanese
+            # and other non-ASCII UTF-8 files would otherwise be
+            # misclassified as binary. Genuine mojibake shows U+FFFD
+            # throughout the sample, not just at the tail, so only the
+            # trailing run is stripped before judging. A longer trailing run
+            # (≥4) is kept as binary (safe direction).
+            stripped = sample.rstrip("\ufffd")
+            if len(sample) - len(stripped) <= 3:
+                sample = stripped
+            if "\ufffd" in sample:
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sample
                                if ord(c) < 32 and c not in '\n\r\t')
-            return non_printable / min(len(content_sample), 1000) > 0.30
+            return non_printable / min(len(sample), 1000) > 0.30
         
         return False
     

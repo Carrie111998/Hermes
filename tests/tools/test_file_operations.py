@@ -673,3 +673,29 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_replacement_from_byte_cut_not_flagged(self, tmp_path):
+        """A U+FFFD at the END of a 1000-byte sample is a `head -c 1000`
+        truncation artifact (multibyte UTF-8 char split at the byte boundary),
+        not evidence the file is binary. Japanese UTF-8 files must not be
+        misclassified as binary."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # Japanese text whose 1000-byte sample ends mid-character: the last
+        # byte pair (\xe5\xbe = "自" cut in half) decodes to a trailing U+FFFD.
+        sample = "# サトシ（受付・ワークコーディネーター）運用メモ\n\nこのファイルは、SOUL.md から分離した作業手順の正本。SOULの指示に従い、該当する作業の前に読むこと。" + "テキスト" * 100 + "\uFFFD"
+        assert ops._is_likely_binary("notes.txt", sample) is False
+
+    def test_replacement_in_middle_still_flagged(self, tmp_path):
+        """Genuine mojibake shows U+FFFD throughout the sample (not just at
+        the tail) — such files must still be flagged binary (read-only)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # U+FFFD in the middle, not just at the end.
+        lossy = "caf\ufffd r\ufffdsum\ufffd\nmore text\n"
+        assert ops._is_likely_binary("notes.txt", lossy) is True
+
+    def test_long_trailing_replacement_run_still_flagged(self, tmp_path):
+        """A trailing U+FFFD run of 4+ is beyond any UTF-8 cut artifact
+        (max 3 dangling bytes) and must stay binary (safe direction)."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        assert ops._is_likely_binary("notes.txt", "plain\n" + "\ufffd" * 5) is True
+        assert ops._is_likely_binary("notes.txt", "plain\n" + "\ufffd" * 3) is False
