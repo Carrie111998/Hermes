@@ -37,6 +37,14 @@ logger = logging.getLogger(__name__)
 _active_worktree: Optional[Dict[str, str]] = None
 
 
+def set_active_worktree(wt_info: Optional[Dict[str, str]]) -> None:
+    """Set the active worktree. Called by cli.py main() instead of
+    ``global _active_worktree; _active_worktree = wt_info`` so the
+    rebinding happens in cli_git's namespace, not a stale cli.py copy."""
+    global _active_worktree
+    _active_worktree = wt_info
+
+
 def _normalize_git_bash_path(p: Optional[str]) -> Optional[str]:
     """Translate a Git Bash-style path (``/c/Users/...``) to the native
     Windows form (``C:\\Users\\...``) that Python's ``subprocess.Popen``

@@ -1420,6 +1420,7 @@ from cli_git import (
     _worktree_is_dirty,
     _worktree_lock_is_live,
     _worktree_merge_cache_path,
+    set_active_worktree,
 )
 
 
@@ -17035,7 +17036,9 @@ def main(
         python cli.py -w                         # Start in isolated git worktree
         python cli.py -w -q "Fix issue #123"     # Single query in worktree
     """
-    global _active_worktree
+    # _active_worktree is owned by cli_git; use the setter so the rebinding
+    # lands in cli_git's namespace, not a stale cli.py import copy.
+    from cli_git import set_active_worktree
 
     # Force UTF-8 stdio on Windows before any banner/print() runs — the
     # Rich console prints Unicode box-drawing characters that would
@@ -17076,7 +17079,7 @@ def main(
             _sync_base = CLI_CONFIG.get("worktree_sync", True)
             wt_info = _setup_worktree(sync_base=_sync_base)
             if wt_info:
-                _active_worktree = wt_info
+                set_active_worktree(wt_info)
                 os.environ["TERMINAL_CWD"] = wt_info["path"]
                 atexit.register(_cleanup_worktree, wt_info)
             else:
