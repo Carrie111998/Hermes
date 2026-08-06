@@ -356,6 +356,13 @@ def get_tool_definitions(
                 _is_dispatcher_owned_worker(),
                 profile_scope,
             )
+        else:
+            # Issue #79047: make cache bypass observable. The only normal
+            # quiet-mode bypass is an unresolved multiplex profile identity.
+            logger.info(
+                "tool_definitions cache bypassed: profile cache scope unresolved "
+                "(multiplex active but hermes_home identity could not be resolved)"
+            )
         cached = _tool_defs_cache.get(cache_key) if cache_key is not None else None
         if cached is not None:
             # Update _last_resolved_tool_names so downstream callers see

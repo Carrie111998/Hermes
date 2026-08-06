@@ -205,36 +205,109 @@ class TestCheckFnTransientFailureSuppression:
             reg.invalidate_check_fn_cache()
             _clear_tool_defs_cache()
 
-    def test_unscoped_multiplex_request_bypasses_cache(self, monkeypatch):
-        """An unknown profile must never share another request's cache entry."""
+    def test_unscoped_multiplex_default_profile_uses_cache(self, monkeypatch):
+        """The default profile in a multiplex gateway has no hermes_home
+        override, but it is still a valid, stable scope: the process Hermes
+        home.  It must share tool-def/check_fn cache across repeated turns
+        (#79047), not recompute every request."""
         import model_tools
         import tools.registry as reg
         from agent.secret_scope import set_multiplex_active
 
-        values = iter([True, False])
         definition_calls = {"n": 0}
 
-        def probe():
-            return next(values)
+        def available():
+            return True
 
         def compute_definitions(*_args, **_kwargs):
             definition_calls["n"] += 1
             return []
 
         set_multiplex_active(True)
+        # Ensure no per-turn profile override is in context.
+        monkeypatch.setattr(
+            "hermes_constants.get_hermes_home_override", lambda: None
+        )
         monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute_definitions)
         try:
-            assert reg._check_fn_cached(probe) is True
-            assert reg._check_fn_cached(probe) is False
-            assert not reg._check_fn_cache
+            assert reg._check_fn_cached(available) is True
+            assert reg._check_fn_cached(available) is True
+            assert len(reg._check_fn_cache) == 1
 
             model_tools.get_tool_definitions(quiet_mode=True)
             model_tools.get_tool_definitions(quiet_mode=True)
-            assert definition_calls["n"] == 2
-            assert not model_tools._tool_defs_cache
+            assert definition_calls["n"] == 1
+            assert len(model_tools._tool_defs_cache) == 1
         finally:
             set_multiplex_active(False)
             reg.invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+
+    def test_multiplex_profiles_do_not_share_tool_def_cache(self, monkeypatch, tmp_path):
+        """The default profile and an explicit profile override must keep
+        separate tool-def cache entries so a per-profile toolset does not leak
+        into another profile (#79047)."""
+        import model_tools
+        import tools.registry as reg
+        from agent.secret_scope import set_multiplex_active
+
+        seen = []
+
+        def compute_definitions(enabled_toolsets, disabled_toolsets, quiet_mode, **kwargs):
+            seen.append(enabled_toolsets)
+            return []
+
+        set_multiplex_active(True)
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", compute_definitions)
+
+        default_home = tmp_path / "default"
+        default_home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+
+        profile_a = tmp_path / "profiles" / "a"
+        profile_a.mkdir(parents=True)
+
+        try:
+            # Default profile call.
+            monkeypatch.setattr(
+                "hermes_constants.get_hermes_home_override", lambda: None
+            )
+            model_tools.get_tool_definitions(quiet_mode=True)
+
+            # Explicit profile override call.
+            monkeypatch.setattr(
+                "hermes_constants.get_hermes_home_override", lambda: str(profile_a)
+            )
+            model_tools.get_tool_definitions(quiet_mode=True)
+
+            assert len(model_tools._tool_defs_cache) == 2, (
+                "default profile and profile A must not share the same cache entry"
+            )
+        finally:
+            set_multiplex_active(False)
+            reg.invalidate_check_fn_cache()
+            model_tools._clear_tool_defs_cache()
+
+    def test_multiplex_bypass_logs_unresolved_scope(self, monkeypatch, caplog):
+        """When the cache is bypassed because the multiplex profile scope
+        could not be resolved, get_tool_definitions logs the exact reason
+        (#79047)."""
+        import logging
+        import model_tools
+        from agent.secret_scope import set_multiplex_active
+
+        set_multiplex_active(True)
+        monkeypatch.setattr(
+            model_tools, "check_fn_cache_scope", lambda: model_tools.CHECK_FN_CACHE_BYPASS
+        )
+        monkeypatch.setattr(model_tools, "_compute_tool_definitions", lambda *_a, **_kw: [])
+        try:
+            with caplog.at_level(logging.INFO, logger="model_tools"):
+                model_tools.get_tool_definitions(quiet_mode=True)
+            assert "tool_definitions cache bypassed" in caplog.text
+            assert "profile cache scope unresolved" in caplog.text
+        finally:
+            set_multiplex_active(False)
             model_tools._clear_tool_defs_cache()
 
     def test_profile_scoped_check_cache_is_bounded(self, monkeypatch):

@@ -250,18 +250,27 @@ def check_fn_cache_scope() -> Optional[str]:
     cache. A multiplex gateway installs a Hermes-home override for every
     profile turn, so the canonical profile key is the stable isolation
     boundary across repeated turns for that profile.
+
+    The default profile in a multiplex gateway has no context-local override
+    (it runs under the process's own HERMES_HOME). That is a stable, valid
+    scope: the default profile is the process Hermes home, not an unknown
+    profile that must bypass both cache layers (#79047).
     """
     try:
         from agent.secret_scope import is_multiplex_active
 
         if not is_multiplex_active():
             return None
-        from hermes_constants import get_hermes_home_override
+        from hermes_constants import get_hermes_home_override, get_process_hermes_home
 
         override = get_hermes_home_override()
-        if not override:
-            return CHECK_FN_CACHE_BYPASS
-        return str(Path(override).expanduser().resolve())
+        if override:
+            return str(Path(override).expanduser().resolve())
+        # Multiplex active, but this request is the default profile. Use the
+        # process home so tool-def and check_fn caches are shared across
+        # repeated default-profile turns rather than recomputing every turn
+        # (regression #79047).
+        return str(get_process_hermes_home().expanduser().resolve())
     except Exception:
         # Fail closed: bypass both cache layers rather than aliasing requests
         # whose multiplex profile identity could not be resolved.
