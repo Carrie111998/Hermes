@@ -11,6 +11,9 @@ from hermes_state import SessionDB
 
 
 _SEARCH_NEEDLE = "memoryresetneedle"
+_TELEGRAM_CHAT_ID = "208214988"
+_TELEGRAM_USER_ID = "208214988"
+_TELEGRAM_THREAD_ID = "17585"
 
 
 def _fts_schema_objects(home) -> set[tuple[str, str]]:
@@ -37,7 +40,7 @@ def _seed_home(tmp_path, monkeypatch):
     db = SessionDB(home / "state.db")
     db.create_session("session-1", "cli")
     db.append_message("session-1", "user", f"hello {_SEARCH_NEEDLE}")
-    db.create_session("session-2", "telegram")
+    db.create_session("session-2", "telegram", user_id=_TELEGRAM_USER_ID)
     db.append_message("session-2", "assistant", "world")
     db.set_session_archived("session-2", True)
     db.create_session(
@@ -52,6 +55,21 @@ def _seed_home(tmp_path, monkeypatch):
         '{"session_id":"session-1"}',
         scope="test-scope",
     )
+
+    # Real optional platform state: the durable topic-mode preference is
+    # configuration and must survive, while the binding is session-owned and
+    # should disappear through its FK when that session is deleted.
+    db.enable_telegram_topic_mode(
+        chat_id=_TELEGRAM_CHAT_ID,
+        user_id=_TELEGRAM_USER_ID,
+    )
+    db.bind_telegram_topic(
+        chat_id=_TELEGRAM_CHAT_ID,
+        thread_id=_TELEGRAM_THREAD_ID,
+        user_id=_TELEGRAM_USER_ID,
+        session_key="telegram:dm:208214988:topic:17585",
+        session_id="session-2",
+    )
     assert db.search_messages(_SEARCH_NEEDLE)
     db.close()
 
@@ -63,8 +81,8 @@ def _seed_home(tmp_path, monkeypatch):
     )
     (sessions / "unrelated.jsonl").write_text("keep", encoding="utf-8")
 
-    # A sentinel platform table proves reset does not repeat the old
-    # sqlite_master loop that emptied every user table.
+    # An arbitrary platform table additionally proves reset does not repeat the
+    # old sqlite_master loop that emptied every user table.
     with sqlite3.connect(home / "state.db") as conn:
         conn.execute(
             "CREATE TABLE platform_state_sentinel "
@@ -78,6 +96,25 @@ def _seed_home(tmp_path, monkeypatch):
     return home, _fts_schema_objects(home)
 
 
+def _assert_seed_still_present(home):
+    db = SessionDB(home / "state.db")
+    try:
+        assert db.session_count(include_archived=True) == 3
+        assert db.message_count() == 3
+        assert db.get_meta("memory-reset-preservation") == "keep"
+        assert db.search_messages(_SEARCH_NEEDLE)
+        assert db.is_telegram_topic_mode_enabled(
+            chat_id=_TELEGRAM_CHAT_ID,
+            user_id=_TELEGRAM_USER_ID,
+        )
+        assert db.get_telegram_topic_binding(
+            chat_id=_TELEGRAM_CHAT_ID,
+            thread_id=_TELEGRAM_THREAD_ID,
+        ) is not None
+    finally:
+        db.close()
+
+
 def _assert_conversations_cleared_and_state_preserved(home, fts_objects):
     db = SessionDB(home / "state.db")
     try:
@@ -88,6 +125,14 @@ def _assert_conversations_cleared_and_state_preserved(home, fts_objects):
         assert db.load_gateway_routing_entries(scope="test-scope") == {
             "route-1": '{"session_id":"session-1"}'
         }
+        assert db.is_telegram_topic_mode_enabled(
+            chat_id=_TELEGRAM_CHAT_ID,
+            user_id=_TELEGRAM_USER_ID,
+        )
+        assert db.get_telegram_topic_binding(
+            chat_id=_TELEGRAM_CHAT_ID,
+            thread_id=_TELEGRAM_THREAD_ID,
+        ) is None
     finally:
         db.close()
 
@@ -161,12 +206,63 @@ def test_everything_target_clears_files_and_conversations(tmp_path, monkeypatch)
     _assert_conversations_cleared_and_state_preserved(home, fts_objects)
 
 
+def test_reset_spans_multiple_session_pages_and_delete_batches(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(memory_reset_module, "_SESSION_DELETE_BATCH", 2)
+
+    db = SessionDB(home / "state.db")
+    for index in range(5):
+        session_id = f"batch-session-{index}"
+        db.create_session(session_id, "cli")
+        db.append_message(session_id, "user", f"message {index}")
+    db.close()
+
+    result = cmd_memory_reset(Namespace(target="conversations", yes=True))
+
+    assert result == 0
+    db = SessionDB(home / "state.db")
+    try:
+        assert db.session_count(include_archived=True) == 0
+        assert db.message_count() == 0
+    finally:
+        db.close()
+
+
 def test_running_gateway_blocks_reset_without_touching_state(tmp_path, monkeypatch):
     home, _fts_objects = _seed_home(tmp_path, monkeypatch)
+    probed_homes = []
+
+    def fake_gateway_probe(hermes_home):
+        probed_homes.append(hermes_home)
+        return 4242
+
     monkeypatch.setattr(
         memory_reset_module,
         "_get_running_gateway_pid",
-        lambda _hermes_home: 4242,
+        fake_gateway_probe,
+    )
+
+    result = cmd_memory_reset(Namespace(target="everything", yes=True))
+
+    assert result == 1
+    assert probed_homes == [home]
+    assert (home / "memories" / "MEMORY.md").is_file()
+    assert (home / "memories" / "USER.md").is_file()
+    _assert_seed_still_present(home)
+
+
+def test_memory_file_preflight_fails_before_database_mutation(tmp_path, monkeypatch):
+    home, _fts_objects = _seed_home(tmp_path, monkeypatch)
+
+    def deny_file_reset(_memories_dir, _existing_files):
+        raise PermissionError("read-only memory directory")
+
+    monkeypatch.setattr(
+        memory_reset_module,
+        "_preflight_memory_file_deletion",
+        deny_file_reset,
     )
 
     result = cmd_memory_reset(Namespace(target="everything", yes=True))
@@ -174,13 +270,7 @@ def test_running_gateway_blocks_reset_without_touching_state(tmp_path, monkeypat
     assert result == 1
     assert (home / "memories" / "MEMORY.md").is_file()
     assert (home / "memories" / "USER.md").is_file()
-    db = SessionDB(home / "state.db")
-    try:
-        assert db.session_count(include_archived=True) == 3
-        assert db.message_count() == 3
-        assert db.search_messages(_SEARCH_NEEDLE)
-    finally:
-        db.close()
+    _assert_seed_still_present(home)
 
 
 def test_confirmation_denied_leaves_everything_untouched(tmp_path, monkeypatch):
@@ -192,15 +282,7 @@ def test_confirmation_denied_leaves_everything_untouched(tmp_path, monkeypatch):
     assert result == 0
     assert (home / "memories" / "MEMORY.md").is_file()
     assert (home / "memories" / "USER.md").is_file()
-
-    db = SessionDB(home / "state.db")
-    try:
-        assert db.session_count(include_archived=True) == 3
-        assert db.message_count() == 3
-        assert db.get_meta("memory-reset-preservation") == "keep"
-        assert db.search_messages(_SEARCH_NEEDLE)
-    finally:
-        db.close()
+    _assert_seed_still_present(home)
 
 
 def test_conversations_target_does_not_create_an_empty_database(
@@ -225,9 +307,4 @@ def test_direct_handler_rejects_legacy_target_without_side_effects(
 
     assert result == 2
     assert (home / "memories" / "MEMORY.md").is_file()
-    db = SessionDB(home / "state.db")
-    try:
-        assert db.session_count(include_archived=True) == 3
-        assert db.message_count() == 3
-    finally:
-        db.close()
+    _assert_seed_still_present(home)
