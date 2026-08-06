@@ -1914,7 +1914,12 @@ def _heredoc_declarations(line: str) -> list[tuple[str, bool]]:
         if ch == "#" and (i == 0 or line[i - 1].isspace() or line[i - 1] in ";|&()"):
             break
 
-        if line.startswith("<<", i) and not line.startswith("<<<", i):
+        if line.startswith("<<<", i):
+            # Herestring — not a heredoc; skip all three characters and move on.
+            i += 3
+            continue
+
+        if line.startswith("<<", i):
             i += 2
             strip_tabs = i < n and line[i] == "-"
             if strip_tabs:
@@ -1987,8 +1992,10 @@ def _strip_heredoc_bodies(command: str) -> str:
 def _shell_background_operator_positions(command: str) -> list[int]:
     """Return positions of real unquoted shell ``&`` operators in *command*.
 
-    Distinguishes job-control ``&`` from ``&&``, ``&>`` and fd redirects, and
-    ignores escaped operators, quoted strings, comments, and heredoc bodies.
+    Distinguishes job-control ``&`` from ``&&``, ``&>``, ``|&``, fd redirects,
+    ``;&``/``;;&`` case-fallthrough operators, and arithmetic/subshell
+    expansions, and ignores escaped operators, quoted strings, comments, and
+    heredoc bodies.
     """
     sanitized = _strip_heredoc_bodies(command)
     positions: list[int] = []
@@ -2026,11 +2033,36 @@ def _shell_background_operator_positions(command: str) -> list[int]:
                 i += 1
             continue
 
+        # Skip parenthesised groups — subshells $(…), arithmetic $((…)),
+        # and plain (…) — so that & inside them is never counted.
+        if ch == "(":
+            depth = 1
+            i += 1
+            while i < n and depth:
+                if sanitized[i] == "(":
+                    depth += 1
+                elif sanitized[i] == ")":
+                    depth -= 1
+                elif sanitized[i] in {"'", '"'}:
+                    quote = sanitized[i]
+                    i += 1
+                    while i < n:
+                        if sanitized[i] == "\\" and quote != "'" and i + 1 < n:
+                            i += 2
+                            continue
+                        if sanitized[i] == quote:
+                            break
+                        i += 1
+                i += 1
+            continue
+
         if ch == "&":
             if sanitized.startswith("&&", i) or sanitized.startswith("&>", i):
+                # && (logical-and) and &> (redirect) — not job-control.
                 i += 2
                 continue
-            if i > 0 and sanitized[i - 1] in "<>":
+            if i > 0 and sanitized[i - 1] in "<>|;":
+                # fd redirect (2>&1), pipe-stderr (|&), case fallthrough (;&, ;;&).
                 i += 1
                 continue
             positions.append(i)
@@ -2051,7 +2083,12 @@ def _contains_shell_background_operator(command: str) -> bool:
 
 
 def _is_final_shell_background_operator(command: str, position: int) -> bool:
-    """Return whether only whitespace/comments follow the operator."""
+    """Return whether only whitespace/comments follow the operator.
+
+    *position* comes from :func:`_shell_background_operator_positions`, which
+    scans the sanitized command.  Because :func:`_strip_heredoc_bodies`
+    preserves total length, positions are valid indices into *command* too.
+    """
     i = position + 1
     n = len(command)
 
