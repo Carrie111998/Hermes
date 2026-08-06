@@ -56,9 +56,13 @@ orphans) and the developer-guide page for the prose walkthrough.
 two transport modes the user picks between — unofficial vs official
 APIs, polling vs websocket, library A vs library B — the right
 structure is two adapters that share a behavior mixin. WhatsApp does
-this: `gateway/platforms/whatsapp.py` (Baileys bridge) and
+this: `plugins/platforms/whatsapp/adapter.py` (Baileys bridge) and
 `gateway/platforms/whatsapp_cloud.py` (Meta Cloud API) both inherit
 from `WhatsAppBehaviorMixin` in `gateway/platforms/whatsapp_common.py`.
+Note that these two now live on opposite sides of the plugin/built-in
+split — the mixin stays in `gateway/platforms/` and the plugin imports
+it directly. Sharing a core mixin from a plugin adapter is supported and
+is the intended way to avoid duplicating protocol-agnostic behavior.
 The mixin owns gating, allow-lists, mention parsing, broadcast
 filters, and the WhatsApp-flavored markdown conversion — everything
 that's platform-protocol-agnostic. Each adapter owns its transport.
@@ -122,7 +126,10 @@ If your platform supports interactive button/menu messages, implement these for 
 | `send_model_picker(...)` | Interactive `/model` picker. Used by Telegram and Discord. |
 | `send_choice_picker(...)` | Flat single-level picker for finite-choice commands (`/reasoning`, `/fast`). Implemented by Telegram (inline keyboard), Discord (select menu), and Matrix (reactions). Platforms without it fall back to the text status card automatically. |
 
-See `gateway/platforms/telegram.py`, `discord.py`, and `whatsapp_cloud.py` for reference implementations. The button-callback id convention (`cl:<id>:<idx>`, `appr:<id>:<choice>`, `sc:<choice>:<id>`) is shared across adapters — match it so the gateway-side resolvers work without modification.
+For reference implementations see `plugins/platforms/telegram/adapter.py` and
+`plugins/platforms/discord/adapter.py` (both migrated to the plugin path, and
+both still the richest examples of interactive UX), and
+`gateway/platforms/whatsapp_cloud.py` for a built-in adapter. The button-callback id convention (`cl:<id>:<idx>`, `appr:<id>:<choice>`, `sc:<choice>:<id>`) is shared across adapters — match it so the gateway-side resolvers work without modification.
 
 ### Required function
 
@@ -187,9 +194,17 @@ elif platform == Platform.YOUR_PLATFORM:
 
 ---
 
-## 4. Authorization Maps (`gateway/run.py`)
+## 4. Authorization Maps (`gateway/authz_mixin.py`)
 
-Add to BOTH dicts in `_is_user_authorized()`:
+> **Plugin path: skip this section.** `_is_user_authorized()` falls back to
+> `gateway/platform_registry.py` for any platform not in the maps below and
+> picks up `allowed_users_env` / `allow_all_env` from your `plugin.yaml`
+> automatically. Only built-in adapters need to hand-edit these dicts.
+
+Authorization lives on `GatewayAuthorizationMixin`, which `gateway/run.py`
+mixes into the runner — the maps are **not** in `run.py` itself.
+
+Add to BOTH dicts in `GatewayAuthorizationMixin._is_user_authorized()`:
 
 ```python
 platform_env_map = {
@@ -301,14 +316,25 @@ platform as a delivery option.
 
 ---
 
-## 11. Channel Directory (`gateway/channel_directory.py`)
+## 11. Channel Directory (`gateway/channel_directory.py`) — usually nothing to do
 
-If your platform can't enumerate chats (most can't), add it to the
-session-based discovery list:
+This used to be an opt-**in** list. It is now opt-**out**: every platform in
+the `Platform` enum (and every plugin in the registry) gets session-based
+discovery automatically when it can't enumerate chats directly. You only act
+here if you need to *suppress* it:
 
 ```python
-for plat_name in ("telegram", "whatsapp", "signal", "your_platform"):
+_SKIP_SESSION_DISCOVERY = frozenset({"local", "api_server", "webhook"})
 ```
+
+Discovery is additionally gated on the platform being **connected in this
+gateway process** — historical sessions from a disabled or decommissioned
+platform are deliberately not resurrected as send targets, because stale
+entries make `send_message` route somewhere that can no longer deliver.
+
+So: if your platform is connected and can't enumerate chats, you get the
+directory for free. Add it to `_SKIP_SESSION_DISCOVERY` only if session
+origins are not valid send targets for it.
 
 ---
 
@@ -394,11 +420,14 @@ Optional but valuable:
 After implementing everything, verify with:
 
 ```bash
-# All tests pass
-python -m pytest tests/ -q
+# All tests pass. Use the runner, not pytest directly — it enforces CI parity
+# (unset credential vars, TZ=UTC, per-file subprocess isolation). See AGENTS.md
+# § Testing; direct pytest has caused repeated works-locally/fails-in-CI splits.
+scripts/run_tests.sh
 
 # Grep for your platform name to find any missed integration points
-grep -r "telegram\|discord\|whatsapp\|slack" gateway/ tools/ agent/ cron/ hermes_cli/ toolsets.py \
+grep -r "telegram\|discord\|whatsapp\|slack" \
+  gateway/ plugins/platforms/ tools/ agent/ cron/ hermes_cli/ toolsets.py \
   --include="*.py" -l | sort -u
 # Check each file in the output — if it mentions other platforms but not yours, you missed it
 ```
