@@ -26,8 +26,10 @@ infersia = ProviderProfile(
     env_vars=("INFERSIA_API_KEY", "INFERSIA_BASE_URL"),
     base_url="https://api.infersia.com/v1",
     auth_type="api_key",
-    # Images are accepted inside tool-result messages, verified against the
-    # served vision model (Step 3.7 Flash) with a multipart tool message.
+    # Images are accepted inside tool-result messages. Re-verified against
+    # qwen/qwen3.6-35b-a3b on 2026-08-06, after Step 3.7 Flash (the model this
+    # was originally checked against) was retired: a two-pixel test image sent
+    # as a base64 data URI came back correctly described.
     supports_vision=True,
     # Prefix caching is automatic and unkeyed here. The endpoint tolerates a
     # ``prompt_cache_key`` field rather than honouring it, and this flag is
