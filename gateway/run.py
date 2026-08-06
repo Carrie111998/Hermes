@@ -19838,8 +19838,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
+            # Say which voice pipeline actually engaged — the realtime start
+            # falls back to classic silently (deps/creds/config), and without
+            # this line the only evidence is a gateway.log warning.
+            brain = ""
+            brain_getter = getattr(adapter, "voice_realtime_brain", None)
+            if callable(brain_getter):
+                try:
+                    result = brain_getter(guild_id)
+                    brain = result if isinstance(result, str) else ""
+                except Exception:
+                    brain = ""
+            if brain == "supervisor":
+                pipeline = (
+                    "Voice pipeline: **realtime supervisor (grok)** — instant replies, "
+                    "real work delegated to Hermes."
+                )
+            elif brain == "ears":
+                pipeline = "Voice pipeline: **realtime transcription (grok ears)**."
+            else:
+                pipeline = "Voice pipeline: **classic transcription** (record → STT → agent → TTS)."
             return (
                 f"Joined voice channel **{voice_channel.name}**.\n"
+                f"{pipeline}\n"
                 f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
             )
         # Join failed — clear callback
