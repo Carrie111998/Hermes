@@ -23,6 +23,7 @@ import { $currentCwd, $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
+import { ComponentsResizeSeam, useComponentsWidth } from '../chat/tile/components-area'
 import { TileFiles } from '../chat/tile/tile-files'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
@@ -146,6 +147,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   // session tiles carry, rooted at the primary session's cwd. Full-page views
   // (messaging/artifacts/…) skip it — it's a chat-surface component.
   const workspaceCwd = useStore($currentCwd).trim()
+  const { componentsWidth, startResize } = useComponentsWidth()
 
   const openFilePreview = async (path: string) => {
     try {
@@ -171,7 +173,11 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
           {...chatActions}
         />
       </div>
-      <div className="flex w-80 shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)">
+      <ComponentsResizeSeam onPointerDown={startResize} />
+      <div
+        className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)"
+        style={{ width: componentsWidth }}
+      >
         <TileFiles cwd={workspaceCwd} onActivateFile={openFilePreview} onActivateFolder={openFilePreview} />
       </div>
     </div>

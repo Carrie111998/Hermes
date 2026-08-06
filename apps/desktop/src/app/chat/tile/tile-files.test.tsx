@@ -5,7 +5,6 @@ import type { HermesReadDirResult } from '@/global'
 import { $connection } from '@/store/session'
 
 import { resetProjectTreeState } from './files/use-project-tree'
-
 import { TileFiles } from './tile-files'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()

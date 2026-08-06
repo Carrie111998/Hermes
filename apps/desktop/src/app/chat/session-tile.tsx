@@ -17,15 +17,7 @@
 import { useStore } from '@nanostores/react'
 import { useQueryClient } from '@tanstack/react-query'
 import { atom, computed } from 'nanostores'
-import {
-  type PointerEvent as ReactPointerEvent,
-  useCallback,
-  useEffect,
-  useMemo,
-  useRef,
-  useState,
-  useSyncExternalStore
-} from 'react'
+import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { useModelControls } from '@/app/session/hooks/use-model-controls'
@@ -82,6 +74,7 @@ import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
+import { ComponentsResizeSeam, useComponentsWidth } from './tile/components-area'
 import { TileFiles } from './tile/tile-files'
 
 import { ChatView } from '.'
@@ -107,12 +100,6 @@ export function sessionTileResumeFailure(
 
   return 'Session unavailable — you can retry resuming it.'
 }
-
-/** Components-area width bounds (px). The tree is a persistent navigation
- *  surface, so it keeps a floor; the preview port will push against the max. */
-const COMPONENTS_MIN_WIDTH = 200
-const COMPONENTS_DEFAULT_WIDTH = 320
-const COMPONENTS_MAX_WIDTH = 560
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
@@ -310,33 +297,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
 
   // Components-area width (px), drag-resizable via the seam between chat and
   // tree. Per-tile component state: separate tiles keep independent widths.
-  const [componentsWidth, setComponentsWidth] = useState(COMPONENTS_DEFAULT_WIDTH)
-  const resizeStartRef = useRef<{ startX: number; startWidth: number } | null>(null)
-
-  const startComponentsResize = useCallback((e: ReactPointerEvent<HTMLElement>) => {
-    e.preventDefault()
-    resizeStartRef.current = { startX: e.clientX, startWidth: componentsWidth }
-
-    const onMove = (ev: PointerEvent) => {
-      const start = resizeStartRef.current
-
-      if (!start) {
-        return
-      }
-
-      const next = start.startWidth + (start.startX - ev.clientX)
-      setComponentsWidth(Math.min(COMPONENTS_MAX_WIDTH, Math.max(COMPONENTS_MIN_WIDTH, next)))
-    }
-
-    const onUp = () => {
-      resizeStartRef.current = null
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-    }
-
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-  }, [componentsWidth])
+  const { componentsWidth, startResize } = useComponentsWidth()
 
   // Must run before any early return (rules-of-hooks): the tile's live runtime
   // cwd, feeding the components area's file tree. '' while unresolved — the
@@ -501,15 +462,7 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
       </div>
       {/* Resize seam: drag to adjust the components area width. Same visual
           language as the layout tree's sashes (hairline + hover band). */}
-      <div
-        aria-hidden
-        className="group relative z-20 w-[9px] shrink-0 cursor-col-resize [-webkit-app-region:no-drag]"
-        onPointerDown={startComponentsResize}
-        role="separator"
-      >
-        <span className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-(--ui-stroke-secondary) opacity-10 transition-opacity duration-100 group-hover:opacity-100" />
-        <span className="absolute inset-y-0 left-1/2 w-(--vscode-sash-hover-size,0.25rem) -translate-x-1/2 bg-(--ui-sash-hover-border) opacity-0 transition-opacity duration-100 group-hover:opacity-100" />
-      </div>
+      <ComponentsResizeSeam onPointerDown={startResize} />
       <div
         className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)"
         style={{ width: componentsWidth }}
