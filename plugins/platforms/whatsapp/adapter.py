@@ -16,6 +16,7 @@ with different backends via a bridge pattern.
 """
 
 import asyncio
+import json
 import logging
 import os
 import platform
@@ -334,6 +335,73 @@ def _file_content_hash(path: Path) -> str:
         return ""
 
 
+def _ownership_router_config_hash(
+    url: str,
+    token: str,
+    timeout_ms: int,
+    prefixes: list,
+) -> str:
+    """Fingerprint router behavior without exposing its URL or shared secret."""
+    if not url:
+        return ""
+    import hashlib
+
+    payload = json.dumps(
+        {
+            "url": url,
+            "token": token,
+            "timeout_ms": timeout_ms,
+            "prefixes": prefixes,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()[:16]
+
+
+def _normalize_ownership_router_prefixes(prefixes: object) -> list[str]:
+    """Return up to eight non-empty custom prefixes; Jeffersom is bridge-reserved."""
+    if isinstance(prefixes, str):
+        prefixes = [prefixes]
+    elif not isinstance(prefixes, list):
+        prefixes = []
+    return [str(prefix).strip() for prefix in prefixes if str(prefix).strip()][:8]
+
+
+_OWNERSHIP_ROUTER_ENV_KEYS = (
+    "WHATSAPP_OWNERSHIP_ROUTER_URL",
+    "WHATSAPP_OWNERSHIP_ROUTER_TOKEN",
+    "WHATSAPP_OWNERSHIP_ROUTER_TIMEOUT_MS",
+    "WHATSAPP_OWNERSHIP_ROUTER_PREFIXES",
+    "WHATSAPP_OWNERSHIP_ROUTER_CONFIG_HASH",
+)
+
+
+def _apply_ownership_router_env(
+    env: dict,
+    url: str,
+    token: str,
+    timeout_ms: int,
+    prefixes: list,
+    config_hash: str,
+) -> None:
+    """Replace inherited router variables with the explicit adapter config."""
+    for key in _OWNERSHIP_ROUTER_ENV_KEYS:
+        env.pop(key, None)
+    if not url:
+        return
+    env["WHATSAPP_OWNERSHIP_ROUTER_URL"] = url
+    env["WHATSAPP_OWNERSHIP_ROUTER_TIMEOUT_MS"] = str(timeout_ms)
+    env["WHATSAPP_OWNERSHIP_ROUTER_PREFIXES"] = json.dumps(
+        prefixes,
+        ensure_ascii=False,
+    )
+    if token:
+        env["WHATSAPP_OWNERSHIP_ROUTER_TOKEN"] = token
+    env["WHATSAPP_OWNERSHIP_ROUTER_CONFIG_HASH"] = config_hash
+
+
 def check_whatsapp_requirements() -> bool:
     """
     Check if WhatsApp dependencies are available.
@@ -380,6 +448,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     - group_policy: "open" | "allowlist" | "disabled" | "pairing" — which groups are processed (default: "pairing")
     - group_allow_from: List of group JIDs allowed (when group_policy="allowlist")
     - send_read_receipts: Mark accepted inbound WhatsApp messages as read
+    - inbound_ownership_router: Optional metadata-only pre-dispatch ownership router
 
     Behavior (gating, mention parsing, markdown conversion, chunking) is
     provided by ``WhatsAppBehaviorMixin`` so the Cloud API adapter can
@@ -415,6 +484,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         self._send_read_receipts = (
             read_receipts if isinstance(read_receipts, bool)
             else str(read_receipts or "").strip().lower() in {"1", "true", "yes", "on"}
+        )
+        ownership_router = config.extra.get("inbound_ownership_router") or {}
+        if not isinstance(ownership_router, dict):
+            ownership_router = {}
+        self._ownership_router_url = str(ownership_router.get("url") or "").strip()
+        token_env = str(
+            ownership_router.get("token_env") or "AUTOCRIA_OWNERSHIP_ROUTER_TOKEN"
+        ).strip()
+        self._ownership_router_token_env = (
+            token_env if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", token_env)
+            else "AUTOCRIA_OWNERSHIP_ROUTER_TOKEN"
+        )
+        try:
+            timeout_ms = int(ownership_router.get("timeout_ms") or 1500)
+        except (TypeError, ValueError):
+            timeout_ms = 1500
+        self._ownership_router_timeout_ms = max(1, min(timeout_ms, 10000))
+        self._ownership_router_prefixes = _normalize_ownership_router_prefixes(
+            ownership_router.get("agent_prefixes") or []
         )
         self._mention_patterns = self._compile_mention_patterns()
         self._message_queue: asyncio.Queue = asyncio.Queue()
@@ -574,6 +662,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
 
             # Ensure session directory exists
             self._session_path.mkdir(parents=True, exist_ok=True)
+
+            router_token = os.getenv(self._ownership_router_token_env, "")
+            router_config_hash = _ownership_router_config_hash(
+                self._ownership_router_url,
+                router_token,
+                self._ownership_router_timeout_ms,
+                self._ownership_router_prefixes,
+            )
             
             # Check if bridge is already running and connected
             import aiohttp
@@ -599,7 +695,11 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 running_hash = data.get("scriptHash", "")
                                 disk_hash = _file_content_hash(bridge_path)
                                 running_read_receipts = bool(data.get("sendReadReceipts", False))
-                                config_matches = running_read_receipts == self._send_read_receipts
+                                running_router_hash = str(data.get("ownershipRouterConfigHash", ""))
+                                config_matches = (
+                                    running_read_receipts == self._send_read_receipts
+                                    and running_router_hash == router_config_hash
+                                )
                                 if (
                                     running_hash
                                     and disk_hash
@@ -612,11 +712,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                     self._http_session = aiohttp.ClientSession()
                                     self._poll_task = asyncio.create_task(self._poll_messages())
                                     return True
-                                stale_reason = (
-                                    f"running={running_hash or 'unversioned'}, disk={disk_hash}"
-                                    if running_hash != disk_hash
-                                    else "send_read_receipts config changed"
-                                )
+                                if running_hash != disk_hash:
+                                    stale_reason = f"running={running_hash or 'unversioned'}, disk={disk_hash}"
+                                elif running_read_receipts != self._send_read_receipts:
+                                    stale_reason = "send_read_receipts config changed"
+                                else:
+                                    stale_reason = "ownership router config changed"
                                 print(f"[{self.name}] Running bridge is stale ({stale_reason}), restarting")
                             else:
                                 print(f"[{self.name}] Bridge found but not connected (status: {bridge_status}), restarting")
@@ -645,6 +746,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 bridge_env["WHATSAPP_REPLY_PREFIX"] = self._reply_prefix
             bridge_env["WHATSAPP_SEND_READ_RECEIPTS"] = (
                 "true" if self._send_read_receipts else "false"
+            )
+            _apply_ownership_router_env(
+                bridge_env,
+                self._ownership_router_url,
+                router_token,
+                self._ownership_router_timeout_ms,
+                self._ownership_router_prefixes,
+                router_config_hash,
             )
             # Pass the profile-aware cache directories so the bridge writes
             # media where the Python side reads it.  Without these the bridge

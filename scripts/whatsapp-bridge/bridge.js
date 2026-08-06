@@ -30,9 +30,10 @@ import { randomBytes, createHash } from 'crypto';
 import { execFileSync } from 'child_process';
 import { tmpdir } from 'os';
 import qrcode from 'qrcode-terminal';
-import { matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
+import { expandWhatsAppIdentifiers, matchesAllowedUser, parseAllowedUsers } from './allowlist.js';
 import { createOutboundIdTracker } from './outbound_ids.js';
 import { classifyOwnerMessageGate } from './owner_message_gate.js';
+import { applyInboundOwnershipGate } from './inbound_ownership_gate.js';
 import {
   buildPollPayload,
   buildLocationPayload,
@@ -81,6 +82,21 @@ const SEND_READ_RECEIPTS =
   process.env &&
   typeof process.env.WHATSAPP_SEND_READ_RECEIPTS === 'string' &&
   ['1', 'true', 'yes', 'on'].includes(process.env.WHATSAPP_SEND_READ_RECEIPTS.toLowerCase());
+
+const OWNERSHIP_ROUTER_URL = String(process.env.WHATSAPP_OWNERSHIP_ROUTER_URL || '').trim();
+const OWNERSHIP_ROUTER_TOKEN = String(process.env.WHATSAPP_OWNERSHIP_ROUTER_TOKEN || '');
+const OWNERSHIP_ROUTER_CONFIG_HASH = String(process.env.WHATSAPP_OWNERSHIP_ROUTER_CONFIG_HASH || '');
+const OWNERSHIP_ROUTER_TIMEOUT_MS = Math.max(
+  1,
+  Math.min(parseInt(process.env.WHATSAPP_OWNERSHIP_ROUTER_TIMEOUT_MS || '1500', 10) || 1500, 10000),
+);
+let OWNERSHIP_ROUTER_PREFIXES = ['jeffersom'];
+try {
+  const parsedPrefixes = JSON.parse(process.env.WHATSAPP_OWNERSHIP_ROUTER_PREFIXES || '[]');
+  if (Array.isArray(parsedPrefixes) && parsedPrefixes.length) {
+    OWNERSHIP_ROUTER_PREFIXES = parsedPrefixes.slice(0, 8);
+  }
+} catch {}
 
 const PORT = parseInt(getArg('port', '3000'), 10);
 const SESSION_DIR = getArg('session', path.join(process.env.HOME || '~', '.hermes', 'whatsapp', 'session'));
@@ -728,6 +744,7 @@ async function startSocket() {
           audio: AUDIO_CACHE_DIR,
         },
       });
+
       event.fromOwner = fromOwner;
 
       // Ignore Hermes' own reply messages in self-chat mode to avoid loops.
@@ -752,6 +769,29 @@ async function startSocket() {
           messageKeys: Object.keys(msg.message || {}),
         });
         continue;
+      }
+
+      // Optional metadata-only ownership gate for multiple automations sharing
+      // this WhatsApp account. It runs after Hermes echo suppression but before
+      // the Python adapter queue, so claimed replies never create agent turns.
+      if (!isGroup && OWNERSHIP_ROUTER_URL) {
+        const ownership = await applyInboundOwnershipGate({
+          config: {
+            url: OWNERSHIP_ROUTER_URL,
+            token: OWNERSHIP_ROUTER_TOKEN,
+            timeoutMs: OWNERSHIP_ROUTER_TIMEOUT_MS,
+            prefixes: OWNERSHIP_ROUTER_PREFIXES,
+          },
+          event,
+          senderAliases: Array.from(expandWhatsAppIdentifiers(senderId, SESSION_DIR)),
+        });
+        if (ownership.action === 'drop') {
+          emitDebugEvent({
+            stage: 'ignored',
+            reason: ownership.reason,
+          });
+          continue;
+        }
       }
 
       messageStore.remember(msg);
@@ -1106,6 +1146,7 @@ app.get('/health', (req, res) => {
     uptime: process.uptime(),
     scriptHash: SCRIPT_HASH,
     sendReadReceipts: SEND_READ_RECEIPTS,
+    ownershipRouterConfigHash: OWNERSHIP_ROUTER_CONFIG_HASH,
   });
 });
 
