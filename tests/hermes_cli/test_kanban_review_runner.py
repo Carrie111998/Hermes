@@ -17,6 +17,7 @@ from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_github as github
 from hermes_cli import kanban_review_runner as runner
+from hermes_cli import kanban_slack as slack
 
 
 NOW = 1_800_000_000
@@ -131,6 +132,28 @@ class ExactHeadReadAdapter:
         )
 
 
+class ExactSlackAcknowledgements:
+    def read_acknowledgements(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+    ) -> tuple[slack.SlackAcknowledgementEvent, ...]:
+        return (
+            slack.SlackAcknowledgementEvent(
+                provider="fixture",
+                event_id="ack-staging",
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+                message_ts="200.001",
+                user_id="U_REVIEWER",
+                source="text",
+                value="ack",
+                observed_at=NOW,
+            ),
+        )
+
+
 def _insert_github_intent(
     conn,
     intent_id: str,
@@ -199,6 +222,7 @@ def _live_config(**overrides: Any) -> runner.ReviewRunnerConfig:
         "enabled": True,
         "mode": "live",
         "github_provider_enabled": True,
+        "github_delivery_enabled": True,
     }
     values.update(overrides)
     return runner.ReviewRunnerConfig(**values)
@@ -224,8 +248,82 @@ def test_default_config_is_dry_run_and_every_mutating_surface_is_disabled():
     assert config.enabled is False
     assert config.gateway_enabled is False
     assert config.github_provider_enabled is False
+    assert config.github_delivery_enabled is False
     assert config.slack_provider_enabled is False
-    assert config.provider_timeout_seconds * 4 < config.timeout_seconds
+    assert config.slack_delivery_enabled is False
+    assert config.provider_timeout_seconds * 7 < config.timeout_seconds
+
+
+def test_delivery_gate_requires_enabled_read_provider() -> None:
+    with pytest.raises(runner.ReviewRunnerError, match="github.enabled"):
+        runner.ReviewRunnerConfig(github_delivery_enabled=True)
+    with pytest.raises(runner.ReviewRunnerError, match="slack.enabled"):
+        runner.ReviewRunnerConfig(slack_delivery_enabled=True)
+
+
+def test_delivery_gates_block_injected_write_adapters() -> None:
+    adapters = runner.ReviewRunnerAdapters(
+        provider_timeout_seconds=1,
+        github_snapshot_provider=RegisteredAdapter(),
+        github_delivery_transport=RegisteredAdapter(),
+        slack_snapshot_provider=RegisteredAdapter(),
+        slack_delivery_transport=cast(Any, RegisteredAdapter()),
+    )
+    cases = (
+        (
+            runner.RunnerCandidate("github", "gho_gate", "pending", 0, 3, 1, 1),
+            runner.ReviewRunnerConfig(github_provider_enabled=True),
+        ),
+        (
+            runner.RunnerCandidate("slack", "slo_gate", "pending", 0, 3, 1, 1),
+            runner.ReviewRunnerConfig(slack_provider_enabled=True),
+        ),
+    )
+
+    for candidate, config in cases:
+        result, skipped = runner._process_candidate(
+            cast(Any, None),
+            candidate,
+            config=config,
+            adapters=adapters,
+            now=NOW,
+        )
+        assert result is None
+        assert skipped == {
+            "surface": candidate.surface,
+            "intent_id": candidate.intent_id,
+            "reason": "delivery_disabled",
+        }
+
+
+def test_candidate_budget_includes_snapshot_and_delivery_requests() -> None:
+    candidate = runner.RunnerCandidate("github", "gho_budget", "pending", 0, 3, 1, 1)
+    adapters = runner.ReviewRunnerAdapters(
+        provider_timeout_seconds=20,
+        reconciliation_provider_call_count=4,
+        github_snapshot_provider=RegisteredAdapter(),
+        github_delivery_transport=RegisteredAdapter(),
+    )
+
+    assert (
+        runner._candidate_provider_call_count(
+            candidate,
+            config=runner.ReviewRunnerConfig(
+                github_provider_enabled=True,
+                github_delivery_enabled=True,
+            ),
+            adapters=adapters,
+        )
+        == 7
+    )
+    assert (
+        runner._candidate_provider_call_count(
+            candidate,
+            config=runner.ReviewRunnerConfig(github_provider_enabled=True),
+            adapters=adapters,
+        )
+        == 0
+    )
 
 
 def test_dry_run_never_constructs_configured_mcp_adapters(
@@ -254,6 +352,31 @@ def test_dry_run_never_constructs_configured_mcp_adapters(
 
     assert receipt.status == "no_op"
     assert receipt.read_only is True
+
+
+def test_disabled_runner_never_constructs_configured_mcp_adapters(
+    kanban_home, monkeypatch
+) -> None:
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("disabled runner must not discover or connect MCP servers")
+
+    monkeypatch.setattr(runner, "_build_configured_mcp_adapters", fail_if_called)
+    with kb.connect_closing() as conn:
+        receipt = runner.run_review_runner(
+            conn,
+            config=runner.ReviewRunnerConfig(
+                enabled=False,
+                mode="live",
+                github_provider_enabled=True,
+                github_adapter="mcp",
+                github_repositories=("nousresearch/hermes-agent",),
+            ),
+            now=NOW,
+        )
+
+    assert receipt.status == "disabled"
+    assert receipt.skipped == ({"reason": "runner_disabled"},)
 
 
 def test_shadow_runner_records_coderabbit_for_same_github_head(kanban_home) -> None:
@@ -289,6 +412,67 @@ def test_shadow_runner_records_coderabbit_for_same_github_head(kanban_home) -> N
     assert assessment is not None
     assert assessment.head_sha == HEAD
     assert assessment.state == "clean"
+
+
+def test_staging_probe_uses_explicit_routes_without_writes() -> None:
+    exact_head = ExactHeadReadAdapter()
+    result = runner.probe_review_runner_resources(
+        config=runner.ReviewRunnerConfig(
+            enabled=True,
+            mode="shadow",
+            github_provider_enabled=True,
+            github_delivery_enabled=True,
+            slack_provider_enabled=True,
+            slack_delivery_enabled=True,
+        ),
+        repository="nousresearch/hermes-agent",
+        pr_number=41,
+        expected_head_sha=HEAD,
+        channel_id="C_STAGING",
+        thread_ts="100.001",
+        adapters=runner.ReviewRunnerAdapters(
+            provider_timeout_seconds=1,
+            github_snapshot_provider=exact_head,
+            coderabbit_snapshot_provider=exact_head,
+            github_delivery_transport=RegisteredAdapter(),
+            slack_delivery_transport=cast(Any, RegisteredAdapter()),
+            slack_acknowledgement_provider=ExactSlackAcknowledgements(),
+        ),
+        now=NOW,
+    )
+
+    assert result["status"] == "ready"
+    assert result["external_provider_writes"] is False
+    assert result["local_writes"] is False
+    assert result["github"]["head_sha"] == HEAD
+    assert result["github"]["delivery_registered"] is True
+    assert result["coderabbit"]["state"] == "clean"
+    assert result["slack"] == {
+        "channel_id": "C_STAGING",
+        "thread_ts": "100.001",
+        "acknowledgement_event_count": 1,
+        "event_ids": ["ack-staging"],
+    }
+    assert result["receipt_delivery"] == {
+        "github": "registered_not_sent",
+        "slack": "registered_not_sent",
+    }
+    assert result["merge_or_branch_write_capability"] is False
+
+
+def test_staging_probe_fails_closed_on_head_mismatch() -> None:
+    with pytest.raises(github.GitHubHeadMismatch):
+        runner.probe_review_runner_resources(
+            config=runner.ReviewRunnerConfig(github_provider_enabled=True),
+            repository="nousresearch/hermes-agent",
+            pr_number=41,
+            expected_head_sha="b" * 40,
+            adapters=runner.ReviewRunnerAdapters(
+                provider_timeout_seconds=1,
+                github_snapshot_provider=ExactHeadReadAdapter(),
+            ),
+            now=NOW,
+        )
 
 
 def test_kanban_parser_rejects_abbreviated_global_options() -> None:
@@ -676,6 +860,51 @@ def test_health_reports_script_only_readiness_and_restart_contract(kanban_home):
     assert health["cron"]["quiet_noop_stdout"] is True
 
 
+def test_health_requires_every_enabled_provider_delivery_transport(kanban_home):
+    config = runner.ReviewRunnerConfig(
+        enabled=True,
+        mode="live",
+        github_provider_enabled=True,
+        github_delivery_enabled=True,
+        slack_provider_enabled=True,
+        slack_delivery_enabled=True,
+    )
+    read_adapter = ExactHeadReadAdapter()
+    adapters = runner.ReviewRunnerAdapters(
+        provider_timeout_seconds=1,
+        github_snapshot_provider=read_adapter,
+        github_delivery_transport=RegisteredAdapter(),
+        slack_snapshot_provider=read_adapter,
+        slack_acknowledgement_provider=ExactSlackAcknowledgements(),
+    )
+    with kb.connect_closing() as conn:
+        blocked = runner.diagnose_review_runner(
+            conn,
+            config=config,
+            adapters=adapters,
+            now=NOW,
+        )
+        ready = runner.diagnose_review_runner(
+            conn,
+            config=config,
+            adapters=runner.ReviewRunnerAdapters(
+                provider_timeout_seconds=1,
+                github_snapshot_provider=read_adapter,
+                github_delivery_transport=RegisteredAdapter(),
+                slack_snapshot_provider=read_adapter,
+                slack_delivery_transport=cast(Any, RegisteredAdapter()),
+                slack_acknowledgement_provider=ExactSlackAcknowledgements(),
+            ),
+            now=NOW,
+        )
+
+    assert blocked["readiness"]["live_ready"] is False
+    assert ready["readiness"]["live_ready"] is True
+    assert ready["readiness"]["production_ready"] is False
+    assert ready["provider_limitations"]["github_request_reviewer_supported"] is False
+    assert ready["provider_limitations"]["merge_or_branch_write_capability"] is False
+
+
 def test_health_does_not_claim_ready_for_unbounded_registered_adapter(kanban_home):
     with kb.connect_closing() as conn:
         health = runner.diagnose_review_runner(
@@ -709,6 +938,21 @@ def test_cli_health_json_and_quiet_noop(kanban_home, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_cli_staging_requires_explicit_repository_pr_and_head(kanban_home, capsys):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "review-runner", "staging", "--json"])
+    assert kc.kanban_command(args) == 2
+    captured = capsys.readouterr()
+
+    assert captured.out == ""
+    assert "--repository" in captured.err
+    assert "--pr-number" in captured.err
+    assert "--expected-head-sha" in captured.err
 
 
 def test_cli_health_human_output_uses_read_and_write_registration_keys(

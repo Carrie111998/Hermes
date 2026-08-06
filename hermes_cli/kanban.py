@@ -559,9 +559,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_review_runner.add_argument(
         "runner_action",
         nargs="?",
-        choices=("run", "health"),
+        choices=("run", "health", "staging"),
         default="run",
-        help="Run one bounded pass or report readiness/health",
+        help="Run one bounded pass, report health, or probe one explicit staging route",
     )
     p_review_runner.add_argument(
         "--mode",
@@ -578,6 +578,32 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         action="append",
         default=[],
         help="Restrict reconciliation to one Linear issue ID (repeatable)",
+    )
+    p_review_runner.add_argument(
+        "--repository",
+        default=None,
+        help="Exact owner/name repository required by the read-only staging probe",
+    )
+    p_review_runner.add_argument(
+        "--pr-number",
+        type=int,
+        default=None,
+        help="Exact pull request number required by the read-only staging probe",
+    )
+    p_review_runner.add_argument(
+        "--expected-head-sha",
+        default=None,
+        help="Exact 40-character PR head SHA required by the staging probe",
+    )
+    p_review_runner.add_argument(
+        "--channel-id",
+        default=None,
+        help="Exact allowlisted Slack channel ID for the staging probe",
+    )
+    p_review_runner.add_argument(
+        "--thread-ts",
+        default=None,
+        help="Exact Slack thread timestamp for the staging probe",
     )
     p_review_runner.add_argument(
         "--quiet",
@@ -2143,6 +2169,68 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
         max_items=getattr(args, "max_items", None),
         retry_ceiling=getattr(args, "retry_ceiling", None),
     )
+
+    if getattr(args, "runner_action", "run") == "staging":
+        repository = str(getattr(args, "repository", None) or "").strip()
+        pr_number = getattr(args, "pr_number", None)
+        expected_head_sha = str(
+            getattr(args, "expected_head_sha", None) or ""
+        ).strip()
+        required = {
+            "--repository": repository,
+            "--pr-number": pr_number,
+            "--expected-head-sha": expected_head_sha,
+        }
+        missing = [name for name, value in required.items() if value in {None, ""}]
+        if missing:
+            print(
+                "kanban review-runner staging: required arguments: "
+                + ", ".join(missing),
+                file=sys.stderr,
+            )
+            return 2
+        assert pr_number is not None
+        payload: dict[str, Any]
+        try:
+            payload = runner.probe_review_runner_resources(
+                config=review_config,
+                repository=repository,
+                pr_number=int(pr_number),
+                expected_head_sha=expected_head_sha,
+                channel_id=getattr(args, "channel_id", None),
+                thread_ts=getattr(args, "thread_ts", None),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            failure = runner._redacted_adapter_setup_failure(exc)
+            payload = {
+                "schema_version": 1,
+                "status": "blocked",
+                "mode": "staging",
+                "script_only": True,
+                "external_provider_writes": False,
+                "local_writes": False,
+                "failure": failure,
+            }
+        if getattr(args, "json", False):
+            print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+        elif payload["status"] == "ready":
+            github_resource = payload["github"]
+            print(
+                "Review runner staging: ready; "
+                f"repository={github_resource['repository']}; "
+                f"pr={github_resource['pr_number']}; "
+                f"head={github_resource['head_sha']}; writes=False"
+            )
+        else:
+            failure = payload["failure"]
+            print(
+                "Review runner staging: blocked; "
+                f"{failure['type']} ({failure['kind']}); writes=False",
+                file=sys.stderr,
+            )
+        return 0 if payload["status"] == "ready" else 1
 
     with kb.connect_closing() as conn:
         if getattr(args, "runner_action", "run") == "health":

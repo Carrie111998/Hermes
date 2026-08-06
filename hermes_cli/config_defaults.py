@@ -2324,12 +2324,15 @@ DEFAULT_CONFIG = {
             # Per-MCP-read outer timeout. The selected MCP server's own request
             # timeout is narrowed to the same value; it may never exceed the
             # runner's wall-clock budget.
-            # Four sequential GitHub reads fit inside the default 120-second
-            # runner budget with headroom for reconciliation and persistence.
-            "provider_timeout_seconds": 20,
+            # A worst-case delivery attempt can span seven MCP requests. The
+            # 15-second cap keeps that attempt inside the 120-second runner
+            # budget with headroom for persistence and lease handling.
+            "provider_timeout_seconds": 15,
             "providers": {
                 "github": {
                     "enabled": False,
+                    # Independent write gate. Enabling reads never enables receipts.
+                    "delivery_enabled": False,
                     "adapter": "disabled",
                     "mcp_server": "github",
                     # Required when adapter=mcp. Exact owner/name entries only.
@@ -2338,6 +2341,8 @@ DEFAULT_CONFIG = {
                 },
                 "slack": {
                     "enabled": False,
+                    # Independent write gate. Enabling reads never enables receipts.
+                    "delivery_enabled": False,
                     "adapter": "disabled",
                     "mcp_server": "slack",
                     # Both allowlists are mandatory when adapter=mcp. Reads are

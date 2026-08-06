@@ -43,7 +43,7 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_LEASE_SECONDS = 180
 DEFAULT_MAX_ITEMS = 50
 DEFAULT_RETRY_CEILING = 3
-DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 15
 MAX_TIMEOUT_SECONDS = 15 * 60
 MAX_LEASE_SECONDS = 60 * 60
 MAX_ITEMS_PER_RUN = 500
@@ -131,7 +131,9 @@ class ReviewRunnerConfig:
     retry_ceiling: int = DEFAULT_RETRY_CEILING
     provider_timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     github_provider_enabled: bool = False
+    github_delivery_enabled: bool = False
     slack_provider_enabled: bool = False
+    slack_delivery_enabled: bool = False
     github_adapter: str = "disabled"
     github_mcp_server: str = "github"
     github_repositories: tuple[str, ...] = ()
@@ -208,12 +210,22 @@ class ReviewRunnerConfig:
             "enabled",
             "gateway_enabled",
             "github_provider_enabled",
+            "github_delivery_enabled",
             "slack_provider_enabled",
+            "slack_delivery_enabled",
         ):
             object.__setattr__(
                 self,
                 field_name,
                 is_truthy_value(getattr(self, field_name), default=False),
+            )
+        if self.github_delivery_enabled and not self.github_provider_enabled:
+            raise ReviewRunnerError(
+                "providers.github.delivery_enabled requires providers.github.enabled"
+            )
+        if self.slack_delivery_enabled and not self.slack_provider_enabled:
+            raise ReviewRunnerError(
+                "providers.slack.delivery_enabled requires providers.slack.enabled"
             )
 
     @classmethod
@@ -240,8 +252,14 @@ class ReviewRunnerConfig:
             github_provider_enabled=is_truthy_value(
                 github_cfg.get("enabled"), default=False
             ),
+            github_delivery_enabled=is_truthy_value(
+                github_cfg.get("delivery_enabled"), default=False
+            ),
             slack_provider_enabled=is_truthy_value(
                 slack_cfg.get("enabled"), default=False
+            ),
+            slack_delivery_enabled=is_truthy_value(
+                slack_cfg.get("delivery_enabled"), default=False
             ),
             github_adapter=str(github_cfg.get("adapter") or "disabled"),
             github_mcp_server=str(github_cfg.get("mcp_server") or "github"),
@@ -509,9 +527,11 @@ def _build_configured_mcp_adapters(
         github_server_name=github_server,
         github_repositories=config.github_repositories,
         coderabbit_logins=config.coderabbit_logins,
+        github_delivery_enabled=config.github_delivery_enabled,
         slack_server_name=slack_server,
         slack_channel_ids=config.slack_channel_ids,
         slack_user_ids=config.slack_acknowledgement_user_ids,
+        slack_delivery_enabled=config.slack_delivery_enabled,
         clock=clock,
     )
     return ReviewRunnerAdapters(
@@ -524,11 +544,11 @@ def _build_configured_mcp_adapters(
         reconciliation_snapshot_provider=bundle.github_adapter,
         github_snapshot_provider=bundle.github_adapter,
         coderabbit_snapshot_provider=bundle.github_adapter,
+        github_delivery_transport=bundle.github_delivery_transport,
         slack_snapshot_provider=bundle.github_adapter,
+        slack_delivery_transport=bundle.slack_delivery_transport,
         slack_acknowledgement_provider=bundle.slack_acknowledgement_provider,
         mcp_credential_preflight=bundle.credential_preflight,
-        # Delivery transports intentionally remain None: this phase cannot
-        # perform GitHub or Slack external writes.
     )
 
 
@@ -643,24 +663,28 @@ def _candidate_provider_call_count(
 ) -> int:
     """Return the worst-case external calls made by one outbox attempt.
 
-    Both provider boundaries perform one current-state read, one idempotency
-    readback, one send, and a final readback if send raises. Reserving all four
-    request windows prevents a runner timeout from expiring its board lease in
-    the middle of an external delivery attempt.
+    A candidate performs one exact-head snapshot collection plus an
+    idempotency readback, one send, and a final readback if send raises. The
+    snapshot collection can itself span several MCP requests (four for the
+    configured GitHub adapter), so include its declared call count rather than
+    treating it as one request window. This prevents a runner timeout from
+    expiring its board lease in the middle of an external delivery attempt.
     """
     if candidate.surface == "github":
         ready = (
             config.github_provider_enabled
+            and config.github_delivery_enabled
             and adapters.github_snapshot_provider is not None
             and adapters.github_delivery_transport is not None
         )
     else:
         ready = (
             config.slack_provider_enabled
+            and config.slack_delivery_enabled
             and adapters.slack_snapshot_provider is not None
             and adapters.slack_delivery_transport is not None
         )
-    return 4 if ready else 0
+    return adapters.reconciliation_provider_call_count + 3 if ready else 0
 
 
 def acquire_runner_lease(
@@ -888,6 +912,132 @@ def _surface_backlog_health(
     }
 
 
+def probe_review_runner_resources(
+    *,
+    config: ReviewRunnerConfig,
+    repository: str,
+    pr_number: int,
+    expected_head_sha: str,
+    channel_id: Optional[str] = None,
+    thread_ts: Optional[str] = None,
+    adapters: Optional[ReviewRunnerAdapters] = None,
+    now: Optional[int] = None,
+) -> dict[str, Any]:
+    """Probe one explicit staging route without provider or local writes."""
+
+    checked_at = int(time.time()) if now is None else int(now)
+    registered = adapters or _build_configured_mcp_adapters(
+        config,
+        clock=lambda: float(checked_at),
+    )
+    provider = registered.github_snapshot_provider
+    if provider is None:
+        raise ReviewRunnerError(
+            "staging requires a registered authoritative GitHub snapshot provider"
+        )
+    snapshot = provider.read_snapshot(
+        repository=repository,
+        pr_number=pr_number,
+    )
+    if not isinstance(snapshot, github.GitHubPullRequestSnapshot):
+        raise ReviewRunnerError("GitHub staging probe returned an invalid snapshot")
+    expected_repository = str(repository or "").strip().casefold()
+    if snapshot.repository != expected_repository or snapshot.pr_number != int(
+        pr_number
+    ):
+        raise ReviewRunnerError(
+            "GitHub staging probe returned a different repository or pull request"
+        )
+    github.validate_snapshot_freshness(snapshot, now=checked_at)
+    github.validate_exact_head(snapshot, expected_head_sha=expected_head_sha)
+
+    coderabbit_payload: Optional[dict[str, Any]] = None
+    if registered.coderabbit_snapshot_provider is not None:
+        review = registered.coderabbit_snapshot_provider.read_review(
+            repository=snapshot.repository,
+            pr_number=snapshot.pr_number,
+            expected_head_sha=snapshot.head_sha,
+        )
+        if not isinstance(review, coderabbit.CodeRabbitSnapshot):
+            raise ReviewRunnerError(
+                "CodeRabbit staging probe returned invalid evidence"
+            )
+        coderabbit_payload = {
+            "provider": review.provider,
+            "observation_id": review.observation_id,
+            "head_sha": review.head_sha,
+            "state": coderabbit.assess_snapshot(
+                review,
+                current_head_sha=snapshot.head_sha,
+                now=checked_at,
+            ).state,
+        }
+
+    normalized_channel = str(channel_id or "").strip()
+    normalized_thread = str(thread_ts or "").strip()
+    if bool(normalized_channel) != bool(normalized_thread):
+        raise ReviewRunnerError(
+            "Slack staging probe requires both --channel-id and --thread-ts"
+        )
+    slack_payload: Optional[dict[str, Any]] = None
+    if config.slack_provider_enabled:
+        if not normalized_channel or not normalized_thread:
+            raise ReviewRunnerError(
+                "enabled Slack staging requires an explicit channel ID and thread_ts"
+            )
+        if registered.slack_acknowledgement_provider is None:
+            raise ReviewRunnerError(
+                "staging requires a registered Slack acknowledgement provider"
+            )
+        events = registered.slack_acknowledgement_provider.read_acknowledgements(
+            channel_id=normalized_channel,
+            thread_ts=normalized_thread,
+        )
+        slack_payload = {
+            "channel_id": normalized_channel,
+            "thread_ts": normalized_thread,
+            "acknowledgement_event_count": len(events),
+            "event_ids": sorted(item.event_id for item in events),
+        }
+
+    return {
+        "schema_version": 1,
+        "status": "ready",
+        "checked_at": checked_at,
+        "mode": "staging",
+        "script_only": True,
+        "external_provider_writes": False,
+        "local_writes": False,
+        "github": {
+            "repository": snapshot.repository,
+            "pr_number": snapshot.pr_number,
+            "pr_url": snapshot.pr_url,
+            "base_ref": snapshot.base_ref,
+            "head_ref": snapshot.head_ref,
+            "head_sha": snapshot.head_sha,
+            "snapshot_sha256": snapshot.snapshot_sha256(),
+            "review_count": len(snapshot.reviews),
+            "review_thread_count": len(snapshot.review_threads),
+            "delivery_registered": registered.github_delivery_transport is not None,
+        },
+        "coderabbit": coderabbit_payload,
+        "slack": slack_payload,
+        "receipt_delivery": {
+            "github": (
+                "registered_not_sent"
+                if registered.github_delivery_transport is not None
+                else "disabled"
+            ),
+            "slack": (
+                "registered_not_sent"
+                if registered.slack_delivery_transport is not None
+                else "disabled"
+            ),
+        },
+        "merge_or_branch_write_capability": False,
+    }
+
+
 def diagnose_review_runner(
     conn: sqlite3.Connection,
     *,
@@ -973,6 +1123,11 @@ def diagnose_review_runner(
         and (not config.github_provider_enabled or github_shadow_ready)
         and (not config.slack_provider_enabled or slack_shadow_ready)
     )
+    all_enabled_writes_ready = (
+        enabled_provider_count > 0
+        and (not config.github_provider_enabled or github_write_registered)
+        and (not config.slack_provider_enabled or slack_write_registered)
+    )
     blockers: list[str] = []
     if redacted_setup_failure:
         blockers.append(
@@ -992,6 +1147,10 @@ def diagnose_review_runner(
         if not github_read_registered:
             blockers.append("github_read_adapter_not_registered")
         blockers.append("github_private_repository_authorization_unprobed")
+        if not config.github_delivery_enabled:
+            blockers.append("github_delivery_disabled")
+        elif not github_write_registered:
+            blockers.append("github_delivery_adapter_not_registered")
     if config.slack_provider_enabled:
         if config.slack_adapter != "mcp":
             blockers.append("slack_mcp_adapter_not_selected")
@@ -1002,6 +1161,10 @@ def diagnose_review_runner(
         if not slack_read_registered:
             blockers.append("slack_read_adapter_not_registered")
         blockers.append("slack_resource_authorization_unprobed")
+        if not config.slack_delivery_enabled:
+            blockers.append("slack_delivery_disabled")
+        elif not slack_write_registered:
+            blockers.append("slack_delivery_adapter_not_registered")
     if not github_write_registered and not slack_write_registered:
         blockers.append("live_delivery_transport_not_registered")
     return {
@@ -1027,6 +1190,7 @@ def diagnose_review_runner(
         "providers": {
             "github": {
                 "enabled": config.github_provider_enabled,
+                "delivery_enabled": config.github_delivery_enabled,
                 "adapter": config.github_adapter,
                 "read_registered": github_read_registered,
                 "write_registered": github_write_registered,
@@ -1041,6 +1205,7 @@ def diagnose_review_runner(
             },
             "slack": {
                 "enabled": config.slack_provider_enabled,
+                "delivery_enabled": config.slack_delivery_enabled,
                 "adapter": config.slack_adapter,
                 "read_registered": slack_read_registered,
                 "write_registered": slack_write_registered,
@@ -1065,18 +1230,8 @@ def diagnose_review_runner(
             "dry_run_ready": timeout_bounded,
             "shadow_ready": config.enabled and all_enabled_reads_ready,
             "live_ready": config.enabled
-            and (
-                (
-                    config.github_provider_enabled
-                    and github_write_registered
-                    and timeout_bounded
-                )
-                or (
-                    config.slack_provider_enabled
-                    and slack_write_registered
-                    and timeout_bounded
-                )
-            ),
+            and all_enabled_writes_ready
+            and timeout_bounded,
             "production_ready": False,
             "blockers": blockers,
         },
@@ -1088,8 +1243,9 @@ def diagnose_review_runner(
                 "current review comments remain unresolved/actionable until an "
                 "authoritative thread-resolution provider is available"
             ),
-            "github_write_tools_registered": False,
-            "slack_write_tools_registered": False,
+            "github_write_tools_registered": github_write_registered,
+            "github_request_reviewer_supported": False,
+            "slack_write_tools_registered": slack_write_registered,
             "slack_is_approval_authority": False,
             "merge_or_branch_write_capability": False,
         },
@@ -1167,6 +1323,12 @@ def _process_candidate(
                 "intent_id": candidate.intent_id,
                 "reason": "provider_disabled",
             }
+        if not config.github_delivery_enabled:
+            return None, {
+                "surface": "github",
+                "intent_id": candidate.intent_id,
+                "reason": "delivery_disabled",
+            }
         if (
             adapters.github_snapshot_provider is None
             or adapters.github_delivery_transport is None
@@ -1189,6 +1351,12 @@ def _process_candidate(
                 "surface": "slack",
                 "intent_id": candidate.intent_id,
                 "reason": "provider_disabled",
+            }
+        if not config.slack_delivery_enabled:
+            return None, {
+                "surface": "slack",
+                "intent_id": candidate.intent_id,
+                "reason": "delivery_disabled",
             }
         if (
             adapters.slack_snapshot_provider is None
@@ -1231,6 +1399,21 @@ def run_review_runner(
         retry_ceiling=config.retry_ceiling,
     )
     mode = config.mode
+    if mode != "dry-run" and not config.enabled:
+        return ReviewRunnerReceipt(
+            "disabled",
+            mode,
+            False,
+            None,
+            None,
+            None,
+            None,
+            0,
+            candidates,
+            (),
+            ({"reason": "runner_disabled"},),
+            (),
+        )
     if adapters is None and mode != "dry-run":
         try:
             effective_adapters = _build_configured_mcp_adapters(
@@ -1281,22 +1464,6 @@ def run_review_runner(
                 "provider_timeout_seconds no greater than the runner timeout",
             ),
         )
-    if mode != "dry-run" and not config.enabled:
-        return ReviewRunnerReceipt(
-            "disabled",
-            mode,
-            mode == "dry-run",
-            None,
-            None,
-            None,
-            None,
-            0,
-            candidates,
-            (),
-            ({"reason": "runner_disabled"},),
-            (),
-        )
-
     run_id = None if mode == "dry-run" else "rbr_" + secrets.token_hex(12)
     lease: Optional[LeaseReceipt] = None
     if mode != "dry-run":

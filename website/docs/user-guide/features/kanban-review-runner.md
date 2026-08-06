@@ -12,16 +12,17 @@ The current production-readiness status is **conditional / blocked for live deli
 
 - Linear, GitHub, CodeRabbit, and Slack acknowledgement reads have typed, allowlisted MCP boundaries.
 - `dry-run` performs no writes. `shadow` performs no provider writes and may persist only immutable local reconciliation or acknowledgement audit rows.
-- No GitHub or Slack delivery transport is registered. `live_ready` and `production_ready` therefore remain false. Do not create a production cron or enable gateway routing until an independently reviewed delivery adapter exists and the operator approves the exact destination.
+- Restricted GitHub review-comment and Slack message/reply transports are available behind independent `delivery_enabled: false` gates. They are not reviewer-request, approval, merge, branch, file, or channel-management authority.
+- `production_ready` remains false until the exact private GitHub PR/head and Slack channel/thread probes pass with the production credentials and the operator approves each destination. Do not create a production cron or enable gateway routing from this runbook.
 
 ## Authority and safety contract
 
 | System | Authority | Allowed by the current runner | Never inferred or allowed |
 |---|---|---|---|
 | Linear | Issue intent, title, status, project context, attachments | OAuth MCP reads and resource probes | Webhook delivery, issue mutation, PR head authority |
-| GitHub | PR identity, open/draft state, exact head SHA, checks, reviews, review comments | Four explicitly allowlisted MCP reads | Merge, approval, branch update, push, reviewer request, comment write |
+| GitHub | PR identity, open/draft state, exact head SHA, checks, reviews, review comments | Four explicitly allowlisted MCP reads; exact-head `COMMENT` review receipt when separately enabled | Merge, approval, branch update, push, reviewer request, file write |
 | CodeRabbit | Review evidence observed through GitHub | Exact-head classification | A green status as proof that no actionable comments exist |
-| Slack | Notification route and acknowledgement evidence only | Allowlisted thread/reaction/text reads | Approval authority, merge authority, channel discovery, channel management |
+| Slack | Notification route and acknowledgement evidence only | Allowlisted thread/reaction/text reads; exact stored channel/thread message delivery when separately enabled | Approval authority, merge authority, destination discovery, channel management |
 | Kanban | Work ownership, exact-head gate, local audit/outbox state | Bounded local reconciliation/audit writes in shadow mode | Automatic follow-up creation or recursive scheduling |
 
 A Slack `approve`, `lgtm`, or approval-looking reaction is stored only as acknowledgement evidence. GitHub remains the human decision source. Merge remains human-only.
@@ -74,23 +75,25 @@ kanban:
     lease_seconds: 180
     max_items_per_run: 50
     retry_ceiling: 3
-    provider_timeout_seconds: 20
+    provider_timeout_seconds: 15
     providers:
       github:
         enabled: false
+        delivery_enabled: false
         adapter: disabled
         mcp_server: github
         repositories: []
         coderabbit_logins: ["coderabbitai[bot]", "coderabbitai"]
       slack:
         enabled: false
+        delivery_enabled: false
         adapter: disabled
         mcp_server: slack
         channel_ids: []
         acknowledgement_user_ids: []
 ```
 
-For an approved read-only staging run, set `enabled: true`, `mode: shadow`, select `adapter: mcp`, enable only the providers being tested, and populate their exact allowlists. Do not enable `gateway_enabled` for a local operator probe.
+For an approved read-only staging run, set `enabled: true`, `mode: shadow`, select `adapter: mcp`, enable only the providers being tested, populate their exact allowlists, and keep both `delivery_enabled` values false. Do not enable `gateway_enabled` for a local operator probe.
 
 ## Deterministic preflight
 
@@ -100,7 +103,7 @@ Run health before any resource read:
 hermes kanban --board <board> review-runner health --json
 ```
 
-Health may start only the explicitly selected MCP servers and discovers only the required read tools. Prompt and resource utility schemas are disabled for this boundary. If a selected server was already registered in the process with any additional tool, health fails closed rather than relying only on the per-call allowlist. It does not read a repository/channel resource and does not call a provider write tool.
+Health may start only the explicitly selected MCP servers and discovers only the tools required by the selected read and delivery gates. Prompt and resource utility schemas are disabled for this boundary. If a selected server was already registered in the process with any additional tool, health fails closed rather than relying only on the per-call allowlist. It does not read a repository/channel resource and does not call a provider write tool.
 
 Required signals:
 
@@ -108,8 +111,8 @@ Required signals:
 - `providers.timeout_bounded=true`
 - selected provider `read_registered=true`
 - selected provider credential preflight `ready=true`
-- `configuration.external_writes_enabled=false`
-- `readiness.live_ready=false`
+- `configuration.external_writes_enabled=false` while delivery gates are disabled
+- `readiness.live_ready=false` while any enabled provider lacks its delivery gate/transport
 - `readiness.production_ready=false`
 - no `adapter_setup_failed:*` blocker
 
@@ -139,6 +142,24 @@ Required signals:
 The defined polling command is the same probe scheduled as a no-agent, read-only process (recommended cadence: every five minutes). Snapshot ingestion into the Linear coordinator is not implemented in this boundary, so production activation remains blocked until that ingestion path is reviewed. Do not treat OAuth as a webhook and do not create a production cron from this runbook while that blocker remains.
 
 ## GitHub, CodeRabbit, and Slack shadow validation
+
+First probe one explicit resource route. This command is read-only: it does not
+open the board database and reports `external_provider_writes=false` and
+`local_writes=false`.
+
+```bash
+hermes kanban --board <board> review-runner staging \
+  --repository <owner/name> \
+  --pr-number <number> \
+  --expected-head-sha <40-character-sha> \
+  --channel-id <approved-channel-id> \
+  --thread-ts <approved-existing-thread-ts> \
+  --json
+```
+
+The GitHub arguments are mandatory. The Slack arguments are mandatory together
+when the Slack provider is enabled. The command fails closed on a repository,
+PR, head, channel, or thread mismatch; it never substitutes a resource.
 
 Use a known Linear issue already linked to authoritative local coordinator rows:
 
@@ -178,7 +199,14 @@ The runner requires both an exact channel allowlist and exact acknowledgement us
 
 ### Live delivery
 
-No delivery adapter is registered. `mode: live` does not create authority: candidates are skipped when the required snapshot + delivery transport pair is absent. GitHub write tools and Slack post tools are not discovered by this boundary.
+Delivery is gated independently from provider reads:
+
+- GitHub delivery registers only `create_pull_request_review` plus the existing review readback. It sends `event=COMMENT` with the immutable full head SHA and a deterministic receipt marker. `request_reviewer` fails closed because that write tool is not exposed.
+- Slack delivery registers only channel history/thread readback plus post/reply. It uses the immutable outbox channel/thread route and a deterministic receipt marker.
+- Both transports search provider readback for the marker before retrying an ambiguous side effect. A receipt must preserve the exact head (GitHub) or exact channel/thread (Slack).
+- Enabling one provider's delivery does not enable the other. If both providers are enabled, `live_ready` requires both delivery transports.
+
+`mode: live` does not create authority. Candidates are skipped when the required snapshot + delivery transport pair is absent, and delivery remains disabled by default.
 
 ## Timeout, retry, and idempotency behavior
 
@@ -190,25 +218,26 @@ No delivery adapter is registered. `mode: live` does not create authority: candi
 
 ## Rollout sequence
 
-1. Keep runner and providers disabled.
+1. Keep runner, providers, and both delivery gates disabled.
 2. Add credential references and exact allowlists.
-3. Run health and Linear OAuth resource probes.
-4. Enable `shadow` locally; run one known issue and inspect evidence.
-5. Repeat the same input to prove deterministic/idempotent local results.
+3. Set `enabled: true`, `mode: shadow`, and enable one read provider with `adapter: mcp`; leave its `delivery_enabled: false`.
+4. Run health, the deterministic `staging` resource probe, and the Linear OAuth resource probe. Stop on any auth, permission, head, channel, or thread failure.
+5. Run one known Linear issue in shadow and repeat the same input to prove deterministic/idempotent local results.
 6. Resolve every health blocker and known provider limitation.
-7. Obtain explicit approval for any production integration, cron routing, gateway routing, or live delivery implementation.
-8. Deploy code, restart the gateway only if gateway-hosted code changed, then rerun health and shadow verification.
-9. Enable one destination at a time only after a write-capable adapter has independent review and exact destination authorization.
+7. Obtain explicit approval for the exact provider, repository/PR or channel/thread, production integration, cron routing, gateway routing, and live-delivery window.
+8. Enable exactly one provider's `delivery_enabled: true` while remaining in `mode: shadow`; rerun health and staging. Verify the discovered tool allowlist contains only the documented restricted delivery tools.
+9. Change to `mode: live` only for the approved destination/window. Inspect the provider receipt and outbox attempt before enabling a second destination.
+10. Deploy code, restart the gateway only if gateway-hosted code changed, then rerun health and staging verification.
 
-This repository does not perform steps 7–9 automatically.
+This repository does not perform steps 7–10 automatically.
 
 ## Rollback
 
-1. Set `kanban.review_runner.enabled: false`.
-2. Set both provider `enabled` values to `false` and adapters to `disabled`.
+1. Set `kanban.review_runner.mode: shadow` (or `dry-run`) and both provider `delivery_enabled` values to `false`.
+2. Set `kanban.review_runner.enabled: false`, then set both provider `enabled` values to `false` and adapters to `disabled`.
 3. Disable/remove the external cron or gateway route using the same operator surface that created it.
 4. Restart the gateway only if its loaded code/config requires it.
-5. Run health and confirm `external_writes_enabled=false`, `live_ready=false`, and no active runner lease.
+5. Run health and confirm `external_writes_enabled=false`, both `write_registered=false`, `live_ready=false`, and no active runner lease.
 6. Preserve reconciliation, gate, outbox, and acknowledgement rows for audit. Do not delete or rewrite history as rollback.
 
 The runner reports `hermes gateway restart` and `hermes gateway status` as operator commands; it never executes a restart itself.
@@ -218,13 +247,13 @@ The runner reports `hermes gateway restart` and `hermes gateway status` as opera
 | Signal | Meaning | Operator response |
 |---|---|---|
 | `credential readiness is blocked` | Missing/unresolved env reference or plaintext secret in config | Move the secret to approved storage; keep provider disabled |
-| `required MCP read tools were not discovered` | Wrong server/package/tool surface or connection failure | Run `hermes mcp test <server>` and verify package/version/config |
+| `required MCP tools were not discovered` | Wrong server/package/tool surface or connection failure | Run `hermes mcp test <server>` and verify package/version/config |
 | `permission` / `auth` | Credential lacks resource access or is invalid | Fix least-privilege access; do not broaden allowlists speculatively |
 | `rate_limited` | Provider quota/backoff | Stop manual loops; retry on a later scheduled pass |
 | `commit_id is unavailable` | Exact-head evidence cannot be established | Keep the gate blocked; use an authoritative provider that supplies commit identity |
 | `actionable_review_thread` | Current-head unresolved comment exists (or cannot be proven resolved) | Resolve in GitHub and re-read through an authoritative resolution source |
 | `head mismatch` / `stale` | Evidence targets an older PR head | Supersede old intent/evidence and rerun on the current full SHA |
-| `adapter_not_registered` | Provider enabled without a complete safe adapter | Keep live mode disabled and correct config/implementation |
+| `adapter_not_registered` | Provider enabled without a complete safe read/delivery pair | Keep live mode disabled and correct config/implementation |
 | runner lease held | Another bounded pass owns the board lease | Wait for completion/expiry; do not bypass the lease |
 
 Never paste raw provider errors into tickets or chat without redaction.

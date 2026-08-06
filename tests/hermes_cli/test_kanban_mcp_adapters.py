@@ -1,8 +1,9 @@
-"""Tests for the read-only MCP boundary used by the Kanban review runner."""
+"""Tests for the scoped MCP boundary used by the Kanban review runner."""
 
 from __future__ import annotations
 
 import time
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, Mapping
 
@@ -12,9 +13,11 @@ from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_github as github
 from hermes_cli import kanban_slack as slack
 from hermes_cli.kanban_mcp_adapters import (
+    GitHubMCPDeliveryTransport,
     GitHubMCPReadAdapter,
     MCPAdapterError,
     RegistryMCPToolCaller,
+    SlackMCPDeliveryTransport,
     SlackMCPAcknowledgementProvider,
     build_review_runner_mcp_bundle,
 )
@@ -24,6 +27,7 @@ HEAD = "a" * 40
 OLD_HEAD = "b" * 40
 NOW = 1_800_000_000
 REPOSITORY = "nousresearch/hermes-agent"
+CHANNEL = "C_STAGING"
 
 
 class FakeCaller:
@@ -130,6 +134,82 @@ def _github_adapter(caller: FakeCaller) -> GitHubMCPReadAdapter:
         server_name="github",
         repositories=(REPOSITORY,),
         clock=lambda: NOW,
+    )
+
+
+def _github_intent(
+    *,
+    operation: github.GitHubOperation = "create_comment",
+    surface: github.GitHubSurface = "pull_request_comments",
+) -> github.GitHubOutboxIntent:
+    key = (
+        f"github-human-review:v1:{REPOSITORY}:pr:41:head:{HEAD}:"
+        f"surface:{surface}:operation:{operation}"
+    )
+    return github.GitHubOutboxIntent(
+        id="gho_delivery",
+        gate_id="g_delivery",
+        repository=REPOSITORY,
+        pr_number=41,
+        head_sha=HEAD,
+        surface=surface,
+        operation=operation,
+        payload={"body": "Exact-head review evidence."},
+        payload_sha256="0" * 64,
+        idempotency_key=key,
+        state="pending",
+        attempt_count=0,
+        max_attempts=3,
+        next_attempt_at=None,
+        external_id=None,
+        last_snapshot_sha256=None,
+        last_snapshot_observed_at=None,
+        last_failure_kind=None,
+        last_error=None,
+        created_at=NOW,
+        updated_at=NOW,
+        sent_at=None,
+    )
+
+
+def _slack_intent(
+    *,
+    surface: slack.SlackSurface = "channel",
+    operation: slack.SlackOperation = "notify_human_review",
+    thread_ts: str = "",
+) -> slack.SlackOutboxIntent:
+    thread_key = thread_ts or "root"
+    key = (
+        f"slack-human-review:v1:channel:{CHANNEL}:thread:{thread_key}:"
+        f"{REPOSITORY}:pr:41:head:{HEAD}:surface:{surface}:operation:{operation}"
+    )
+    return slack.SlackOutboxIntent(
+        id="slo_delivery",
+        gate_id="g_delivery",
+        source_intent_id=None,
+        repository=REPOSITORY,
+        pr_number=41,
+        head_sha=HEAD,
+        channel_id=CHANNEL,
+        thread_ts=thread_ts,
+        surface=surface,
+        operation=operation,
+        payload={"body": "Exact-head human-review notification."},
+        payload_sha256="0" * 64,
+        idempotency_key=key,
+        state="pending",
+        attempt_count=0,
+        max_attempts=3,
+        next_attempt_at=None,
+        external_message_ts=None,
+        delivered_thread_ts=None,
+        last_snapshot_sha256=None,
+        last_snapshot_observed_at=None,
+        last_failure_kind=None,
+        last_error=None,
+        created_at=NOW,
+        updated_at=NOW,
+        sent_at=None,
     )
 
 
@@ -401,6 +481,208 @@ def test_slack_mcp_invalid_auth_fails_closed() -> None:
     assert exc_info.value.kind == "auth"
 
 
+def test_github_delivery_sends_exact_head_review_and_reads_marker_receipt() -> None:
+    intent = _github_intent()
+    send_caller = FakeCaller({
+        "mcp__github__create_pull_request_review": {
+            "id": 701,
+            "commit_id": HEAD,
+        }
+    })
+    transport = GitHubMCPDeliveryTransport(
+        send_caller,
+        server_name="github",
+        repositories=(REPOSITORY,),
+    )
+
+    sent = transport.send_intent(intent)
+    tool, arguments = send_caller.calls[0]
+
+    assert sent.external_id == "github-review:701"
+    assert tool == "mcp__github__create_pull_request_review"
+    assert arguments["commit_id"] == HEAD
+    assert arguments["event"] == "COMMENT"
+    assert "hermes-review-receipt:" in arguments["body"]
+    assert intent.idempotency_key not in arguments["body"]
+
+    read_caller = FakeCaller({
+        "mcp__github__get_pull_request_reviews": [
+            {
+                "id": 701,
+                "commit_id": HEAD,
+                "body": arguments["body"],
+            }
+        ]
+    })
+    replay = GitHubMCPDeliveryTransport(
+        read_caller,
+        server_name="github",
+        repositories=(REPOSITORY,),
+    ).find_delivery(idempotency_key=intent.idempotency_key)
+
+    assert replay == sent
+    assert read_caller.calls == [
+        (
+            "mcp__github__get_pull_request_reviews",
+            {"owner": "nousresearch", "repo": "hermes-agent", "pull_number": 41},
+        )
+    ]
+
+
+def test_github_delivery_fails_closed_for_unsupported_reviewer_request() -> None:
+    caller = FakeCaller({})
+    transport = GitHubMCPDeliveryTransport(
+        caller,
+        server_name="github",
+        repositories=(REPOSITORY,),
+    )
+
+    with pytest.raises(github.GitHubTransportFailure) as exc_info:
+        transport.send_intent(
+            _github_intent(
+                operation="request_reviewer",
+                surface="review_requests",
+            )
+        )
+
+    assert exc_info.value.kind == "validation"
+    assert caller.calls == []
+
+
+def test_github_delivery_retries_ambiguous_write_but_not_invalid_intent() -> None:
+    caller = FakeCaller({"mcp__github__create_pull_request_review": "not-a-receipt"})
+    transport = GitHubMCPDeliveryTransport(
+        caller,
+        server_name="github",
+        repositories=(REPOSITORY,),
+    )
+
+    with pytest.raises(github.GitHubTransportFailure) as ambiguous:
+        transport.send_intent(_github_intent())
+    assert ambiguous.value.kind == "unavailable"
+
+    with pytest.raises(github.GitHubTransportFailure) as invalid:
+        transport.send_intent(replace(_github_intent(), payload={}))
+    assert invalid.value.kind == "validation"
+    assert len(caller.calls) == 1
+
+
+@pytest.mark.parametrize(
+    ("intent", "tool", "response", "delivered_thread"),
+    [
+        (
+            _slack_intent(),
+            "mcp__slack__slack_post_message",
+            {"ok": True, "channel": CHANNEL, "ts": "200.001"},
+            "200.001",
+        ),
+        (
+            _slack_intent(
+                surface="thread",
+                operation="reply",
+                thread_ts="100.001",
+            ),
+            "mcp__slack__slack_reply_to_thread",
+            {
+                "ok": True,
+                "channel": CHANNEL,
+                "ts": "200.002",
+                "thread_ts": "100.001",
+            },
+            "100.001",
+        ),
+    ],
+)
+def test_slack_delivery_preserves_exact_channel_and_thread_routes(
+    intent: slack.SlackOutboxIntent,
+    tool: str,
+    response: Mapping[str, Any],
+    delivered_thread: str,
+) -> None:
+    caller = FakeCaller({tool: response})
+    transport = SlackMCPDeliveryTransport(
+        caller,
+        server_name="slack",
+        channel_ids=(CHANNEL,),
+    )
+
+    receipt = transport.send_intent(intent)
+    called_tool, arguments = caller.calls[0]
+
+    assert called_tool == tool
+    assert arguments["channel_id"] == CHANNEL
+    assert receipt.thread_ts == delivered_thread
+    assert receipt.message_ts == response["ts"]
+    assert "hermes-review-receipt:" in arguments["text"]
+    assert intent.idempotency_key not in arguments["text"]
+
+
+def test_slack_delivery_reads_existing_marker_before_replay() -> None:
+    intent = _slack_intent(
+        surface="thread",
+        operation="reply",
+        thread_ts="100.001",
+    )
+    send_caller = FakeCaller({
+        "mcp__slack__slack_reply_to_thread": {
+            "ok": True,
+            "channel": CHANNEL,
+            "ts": "200.002",
+            "thread_ts": "100.001",
+        }
+    })
+    sender = SlackMCPDeliveryTransport(
+        send_caller,
+        server_name="slack",
+        channel_ids=(CHANNEL,),
+    )
+    sent = sender.send_intent(intent)
+    body = send_caller.calls[0][1]["text"]
+    read_caller = FakeCaller({
+        "mcp__slack__slack_get_thread_replies": {
+            "messages": [
+                {
+                    "ts": "200.002",
+                    "thread_ts": "100.001",
+                    "text": body,
+                }
+            ]
+        }
+    })
+
+    replay = SlackMCPDeliveryTransport(
+        read_caller,
+        server_name="slack",
+        channel_ids=(CHANNEL,),
+    ).find_delivery(idempotency_key=intent.idempotency_key)
+
+    assert replay == sent
+    assert read_caller.calls == [
+        (
+            "mcp__slack__slack_get_thread_replies",
+            {"channel_id": CHANNEL, "thread_ts": "100.001"},
+        )
+    ]
+
+
+def test_slack_delivery_retries_ambiguous_write_but_not_invalid_intent() -> None:
+    caller = FakeCaller({"mcp__slack__slack_post_message": "not-a-receipt"})
+    transport = SlackMCPDeliveryTransport(
+        caller,
+        server_name="slack",
+        channel_ids=(CHANNEL,),
+    )
+
+    with pytest.raises(slack.SlackTransportFailure) as ambiguous:
+        transport.send_intent(_slack_intent())
+    assert ambiguous.value.kind == "unavailable"
+
+    with pytest.raises(slack.SlackTransportFailure) as invalid:
+        transport.send_intent(replace(_slack_intent(), payload={}))
+    assert invalid.value.kind == "validation"
+    assert len(caller.calls) == 1
+
+
 def test_registry_boundary_times_out_and_rejects_non_allowlisted_tools(
     monkeypatch,
 ) -> None:
@@ -515,10 +797,98 @@ def test_bundle_registers_only_selected_servers_and_overrides_timeouts(
         "resources": False,
     }
     assert bundle.github_adapter is not None
+    assert bundle.github_delivery_transport is None
+    assert bundle.slack_delivery_transport is None
     assert bundle.slack_acknowledgement_provider is not None
     assert bundle.credential_preflight is not None
     assert bundle.credential_preflight["github"]["ready"] is True
     assert bundle.credential_preflight["slack"]["ready"] is True
+
+
+def test_bundle_delivery_gate_registers_only_restricted_receipt_tools(
+    monkeypatch,
+) -> None:
+    registered: dict[str, Any] = {}
+
+    def fake_register(config: Mapping[str, Any]) -> list[str]:
+        registered.update(config)
+        return [
+            f"mcp__{server_name}__{tool_name}"
+            for server_name, server_config in config.items()
+            for tool_name in server_config["tools"]["include"]
+        ]
+
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", fake_register)
+    expanded = {
+        "github": {
+            "command": "github",
+            "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token"},
+        },
+        "slack": {
+            "command": "slack",
+            "env": {
+                "SLACK_BOT_TOKEN": "slack-test-token",
+                "SLACK_TEAM_ID": "T_TEST",
+            },
+        },
+    }
+    raw = {
+        "github": {
+            "command": "github",
+            "env": {
+                "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+            },
+        },
+        "slack": {
+            "command": "slack",
+            "env": {
+                "SLACK_BOT_TOKEN": "${env:SLACK_BOT_TOKEN}",
+                "SLACK_TEAM_ID": "T_TEST",
+            },
+        },
+    }
+
+    bundle = build_review_runner_mcp_bundle(
+        provider_timeout_seconds=7,
+        github_server_name="github",
+        github_repositories=(REPOSITORY,),
+        github_delivery_enabled=True,
+        slack_server_name="slack",
+        slack_channel_ids=(CHANNEL,),
+        slack_user_ids=("U_REVIEWER",),
+        slack_delivery_enabled=True,
+        mcp_servers=expanded,
+        raw_mcp_servers=raw,
+    )
+
+    assert registered["github"]["tools"]["include"] == [
+        "create_pull_request_review",
+        "get_pull_request",
+        "get_pull_request_comments",
+        "get_pull_request_reviews",
+        "get_pull_request_status",
+    ]
+    assert registered["slack"]["tools"]["include"] == [
+        "slack_get_channel_history",
+        "slack_get_thread_replies",
+        "slack_post_message",
+        "slack_reply_to_thread",
+    ]
+    exposed = {
+        tool
+        for provider in registered.values()
+        for tool in provider["tools"]["include"]
+    }
+    assert not exposed.intersection({
+        "approve_pull_request",
+        "merge_pull_request",
+        "request_reviewers",
+        "slack_create_channel",
+    })
+    assert bundle.github_delivery_transport is not None
+    assert bundle.slack_delivery_transport is not None
 
 
 def test_bundle_requires_explicit_repository_channel_and_user_allowlists(
@@ -606,8 +976,12 @@ def test_bundle_fails_when_required_read_tools_are_not_discovered(monkeypatch) -
     assert exc_info.value.kind == "unavailable"
 
 
+@pytest.mark.parametrize(
+    ("server_name", "normalized_server_name"),
+    (("github", "github"), ("github-prod", "github_prod")),
+)
 def test_bundle_fails_when_selected_server_was_registered_with_write_tools(
-    monkeypatch,
+    monkeypatch, server_name: str, normalized_server_name: str
 ) -> None:
     import tools.mcp_tool as mcp_tool
 
@@ -615,24 +989,27 @@ def test_bundle_fails_when_selected_server_was_registered_with_write_tools(
         mcp_tool,
         "register_mcp_servers",
         lambda config: [
-            *(f"mcp__github__{name}" for name in config["github"]["tools"]["include"]),
-            "mcp__github__merge_pull_request",
+            *(
+                f"mcp__{normalized_server_name}__{name}"
+                for name in config[server_name]["tools"]["include"]
+            ),
+            f"mcp__{normalized_server_name}__merge_pull_request",
             "mcp__other__unrelated_tool",
         ],
     )
     with pytest.raises(MCPAdapterError) as exc_info:
         build_review_runner_mcp_bundle(
             provider_timeout_seconds=5,
-            github_server_name="github",
+            github_server_name=server_name,
             github_repositories=(REPOSITORY,),
             mcp_servers={
-                "github": {
+                server_name: {
                     "command": "github",
                     "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token"},
                 }
             },
             raw_mcp_servers={
-                "github": {
+                server_name: {
                     "command": "github",
                     "env": {
                         "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"

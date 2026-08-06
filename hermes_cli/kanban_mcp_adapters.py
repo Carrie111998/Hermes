@@ -1,10 +1,11 @@
-"""Read-only GitHub and Slack MCP adapters for the Kanban review runner.
+"""Scoped GitHub and Slack MCP adapters for the Kanban review runner.
 
-The boundary deliberately exposes only the provider reads required by exact-head
-reconciliation.  MCP discovery is scoped to operator-selected server names,
-repository/channel/user allowlists are mandatory, and every tool call is bounded
-by an outer daemon-thread timeout.  The adapter dispatches only allowlisted read
-tools, and no delivery transport is implemented here.
+Read adapters are enabled independently from the restricted delivery transports.
+MCP discovery is scoped to operator-selected server names, repository/channel/user
+allowlists are mandatory, and every tool call is bounded by an outer daemon-thread
+timeout.  Delivery remains off unless a separate provider delivery gate is enabled;
+the write surface contains no merge, approval, branch, file, or channel-management
+operation.
 """
 
 from __future__ import annotations
@@ -42,7 +43,14 @@ _GITHUB_READ_TOOLS = frozenset({
     "get_pull_request_reviews",
     "get_pull_request_comments",
 })
+_GITHUB_DELIVERY_TOOLS = frozenset({"create_pull_request_review"})
 _SLACK_READ_TOOLS = frozenset({"slack_get_thread_replies"})
+_SLACK_DELIVERY_TOOLS = frozenset({
+    "slack_get_channel_history",
+    "slack_get_thread_replies",
+    "slack_post_message",
+    "slack_reply_to_thread",
+})
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -215,6 +223,41 @@ def _canonical_json(value: Any) -> str:
 
 def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _receipt_marker(provider: Literal["github", "slack"], idempotency_key: str) -> str:
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    if provider == "github":
+        return f"<!-- hermes-review-receipt:{digest} -->"
+    return f"[hermes-review-receipt:{digest}]"
+
+
+_GITHUB_IDEMPOTENCY_RE = re.compile(
+    r"^github-human-review:v1:(?P<repository>[^:]+/[^:]+):pr:(?P<pr_number>[1-9][0-9]*):"
+    r"head:(?P<head_sha>[0-9a-f]{40}):surface:(?P<surface>[^:]+):"
+    r"operation:(?P<operation>[^:]+)$"
+)
+_SLACK_IDEMPOTENCY_RE = re.compile(
+    r"^slack-human-review:v1:channel:(?P<channel_id>[^:]+):"
+    r"thread:(?P<thread_ts>[^:]+):(?P<repository>[^:]+/[^:]+):"
+    r"pr:(?P<pr_number>[1-9][0-9]*):head:(?P<head_sha>[0-9a-f]{40}):"
+    r"surface:(?P<surface>[^:]+):operation:(?P<operation>[^:]+)$"
+)
+
+
+def _idempotency_identity(
+    value: str,
+    *,
+    provider: Literal["github", "slack"],
+) -> Mapping[str, str]:
+    pattern = _GITHUB_IDEMPOTENCY_RE if provider == "github" else _SLACK_IDEMPOTENCY_RE
+    matched = pattern.fullmatch(str(value or "").strip())
+    if matched is None:
+        raise MCPAdapterError(
+            f"{provider} delivery idempotency key is malformed",
+            kind="validation",
+        )
+    return matched.groupdict()
 
 
 def _parse_timestamp(value: Any) -> Optional[int]:
@@ -409,6 +452,19 @@ def _github_failure(error: MCPAdapterError) -> github.GitHubTransportFailure:
         "validation": "validation",
     }
     return github.GitHubTransportFailure(str(error), kind=kind_map[error.kind])
+
+
+def _slack_failure(error: MCPAdapterError) -> slack.SlackTransportFailure:
+    kind_map: dict[MCPFailureKind, slack.FailureKind] = {
+        "auth": "auth",
+        "permission": "permission",
+        "not_found": "thread_not_found",
+        "rate_limited": "rate_limited",
+        "timeout": "timeout",
+        "unavailable": "unavailable",
+        "validation": "validation",
+    }
+    return slack.SlackTransportFailure(str(error), kind=kind_map[error.kind])
 
 
 @dataclass(frozen=True)
@@ -942,6 +998,317 @@ class GitHubMCPReadAdapter:
         return None
 
 
+class GitHubMCPDeliveryTransport:
+    """Restricted exact-head review-comment transport with receipt readback."""
+
+    def __init__(
+        self,
+        caller: MCPToolCaller,
+        *,
+        server_name: str,
+        repositories: Sequence[str],
+    ) -> None:
+        self._caller = caller
+        self._server_name = server_name
+        self._repositories = frozenset(
+            _canonical_repository(item) for item in repositories
+        )
+        if not self._repositories:
+            raise MCPAdapterError(
+                "GitHub delivery repository allowlist is empty",
+                kind="permission",
+            )
+
+    def _call(self, tool: str, arguments: Mapping[str, Any]) -> Any:
+        return self._caller.call(_tool_name(self._server_name, tool), arguments)
+
+    def _identity(self, idempotency_key: str) -> Mapping[str, str]:
+        try:
+            identity = _idempotency_identity(idempotency_key, provider="github")
+            repository = _canonical_repository(identity["repository"])
+        except MCPAdapterError as exc:
+            raise _github_failure(exc) from exc
+        if repository not in self._repositories:
+            raise github.GitHubTransportFailure(
+                f"repository {repository} is outside the configured delivery allowlist",
+                kind="permission",
+            )
+        return identity
+
+    @staticmethod
+    def _receipt(
+        review: Mapping[str, Any],
+        *,
+        idempotency_key: str,
+        expected_head_sha: str,
+    ) -> github.GitHubDeliveryReceipt:
+        commit_id = _full_sha(review.get("commit_id"))
+        if commit_id != expected_head_sha:
+            raise github.GitHubTransportFailure(
+                "GitHub delivery receipt is not bound to the exact head SHA",
+                kind="conflict",
+            )
+        external_id = (
+            review.get("id") or review.get("node_id") or review.get("html_url")
+        )
+        if not external_id:
+            raise github.GitHubTransportFailure(
+                "GitHub delivery response omitted a provider receipt ID",
+                kind="unavailable",
+            )
+        return github.GitHubDeliveryReceipt(
+            external_id=f"github-review:{external_id}",
+            idempotency_key=idempotency_key,
+        )
+
+    def find_delivery(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> Optional[github.GitHubDeliveryReceipt]:
+        identity = self._identity(idempotency_key)
+        owner, repo = identity["repository"].split("/", 1)
+        arguments = {
+            "owner": owner,
+            "repo": repo,
+            "pull_number": int(identity["pr_number"]),
+        }
+        marker = _receipt_marker("github", idempotency_key)
+        try:
+            reviews = _as_sequence(
+                self._call("get_pull_request_reviews", arguments),
+                "pull request reviews",
+            )
+            for item in reviews:
+                review = _as_mapping(item, "pull request review")
+                if marker not in str(review.get("body") or ""):
+                    continue
+                return self._receipt(
+                    review,
+                    idempotency_key=idempotency_key,
+                    expected_head_sha=identity["head_sha"],
+                )
+        except MCPAdapterError as exc:
+            raise _github_failure(exc) from exc
+        return None
+
+    def send_intent(
+        self,
+        intent: github.GitHubOutboxIntent,
+    ) -> github.GitHubDeliveryReceipt:
+        identity = self._identity(intent.idempotency_key)
+        if (
+            identity["repository"] != intent.repository
+            or int(identity["pr_number"]) != intent.pr_number
+            or identity["head_sha"] != intent.head_sha
+            or identity["surface"] != intent.surface
+            or identity["operation"] != intent.operation
+        ):
+            raise github.GitHubTransportFailure(
+                "GitHub intent fields do not match its idempotency identity",
+                kind="conflict",
+            )
+        if intent.operation == "request_reviewer":
+            raise github.GitHubTransportFailure(
+                "the configured GitHub MCP has no reviewer-request write tool",
+                kind="validation",
+            )
+        try:
+            body = _required_text(intent.payload.get("body"), "GitHub intent body")
+        except MCPAdapterError as exc:
+            raise _github_failure(exc) from exc
+        marker = _receipt_marker("github", intent.idempotency_key)
+        owner, repo = intent.repository.split("/", 1)
+        try:
+            review = _as_mapping(
+                self._call(
+                    "create_pull_request_review",
+                    {
+                        "owner": owner,
+                        "repo": repo,
+                        "pull_number": intent.pr_number,
+                        "body": f"{body.rstrip()}\n\n{marker}",
+                        "event": "COMMENT",
+                        "commit_id": intent.head_sha,
+                    },
+                ),
+                "pull request review delivery",
+            )
+            return self._receipt(
+                review,
+                idempotency_key=intent.idempotency_key,
+                expected_head_sha=intent.head_sha,
+            )
+        except MCPAdapterError as exc:
+            if exc.kind == "validation":
+                exc = MCPAdapterError(
+                    "GitHub delivery response is ambiguous; retry through receipt readback",
+                    kind="unavailable",
+                )
+            raise _github_failure(exc) from exc
+
+
+class SlackMCPDeliveryTransport:
+    """Restricted exact-route Slack sender with deterministic receipt readback."""
+
+    def __init__(
+        self,
+        caller: MCPToolCaller,
+        *,
+        server_name: str,
+        channel_ids: Sequence[str],
+    ) -> None:
+        self._caller = caller
+        self._server_name = server_name
+        self._channels = frozenset(str(item or "").strip() for item in channel_ids)
+        if not self._channels or "" in self._channels:
+            raise MCPAdapterError(
+                "Slack delivery channel allowlist is empty or invalid",
+                kind="permission",
+            )
+
+    def _call(self, tool: str, arguments: Mapping[str, Any]) -> Any:
+        return self._caller.call(_tool_name(self._server_name, tool), arguments)
+
+    def _identity(self, idempotency_key: str) -> Mapping[str, str]:
+        try:
+            identity = _idempotency_identity(idempotency_key, provider="slack")
+        except MCPAdapterError as exc:
+            raise _slack_failure(exc) from exc
+        if identity["channel_id"] not in self._channels:
+            raise slack.SlackTransportFailure(
+                f"Slack channel {identity['channel_id']} is outside the delivery allowlist",
+                kind="permission",
+            )
+        return identity
+
+    @staticmethod
+    def _receipt(
+        response: Mapping[str, Any],
+        *,
+        idempotency_key: str,
+        channel_id: str,
+        thread_ts: str,
+    ) -> slack.SlackDeliveryReceipt:
+        message = response.get("message")
+        nested = message if isinstance(message, Mapping) else {}
+        response_channel = str(response.get("channel") or nested.get("channel") or "")
+        if response_channel and response_channel != channel_id:
+            raise slack.SlackTransportFailure(
+                "Slack delivery response changed the stored channel route",
+                kind="conflict",
+            )
+        message_ts = str(
+            response.get("ts") or nested.get("ts") or response.get("message_ts") or ""
+        ).strip()
+        if not message_ts:
+            raise slack.SlackTransportFailure(
+                "Slack delivery response omitted message_ts",
+                kind="unavailable",
+            )
+        delivered_thread = thread_ts or message_ts
+        response_thread = str(
+            response.get("thread_ts") or nested.get("thread_ts") or delivered_thread
+        ).strip()
+        if response_thread != delivered_thread:
+            raise slack.SlackTransportFailure(
+                "Slack delivery response changed the stored thread route",
+                kind="conflict",
+            )
+        return slack.SlackDeliveryReceipt(
+            external_id=f"slack:{channel_id}:{message_ts}",
+            message_ts=message_ts,
+            thread_ts=delivered_thread,
+            idempotency_key=idempotency_key,
+        )
+
+    def find_delivery(
+        self,
+        *,
+        idempotency_key: str,
+    ) -> Optional[slack.SlackDeliveryReceipt]:
+        identity = self._identity(idempotency_key)
+        channel = identity["channel_id"]
+        thread = identity["thread_ts"]
+        marker = _receipt_marker("slack", idempotency_key)
+        try:
+            if thread == "root":
+                raw = self._call(
+                    "slack_get_channel_history",
+                    {"channel_id": channel, "limit": 100},
+                )
+                delivered_thread = ""
+            else:
+                raw = self._call(
+                    "slack_get_thread_replies",
+                    {"channel_id": channel, "thread_ts": thread},
+                )
+                delivered_thread = thread
+            messages = SlackMCPAcknowledgementProvider._extract_messages(raw)
+            for message in messages:
+                if marker not in str(message.get("text") or ""):
+                    continue
+                return self._receipt(
+                    message,
+                    idempotency_key=idempotency_key,
+                    channel_id=channel,
+                    thread_ts=delivered_thread,
+                )
+        except MCPAdapterError as exc:
+            raise _slack_failure(exc) from exc
+        return None
+
+    def send_intent(
+        self,
+        intent: slack.SlackOutboxIntent,
+    ) -> slack.SlackDeliveryReceipt:
+        identity = self._identity(intent.idempotency_key)
+        expected_thread = intent.thread_ts or "root"
+        if (
+            identity["channel_id"] != intent.channel_id
+            or identity["thread_ts"] != expected_thread
+            or identity["repository"] != intent.repository
+            or int(identity["pr_number"]) != intent.pr_number
+            or identity["head_sha"] != intent.head_sha
+            or identity["surface"] != intent.surface
+            or identity["operation"] != intent.operation
+        ):
+            raise slack.SlackTransportFailure(
+                "Slack intent fields do not match its idempotency identity",
+                kind="conflict",
+            )
+        try:
+            body = _required_text(intent.payload.get("body"), "Slack intent body")
+        except MCPAdapterError as exc:
+            raise _slack_failure(exc) from exc
+        text = f"{body.rstrip()}\n\n{_receipt_marker('slack', intent.idempotency_key)}"
+        if intent.surface == "channel":
+            tool = "slack_post_message"
+            arguments = {"channel_id": intent.channel_id, "text": text}
+        else:
+            tool = "slack_reply_to_thread"
+            arguments = {
+                "channel_id": intent.channel_id,
+                "thread_ts": intent.thread_ts,
+                "text": text,
+            }
+        try:
+            response = _as_mapping(self._call(tool, arguments), "Slack delivery")
+            return self._receipt(
+                response,
+                idempotency_key=intent.idempotency_key,
+                channel_id=intent.channel_id,
+                thread_ts=intent.thread_ts,
+            )
+        except MCPAdapterError as exc:
+            if exc.kind == "validation":
+                exc = MCPAdapterError(
+                    "Slack delivery response is ambiguous; retry through receipt readback",
+                    kind="unavailable",
+                )
+            raise _slack_failure(exc) from exc
+
+
 class SlackMCPAcknowledgementProvider:
     """Read normalized acknowledgements from exact allowlisted Slack threads."""
 
@@ -993,18 +1360,7 @@ class SlackMCPAcknowledgementProvider:
             )
             messages = self._extract_messages(raw)
         except MCPAdapterError as exc:
-            kind_map: dict[MCPFailureKind, slack.FailureKind] = {
-                "auth": "auth",
-                "permission": "permission",
-                "not_found": "thread_not_found",
-                "rate_limited": "rate_limited",
-                "timeout": "timeout",
-                "unavailable": "unavailable",
-                "validation": "validation",
-            }
-            raise slack.SlackTransportFailure(
-                str(exc), kind=kind_map[exc.kind]
-            ) from exc
+            raise _slack_failure(exc) from exc
 
         events: list[slack.SlackAcknowledgementEvent] = []
         for message in messages:
@@ -1091,6 +1447,8 @@ class SlackMCPAcknowledgementProvider:
 class ReviewRunnerMCPBundle:
     provider_timeout_seconds: int
     github_adapter: Optional[GitHubMCPReadAdapter] = None
+    github_delivery_transport: Optional[GitHubMCPDeliveryTransport] = None
+    slack_delivery_transport: Optional[SlackMCPDeliveryTransport] = None
     slack_acknowledgement_provider: Optional[SlackMCPAcknowledgementProvider] = None
     credential_preflight: Optional[Mapping[str, Mapping[str, Any]]] = None
 
@@ -1101,9 +1459,11 @@ def build_review_runner_mcp_bundle(
     github_server_name: Optional[str] = None,
     github_repositories: Sequence[str] = (),
     coderabbit_logins: Sequence[str] = ("coderabbitai[bot]", "coderabbitai"),
+    github_delivery_enabled: bool = False,
     slack_server_name: Optional[str] = None,
     slack_channel_ids: Sequence[str] = (),
     slack_user_ids: Sequence[str] = (),
+    slack_delivery_enabled: bool = False,
     mcp_servers: Optional[Mapping[str, Any]] = None,
     raw_mcp_servers: Optional[Mapping[str, Any]] = None,
     clock: Callable[[], float] = time.time,
@@ -1116,9 +1476,23 @@ def build_review_runner_mcp_bundle(
         required_tools_by_server.setdefault(github_server_name, set()).update(
             _GITHUB_READ_TOOLS
         )
+        if github_delivery_enabled:
+            required_tools_by_server[github_server_name].update(_GITHUB_DELIVERY_TOOLS)
     if slack_server_name:
         required_tools_by_server.setdefault(slack_server_name, set()).update(
             _SLACK_READ_TOOLS
+        )
+        if slack_delivery_enabled:
+            required_tools_by_server[slack_server_name].update(_SLACK_DELIVERY_TOOLS)
+    if github_delivery_enabled and not github_server_name:
+        raise MCPAdapterError(
+            "GitHub MCP delivery requires the GitHub provider adapter",
+            kind="permission",
+        )
+    if slack_delivery_enabled and not slack_server_name:
+        raise MCPAdapterError(
+            "Slack MCP delivery requires the Slack provider adapter",
+            kind="permission",
         )
     selected_names = tuple(required_tools_by_server)
     if not selected_names:
@@ -1221,7 +1595,7 @@ def build_review_runner_mcp_bundle(
             "required MCP read tools were not discovered for the review runner",
             kind="unavailable",
         )
-    selected_prefixes = tuple(f"mcp__{name}__" for name in selected_names)
+    selected_prefixes = tuple(_tool_name(name, "") for name in selected_names)
     unexpected_names = sorted(
         name
         for name in registered_names - expected_names
@@ -1238,6 +1612,7 @@ def build_review_runner_mcp_bundle(
         )
 
     github_adapter: Optional[GitHubMCPReadAdapter] = None
+    github_delivery_transport: Optional[GitHubMCPDeliveryTransport] = None
     if github_server_name:
         allowed = frozenset(
             _tool_name(github_server_name, tool) for tool in _GITHUB_READ_TOOLS
@@ -1254,8 +1629,23 @@ def build_review_runner_mcp_bundle(
             coderabbit_logins=coderabbit_logins,
             clock=clock,
         )
+        if github_delivery_enabled:
+            delivery_allowed = frozenset(
+                _tool_name(github_server_name, tool)
+                for tool in (_GITHUB_DELIVERY_TOOLS | {"get_pull_request_reviews"})
+            )
+            github_delivery_transport = GitHubMCPDeliveryTransport(
+                RegistryMCPToolCaller(
+                    github_server_name,
+                    delivery_allowed,
+                    timeout,
+                ),
+                server_name=github_server_name,
+                repositories=github_repositories,
+            )
 
     slack_provider: Optional[SlackMCPAcknowledgementProvider] = None
+    slack_delivery_transport: Optional[SlackMCPDeliveryTransport] = None
     if slack_server_name:
         allowed = frozenset(
             _tool_name(slack_server_name, tool) for tool in _SLACK_READ_TOOLS
@@ -1272,10 +1662,25 @@ def build_review_runner_mcp_bundle(
             user_ids=slack_user_ids,
             clock=clock,
         )
+        if slack_delivery_enabled:
+            delivery_allowed = frozenset(
+                _tool_name(slack_server_name, tool) for tool in _SLACK_DELIVERY_TOOLS
+            )
+            slack_delivery_transport = SlackMCPDeliveryTransport(
+                RegistryMCPToolCaller(
+                    slack_server_name,
+                    delivery_allowed,
+                    timeout,
+                ),
+                server_name=slack_server_name,
+                channel_ids=slack_channel_ids,
+            )
 
     return ReviewRunnerMCPBundle(
         provider_timeout_seconds=timeout,
         github_adapter=github_adapter,
+        github_delivery_transport=github_delivery_transport,
+        slack_delivery_transport=slack_delivery_transport,
         slack_acknowledgement_provider=slack_provider,
         credential_preflight=credential_preflight,
     )
