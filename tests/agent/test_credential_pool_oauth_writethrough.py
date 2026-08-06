@@ -18,6 +18,7 @@ mocking the save boundary, so they exercise the actual atomic write path.
 
 import json
 import threading
+from pathlib import Path
 
 import pytest
 
@@ -27,6 +28,7 @@ from agent.credential_pool import (
     CredentialPool,
     PooledCredential,
 )
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli import auth as A
 
 
@@ -232,6 +234,242 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     assert refreshed.refresh_token == "rotated-refresh"
     # The invariant: the single-use token POST ran inside the auth-store lock.
     assert lock_held["during_post"] is True
+
+
+def test_codex_pool_refresh_serializes_borrowed_root_chain_across_profiles(
+    monkeypatch, tmp_path
+):
+    """Profiles borrowing one root grant must serialize on the root store."""
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
+
+    root_home = tmp_path / ".hermes"
+    root_path = root_home / "auth.json"
+    profile_paths = [
+        root_home / "profiles" / "alpha" / "auth.json",
+        root_home / "profiles" / "beta" / "auth.json",
+    ]
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "active_provider": "openrouter",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "root-old-access",
+                        "refresh_token": "root-old-refresh",
+                    },
+                    "last_refresh": "2026-08-01T00:00:00Z",
+                    "auth_mode": "chatgpt",
+                },
+                "anthropic": {"api_key": "root-unrelated-provider"},
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "root-codex",
+                        "label": "root singleton",
+                        "source": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "access_token": "root-old-access",
+                        "refresh_token": "root-old-refresh",
+                    },
+                    {
+                        "id": "independent-codex",
+                        "label": "independent account",
+                        "source": "manual:device_code",
+                        "auth_type": "oauth",
+                        "priority": 1,
+                        "access_token": "independent-access",
+                        "refresh_token": "independent-refresh",
+                        "last_status": "exhausted",
+                        "last_error_code": 429,
+                    },
+                ],
+                "openrouter": [{"id": "root-unrelated-pool"}],
+            },
+            "root_marker": {"preserve": True},
+        },
+    )
+    for index, profile_path in enumerate(profile_paths):
+        _write_store(
+            profile_path,
+            {
+                "version": 1,
+                "active_provider": "anthropic",
+                "providers": {
+                    "anthropic": {"api_key": f"profile-{index}-provider"}
+                },
+                "credential_pool": {
+                    "anthropic": [{"id": f"profile-{index}-pool"}]
+                },
+                "profile_marker": index,
+            },
+        )
+    profile_before = {path: path.read_bytes() for path in profile_paths}
+
+    calls = []
+    calls_lock = threading.Lock()
+    second_post_entered = threading.Event()
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        with calls_lock:
+            calls.append((access_token, refresh_token))
+            call_number = len(calls)
+        if call_number == 1:
+            # On the broken code the other profile owns a different lock and
+            # enters the second POST immediately. On fixed code it waits on
+            # the root lock, then adopts this rotated pair without POSTing.
+            second_post_entered.wait(timeout=1)
+        else:
+            second_post_entered.set()
+        return {
+            "access_token": "root-new-access",
+            "refresh_token": "root-new-refresh",
+            "last_refresh": "2026-08-06T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+
+    start = threading.Barrier(3)
+    results = []
+    errors = []
+
+    def refresh_from_profile(profile_path):
+        token = set_hermes_home_override(profile_path.parent)
+        try:
+            payload = A.read_credential_pool("openai-codex")[0]
+            entry = PooledCredential.from_dict("openai-codex", payload)
+            pool = CredentialPool("openai-codex", [entry])
+            start.wait(timeout=5)
+            results.append(pool._refresh_entry(entry, force=True))
+        except BaseException as exc:  # surfaced in the main test thread below
+            errors.append(exc)
+        finally:
+            reset_hermes_home_override(token)
+
+    threads = [
+        threading.Thread(target=refresh_from_profile, args=(path,))
+        for path in profile_paths
+    ]
+    for thread in threads:
+        thread.start()
+    start.wait(timeout=5)
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert errors == []
+    assert calls == [("root-old-access", "root-old-refresh")]
+    assert len(results) == 2
+    assert {result.access_token for result in results if result is not None} == {
+        "root-new-access"
+    }
+    assert {result.refresh_token for result in results if result is not None} == {
+        "root-new-refresh"
+    }
+
+    root = _read_store(root_path)
+    assert root["active_provider"] == "openrouter"
+    assert root["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "root-new-access",
+        "refresh_token": "root-new-refresh",
+    }
+    root_pool = {
+        entry["id"]: entry for entry in root["credential_pool"]["openai-codex"]
+    }
+    assert root_pool["root-codex"]["access_token"] == "root-new-access"
+    assert root_pool["root-codex"]["refresh_token"] == "root-new-refresh"
+    assert root_pool["independent-codex"]["access_token"] == "independent-access"
+    assert root_pool["independent-codex"]["refresh_token"] == "independent-refresh"
+    assert root_pool["independent-codex"]["last_status"] == "exhausted"
+    assert root_pool["independent-codex"]["last_error_code"] == 429
+    assert root["providers"]["anthropic"] == {
+        "api_key": "root-unrelated-provider"
+    }
+    assert root["credential_pool"]["openrouter"] == [
+        {"id": "root-unrelated-pool"}
+    ]
+    assert root["root_marker"] == {"preserve": True}
+    for path in profile_paths:
+        assert path.read_bytes() == profile_before[path]
+
+
+def test_codex_pool_refresh_keeps_profile_owned_chain_local(monkeypatch, tmp_path):
+    profile_home = tmp_path / "profile"
+    profile_path = profile_home / "auth.json"
+    monkeypatch.setenv("HERMES_HOME", str(profile_home))
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "active_provider": "openrouter",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "profile-old-access",
+                        "refresh_token": "profile-old-refresh",
+                    }
+                },
+                "anthropic": {"api_key": "profile-unrelated"},
+            },
+            "credential_pool": {
+                "openai-codex": [
+                    {
+                        "id": "profile-codex",
+                        "source": "device_code",
+                        "auth_type": "oauth",
+                        "priority": 0,
+                        "access_token": "profile-old-access",
+                        "refresh_token": "profile-old-refresh",
+                    }
+                ],
+                "openrouter": [{"id": "profile-unrelated-pool"}],
+            },
+            "profile_marker": {"preserve": True},
+        },
+    )
+
+    monkeypatch.setattr(
+        A,
+        "refresh_codex_oauth_pure",
+        lambda *_args, **_kwargs: {
+            "access_token": "profile-new-access",
+            "refresh_token": "profile-new-refresh",
+            "last_refresh": "2026-08-06T00:00:00Z",
+        },
+    )
+    payload = A.read_credential_pool("openai-codex")[0]
+    entry = PooledCredential.from_dict("openai-codex", payload)
+    refreshed = CredentialPool("openai-codex", [entry])._refresh_entry(
+        entry, force=True
+    )
+
+    assert refreshed is not None
+    assert refreshed.access_token == "profile-new-access"
+    stored = _read_store(profile_path)
+    assert stored["active_provider"] == "openrouter"
+    assert stored["providers"]["openai-codex"]["tokens"] == {
+        "access_token": "profile-new-access",
+        "refresh_token": "profile-new-refresh",
+    }
+    assert stored["credential_pool"]["openai-codex"][0][
+        "access_token"
+    ] == "profile-new-access"
+    assert stored["credential_pool"]["openai-codex"][0][
+        "refresh_token"
+    ] == "profile-new-refresh"
+    assert stored["providers"]["anthropic"] == {
+        "api_key": "profile-unrelated"
+    }
+    assert stored["credential_pool"]["openrouter"] == [
+        {"id": "profile-unrelated-pool"}
+    ]
+    assert stored["profile_marker"] == {"preserve": True}
 
 
 def test_write_through_fires_on_every_refresh_not_just_first(

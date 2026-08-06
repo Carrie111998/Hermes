@@ -3727,8 +3727,14 @@ def _save_codex_tokens(
     label: Optional[str] = None,
     *,
     source_path: Optional[Path] = None,
+    set_active: bool = True,
 ) -> None:
-    """Save Codex tokens locally, or back to an explicit credential source."""
+    """Save Codex tokens locally, or back to an explicit credential source.
+
+    Interactive login/add callers keep ``set_active=True``. Runtime refresh
+    and recovery callers pass ``False`` because token maintenance is not a
+    provider-selection action.
+    """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     with _auth_store_lock(target_path=source_path):
@@ -3745,7 +3751,12 @@ def _save_codex_tokens(
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
-        _save_provider_state(auth_store, "openai-codex", state)
+        _store_provider_state(
+            auth_store,
+            "openai-codex",
+            state,
+            set_active=set_active,
+        )
         _sync_codex_pool_entries(
             auth_store,
             tokens,
@@ -3771,7 +3782,7 @@ def _recover_codex_tokens_from_cli(
     ):
         return None
     logger.info("Codex auth recovered from Codex CLI auth.json (%s).", reason)
-    _save_codex_tokens(imported, source_path=source_path)
+    _save_codex_tokens(imported, source_path=source_path, set_active=False)
     return dict(imported)
 
 
@@ -3952,7 +3963,11 @@ def _refresh_codex_auth_tokens(
     updated_tokens["access_token"] = refreshed["access_token"]
     updated_tokens["refresh_token"] = refreshed["refresh_token"]
 
-    _save_codex_tokens(updated_tokens, source_path=source_path)
+    _save_codex_tokens(
+        updated_tokens,
+        source_path=source_path,
+        set_active=False,
+    )
     return updated_tokens
 
 
@@ -4022,14 +4037,40 @@ def resolve_codex_runtime_credentials(
                 _state,
                 state_source_path,
             ):
-                imported = _recover_codex_tokens_from_cli(
-                    str(getattr(exc, "code", None) or "auth_error"),
-                    source_path=state_source_path,
-                )
-            if imported:
-                data = {"tokens": imported, "last_refresh": imported.get("last_refresh")}
-            else:
-                data = None
+                # The pre-lock error is only a hint. Another writer may have
+                # repaired the owning store before this transaction acquired
+                # its source lock, so re-read and revalidate before importing
+                # CLI tokens over the top of that fresh chain.
+                try:
+                    data = _read_codex_tokens(_lock=False)
+                except AuthError as locked_exc:
+                    read_error = locked_exc
+                    if (
+                        getattr(locked_exc, "relogin_required", False)
+                        and getattr(locked_exc, "code", None)
+                        in {
+                            "codex_auth_missing_access_token",
+                            "codex_auth_missing_refresh_token",
+                            "codex_auth_invalid_shape",
+                        }
+                    ):
+                        imported = _recover_codex_tokens_from_cli(
+                            str(
+                                getattr(locked_exc, "code", None)
+                                or "auth_error"
+                            ),
+                            source_path=state_source_path,
+                        )
+                        data = (
+                            {
+                                "tokens": imported,
+                                "last_refresh": imported.get("last_refresh"),
+                            }
+                            if imported
+                            else None
+                        )
+                    else:
+                        data = None
         else:
             data = None
 
