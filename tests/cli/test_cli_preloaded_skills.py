@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -155,6 +156,11 @@ def test_kanban_worker_blocks_removed_forced_skill_before_cli_construction(
         ).fetchone()
         assert dict(run) == {"status": "blocked", "outcome": "blocked"}
         assert row["consecutive_failures"] == 0
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked'",
+            (task_id,),
+        ).fetchone()
+        assert json.loads(event["payload"])["not_started"] is True
     finally:
         conn.close()
 

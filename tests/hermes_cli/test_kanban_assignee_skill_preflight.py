@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -178,8 +179,10 @@ def test_dispatch_blocks_skill_removed_after_valid_create_without_starting(
     assert row["consecutive_failures"] == 0
     assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)).fetchone()[0] == 0
     assert [event["kind"] for event in events] == ["created", "blocked"]
-    assert "alpha" in events[-1]["payload"]
-    assert "removable" in events[-1]["payload"]
+    blocked_payload = json.loads(events[-1]["payload"])
+    assert "alpha" in blocked_payload["reason"]
+    assert "removable" in blocked_payload["reason"]
+    assert blocked_payload["not_started"] is True
 
 
 def test_dispatch_revalidates_a_reassigned_card_before_claim_or_spawn(

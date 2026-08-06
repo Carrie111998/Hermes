@@ -5734,6 +5734,7 @@ def block_task(
     expected_run_id: Optional[int] = None,
     expected_ready_snapshot: tuple[Optional[str], Optional[str]] | None = None,
     synthesize_run: bool = True,
+    not_started: bool = False,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5766,6 +5767,8 @@ def block_task(
     worker ever starts; it keeps those capability events out of run history.
     ``expected_ready_snapshot`` makes a dispatcher preflight verdict a no-op
     if another writer changed or claimed the ready row in the meantime.
+    ``not_started=True`` marks blocks from an authoritative pre-start gate for
+    truthful notification wording; capability blocks do not imply this alone.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -5942,10 +5945,13 @@ def block_task(
                     outcome="blocked",
                     summary=reason,
                 )
+            blocked_payload = {
+                "reason": reason, "kind": kind, "recurrences": recurrences,
+            }
+            if not_started:
+                blocked_payload["not_started"] = True
             _append_event(
-                conn, task_id, "blocked",
-                {"reason": reason, "kind": kind, "recurrences": recurrences},
-                run_id=run_id,
+                conn, task_id, "blocked", blocked_payload, run_id=run_id,
             )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
@@ -8690,6 +8696,7 @@ def _dispatch_once_locked(
                     expected_ready_snapshot=(snapshot["assignee"], snapshot["skills"]),
                     # This never started a worker, so leave no run/attempt record.
                     synthesize_run=False,
+                    not_started=True,
                 )
             continue
         if dry_run:

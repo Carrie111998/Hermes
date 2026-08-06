@@ -177,7 +177,9 @@ def test_capability_block_notification_says_worker_never_started(tmp_path, monke
     try:
         tid = kb.create_task(conn, title="release", assignee="alpha")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb.block_task(conn, tid, reason=reason, kind="capability")
+        kb.block_task(
+            conn, tid, reason=reason, kind="capability", not_started=True
+        )
     finally:
         conn.close()
 
@@ -192,6 +194,33 @@ def test_capability_block_notification_says_worker_never_started(tmp_path, monke
     assert "release-notes, api-review" in message
     assert "gave up" not in message
     assert "crashed" not in message
+
+
+def test_runtime_capability_block_notification_does_not_claim_worker_never_started(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "runtime-capability.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    reason = "credential unavailable after inspection"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="inspect credentials", assignee="alpha")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        assert kb.claim_task(conn, tid, claimer="worker") is not None
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "blocked" in message
+    assert "blocked before start" not in message
+    assert reason in message
 
 
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(

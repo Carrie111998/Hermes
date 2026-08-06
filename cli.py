@@ -4135,6 +4135,7 @@ def _block_missing_kanban_forced_skills(skill_identifiers: list[str]) -> bool:
             kind="capability",
             expected_run_id=run_id,
             synthesize_run=False,
+            not_started=True,
         )
         if blocked:
             logger.error("Kanban worker blocked before startup: %s", reason)

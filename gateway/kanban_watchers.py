@@ -436,7 +436,7 @@ class GatewayKanbanWatchersMixin:
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            if ev.payload and ev.payload.get("kind") == "capability":
+                            if ev.payload and ev.payload.get("not_started") is True:
                                 msg = (
                                     f"⏸ {board_tag}{tag}Kanban {sub['task_id']} "
                                     f"blocked before start{reason}"
