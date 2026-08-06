@@ -19807,10 +19807,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         manually by a user. The lifecycle title feature is intentionally based
         on the active Discord thread context, not on who created the thread.
         """
+        platform = getattr(source.platform, "value", source.platform)
+        thread_id = str(getattr(source, "thread_id", "") or "")
+        chat_id = str(getattr(source, "chat_id", "") or "")
         return (
-            source.platform == Platform.DISCORD
-            and source.chat_type == "thread"
-            and bool(source.thread_id)
+            str(platform).lower() == Platform.DISCORD.value
+            and bool(thread_id)
+            and (
+                source.chat_type == "thread"
+                or chat_id == thread_id
+            )
         )
 
     def _is_relay_discord_channel_lane(self, source: SessionSource) -> bool:

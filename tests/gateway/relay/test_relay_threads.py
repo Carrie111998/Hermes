@@ -332,8 +332,16 @@ def test_discord_thread_title_lane_includes_manual_threads():
         auto_thread_initial_name=None,
     )
     assert stub._is_discord_auto_thread_lane(source) is True
+    restored_source = SimpleNamespace(
+        platform=Platform.DISCORD,
+        chat_type="group",
+        chat_id="manual-thread",
+        thread_id="manual-thread",
+    )
+    assert stub._is_discord_auto_thread_lane(restored_source) is True
 
 
+def test_relay_channel_lane_shape_gate():
     from types import SimpleNamespace
     from gateway.config import Platform as P
 
