@@ -441,8 +441,12 @@ def _spawn_laravel_lsp(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
         from agent.lsp.install import try_install
 
         bin_path = try_install("laravel-lsp", ctx.install_strategy)
-        if bin_path is None:
-            return None
+    if bin_path is None:
+        # laravel-lsp is manual-install only and rarely present.  Fall back
+        # to intelephense so ``.blade.php`` files don't lose all diagnostics
+        # when the Laravel server isn't installed (they matched intelephense
+        # via ``.php`` before the multi-part extension handling).
+        return _spawn_intelephense(root, ctx)
     return SpawnSpec(
         command=[bin_path, "lsp"],
         workspace_root=root,

@@ -67,9 +67,29 @@ def test_laravel_lsp_spawn_command(monkeypatch):
 def test_laravel_lsp_spawn_returns_none_when_missing(monkeypatch):
     """When binary is not on PATH and install is manual, must return None."""
     monkeypatch.setattr("agent.lsp.servers._which", lambda *names: None)
+    # _spawn_laravel_lsp falls back to try_install (manual → _existing_binary),
+    # which probes the real PATH; patch it so the test is hermetic even on a
+    # machine where laravel-lsp happens to be installed. With both servers'
+    # binaries absent, the fallback gives up and returns None.
+    monkeypatch.setattr("agent.lsp.install.try_install", lambda pkg, strategy: None)
     ctx = ServerContext(workspace_root="/project", install_strategy="manual")
     spec = _spawn_laravel_lsp("/project", ctx)
     assert spec is None
+
+
+def test_laravel_lsp_falls_back_to_intelephense_when_missing(monkeypatch):
+    """Confirm that a missing laravel-lsp with intelephense present no longer
+    loses diagnostics: it falls back to intelephense's spawn spec."""
+    monkeypatch.setattr("agent.lsp.install.try_install", lambda pkg, strategy: None)
+    # _which returns None for laravel-lsp but finds intelephense.
+    monkeypatch.setattr(
+        "agent.lsp.servers._which",
+        lambda *names: "/fake/bin/intelephense" if names[0] == "intelephense" else None,
+    )
+    ctx = ServerContext(workspace_root="/project", install_strategy="manual")
+    spec = _spawn_laravel_lsp("/project", ctx)
+    assert spec is not None
+    assert spec.command[0] == "/fake/bin/intelephense"
 
 
 def test_laravel_lsp_in_servers_registry():
