@@ -1387,6 +1387,12 @@ def _write_failed_final_activation_bundle(
     iam = recovery.ExternalIAMReceipt.from_mapping(
         _external_iam_mapping(source_approval_sha256=owner.sha256)
     )
+    recovery_tree["owner_approval_path"].write_bytes(
+        recovery._canonical_bytes(owner.to_mapping())
+    )
+    recovery_tree["external_iam_path"].write_bytes(
+        recovery._canonical_bytes(iam.to_mapping())
+    )
     evidence_root = (
         recovery_tree["quarantine_path"].parent
         / "plans"
@@ -1590,6 +1596,89 @@ def test_final_activation_recovery_rejects_partial_live_residue(
     with pytest.raises(
         RuntimeError,
         match="installed activation artifact residue is partial",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_final_activation_recovery_rejects_native_staged_owner(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    _write_failed_final_activation_bundle(recovery_tree)
+    native = recovery.NativeObservationPlan.from_mapping(
+        json.loads(recovery_tree["native_plan_path"].read_text())
+    )
+    owner_mapping = json.loads(recovery_tree["owner_approval_path"].read_text())
+    owner_mapping.update({
+        "scope": "native_observation",
+        "plan_sha256": native.sha256,
+    })
+    native_owner = recovery.OwnerApprovalReceipt.from_mapping(owner_mapping)
+    recovery_tree["owner_approval_path"].write_bytes(
+        recovery._canonical_bytes(native_owner.to_mapping())
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="staged owner approval is bound to another activation plan",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_final_activation_recovery_rejects_unbound_staged_iam(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    _write_failed_final_activation_bundle(recovery_tree)
+    iam_mapping = json.loads(recovery_tree["external_iam_path"].read_text())
+    iam_mapping["source_approval_sha256"] = "f" * 64
+    unbound_iam = recovery.ExternalIAMReceipt.from_mapping(iam_mapping)
+    recovery_tree["external_iam_path"].write_bytes(
+        recovery._canonical_bytes(unbound_iam.to_mapping())
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="staged external IAM receipt authority chain drifted",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_final_activation_recovery_rejects_embedded_owner_drift(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    _activation_raw, failure_raw = _write_failed_final_activation_bundle(
+        recovery_tree
+    )
+    failure = json.loads(failure_raw.decode())
+    owner_mapping = dict(failure["owner_approval_receipt"])
+    owner_mapping["nonce_sha256"] = "e" * 64
+    embedded_owner = recovery.OwnerApprovalReceipt.from_mapping(owner_mapping)
+    failure["owner_approval_receipt"] = embedded_owner.to_mapping()
+    failure["owner_approval_receipt_sha256"] = embedded_owner.sha256
+    drifted_raw = recovery._canonical_bytes(failure)
+    Path(failure["failure_receipt_path"]).write_bytes(drifted_raw)
+    recovery_tree["quarantine_path"].write_bytes(drifted_raw)
+
+    with pytest.raises(
+        ValueError,
+        match="activation failure owner approval drifted",
     ):
         recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
