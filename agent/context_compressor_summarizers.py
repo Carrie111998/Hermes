@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Dict, List
+from typing import Any
 
 from agent.context_compressor_skill_prune import (
     _SKILL_VIEW_PRUNE_MIN_CHARS,
