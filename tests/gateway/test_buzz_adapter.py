@@ -243,6 +243,42 @@ class TestMentionGating:
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_free_response_channel_dispatches_without_mention(self):
+        adapter = _make_adapter({"free_response_channels": [CHANNEL]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        await self._poll_with(adapter, _event("e1", content="ordinary owner message", created_at=10))
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_dm_dispatches_without_mention(self, adapter):
+        adapter._channel_state[CHANNEL]["chat_type"] = "dm"
+        await self._poll_with(adapter, _event("e1", content="ordinary DM", created_at=10))
+        assert [d["message_id"] for d in adapter._dispatched] == ["e1"]
+
+    @pytest.mark.asyncio
+    async def test_self_echo_stays_suppressed_in_free_response_channel(self):
+        adapter = _make_adapter({"free_response_channels": [CHANNEL]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        adapter._channel_state[CHANNEL] = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        await self._poll_with(
+            adapter,
+            _event("e1", pubkey=SELF_PUBKEY, content="agent echo", created_at=10),
+        )
+        assert adapter._dispatched == []
 
     @pytest.mark.asyncio
     async def test_allowlist_blocks_unauthorized(self, adapter):

@@ -25,6 +25,7 @@ Configuration in config.yaml::
             cli_path: ""               # path to the buzz binary (default: PATH, then ~/bin/buzz)
             credentials_file: ""       # JSON file holding the nsec (fallback for BUZZ_PRIVATE_KEY)
             allowed_users: []          # empty = allow all; entries are hex pubkeys or npubs
+            free_response_channels: [] # channel UUIDs that do not require an @mention
 
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
@@ -391,6 +392,21 @@ class BuzzAdapter(BasePlatformAdapter):
         else:
             _rm_cfg = _rm_raw
         self.require_mention = str(_rm_cfg).strip().lower() not in ("false", "0", "no", "off")
+
+        # Profile-scoped channel exemptions from the global mention gate. This
+        # mirrors the cross-platform ``free_response_channels`` vocabulary used
+        # by Discord and Slack. It changes relevance only: channel discovery,
+        # membership, allowed-user, and self-echo gates remain independent.
+        raw_free_response = extra.get("free_response_channels", [])
+        if isinstance(raw_free_response, (list, tuple, set)):
+            free_response_values = raw_free_response
+        else:
+            free_response_values = str(raw_free_response).split(",")
+        self.free_response_channels: set[str] = {
+            str(channel_id).strip()
+            for channel_id in free_response_values
+            if str(channel_id).strip()
+        }
 
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
@@ -1065,10 +1081,15 @@ class BuzzAdapter(BasePlatformAdapter):
         self._maybe_latch_dm(channel_id, state, event)
 
         is_dm = state["chat_type"] == "dm"
-        # In shared channels, respond only when addressed — unless
-        # require_mention is disabled, in which case respond to every message.
-        # DMs always dispatch.
-        if not is_dm and self.require_mention and not self._is_mentioned(content):
+        # In shared channels, respond only when addressed unless mention gating
+        # is globally disabled or this exact channel is explicitly exempted.
+        # DMs always dispatch. Relevance never bypasses author authorization.
+        if (
+            not is_dm
+            and self.require_mention
+            and channel_id not in self.free_response_channels
+            and not self._is_mentioned(content)
+        ):
             return
 
         # Adapter-level allow-list (the gateway applies BUZZ_ALLOWED_USERS /
