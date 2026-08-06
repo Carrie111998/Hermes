@@ -278,6 +278,11 @@ def run_oneshot(
     _write_usage_file(usage_file, result)
 
     if response:
+        # Some providers return lone UTF-16 surrogates (e.g. \ud800) in model
+        # text, which crash UTF-8 stdout with UnicodeEncodeError.  Replace
+        # them with U+FFFD so the user sees � instead of a traceback.
+        # See issue #80366.
+        response = response.encode("utf-8", "replace").decode("utf-8")
         real_stdout.write(response)
         if not response.endswith("\n"):
             real_stdout.write("\n")
