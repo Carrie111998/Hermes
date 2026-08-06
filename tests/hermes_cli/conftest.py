@@ -5,6 +5,36 @@ from __future__ import annotations
 import pytest
 
 
+_SYNTHETIC_ASSIGNEES = (
+    "a", "alice", "alpha", "b", "beta", "bob", "broken", "coder", "default",
+    "demo", "dev", "elias", "engineer", "factory", "made_up", "ops", "orch",
+    "orchestrator", "peer", "researcher", "researcher-a", "researcher-b",
+    "reviewer", "setup", "some-profile", "someother", "swarm-orchestrator",
+    "teknium", "broken-model",
+    "test-worker", "w", "worker", "worker-a", "worker-d",
+    "worker1", "writer", "x",
+)
+
+
+@pytest.fixture(autouse=True)
+def _register_synthetic_assignee_lanes(monkeypatch):
+    """Register legacy test-only labels as explicit non-spawnable lanes.
+
+    Production ingress rejects arbitrary labels. The historical Kanban tests
+    intentionally use short synthetic labels, so make those fixtures explicit
+    resolver targets without weakening production validation.
+    """
+    from hermes_cli import profiles
+
+    real_exists = profiles.profile_exists
+    monkeypatch.setattr(
+        profiles,
+        "profile_exists",
+        lambda name: str(name).strip().casefold() in _SYNTHETIC_ASSIGNEES
+        or real_exists(name),
+    )
+
+
 @pytest.fixture
 def all_assignees_spawnable(monkeypatch):
     """Pretend every assignee maps to a real Hermes profile.

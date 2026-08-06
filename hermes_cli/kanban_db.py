@@ -2891,13 +2891,35 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
-def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
-    """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
-    if assignee is None:
-        return None
-    from hermes_cli.profiles import normalize_profile_name
+def _canonical_assignee(assignee: Optional[str], *, strict: bool = True) -> Optional[str]:
+    """Resolve an assignee before persisting it in a Kanban row.
 
-    return normalize_profile_name(assignee)
+    New create/assign/reassign ingress is strict: an input that does not
+    resolve to an on-disk profile, a configured external lane, or a
+    configured alias raises :class:`InvalidAssigneeError` BEFORE any DB
+    mutation.  Read/filter paths pass ``strict=False`` so pre-existing
+    legacy rows carrying unresolvable labels stay listable — defensive
+    invalid handling for legacy persisted rows belongs to the dispatcher
+    and diagnostics, never to write ingress.
+    """
+    from hermes_cli.kanban_assignees import (
+        InvalidAssigneeError,
+        resolve_assignee,
+    )
+
+    try:
+        return resolve_assignee(assignee).canonical
+    except InvalidAssigneeError:
+        if strict:
+            raise
+        # Legacy read path: keep the label filterable even though it no
+        # longer resolves.  No profile/lane validation — the caller only
+        # wants to match rows that already carry this label.
+        if assignee is None:
+            return None
+        from hermes_cli.profiles import normalize_profile_name
+
+        return normalize_profile_name(str(assignee))
 
 
 def create_task(
@@ -3398,7 +3420,7 @@ def list_tasks(
     params: list[Any] = []
     if assignee is not None:
         query += " AND assignee = ?"
-        params.append(_canonical_assignee(assignee))
+        params.append(_canonical_assignee(assignee, strict=False))
     if status is not None:
         if status not in VALID_STATUSES:
             raise ValueError(f"status must be one of {sorted(VALID_STATUSES)}")
@@ -4399,13 +4421,13 @@ def claim_review_task(
         cur = conn.execute(
             """
             UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'review'
-               AND claim_lock IS NULL
+              SET status        = 'running',
+                  claim_lock    = ?,
+                  claim_expires = ?,
+                  started_at    = COALESCE(started_at, ?)
+            WHERE id = ?
+              AND status = 'review'
+              AND claim_lock IS NULL
             """,
             (lock, expires, now, task_id),
         )
@@ -4421,8 +4443,8 @@ def claim_review_task(
             INSERT INTO task_runs (
                 task_id, profile, step_key, status,
                 claim_lock, claim_expires, max_runtime_seconds,
-                started_at
-            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?)
+                started_at, metadata
+            ) VALUES (?, ?, ?, 'running', ?, ?, ?, ?, ?)
             """,
             (
                 task_id,
@@ -4432,6 +4454,13 @@ def claim_review_task(
                 expires,
                 trow["max_runtime_seconds"] if trow else None,
                 now,
+                # Durable marker for requeue paths: a review claim that
+                # gets requeued (TTL expiry, heartbeat staleness, runtime
+                # timeout, crash, manual reclaim) must return to the
+                # ``review`` column so the review dispatcher re-claims it
+                # with the mandatory sdlc-review skill, never the ready
+                # loop.
+                json.dumps({"source_status": "review"}),
             ),
         )
         run_id = run_cur.lastrowid
@@ -4446,6 +4475,50 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def _requeue_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the status a requeued task should land in.
+
+    Review claims (``claim_review_task``) stamp their active run metadata
+    with ``source_status=review``, so a reviewer requeued by TTL expiry,
+    heartbeat staleness, runtime timeout, crash, manual reclaim, spawn
+    failure, or unblock must return to the ``review`` column — the review
+    dispatcher then re-claims it via ``claim_review_task`` with the
+    mandatory ``sdlc-review`` skill. Without this, those paths reset the
+    card to ``ready`` and the ready loop would spawn the card as an
+    ordinary worker with no review skill. Every other requeue goes to
+    ``ready``.
+
+    The active-run check is the fast path. When no active review-stamped
+    run exists (the run was closed — e.g. a review card auto-blocked after
+    repeated spawn failures), the most recent claim decides the lane,
+    mirroring the coding gate's review-lane detection: ``claim_review_task``
+    stamps its ``claimed`` event with ``source_status=review``, a plain
+    ready-loop claim after a changes-requested rejection stamps none, and a
+    ``review_submitted`` event also marks the review lane when no claim has
+    happened yet.
+    """
+    row = conn.execute(
+        "SELECT r.metadata FROM task_runs r "
+        "JOIN tasks t ON t.current_run_id = r.id "
+        "WHERE t.id = ?",
+        (task_id,),
+    ).fetchone()
+    if row and row["metadata"]:
+        try:
+            meta = json.loads(row["metadata"])
+        except (TypeError, ValueError):
+            meta = None
+        if isinstance(meta, dict) and meta.get("source_status") == "review":
+            return "review"
+    for event in reversed(list_events(conn, task_id)):
+        if event.kind == "claimed":
+            payload = event.payload if isinstance(event.payload, dict) else {}
+            return "review" if payload.get("source_status") == "review" else "ready"
+        if event.kind == "review_submitted":
+            return "review"
+    return "ready"
 
 
 def heartbeat_claim(
@@ -4585,12 +4658,13 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                (requeue_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
                 continue
@@ -4657,12 +4731,13 @@ def reclaim_task(
         row["worker_pid"], prev_lock, signal_fn=signal_fn,
     )
     with write_txn(conn):
+        requeue_status = _requeue_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            (requeue_status, task_id, prev_lock),
         )
         if cur.rowcount != 1:
             return False
@@ -4713,6 +4788,7 @@ def reassign_task(
     Returns True if the reassign landed. ``profile`` may be ``None`` to
     unassign entirely.
     """
+    profile = _canonical_assignee(profile)
     if reclaim_first:
         # Safe to call even if nothing to reclaim.
         reclaim_task(conn, task_id, reason=reason or "reassign")
@@ -5954,19 +6030,31 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        # Re-gate on parent completion before flipping 'blocked' back to
-        # 'ready'. Unconditionally setting status='ready' here bypasses the
-        # parent-completion invariant (the dispatcher trusts that column);
-        # if parents are still in progress the task must wait in 'todo'
-        # until recompute_ready picks it up. RCA: Bug 2 at
-        # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        undone_parents = conn.execute(
-            "SELECT 1 FROM task_links l "
-            "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
-            (task_id,),
-        ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        # A blocked review card returns to the ``review`` column so the
+        # review dispatcher re-claims it via ``claim_review_task`` with the
+        # mandatory ``sdlc-review`` skill — never to ``ready``, where the
+        # ready loop would spawn it without the review skill.  Resolved
+        # before the UPDATE below (which clears ``current_run_id``); for a
+        # card whose review run was already closed by the auto-block, the
+        # event-history fallback in ``_requeue_status`` still detects the
+        # review lane.
+        requeue_status = _requeue_status(conn, task_id)
+        if requeue_status == "review":
+            new_status = "review"
+        else:
+            # Re-gate on parent completion before flipping 'blocked' back to
+            # 'ready'. Unconditionally setting status='ready' here bypasses the
+            # parent-completion invariant (the dispatcher trusts that column);
+            # if parents are still in progress the task must wait in 'todo'
+            # until recompute_ready picks it up. RCA: Bug 2 at
+            # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+            undone_parents = conn.execute(
+                "SELECT 1 FROM task_links l "
+                "JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            new_status = "todo" if undone_parents else "ready"
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -6840,6 +6928,10 @@ class DispatchResult:
     operator-actionable failure. Tracked separately so health telemetry
     can distinguish "real stuck" (nothing spawned but spawnable work
     available) from "correctly idle" (nothing spawnable in the queue)."""
+    skipped_invalid_assignee: list[str] = field(default_factory=list)
+    """Ready/review task ids with legacy unresolved assignees."""
+    invalid_assignee_diagnostics: dict[str, str] = field(default_factory=dict)
+    """Actionable diagnostics keyed by legacy task id."""
     skipped_per_profile_capped: list[tuple[str, str, int]] = field(default_factory=list)
     """Tasks deferred this tick because their assignee is already at
     ``kanban.max_in_progress_per_profile`` (#21582). Each entry is
@@ -7284,13 +7376,14 @@ def enforce_max_runtime(
                     pass
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                (requeue_status, tid, pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -7409,13 +7502,14 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            requeue_status = _requeue_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                (requeue_status, tid, row["claim_lock"]),
             )
             if cur.rowcount != 1:
                 continue
@@ -7667,12 +7761,13 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            requeue_status = _requeue_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                (requeue_status, row["id"], pid, row["claim_lock"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7943,13 +8038,22 @@ def _record_task_failure(
         else:
             # Below threshold.
             if release_claim:
-                # Spawn path: transition running → ready + clear claim.
+                # Spawn path: transition running → requeue status + clear
+                # claim.  A review claim (``claim_review_task``) must return
+                # to the ``review`` column so the review dispatcher re-claims
+                # it with the mandatory ``sdlc-review`` skill — never to
+                # ``ready``, where the ready loop would spawn it without the
+                # skill.  Resolve the requeue status BEFORE the UPDATE: it
+                # reads the active run's ``source_status`` metadata, which
+                # ``_end_run`` below clears (and overwrites) once the run is
+                # closed.
+                requeue_status = _requeue_status(conn, task_id)
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (requeue_status, failures, error[:500], task_id),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
@@ -8432,15 +8536,15 @@ def _dispatch_once_locked(
     _default_assignee_resolved = False
     if _default_assignee:
         try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            _default_assignee = resolve_assignee(
+                _default_assignee,
+                allow_unassigned=False,
+            ).canonical
+            _default_assignee_resolved = bool(_default_assignee)
         except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+            _default_assignee = None
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
@@ -8498,17 +8602,14 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
+        from hermes_cli.kanban_assignees import AssigneeResolver, InvalidAssigneeError
         try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
-            # Bucket separately from skipped_unassigned: the operator
-            # cannot fix this by assigning a profile (the assignee IS the
-            # intended owner — a terminal lane). Health telemetry uses
-            # this distinction to suppress spurious "stuck" warnings on
-            # multi-lane setups where the ready queue is steadily full
-            # of human-pulled work.
+            resolved = AssigneeResolver().resolve(row_assignee, allow_unassigned=False)
+        except InvalidAssigneeError as exc:
+            result.skipped_invalid_assignee.append(row["id"])
+            result.invalid_assignee_diagnostics[row["id"]] = str(exc)
+            continue
+        if not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         # Per-profile concurrency cap (#21582): even if there's global
@@ -8638,11 +8739,14 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        from hermes_cli.kanban_assignees import AssigneeResolver, InvalidAssigneeError
         try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+            resolved = AssigneeResolver().resolve(row["assignee"], allow_unassigned=False)
+        except InvalidAssigneeError as exc:
+            result.skipped_invalid_assignee.append(row["id"])
+            result.invalid_assignee_diagnostics[row["id"]] = str(exc)
+            continue
+        if not resolved.spawnable:
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
@@ -10170,6 +10274,11 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
       the whole board.
     """
     on_disk = set(list_profiles_on_disk())
+    from hermes_cli.kanban_assignees import configured_assignee_choices
+    configured = configured_assignee_choices()
+    configured_names = {
+        str(choice.input_value) for choice in configured if choice.input_value
+    }
 
     # Count tasks per (assignee, status), excluding archived.
     counts: dict[str, dict[str, int]] = {}
@@ -10180,15 +10289,37 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
 
-    names = sorted(on_disk | set(counts.keys()))
-    return [
-        {
+    names = sorted(on_disk | configured_names | set(counts.keys()))
+    entries = []
+    for name in names:
+        try:
+            from hermes_cli.kanban_assignees import resolve_assignee
+
+            resolution = resolve_assignee(name, allow_unassigned=False)
+            category = resolution.category
+            target_category = (
+                resolution.target_category.value
+                if resolution.target_category else None
+            )
+            canonical = resolution.canonical
+        except Exception:
+            category = "invalid"
+            target_category = None
+            canonical = None
+        entries.append({
             "name": name,
             "on_disk": name in on_disk,
             "counts": counts.get(name, {}),
-        }
-        for name in names
-    ]
+            "canonical": canonical,
+            "category": category.value if hasattr(category, "value") else category,
+            "target_category": target_category,
+            "spawnable": (
+                target_category == "profile"
+                or category == "profile"
+                or getattr(category, "value", None) == "profile"
+            ),
+        })
+    return entries
 
 
 # ---------------------------------------------------------------------------
