@@ -1293,6 +1293,7 @@ AGENT_ITERATION_REASON_MISSING = "agent_iteration_missing"
 AGENT_ITERATION_REASON_PARSE_FAILED = "agent_iteration_parse_failed"
 AGENT_ITERATION_REASON_SCHEMA_MISMATCH = "agent_iteration_schema_mismatch"
 AGENT_ITERATION_SUMMARY_MAX_CHARS = 200
+AGENT_ITERATION_BRIEF_MAX_CHARS = 1500
 TRACKER_ITERATION_JOB_NAME = "jobflow-tracker-cycle"
 TRACKER_PHASE_SECONDS_KEYS = frozenset({
     "inbox",
@@ -1405,6 +1406,18 @@ def _extract_agent_iteration(final_response: str):
     reason = parsed.get("reason")
     if reason is not None and not isinstance(reason, str):
         return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+
+    brief = parsed.get("brief")
+    if brief is not None:
+        if not isinstance(brief, str):
+            return None, AGENT_ITERATION_REASON_SCHEMA_MISMATCH, raw_block
+        stripped = brief.strip()
+        if not stripped:
+            parsed.pop("brief", None)
+        else:
+            if len(stripped) > AGENT_ITERATION_BRIEF_MAX_CHARS:
+                stripped = stripped[: AGENT_ITERATION_BRIEF_MAX_CHARS - 1] + "…"
+            parsed["brief"] = stripped
 
     # Normalize: lowercase agent name, truncate summary if needed
     parsed["agent"] = parsed["agent"].strip().lower()

@@ -4973,6 +4973,55 @@ class TestExtractAgentIteration:
         assert "counters" not in parsed
         assert "anomalies" not in parsed
 
+    def test_brief_multiline_preserved_and_trimmed(self):
+        from cron.scheduler import _extract_agent_iteration
+        brief = "── Critic · daily skill review ──\nVERDICT: No changes recommended.\n\nACTION NEEDED: none"
+        block = (
+            '<AGENT_ITERATION_JSON>\n'
+            '{"agent": "critic", "summary": "no changes",'
+            ' "brief": ' + json.dumps("\n  " + brief + "  \n") + '}\n'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(block)
+        assert err is None
+        assert parsed["brief"] == brief  # surrounding whitespace trimmed, internal newlines kept
+        assert "\n\n" in parsed["brief"]
+
+    def test_brief_non_string_is_schema_mismatch(self):
+        from cron.scheduler import _extract_agent_iteration
+        block = (
+            '<AGENT_ITERATION_JSON>\n'
+            '{"agent": "critic", "summary": "x", "brief": 123}\n'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(block)
+        assert parsed is None
+        assert err == "agent_iteration_schema_mismatch"
+
+    def test_brief_whitespace_only_treated_as_absent(self):
+        from cron.scheduler import _extract_agent_iteration
+        block = (
+            '<AGENT_ITERATION_JSON>\n'
+            '{"agent": "critic", "summary": "x", "brief": "   \\n  "}\n'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(block)
+        assert err is None
+        assert "brief" not in parsed
+
+    def test_brief_oversized_truncated_with_ellipsis(self):
+        from cron.scheduler import _extract_agent_iteration
+        long_brief = "V" * 2000
+        block = (
+            '<AGENT_ITERATION_JSON>\n'
+            '{"agent": "critic", "summary": "x", "brief": ' + json.dumps(long_brief) + '}\n'
+            '</AGENT_ITERATION_JSON>'
+        )
+        parsed, err, _ = _extract_agent_iteration(block)
+        assert err is None
+        assert len(parsed["brief"]) == 1500
+        assert parsed["brief"].endswith("…")
+
 
 class TestEmitAgentIterationEvent:
     """Behavior tests for _emit_agent_iteration_event."""
@@ -5036,6 +5085,31 @@ class TestEmitAgentIterationEvent:
         assert payload["counters"]["new"] == 23
         assert payload["job_name"] == "jobflow-scout"
         assert payload["job_id"] == "scout-456"
+
+    def test_emitted_payload_carries_brief(self):
+        import json
+        from cron.scheduler import _emit_agent_iteration_event
+        from events.schema import EventType
+        emitter = self._emitter_with_bus()
+        brief = (
+            "── Critic · daily skill review ──\n"
+            "VERDICT: No changes recommended.\n"
+            "ACTION NEEDED: none"
+        )
+        response = (
+            '<AGENT_ITERATION_JSON>'
+            '{"agent": "scout", "summary": "no changes", "brief": '
+            + json.dumps(brief) +
+            ', "reason": "no_work"}'
+            '</AGENT_ITERATION_JSON>'
+        )
+        _emit_agent_iteration_event(emitter, self._scout_job(), response)
+        assert emitter.bus.emit.call_count == 1
+        kwargs = emitter.bus.emit.call_args.kwargs
+        assert kwargs["event_type"] == EventType.AGENT_ITERATION
+        payload = kwargs["payload"]
+        assert payload["brief"] == brief
+        assert "\n" in payload["brief"]
 
     def test_tracker_cycle_requires_phase_seconds(self):
         from cron.scheduler import (
