@@ -1672,6 +1672,229 @@ class TestWebServerEndpoints:
         assert payload["limit"] == 3
         assert len(payload["sessions"]) == 3
 
+    @staticmethod
+    def _seed_named_profile_store(name: str):
+        """Create profiles/<name>/state.db with one real session and return
+        the store path. Named profiles are the OOF-76 population: their
+        gateways aren't running, so nothing ever opens these stores writable."""
+        from hermes_constants import get_hermes_home
+        from hermes_state import SessionDB
+
+        db_path = get_hermes_home() / "profiles" / name / "state.db"
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        seed = SessionDB(db_path=db_path)
+        try:
+            seed.create_session(f"{name}-session", source="cli")
+            seed.append_message(
+                session_id=f"{name}-session", role="user", content="hello"
+            )
+        finally:
+            seed.close()
+        return db_path
+
+    @staticmethod
+    def _degrade_store(db_path, *, drop_column=None, drop_table=None):
+        import sqlite3
+
+        legacy = sqlite3.connect(str(db_path))
+        try:
+            if drop_column:
+                legacy.execute(
+                    f"ALTER TABLE sessions DROP COLUMN {drop_column}"
+                )
+            if drop_table:
+                legacy.execute(f"DROP TABLE {drop_table}")
+            legacy.commit()
+        finally:
+            legacy.close()
+
+    @pytest.mark.parametrize(
+        "degradation",
+        [{"drop_column": "archived"}, {"drop_table": "system_prompts"}],
+        ids=["missing-column", "missing-table"],
+    )
+    def test_profiles_sessions_heals_stale_named_profile_store(self, degradation):
+        """OOF-76 regression: a named profile whose store predates the current
+        read surface must be healed by the aggregate route, not 500 forever.
+        Idle named profiles never get a writable open, so before the shared
+        heal-capable opener this drift was permanent until redeploy."""
+        import sqlite3
+
+        db_path = self._seed_named_profile_store("opsbot")
+        self._degrade_store(db_path, **degradation)
+
+        resp = self.client.get("/api/profiles/sessions?profile=opsbot")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload.get("errors") in (None, [])
+        assert [row["id"] for row in payload["sessions"]] == ["opsbot-session"]
+        healed = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1] for row in healed.execute("PRAGMA table_info(sessions)")
+            }
+            tables = {
+                row[0]
+                for row in healed.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                )
+            }
+        finally:
+            healed.close()
+        assert "archived" in columns
+        assert "system_prompts" in tables
+
+    def test_profiles_sessions_heals_repeated_drift_in_one_process(self):
+        """The heal marker is keyed on (store identity, stale schema cookie),
+        not the path alone: a SECOND drift later in the process lifetime
+        (restore rewriting the file, external DDL) must get its own heal
+        instead of 500ing until restart."""
+        import sqlite3
+
+        db_path = self._seed_named_profile_store("driftbot")
+        self._degrade_store(db_path, drop_column="archived")
+        first = self.client.get("/api/profiles/sessions?profile=driftbot")
+        assert first.status_code == 200
+
+        self._degrade_store(db_path, drop_column="pinned")
+        second = self.client.get("/api/profiles/sessions?profile=driftbot")
+
+        assert second.status_code == 200
+        assert [row["id"] for row in second.json()["sessions"]] == [
+            "driftbot-session"
+        ]
+        healed = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1] for row in healed.execute("PRAGMA table_info(sessions)")
+            }
+        finally:
+            healed.close()
+        assert {"archived", "pinned"} <= columns
+
+    def test_profiles_sessions_concurrent_stale_reads_heal_once(self, monkeypatch):
+        """Concurrent requests against one stale store must serialise into a
+        single writable reconcile (DDL), with every request still succeeding."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        import hermes_state
+
+        db_path = self._seed_named_profile_store("racebot")
+        self._degrade_store(db_path, drop_column="archived")
+
+        real_session_db = hermes_state.SessionDB
+        writable_opens = []
+
+        class CountingSessionDB(real_session_db):
+            def __init__(self, *args, **kwargs):
+                if not kwargs.get("read_only", False):
+                    writable_opens.append(kwargs.get("db_path"))
+                super().__init__(*args, **kwargs)
+
+        # The opener resolves SessionDB at call time via `from hermes_state
+        # import SessionDB`, so patching the module attribute is sufficient.
+        monkeypatch.setattr(hermes_state, "SessionDB", CountingSessionDB)
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            responses = list(
+                pool.map(
+                    self.client.get,
+                    ["/api/profiles/sessions?profile=racebot"] * 6,
+                )
+            )
+
+        assert [r.status_code for r in responses] == [200] * 6
+        stale_store_heals = [p for p in writable_opens if p == db_path]
+        assert len(stale_store_heals) == 1
+
+    def test_profiles_sessions_sidebar_heals_stale_named_profile_store(self):
+        """The batched sidebar aggregate uses the same heal-capable opener."""
+        db_path = self._seed_named_profile_store("sidebot")
+        self._degrade_store(db_path, drop_column="archived")
+
+        resp = self.client.get("/api/profiles/sessions/sidebar")
+
+        assert resp.status_code == 200
+        payload = resp.json()
+        assert payload.get("errors") in (None, [])
+        recents = payload["recents"]["sessions"]
+        assert any(row["id"] == "sidebot-session" for row in recents)
+
+    def test_stale_store_deterministic_heal_failure_is_not_retried(
+        self, monkeypatch
+    ):
+        """A writable reconcile that fails deterministically (disk full,
+        unfixable DDL) must be attempted exactly once per stale schema
+        state — never re-run as DDL on every subsequent poll."""
+        import sqlite3
+
+        import hermes_state
+
+        db_path = self._seed_named_profile_store("doomedbot")
+        self._degrade_store(db_path, drop_column="archived")
+
+        real_session_db = hermes_state.SessionDB
+        writable_opens = []
+
+        class FailingWritableSessionDB(real_session_db):
+            def __init__(self, *args, **kwargs):
+                if (
+                    not kwargs.get("read_only", False)
+                    and kwargs.get("db_path") == db_path
+                ):
+                    writable_opens.append(kwargs.get("db_path"))
+                    raise sqlite3.OperationalError("disk I/O error")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state, "SessionDB", FailingWritableSessionDB)
+
+        first = self.client.get("/api/profiles/sessions?profile=doomedbot")
+        second = self.client.get("/api/profiles/sessions?profile=doomedbot")
+
+        # The route degrades per-profile (errors list), never 500s the
+        # aggregate — and the failed heal is not re-attempted as DDL.
+        assert first.status_code == 200
+        assert second.status_code == 200
+        assert len(writable_opens) == 1
+
+    def test_stale_store_locked_heal_failure_stays_retryable(self, monkeypatch):
+        """Transient lock/busy contention during the writable reconcile must
+        NOT consume the store's single heal attempt: once the lock clears,
+        the next request heals and succeeds."""
+        import sqlite3
+
+        import hermes_state
+
+        db_path = self._seed_named_profile_store("lockedbot")
+        self._degrade_store(db_path, drop_column="archived")
+
+        real_session_db = hermes_state.SessionDB
+        writable_opens = []
+
+        class LockedOnceSessionDB(real_session_db):
+            def __init__(self, *args, **kwargs):
+                if (
+                    not kwargs.get("read_only", False)
+                    and kwargs.get("db_path") == db_path
+                ):
+                    writable_opens.append(kwargs.get("db_path"))
+                    if len(writable_opens) == 1:
+                        raise sqlite3.OperationalError("database is locked")
+                super().__init__(*args, **kwargs)
+
+        monkeypatch.setattr(hermes_state, "SessionDB", LockedOnceSessionDB)
+
+        first = self.client.get("/api/profiles/sessions?profile=lockedbot")
+        second = self.client.get("/api/profiles/sessions?profile=lockedbot")
+
+        assert first.status_code == 200  # degraded per-profile, not healed yet
+        assert second.status_code == 200
+        assert [row["id"] for row in second.json()["sessions"]] == [
+            "lockedbot-session"
+        ]
+        assert len(writable_opens) == 2
+
     def test_get_session_messages_rejects_negative_limit(self):
         """limit=-1 previously bypassed the documented 500-row clamp because
         min(-1, 500) == -1, which SQLite treats as 'no limit'."""

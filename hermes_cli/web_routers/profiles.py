@@ -44,6 +44,7 @@ router = APIRouter()
 # Late-bound web_server helpers (resolved at call time; cycle-safe,
 # monkeypatch-transparent).
 _cron_profile_home = late("_cron_profile_home")
+_open_session_db_at_path = late("_open_session_db_at_path")
 _disable_unselected_skills = late("_disable_unselected_skills")
 _fallback_profile_dicts = late("_fallback_profile_dicts")
 _hub_action_name = late("_hub_action_name")
@@ -92,7 +93,6 @@ def get_profiles_sessions(
     if order not in ("created", "recent"):
         raise HTTPException(status_code=400, detail="order must be one of: created, recent")
 
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     targets: List[Tuple[str, Path]] = []
@@ -132,10 +132,14 @@ def get_profiles_sessions(
         if not db_path.exists():
             continue
         try:
-            # Read-only: this loop runs on every sidebar refresh, so it must
-            # never DDL/write-lock another profile's live DB (see SessionDB
-            # read_only docstring).
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Read-only aggregation: this loop runs on every sidebar refresh,
+            # so the healthy path must never DDL/write-lock another profile's
+            # live DB (see SessionDB read_only docstring). The shared opener
+            # heals a stale/older schema through one idempotent writable open
+            # (OOF-76: idle named profiles never get a writable open, so their
+            # stores otherwise drift behind the dashboard's read surface and
+            # 500 here forever).
+            db = _open_session_db_at_path(db_path, read_only=True)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue
@@ -226,7 +230,6 @@ def get_profiles_sessions_sidebar(
     ``min_messages=1`` / ``archived=exclude`` / recency order, matching the
     desktop's per-slice calls.
     """
-    from hermes_state import SessionDB
     from hermes_cli import profiles as profiles_mod
 
     # cron + messaging are cross-profile; recents is scoped to recents_profile.
@@ -290,7 +293,8 @@ def get_profiles_sessions_sidebar(
         if not db_path.exists():
             continue
         try:
-            db = SessionDB(db_path=db_path, read_only=True)
+            # Same heal-capable opener as /api/profiles/sessions (OOF-76).
+            db = _open_session_db_at_path(db_path, read_only=True)
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
             continue

@@ -612,3 +612,85 @@ AFTER UPDATE OF content, tool_name, tool_calls ON messages BEGIN
     );
 END;
 """
+
+
+# ---------------------------------------------------------------------------
+# Schema contract (derived from SCHEMA_SQL — single source of truth)
+# ---------------------------------------------------------------------------
+
+# Lazily-built {table: {column, ...}} contract parsed from SCHEMA_SQL via an
+# in-memory database (same Beets/sqlite-utils trick as
+# SessionSchemaMixin._parse_schema_columns). SCHEMA_SQL is static application
+# code: if it fails to parse, that is a programming fault and the error must
+# propagate — silently disabling drift detection for the whole process would
+# recreate the OOF-76 false-green. ``None`` = not built yet.
+_STATE_SCHEMA_CONTRACT_CACHE = None
+
+
+def _state_schema_contract():
+    """Return the expected {table: {columns}} map for a session store."""
+    global _STATE_SCHEMA_CONTRACT_CACHE
+    if _STATE_SCHEMA_CONTRACT_CACHE is not None:
+        return _STATE_SCHEMA_CONTRACT_CACHE
+    import sqlite3
+
+    contract = {}
+    ref = sqlite3.connect(":memory:")
+    try:
+        ref.executescript(SCHEMA_SQL)
+        for (tbl,) in ref.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall():
+            contract[tbl] = {
+                row[1] for row in ref.execute(f'PRAGMA table_info("{tbl}")')
+            }
+    finally:
+        ref.close()
+    _STATE_SCHEMA_CONTRACT_CACHE = contract
+    return contract
+
+
+def state_schema_mismatches(conn) -> "list[str]":
+    """Diff a live connection's regular tables against the SCHEMA_SQL contract.
+
+    Returns bounded human-readable mismatch descriptions (missing tables or
+    columns), or ``[]`` when the store converges. FTS virtual tables are
+    intentionally out of scope: their layout is capability-dependent
+    (``fts_storage_version`` in ``state_meta``) and managed separately, and
+    the recorded ``schema_version`` may legitimately sit behind
+    ``SCHEMA_VERSION`` on FTS5-unavailable runtimes even after every regular
+    table has converged — which is exactly why callers must diff the
+    contract, not the version integer (OOF-76).
+
+    A store with no tables at all is treated as uninitialised (``[]``) —
+    bootstrap owns creation, not this check. Once any table exists, every
+    contract table and column is required. Live-database errors (locked,
+    malformed) propagate to the caller.
+    """
+    contract = _state_schema_contract()
+    live_tables = {
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    }
+    if not live_tables:
+        # A database with no tables at all is uninitialised, not stale —
+        # bootstrap owns creation. Any non-empty database claiming to be a
+        # session store must satisfy the full contract; a store holding
+        # only foreign tables is exactly the failure this check surfaces.
+        return []
+    mismatches = []
+    for tbl in sorted(contract):
+        if tbl not in live_tables:
+            mismatches.append(f"missing table {tbl}")
+            continue
+        live_cols = {
+            row[1] for row in conn.execute(f'PRAGMA table_info("{tbl}")')
+        }
+        missing = sorted(contract[tbl] - live_cols)
+        if missing:
+            mismatches.append(f"table {tbl} missing columns: {', '.join(missing)}")
+    return mismatches

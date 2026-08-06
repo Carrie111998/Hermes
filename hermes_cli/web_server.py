@@ -3258,6 +3258,14 @@ async def get_status(profile: Optional[str] = None):
         try:
             from gateway.readiness import _probe_state_db
 
+            # Named-profile schema drift (OOF-76) is deliberately NOT folded
+            # into this public storage status: restart-driven remediation
+            # cannot heal an idle profile store (only the dashboard's
+            # heal-capable read path can), so surfacing it here could put
+            # supervisors into a restart loop against an unhealable-signal
+            # (OOF-39 class). Profile-store drift is reported on the
+            # authenticated detailed readiness endpoint instead
+            # (gateway.readiness.collect_runtime_readiness).
             storage_check = await asyncio.get_running_loop().run_in_executor(
                 None, functools.partial(_probe_state_db, get_hermes_home())
             )
@@ -11195,16 +11203,61 @@ from hermes_cli.web_routers.sessions import (  # noqa: E402,F401 — legacy re-e
 # query raises "no such table: sessions".
 _session_db_bootstrap_lock = threading.Lock()
 
-# Stale-schema probe for read-only opens: compiled against the newest columns
-# the dashboard read paths query. Reads at most one row per table. Read-only
-# opens skip _reconcile_columns(), so an older store would otherwise 500 on
-# every poll until something opened it writable.
+# Store keys are (path, st_dev, st_ino): recovery/restore machinery can
+# atomically replace a state.db at the same path without restarting this
+# process, and the replacement must not inherit the original file's heal or
+# validation state (SQLite schema cookies are small integers that collide
+# trivially between databases born from the same DDL).
+def _session_store_key(db_path: Path) -> "tuple[str, int, int]":
+    try:
+        stat = db_path.stat()
+        return (str(db_path), stat.st_dev, stat.st_ino)
+    except OSError:
+        return (str(db_path), -1, -1)
+
+
+# (store key, stale schema cookie) pairs whose heal already ran in this
+# process. Keying by the cookie observed at stale-detection time (instead of
+# the store alone) means a SECOND drift later in the process lifetime — a
+# recovery rewriting the file in place, an external tool dropping a column —
+# gets its own heal attempt rather than 500ing forever. Still loop-bounded:
+# the writable reconcile is idempotent, so an unhealable store's cookie
+# stops changing after one repair pass and its stale state lands in this set
+# permanently (fail-visible, never a DDL loop). Inspected and mutated only
+# under _session_db_bootstrap_lock.
+_session_db_heal_attempted: "set[tuple[tuple[str, int, int], int]]" = set()
+
+# Contract-validation cache: store key -> SQLite schema cookie (PRAGMA
+# schema_version — the engine's monotonic DDL counter, NOT the application
+# schema_version table) at the last successful contract diff. A matching
+# cookie means no DDL has touched the store since it last converged, so the
+# per-poll cost stays one PRAGMA read; any DDL (including an external
+# gateway's own reconcile) bumps the cookie and forces revalidation.
+_session_db_contract_validated: "dict[tuple[str, int, int], int]" = {}
+
+# Fast-fail stale-schema probe for read-only opens: touches the newest
+# columns and tables the dashboard read paths query (at most one row per
+# table). Read-only opens skip _reconcile_columns(), so an older store
+# would otherwise 500 on every poll until something opened it writable.
+# OOF-76: named-profile stores whose gateway isn't running never get a
+# writable open, so a store missing the newer read surface (system_prompts,
+# sessions.last_activity_at/system_prompt_hash) 500ed on every dashboard
+# session route until redeploy. The durable guard is the SCHEMA_SQL
+# contract diff in _open_session_db_at_path() (state_schema_mismatches);
+# this probe stays as a cheap direct read against the known-hot surface.
 _SESSION_DB_READ_PROBE_SQL = (
     "SELECT (SELECT archived FROM sessions LIMIT 1), "
     "(SELECT pinned FROM sessions LIMIT 1), "
+    "(SELECT last_activity_at FROM sessions LIMIT 1), "
+    "(SELECT system_prompt_hash FROM sessions LIMIT 1), "
+    "(SELECT hash FROM system_prompts LIMIT 1), "
     "(SELECT active FROM messages LIMIT 1), "
     "(SELECT compacted FROM messages LIMIT 1)"
 )
+
+
+class _StaleSessionSchema(Exception):
+    """Read-only open found the store behind the SCHEMA_SQL contract."""
 
 
 def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
@@ -11212,21 +11265,38 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
 
     ``profile`` None/empty selects this process's own ``state.db``. A named
     profile opens that profile's on-disk store directly.
-
-    Writable opens keep the full init and repair path. Read-only opens
-    bootstrap a missing or zero-byte store once, and heal an older or
-    malformed schema through one writable open before reopening read-only.
-    The healthy read path never takes a write lock or requests a checkpoint.
     """
-    import sqlite3
-
-    from hermes_state import SessionDB, _default_db_path, is_malformed_db_error
+    from hermes_state import _default_db_path
 
     if profile:
         _name, home = _cron_profile_home(profile)
         db_path = Path(home) / "state.db"
     else:
         db_path = Path(_default_db_path())
+    return _open_session_db_at_path(db_path, read_only=read_only)
+
+
+def _open_session_db_at_path(db_path: Path, *, read_only: bool):
+    """Open a SessionDB at ``db_path`` with an explicit access mode.
+
+    Writable opens keep the full init and repair path. Read-only opens
+    bootstrap a missing or zero-byte store once, and heal an older or
+    malformed schema through one writable open before reopening read-only.
+    Staleness is detected two ways: the read probe (missing table/column on
+    the hot dashboard surface raises immediately) and a full diff of the
+    store's regular tables against the SCHEMA_SQL contract (catches stores
+    that predate ANY newer read path before a route 500s on it), cached on
+    SQLite's schema cookie so converged stores pay one PRAGMA read per open.
+    The application's recorded ``schema_version`` integer is deliberately
+    not consulted — it legitimately sits behind ``SCHEMA_VERSION`` on
+    FTS5-unavailable runtimes even when every regular table has converged.
+    The healthy read path never takes a write lock or requests a checkpoint.
+    """
+    import sqlite3
+
+    from hermes_state import SessionDB, is_malformed_db_error
+    from hermes_state_common import state_schema_mismatches
+
     if not read_only:
         return SessionDB(db_path=db_path, read_only=False)
 
@@ -11243,14 +11313,49 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
             if _needs_bootstrap():
                 SessionDB(db_path=db_path, read_only=False).close()
 
+    store_key = _session_store_key(db_path)
+
+    # Schema cookie observed by the most recent probe. Captured before the
+    # hot-surface probe so a "no such table" failure still records which
+    # schema state was stale — the heal marker is keyed on it. -1 = cookie
+    # unreadable (malformed store).
+    observed_cookie = -1
+
     def _open_probed():
+        nonlocal observed_cookie
         db = SessionDB(db_path=db_path, read_only=True)
         # Unit-test fakes may replace SessionDB without exposing a raw
         # connection. Probe only real connections.
         conn = getattr(db, "_conn", None)
         if conn is not None:
             try:
+                cookie_row = conn.execute("PRAGMA schema_version").fetchone()
+                cookie = int(cookie_row[0]) if cookie_row else -1
+                observed_cookie = cookie
                 conn.execute(_SESSION_DB_READ_PROBE_SQL).fetchone()
+                # Contract diff, cached on the engine's schema cookie: a
+                # store that converged and has seen no DDL since costs one
+                # PRAGMA read per open here.
+                if _session_db_contract_validated.get(store_key) != cookie:
+                    mismatches = state_schema_mismatches(conn)
+                    if mismatches:
+                        raise _StaleSessionSchema(
+                            f"{db_path.name} behind schema contract: "
+                            + "; ".join(mismatches[:4])
+                        )
+                    # Re-read the cookie after the diff: an external process
+                    # (another profile's gateway reconciling) may have run
+                    # DDL mid-diff, making the diff's view unreliable. Cache
+                    # only a fenced result; an unfenced pass still serves
+                    # this request and revalidates on the next open.
+                    cookie_after_row = conn.execute(
+                        "PRAGMA schema_version"
+                    ).fetchone()
+                    cookie_after = (
+                        int(cookie_after_row[0]) if cookie_after_row else -2
+                    )
+                    if cookie_after == cookie:
+                        _session_db_contract_validated[store_key] = cookie
             except BaseException:
                 db.close()
                 raise
@@ -11258,12 +11363,41 @@ def _open_session_db_for_profile(profile: Optional[str], *, read_only: bool):
 
     try:
         return _open_probed()
-    except sqlite3.DatabaseError as exc:
-        message = str(exc).lower()
-        stale_schema = "no such table" in message or "no such column" in message
-        if not stale_schema and not is_malformed_db_error(exc):
-            raise
-        SessionDB(db_path=db_path, read_only=False).close()
+    except (_StaleSessionSchema, sqlite3.DatabaseError) as exc:
+        if not isinstance(exc, _StaleSessionSchema):
+            message = str(exc).lower()
+            stale_schema = "no such table" in message or "no such column" in message
+            if not stale_schema and not is_malformed_db_error(exc):
+                raise
+        # Serialise the writable heal: concurrent stale reads must not run
+        # overlapping DDL against one store.
+        heal_key = (store_key, observed_cookie)
+        with _session_db_bootstrap_lock:
+            if heal_key not in _session_db_heal_attempted:
+                # First healer for this stale schema state in this process.
+                # A concurrent request may still have repaired it between
+                # our failed probe and taking the lock — the writable open
+                # is idempotent, so one redundant reconcile is cheaper than
+                # re-probing here.
+                #
+                # Mark BEFORE opening writable: a reconcile that raises
+                # deterministically (disk full, unfixable DDL) must not be
+                # retried by every subsequent poll. Only transient lock
+                # contention un-marks itself to stay retryable.
+                _session_db_heal_attempted.add(heal_key)
+                try:
+                    SessionDB(db_path=db_path, read_only=False).close()
+                except sqlite3.OperationalError as heal_exc:
+                    heal_message = str(heal_exc).lower()
+                    if "locked" in heal_message or "busy" in heal_message:
+                        _session_db_heal_attempted.discard(heal_key)
+                    raise
+        # The reopen keeps the full probe + contract diff: if the writable
+        # reconcile could not converge the store, the error propagates to
+        # the route (fail-visible) instead of silently serving a degraded
+        # read surface. The heal marker above still guarantees at most one
+        # writable heal per stale schema state — an unhealable store costs
+        # one error per request, never a DDL loop.
         return _open_probed()
 
 
