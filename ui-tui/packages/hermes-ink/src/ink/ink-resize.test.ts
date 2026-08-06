@@ -3,8 +3,8 @@ import { EventEmitter } from 'events'
 import React from 'react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import Text from './components/Text.js'
 import { TerminalSizeContext } from './components/TerminalSizeContext.js'
+import Text from './components/Text.js'
 import Ink from './ink.js'
 import { CURSOR_HOME, ERASE_SCREEN } from './termio/csi.js'
 
