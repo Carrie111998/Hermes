@@ -11199,9 +11199,17 @@ _session_db_bootstrap_lock = threading.Lock()
 # the dashboard read paths query. Reads at most one row per table. Read-only
 # opens skip _reconcile_columns(), so an older store would otherwise 500 on
 # every poll until something opened it writable.
+#
+# MAINTENANCE: any new column added to hermes_state_common.py's sessions/
+# messages schema that a dashboard read path (list_sessions_rich et al.)
+# queries must be added here too, or an existing pre-feature database will
+# 500 on GET /api/sessions until a write connection happens to open first
+# (e.g. creating a new session) -- issue #80037, where last_read_at was
+# never added to this list when the read-state feature shipped.
 _SESSION_DB_READ_PROBE_SQL = (
     "SELECT (SELECT archived FROM sessions LIMIT 1), "
     "(SELECT pinned FROM sessions LIMIT 1), "
+    "(SELECT last_read_at FROM sessions LIMIT 1), "
     "(SELECT active FROM messages LIMIT 1), "
     "(SELECT compacted FROM messages LIMIT 1)"
 )

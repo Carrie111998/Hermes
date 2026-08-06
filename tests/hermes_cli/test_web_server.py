@@ -398,7 +398,7 @@ class TestWebServerEndpoints:
         assert response.json()["sessions"] == []
         assert response.json()["total"] == 0
 
-    @pytest.mark.parametrize("missing_column", ["archived", "pinned"])
+    @pytest.mark.parametrize("missing_column", ["archived", "pinned", "last_read_at"])
     def test_get_sessions_heals_stale_schema_store(self, missing_column):
         import sqlite3
 
