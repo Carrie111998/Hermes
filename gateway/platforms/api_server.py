@@ -2004,6 +2004,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("POST", "/api/sessions/{session_id}/chat/stream", self._handle_session_chat_stream),
             ("POST", "/api/sessions/{session_id}/model", self._handle_session_model_lock),
             ("POST", "/v1/audio/transcriptions", self._handle_audio_transcriptions),
+            ("POST", "/v1/audio/speech", self._handle_audio_speech),
             ("POST", "/v1/chat/completions", self._handle_chat_completions),
             ("POST", "/v1/responses", self._handle_responses),
             ("GET", "/v1/responses/{response_id}", self._handle_get_response),
@@ -3064,6 +3065,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "skills_api": True,
                 "audio_api": True,
                 "audio_transcriptions": True,
+                "audio_speech": True,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
                 "session_key_header": "X-Hermes-Session-Key",
@@ -3076,6 +3078,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model_options": {"method": "GET", "path": "/api/model/options"},
                 "chat_completions": {"method": "POST", "path": "/v1/chat/completions"},
                 "audio_transcriptions": {"method": "POST", "path": "/v1/audio/transcriptions"},
+                "audio_speech": {"method": "POST", "path": "/v1/audio/speech"},
                 "responses": {"method": "POST", "path": "/v1/responses"},
                 "runs": {"method": "POST", "path": "/v1/runs"},
                 "run_status": {"method": "GET", "path": "/v1/runs/{run_id}"},
@@ -4015,6 +4018,134 @@ class APIServerAdapter(BasePlatformAdapter):
                 "model": result.get("model", model or ""),
             }
         )
+
+    async def _handle_audio_speech(
+        self, request: "web.Request"
+    ) -> "web.Response":
+        """POST /v1/audio/speech — OpenAI-compatible text-to-speech.
+
+        Accepts a JSON body with ``input`` (text to synthesize) and optional
+        ``model``, ``voice``, ``response_format``, ``speed``, and
+        ``instructions`` fields, then delegates to
+        ``tools.tts_tool.text_to_speech_tool`` so every configured TTS
+        provider (edge, elevenlabs, openai, minimax, xai, mistral, gemini,
+        neutts, kittentts, piper, deepinfra, command providers) is available
+        with zero new dependencies.
+
+        Returns the synthesized audio bytes with the appropriate
+        Content-Type (``audio/mpeg`` for mp3, ``audio/wav`` for wav, etc.).
+        When ``response_format`` is ``json``, returns a JSON envelope with
+        a base64-encoded audio data URL instead.
+
+        OpenAI-compatible request shape::
+
+            {"model": "tts-1", "input": "Hello world", "voice": "alloy",
+             "response_format": "mp3", "speed": 1.0}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error("Request body must be valid JSON.", param="body"),
+                status=400,
+            )
+
+        text = body.get("input") or body.get("text")
+        if not text or not str(text).strip():
+            return web.json_response(
+                _openai_error("'input' is required and must be non-empty.", param="input"),
+                status=400,
+            )
+
+        # Optional fields — all forwarded to text_to_speech_tool.
+        voice = body.get("voice")  # noqa: F841 — consumed by provider config, not the tool signature
+        speed = body.get("speed")
+        instructions = body.get("instructions")
+        provider = body.get("provider") or body.get("model")
+        response_format = body.get("response_format", "mp3")
+
+        # text_to_speech_tool is CPU/IO-bound (local providers load models on
+        # first call). Run it off the aiohttp event loop.
+        from tools.tts_tool import text_to_speech_tool
+
+        result_str = await asyncio.to_thread(
+            text_to_speech_tool,
+            text,
+            None,  # output_path — let the tool pick a default
+            float(speed) if speed is not None else None,
+            instructions,
+            provider,
+        )
+
+        try:
+            result = json.loads(result_str)
+        except (json.JSONDecodeError, Exception):
+            return web.json_response(
+                _openai_error(
+                    "TTS returned an unexpected response.",
+                    code="tts_parse_failed",
+                ),
+                status=500,
+            )
+
+        if not result.get("success"):
+            return web.json_response(
+                _openai_error(
+                    result.get("error", "TTS failed."),
+                    code="tts_failed",
+                ),
+                status=500,
+            )
+
+        file_path = result.get("file_path", "")
+        if not file_path or not os.path.isfile(file_path):
+            return web.json_response(
+                _openai_error(
+                    "TTS succeeded but no audio file was produced.",
+                    code="tts_no_file",
+                ),
+                status=500,
+            )
+
+        # Read the generated audio file.
+        with open(file_path, "rb") as f:
+            audio_bytes = f.read()
+
+        # Determine content type from the file extension.
+        ext = os.path.splitext(file_path)[1].lower()
+        content_types = {
+            ".mp3": "audio/mpeg",
+            ".wav": "audio/wav",
+            ".ogg": "audio/ogg",
+            ".opus": "audio/ogg",
+            ".flac": "audio/flac",
+            ".aac": "audio/aac",
+        }
+        content_type = content_types.get(ext, "audio/mpeg")
+
+        # Clean up the temp file (the tool writes to ~/voice-memos/ or a
+        # temp path; we don't want to accumulate files from API calls).
+        with suppress(OSError):
+            os.unlink(file_path)
+
+        if response_format == "json":
+            import base64
+
+            audio_b64 = base64.b64encode(audio_bytes).decode()
+            return web.json_response(
+                {
+                    "audio": f"data:{content_type};base64,{audio_b64}",
+                    "content_type": content_type,
+                    "provider": result.get("provider", ""),
+                }
+            )
+
+        # Default: return raw audio bytes (OpenAI-compatible).
+        return web.Response(body=audio_bytes, content_type=content_type)
 
     @_admit_api_agent_request
     async def _handle_chat_completions(self, request: "web.Request") -> "web.Response":
