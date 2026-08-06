@@ -8,9 +8,13 @@ existing behavior.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
+# ``SessionDB.delete_sessions`` discovers delegate children with a query that
+# binds each input ID twice. 250 keeps that query, plus the follow-up IN lists,
+# comfortably below SQLite builds that retain the legacy 999-variable limit.
 _SESSION_DELETE_BATCH = 250
 _CONVERSATION_TARGETS = frozenset({"conversations", "everything"})
 
@@ -25,10 +29,22 @@ def _close_db(db: Any) -> None:
 
 
 def _get_running_gateway_pid(hermes_home: Path) -> int | None:
-    """Return the gateway PID associated with the target Hermes home."""
-    from gateway.status import get_running_pid
+    """Return the live gateway PID associated with the target Hermes home.
 
-    return get_running_pid(hermes_home / "gateway.pid")
+    Use the repository's complete liveness ladder rather than checking only
+    ``gateway.pid``: launch-service-managed gateways can remain live with only
+    ``gateway_state.json`` available. ``profile_dir`` also prevents one
+    profile's reset from being blocked by another profile's gateway.
+    """
+    from gateway.status import resolve_gateway_liveness
+
+    liveness = resolve_gateway_liveness(
+        profile_dir=hermes_home,
+        use_cache=False,
+    )
+    if liveness.probe_error and not liveness.running:
+        raise RuntimeError("gateway liveness probe was inconclusive")
+    return liveness.pid if liveness.running else None
 
 
 def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
@@ -40,6 +56,27 @@ def _memory_files_for_target(target: str) -> list[tuple[str, str]]:
             ("USER.md", "user profile"),
         ]
     raise ValueError(f"unsupported conversation reset target: {target}")
+
+
+def _preflight_memory_file_deletion(
+    memories_dir: Path,
+    existing_files: list[tuple[str, str]],
+) -> None:
+    """Fail before DB mutation when selected memory files cannot be removed.
+
+    Unlink permission is primarily controlled by the parent directory; Windows
+    also commonly refuses deletion of a read-only file. This is a best-effort
+    preflight against both conditions. The actual unlink remains guarded because
+    permissions can still change after this check.
+    """
+    if not existing_files:
+        return
+    if not os.access(memories_dir, os.W_OK | os.X_OK):
+        raise PermissionError(f"memory directory is not writable: {memories_dir}")
+    for name, _description in existing_files:
+        path = memories_dir / name
+        if not os.access(path, os.W_OK):
+            raise PermissionError(f"memory file is not writable: {path}")
 
 
 def _collect_session_ids(db: Any) -> list[str]:
@@ -94,13 +131,19 @@ def _delete_conversations(
     *,
     expected_session_count: int,
 ) -> int:
-    """Delete the captured sessions through SessionDB transactions.
+    """Delete the captured sessions through bounded SessionDB transactions.
 
     ``SessionDB.delete_sessions`` owns the SQL contract: messages and sessions
     are removed with FTS triggers active, session-model usage cascades, orphaned
     child references are repaired, unreferenced system prompts are cleaned, and
     legacy transcript/request-dump files are removed. Unrelated tables are not
     touched.
+
+    The operation is intentionally batched to stay below SQLite's bind-variable
+    limits. Every batch is atomic; the final zero-row verification refuses to
+    report success after a partial reset. The gateway guard and stable snapshot
+    make a partial result unlikely, but another non-gateway Hermes writer can
+    still race this destructive maintenance command and cause a failure.
     """
     for start in range(0, len(session_ids), _SESSION_DELETE_BATCH):
         db.delete_sessions(
@@ -151,6 +194,11 @@ def cmd_memory_reset(args: Any) -> int:
         for name, description in selected_files
         if (memories_dir / name).is_file()
     ]
+    try:
+        _preflight_memory_file_deletion(memories_dir, existing_files)
+    except (OSError, PermissionError) as exc:
+        print(f"\n  ✗ Could not prepare memory-file reset: {exc}\n")
+        return 1
 
     db = None
     session_ids: list[str] = []
@@ -193,6 +241,7 @@ def cmd_memory_reset(args: Any) -> int:
             "    ◆ conversation history — "
             f"{session_count:,} sessions, {message_count:,} messages"
         )
+        print("    Note: stop all other Hermes CLI/TUI/cron processes first.")
 
     if not getattr(args, "yes", False):
         try:
