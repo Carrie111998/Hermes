@@ -49,6 +49,11 @@ _ENV_VARS = (
     "BUZZ_THREAD_SESSIONS",
     "BUZZ_AUTO_JOIN_CHANNEL_NAME_PATTERN",
     "BUZZ_AUTO_JOIN_STATE_FILE",
+    "BUZZ_PROFILE_CHANNEL_SYNC",
+    "BUZZ_PROFILE_CHANNEL_ADOPT_EXISTING",
+    "BUZZ_PROFILE_CHANNEL_ARCHIVE_ON_DELETE",
+    "BUZZ_PROFILE_CHANNEL_STATE_FILE",
+    "BUZZ_PROFILE_CHANNEL_MAP_FILE",
 )
 
 
@@ -533,6 +538,127 @@ class TestBuzzThreadResolution:
         assert await adapter._resolve_thread_root(CHANNEL, reply) == "parent"
         assert adapter._thread_root_cache["reply"] == "parent"
 
+
+class TestProfileChannelSync:
+
+    def _adapter(self, tmp_path, **extra):
+        return _make_adapter({
+            "profile_channel_sync": True,
+            "profile_channel_state_file": str(tmp_path / "profile-channels.json"),
+            **extra,
+        })
+
+    @pytest.mark.asyncio
+    async def test_creates_one_managed_channel_per_profile(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._local_profiles = lambda: {"default": "1:1", "pikachu": "1:2"}
+        cli = _ScriptedCli()
+        cli.script("channels", "search", [])
+        cli.script("channels", "search", [])
+        cli.script("channels", "create", {"channel_id": "default-channel"})
+        cli.script("channels", "create", {"channel_id": "pikachu-channel"})
+        adapter._run_cli = cli
+
+        await adapter._sync_profile_channels()
+
+        state = json.loads(adapter._profile_channel_state_file.read_text())
+        profiles = state["scopes"][adapter._profile_channel_scope_key()]["profiles"]
+        assert profiles["default"]["channel_id"] == "default-channel"
+        assert profiles["pikachu"]["channel_id"] == "pikachu-channel"
+        create_names = [
+            args[args.index("--name") + 1]
+            for args, _ in cli.calls if args[:2] == ["channels", "create"]
+        ]
+        assert create_names == ["default", "pikachu"]
+
+    @pytest.mark.asyncio
+    async def test_removed_profile_archives_only_registered_channel(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._local_profiles = lambda: {"default": "1:1"}
+        state = {
+            "version": 1,
+            "scopes": {adapter._profile_channel_scope_key(): {"profiles": {
+                "default": {"channel_id": "default-channel", "identity": "1:1", "archived": False},
+                "pikachu": {"channel_id": "pikachu-channel", "identity": "1:2", "archived": False},
+            }}},
+        }
+        adapter._write_profile_channel_state(state)
+        cli = _ScriptedCli()
+        cli.script("channels", "get", {"channel_id": "default-channel", "name": "default", "archived": False})
+        cli.script("channels", "archive", {"accepted": True})
+        adapter._run_cli = cli
+
+        await adapter._sync_profile_channels()
+
+        assert any(
+            args == ["channels", "archive", "--channel", "pikachu-channel"]
+            for args, _ in cli.calls
+        )
+
+    @pytest.mark.asyncio
+    async def test_readded_profile_restores_same_channel(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._local_profiles = lambda: {"pikachu": "2:9"}
+        state = {"version": 1, "scopes": {adapter._profile_channel_scope_key(): {
+            "profiles": {"pikachu": {
+                "channel_id": "pikachu-channel", "identity": "1:2", "archived": True,
+            }}
+        }}}
+        adapter._write_profile_channel_state(state)
+        cli = _ScriptedCli()
+        cli.script("channels", "get", {"channel_id": "pikachu-channel", "name": "pikachu", "archived": True})
+        cli.script("channels", "unarchive", {"accepted": True})
+        adapter._run_cli = cli
+
+        await adapter._sync_profile_channels()
+
+        assert any(args[:2] == ["channels", "unarchive"] for args, _ in cli.calls)
+        saved = json.loads(adapter._profile_channel_state_file.read_text())
+        entry = saved["scopes"][adapter._profile_channel_scope_key()]["profiles"]["pikachu"]
+        assert entry == {"channel_id": "pikachu-channel", "identity": "2:9", "archived": False}
+
+    @pytest.mark.asyncio
+    async def test_profile_rename_preserves_channel_uuid(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._local_profiles = lambda: {"raichu": "1:2"}
+        state = {"version": 1, "scopes": {adapter._profile_channel_scope_key(): {
+            "profiles": {"pikachu": {
+                "channel_id": "same-channel", "identity": "1:2", "archived": False,
+            }}
+        }}}
+        adapter._write_profile_channel_state(state)
+        cli = _ScriptedCli()
+        cli.script("channels", "get", {"channel_id": "same-channel", "name": "pikachu", "archived": False})
+        cli.script("channels", "update", {"accepted": True})
+        adapter._run_cli = cli
+
+        await adapter._sync_profile_channels()
+
+        assert any(
+            args == ["channels", "update", "--channel", "same-channel", "--name", "raichu"]
+            for args, _ in cli.calls
+        )
+        saved = json.loads(adapter._profile_channel_state_file.read_text())
+        profiles = saved["scopes"][adapter._profile_channel_scope_key()]["profiles"]
+        assert "pikachu" not in profiles
+        assert profiles["raichu"]["channel_id"] == "same-channel"
+
+    @pytest.mark.asyncio
+    async def test_existing_channel_is_not_adopted_without_opt_in(self, tmp_path):
+        adapter = self._adapter(tmp_path)
+        adapter._local_profiles = lambda: {"pikachu": "1:2"}
+        cli = _ScriptedCli()
+        cli.script("channels", "search", {"channel_id": "human-channel", "name": "pikachu"})
+        # Search output is a list in the real CLI.
+        cli.responses[("channels", "search")] = [(0, json.dumps([
+            {"channel_id": "human-channel", "name": "pikachu"}
+        ]), "")]
+        adapter._run_cli = cli
+
+        await adapter._sync_profile_channels()
+
+        assert not any(args[:2] == ["channels", "create"] for args, _ in cli.calls)
+        assert not adapter._profile_channel_state_file.exists()
 
     @pytest.mark.asyncio
     async def test_dm_message_keeps_conversation_session_unthreaded(self):
