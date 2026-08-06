@@ -403,12 +403,15 @@ def test_xai_root_write_failure_never_returns_or_reloads_consumed_lineage(
     )
     real_save = A._save_auth_store
     failed = False
+    root_saves = 0
 
     def fail_rotated_root_write(store: dict[str, Any], target_path: Path | None = None):
-        nonlocal failed
-        if target_path is not None and A._same_path(Path(target_path), root_path) and not failed:
-            failed = True
-            raise OSError("simulated source persistence failure")
+        nonlocal failed, root_saves
+        if target_path is not None and A._same_path(Path(target_path), root_path):
+            root_saves += 1
+            if root_saves > 1:
+                failed = True
+                raise OSError("simulated source persistence failure")
         return real_save(store, target_path)
 
     monkeypatch.setattr(A, "_save_auth_store", fail_rotated_root_write)
@@ -597,21 +600,13 @@ def test_anthropic_replacement_after_post_survives_conditional_write(
         }
 
     monkeypatch.setattr(anthropic_adapter, "refresh_anthropic_oauth_pure", fake_refresh)
-    write_name = (
-        "_write_claude_code_credentials_file"
-        if hasattr(anthropic_adapter, "_write_claude_code_credentials_file")
-        else "_write_claude_code_credentials"
-    )
-    real_write = getattr(anthropic_adapter, write_name)
-
-    def pause_at_write_boundary(*args: Any, **kwargs: Any) -> None:
+    def pause_at_write_boundary() -> None:
         write_boundary.set()
         assert release_write.wait(timeout=5)
-        real_write(*args, **kwargs)
 
     monkeypatch.setattr(
         anthropic_adapter,
-        write_name,
+        "_claude_reservation_commit_hook",
         pause_at_write_boundary,
     )
     results: list[str | None] = []
@@ -663,7 +658,7 @@ def _nous_entry(
     )
 
 
-def test_nous_resolver_persistence_failure_quarantines_consumed_lineage(
+def test_nous_resolver_persistence_failure_reserves_consumed_lineage(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -674,6 +669,8 @@ def test_nous_resolver_persistence_failure_quarantines_consumed_lineage(
     monkeypatch.setattr(A, "is_provider_explicitly_configured", lambda _provider: True)
     monkeypatch.setattr(CP, "load_env", lambda: {})
     monkeypatch.setattr(CP, "_get_secret", lambda *_args: "")
+    monkeypatch.setattr(A, "_read_shared_nous_state", lambda: None)
+    monkeypatch.setattr(A, "_reserve_shared_nous_lineage", lambda _token: None)
     monkeypatch.setattr(A, "_write_shared_nous_state", lambda _state: None)
     old_access = _jwt(seconds=3600, scope=A.DEFAULT_NOUS_SCOPE)
     new_access = _jwt(seconds=7200, scope=A.DEFAULT_NOUS_SCOPE)
@@ -722,22 +719,23 @@ def test_nous_resolver_persistence_failure_quarantines_consumed_lineage(
         return real_client(*args, transport=transport, **kwargs)
 
     monkeypatch.setattr(A.httpx, "Client", client_factory)
-    save_name = (
-        "_save_provider_state_to_locked_source"
-        if hasattr(A, "_save_provider_state_to_locked_source")
-        else "_save_provider_state_to_source"
-    )
-    real_save = getattr(A, save_name)
+    real_save = A._save_auth_store
     failed = False
+    auth_saves = 0
 
-    def fail_post_refresh_save(*args: Any, **kwargs: Any) -> None:
-        nonlocal failed
-        if not failed:
-            failed = True
-            raise OSError("simulated provider-state save failure")
-        real_save(*args, **kwargs)
+    def fail_post_refresh_save(
+        store: dict[str, Any],
+        target_path: Path | None = None,
+    ) -> None:
+        nonlocal failed, auth_saves
+        if target_path is not None and A._same_path(Path(target_path), auth_path):
+            auth_saves += 1
+            if auth_saves > 1:
+                failed = True
+                raise OSError("simulated provider-state save failure")
+        real_save(store, target_path)
 
-    monkeypatch.setattr(A, save_name, fail_post_refresh_save)
+    monkeypatch.setattr(A, "_save_auth_store", fail_post_refresh_save)
     pool = CredentialPool("nous", [old])
     refreshed = pool._refresh_entry(old, force=True)
 
@@ -745,14 +743,15 @@ def test_nous_resolver_persistence_failure_quarantines_consumed_lineage(
     assert requests == ["nous-refresh-old"]
     assert refreshed is None
     fresh = CP.load_pool("nous")
-    authoritative = next(entry for entry in fresh.entries() if entry.source == "device_code")
-    assert authoritative.access_token == old_access
-    assert authoritative.refresh_token == "nous-refresh-old"
-    assert authoritative.last_status == CP.STATUS_DEAD
     assert fresh.has_available() is False
+    assert all(
+        entry.refresh_token != "nous-refresh-old"
+        for entry in fresh.entries()
+    )
 
     newer = _read_json(auth_path)
     newer_state = newer["providers"]["nous"]
+    newer_state.pop(A.SOURCE_REFRESH_RESERVATION_KEY, None)
     newer_state["access_token"] = new_access
     newer_state["refresh_token"] = "nous-refresh-newer"
     newer_state["agent_key"] = new_access

@@ -184,9 +184,13 @@ def _reloaded_claude_entry():
 
 def _install_claude_source(monkeypatch, initial):
     state = {"credentials": dict(initial), "writes": []}
+    source_lock = threading.RLock()
 
     def read_credentials():
-        return dict(state["credentials"])
+        return {
+            **state["credentials"],
+            "source": "claude_code_credentials_file",
+        }
 
     def write_credentials(access_token, refresh_token, expires_at_ms):
         write = (access_token, refresh_token, expires_at_ms)
@@ -212,6 +216,27 @@ def _install_claude_source(monkeypatch, initial):
             raise auth_mod.SourceCredentialLineageChanged("anthropic")
         return write_credentials(access_token, refresh_token, expires_at_ms)
 
+    def refresh_source(observed):
+        with source_lock:
+            current = read_credentials()
+            if current.get("refreshToken") != observed.get("refreshToken"):
+                return current
+            refreshed = anthropic_adapter.refresh_anthropic_oauth_pure(
+                observed["refreshToken"],
+                use_json=False,
+            )
+            try:
+                anthropic_adapter._write_claude_code_credentials_locked(
+                    refreshed["access_token"],
+                    refreshed["refresh_token"],
+                    refreshed["expires_at_ms"],
+                    expected_refresh_token=observed["refreshToken"],
+                    allow_missing=False,
+                )
+            except auth_mod.SourceCredentialLineageChanged:
+                return read_credentials()
+            return read_credentials()
+
     monkeypatch.setattr(
         anthropic_adapter,
         "read_claude_code_credentials",
@@ -231,6 +256,11 @@ def _install_claude_source(monkeypatch, initial):
         anthropic_adapter,
         "_write_claude_code_credentials_locked",
         write_locked,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_refresh_claude_code_source_credentials",
+        refresh_source,
     )
     return state
 

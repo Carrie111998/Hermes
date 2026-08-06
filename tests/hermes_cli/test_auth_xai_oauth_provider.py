@@ -11,6 +11,7 @@ from hermes_cli.auth import (
     AuthError,
     DEFAULT_XAI_OAUTH_BASE_URL,
     PROVIDER_REGISTRY,
+    SOURCE_REFRESH_RESERVATION_KEY,
     XAI_OAUTH_CLIENT_ID,
     XAI_OAUTH_SCOPE,
     _read_xai_oauth_tokens,
@@ -307,14 +308,11 @@ def _seed_xai_oauth_state(
     (hermes_home / "auth.json").write_text(json.dumps(auth_store, indent=2))
 
 
-def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure(
+def test_resolve_credentials_reserves_tokens_before_terminal_refresh_failure(
     tmp_path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Terminal refresh failure (relogin_required=True, code=xai_refresh_failed)
-    must remove the consumed singleton so reload cannot seed an empty or stale
-    credential. Mirrors the pool quarantine for the direct resolve path.
-    """
+    """A terminal refresh failure leaves the pre-POST reservation authoritative."""
     hermes_home = tmp_path / "hermes"
     _seed_xai_oauth_state(hermes_home, dict(_STALE_XAI_OAUTH_STATE), active_provider="nous")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
@@ -336,7 +334,10 @@ def test_resolve_credentials_quarantines_dead_tokens_on_terminal_refresh_failure
     assert exc_info.value.relogin_required is True
 
     raw = json.loads((hermes_home / "auth.json").read_text())
-    assert "xai-oauth" not in raw["providers"]
+    reserved = raw["providers"]["xai-oauth"]
+    assert reserved[SOURCE_REFRESH_RESERVATION_KEY]["status"] == "reserved"
+    assert "access_token" not in reserved["tokens"]
+    assert "refresh_token" not in reserved["tokens"]
 
     # Active provider must be unchanged.
     assert raw["active_provider"] == "nous"

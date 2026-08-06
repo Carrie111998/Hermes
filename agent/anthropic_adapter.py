@@ -11,6 +11,7 @@ Auth supports:
 """
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -1172,43 +1173,10 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     Only fall back to refreshing ourselves when no fresh credential is found.
     """
     try:
-        with claude_code_credentials_transaction() as (_source_path, current):
-            authoritative = current or creds
-            current_token = authoritative.get("accessToken", "")
-            current_exp = authoritative.get("expiresAt", 0) or 0
-            if (
-                current is not None
-                and current_token
-                and current_token != creds.get("accessToken", "")
-                and current_exp > 0
-                and is_claude_code_token_valid(authoritative)
-            ):
-                logger.debug("Adopted Claude Code's already-refreshed OAuth token")
-                return current_token
-
-            refresh_token = authoritative.get("refreshToken", "")
-            if not refresh_token:
-                logger.debug("No refresh token available — cannot refresh")
-                return None
-            refreshed = refresh_anthropic_oauth_pure(
-                refresh_token,
-                use_json=False,
-            )
-            try:
-                _write_claude_code_credentials_locked(
-                    refreshed["access_token"],
-                    refreshed["refresh_token"],
-                    refreshed["expires_at_ms"],
-                    expected_refresh_token=refresh_token,
-                    allow_missing=current is None,
-                )
-            except _claude_lineage_changed_type():
-                winner = _read_claude_code_credentials_from_file()
-                if winner and is_claude_code_token_valid(winner):
-                    return str(winner.get("accessToken", "") or "") or None
-                return None
-            logger.debug("Successfully refreshed Claude Code OAuth token")
-            return refreshed["access_token"]
+        refreshed = _refresh_claude_code_source_credentials(creds)
+        if refreshed:
+            return str(refreshed.get("accessToken", "") or "") or None
+        return None
     except Exception as e:
         logger.debug("Failed to refresh Claude Code token: %s", e)
         return None
@@ -1235,6 +1203,317 @@ def claude_code_credentials_transaction(timeout_seconds: float = 30.0):
         target_path=source_path,
     ):
         yield source_path, _read_claude_code_credentials_from_file()
+
+
+_CLAUDE_RESERVATION_KEY = "_oauth_refresh_reservation"
+_claude_reservation_commit_hook = None
+
+
+def _claude_source_generation(path: Path) -> tuple[int, int, int, int]:
+    source_stat = path.stat()
+    return (
+        source_stat.st_dev,
+        source_stat.st_ino,
+        source_stat.st_size,
+        source_stat.st_mtime_ns,
+    )
+
+
+def _fsync_directory(path: Path) -> None:
+    try:
+        dir_fd = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
+
+
+def _restore_claude_source_claim(claim_path: Path, source_path: Path) -> None:
+    """Restore a claimed external winner without overwriting a newer writer."""
+    try:
+        os.link(claim_path, source_path)
+    except FileExistsError:
+        pass
+    except OSError:
+        try:
+            fd = os.open(
+                str(source_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+        except FileExistsError:
+            pass
+        else:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(claim_path.read_bytes())
+                handle.flush()
+                os.fsync(handle.fileno())
+    finally:
+        try:
+            claim_path.unlink()
+        except FileNotFoundError:
+            pass
+    _fsync_directory(source_path.parent)
+
+
+def _install_claude_payload_if_absent(
+    temp_path: Path,
+    source_path: Path,
+    payload: bytes,
+) -> None:
+    """Install a prepared payload without replacing a non-cooperating writer."""
+    try:
+        os.link(temp_path, source_path)
+        return
+    except FileExistsError as exc:
+        raise _claude_lineage_changed_type()("anthropic") from exc
+    except OSError:
+        # Some filesystems do not permit hard links. O_EXCL retains the same
+        # no-overwrite ownership property; a partial crash state is malformed
+        # and therefore fail-closed to the existing loader.
+        try:
+            fd = os.open(
+                str(source_path),
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+        except FileExistsError as exc:
+            raise _claude_lineage_changed_type()("anthropic") from exc
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(payload)
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception:
+            try:
+                source_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+
+def _conditional_claude_source_replace(
+    source_path: Path,
+    payload: Dict[str, Any],
+    *,
+    expected_bytes: bytes,
+    expected_generation: tuple[int, int, int, int],
+    run_commit_hook: bool = False,
+) -> None:
+    """Replace one exact source generation without overwriting another writer."""
+    encoded = json.dumps(payload, indent=2).encode("utf-8") + b"\n"
+    source_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = source_path.with_suffix(f".tmp.{secrets.token_hex(8)}")
+    claim_path = source_path.with_suffix(f".claim.{secrets.token_hex(8)}")
+    fd = os.open(
+        str(temp_path),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        stat.S_IRUSR | stat.S_IWUSR,
+    )
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+        if run_commit_hook and _claude_reservation_commit_hook is not None:
+            _claude_reservation_commit_hook()
+
+        try:
+            os.replace(source_path, claim_path)
+        except FileNotFoundError as exc:
+            raise _claude_lineage_changed_type()("anthropic") from exc
+
+        try:
+            claimed_bytes = claim_path.read_bytes()
+            claimed_generation = _claude_source_generation(claim_path)
+            if (
+                claimed_bytes != expected_bytes
+                or claimed_generation != expected_generation
+            ):
+                _restore_claude_source_claim(claim_path, source_path)
+                raise _claude_lineage_changed_type()("anthropic")
+
+            try:
+                _install_claude_payload_if_absent(
+                    temp_path,
+                    source_path,
+                    encoded,
+                )
+            except Exception:
+                _restore_claude_source_claim(claim_path, source_path)
+                raise
+            claim_path.unlink()
+            _fsync_directory(source_path.parent)
+        except Exception:
+            if claim_path.exists():
+                _restore_claude_source_claim(claim_path, source_path)
+            raise
+    finally:
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _reserve_claude_code_credentials_locked(
+    source_path: Path,
+    expected_refresh_token: str,
+):
+    from hermes_cli import auth as auth_mod
+
+    raw = source_path.read_bytes()
+    generation = _claude_source_generation(source_path)
+    payload = json.loads(raw)
+    oauth = payload.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        raise auth_mod.SourceCredentialLineageChanged("anthropic")
+    current_refresh = str(oauth.get("refreshToken", "") or "")
+    if (
+        auth_mod._refresh_lineage_fingerprint(current_refresh)
+        != auth_mod._refresh_lineage_fingerprint(expected_refresh_token)
+    ):
+        raise auth_mod.SourceCredentialLineageChanged("anthropic")
+
+    reservation = auth_mod.SourceRefreshReservation(
+        provider="anthropic",
+        source_path=source_path,
+        owner_fingerprint=auth_mod._source_owner_fingerprint(
+            "anthropic",
+            source_path,
+        ),
+        nonce=secrets.token_hex(16),
+        refresh_fingerprint=(
+            auth_mod._refresh_lineage_fingerprint(expected_refresh_token) or ""
+        ),
+    )
+    reserved_oauth: Dict[str, Any] = {
+        _CLAUDE_RESERVATION_KEY: reservation.metadata(),
+    }
+    if "scopes" in oauth:
+        reserved_oauth["scopes"] = copy.deepcopy(oauth["scopes"])
+    reserved_payload = copy.deepcopy(payload)
+    reserved_payload["claudeAiOauth"] = reserved_oauth
+    _conditional_claude_source_replace(
+        source_path,
+        reserved_payload,
+        expected_bytes=raw,
+        expected_generation=generation,
+    )
+    return reservation
+
+
+def _finalize_claude_code_reservation_locked(
+    reservation,
+    refreshed: Dict[str, Any],
+) -> Dict[str, Any]:
+    from hermes_cli import auth as auth_mod
+
+    source_path = Path(reservation.source_path)
+    raw = source_path.read_bytes()
+    generation = _claude_source_generation(source_path)
+    payload = json.loads(raw)
+    oauth = payload.get("claudeAiOauth")
+    metadata = oauth.get(_CLAUDE_RESERVATION_KEY) if isinstance(oauth, dict) else None
+    if not isinstance(metadata, dict) or metadata != reservation.metadata():
+        raise auth_mod.SourceCredentialLineageChanged("anthropic")
+
+    finalized_oauth: Dict[str, Any] = {
+        "accessToken": refreshed["access_token"],
+        "refreshToken": refreshed["refresh_token"],
+        "expiresAt": refreshed["expires_at_ms"],
+    }
+    if "scopes" in oauth:
+        finalized_oauth["scopes"] = copy.deepcopy(oauth["scopes"])
+    finalized_payload = copy.deepcopy(payload)
+    finalized_payload["claudeAiOauth"] = finalized_oauth
+    _conditional_claude_source_replace(
+        source_path,
+        finalized_payload,
+        expected_bytes=raw,
+        expected_generation=generation,
+        run_commit_hook=True,
+    )
+    winner = _read_claude_code_credentials_from_file()
+    if (
+        not winner
+        or auth_mod._refresh_lineage_fingerprint(winner.get("refreshToken"))
+        != auth_mod._refresh_lineage_fingerprint(refreshed["refresh_token"])
+    ):
+        raise auth_mod.SourceCredentialLineageChanged("anthropic")
+    return winner
+
+
+def _refresh_claude_code_source_credentials(
+    observed: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Refresh one concrete writable Claude source through a reservation."""
+    from hermes_cli import auth as auth_mod
+
+    observed_source = str(
+        observed.get("source") or "claude_code_credentials_file"
+    )
+    if observed_source != "claude_code_credentials_file":
+        logger.debug("Selected Claude credential owner is not writable by Hermes")
+        return None
+    observed_refresh = str(observed.get("refreshToken", "") or "")
+    if not observed_refresh:
+        return None
+
+    source_path = _claude_code_credentials_path()
+    with auth_mod._auth_store_lock(target_path=source_path):
+        authoritative = read_claude_code_credentials()
+        if not authoritative:
+            return None
+        authoritative_source = str(authoritative.get("source") or "")
+        authoritative_refresh = str(
+            authoritative.get("refreshToken", "") or ""
+        )
+        if authoritative_source != "claude_code_credentials_file":
+            if (
+                auth_mod._refresh_lineage_fingerprint(authoritative_refresh)
+                != auth_mod._refresh_lineage_fingerprint(observed_refresh)
+                and is_claude_code_token_valid(authoritative)
+            ):
+                return authoritative
+            return None
+        if (
+            auth_mod._refresh_lineage_fingerprint(authoritative_refresh)
+            != auth_mod._refresh_lineage_fingerprint(observed_refresh)
+        ):
+            if is_claude_code_token_valid(authoritative):
+                return authoritative
+
+        reservation = _reserve_claude_code_credentials_locked(
+            source_path,
+            authoritative_refresh,
+        )
+        try:
+            refreshed = refresh_anthropic_oauth_pure(
+                authoritative_refresh,
+                use_json=False,
+            )
+        except Exception:
+            # The reservation is already the durable fail-closed state.
+            raise
+        try:
+            return _finalize_claude_code_reservation_locked(
+                reservation,
+                refreshed,
+            )
+        except auth_mod.SourceCredentialLineageChanged:
+            winner = read_claude_code_credentials()
+            if winner and is_claude_code_token_valid(winner):
+                return winner
+            return None
+        except OSError as exc:
+            raise auth_mod.SourceCredentialPersistenceError(
+                "anthropic",
+                source_path=source_path,
+                consumed_refresh_token=authoritative_refresh,
+            ) from exc
 
 
 _EXPECTED_CLAUDE_REFRESH_UNSET = object()

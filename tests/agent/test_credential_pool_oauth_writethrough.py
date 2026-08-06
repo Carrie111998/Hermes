@@ -2026,6 +2026,23 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
         assert credentials["refreshToken"] == expected_refresh_token
         return write_credentials(access_token, refresh_token, expires_at_ms)
 
+    def refresh_source(observed):
+        refreshed = anthropic_adapter.refresh_anthropic_oauth_pure(
+            observed["refreshToken"],
+            use_json=False,
+        )
+        anthropic_adapter._write_claude_code_credentials_locked(
+            refreshed["access_token"],
+            refreshed["refresh_token"],
+            refreshed["expires_at_ms"],
+            expected_refresh_token=observed["refreshToken"],
+            allow_missing=False,
+        )
+        return {
+            **credentials,
+            "source": "claude_code_credentials_file",
+        }
+
     monkeypatch.setattr(
         anthropic_adapter,
         "read_claude_code_credentials",
@@ -2050,6 +2067,11 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
         anthropic_adapter,
         "_write_claude_code_credentials_locked",
         write_credentials_locked,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_refresh_claude_code_source_credentials",
+        refresh_source,
     )
     monkeypatch.setattr(CP, "write_credential_pool", recording_write)
 
@@ -2166,7 +2188,7 @@ def test_terminal_provider_cleanup_persists_removed_ids_outside_pool_lock(
     if provider == "xai-oauth":
         monkeypatch.setattr(A, "refresh_xai_oauth_pure", reject_refresh)
         monkeypatch.setattr(A, "_is_terminal_xai_oauth_refresh_error", lambda _exc: True)
-        expected_ids = {extra_removed.id, survivor.id}
+        expected_ids = {device.id, extra_removed.id, survivor.id}
     else:
         monkeypatch.setattr(A, "resolve_nous_runtime_credentials", reject_refresh)
         monkeypatch.setattr(A, "_is_terminal_nous_refresh_error", lambda _exc: True)
@@ -2186,8 +2208,11 @@ def test_terminal_provider_cleanup_persists_removed_ids_outside_pool_lock(
 
     assert not worker.is_alive()
     assert errors == []
-    assert write_lock_states
-    assert not any(write_lock_states)
+    if provider == "xai-oauth":
+        assert write_lock_states == []
+    else:
+        assert write_lock_states
+        assert not any(write_lock_states)
     assert {entry.id for entry in pool.entries()} == expected_ids
     persisted = _read_store(auth_path)["credential_pool"][provider]
     assert {entry["id"] for entry in persisted} == expected_ids
@@ -2937,7 +2962,8 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
             },
         )
 
-        def reject_claude_source_write(*_args, **_kwargs):
+        def reject_claude_source_write(_observed):
+            claude_credentials.clear()
             raise A.SourceCredentialPersistenceError(
                 "anthropic",
                 source_path=None,
@@ -2946,7 +2972,7 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
 
         monkeypatch.setattr(
             anthropic_adapter,
-            "_write_claude_code_credentials_locked",
+            "_refresh_claude_code_source_credentials",
             reject_claude_source_write,
         )
     elif provider == "xai-oauth":
@@ -2960,66 +2986,62 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
                 "last_refresh": "2026-08-06T05:00:00Z",
             },
         )
-        real_locked_save = A._save_provider_state_to_locked_source
+        real_save = A._save_auth_store
+        xai_saves = 0
 
-        def reject_xai_source_write(auth_store, provider_id, state, source_path, **kwargs):
-            if provider_id == "xai-oauth":
-                raise OSError("simulated source persistence failure")
-            return real_locked_save(
-                auth_store,
-                provider_id,
-                state,
-                source_path,
-                **kwargs,
-            )
+        def reject_xai_source_write(store, target_path=None):
+            nonlocal xai_saves
+            if target_path is not None and A._same_path(Path(target_path), auth_path):
+                xai_saves += 1
+                if xai_saves > 1:
+                    raise OSError("simulated source persistence failure")
+            return real_save(store, target_path)
 
         monkeypatch.setattr(
             A,
-            "_save_provider_state_to_locked_source",
+            "_save_auth_store",
             reject_xai_source_write,
         )
     else:
         pool = CredentialPool(provider, [old])
-        nous_refreshed = False
-
-        def fake_nous_sync(entry, *, persist=True):
-            if not nous_refreshed:
-                return entry
-            return replace(
-                entry,
-                access_token="orphan-access",
-                refresh_token="orphan-refresh",
-                expires_at_ms=9_999_999_999_999,
-            )
 
         def fake_nous_refresh(**_kwargs):
-            nonlocal nous_refreshed
-            nous_refreshed = True
-            return {"api_key": "orphan-access"}
+            reserved = _read_store(auth_path)
+            reserved["providers"]["nous"] = {
+                A.SOURCE_REFRESH_RESERVATION_KEY: {"status": "reserved"},
+            }
+            for item in reserved["credential_pool"]["nous"]:
+                item.pop("access_token", None)
+                item.pop("refresh_token", None)
+                item["last_status"] = CP.STATUS_DEAD
+            _write_store(auth_path, reserved)
+            raise A.SourceCredentialPersistenceError(
+                "nous",
+                source_path=auth_path,
+                consumed_refresh_token="old-refresh",
+            )
 
         monkeypatch.setattr(
             A,
             "resolve_nous_runtime_credentials",
             fake_nous_refresh,
         )
-        pool._sync_nous_entry_from_auth_store = fake_nous_sync
-        pool._sync_device_code_entry_to_auth_store = lambda entry: False
 
     refreshed = pool._refresh_entry(old, force=True)
     reloaded = CP.load_pool(provider)
     source = "claude_code" if provider == "anthropic" else "device_code"
-    authoritative = next(
-        entry
-        for entry in reloaded.entries()
-        if entry.source == source
-    )
 
     assert refreshed is None
-    assert authoritative.access_token == "old-access"
-    assert authoritative.refresh_token == "old-refresh"
-    assert authoritative.last_status == CP.STATUS_DEAD
     assert reloaded.has_available() is False
     assert all(entry.access_token != "orphan-access" for entry in reloaded.entries())
+    if provider in {"anthropic", "nous"}:
+        assert all(entry.source != source for entry in reloaded.entries())
+    else:
+        source_entries = [
+            entry for entry in reloaded.entries() if entry.source == source
+        ]
+        assert all(entry.refresh_token != "old-refresh" for entry in source_entries)
+        assert all(entry.last_status == CP.STATUS_DEAD for entry in source_entries)
 
     if provider == "anthropic":
         claude_credentials.update(
