@@ -1,0 +1,16 @@
+project: hermes
+
+http:
+  base_url: http://127.0.0.1:18080
+
+  checks:
+    - name: API Health
+      path: /health
+      expect: 200
+      json:
+        success: true
+        data.service: hermes-api
+
+    - name: OpenAPI
+      path: /openapi.json
+      expect: 200
