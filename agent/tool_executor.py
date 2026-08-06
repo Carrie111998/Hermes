@@ -358,6 +358,13 @@ class _ManagedToolResult:
 class _ConcurrentToolAuthorizationGate:
     """Serialize policy prompts and exclude their queue from batch deadlines."""
 
+    # Maximum total excluded seconds before the gate stops extending the
+    # batch deadline.  Without a cap, a wedged authorization (e.g. a hung
+    # pre_tool_block plugin or a dead approval client) grows
+    # excluded_seconds() 1:1 with wall clock, keeping remaining constant
+    # and the deadline loop from ever firing.  (#79719)
+    _MAX_EXCLUDED_SECONDS: float = 120.0
+
     def __init__(self) -> None:
         self._serialization_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -371,10 +378,26 @@ class _ConcurrentToolAuthorizationGate:
             if self._pending == 0:
                 self._window_started = now
             self._pending += 1
+        acquired = False
         try:
-            with self._serialization_lock:
+            acquired = self._serialization_lock.acquire(timeout=self._MAX_EXCLUDED_SECONDS)
+            if not acquired:
+                logger.warning(
+                    "Authorization gate: timed out waiting for serialization "
+                    "lock after %.0fs — proceeding without serialization "
+                    "(wedged pre_tool_block or approval client?)",
+                    self._MAX_EXCLUDED_SECONDS,
+                )
+                # Still run the callback in degraded mode — the lock is
+                # unavailable but the tool call should not hang forever.
                 return callback()
+            return callback()
         finally:
+            if acquired:
+                try:
+                    self._serialization_lock.release()
+                except RuntimeError:
+                    pass
             now = time.monotonic()
             with self._state_lock:
                 self._pending -= 1
@@ -386,13 +409,17 @@ class _ConcurrentToolAuthorizationGate:
                     self._window_started = None
 
     def excluded_seconds(self) -> float:
-        """Return completed plus currently active authorization wait time."""
+        """Return completed plus currently active authorization wait time.
+
+        Capped at _MAX_EXCLUDED_SECONDS to prevent the batch deadline from
+        being pushed out indefinitely by a wedged authorization.  (#79719)
+        """
         now = time.monotonic()
         with self._state_lock:
             excluded = self._excluded_seconds
             if self._window_started is not None:
                 excluded += max(0.0, now - self._window_started)
-            return excluded
+            return min(excluded, self._MAX_EXCLUDED_SECONDS)
 
 
 def _managed_values(
