@@ -74,6 +74,31 @@ async def test_rename_thread_allows_hermes_lifecycle_title_transition(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_rename_thread_changes_only_lifecycle_emoji():
+    adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
+    thread = SimpleNamespace(
+        name="thread-title",
+        edit=AsyncMock(),
+    )
+    adapter._client = SimpleNamespace(
+        get_channel=MagicMock(return_value=thread),
+        fetch_channel=AsyncMock(),
+    )
+
+    renamed = await adapter.rename_thread(
+        "123",
+        "",
+        lifecycle_emoji="⏳",
+    )
+
+    assert renamed is True
+    thread.edit.assert_awaited_once_with(
+        name="⏳ thread-title",
+        reason="Hermes semantic session title",
+    )
+
+
+@pytest.mark.asyncio
 async def test_rename_thread_still_protects_human_renamed_thread(tmp_path):
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="***"))
     thread = SimpleNamespace(

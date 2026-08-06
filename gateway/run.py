@@ -20011,15 +20011,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not callable(rename_thread):
             return
 
-        base = self._sanitize_discord_thread_title(prompt)
-        working_title = self._sanitize_discord_thread_title(f"⏳ Working · {base}")
-        status_title = self._sanitize_discord_thread_title(
-            f"{status} · {base}"
-        )
+        lifecycle_emoji = status.split(" ", 1)[0]
         expected_name = (
             getattr(source, "auto_thread_initial_name", None)
             if status == "⏳ Working"
-            else working_title
+            else None
         )
         if not source.thread_id:
             return
@@ -20028,8 +20024,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 await rename_thread(
                     str(source.thread_id),
-                    status_title,
+                    "",
                     only_if_current_name=expected_name,
+                    lifecycle_emoji=lifecycle_emoji,
                 )
             except Exception:
                 logger.debug(
@@ -20058,6 +20055,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Schedule Discord auto-thread rename from the auto-title background thread."""
         relay_info = None
         if not title:
+            return
+        # Native Discord lifecycle titles preserve the current thread name and
+        # only change its status emoji; do not let semantic auto-title replace
+        # that name later in the turn.
+        if self._is_discord_auto_thread_lane(source):
             return
         if not self._is_discord_auto_thread_lane(source):
             # Relay title turn: the source is the PARENT channel event (the

@@ -6870,6 +6870,7 @@ class DiscordAdapter(BasePlatformAdapter):
         *,
         only_if_current_name: Optional[str] = None,
         allow_current_name_prefixes: Optional[Sequence[str]] = None,
+        lifecycle_emoji: Optional[str] = None,
     ) -> bool:
         """Best-effort Discord thread rename.
 
@@ -6884,15 +6885,6 @@ class DiscordAdapter(BasePlatformAdapter):
         except (TypeError, ValueError):
             return False
 
-        cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
-        if not cleaned:
-            return False
-        # Discord thread names are budgeted in UTF-16 code units (emoji count
-        # double) — truncate with the UTF-16 helpers, not code-point slices.
-        from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
-        if utf16_len(cleaned) > 80:
-            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
-
         try:
             thread = self._client.get_channel(thread_id_int)
             if thread is None:
@@ -6902,6 +6894,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
 
         current_name = getattr(thread, "name", None)
+        if lifecycle_emoji:
+            base_name = str(current_name or "").strip()
+            for prefix in ("⏳ ", "✅ ", "❌ "):
+                if base_name.startswith(prefix):
+                    base_name = base_name[len(prefix):].lstrip()
+                    break
+            cleaned = f"{lifecycle_emoji} {base_name}".strip()
+        else:
+            cleaned = re.sub(r"\s+", " ", str(name or "")).strip()
+        if not cleaned:
+            return False
+        # Discord thread names are budgeted in UTF-16 code units (emoji count
+        # double) — truncate with the UTF-16 helpers, not code-point slices.
+        from gateway.platforms.base import utf16_len, _prefix_within_utf16_limit
+        if utf16_len(cleaned) > 80:
+            cleaned = _prefix_within_utf16_limit(cleaned, 77).rstrip() + "..."
+
         if (
             only_if_current_name is not None
             and current_name != only_if_current_name
