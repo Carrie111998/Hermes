@@ -327,7 +327,9 @@ def test_recall_indicator_emitted_when_memory_injected():
     mm.describe_recall.return_value = "👁️ Hindsight — recalled 2 memories"
     agent._memory_manager = mm
 
-    _build(agent)
+    # A substantive query — a trivial prompt ("hi", "hello") skips prefetch_all
+    # entirely, so there'd be nothing to indicate. See is_trivial_prompt.
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
 
     agent._emit_status.assert_any_call("👁️ Hindsight — recalled 2 memories")
 
@@ -340,7 +342,9 @@ def test_recall_indicator_skipped_when_nothing_injected():
     mm.prefetch_all.return_value = ""
     agent._memory_manager = mm
 
-    _build(agent)
+    # Substantive query so prefetch_all actually runs; it returns nothing, so the
+    # indicator path must stay silent (as opposed to being skipped as trivial).
+    _build(agent, user_message="what did we decide about the deploy pipeline?")
 
     mm.describe_recall.assert_not_called()
     for call in agent._emit_status.call_args_list:
