@@ -1,7 +1,30 @@
-"""Tests for hermes_cli/fallback_config.py — fallback entry API-key resolution."""
+"""Tests for hermes_cli/fallback_config.py."""
 
 from agent.secret_scope import reset_secret_scope, set_secret_scope
-from hermes_cli.fallback_config import resolve_entry_api_key
+from hermes_cli.fallback_config import get_fallback_chain, resolve_entry_api_key
+
+
+class TestGetFallbackChain:
+    def test_json_string_fallback_providers_is_parsed_as_chain(self):
+        config = {
+            "fallback_providers": '[{"provider":"openai-api","model":"gpt-5.5"}]'
+        }
+
+        assert get_fallback_chain(config) == [
+            {"provider": "openai-api", "model": "gpt-5.5"}
+        ]
+
+    def test_json_string_fallback_model_dict_is_parsed_as_legacy_entry(self):
+        config = {
+            "fallback_model": '{"provider":"openrouter","model":"anthropic/claude-sonnet-4"}'
+        }
+
+        assert get_fallback_chain(config) == [
+            {"provider": "openrouter", "model": "anthropic/claude-sonnet-4"}
+        ]
+
+    def test_non_json_string_fallback_is_ignored(self):
+        assert get_fallback_chain({"fallback_providers": "openai-api/gpt-5.5"}) == []
 
 
 class TestResolveEntryApiKey:
