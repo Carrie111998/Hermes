@@ -88,7 +88,7 @@ Config file: `~/.hermes/hindsight/config.json`
 >
 > Restore the broad recall with `"recall_types": "observation,world,experience"` (string or JSON list) in `~/.hermes/hindsight/config.json`. This applies to **both** auto-recall and the `hindsight_recall` tool — both read the same `recall_types` setting (the tool schema has no per-call `types` argument), so narrowing the default narrows both paths.
 
-Both recall paths use the same bounded post-processing step. Exact and narrowly equivalent repetitions are collapsed while distinct supporting details remain. If distinct results exceed `recall_max_results` or `recall_max_tokens`, the rendered output includes an omission notice rather than truncating silently.
+Both recall paths use the same bounded post-processing step. Exact and narrowly equivalent repetitions are collapsed while distinct supporting details remain. If distinct results exceed `recall_max_results`, the rendered output includes an omission notice rather than truncating silently. `recall_max_tokens` remains the generation budget sent to Hindsight; it is not a second rendered-output cap.
 
 ### Retain
 

@@ -69,20 +69,24 @@ def _tags(value: Any) -> tuple[str, ...]:
 
 def normalize_text(text: str) -> str:
     value = unicodedata.normalize("NFKC", text).casefold()
-    value = re.sub(r"[^\w]+", " ", value, flags=re.UNICODE)
-    return " ".join(value.split())
+    value = " ".join(value.split())
+    # Ignore only ordinary sentence-ending punctuation. Generic punctuation
+    # can carry meaning (for example C, C++, and C#) and must remain distinct.
+    return re.sub(r"[.!?]+$", "", value).rstrip()
 
 
 def equivalence_key(text: str) -> str:
     """Return a conservative key for exact text and atomic name statements."""
     normalized = normalize_text(text)
+    identity_text = re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE)
+    identity_text = " ".join(identity_text.split())
     patterns = (
         r"(?:the )?user s name is ([a-z][a-z ]*)",
         r"(?:the )?user is named ([a-z][a-z ]*)",
         r"([a-z]+) is (?:the )?user",
     )
     for pattern in patterns:
-        match = re.fullmatch(pattern, normalized)
+        match = re.fullmatch(pattern, identity_text)
         if match:
             return f"identity:name:{match.group(1).strip()}"
     return f"text:{normalized}"

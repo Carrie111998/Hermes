@@ -38,7 +38,7 @@ def _provider(tmp_path, monkeypatch, **overrides):
     config.update(overrides)
     config_path = tmp_path / "hindsight" / "config.json"
     config_path.parent.mkdir(parents=True, exist_ok=True)
-    config_path.write_text(json.dumps(config))
+    config_path.write_text(json.dumps(config), encoding="utf-8")
     monkeypatch.setattr("plugins.memory.hindsight.get_hermes_home", lambda: tmp_path)
     provider = HindsightMemoryProvider()
     provider.initialize(
@@ -78,6 +78,22 @@ def test_distinct_facts_keep_server_order_without_authority():
     kept = rank_and_deduplicate(rows, max_results=3)
 
     assert [item.text for item in kept] == [row.text for row in rows]
+
+
+def test_punctuation_significant_facts_remain_distinct():
+    rows = [_result("Use C"), _result("Use C++"), _result("Use C#")]
+
+    kept = rank_and_deduplicate(rows, max_results=7)
+
+    assert [item.text for item in kept] == [row.text for row in rows]
+
+
+def test_terminal_sentence_punctuation_still_collapses_exact_repeats():
+    rows = [_result("Use Python"), _result("Use Python.")]
+
+    kept = rank_and_deduplicate(rows, max_results=7)
+
+    assert [item.text for item in kept] == ["Use Python"]
 
 
 def test_configured_authority_ranks_first_then_cap():
