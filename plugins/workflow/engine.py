@@ -4102,55 +4102,96 @@ class WorkflowEngine:
                                                 break
                             elif passed:
                                 print(f"   ✅ {nid} PASSED — enriching {reviewer_for} with review results")
+                                # Resolve post_pass action from the review entry
+                                _post_pass = "accept"
+                                for _rentry in (upstream_node.reviews or []):
+                                    _rev = _rentry if isinstance(_rentry, str) else _rentry.get("review", "")
+                                    if _rev == nid:
+                                        if isinstance(_rentry, dict):
+                                            _post_pass = _rentry.get("post_pass", "accept")
+                                        break
                                 if upstream_state.kanban_card_id:
                                     try:
                                         with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                             kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
-                                            if upstream_state.status != "done":
-                                                # Done-based review flow: the upstream
-                                                # already completed before reviewers
-                                                # dispatched — a PASS ACCEPTS it. Leave
-                                                # it done. Resetting to ready would
-                                                # re-trigger the author and leave the
-                                                # workflow non-terminal (ideation
-                                                # 2026-08-04: spec kept getting reset
-                                                # to ready after each reviewer passed,
-                                                # so cards re-ran under the kanban
-                                                # dispatcher and the run never cleanly
-                                                # completed).
+                                            if _post_pass == "re_dispatch":
+                                                # Implementation-style: reset the upstream
+                                                # to ready so the author re-dispatches to
+                                                # perform the post-PASS action (e.g. pull
+                                                # the QA branch and open the PR).
+                                                conn.execute(
+                                                    "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                                                    (upstream_state.kanban_card_id,)
+                                                )
+                                                kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
+                                            elif upstream_state.status != "done":
+                                                # Ideation-style: accept the upstream and
+                                                # leave it done. A PASS ACCEPTS the work;
+                                                # resetting to ready would re-trigger the
+                                                # author and leave the workflow non-terminal
+                                                # (ideation 2026-08-04: spec kept getting
+                                                # reset to ready after each reviewer passed).
                                                 conn.execute(
                                                     "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
                                                     (int(time.time()), upstream_state.kanban_card_id)
                                                 )
                                                 kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "ready", "new": "done"})
                                             conn.commit()
-                                        if upstream_state.status != "done":
+                                        if _post_pass == "re_dispatch":
+                                            upstream_state.status = "ready"
+                                            upstream_state.completed_at = None
+                                            upstream_state.result = None
+                                            print(f"   ↩  {reviewer_for} re-dispatched for post-pass work (re_dispatch)")
+                                        elif upstream_state.status != "done":
                                             upstream_state.status = "done"
                                             upstream_state.completed_at = datetime.now(timezone.utc).isoformat()
                                             upstream_state.result = None
-                                        print(f"   ↩  {reviewer_for} accepted — review passed")
+                                            print(f"   ↩  {reviewer_for} accepted — review passed")
+                                        else:
+                                            print(f"   ↩  {reviewer_for} accepted — review passed")
                                     except Exception as e:
                                         print(f"   ⚠  Failed to enrich upstream card: {e}")
                             else:
                                 # No verdict marker — default to pass but
                                 # log it so operators notice the ambiguity.
                                 print(f"   ⚠  {nid} completed with NO verdict marker — treating as PASS: {reviewer_body[:80]!r}")
+                                # Resolve post_pass action for the unknown-verdict path
+                                _post_pass = "accept"
+                                for _rentry in (upstream_node.reviews or []):
+                                    _rev = _rentry if isinstance(_rentry, str) else _rentry.get("review", "")
+                                    if _rev == nid:
+                                        if isinstance(_rentry, dict):
+                                            _post_pass = _rentry.get("post_pass", "accept")
+                                        break
                                 if upstream_state.kanban_card_id:
                                     try:
                                         with kanban_db.connect_closing(board=self.kanban_board) as conn:
                                             kanban_db.add_comment(conn, upstream_state.kanban_card_id, "workflow-engine", f"Review Passed ({nid}):\n{reviewer_body}")
-                                            if upstream_state.status != "done":
+                                            if _post_pass == "re_dispatch":
+                                                conn.execute(
+                                                    "UPDATE tasks SET status = 'ready', completed_at = NULL WHERE id = ?",
+                                                    (upstream_state.kanban_card_id,),
+                                                )
+                                                kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "done", "new": "ready"})
+                                            elif upstream_state.status != "done":
                                                 conn.execute(
                                                     "UPDATE tasks SET status = 'done', completed_at = ? WHERE id = ?",
-                                                    (int(time.time()), upstream_state.kanban_card_id)
+                                                    (int(time.time()), upstream_state.kanban_card_id),
                                                 )
                                                 kanban_db._append_event(conn, upstream_state.kanban_card_id, "status", {"old": "ready", "new": "done"})
                                             conn.commit()
-                                        if upstream_state.status != "done":
+                                        if _post_pass == "re_dispatch":
+                                            upstream_state.status = "ready"
+                                            upstream_state.completed_at = None
+                                            upstream_state.result = None
+                                            print(f"   ↩  {reviewer_for} re-dispatched for post-pass work (re_dispatch, no verdict marker)")
+                                        elif upstream_state.status != "done":
                                             upstream_state.status = "done"
                                             upstream_state.completed_at = datetime.now(timezone.utc).isoformat()
                                             upstream_state.result = None
-                                        print(f"   ↩  {reviewer_for} accepted — review passed (no marker)")
+                                            print(f"   ↩  {reviewer_for} accepted — review passed (no marker)")
+                                        else:
+                                            print(f"   ↩  {reviewer_for} accepted — review passed (no marker)")
                                     except Exception as e:
                                         print(f"   ⚠  Failed to enrich upstream card: {e}")
 
@@ -4614,4 +4655,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
