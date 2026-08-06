@@ -51,6 +51,12 @@ def _required_text(value: Any, field: str) -> str:
     return value.strip()
 
 
+def _optional_text(value: Any, field: str) -> Optional[str]:
+    if value is None:
+        return None
+    return _required_text(value, field)
+
+
 def _nonnegative_int(value: Any, field: str) -> int:
     if isinstance(value, bool):
         raise LinearBoundaryError(f"{field} must be a non-negative integer")
@@ -121,6 +127,14 @@ class LinearIssueSnapshot:
     issue_url: str
     source_revision: int
     attachments: Optional[tuple[PullRequestRef, ...]]
+    state: Optional[str] = None
+    state_type: Optional[str] = None
+    labels: tuple[str, ...] = ()
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    project_id: Optional[str] = None
+    project_name: Optional[str] = None
+    observation_id: Optional[str] = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "issue_id", _required_text(self.issue_id, "issue_id"))
@@ -136,6 +150,29 @@ class LinearIssueSnapshot:
             "source_revision",
             _nonnegative_int(self.source_revision, "source_revision"),
         )
+        for field_name in (
+            "state",
+            "state_type",
+            "team_id",
+            "team_name",
+            "project_id",
+            "project_name",
+            "observation_id",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _optional_text(getattr(self, field_name), field_name),
+            )
+        if isinstance(self.labels, (str, bytes, bytearray)):
+            raise LinearBoundaryError("labels must contain strings")
+        try:
+            labels = tuple(
+                sorted({_required_text(label, "label") for label in self.labels})
+            )
+        except TypeError as exc:
+            raise LinearBoundaryError("labels must contain strings") from exc
+        object.__setattr__(self, "labels", labels)
         if self.attachments is not None:
             refs = tuple(sorted(set(self.attachments)))
             if any(not isinstance(ref, PullRequestRef) for ref in refs):
@@ -149,20 +186,43 @@ class LinearIssueSnapshot:
         return self.attachments is not None
 
     def digest(self) -> str:
-        return _canonical_json_sha256(
-            {
-                "issue_id": self.issue_id,
-                "identifier": self.identifier,
-                "title": self.title,
-                "issue_url": self.issue_url,
-                "source_revision": self.source_revision,
-                "attachments_complete": self.attachments_complete,
-                "attachments": [
-                    {"repository": ref.repository, "number": ref.number}
-                    for ref in (self.attachments or ())
-                ],
+        payload: dict[str, Any] = {
+            "issue_id": self.issue_id,
+            "identifier": self.identifier,
+            "title": self.title,
+            "issue_url": self.issue_url,
+            "source_revision": self.source_revision,
+            "attachments_complete": self.attachments_complete,
+            "attachments": [
+                {"repository": ref.repository, "number": ref.number}
+                for ref in (self.attachments or ())
+            ],
+        }
+        # Preserve the exact legacy digest when every MCP extension field is
+        # unset. Existing coordinator rows use that digest for replay
+        # detection, so adding optional normalization metadata must not turn a
+        # previously applied observation into a replay conflict.
+        if any((
+            self.state,
+            self.state_type,
+            self.labels,
+            self.team_id,
+            self.team_name,
+            self.project_id,
+            self.project_name,
+            self.observation_id,
+        )):
+            payload["linear_mcp"] = {
+                "state": self.state,
+                "state_type": self.state_type,
+                "labels": list(self.labels),
+                "team_id": self.team_id,
+                "team_name": self.team_name,
+                "project_id": self.project_id,
+                "project_name": self.project_name,
+                "observation_id": self.observation_id,
             }
-        )
+        return _canonical_json_sha256(payload)
 
 
 @dataclass(frozen=True)

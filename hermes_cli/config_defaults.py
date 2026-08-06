@@ -2347,6 +2347,17 @@ DEFAULT_CONFIG = {
                 },
             },
         },
+        # Read-only Linear OAuth MCP adapter for the normalized Linear
+        # coordinator boundary. It is invoked explicitly by the health CLI or
+        # injected coordinator callers; it never registers event delivery,
+        # webhooks, or a Linear write transport.
+        "linear_mcp": {
+            "mcp_server": "linear",
+            "provider_timeout_seconds": 20,
+            "retry_attempts": 3,
+            "page_size": 50,
+            "max_pages": 10,
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

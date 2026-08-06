@@ -590,6 +590,40 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Emit canonical JSON for script/cron consumption",
     )
 
+    # --- read-only Linear OAuth MCP diagnostic ---
+    p_linear_mcp = sub.add_parser(
+        "linear-mcp",
+        help="Probe the fail-closed read-only Linear OAuth MCP adapter",
+    )
+    p_linear_mcp.add_argument(
+        "linear_mcp_action",
+        nargs="?",
+        choices=("health",),
+        default="health",
+        help="Report configured/connected/discovered/resource authorization gates",
+    )
+    p_linear_mcp.add_argument(
+        "--server",
+        default=None,
+        help="Override kanban.linear_mcp.mcp_server for this read-only probe",
+    )
+    p_linear_mcp.add_argument(
+        "--team",
+        default=None,
+        help="Require one exact team name or key during the authorization probe",
+    )
+    p_linear_mcp.add_argument(
+        "--issue-id",
+        default=None,
+        help="Read one exact Linear issue ID/identifier as the resource probe",
+    )
+    p_linear_mcp.add_argument("--timeout-seconds", type=int, default=None)
+    p_linear_mcp.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit canonical JSON instead of the human-readable health summary",
+    )
+
     p_migration = sub.add_parser(
         "review-migration",
         help="plan/apply exact-head human-review migration (dry-run by default)",
@@ -1128,6 +1162,9 @@ def kanban_command(args: argparse.Namespace) -> int:
         # must run before normal auto-init can mutate an old schema.
         if action == "review-migration":
             return _cmd_review_migration(args)
+        # This remote read-only diagnostic must not create or migrate a board.
+        if action == "linear-mcp":
+            return _cmd_linear_mcp(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -2171,6 +2208,97 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
             for error in payload["errors"]:
                 print(f"  error: {error}", file=sys.stderr)
     return 1 if receipt.status in {"failed", "timed_out"} else 0
+
+
+def _cmd_linear_mcp(args: argparse.Namespace) -> int:
+    """Probe the typed Linear MCP boundary without Kanban or remote writes."""
+    from hermes_cli.config import load_config
+    from hermes_cli import kanban_linear_mcp as linear_mcp
+
+    runtime_config = load_config() or {}
+    kanban_config = runtime_config.get("kanban")
+    kanban_config = kanban_config if isinstance(kanban_config, dict) else {}
+    raw_config = kanban_config.get("linear_mcp")
+    raw_config = dict(raw_config) if isinstance(raw_config, dict) else {}
+    if getattr(args, "server", None) is not None:
+        raw_config["mcp_server"] = args.server
+    if getattr(args, "timeout_seconds", None) is not None:
+        raw_config["provider_timeout_seconds"] = args.timeout_seconds
+    mcp_servers = runtime_config.get("mcp_servers")
+    configured_servers = mcp_servers if isinstance(mcp_servers, dict) else {}
+    try:
+        config = linear_mcp.LinearMCPConfig.from_mapping(raw_config)
+        payload = linear_mcp.diagnose_linear_mcp(
+            config=config,
+            mcp_servers=configured_servers,
+            team_query=getattr(args, "team", None),
+            issue_id=getattr(args, "issue_id", None),
+        )
+    except linear_mcp.LinearMCPReadError as exc:
+        server_name = str(raw_config.get("mcp_server") or "linear").strip()
+        server = configured_servers.get(server_name)
+        oauth_configured = (
+            isinstance(server, dict)
+            and str(server.get("auth") or "").strip().casefold() == "oauth"
+        )
+        payload = {
+            "schema_version": 1,
+            "status": "blocked",
+            "server_name": server_name,
+            "read_only": True,
+            "allowed_read_tools": sorted(linear_mcp.LINEAR_MCP_READ_TOOLS),
+            "registered_read_tool_count": 0,
+            "stages": {
+                "configured": isinstance(server, dict),
+                "connected": False,
+                "discovered": False,
+                "resource_authorized": False,
+                "write_enabled": False,
+            },
+            "oauth_configured": oauth_configured,
+            "webhooks_implemented": False,
+            "oauth_event_delivery": False,
+            "external_side_effects": "none",
+            "requires_gateway_restart": False,
+            "resource": None,
+            "failure": {
+                "kind": exc.kind,
+                "message": str(exc),
+                "retryable": exc.retryable,
+                "attempts": exc.attempts,
+                "stage": exc.stage,
+            },
+        }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+    else:
+        stages = payload["stages"]
+        print(
+            "Linear MCP health: "
+            f"configured={stages['configured']} "
+            f"connected={stages['connected']} "
+            f"discovered={stages['discovered']} "
+            f"resource_authorized={stages['resource_authorized']} "
+            f"write_enabled={stages['write_enabled']}"
+        )
+        print(
+            "Boundary: read_only=True webhooks_implemented=False "
+            "oauth_event_delivery=False"
+        )
+        resource = payload.get("resource")
+        if resource:
+            print(
+                "Resource: "
+                f"team={resource.get('team_id') or resource.get('team_name')} "
+                f"issue={resource.get('issue_id') or 'not-probed'}"
+            )
+        failure = payload.get("failure")
+        if failure:
+            print(
+                f"Failure: {failure['kind']}: {failure['message']}",
+                file=sys.stderr,
+            )
+    return 0 if payload["status"] == "ready" else 1
 
 
 def _cmd_review_migration(args: argparse.Namespace) -> int:
