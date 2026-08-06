@@ -8278,14 +8278,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         cfg = _load_gateway_runtime_config()
         if platform_key:
-            from gateway.display_config import resolve_display_setting
-
-            value = resolve_display_setting(
-                cfg, platform_key, "show_reasoning", fallback=False
+            # Route through the canonical resolver so the picker and the
+            # recap-render path share ONE decision: per-platform override →
+            # global → default, plus the Mattermost platform-only opt-in
+            # guard (#79885). A hand-rolled read here would silently diverge
+            # from the render path's require_platform_override_for.
+            return _resolve_gateway_display_bool(
+                cfg,
+                platform_key,
+                "show_reasoning",
+                default=False,
+                require_platform_override_for={Platform.MATTERMOST},
             )
-            if isinstance(value, str):
-                return value.strip().lower() in {"true", "yes", "1", "on"}
-            return bool(value)
         return is_truthy_value(
             cfg_get(cfg, "display", "show_reasoning"),
             default=False,

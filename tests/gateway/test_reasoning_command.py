@@ -128,6 +128,32 @@ class TestReasoningCommand:
 
 
     @pytest.mark.asyncio
+    async def test_reasoning_picker_mattermost_requires_platform_override(self, tmp_path, monkeypatch):
+        """#79885: Mattermost is platform-only opt-in — a global
+        show_reasoning=true must NOT light up the picker without an explicit
+        display.platforms.mattermost.show_reasoning override, matching the
+        recap-render path's require_platform_override_for guard."""
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "display:\n"
+            "  show_reasoning: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        event = _make_event("/reasoning", platform=Platform.MATTERMOST)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert "**Display:** off" in result, (
+            "global show_reasoning=true must not enable reasoning display "
+            "on Mattermost without a per-platform override"
+        )
+        assert runner._show_reasoning is False
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])
     async def test_handle_reasoning_command_accepts_extended_efforts(
         self, tmp_path, monkeypatch, effort
