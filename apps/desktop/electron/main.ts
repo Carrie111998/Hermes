@@ -159,7 +159,7 @@ import { rehomePrimaryConnection } from './primary-connection-rehome'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import { fetchPrimaryProfileSessions } from './profile-session-routing'
 import { createQuickEntryShortcut, quickEntryWindowBounds, sanitizeQuickEntrySettings } from './quick-entry'
-import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor } from './quit-guard'
+import { type ActiveWork, mergeActiveWork, normalizeActiveWork, quitPromptFor, shouldGuardWindowClose } from './quit-guard'
 import * as remoteLifecycle from './remote-lifecycle'
 import {
   RemoteLivenessTracker,
@@ -9347,7 +9347,59 @@ function createWindow() {
   mainWindow.on('moved', schedulePersistWindowState)
   mainWindow.on('maximize', schedulePersistWindowState)
   mainWindow.on('unmaximize', schedulePersistWindowState)
-  mainWindow.on('close', () => schedulePersistWindowState.flush())
+
+  // On Windows/Linux, closing the last window triggers app.quit() → before-quit,
+  // but by then the renderer's webContents is already destroyed and its entry
+  // has been removed from the active-work map — so the before-quit guard finds
+  // nothing and the app exits silently, killing any turn in flight. Intercept
+  // 'close' instead, while the work data is still live. macOS is excluded: there
+  // closing the primary window is the standard "stay in Dock" gesture.
+  mainWindow.on('close', event => {
+    schedulePersistWindowState.flush()
+
+    if (!shouldGuardWindowClose(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff, IS_MAC)) {
+      return
+    }
+
+    // Reuse the same latch as the before-quit guard so the two paths never
+    // stack dialogs. Once the user confirms, a second close (or the app.quit()
+    // it triggers) falls through.
+    if (SKIP_QUIT_CONFIRM || quitConfirmedWithActiveWork || quitPromptOpen) {
+      return
+    }
+
+    const prompt = quitPromptFor(mergeActiveWork(activeWorkByWebContents.values()), isQuittingForHandoff)
+
+    if (!prompt) {
+      return
+    }
+
+    event.preventDefault()
+    quitPromptOpen = true
+
+    void dialog
+      .showMessageBox(mainWindow!, {
+        buttons: ['Keep Running', 'Quit Anyway'],
+        cancelId: 0,
+        defaultId: 0,
+        detail: prompt.detail,
+        message: prompt.message,
+        type: 'question'
+      })
+      .then(({ response }) => {
+        quitPromptOpen = false
+
+        if (response === 1) {
+          quitConfirmedWithActiveWork = true
+          app.quit()
+        }
+      })
+      .catch(() => {
+        quitPromptOpen = false
+        quitConfirmedWithActiveWork = true
+        app.quit()
+      })
+  })
 
   // the closed wrapper remains truthy, so clear only the window this callback owns.
   const createdMainWindow = mainWindow
