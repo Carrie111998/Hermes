@@ -11,7 +11,7 @@ import asyncio
 import json
 import logging
 from collections import deque
-from typing import Any, Callable, Deque, Dict
+from typing import Any, Callable, Deque, Dict, Optional
 
 import acp
 from acp.schema import AgentPlanUpdate, PlanEntry
@@ -89,15 +89,32 @@ def _send_update(
     session_id: str,
     loop: asyncio.AbstractEventLoop,
     update: Any,
+    *,
+    recovery: Optional[Callable[[], None]] = None,
 ) -> bool:
     """Schedule an ACP update and report whether the loop accepted ownership.
 
     ``True`` means the coroutine was accepted by the event loop, not that it
     already finished. Accepted futures are observed asynchronously and must
-    never be resubmitted: a bounded wait cannot distinguish a slow delivery
-    from a lost one and retrying can duplicate completion updates (#33023).
-    ``False`` is reserved for scheduler rejection, where the coroutine was
-    closed and therefore provably cannot deliver.
+    never be resubmitted directly: a bounded wait cannot distinguish a slow
+    delivery from a lost one and retrying an in-flight future can duplicate
+    completion updates (#33023). ``False`` is reserved for scheduler
+    rejection, where the coroutine was closed and therefore provably cannot
+    deliver.
+
+    ``recovery`` is an optional caller-supplied hook invoked ONLY when the
+    accepted future later fires with an exception (a definitive signal the
+    original attempt could not deliver). The hook is NOT invoked on a
+    successful observed completion (a successful accepted future is canonical
+    — retried would risk double-delivery) or on scheduler rejection (the
+    caller's existing scheduler-rejection retry already covers that case).
+
+    Non-canonical callers (``make_step_cb`` and the thinking/message callbacks)
+    keep the default ``recovery=None`` behavior. The canonical completion path
+    in ``make_tool_complete_cb`` passes a recovery closure that does one bounded
+    retry of the same update and, on retry exhaustion, retains a
+    ``failed_delivery`` marker in ``tool_call_meta`` so later reconciliation
+    can surface the lost completion.
     """
     from agent.async_utils import safe_schedule_threadsafe
 
@@ -121,6 +138,17 @@ def _send_update(
                 type(update).__name__,
                 exc_info=True,
             )
+            if recovery is not None:
+                try:
+                    recovery()
+                except Exception:
+                    logger.debug(
+                        "Recovery hook raised for ACP update "
+                        "(session=%s, update_type=%s)",
+                        session_id,
+                        type(update).__name__,
+                        exc_info=True,
+                    )
 
     future.add_done_callback(_observe_delivery)
     return True
@@ -301,20 +329,97 @@ def make_tool_complete_cb(
     ) -> None:
         meta = tool_call_meta.get(tc_id, {})
         args = function_args if function_args is not None else meta.get("args")
+        snapshot = meta.get("snapshot")
         update = build_tool_complete(
             tc_id,
             tool_name,
             result=str(result) if result is not None else None,
             function_args=args,
-            snapshot=meta.get("snapshot"),
+            snapshot=snapshot,
         )
+
+        # Observed-future-failure recovery hook (adjudicated contract for
+        # #67062 §accepted-future-delivery-gap). The initial _send_update
+        # below passes this closure so that if the loop-owned Future later
+        # fires with an exception (a definitive "this completion did not
+        # deliver" signal), we retry the SAME canonical completion update
+        # exactly once. Retrying with the same update is safe — the result
+        # is immutable and the canonical tc_id already binds it to this
+        # tool call — and ACP clients idempotently accept a re-delivered
+        # completion update keyed on the canonical tc_id.
+        #
+        # The retry's own recovery hook records terminal failure without
+        # scheduling again. Bounded therefore means exactly one retry whether
+        # that retry is rejected immediately or its accepted Future fails
+        # later. In either terminal case, retain a ``failed_delivery`` marker
+        # so heartbeat/session-close reconciliation can surface the loss.
+        #
+        # ``_failed_delivery_marker`` captures a marker written synchronously,
+        # so the post-call cleanup below can preserve it across the canonical
+        # tool_call_meta.pop(). An asynchronous retry failure writes directly
+        # into tool_call_meta after cleanup.
+        _failed_delivery_marker: Optional[Dict[str, Any]] = None
+
+        def _mark_failed_delivery() -> None:
+            nonlocal _failed_delivery_marker
+            marker: Dict[str, Any] = {
+                "failed_delivery": True,
+                "session_id": session_id,
+                "tool_name": tool_name,
+                "tc_id": tc_id,
+            }
+            if result is not None:
+                marker["result"] = str(result)
+            if args is not None:
+                marker["args"] = args
+            if snapshot is not None:
+                marker["snapshot"] = snapshot
+            # Preserve any additional pre-existing meta fields so a
+            # reconciliation pass can replay the completion without
+            # consulting the executor again.
+            prior = tool_call_meta.get(tc_id)
+            if prior:
+                for k, v in prior.items():
+                    marker.setdefault(k, v)
+            # Publish the closure-visible marker before touching shared meta.
+            # Cleanup can race this callback; either it sees this marker and
+            # restores it after pop(), or it finishes first and this callback
+            # inserts the marker below.
+            _failed_delivery_marker = marker
+            current = tool_call_meta.get(tc_id)
+            if current is None:
+                tool_call_meta[tc_id] = dict(marker)
+            else:
+                current.clear()
+                current.update(marker)
+            logger.error(
+                "ACP tool completion permanently undelivered after retry "
+                "(session=%s, tool=%s, tc_id=%s); retained failed_delivery "
+                "marker for follow-up reconciliation.",
+                session_id,
+                tool_name,
+                tc_id,
+            )
+
+        def _recover_canonical_completion() -> None:
+            retry_accepted = _send_update(
+                conn,
+                session_id,
+                loop,
+                update,
+                recovery=_mark_failed_delivery,
+            )
+            if not retry_accepted:
+                _mark_failed_delivery()
 
         # A scheduler rejection proves the first coroutine cannot deliver, so
         # one bounded retry is safe. Once accepted, ownership belongs to the
         # loop and _send_update observes the Future without resubmitting it.
-        accepted = _send_update(conn, session_id, loop, update)
+        accepted = _send_update(
+            conn, session_id, loop, update, recovery=_recover_canonical_completion
+        )
         if not accepted:
-            accepted = _send_update(conn, session_id, loop, update)
+            accepted = _send_update(conn, session_id, loop, update, recovery=None)
 
         if accepted and tool_name == "todo":
             plan_update = _build_plan_update_from_todo_result(result)
@@ -340,7 +445,17 @@ def make_tool_complete_cb(
                 pass
             if not queue:
                 tool_call_ids.pop(tool_name, None)
-        tool_call_meta.pop(tc_id, None)
+        # Canonical cleanup: pop the meta on a normal delivery. If the
+        # recovery hook fired synchronously and wrote a failed_delivery
+        # marker, restore it AFTER the pop so reconciliation can find it.
+        popped = tool_call_meta.pop(tc_id, None)
+        if _failed_delivery_marker is not None:
+            tool_call_meta[tc_id] = (
+                popped if popped is not None else _failed_delivery_marker
+            )
+            if popped is not None and popped is not _failed_delivery_marker:
+                # Recovery overwrote — re-apply the marker so it can't be lost.
+                tool_call_meta[tc_id].update(_failed_delivery_marker)
 
     return _tool_complete
 
