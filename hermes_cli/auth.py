@@ -1369,21 +1369,38 @@ def _load_provider_state_with_source(
 def _provider_state_transaction(
     provider_id: str,
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+    *,
+    expected_source_path: Optional[Path] = None,
 ):
     """Lock the active auth store and any global fallback source in order.
 
-    Profile-backed refresh paths must take the global auth-store lock before
-    any provider-specific shared-store lock. Re-reading the source after the
-    target lock is acquired prevents both stale refreshes and whole-file lost
-    updates without inverting the documented auth -> shared lock order.
+    Profile-backed refresh paths must take the active auth-store lock before
+    any fallback source-store lock. Re-reading the source after the target
+    lock is acquired prevents both stale refreshes and whole-file lost updates
+    without inverting the documented active -> source lock order. A caller
+    that already knows an entry's owner may pin ``expected_source_path`` so a
+    removed or newly shadowed singleton cannot silently change ownership.
     """
     with _auth_store_lock(timeout_seconds=timeout_seconds):
         auth_store = _load_auth_store()
-        state, source_path = _load_provider_state_with_source(
-            auth_store,
-            provider_id,
-        )
         active_path = _auth_file_path()
+        if expected_source_path is not None:
+            source_path = Path(expected_source_path)
+            if _same_path(source_path, active_path):
+                providers = auth_store.get("providers")
+                raw_state = (
+                    providers.get(provider_id)
+                    if isinstance(providers, dict)
+                    else None
+                )
+                state = dict(raw_state) if isinstance(raw_state, dict) else None
+            else:
+                state = None
+        else:
+            state, source_path = _load_provider_state_with_source(
+                auth_store,
+                provider_id,
+            )
         if source_path is None or _same_path(source_path, active_path):
             yield auth_store, state, source_path
             return
