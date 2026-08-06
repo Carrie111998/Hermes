@@ -1,0 +1,5 @@
+name: discord-thread-lifecycle
+description: Change only the lifecycle emoji on Discord thread names.
+events:
+  - agent:start
+  - agent:end

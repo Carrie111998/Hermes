@@ -17536,11 +17536,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "chat_type": getattr(source, "chat_type", "") or "",
                 "session_id": session_entry.session_id,
                 "message": message_text[:500],
+                # Internal adapter handle for trusted in-process hooks. Hooks
+                # must treat this as optional and never serialize it.
+                "adapter": self._adapter_for_source(source),
             }
             await self.hooks.emit("agent:start", hook_ctx)
-            self._schedule_discord_thread_lifecycle_title(
-                source, "⏳ Working", message_text
-            )
 
             # Run the agent. Capture the session id that this run was launched
             # against so post-run compression publication can be identity-guarded
@@ -17564,11 +17564,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 message_type=event.message_type,
             )
             _turn_seconds = time.monotonic() - _turn_started_monotonic
-            self._schedule_discord_thread_lifecycle_title(
-                source,
-                "❌ Failed" if agent_result.get("failed") else "✅ Done",
-                message_text,
-            )
 
             # Stop persistent typing indicator now that the agent is done.
             # Slack AI status is scoped to a thread/workspace, so preserve the
@@ -18184,9 +18179,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return response
             
         except Exception as e:
-            self._schedule_discord_thread_lifecycle_title(
-                source, "❌ Failed", message_text if "message_text" in locals() else "Hermes task"
-            )
+            try:
+                _error_hook_ctx = dict(locals().get("hook_ctx") or {})
+                if _error_hook_ctx:
+                    _error_hook_ctx["failed"] = True
+                    _error_hook_ctx["error"] = str(e)[:500]
+                    await self.hooks.emit("agent:end", _error_hook_ctx)
+            except Exception:
+                pass
             # Stop typing indicator on error too, retaining Slack thread/workspace
             # routing so a failed turn cannot leave its status visible.
             try:
