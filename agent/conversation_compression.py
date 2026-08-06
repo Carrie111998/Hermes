@@ -3534,6 +3534,64 @@ def compress_context(
         except Exception:
             pass
 
+        # Persist durable facts extracted from the compression summary into
+        # the built-in memory store so they survive across sessions.  Only
+        # the LLM-generated summary has a "## Durable Facts" section; static
+        # fallbacks are skipped silently by the extractor.
+        try:
+            _raw_summary = getattr(
+                agent.context_compressor, "_last_raw_summary", None
+            )
+            if _raw_summary:
+                from agent.context_compressor import (
+                    extract_durable_facts_from_summary,
+                )
+                _facts = extract_durable_facts_from_summary(_raw_summary)
+                if _facts:
+                    _store = getattr(agent, "_memory_store", None)
+                    if _store is not None:
+                        from tools.memory_tool import memory_tool
+
+                        _results: list[tuple[str, dict[str, Any]]] = []
+                        _persisted = 0
+                        for _fact in _facts:
+                            _result_json = memory_tool(
+                                action="add",
+                                target="memory",
+                                content=_fact,
+                                store=_store,
+                            )
+                            try:
+                                _result = json.loads(_result_json)
+                            except (json.JSONDecodeError, TypeError):
+                                _result = {}
+                            _results.append((_result_json, _result))
+                            if _result.get("success"):
+                                _persisted += 1
+                        if _persisted:
+                            logger.info(
+                                "persisted %d durable fact(s) from compression "
+                                "summary to memory store (%d skipped)",
+                                _persisted,
+                                len(_facts) - _persisted,
+                            )
+                            # Mirror to external memory providers (Mem0,
+                            # Honcho, etc.) so they see the new facts too.
+                            _manager = getattr(agent, "_memory_manager", None)
+                            if _manager:
+                                for _fact, (_result_json, _) in zip(
+                                    _facts, _results
+                                ):
+                                    _manager.notify_memory_tool_write(
+                                        _result_json,
+                                        {"action": "add", "target": "memory",
+                                         "content": _fact},
+                                    )
+        except Exception as _exc:
+            logger.debug(
+                "durable facts persistence after compression failed: %s", _exc
+            )
+
         logger.info(
             "context compression done: session=%s messages=%d->%d rough_tokens=~%s awaiting_real_usage=true",
             agent.session_id or "none", _pre_msg_count, len(compressed),
