@@ -394,8 +394,8 @@ Optional but valuable:
 After implementing everything, verify with:
 
 ```bash
-# All tests pass
-python -m pytest tests/ -q
+# All tests pass (uses the canonical wrapper for CI-parity verification)
+scripts/run_tests.sh tests/ -q
 
 # Grep for your platform name to find any missed integration points
 grep -r "telegram\|discord\|whatsapp\|slack" gateway/ tools/ agent/ cron/ hermes_cli/ toolsets.py \
