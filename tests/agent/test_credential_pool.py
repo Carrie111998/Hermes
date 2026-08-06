@@ -1352,6 +1352,33 @@ def test_load_pool_seeds_copilot_via_gh_auth_token(tmp_path, monkeypatch):
     assert entries[0].base_url == "https://api.githubcopilot.com"
 
 
+def test_load_pool_prefers_explicit_copilot_api_base_url(tmp_path, monkeypatch):
+    """A configured GHE endpoint must override exchange response metadata."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv(
+        "COPILOT_API_BASE_URL",
+        "https://copilot-api.ghe.example.com/",
+    )
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("ghu_enterprise", "COPILOT_GITHUB_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda token: (
+            "tid=exchanged",
+            "https://api.enterprise.githubcopilot.com",
+        ),
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("copilot")
+
+    assert pool.entries()[0].base_url == "https://copilot-api.ghe.example.com"
+
+
 def test_load_pool_skips_exchange_for_suppressed_copilot(tmp_path, monkeypatch):
     """A suppressed copilot source must NOT run the token exchange.
 

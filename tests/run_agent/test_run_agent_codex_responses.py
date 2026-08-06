@@ -306,6 +306,26 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert "extra_body" not in kwargs
 
 
+def test_exchange_discovered_copilot_endpoint_uses_github_responses(monkeypatch):
+    monkeypatch.delenv("COPILOT_API_BASE_URL", raising=False)
+    agent = _build_copilot_agent(monkeypatch)
+    enterprise_base_url = "https://copilot-api.ghe.example.com"
+    agent.base_url = enterprise_base_url
+    agent._base_url_lower = enterprise_base_url
+    captured = {}
+    transport = agent._get_transport()
+
+    def _capture_build_kwargs(**kwargs):
+        captured.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(transport, "build_kwargs", _capture_build_kwargs)
+
+    agent._build_api_kwargs([{"role": "user", "content": "Ping"}])
+
+    assert captured["is_github_responses"] is True
+
+
 def test_build_api_kwargs_mantle_sets_extended_prompt_cache_retention(monkeypatch):
     _patch_agent_bootstrap(monkeypatch)
     agent = run_agent.AIAgent(
@@ -1116,6 +1136,58 @@ def test_try_refresh_copilot_client_credentials_rebuilds_client(monkeypatch):
     assert rebuilt["kwargs"]["base_url"] == "https://api.githubcopilot.com"
     assert rebuilt["kwargs"]["default_headers"]["Copilot-Integration-Id"] == "vscode-chat"
     assert isinstance(agent.client, _RebuiltClient)
+
+
+def test_try_refresh_copilot_client_preserves_explicit_base_url(monkeypatch):
+    explicit_base_url = "https://copilot-api.ghe.example.com"
+    monkeypatch.setenv("COPILOT_API_BASE_URL", explicit_base_url)
+    agent = _build_copilot_agent(monkeypatch)
+    agent.base_url = explicit_base_url
+    agent._client_kwargs["base_url"] = explicit_base_url
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("ghu_raw", "COPILOT_GITHUB_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
+        lambda _raw: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda _raw: ("tid=fresh", "https://exchange-metadata.example.com"),
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", lambda **kwargs: object())
+
+    assert agent._try_refresh_copilot_client_credentials() is True
+    assert agent.base_url == explicit_base_url
+    assert agent._client_kwargs["base_url"] == explicit_base_url
+
+
+def test_stale_copilot_recovery_preserves_explicit_base_url(monkeypatch):
+    explicit_base_url = "https://copilot-api.ghe.example.com"
+    monkeypatch.setenv("COPILOT_API_BASE_URL", explicit_base_url)
+    agent = _build_copilot_agent(monkeypatch)
+    agent.base_url = explicit_base_url
+    agent._client_kwargs["base_url"] = explicit_base_url
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("ghu_raw", "COPILOT_GITHUB_TOKEN"),
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.evict_cached_exchanged_token",
+        lambda _raw: None,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.get_copilot_api_token",
+        lambda _raw: ("tid=fresh", "https://exchange-metadata.example.com"),
+    )
+    monkeypatch.setattr(run_agent, "OpenAI", lambda **kwargs: object())
+
+    assert agent._try_recover_stale_copilot_credential() is True
+    assert agent.base_url == explicit_base_url
+    assert agent._client_kwargs["base_url"] == explicit_base_url
 
 
 def test_try_refresh_copilot_client_credentials_rebuilds_even_if_token_unchanged(monkeypatch):
@@ -1981,8 +2053,6 @@ def test_duplicate_detection_uses_commentary_when_hidden_reasoning_changes(monke
     reasoning_items = interim_msgs[0].get("codex_reasoning_items")
     if reasoning_items:
         assert reasoning_items[0].get("id") == "rs_second"
-
-
 
 
 

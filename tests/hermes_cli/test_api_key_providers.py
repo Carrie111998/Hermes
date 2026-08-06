@@ -366,6 +366,29 @@ class TestResolveApiKeyProviderCredentials:
         assert _try_gh_cli_token() == "gh-cli-secret"
         assert calls == [["/opt/homebrew/bin/gh", "auth", "token"]]
 
+    def test_try_gh_cli_token_normalizes_enterprise_url_hostname(self, monkeypatch):
+        monkeypatch.setenv("COPILOT_GH_HOST", "https://ghe.example.com/")
+        monkeypatch.setattr(
+            "hermes_cli.copilot_auth._gh_cli_candidates",
+            lambda: ["/usr/bin/gh"],
+        )
+        calls = []
+
+        class _Result:
+            returncode = 0
+            stdout = "gh-cli-secret\n"
+
+        def _fake_run(cmd, **kwargs):
+            calls.append(cmd)
+            return _Result()
+
+        monkeypatch.setattr("hermes_cli.copilot_auth.subprocess.run", _fake_run)
+
+        assert _try_gh_cli_token() == "gh-cli-secret"
+        assert calls == [
+            ["/usr/bin/gh", "auth", "token", "--hostname", "ghe.example.com"]
+        ]
+
 
 
     def test_resolve_stepfun_with_key(self, monkeypatch):
@@ -1213,4 +1236,3 @@ class TestDeepInfraProviderProfile:
         # Fallback list intentionally empty — live catalog is the source
         # of truth. Pin the shape only, not contents.
         assert isinstance(profile.fallback_models, tuple)
-
