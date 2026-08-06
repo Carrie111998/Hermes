@@ -132,25 +132,57 @@ def _drive_connect(monkeypatch, *, proxy_url, fallback_ips=None):
     return list(_RecordingHTTPXRequest.instances)
 
 
+def _limits_of(inst):
+    limits = inst.kwargs.get("httpx_kwargs", {}).get("limits")
+    assert isinstance(limits, httpx.Limits), (
+        "HTTPXRequest must receive httpx_kwargs['limits'] = httpx.Limits "
+        "wired from platform_httpx_limits() (#31599). Missing → PTB falls "
+        "back to default keepalive_expiry=5.0 and leaks CLOSE_WAIT fds."
+    )
+    # Holds for every pool: keepalive must be tighter than httpx's 5.0 default.
+    assert limits.keepalive_expiry is not None
+    assert limits.keepalive_expiry < 5.0, (
+        "keepalive_expiry must be < httpx default 5.0 so idle/CLOSE_WAIT "
+        "sockets drain promptly behind a proxy (#31599)."
+    )
+    # PTB's connection_pool_size (max_connections) must be preserved.
+    assert limits.max_connections is not None and limits.max_connections > 0
+    return limits
+
+
 def _assert_keepalive_tight(instances):
+    """Contract for the *general* request pool.
+
+    Ordinary Bot API calls are short and sporadic, so reusing a connection is
+    a win — the pool just must not sit on idle sockets (#31599).
+    """
     assert instances, "connect() built no HTTPXRequest — test setup is wrong"
-    for inst in instances:
-        limits = inst.kwargs.get("httpx_kwargs", {}).get("limits")
-        assert isinstance(limits, httpx.Limits), (
-            "HTTPXRequest must receive httpx_kwargs['limits'] = httpx.Limits "
-            "wired from platform_httpx_limits() (#31599). Missing → PTB falls "
-            "back to default keepalive_expiry=5.0 and leaks CLOSE_WAIT fds."
-        )
-        # The whole point: keepalive must be tighter than httpx's 5.0 default.
-        assert limits.keepalive_expiry is not None
-        assert limits.keepalive_expiry < 5.0, (
-            "keepalive_expiry must be < httpx default 5.0 so idle/CLOSE_WAIT "
-            "sockets drain promptly behind a proxy (#31599)."
-        )
-        assert limits.max_keepalive_connections is not None
-        assert 1 <= limits.max_keepalive_connections <= 50
-        # PTB's connection_pool_size (max_connections) must be preserved.
-        assert limits.max_connections is not None and limits.max_connections > 0
+    limits = _limits_of(instances[0])
+    assert limits.max_keepalive_connections is not None
+    assert 1 <= limits.max_keepalive_connections <= 50
+
+
+def _assert_updates_pool_never_reuses(instances):
+    """Contract for the getUpdates pool: no connection reuse at all.
+
+    api.telegram.org closes a pooled connection ~39s after it is opened. The
+    long poll runs back-to-back (PTB's poll_interval defaults to 0), so the
+    socket is never idle and keepalive_expiry — which measures *idle* time —
+    never fires. The next getUpdates then goes out over a socket the server
+    already closed and httpx raises a bare ReadError, which the adapter reads
+    as a network fault and answers with a 5s reconnect: a reconnect every
+    ~44s, forever, each costing a 5s window in which no updates arrive.
+
+    Measured against the live endpoint: the connection died at 38.7s and
+    38.9s, matching the adapter's observed 39.3s reconnect period. With
+    max_keepalive_connections=0 the same probe ran 100s with zero errors.
+    """
+    assert len(instances) >= 2, "connect() must build a separate getUpdates pool"
+    limits = _limits_of(instances[1])
+    assert limits.max_keepalive_connections == 0, (
+        "the getUpdates pool must not reuse connections — Telegram closes "
+        "them server-side at ~39s and httpx then writes to a dead socket."
+    )
 
 
 def test_proxy_branch_general_pool_has_tight_keepalive(monkeypatch):
@@ -159,6 +191,7 @@ def test_proxy_branch_general_pool_has_tight_keepalive(monkeypatch):
     # Both the general request pool and the get_updates pool are built here.
     assert len(instances) >= 2
     _assert_keepalive_tight(instances)
+    _assert_updates_pool_never_reuses(instances)
     # Sanity: the proxy was actually threaded through (we're on the proxy branch).
     assert any(inst.kwargs.get("proxy") == "http://127.0.0.1:9/" for inst in instances)
 
@@ -182,6 +215,22 @@ def test_fallback_branch_forwards_tuned_limits_to_inner_transports(monkeypatch):
         assert limits.keepalive_expiry is not None
         assert limits.keepalive_expiry < 5.0
         assert limits.max_connections == 512
+
+    # On this branch the limits live on the transport, not the client, so the
+    # per-pool contracts are asserted here rather than through
+    # _assert_keepalive_tight / _assert_updates_pool_never_reuses (both read
+    # client-level httpx_kwargs["limits"], which this branch deliberately does
+    # not set — httpx would discard it alongside a custom transport).
+    general_limits = instances[0].kwargs["httpx_kwargs"]["transport"]._transport_kwargs["limits"]
+    assert 1 <= general_limits.max_keepalive_connections <= 50, (
+        "ordinary Bot API calls should still reuse connections — only the "
+        "getUpdates pool opts out."
+    )
+    updates_limits = instances[1].kwargs["httpx_kwargs"]["transport"]._transport_kwargs["limits"]
+    assert updates_limits.max_keepalive_connections == 0, (
+        "the getUpdates pool must not reuse connections — Telegram closes "
+        "them server-side at ~39s and httpx then writes to a dead socket."
+    )
 
     for instance in instances:
         asyncio.run(instance.kwargs["httpx_kwargs"]["transport"].aclose())

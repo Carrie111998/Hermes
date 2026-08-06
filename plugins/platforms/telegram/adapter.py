@@ -3823,6 +3823,66 @@ class TelegramAdapter(BasePlatformAdapter):
                     kwargs["limits"] = _pool_limits
                 return kwargs
 
+            def _with_updates_limits(httpx_kwargs: Optional[dict] = None) -> dict:
+                """Limits for the getUpdates pool: never reuse a connection.
+
+                api.telegram.org closes a pooled connection ~39s after it is
+                opened. The long poll runs back-to-back (PTB's poll_interval
+                defaults to 0), so the socket is never idle and
+                ``keepalive_expiry`` — which measures *idle* time — never
+                fires. httpx therefore sends the next getUpdates over a socket
+                the server has already closed and raises a bare
+                ``httpx.ReadError``, which the polling error callback treats as
+                a network fault and answers with a 5s reconnect. That is the
+                ~39s metronome in gateway.log: hundreds of reconnects a day,
+                each costing a 5s window in which no updates are collected.
+
+                Measured against the live endpoint (no bot token, plain GETs
+                on a reused pool): connection died at 38.7s and 38.9s, matching
+                the adapter's 39.3s exactly. With max_keepalive_connections=0
+                the same probe ran 100s with zero errors.
+
+                Cost of the fix is one TLS handshake per poll (~35ms to the
+                IPv6 endpoint, ~150ms to IPv4) every ``timeout`` seconds —
+                cheap next to a 5s blind window every 44s. Only the getUpdates
+                pool opts out; ordinary API calls keep the shared keepalive
+                limits, where reuse is a win and the ~39s lifetime is invisible
+                because those requests are short and sporadic.
+                """
+                kwargs = dict(httpx_kwargs or {})
+                if "limits" not in kwargs:
+                    kwargs["limits"] = _updates_limits()
+                return kwargs
+
+            def _updates_limits():
+                """No-keepalive limits for the getUpdates pool. See above.
+
+                Must be handed to whichever object actually owns the
+                connection pool. When a custom ``transport`` is supplied,
+                httpx builds no transport of its own and the client-level
+                ``limits`` are silently ignored — so the fallback branch below
+                passes these into ``TelegramFallbackTransport`` instead, which
+                forwards **transport_kwargs to the httpx.AsyncHTTPTransport it
+                creates per IP. Passing them only to the client is what made
+                the first attempt at this fix look like it had no effect.
+                """
+                import httpx as _httpx_updates
+
+                # keepalive_expiry is moot while max_keepalive_connections=0 —
+                # nothing is ever kept alive to expire. It is still carried
+                # from the shared tuned limits because #31599's invariant is
+                # that no pool is left on httpx's 5.0 default, and the value
+                # must already be right if the keepalive count is ever raised.
+                _expiry = 2.0
+                if _pool_limits is not None and _pool_limits.keepalive_expiry is not None:
+                    _expiry = _pool_limits.keepalive_expiry
+
+                return _httpx_updates.Limits(
+                    max_connections=request_kwargs["connection_pool_size"],
+                    max_keepalive_connections=0,
+                    keepalive_expiry=_expiry,
+                )
+
             disable_fallback = (os.getenv("HERMES_TELEGRAM_DISABLE_FALLBACK_IPS", "").strip().lower() in {"1", "true", "yes", "on"})
             fallback_ips = self._fallback_ips()
             if not fallback_ips:
@@ -3862,11 +3922,19 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     },
                 )
+                # The getUpdates pool opts out of reuse entirely (see
+                # `_updates_limits`). The custom-transport rule above applies
+                # here too: these limits have to reach TelegramFallbackTransport
+                # itself, so they replace `limits` in a copy of the shared
+                # transport kwargs rather than being passed at the client level,
+                # where httpx would discard them.
+                _updates_transport_kwargs = dict(_transport_kwargs)
+                _updates_transport_kwargs["limits"] = _updates_limits()
                 get_updates_request = HTTPXRequest(
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
-                            fallback_ips, **_transport_kwargs
+                            fallback_ips, **_updates_transport_kwargs
                         )
                     },
                 )
@@ -3876,14 +3944,15 @@ class TelegramAdapter(BasePlatformAdapter):
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
+                    **request_kwargs, proxy=proxy_url,
+                    httpx_kwargs=_with_updates_limits()
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
                 get_updates_request = HTTPXRequest(
-                    **request_kwargs, httpx_kwargs=_with_limits()
+                    **request_kwargs, httpx_kwargs=_with_updates_limits()
                 )
 
             get_updates_request = self._instrument_polling_request(get_updates_request)
