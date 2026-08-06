@@ -984,6 +984,14 @@ for _alias, _canonical in {
     ]
 del _alias, _canonical
 
+# Alibaba Cloud Model Studio "Token Plan" lists the model as
+# deepseek-v4-flash-0731 (a frozen 2026-07-31 snapshot of deepseek-v4-flash).
+# Price it at the base flash rate so a selection through the
+# alibaba-token-plan proxy (which is not a snapshot provider) is billable.
+_OFFICIAL_DOCS_PRICING[("deepseek", "deepseek-v4-flash-0731")] = _OFFICIAL_DOCS_PRICING[
+    ("deepseek", "deepseek-v4-flash")
+]
+
 
 def _to_decimal(value: Any) -> Optional[Decimal]:
     if value is None:

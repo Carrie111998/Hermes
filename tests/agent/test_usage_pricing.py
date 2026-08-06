@@ -407,3 +407,23 @@ def test_known_provider_never_uses_model_name_fallback():
     assert result.status == "estimated"
     assert result.source == "official_docs_snapshot"
     assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_deepseek_v4_flash_0731_alias_prices_as_base_flash():
+    """Alibaba Cloud Model Studio "Token Plan" exposes the frozen 2026-07-31
+    snapshot as ``deepseek-v4-flash-0731``. The alibaba-token-plan provider is
+    a proxy (not a snapshot provider), so the bare-model-name fallback must
+    resolve this version-suffixed ID to the base deepseek-v4-flash entry —
+    otherwise a selection through that provider estimates cost as ``unknown``
+    and the status-bar $ cost stays hidden.
+    """
+    result = estimate_usage_cost(
+        "deepseek-v4-flash-0731",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000),
+        provider="alibaba-token-plan",
+    )
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
+    # 1M input @ $0.14/M + 1M output @ $0.28/M = $0.42, same as base flash.
+    assert result.amount_usd is not None
+    assert float(result.amount_usd) == pytest.approx(0.42, abs=1e-6)
