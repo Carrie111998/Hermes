@@ -6207,7 +6207,7 @@ def resolve_provider_client(
             logger.debug("resolve_provider_client: unknown provider %r", provider)
         return None, None
 
-    if pconfig.auth_type == "api_key":
+    if pconfig.auth_type in ("api_key", "none"):
         if provider == "anthropic":
             client, default_model = _try_anthropic(explicit_api_key=explicit_api_key)
             if client is None:
@@ -6241,13 +6241,16 @@ def resolve_provider_client(
             except Exception:
                 pass
         if not api_key:
-            tried_sources = list(pconfig.api_key_env_vars)
-            if provider == "copilot":
-                tried_sources.append("gh auth token")
-            logger.debug("resolve_provider_client: provider %s has no API "
-                         "key configured (tried: %s)",
-                         provider, ", ".join(tried_sources))
-            return None, None
+            # auth_type="none" providers: build client with api_key=""
+            # so the SDK omits Authorization.
+            if pconfig.auth_type != "none":
+                tried_sources = list(pconfig.api_key_env_vars)
+                if provider == "copilot":
+                    tried_sources.append("gh auth token")
+                logger.debug("resolve_provider_client: provider %s has no API "
+                             "key configured (tried: %s)",
+                             provider, ", ".join(tried_sources))
+                return None, None
 
         base_url = _to_openai_base_url(raw_base_url)
         # Honour an explicit base_url override from the caller — used when a

@@ -1599,7 +1599,7 @@ def _resolve_explicit_runtime(
         )
 
     pconfig = PROVIDER_REGISTRY.get(provider)
-    if pconfig and pconfig.auth_type == "api_key":
+    if pconfig and pconfig.auth_type in ("api_key", "none"):
         env_url = ""
         if pconfig.base_url_env_var:
             env_url = _getenv(pconfig.base_url_env_var, "").strip().rstrip("/")
@@ -2184,9 +2184,9 @@ def resolve_runtime_provider(
             runtime["guardrail_config"] = guardrail_config
         return runtime
 
-    # API-key providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN)
+    # API-key and no-auth providers (z.ai/GLM, Kimi, MiniMax, MiniMax-CN, free tiers)
     pconfig = PROVIDER_REGISTRY.get(provider)
-    if pconfig and pconfig.auth_type == "api_key":
+    if pconfig and pconfig.auth_type in ("api_key", "none"):
         creds = resolve_api_key_provider_credentials(provider)
         # Actual Computer: a loopback base_url configured in model_cfg (not
         # just env) selects the daemon's local offline API, which requires no
@@ -2210,14 +2210,14 @@ def resolve_runtime_provider(
         # resolution so callers surface the missing credential (or consult only
         # an explicitly configured fallback chain). LM Studio's no-auth path
         # supplies a non-empty placeholder in the credential resolver above.
-        if not has_usable_secret(creds.get("api_key")):
-            env_names = ", ".join(pconfig.api_key_env_vars)
-            hint = f" Set {env_names}." if env_names else ""
-            raise AuthError(
-                f"No usable credentials found for provider '{provider}'.{hint}",
-                provider=provider,
-                code="missing_api_key",
-            )
+        if not has_usable_secret(creds.get("api_key")) and pconfig.auth_type != "none":
+                env_names = ", ".join(pconfig.api_key_env_vars)
+                hint = f" Set {env_names}." if env_names else ""
+                raise AuthError(
+                    f"No usable credentials found for provider '{provider}'.{hint}",
+                    provider=provider,
+                    code="missing_api_key",
+                )
         # Honour model.base_url from config.yaml when the configured provider
         # matches this provider — mirrors the Anthropic path above.  Without
         # this, users who set model.base_url to e.g. api.minimaxi.com/anthropic
