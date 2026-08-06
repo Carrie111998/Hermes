@@ -2056,11 +2056,14 @@ def _fetch_kilocode_pricing(
             entry["prompt"] = "0"
             entry["completion"] = "0"
         else:
-            if pricing.get("prompt"):
+            # `is not None` (not truthiness): a custom proxy may report
+            # numeric 0/0.0 pricing, which must surface as "0" rather than
+            # being dropped.
+            if pricing.get("prompt") is not None:
                 entry["prompt"] = str(pricing["prompt"])
-            if pricing.get("completion"):
+            if pricing.get("completion") is not None:
                 entry["completion"] = str(pricing["completion"])
-        if pricing.get("input_cache_read"):
+        if pricing.get("input_cache_read") is not None:
             entry["input_cache_read"] = str(pricing["input_cache_read"])
 
         if entry:
