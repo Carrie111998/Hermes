@@ -1472,19 +1472,27 @@ class PluginManager:
                 # never reach the agent session). Non-enabled platforms stay
                 # deferred so plain `hermes` invocations don't import heavy
                 # platform SDKs they never use.
+                _enabled_set = set(enabled) if enabled is not None else set()
                 _lk = manifest.key or manifest.name
+                _cands = {manifest.name, _lk}
                 _path_key = None
                 try:
                     from pathlib import Path
                     _pp = Path(manifest.path).resolve()
                     _root = Path(get_bundled_plugins_dir()).resolve()
-                    _path_key = str(_pp.relative_to(_root))
-                except Exception:
-                    pass
-                _cands = {manifest.name, _lk}
+                    # as_posix(): canonical keys are forward-slash even on
+                    # Windows (str(relative_to) would yield backslashes there
+                    # and never match user-saved enable keys).
+                    _path_key = _pp.relative_to(_root).as_posix()
+                except (OSError, ValueError):
+                    logger.debug(
+                        "Could not derive path-derived key for plugin %r; "
+                        "falling back to name/key matching only",
+                        _lk,
+                    )
                 if _path_key:
                     _cands.add(_path_key)
-                if enabled is not None and (enabled & _cands):
+                if _enabled_set & _cands:
                     self._load_plugin(manifest)
                 else:
                     self._register_deferred_platform(manifest)
