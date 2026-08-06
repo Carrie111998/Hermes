@@ -1,0 +1,56 @@
+---
+name: fashion-image-generation
+description: "Generate fashion/e-commerce product images via cloud image APIs — recolor ghost mannequins to brand colorways, then fit garments on model references. Manifest-driven batch runs over Google Drive folders. Covers OpenRouter gpt-image models, cost control, idempotency, and Drive upload."
+version: 1.0.0
+author: Hermes Agent
+license: MIT
+platforms: [linux, macos, windows]
+metadata:
+  hermes:
+    tags: [fashion, ecommerce, image-generation, ghost-mannequin, recolor, virtual-try-on, openrouter, google-drive]
+    related_skills: [comfyui, google-workspace, vision]
+---
+
+# Fashion E-commerce Image Generation
+
+Generate catalog/editorial product imagery from a garment's **ghost mannequin** (the product shot on an invisible mannequin) and **color swatches** (flat tint + color name/code). This is a two-step pipeline that any cloud image-generation API (OpenRouter `gpt-image` family, etc.) can drive.
+
+## When to use
+- Recolor a garment photo to a set of brand colorways (swatches).
+- Fit a garment (ghost or recolored) onto a real model reference photo (virtual try-on).
+- Produce a full batch of product variants for a collection, organized per garment and per colorway.
+
+## References & scripts
+- `references/openrouter-image-api.md` — exact OpenRouter image API wire format (endpoint, `input_references`, params, billing).
+- `templates/batch_gen.py` — known-good manifest-driven batch script (STEP A + STEP B, idempotent, cost-logging). Copy and adapt.
+
+## The two-step pipeline
+For each garment, for each colorway N:
+
+**STEP A — recolor ghost mannequin** — inputs: [1] ghost mannequin, [2] color swatch.
+Prompt: *"Recolor this ghost-mannequin garment to the exact solid color shown in the reference swatch (reference 2). Keep the garment shape, fabric texture, knit/fur structure, stitching, zippers, buttons, pockets and labels exactly identical — change only the color. Same lighting, same neutral grey background, invisible/ghost mannequin product photography. Do not add or alter any text or logos."*
+Output → `ghost_<COLOR>.png`
+
+**STEP B — worn on model** — inputs: [1] model reference photo, [2] `ghost_<COLOR>.png`.
+Prompt (ecommerce studio): *"The model from the reference image wearing the garment from the reference image, {POSE}, neutral light grey background, full body shot, professional ecommerce fashion photography, clean studio lighting. Preserve all original garment details exactly as shown: stitching, hardware, zippers, buttons and labels must remain identical to the reference, do not generate any text, logos or writing on buttons, zippers or labels, keep all branding elements blank and anonymous."*
+`{POSE}` ∈ front / 3-4 / back / detail. Editorial (campaign) variants swap the studio scene for a cinematic European-winter street scene.
+Output → `indossato_<POSA>_<COLOR>.png`
+
+## Workflow (end-to-end)
+1. **Enumerate the Drive source** — for each garment folder: identify the ghost mannequin (product photo on flat grey) vs. the color swatches (flat rectangle with a color name+code). Use vision to disambiguate and to map each swatch file → its color code (`NOCCIOLA-302`…). A single `seed` colorway may also come pre-generated.
+2. **Scaffold a manifest** of `{garment: {ghost: path, swatch: {COLOR: path}}}`.
+3. **Do a single paid test** (one STEP A) and show the user before launching the batch — validates ref-image format and quality for ~one image cost.
+4. **Run the batch in background** (STEP A then STEP B per colorway), with cost logging and retries.
+5. **Verify** outputs are valid PNGs for every expected colorway (both ghost + worn), then **upload to Drive** into `_OUTPUT/<COLOR>/` under each garment folder.
+
+## Pitfalls (learned the hard way)
+- **Model photos are required for STEP B** and are NOT stored in the Drive garment folders. If the previous pipeline used provider-hosted media IDs (e.g. Higgsfield `media_id`), those do NOT carry over to a different API — you must obtain the actual model reference JPGs (the user provides a Drive link). Ask for them before promising a full batch.
+- **STEP A and STEP B must each be idempotent**: guard on the existence of the *output* file (`ghost_<C>.png` for A, `indossato_<C>.png` for B), not just the input. A step that only checks its input will re-run (and re-bill) every time on re-execution. See `templates/batch_gen.py`.
+- **Cost scales linearly with image count** — at ~$0.19/img (quality high, 2:3) a 9-colorway × 2-step batch ≈ $3–4. Confirm scope before a large run.
+- **Batch scripts fail silently when gated by a typo in the manifest key** (e.g. filtering on `"A":"ALASKA"` when the dict key is `"ALASKA"`) → the loop body never executes and reports a bogus `$0.00`. Validate the selector against the manifest before running.
+- **Drive folder IDs are copy-sensitive**; a wrong parent ID yields `HttpError 404 File not found` on upload. Re-query the folder ID (`drive search "name='<FOLDER>'"`) rather than trusting a copied listing.
+- When the Google CLI shorthand is a two-token command (`GAPI="python .../google_api.py"`), invoking it as `"$GAPI"` treats the whole string as one executable name. Call it unquoted (`$GAPI ...`) so the shell word-splits correctly.
+- Keep the same model/face across the collection for coherence; use one female model for donna garments and one male for uomo.
+
+## Verification
+After a batch, programmatically confirm every expected `<garment>/ghost_<C>.png` and `<garment>/indossato_<C>.png` exists, is a real PNG (magic bytes) and is above a size floor (e.g. >100KB). Also do a **re-run idempotency check** with a dummy API key — it must skip all steps (no API calls) and leave the file set unchanged. Spot-check 1–2 images with vision for model/garment fidelity and "no text/logo" compliance.
