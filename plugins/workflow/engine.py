@@ -1014,7 +1014,7 @@ class WorkflowEngine:
         """Return (upstream_node, upstream_state) for a reviewer, or None."""
         for up_nid, up_state in states.items():
             up_node = workflow.nodes.get(up_nid)
-            if up_node and rev_id in (up_node.reviews or []):
+            if up_node and self._is_reviewer(up_node.reviews, rev_id):
                 return up_node, up_state
         return None
 
@@ -1141,6 +1141,36 @@ class WorkflowEngine:
             "NEVER block this card. Blocking stalls the workflow; the engine "
             "can only act on completed verdicts.\n"
         )
+
+    def _is_reviewer(self, reviews: list, node_id: str) -> bool:
+        """Check if a node ID appears in a reviews list, handling both
+        string and dict review entries.
+
+        String format: reviews: [qa-verify]
+        Dict format: reviews: [{review: qa-verify, ...}]
+        """
+        for r in (reviews or []):
+            if isinstance(r, str):
+                if r == node_id:
+                    return True
+            elif isinstance(r, dict):
+                if r.get("review") == node_id:
+                    return True
+        return False
+
+    def _get_reviewer_ids(self, reviews: list) -> list[str]:
+        """Extract reviewer node IDs from a reviews list, normalizing
+        both string and dict entries."""
+        ids = []
+        for r in (reviews or []):
+            if isinstance(r, str):
+                ids.append(r)
+            elif isinstance(r, dict):
+                rid = r.get("review", "")
+                if rid:
+                    ids.append(rid)
+        return ids
+
 
     def _classify_review_verdict(self, reviewer_body: str) -> str:
         """Classify a reviewer's completion summary as pass / fail / unknown.
@@ -3023,7 +3053,7 @@ class WorkflowEngine:
                     # Check if this node is a reviewer for an upstream node
                     for upstream_nid, upstream_state in states.items():
                         upstream_node = workflow.nodes.get(upstream_nid)
-                        if upstream_node and nid in upstream_node.reviews:
+                        if upstream_node and self._is_reviewer(upstream_node.reviews, nid):
                             # Reviewer blocked — enrich upstream with failure
                             body = self.get_card_body(state.kanban_card_id)
                             print(f"   ↩ {nid} BLOCKED (reviewer) — enriching {upstream_nid} on resume")
@@ -3117,6 +3147,10 @@ class WorkflowEngine:
                         # creator blocks with "pending review".
                         is_reviewer = any(
                             nid in other_node.reviews
+                            or any(
+                                isinstance(r, dict) and r.get("review") == nid
+                                for r in (other_node.reviews or [])
+                            )
                             for other_nid, other_node in workflow.nodes.items()
                             if other_nid != nid
                         )
@@ -3357,7 +3391,7 @@ class WorkflowEngine:
                 # and inject review context header into the card body.
                 _review_body_prefix = ""
                 for _up_nid, _up_node in workflow.nodes.items():
-                    if _up_nid != nid and nid in (_up_node.reviews or []):
+                    if _up_nid != nid and self._is_reviewer(_up_node.reviews, nid):
                         _up_card = states.get(_up_nid, NodeState(nid)).kanban_card_id or "unknown"
                         _review_body_prefix = (
                             f"You are reviewing the output of node '{_up_nid}' "
@@ -3494,7 +3528,7 @@ class WorkflowEngine:
                 _exhausted_reviewer = False
                 for _up_nid, _up_state in states.items():
                     _up_node = workflow.nodes.get(_up_nid)
-                    if _up_node and nid in (_up_node.reviews or []):
+                    if _up_node and self._is_reviewer(_up_node.reviews, nid):
                         _rounds = _up_state.review_counts.get(nid, 0)
                         _lim = self._review_retry_limit(_up_node, nid, workflow)
                         if _rounds > _lim:
@@ -3908,7 +3942,7 @@ class WorkflowEngine:
                         reviewer_for = None
                         for upstream_nid, upstream_state in states.items():
                             upstream_node = workflow.nodes.get(upstream_nid)
-                            if upstream_node and nid in upstream_node.reviews:
+                            if upstream_node and self._is_reviewer(upstream_node.reviews, nid):
                                 reviewer_for = upstream_nid
                                 break
 
@@ -4346,7 +4380,7 @@ class WorkflowEngine:
                                 reviewer_for = None
                                 for upstream_nid, upstream_state in states.items():
                                     upstream_node = workflow.nodes.get(upstream_nid)
-                                    if upstream_node and nid in upstream_node.reviews:
+                                    if upstream_node and self._is_reviewer(upstream_node.reviews, nid):
                                         reviewer_for = upstream_nid
                                         break
                                 if reviewer_for:
@@ -4427,7 +4461,7 @@ class WorkflowEngine:
                             reviewer_for = None
                             for upstream_nid, upstream_state in states.items():
                                 upstream_node = workflow.nodes.get(upstream_nid)
-                                if upstream_node and nid in upstream_node.reviews:
+                                if upstream_node and self._is_reviewer(upstream_node.reviews, nid):
                                     reviewer_for = upstream_nid
                                     break
 
