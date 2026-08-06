@@ -2395,7 +2395,7 @@ def create_task(
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
     tenant: Optional[str] = None,
-    priority: int = 0,
+    priority: Optional[int] = None,
     parents: Iterable[str] = (),
     triage: bool = False,
     idempotency_key: Optional[str] = None,
@@ -2431,6 +2431,13 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``priority`` defaults to ``None``: when the caller does not specify
+    a priority and the task has parents, the child inherits the highest
+    parent priority (a child must be processed at least as urgently as
+    any parent it gates). With no parents — or parents whose priority is
+    NULL — the schema default 0 applies. An explicit priority always
+    wins; parent priorities are never modified.
     """
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
@@ -2629,6 +2636,33 @@ def create_task(
                         except Exception:
                             branch_name = None
 
+                # Priority inheritance: when the caller left priority
+                # unspecified and the task has parents, inherit the
+                # HIGHEST parent priority — a child that gates a
+                # high-priority parent must itself be picked sooner.
+                # Parents with NULL priority contribute nothing; if all
+                # are NULL (or there are no parents) the schema default
+                # 0 applies. The parents' own priorities are never
+                # modified here.
+                effective_priority = priority
+                if effective_priority is None and parents:
+                    _p_rows = conn.execute(
+                        "SELECT priority FROM tasks WHERE id IN ("
+                        + ",".join("?" * len(parents))
+                        + ")",
+                        parents,
+                    ).fetchall()
+                    effective_priority = max(
+                        (
+                            r["priority"]
+                            for r in _p_rows
+                            if r["priority"] is not None
+                        ),
+                        default=0,
+                    )
+                if effective_priority is None:
+                    effective_priority = 0
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -2645,7 +2679,7 @@ def create_task(
                         body,
                         assignee,
                         task_status,
-                        priority,
+                        effective_priority,
                         created_by,
                         now,
                         workspace_kind,
@@ -5395,6 +5429,12 @@ def decompose_triage_task(
       - The root task is not in ``triage``
       - A cycle would result (caller built a bad graph)
 
+    Children inherit the root task's priority exactly: a root with
+    ``priority=NULL`` yields the schema default 0, a root with a
+    concrete priority propagates that value to every child. The root's
+    own priority is never modified here (only ``status``/``assignee``
+    are touched on the flip to ``todo``).
+
     Validation of titles/assignees happens inside the same write_txn as
     the inserts so a malformed entry aborts the whole decomposition
     cleanly (no orphan children).
@@ -5457,7 +5497,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, priority "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -5496,14 +5536,18 @@ def decompose_triage_task(
                 child_ws_path = None
             conn.execute(
                 "INSERT INTO tasks "
-                "(id, title, body, assignee, status, workspace_kind, "
+                "(id, title, body, assignee, status, priority, workspace_kind, "
                 " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
                     body if isinstance(body, str) else None,
                     assignee,
+                    # Children inherit the root's priority exactly. A
+                    # NULL root priority maps to the schema default 0 —
+                    # NOT a NULL insert, which would bypass the DEFAULT.
+                    root_row["priority"] if root_row["priority"] is not None else 0,
                     child_ws_kind,
                     child_ws_path,
                     tenant,

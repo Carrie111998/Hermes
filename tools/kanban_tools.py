@@ -623,6 +623,24 @@ def _handle_complete(args: dict, **kw) -> str:
                         f"and keep this task alive."
                     )
 
+            # Auto-commit any uncommitted worktree changes before marking done.
+            # This is a safety net for worktree kanban tasks whose worker
+            # forgot to commit (or timed out before committing) — the changes
+            # are already in the worktree on disk but would be invisible to
+            # git history without this guard. Best-effort: if the workspace
+            # is not a git worktree or commit fails, we complete anyway.
+            if task and task.workspace_kind == "worktree" and task.workspace_path:
+                try:
+                    kb._git_auto_commit_worktree(
+                        task.workspace_path, tid,
+                        reason="auto-commit on kanban_complete",
+                    )
+                except Exception:
+                    logger.warning(
+                        "auto-commit failed for worktree task %s", tid,
+                        exc_info=True,
+                    )
+
             try:
                 ok = kb.complete_task(
                     conn, tid,
@@ -1141,7 +1159,7 @@ def _handle_create(args: dict, **kw) -> str:
                 assignee=str(assignee),
                 parents=tuple(parents),
                 tenant=tenant,
-                priority=int(priority) if priority is not None else 0,
+                priority=priority,
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
@@ -1767,7 +1785,9 @@ KANBAN_CREATE_SCHEMA = {
                 "type": "integer",
                 "description": (
                     "Dispatcher tiebreaker. Higher = picked sooner "
-                    "when multiple ready tasks share an assignee."
+                    "when multiple ready tasks share an assignee. "
+                    "Omitted = inherit the highest parent priority "
+                    "when parents are given; otherwise 0."
                 ),
             },
             "workspace_kind": {

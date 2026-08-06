@@ -21,7 +21,8 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
-def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None):
+def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=None,
+                   priority=None):
     return kb.create_task(
         conn,
         title=title,
@@ -29,6 +30,7 @@ def _create_triage(conn, title="rough idea", body=None, assignee=None, tenant=No
         assignee=assignee,
         tenant=tenant,
         triage=True,
+        priority=priority,
     )
 
 
@@ -66,6 +68,53 @@ def test_decompose_creates_children_and_promotes_root(kanban_home):
     # Second child has parents=[0] → stays in todo until c0 completes.
     assert c1.status == "todo"
     assert c1.assignee == "engineer"
+
+
+def test_decompose_children_inherit_root_priority(kanban_home):
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="prioritized idea", priority=7)
+        assert kb.get_task(conn, tid).priority == 7
+
+    children = [
+        {"title": "research", "assignee": "researcher", "parents": []},
+        {"title": "build it", "assignee": "engineer", "parents": [0]},
+    ]
+    with kb.connect() as conn:
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator", children=children,
+        )
+    assert child_ids is not None
+    with kb.connect() as conn:
+        root = kb.get_task(conn, tid)
+        # Every child carries the root's exact priority…
+        for cid in child_ids:
+            assert kb.get_task(conn, cid).priority == 7
+        # …and the root's own priority is untouched by the fan-out.
+        assert root.priority == 7
+
+
+def test_decompose_children_default_zero_when_root_priority_null(kanban_home):
+    # Legacy/edge rows can carry priority=NULL in the DB (only reachable
+    # via raw SQL — create_task normalizes None to 0). The fan-out must
+    # not leak NULL into children: it maps to the schema default 0.
+    with kb.connect() as conn:
+        tid = _create_triage(conn, title="unprioritized idea", priority=5)
+        conn.execute("UPDATE tasks SET priority = NULL WHERE id = ?", (tid,))
+        assert kb.get_task(conn, tid).priority is None
+
+    children = [
+        {"title": "research", "assignee": "researcher", "parents": []},
+    ]
+    with kb.connect() as conn:
+        child_ids = kb.decompose_triage_task(
+            conn, tid, root_assignee="orchestrator", children=children,
+        )
+    assert child_ids is not None
+    with kb.connect() as conn:
+        # NULL root priority must NOT insert NULL children (which would
+        # bypass the schema DEFAULT) — it maps to the default 0.
+        for cid in child_ids:
+            assert kb.get_task(conn, cid).priority == 0
 
 
 def test_decompose_returns_none_when_task_missing(kanban_home):

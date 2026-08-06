@@ -236,6 +236,61 @@ def test_create_task_unknown_parent_errors(kanban_home):
         kb.create_task(conn, title="orphan", parents=["t_ghost"])
 
 
+def test_create_task_child_inherits_parent_priority(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent", priority=7)
+        c = kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, c).priority == 7
+
+
+def test_create_task_child_inherits_highest_parent_priority(kanban_home):
+    with kb.connect() as conn:
+        p1 = kb.create_task(conn, title="low parent", priority=3)
+        p2 = kb.create_task(conn, title="high parent", priority=9)
+        c = kb.create_task(conn, title="child", parents=[p1, p2])
+        assert kb.get_task(conn, c).priority == 9
+
+
+def test_create_task_no_priority_without_parents_defaults_zero(kanban_home):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="standalone")
+        assert kb.get_task(conn, t).priority == 0
+
+
+def test_create_task_null_priority_normalizes_to_zero(kanban_home):
+    # Passing priority=None explicitly is normalized to the schema
+    # default 0 (the old code stored NULL, which the dispatcher treats
+    # like a missing priority anyway).
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="standalone", priority=None)
+        assert kb.get_task(conn, t).priority == 0
+
+
+def test_create_task_child_of_null_priority_parent_yields_zero(kanban_home):
+    # A parent whose DB row carries NULL priority (e.g. legacy rows)
+    # must not leak NULL into the child — the default 0 applies.
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent", priority=3)
+        conn.execute("UPDATE tasks SET priority = NULL WHERE id = ?", (p,))
+        c = kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, p).priority is None
+        assert kb.get_task(conn, c).priority == 0
+
+
+def test_create_task_explicit_priority_wins_over_inheritance(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent", priority=7)
+        c = kb.create_task(conn, title="child", parents=[p], priority=2)
+        assert kb.get_task(conn, c).priority == 2
+
+
+def test_create_task_child_creation_never_modifies_parent_priority(kanban_home):
+    with kb.connect() as conn:
+        p = kb.create_task(conn, title="parent", priority=5)
+        kb.create_task(conn, title="child", parents=[p])
+        assert kb.get_task(conn, p).priority == 5
+
+
 def test_workspace_kind_validation(kanban_home):
     with kb.connect() as conn, pytest.raises(ValueError, match="workspace_kind"):
         kb.create_task(conn, title="bad ws", workspace_kind="cloud")

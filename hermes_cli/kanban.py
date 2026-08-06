@@ -320,7 +320,13 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
-    p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
+    p_create.add_argument(
+        "--priority", type=int, default=None,
+        help=(
+            "Priority tiebreaker (higher = picked sooner). Omitted: inherit "
+            "the highest parent priority when --parent is given, else 0."
+        ),
+    )
     p_create.add_argument("--triage", action="store_true",
                           help="Park in triage — a specifier will flesh out the spec and promote to todo")
     p_create.add_argument("--idempotency-key", default=None,
