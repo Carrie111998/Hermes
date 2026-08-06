@@ -1718,6 +1718,18 @@ CREATE TABLE IF NOT EXISTS reconciliation_findings (
     PRIMARY KEY (run_id, finding_key)
 );
 
+-- One board-local scheduler/gateway lease prevents overlapping shadow/live
+-- reconciliation/outbox passes. Dry-run never touches this table. A crashed
+-- owner can be replaced only after expires_at, while per-intent outbox CAS and
+-- idempotency remain the final double-delivery backstop.
+CREATE TABLE IF NOT EXISTS review_boundary_runner_leases (
+    lease_key                 TEXT PRIMARY KEY,
+    owner_id                  TEXT NOT NULL,
+    acquired_at               INTEGER NOT NULL,
+    heartbeat_at              INTEGER NOT NULL,
+    expires_at                INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1791,6 +1803,8 @@ CREATE INDEX IF NOT EXISTS idx_reconciliation_run_status
     ON reconciliation_runs(status, created_at);
 CREATE INDEX IF NOT EXISTS idx_reconciliation_finding_category
     ON reconciliation_findings(category, severity, repository, pr_number);
+CREATE INDEX IF NOT EXISTS idx_review_boundary_runner_lease_expiry
+    ON review_boundary_runner_leases(expires_at);
 """
 
 

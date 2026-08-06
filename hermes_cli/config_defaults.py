@@ -2309,6 +2309,23 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Script-only exact-head reconciliation/outbox runner. No cron job or
+        # live provider adapter is registered automatically. Dry-run remains
+        # available for deterministic read-only audits; shadow/live require
+        # enabled=true, and gateway invocation has its own opt-in gate.
+        "review_runner": {
+            "enabled": False,
+            "gateway_enabled": False,
+            "mode": "dry-run",
+            "timeout_seconds": 120,
+            "lease_seconds": 180,
+            "max_items_per_run": 50,
+            "retry_ceiling": 3,
+            "providers": {
+                "github": {"enabled": False},
+                "slack": {"enabled": False},
+            },
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.

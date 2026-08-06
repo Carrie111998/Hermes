@@ -220,6 +220,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     """
     kanban_parser = parent_subparsers.add_parser(
         "kanban",
+        allow_abbrev=False,
         help="Multi-profile collaboration board (tasks, links, comments)",
         description=(
             "Durable SQLite-backed task board shared across Hermes profiles. "
@@ -544,6 +545,48 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_diag.add_argument(
         "--json", action="store_true",
         help="Emit JSON (structured) instead of the default human table",
+    )
+
+    # --- exact-head reconciliation/outbox runner ---
+    p_review_runner = sub.add_parser(
+        "review-runner",
+        help=(
+            "Run the bounded script-only reconciliation/outbox boundary "
+            "(dry-run by default)"
+        ),
+    )
+    p_review_runner.add_argument(
+        "runner_action",
+        nargs="?",
+        choices=("run", "health"),
+        default="run",
+        help="Run one bounded pass or report readiness/health",
+    )
+    p_review_runner.add_argument(
+        "--mode",
+        choices=("dry-run", "shadow", "live"),
+        default=None,
+        help="Override kanban.review_runner.mode for this invocation",
+    )
+    p_review_runner.add_argument("--timeout-seconds", type=int, default=None)
+    p_review_runner.add_argument("--lease-seconds", type=int, default=None)
+    p_review_runner.add_argument("--max-items", type=int, default=None)
+    p_review_runner.add_argument("--retry-ceiling", type=int, default=None)
+    p_review_runner.add_argument(
+        "--linear-issue-id",
+        action="append",
+        default=[],
+        help="Restrict reconciliation to one Linear issue ID (repeatable)",
+    )
+    p_review_runner.add_argument(
+        "--quiet",
+        action="store_true",
+        help="Emit no stdout for disabled/lease-held/no-op runs",
+    )
+    p_review_runner.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit canonical JSON for script/cron consumption",
     )
 
     # --- link / unlink ---
@@ -1054,6 +1097,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
+            "review-runner": _cmd_review_runner,
             "link":     _cmd_link,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
@@ -1120,6 +1164,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "assign",
     "reclaim",
     "reassign",
+    "review-runner",
     "link",
     "unlink",
     "claim",
@@ -1991,6 +2036,90 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     print(f"       → {a.label}")
         print()
     return 0
+
+
+def _cmd_review_runner(args: argparse.Namespace) -> int:
+    """Run or diagnose the provider-disabled script-only review boundary."""
+    from hermes_cli.config import load_config
+    from hermes_cli import kanban_review_runner as runner
+
+    runtime_config = load_config() or {}
+    kanban_config = runtime_config.get("kanban", {})
+    kanban_config = kanban_config if isinstance(kanban_config, dict) else {}
+    review_config = runner.ReviewRunnerConfig.from_mapping(
+        kanban_config.get("review_runner")
+    ).with_overrides(
+        mode=getattr(args, "mode", None),
+        timeout_seconds=getattr(args, "timeout_seconds", None),
+        lease_seconds=getattr(args, "lease_seconds", None),
+        max_items=getattr(args, "max_items", None),
+        retry_ceiling=getattr(args, "retry_ceiling", None),
+    )
+
+    with kb.connect_closing() as conn:
+        if getattr(args, "runner_action", "run") == "health":
+            payload = runner.diagnose_review_runner(conn, config=review_config)
+            if getattr(args, "json", False):
+                print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+            else:
+                readiness = payload["readiness"]
+                providers = payload["providers"]
+                outbox = payload["outbox"]
+                gateway = payload["gateway"]
+                print(
+                    "Review runner health: "
+                    f"dry-run={'ready' if readiness['dry_run_ready'] else 'blocked'}, "
+                    f"shadow={'ready' if readiness['shadow_ready'] else 'disabled'}, "
+                    f"live={'ready' if readiness['live_ready'] else 'disabled'}"
+                )
+                print(
+                    "Providers: "
+                    f"github enabled={providers['github']['enabled']} "
+                    f"registered={providers['github']['registered']}; "
+                    f"slack enabled={providers['slack']['enabled']} "
+                    f"registered={providers['slack']['registered']}"
+                )
+                print(
+                    "Outbox: "
+                    f"github_due={outbox['github_due']} "
+                    f"slack_due={outbox['slack_due']} "
+                    f"retry_exhausted="
+                    f"{outbox['github_retry_exhausted'] + outbox['slack_retry_exhausted']}"
+                )
+                print(
+                    "Gateway config reload: "
+                    f"requires_gateway_restart={gateway['requires_gateway_restart']}; "
+                    "code deployment restart command: "
+                    f"{gateway['external_operator_restart_command']}"
+                )
+            return 0
+
+        receipt = runner.run_review_runner(
+            conn,
+            config=review_config,
+            linear_issue_ids=(
+                getattr(args, "linear_issue_id", None) or None
+            ),
+        )
+
+    if getattr(args, "quiet", False) and receipt.quiet_noop:
+        return 0
+    if getattr(args, "json", False):
+        print(receipt.to_json())
+    else:
+        payload = receipt.to_dict()
+        print(
+            f"Review runner {receipt.mode}: {receipt.status}; "
+            f"read_only={receipt.read_only}; "
+            f"findings={receipt.finding_count}; "
+            f"candidates={len(receipt.candidates)}; "
+            f"processed={len(receipt.results)}; "
+            f"skipped={len(receipt.skipped)}"
+        )
+        if payload["errors"]:
+            for error in payload["errors"]:
+                print(f"  error: {error}", file=sys.stderr)
+    return 1 if receipt.status in {"failed", "timed_out"} else 0
 
 
 def _cmd_link(args: argparse.Namespace) -> int:

@@ -475,11 +475,70 @@ class GatewaySlashCommandsMixin:
             break
 
         is_create = action == "create"
+        # Fail closed on the sensitive runner token instead of trusting this
+        # lightweight pre-parser to stay perfectly aligned with argparse. In
+        # particular, an abbreviated global option must not hide the action
+        # from the gateway-only operator gate.
+        is_review_runner = "review-runner" in tokens
+
+        # The existing /kanban command is always registered, but this
+        # scheduler/outbox execution boundary is separately opt-in. Read the
+        # config on each invocation so an operator can enable/disable the gate
+        # without recursive scheduling or a model turn; no live adapter is
+        # registered by this handler.
+        if is_review_runner:
+            try:
+                from hermes_cli.config import load_config
+                from utils import is_truthy_value
+
+                _runtime_config = load_config() or {}
+                _kanban_config = _runtime_config.get("kanban", {})
+                _kanban_config = (
+                    _kanban_config if isinstance(_kanban_config, dict) else {}
+                )
+                _runner_config = _kanban_config.get("review_runner", {})
+                _runner_config = (
+                    _runner_config if isinstance(_runner_config, dict) else {}
+                )
+                gateway_enabled = is_truthy_value(
+                    _runner_config.get("gateway_enabled"), default=False
+                )
+            except Exception:
+                gateway_enabled = False
+            if not gateway_enabled:
+                return (
+                    "Review runner gateway dispatch is disabled. An external "
+                    "operator must set "
+                    "`kanban.review_runner.gateway_enabled: true` first. "
+                    "No cron job, model turn, provider adapter, or notification "
+                    "was started."
+                )
+            policy_options = (
+                "--mode",
+                "--timeout-seconds",
+                "--lease-seconds",
+                "--max-items",
+                "--retry-ceiling",
+            )
+            if any(
+                token == option or token.startswith(option + "=")
+                for token in tokens
+                for option in policy_options
+            ):
+                return (
+                    "Review runner policy overrides are not accepted through "
+                    "the gateway. An external operator must change "
+                    "`kanban.review_runner` in config.yaml. No runner, provider "
+                    "adapter, cron job, or notification was started."
+                )
 
         try:
             output = await asyncio.to_thread(run_slash, text)
         except Exception as exc:  # pragma: no cover - defensive
             return t("gateway.kanban.error_prefix", error=exc)
+
+        if is_review_runner and output == "(no output)":
+            return ""
 
         # Auto-subscribe on create. Parse the task id from the CLI's standard
         # success line ("Created t_abcd  (ready, assignee=...)"). If the user
