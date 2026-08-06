@@ -29,6 +29,7 @@ import os
 import re
 import difflib
 import hashlib
+import sys
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Any, ClassVar
@@ -1188,8 +1189,22 @@ class ShellFileOperations(FileOperations):
                 ),
             )
         
-        # Read a sample to check for binary content
-        sample_cmd = f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null"
+        # Read a sample to check for binary content. Use python instead of a
+        # raw `head -c 1000`: a byte-aligned cut can land mid-way through a
+        # multi-byte UTF-8 char, and the truncated tail decodes (utf-8,
+        # errors="replace") into U+FFFD — which the binary detector treats as
+        # mojibake and wrongly flags legitimate UTF-8 text as binary. Extend
+        # the window to the next char boundary so the sample is always whole
+        # chars; genuinely undecodable bytes still produce U+FFFD and are
+        # caught by _is_likely_binary as before.
+        sample_cmd = (
+            f"{self._escape_shell_arg(sys.executable)} -c \"import sys;"
+            f"d=open(sys.argv[1],'rb').read();"
+            f"n=min(1000,len(d));"
+            f"while n<len(d) and (d[n]&0xC0)==0x80: n+=1;"
+            f"sys.stdout.buffer.write(d[:n])\" "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
         sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         
@@ -1307,7 +1322,15 @@ class ShellFileOperations(FileOperations):
             file_size = 0
         if self._is_image(path):
             return ReadResult(is_image=True, is_binary=True, file_size=file_size)
-        sample_result = self._exec(f"head -c 1000 {self._escape_shell_arg(path)} 2>/dev/null")
+        sample_cmd = (
+            f"{self._escape_shell_arg(sys.executable)} -c \"import sys;"
+            f"d=open(sys.argv[1],'rb').read();"
+            f"n=min(1000,len(d));"
+            f"while n<len(d) and (d[n]&0xC0)==0x80: n+=1;"
+            f"sys.stdout.buffer.write(d[:n])\" "
+            f"{self._escape_shell_arg(path)} 2>/dev/null"
+        )
+        sample_result = self._exec(sample_cmd)
         sample_output = _strip_terminal_fence_leaks(sample_result.stdout)
         if self._is_likely_binary(path, sample_output):
             return ReadResult(

@@ -304,7 +304,7 @@ class TestShellFileOpsHelpers:
             commands.append(command)
             if command.startswith("wc -c"):
                 return {"output": "5\n", "returncode": 0}
-            if command.startswith("head -c"):
+            if "import sys" in command:
                 return {"output": "hello", "returncode": 0}
             if command.startswith("sed -n"):
                 return {"output": "hello\n", "returncode": 0}
@@ -318,7 +318,8 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert "import sys" in commands[1]
+        assert commands[1].endswith("'/c/Users/alice/notes.txt' 2>/dev/null")
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
@@ -673,3 +674,65 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+
+class TestReadUtf8BoundaryCut:
+    """UTF-8 text whose 1000th byte lands mid-character must read as text.
+
+    Regression: the sample was taken with ``head -c 1000``, a byte-aligned cut.
+    When byte 1000 landed inside a multi-byte UTF-8 char, the truncated tail
+    decoded (errors="replace") to U+FFFD, the binary detector saw mojibake and
+    flagged a legitimate UTF-8 file as binary. The fix samples via python and
+    extends the window to the next char boundary.
+    """
+
+    # A 3-byte char exactly straddling byte 1000: 998 ASCII + 中 (E4 B8 AD)
+    # puts the char's tail at index 999-1000, so `head -c 1000` would cut it.
+    def _write_straddling_file(self, tmp_path, name="notes.md"):
+        path = tmp_path / name
+        path.write_bytes(b"a" * 998 + "中".encode("utf-8") + b"b" * 50)
+        return path
+
+    @pytest.fixture()
+    def ops(self, tmp_path):
+        from tools.environments.local import LocalEnvironment
+
+        return ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
+
+    def test_read_file_not_binary_when_boundary_cuts_char(self, tmp_path, ops):
+        path = self._write_straddling_file(tmp_path)
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is False, result.error
+        assert result.error is None
+        assert "中" in result.content
+
+    def test_read_file_raw_not_binary_when_boundary_cuts_char(self, tmp_path, ops):
+        path = self._write_straddling_file(tmp_path)
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.is_binary is False, result.error
+        assert "中" in result.content
+
+    def test_utf8_char_spanning_window_tail_kept_intact(self, tmp_path, ops):
+        """A 4-byte char (emoji) straddling the boundary must not lose bytes."""
+        # 996 ASCII + 1-byte char + 😀 (F0 9F 98 80) spans indices 997-1000.
+        path = tmp_path / "emoji.md"
+        path.write_bytes(b"a" * 996 + b"x" + "😀".encode("utf-8") + b"y" * 50)
+
+        result = ops.read_file_raw(str(path))
+
+        assert result.is_binary is False, result.error
+        assert "😀" in result.content
+
+    def test_real_binary_still_flagged_after_sample_change(self, tmp_path, ops):
+        """The python sampler must not let genuine binary content through."""
+        path = tmp_path / "blob.bin"
+        # 1200 bytes of high-bit garbage + NULs — genuinely binary.
+        path.write_bytes(b"\x00\xff\xfe" * 400)
+
+        result = ops.read_file(str(path))
+
+        assert result.is_binary is True
