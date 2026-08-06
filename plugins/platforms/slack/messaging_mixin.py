@@ -14,6 +14,8 @@ import logging
 import time
 from typing import Any, Dict, Optional
 
+import aiohttp
+
 from gateway.platforms.base import SendResult
 
 logger = logging.getLogger(__name__)
