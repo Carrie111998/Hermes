@@ -586,18 +586,24 @@ class TelegramNotifier(BaseSubscriber):
             return f"{head}\n{prior} → {new}{via}"
 
         if et == EventType.AGENT_ITERATION:
-            # Per-agent run summary (2026-04-30). Lead with agent name +
-            # the human-readable summary line. Counters are compactly
-            # rendered as "k=v · k=v" so the message stays a single
-            # readable line in Telegram even with 5-6 counters.
-            agent = (p.get("agent") or "?").strip()
-            summary = (p.get("summary") or "").strip()
-            counters = p.get("counters") or {}
+            # Per-agent run summary (2026-04-30). When the agent supplies a
+            # structured multi-line ``brief`` (2026-08-06 Critic messaging),
+            # render it verbatim and DO NOT prefix with the agent name or
+            # append the compact ``k=v · k=v`` counter line — the brief is the
+            # human-readable surface and counters remain on the event payload.
             anomalies = p.get("anomalies") or []
-            lines = [f"{agent}: {summary}" if summary else f"{agent}: (no summary)"]
-            if isinstance(counters, dict) and counters:
-                compact = " · ".join(f"{k}={v}" for k, v in counters.items())
-                lines.append(compact)
+            brief = p.get("brief")
+            if isinstance(brief, str) and brief.strip():
+                lines = [brief.strip()]
+            else:
+                # Legacy path: agent name + summary, then compact counters.
+                agent = (p.get("agent") or "?").strip()
+                summary = (p.get("summary") or "").strip()
+                counters = p.get("counters") or {}
+                lines = [f"{agent}: {summary}" if summary else f"{agent}: (no summary)"]
+                if isinstance(counters, dict) and counters:
+                    compact = " · ".join(f"{k}={v}" for k, v in counters.items())
+                    lines.append(compact)
             if isinstance(anomalies, list) and anomalies:
                 # Anomalies are short (we expect 0-3). Take first 3 to
                 # keep the message bounded.

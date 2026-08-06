@@ -60,6 +60,75 @@ def verbosity_config(tmp_path):
     return path
 
 
+NO_WORK_BRIEF = (
+    "── Critic · daily skill review ──\n"
+    "VERDICT: No changes recommended.\n"
+    "\n"
+    "REVIEWED: 20 skills, 7 days of evidence (28,796 audit lines)\n"
+    "TOP REJECTED EVIDENCE:\n"
+    "  orchestrator ×3 → DevFlow actor IDs, not skill use\n"
+    "SCORES MOVED: none\n"
+    "RETIREMENT FLAGS: none\n"
+    "\n"
+    "ACTION NEEDED: none"
+)
+
+
+class TestAgentIterationBriefFormatting:
+    def _notifier(self, bus, topics_config, verbosity_config):
+        return TelegramNotifier(
+            bus, topics_path=topics_config, verbosity_path=verbosity_config,
+        )
+
+    def test_brief_rendered_verbatim_without_counters(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.AGENT_ITERATION, "critic",
+            {
+                "agent": "critic",
+                "summary": "no changes",
+                "brief": NO_WORK_BRIEF,
+                "counters": {"skills_inspected": 20, "audit_lines_scanned": 28796},
+            },
+            priority=Priority.LOW,
+        )
+        body = notifier._format_payload(event)
+        assert body == NO_WORK_BRIEF
+        assert "skills_inspected=20" not in body
+        assert not body.startswith("critic:")
+
+    def test_brief_absent_falls_back_to_legacy(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.AGENT_ITERATION, "critic",
+            {"agent": "critic", "summary": "no changes",
+             "counters": {"skills_inspected": 20}},
+            priority=Priority.LOW,
+        )
+        body = notifier._format_payload(event)
+        assert body.startswith("critic: no changes")
+        assert "skills_inspected=20" in body
+
+    def test_brief_with_anomalies_appends_warning(
+        self, bus, topics_config, verbosity_config,
+    ):
+        notifier = self._notifier(bus, topics_config, verbosity_config)
+        event = Event.create(
+            EventType.AGENT_ITERATION, "critic",
+            {"agent": "critic", "summary": "x", "brief": NO_WORK_BRIEF,
+             "anomalies": [{"kind": "audit_gap", "note": "missing day"}]},
+            priority=Priority.LOW,
+        )
+        body = notifier._format_payload(event)
+        assert body.startswith(NO_WORK_BRIEF)
+        assert "⚠" in body
+        assert "audit_gap" in body
+
+
 class TestTopicRouting:
     def test_all_event_types_have_routing(self):
         # v3: the event→topic table lives in events.routing_policy._POLICY
@@ -771,6 +840,44 @@ class TestLowPriorityBatching:
 
         assert len(sent) == 1
         assert "Batched (2 events)" in sent[0]
+
+    def test_batched_brief_preserves_multiline_body(
+        self, bus, topics_config, verbosity_config,
+    ):
+        sent = []
+        notifier = TelegramNotifier(
+            bus,
+            topics_path=topics_config,
+            verbosity_path=verbosity_config,
+            send_fn=lambda chat_id, thread_id, msg: sent.append(msg),
+        )
+        brief = (
+            "── Critic · daily skill review ──\n"
+            "VERDICT: No changes recommended.\n"
+            "\n"
+            "REVIEWED: 20 skills, 7 days of evidence (28,796 audit lines)\n"
+            "TOP REJECTED EVIDENCE:\n"
+            "  orchestrator ×3 → DevFlow actor IDs, not skill use\n"
+            "SCORES MOVED: none\n"
+            "RETIREMENT FLAGS: none\n"
+            "\n"
+            "ACTION NEEDED: none"
+        )
+        notifier.handle(Event.create(
+            EventType.AGENT_ITERATION,
+            "critic",
+            {"agent": "critic", "summary": "no changes", "brief": brief},
+            priority=Priority.LOW,
+        ))
+        assert sent == []  # TRACE/LOW event is buffered
+
+        notifier._flush_stale_batches(max_age=0)
+
+        assert len(sent) == 1
+        assert "Batched (1 events)" in sent[0]
+        assert brief in sent[0]
+        assert "VERDICT: No changes recommended.\n\nREVIEWED: 20 skills" in sent[0]
+        assert "RETIREMENT FLAGS: none\n\nACTION NEEDED: none" in sent[0]
 
     def test_batch_flush_emits_synthetic_delivered_event(
         self, bus, topics_config, verbosity_config,
