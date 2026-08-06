@@ -657,11 +657,9 @@ class CredentialPool:
         self._entries = sorted(entries, key=lambda entry: entry.priority)
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
-        # RLock: the mutation primitives below (_replace_entry/_persist)
-        # self-acquire this lock so the DEFERRED single-use-token refresh
-        # path (which runs network I/O outside the lock by design) still
-        # serializes its pool mutations. In-lock callers re-acquire
-        # reentrantly at negligible cost.
+        # RLock: mutation primitives self-acquire this lock so refresh and
+        # status-sync work performed outside the lock still serializes its
+        # in-memory updates. Persistence is always drained after releasing it.
         self._lock = threading.RLock()
         self._persist_lock = threading.Lock()
         # Persist only entries changed by this pool instance. Borrowed rows are
@@ -805,6 +803,7 @@ class CredentialPool:
         # otherwise a status probe here can race a concurrent ``select`` /
         # rotation and tear ``self._entries`` or double-write auth.json.
         failed_source_ids = self._validate_source_owned_codex_entries()
+        self._sync_external_status_entries()
         with self._lock:
             available, _pending = self._available_entries(
                 excluded_source_ids=failed_source_ids,
@@ -829,6 +828,7 @@ class CredentialPool:
         ``_available_entries`` caller (see the comment on ``has_available``).
         """
         failed_source_ids = self._validate_source_owned_codex_entries()
+        self._sync_external_status_entries()
         with self._lock:
             available, _pending = self._available_entries(
                 excluded_source_ids=failed_source_ids,
@@ -996,6 +996,11 @@ class CredentialPool:
         removed_ids: Optional[List[str]] = None,
         removed_entries: Optional[List[PooledCredential]] = None,
     ) -> None:
+        is_owned = getattr(self._lock, "_is_owned", None)
+        if callable(is_owned) and is_owned():
+            raise RuntimeError(
+                "credential pool persistence cannot run while the pool lock is held"
+            )
         # Auth transactions and file writes deliberately happen without the
         # pool lock. Source refresh takes auth locks first and then replaces an
         # in-memory row; holding the pool lock here would invert that order.
@@ -1194,7 +1199,12 @@ class CredentialPool:
             self._persist()
         return replaced
 
-    def _sync_anthropic_entry_from_credentials_file(self, entry: PooledCredential) -> PooledCredential:
+    def _sync_anthropic_entry_from_credentials_file(
+        self,
+        entry: PooledCredential,
+        *,
+        persist: bool = True,
+    ) -> PooledCredential:
         """Sync a claude_code pool entry from ~/.claude/.credentials.json if tokens differ.
 
         OAuth refresh tokens are single-use. When something external (e.g.
@@ -1240,7 +1250,8 @@ class CredentialPool:
                     last_error_reset_at=None,
                 )
                 self._replace_entry(entry, updated)
-                self._persist()
+                if persist:
+                    self._persist_pending_changes()
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync from credentials file: %s", exc)
@@ -1853,7 +1864,12 @@ class CredentialPool:
             logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
             return entry
 
-    def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
+    def _sync_xai_oauth_entry_from_auth_store(
+        self,
+        entry: PooledCredential,
+        *,
+        persist: bool = True,
+    ) -> PooledCredential:
         """Sync an xAI OAuth pool entry from auth.json if tokens differ.
 
         xAI OAuth refresh tokens are single-use.  When another Hermes process
@@ -1905,7 +1921,8 @@ class CredentialPool:
                     field_updates["last_refresh"] = state["last_refresh"]
                 updated = replace(entry, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist()
+                if persist:
+                    self._persist_pending_changes()
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync xAI OAuth entry from auth.json: %s", exc)
@@ -1950,7 +1967,12 @@ class CredentialPool:
             logger.debug("Failed to sync xAI OAuth entry from credential pool: %s", exc)
         return entry
 
-    def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
+    def _sync_nous_entry_from_auth_store(
+        self,
+        entry: PooledCredential,
+        *,
+        persist: bool = True,
+    ) -> PooledCredential:
         """Sync a Nous pool entry from auth.json if tokens differ.
 
         Nous OAuth refresh tokens are single-use.  When another process
@@ -2016,7 +2038,8 @@ class CredentialPool:
                         extra_updates[extra_key] = val
                 updated = replace(entry, extra=extra_updates, **field_updates)
                 self._replace_entry(entry, updated)
-                self._persist()
+                if persist:
+                    self._persist_pending_changes()
                 return updated
         except Exception as exc:
             logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
@@ -2508,7 +2531,7 @@ class CredentialPool:
                         ]
                         if self._current_id == entry.id:
                             self._current_id = None
-                        self._persist(removed_ids=removed_ids)
+                    self._persist(removed_ids=removed_ids)
                     return None
             # For openai-codex: same race as xAI/nous — another Hermes process
             # may have consumed the refresh token between our proactive sync
@@ -2727,7 +2750,7 @@ class CredentialPool:
                         ]
                         if self._current_id == entry.id:
                             self._current_id = None
-                        self._persist(removed_ids=removed_ids)
+                    self._persist(removed_ids=removed_ids)
                     return None
             if self.provider == "openai-codex" and codex_source_path is not None:
                 exhausted = self._mark_exhausted(entry, None, persist=False)
@@ -2827,8 +2850,57 @@ class CredentialPool:
             return False
         return False
 
+    def _sync_external_status_entries(self, *, probe_quota: bool = False) -> None:
+        """Refresh external status sources without holding the pool lock."""
+        with self._lock:
+            status_entries = [
+                entry
+                for entry in self._entries
+                if entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}
+            ]
+
+        for entry in status_entries:
+            if self.provider == "anthropic" and entry.source == "claude_code":
+                self._sync_anthropic_entry_from_credentials_file(
+                    entry,
+                    persist=False,
+                )
+            elif self.provider == "nous" and entry.source == "device_code":
+                self._sync_nous_entry_from_auth_store(entry, persist=False)
+            elif (
+                self.provider == "openai-codex"
+                and entry.source == "device_code"
+                and entry.source_store_path is None
+            ):
+                self._sync_codex_entry_from_auth_store(entry)
+            elif self.provider == "xai-oauth" and entry.source == "device_code":
+                self._sync_xai_oauth_entry_from_auth_store(entry, persist=False)
+
+        if not probe_quota:
+            return
+        with self._lock:
+            quota_entries = [
+                entry
+                for entry in self._entries
+                if entry.last_status == STATUS_EXHAUSTED
+            ]
+        for entry in quota_entries:
+            if not self._codex_quota_restored_upstream(entry):
+                continue
+            cleared = replace(
+                entry,
+                last_status=STATUS_OK,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            self._replace_entry(entry, cleared)
+
     def select(self) -> Optional[PooledCredential]:
         failed_source_ids = self._validate_source_owned_codex_entries()
+        self._sync_external_status_entries(probe_quota=True)
         entry, pending_refresh = self._select_under_lock(failed_source_ids)
         self._persist_pending_changes()
         if pending_refresh:
@@ -2840,6 +2912,7 @@ class CredentialPool:
         # now that the refreshed entries are back in the pool.
         if pending_refresh:
             failed_source_ids = self._validate_source_owned_codex_entries()
+            self._sync_external_status_entries(probe_quota=True)
             entry, _ = self._select_under_lock(failed_source_ids)
             self._persist_pending_changes()
             if entry is not None:
@@ -2857,13 +2930,13 @@ class CredentialPool:
             )
 
     def _refresh_pending_entries(self, pending: List[tuple]) -> None:
-        """Refresh deferred single-use-token entries outside the lock.
+        """Refresh deferred OAuth entries outside the lock.
 
         Each entry is refreshed under the cross-process ``_auth_store_lock``
         (which can block for 20+ seconds) and then merged into the pool.
         On failure the entry is silently skipped.
         """
-        for entry, sync_fn in pending:
+        for entry, _sync_fn in pending:
             # _refresh_entry merges the refreshed entry into the pool
             # internally. Its mutation primitives (_replace_entry, _persist)
             # are self-locking, and the quarantine paths inside
@@ -2882,22 +2955,15 @@ class CredentialPool:
         """Return (available, pending_refresh) for entries not in cooldown.
 
         When *clear_expired* is True, entries whose cooldown has elapsed are
-        reset to STATUS_OK and persisted.  When *refresh* is True, entries
-        that need a token refresh are refreshed (skipped on failure).
-
-        Single-use-token refreshes (openai-codex, xai-oauth) are returned as
-        *pending_refresh* tuples so the caller can execute them outside the
-        lock, avoiding stalling all pool consumers during cross-process flock
-        acquisition + OAuth network I/O.
+        reset to STATUS_OK and persisted. When *refresh* is True, entries that
+        need a token refresh are returned to the caller for refresh after the
+        lock is released.
         """
         now = time.time()
-        cleared_any = False
         entries_to_prune: List[str] = []
         available: List[PooledCredential] = []
-        # Entries that need an OAuth refresh via a single-use token provider
-        # (openai-codex, xai-oauth).  These require a cross-process file lock
-        # that can block for 20+ seconds.  We collect them under self._lock
-        # and refresh outside the lock to avoid stalling all pool consumers.
+        # Refresh can perform network and auth-store I/O for every OAuth
+        # provider, so collect candidates here and execute them after unlock.
         pending_refresh: List[tuple] = []  # (entry, sync_entry_fn)
         # DEAD entries never re-enter rotation, so if at most one non-DEAD entry
         # exists there is nothing to rotate to: an exhausted sole credential
@@ -2913,50 +2979,6 @@ class CredentialPool:
             # can remain unhydrated; never lease or select it as an empty key.
             if entry.auth_type == AUTH_TYPE_API_KEY and not entry.runtime_api_key:
                 continue
-            # For anthropic claude_code entries, sync from the credentials file
-            # before any status/refresh checks. This picks up tokens refreshed
-            # by other processes (Claude Code CLI, other Hermes profiles).
-            if (self.provider == "anthropic" and entry.source == "claude_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_anthropic_entry_from_credentials_file(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
-            # For nous entries, sync from auth.json before status checks.
-            # Another process may have successfully refreshed via
-            # resolve_nous_runtime_credentials(), making this entry's
-            # exhausted status stale.
-            if (self.provider == "nous"
-                    and entry.source == "device_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_nous_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
-            # For openai-codex entries, same pattern: the user may have
-            # re-authed via `hermes model` / `hermes auth` after a 429/401,
-            # leaving fresh tokens on disk while the pool entry is still
-            # frozen behind last_error_reset_at (can be hours in the
-            # future for ChatGPT weekly windows).
-            if (self.provider == "openai-codex"
-                    and entry.source == "device_code"
-                    and entry.source_store_path is None
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_codex_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
-            # For xai-oauth singleton-seeded entries, identical pattern:
-            # an entry frozen as exhausted may simply be holding stale
-            # tokens that another process (or a fresh `hermes model` ->
-            # xAI Grok OAuth login) has since rotated in auth.json.
-            if (self.provider == "xai-oauth"
-                    and entry.source == "device_code"
-                    and entry.last_status in {STATUS_EXHAUSTED, STATUS_DEAD}):
-                synced = self._sync_xai_oauth_entry_from_auth_store(entry)
-                if synced is not entry:
-                    entry = synced
-                    cleared_any = True
             if entry.last_status == STATUS_DEAD:
                 # Manual DEAD credentials get pruned after a 24h quiet window
                 # so the pool doesn't accumulate dead entries forever.  The
@@ -2980,7 +3002,6 @@ class CredentialPool:
                         # Mark for removal after the loop completes; we can't
                         # mutate self._entries while iterating.
                         entries_to_prune.append(entry.id)
-                        cleared_any = True
                 # Permanently failed credentials never re-enter rotation via
                 # TTL.  They only clear when a write-side re-auth sync rewrites
                 # the tokens (e.g. ``_save_codex_tokens`` after a fresh
@@ -2990,18 +3011,7 @@ class CredentialPool:
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry, sole_credential=sole_credential)
                 if exhausted_until is not None and now < exhausted_until:
-                    # Codex quota windows can reopen EARLY: the user redeems a
-                    # banked rate-limit reset (Codex CLI / ChatGPT UI), upgrades
-                    # their plan, or OpenAI resets the window.  The persisted
-                    # ``last_error_reset_at`` can then be days in the future
-                    # while the account is already usable again — a throttled
-                    # live probe of the Codex usage endpoint detects that and
-                    # lifts the stale cooldown (issue #43747).
-                    if not (
-                        clear_expired
-                        and self._codex_quota_restored_upstream(entry)
-                    ):
-                        continue
+                    continue
                 if clear_expired:
                     cleared = replace(
                         entry,
@@ -3014,22 +3024,9 @@ class CredentialPool:
                     )
                     self._replace_entry(entry, cleared)
                     entry = cleared
-                    cleared_any = True
             if refresh and self._entry_needs_refresh(entry):
-                if self.provider in ("openai-codex", "xai-oauth"):
-                    # Defer single-use-token refresh to avoid holding the
-                    # threading lock during cross-process flock + network I/O.
-                    sync_fn = (
-                        self._sync_codex_entry_from_auth_store
-                        if self.provider == "openai-codex"
-                        else self._sync_xai_oauth_entry_from_pool_store
-                    )
-                    pending_refresh.append((entry, sync_fn))
-                    continue
-                refreshed = self._refresh_entry(entry, force=False)
-                if refreshed is None:
-                    continue
-                entry = refreshed
+                pending_refresh.append((entry, None))
+                continue
             available.append(entry)
         if entries_to_prune:
             pruned_ids = set(entries_to_prune)
@@ -3140,6 +3137,7 @@ class CredentialPool:
         # Single lock acquisition for the whole read; call the unlocked
         # helpers so we don't re-enter the non-reentrant ``self._lock``.
         failed_source_ids = self._validate_source_owned_codex_entries()
+        self._sync_external_status_entries()
         with self._lock:
             available, _pending = self._available_entries(
                 excluded_source_ids=failed_source_ids,
@@ -3167,6 +3165,7 @@ class CredentialPool:
         failure_reason: Optional[str] = None,
     ) -> Optional[PooledCredential]:
         failed_source_ids = self._validate_source_owned_codex_entries()
+        self._sync_external_status_entries(probe_quota=True)
         try:
             return self._mark_exhausted_and_rotate_locked(
                 status_code=status_code,
@@ -3364,6 +3363,7 @@ class CredentialPool:
         """
         entry_ids = {credential_id} if credential_id is not None else None
         failed_source_ids = self._validate_source_owned_codex_entries(entry_ids)
+        self._sync_external_status_entries(probe_quota=True)
         if failed_source_ids:
             chosen_id, pending_refresh = self._acquire_lease_under_lock(
                 credential_id,
@@ -3386,6 +3386,7 @@ class CredentialPool:
                 failed_source_ids = self._validate_source_owned_codex_entries(
                     entry_ids,
                 )
+                self._sync_external_status_entries(probe_quota=True)
                 if failed_source_ids:
                     chosen_id, _ = self._acquire_lease_under_lock(
                         credential_id,
@@ -3484,44 +3485,47 @@ class CredentialPool:
         rotating refresh token exactly once.
         """
         failed_source_ids = self._validate_source_owned_codex_entries()
-        with self._lock:
-            if credential_id and credential_id in failed_source_ids:
-                if self._current_id == credential_id:
-                    self._current_id = None
-                return None
-            entry = None
-            if credential_id and credential_id not in failed_source_ids:
-                entry = next(
-                    (
-                        candidate
-                        for candidate in self._entries
-                        if candidate.id == credential_id
-                    ),
-                    None,
-                )
-            if entry is None:
-                if api_key_hint:
+        self._sync_external_status_entries(probe_quota=True)
+        try:
+            with self._lock:
+                if credential_id and credential_id in failed_source_ids:
+                    if self._current_id == credential_id:
+                        self._current_id = None
+                    return None
+                entry = None
+                if credential_id and credential_id not in failed_source_ids:
                     entry = next(
                         (
                             candidate
                             for candidate in self._entries
-                            if candidate.id not in failed_source_ids
-                            and candidate.runtime_api_key == api_key_hint
+                            if candidate.id == credential_id
                         ),
                         None,
                     )
-                else:
-                    current = self._current_unlocked()
-                    if current is not None and current.id in failed_source_ids:
-                        current = None
-                    entry = current or self._select_unlocked(
-                        refresh=False,
-                        excluded_source_ids=failed_source_ids,
-                    )[0]
-            if entry is None:
-                return None
-            self._current_id = entry.id
-        self._persist_pending_changes()
+                if entry is None:
+                    if api_key_hint:
+                        entry = next(
+                            (
+                                candidate
+                                for candidate in self._entries
+                                if candidate.id not in failed_source_ids
+                                and candidate.runtime_api_key == api_key_hint
+                            ),
+                            None,
+                        )
+                    else:
+                        current = self._current_unlocked()
+                        if current is not None and current.id in failed_source_ids:
+                            current = None
+                        entry = current or self._select_unlocked(
+                            refresh=False,
+                            excluded_source_ids=failed_source_ids,
+                        )[0]
+                if entry is None:
+                    return None
+                self._current_id = entry.id
+        finally:
+            self._persist_pending_changes()
         refreshed = self._refresh_entry(entry, force=True)
         if refreshed is not None:
             with self._lock:

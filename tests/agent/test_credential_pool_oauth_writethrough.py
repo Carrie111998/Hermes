@@ -1832,6 +1832,323 @@ def test_removal_persistence_converges_after_same_id_readd(
     assert len(writes) == 2
 
 
+def _pool_lock_owned_by_current_thread(pool):
+    is_owned = getattr(pool._lock, "_is_owned", None)
+    return bool(is_owned and is_owned())
+
+
+def _anthropic_pool_for_lock_order_test(tmp_path, monkeypatch):
+    auth_path = tmp_path / "profile" / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: auth_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    entry = PooledCredential(
+        provider="anthropic",
+        id="claude-entry",
+        label="Claude entry",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="claude_code",
+        access_token="stale-access",
+        refresh_token="stale-refresh",
+        expires_at_ms=9_999_999_999_999,
+        last_status="exhausted",
+        last_status_at=1.0,
+        last_error_code=429,
+        last_error_reason="rate_limit",
+    )
+    _write_store(
+        auth_path,
+        {
+            "version": 1,
+            "credential_pool": {"anthropic": [entry.to_dict()]},
+        },
+    )
+    return auth_path, CredentialPool("anthropic", [entry])
+
+
+def test_anthropic_status_sync_cannot_deadlock_with_concurrent_persistence(
+    tmp_path, monkeypatch
+):
+    """A real provider status sync must not oppose the persistence lock."""
+    from agent import anthropic_adapter
+
+    auth_path, pool = _anthropic_pool_for_lock_order_test(tmp_path, monkeypatch)
+    original = pool.entries()[0]
+    pool._replace_entry(original, replace(original, request_count=1))
+
+    status_sync_entered = threading.Event()
+    persist_lock_acquired = threading.Event()
+    raw_persist_lock = threading.Lock()
+    errors = []
+
+    class SignalingPersistLock:
+        def __enter__(self):
+            raw_persist_lock.acquire()
+            persist_lock_acquired.set()
+            return self
+
+        def __exit__(self, *_exc_info):
+            raw_persist_lock.release()
+
+    pool.__dict__["_persist_lock"] = SignalingPersistLock()
+
+    def controlled_credentials_read():
+        status_sync_entered.set()
+        assert persist_lock_acquired.wait(timeout=5)
+        return {
+            "accessToken": "fresh-access",
+            "refreshToken": "fresh-refresh",
+            "expiresAt": 9_999_999_999_999,
+        }
+
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "read_claude_code_credentials",
+        controlled_credentials_read,
+    )
+
+    def status_worker():
+        try:
+            assert pool.has_available() is True
+        except BaseException as exc:
+            errors.append(("status", exc))
+
+    def persistence_worker():
+        try:
+            assert status_sync_entered.wait(timeout=5)
+            pool._persist()
+        except BaseException as exc:
+            errors.append(("persistence", exc))
+
+    status_thread = threading.Thread(target=status_worker, daemon=True)
+    persistence_thread = threading.Thread(target=persistence_worker, daemon=True)
+    status_thread.start()
+    persistence_thread.start()
+    assert status_sync_entered.wait(timeout=5)
+    assert persist_lock_acquired.wait(timeout=5)
+    status_thread.join(timeout=0.5)
+    persistence_thread.join(timeout=0.5)
+
+    deadlock_reproduced = status_thread.is_alive() and persistence_thread.is_alive()
+    if status_thread.is_alive() or persistence_thread.is_alive():
+        if raw_persist_lock.locked():
+            raw_persist_lock.release()
+        status_thread.join(timeout=5)
+        persistence_thread.join(timeout=5)
+
+    assert not deadlock_reproduced, (
+        f"status_thread_alive={status_thread.is_alive()} "
+        f"persistence_thread_alive={persistence_thread.is_alive()}"
+    )
+    assert not status_thread.is_alive()
+    assert not persistence_thread.is_alive()
+    assert errors == []
+    memory = pool.entries()[0]
+    disk = _read_store(auth_path)["credential_pool"]["anthropic"][0]
+    assert memory.access_token == "fresh-access"
+    assert memory.refresh_token == "fresh-refresh"
+    assert memory.last_status is None
+    assert disk["last_status"] is None
+    assert disk["request_count"] == 1
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "has_available",
+        "next_available_at",
+        "peek",
+        "select",
+        "lease",
+        "rotation",
+        "refresh",
+        "status",
+    ],
+)
+def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
+    tmp_path, monkeypatch, operation
+):
+    from agent import anthropic_adapter
+
+    auth_path, pool = _anthropic_pool_for_lock_order_test(tmp_path, monkeypatch)
+    io_lock_states = []
+    real_write = CP.write_credential_pool
+
+    def fresh_credentials():
+        io_lock_states.append(("credentials_read", _pool_lock_owned_by_current_thread(pool)))
+        return {
+            "accessToken": "fresh-access",
+            "refreshToken": "fresh-refresh",
+            "expiresAt": 9_999_999_999_999,
+        }
+
+    def recording_write(provider, entries, *, removed_ids=None):
+        io_lock_states.append(("pool_write", _pool_lock_owned_by_current_thread(pool)))
+        return real_write(provider, entries, removed_ids=removed_ids)
+
+    def refresh_credentials(refresh_token, *, use_json):
+        io_lock_states.append(("refresh", _pool_lock_owned_by_current_thread(pool)))
+        assert refresh_token == "fresh-refresh"
+        assert use_json is False
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "expires_at_ms": 9_999_999_999_999,
+        }
+
+    def write_credentials(access_token, refresh_token, expires_at_ms):
+        io_lock_states.append(
+            ("credentials_write", _pool_lock_owned_by_current_thread(pool))
+        )
+        assert (access_token, refresh_token, expires_at_ms) == (
+            "rotated-access",
+            "rotated-refresh",
+            9_999_999_999_999,
+        )
+
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "read_claude_code_credentials",
+        fresh_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "refresh_anthropic_oauth_pure",
+        refresh_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_write_claude_code_credentials",
+        write_credentials,
+    )
+    monkeypatch.setattr(CP, "write_credential_pool", recording_write)
+
+    if operation == "has_available":
+        assert pool.has_available() is True
+    elif operation == "next_available_at":
+        assert pool.next_available_at() is None
+    elif operation == "peek":
+        assert pool.peek() is not None
+    elif operation == "select":
+        assert pool.select() is not None
+    elif operation == "lease":
+        assert pool.acquire_lease() == "claude-entry"
+    elif operation == "rotation":
+        assert (
+            pool.mark_exhausted_and_rotate(
+                status_code=429,
+                credential_id="claude-entry",
+            )
+            is None
+        )
+    elif operation == "refresh":
+        refreshed = pool.try_refresh_matching(credential_id="claude-entry")
+        assert refreshed is not None
+        assert refreshed.access_token == "rotated-access"
+    else:
+        assert pool.reset_statuses() == 1
+
+    assert io_lock_states
+    assert [kind for kind, owned in io_lock_states if owned] == []
+    memory = [entry.to_dict() for entry in pool.entries()]
+    disk = _read_store(auth_path)["credential_pool"]["anthropic"]
+    assert disk == memory
+    assert pool._dirty_entry_ids == set()
+    assert pool._pending_removed_entries == []
+
+
+@pytest.mark.parametrize("provider", ["xai-oauth", "nous"])
+def test_terminal_provider_cleanup_persists_removed_ids_outside_pool_lock(
+    tmp_path, monkeypatch, provider
+):
+    auth_path = tmp_path / provider / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: auth_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    device = _entry(
+        provider,
+        id=f"{provider}-device",
+        access_token="device-access",
+        refresh_token="device-refresh",
+    )
+    extra_removed = replace(
+        device,
+        id=f"{provider}-manual-device",
+        source="manual:device_code",
+        priority=1,
+        access_token="manual-device-access",
+        refresh_token="manual-device-refresh",
+    )
+    survivor = replace(
+        device,
+        id=f"{provider}-survivor",
+        source="manual:oauth",
+        priority=2,
+        access_token="survivor-access",
+        refresh_token="survivor-refresh",
+    )
+    entries = [device, extra_removed, survivor]
+    if provider == "xai-oauth":
+        provider_state = {
+            "tokens": {
+                "access_token": device.access_token,
+                "refresh_token": device.refresh_token,
+            }
+        }
+    else:
+        provider_state = {
+            "access_token": device.access_token,
+            "refresh_token": device.refresh_token,
+        }
+    _write_store(
+        auth_path,
+        {
+            "version": 1,
+            "providers": {provider: provider_state},
+            "credential_pool": {provider: [entry.to_dict() for entry in entries]},
+        },
+    )
+    pool = CredentialPool(provider, entries)
+    write_lock_states = []
+    real_write = CP.write_credential_pool
+
+    def recording_write(provider_name, persisted, *, removed_ids=None):
+        write_lock_states.append(_pool_lock_owned_by_current_thread(pool))
+        return real_write(provider_name, persisted, removed_ids=removed_ids)
+
+    def reject_refresh(*_args, **_kwargs):
+        raise RuntimeError("terminal refresh failure")
+
+    monkeypatch.setattr(CP, "write_credential_pool", recording_write)
+    if provider == "xai-oauth":
+        monkeypatch.setattr(A, "refresh_xai_oauth_pure", reject_refresh)
+        monkeypatch.setattr(A, "_is_terminal_xai_oauth_refresh_error", lambda _exc: True)
+        expected_ids = {extra_removed.id, survivor.id}
+    else:
+        monkeypatch.setattr(A, "resolve_nous_runtime_credentials", reject_refresh)
+        monkeypatch.setattr(A, "_is_terminal_nous_refresh_error", lambda _exc: True)
+        expected_ids = {survivor.id}
+
+    errors = []
+
+    def cleanup_worker():
+        try:
+            assert pool._refresh_entry(device, force=True) is None
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=cleanup_worker, daemon=True)
+    worker.start()
+    worker.join(timeout=5)
+
+    assert not worker.is_alive()
+    assert errors == []
+    assert write_lock_states
+    assert not any(write_lock_states)
+    assert {entry.id for entry in pool.entries()} == expected_ids
+    persisted = _read_store(auth_path)["credential_pool"][provider]
+    assert {entry["id"] for entry in persisted} == expected_ids
+
+
 @pytest.mark.parametrize("construction", ["direct", "replace_then_add"])
 @pytest.mark.parametrize("target_kind", ["arbitrary", "known_global"])
 def test_untrusted_runtime_source_path_never_gains_owner_write_authority(
