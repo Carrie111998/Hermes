@@ -153,6 +153,9 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.AUDIO_CACHE_DIR", tmp_path / "audio_cache"
     )
+    monkeypatch.setattr(
+        "gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "image_cache"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +233,71 @@ class TestDocumentDownloadBlock:
         assert "file text" in event.text
         assert "Please summarize" in event.text
 
+    @pytest.mark.asyncio
+    async def test_svg_document_is_rasterized_and_routed_as_png(self, adapter):
+        """SVG image documents must become PNG before entering model history."""
+        svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg">'
+            b'<rect width="1" height="1"/></svg>'
+        )
+        png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 16
+        file_obj = _make_file_obj(svg)
+        doc = _make_document(
+            file_name="mark.svg",
+            mime_type="image/svg+xml",
+            file_size=len(svg),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter._rasterize_svg_bytes_for_telegram",
+                return_value=png,
+            ) as rasterize_mock,
+            patch.object(adapter, "_photo_batch_key", return_value="batch-svg"),
+            patch.object(adapter, "_enqueue_photo_event") as enqueue_mock,
+        ):
+            await adapter._handle_media_message(update, MagicMock())
+
+        rasterize_mock.assert_called_once_with(svg)
+        enqueue_mock.assert_called_once()
+        event = enqueue_mock.call_args.args[1]
+        assert event.message_type == MessageType.PHOTO
+        assert event.media_urls and event.media_urls[0].endswith(".png")
+        assert event.media_types == ["image/png"]
+        assert adapter.handle_message.call_count == 0
+
+    @pytest.mark.asyncio
+    async def test_unsafe_svg_document_fails_before_photo_enqueue(self, adapter):
+        """SVGs rejected by the shared safety boundary must fail clearly."""
+        svg = (
+            b'<svg xmlns="http://www.w3.org/2000/svg">'
+            b'<image href="https://example.com/x.png"/></svg>'
+        )
+        file_obj = _make_file_obj(svg)
+        doc = _make_document(
+            file_name="unsafe.svg",
+            mime_type="image/svg+xml",
+            file_size=len(svg),
+            file_obj=file_obj,
+        )
+        msg = _make_message(document=doc)
+        update = _make_update(msg)
+
+        with (
+            patch(
+                "plugins.platforms.telegram.adapter._rasterize_svg_bytes_for_telegram",
+                side_effect=ValueError("SVG external references are not allowed"),
+            ),
+            patch.object(adapter, "_enqueue_photo_event") as enqueue_mock,
+        ):
+            await adapter._handle_media_message(update, MagicMock())
+
+        enqueue_mock.assert_not_called()
+        event = adapter.handle_message.call_args[0][0]
+        assert "could not be read as an image" in event.text
 
     @pytest.mark.asyncio
     async def test_text_injection_capped(self, adapter):
