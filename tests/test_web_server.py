@@ -240,3 +240,94 @@ def test_start_server_keeps_bare_asyncio_run_on_posix(monkeypatch):
     assert runner_called["hit"] is False, (
         "POSIX must not take the Windows loop-factory branch"
     )
+
+
+# ---------------------------------------------------------------------------
+# Parent-death watchdog (#80204)
+# ---------------------------------------------------------------------------
+
+class _FakeWatchServer:
+    def __init__(self):
+        self.should_exit = False
+        self.exit_event = asyncio.Event()
+        self.exit_event.set = lambda: None  # no-op set; flag check below
+        self.signaled = False
+
+    async def shutdown(self):
+        self.signaled = True
+
+
+def test_parent_death_watchdog_shuts_down_when_parent_dies(monkeypatch):
+    """getppid() changing (parent reparented to 1) triggers should_exit."""
+    server = _FakeWatchServer()
+    loop = asyncio.new_event_loop()
+    try:
+        # The thread runs in a real event-loop context via run_coroutine_threadsafe.
+        # Simulate by patching the loop's call to run the coroutine inline.
+        calls = []
+
+        def _fake_threadsafe(coro, _loop):
+            calls.append(coro)
+            asyncio.get_event_loop().run_until_complete(coro)
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server.asyncio.run_coroutine_threadsafe", _fake_threadsafe
+        )
+        monkeypatch.setattr(web_server.os, "getppid", lambda: 1)  # parent gone
+
+        web_server._parent_death_watchdog_loop(
+            server, loop, parent_pid=424242, poll_interval=0.001
+        )
+
+        assert server.should_exit is True
+        assert len(calls) == 1  # exactly one shutdown request
+    finally:
+        loop.close()
+
+
+def test_parent_death_watchdog_noop_while_parent_alive(monkeypatch):
+    """getppid() unchanged → watchdog keeps polling, never signals."""
+    server = _FakeWatchServer()
+    loop = asyncio.new_event_loop()
+    try:
+        signaled = {"hit": False}
+
+        def _fake_threadsafe(coro, _loop):
+            signaled["hit"] = True
+
+        monkeypatch.setattr(
+            "hermes_cli.web_server.asyncio.run_coroutine_threadsafe", _fake_threadsafe
+        )
+        monkeypatch.setattr(web_server.os, "getppid", lambda: 424242)
+
+        # Poll a few times with a tiny interval, then stop via should_exit.
+        import threading
+
+        def _stop():
+            import time
+
+            time.sleep(0.02)
+            server.should_exit = True
+
+        t = threading.Thread(target=_stop)
+        t.start()
+        web_server._parent_death_watchdog_loop(
+            server, loop, parent_pid=424242, poll_interval=0.001
+        )
+        t.join()
+
+        assert signaled["hit"] is False
+        assert server.should_exit is True  # exited via loop condition, not parent
+    finally:
+        loop.close()
+
+
+def test_request_parent_death_shutdown_flags_server(monkeypatch):
+    server = _FakeWatchServer()
+    monkeypatch.setattr(web_server.asyncio, "Event", lambda: type("E", (), {})())
+
+    async def _run():
+        await web_server._request_parent_death_shutdown(server)
+
+    asyncio.get_event_loop().run_until_complete(_run())
+    assert server.should_exit is True

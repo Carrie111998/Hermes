@@ -17338,6 +17338,46 @@ def _read_bound_port(server: "uvicorn.Server", fallback: int) -> int:
     return fallback
 
 
+async def _request_parent_death_shutdown(server: "uvicorn.Server") -> None:
+    """Ask the running uvicorn server to exit (parent-death watchdog)."""
+    server.should_exit = True
+    try:
+        server.exit_event.set()
+    except Exception:
+        pass
+
+
+def _parent_death_watchdog_loop(
+    server: "uvicorn.Server",
+    loop: "asyncio.AbstractEventLoop",
+    parent_pid: int,
+    *,
+    poll_interval: float = 2.0,
+) -> None:
+    """Daemon-thread body: poll getppid() and shut the server down when the
+    spawning parent dies (reparented to 1). Exits when the server already
+    stopped or the loop is closed."""
+    while not server.should_exit:
+        try:
+            if os.getppid() != parent_pid:
+                _log.warning(
+                    "parent (desktop) exited; shutting down headless backend "
+                    "(was pid %s)",
+                    parent_pid,
+                )
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _request_parent_death_shutdown(server), loop
+                    )
+                except RuntimeError:
+                    # Loop is closed — nothing left to signal.
+                    pass
+                return
+        except (OSError, RuntimeError):
+            return
+        time.sleep(poll_interval)
+
+
 def _write_dashboard_ready_file(actual_port: int) -> None:
     """Optionally publish the dashboard port through an atomic ready file.
 
@@ -17683,6 +17723,25 @@ def start_server(
             _hb_loop.call_later(
                 _hb_interval, _loop_heartbeat, _hb_loop.time() + _hb_interval
             )
+
+            # ── Parent-death watchdog (headless desktop backend, #80204) ──
+            # The Desktop app normally SIGTERMs its `hermes serve` child on
+            # quit (before-quit → stopBackendChild). But update hand-offs,
+            # crashes, and force-quits skip that path: the backend is
+            # reparented to PID 1 and keeps serving forever — 14 orphaned
+            # backends observed (each holding MCP watchdogs + helper daemons).
+            # When the Electron parent dies, exit on our own: poll getppid()
+            # from a daemon thread and flip uvicorn's should_exit once the
+            # parent is gone (reparented to 1 = no longer the spawner).
+            if headless and os.environ.get("HERMES_DESKTOP") == "1":
+                _parent_pid = os.getppid()
+                _loop = asyncio.get_running_loop()
+                threading.Thread(
+                    target=_parent_death_watchdog_loop,
+                    args=(server, _loop, _parent_pid),
+                    name="serve-parent-watch",
+                    daemon=True,
+                ).start()
 
             await server.main_loop()
             if server.started:
