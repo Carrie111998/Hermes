@@ -1165,17 +1165,19 @@ ClawRouter requires a USDC-funded wallet on Base or Solana for payment. All requ
 
 ---
 
-### Poolside
+### Poolside — Coding Models
 
-Hermes can access Poolside models through its built-in OpenRouter provider or through an OpenAI-compatible custom endpoint:
+[Poolside](https://poolside.ai) provides coding models through Poolside Platform, organization deployments, and OpenRouter.
 
 | Access method | Hermes setup | Base URL | Credential |
 |---------------|--------------|----------|------------|
-| **[Poolside Platform](https://docs.poolside.ai/api/overview)** | Custom endpoint | `https://inference.poolside.ai/v1` | Poolside Platform API key |
+| **[Poolside Platform](https://platform.poolside.ai/)** | Custom endpoint | `https://inference.poolside.ai/v1` | Poolside Platform API key |
 | **Your organization's Poolside deployment** | Custom endpoint | `https://<api-domain>/openai/v1` | API key or token supplied by your Poolside administrator |
 | **[OpenRouter](https://openrouter.ai/poolside)** | OpenRouter provider | `https://openrouter.ai/api/v1` | OpenRouter API key |
 
-Run `hermes model`, then choose **Custom endpoint** and copy the matching URL above, or choose **OpenRouter** and select a Poolside model.
+Configure Hermes with `hermes model` → Custom endpoint → the matching URL above → API key → model ID.
+
+For OpenRouter: `hermes model` → OpenRouter → API key → Enter custom model name → an ID from [Poolside models on OpenRouter](https://openrouter.ai/poolside).
 
 ---
 
