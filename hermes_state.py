@@ -5177,6 +5177,55 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             )
         self._execute_write(_do)
 
+    def get_session_model_usage(
+        self, session_ids: List[str]
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Return client-safe detailed usage rows grouped by session ID.
+
+        ``sessions`` contains only the main agent loop's summary counters.
+        Auxiliary calls are intentionally recorded solely in
+        ``session_model_usage`` so they cannot be clobbered by the gateway's
+        absolute summary updates. Consumers that need complete accounting
+        therefore have to read this ledger rather than summing session rows.
+
+        The billing base URL and internal cost provenance are deliberately not
+        exported: callers need provider/model/task and counters, not endpoint
+        details that may contain tenant-specific routing information.
+        """
+        ids = [str(session_id) for session_id in session_ids if session_id]
+        if not ids:
+            return {}
+        self.flush_token_counts()
+        placeholders = ",".join("?" for _ in ids)
+        with self._read_ctx() as conn:
+            assert conn is not None
+            rows = conn.execute(
+                f"""
+                SELECT session_id, model, billing_provider, billing_mode, task,
+                       SUM(api_call_count) AS api_call_count,
+                       SUM(input_tokens) AS input_tokens,
+                       SUM(output_tokens) AS output_tokens,
+                       SUM(cache_read_tokens) AS cache_read_tokens,
+                       SUM(cache_write_tokens) AS cache_write_tokens,
+                       SUM(reasoning_tokens) AS reasoning_tokens,
+                       SUM(estimated_cost_usd) AS estimated_cost_usd,
+                       SUM(actual_cost_usd) AS actual_cost_usd,
+                       MIN(first_seen) AS first_seen,
+                       MAX(last_seen) AS last_seen
+                FROM session_model_usage
+                WHERE session_id IN ({placeholders})
+                GROUP BY session_id, model, billing_provider, billing_mode, task
+                ORDER BY session_id, task, model, billing_provider, billing_mode
+                """,
+                ids,
+            ).fetchall()
+        grouped: Dict[str, List[Dict[str, Any]]] = {session_id: [] for session_id in ids}
+        for row in rows:
+            payload = dict(row)
+            session_id = payload.pop("session_id")
+            grouped.setdefault(session_id, []).append(payload)
+        return grouped
+
     def prune_empty_ghost_sessions(self, sessions_dir: "Optional[Path]" = None) -> int:
         """Remove empty TUI ghost sessions (no messages, no title, >24hr old)."""
         cutoff = time.time() - 86400  # Only sessions older than 24 hours

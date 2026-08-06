@@ -445,7 +445,7 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 
 | Method | Path | Description |
 |--------|------|-------------|
-| `GET` | `/api/sessions` | List sessions (paginated — `limit`, `offset`, `source`, `include_children`) |
+| `GET` | `/api/sessions` | List sessions (paginated — `limit`, `offset`, `source`, `include_children`, `include_usage`) |
 | `POST` | `/api/sessions` | Create an empty session |
 | `GET` | `/api/sessions/{id}` | Read session metadata |
 | `PATCH` | `/api/sessions/{id}` | Update title or `end_reason` |
@@ -454,6 +454,53 @@ External UIs can manage Hermes sessions over REST without standing up the dashbo
 | `POST` | `/api/sessions/{id}/fork` | Branch the session via `SessionDB` lineage (matches CLI `/branch` semantics) |
 | `POST` | `/api/sessions/{id}/chat` | Run one synchronous agent turn |
 | `POST` | `/api/sessions/{id}/chat/stream` | SSE wrapper over a single turn — emits `assistant.delta`, `tool.started`, `tool.completed`, `run.completed` events |
+
+### Session list query parameters
+
+`GET /api/sessions` accepts these query parameters:
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `limit` | integer | `50` | Number of sessions to return, from `0` to `200` |
+| `offset` | integer | `0` | Number of sessions to skip for pagination |
+| `source` | string | — | Return only sessions from this source |
+| `include_children` | boolean | `false` | Include raw child sessions instead of only logical, user-facing sessions |
+| `include_usage` | boolean | `false` | Add a `usage_by_model` array to each returned session |
+
+When `include_usage=true`, each `usage_by_model` row identifies the model,
+billing provider and mode, and task, followed by its cumulative API-call, token,
+cost, and first/last-seen counters:
+
+```json
+{
+  "id": "session-id",
+  "usage_by_model": [
+    {
+      "model": "gpt-5.6-sol",
+      "billing_provider": "openai-codex",
+      "billing_mode": "subscription_included",
+      "task": "",
+      "api_call_count": 3,
+      "input_tokens": 1200,
+      "output_tokens": 240,
+      "cache_read_tokens": 800,
+      "cache_write_tokens": 0,
+      "reasoning_tokens": 100,
+      "estimated_cost_usd": 0.0,
+      "actual_cost_usd": 0.0,
+      "first_seen": 1785632400.0,
+      "last_seen": 1785632460.0
+    }
+  ]
+}
+```
+
+The field is omitted unless requested so ordinary session listings remain
+lightweight. For the default logical listing, usage from every session in a
+compression lineage is merged into the projected session. With
+`include_children=true`, each raw session carries only its own usage. Rows that
+differ only by internal billing endpoint are combined; billing base URLs and
+internal pricing provenance are never returned.
 
 `/v1/capabilities` advertises the full surface via `session_*` feature flags and `endpoints.session_*` entries so external UIs can detect support and fall back safely. Inline images are supported in `chat` and `chat/stream` payloads (multimodal-aware path).
 
