@@ -693,6 +693,7 @@ async def test_profile_command_reports_source_stamped_profile(monkeypatch, tmp_p
     runner = _make_runner(session_entry)
     runner.config.multiplex_profiles = True
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "unrelated-home")
 
     event = _make_event("/profile")
     event.source.profile = "milo"
@@ -724,6 +725,7 @@ async def test_profile_command_ignores_stamp_when_multiplexing_off(monkeypatch, 
     runner = _make_runner(session_entry)
     assert runner.config.multiplex_profiles is False
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "unrelated-home")
 
     event = _make_event("/profile")
     event.source.profile = "milo"
@@ -751,6 +753,7 @@ async def test_profile_command_unstamped_source_unchanged(monkeypatch, tmp_path)
     )
     runner = _make_runner(session_entry)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path / "unrelated-home")
 
     result = await runner._handle_profile_command(_make_event("/profile"))
 

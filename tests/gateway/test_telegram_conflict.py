@@ -388,7 +388,7 @@ async def test_connect_does_not_block_on_post_connect_housekeeping(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",
@@ -488,7 +488,7 @@ async def test_polling_conflict_reschedule_uses_running_loop(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",
@@ -590,7 +590,7 @@ def _build_polling_app(monkeypatch):
     )
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr("asyncio.sleep", AsyncMock())
     return captured
@@ -676,7 +676,7 @@ async def test_conflict_callback_disarms_before_scheduling(monkeypatch):
 
     monkeypatch.setattr(
         "gateway.status.acquire_scoped_lock",
-        lambda scope, identity, metadata=None: (True, None),
+        lambda scope, identity, metadata=None, pid_recheck_after_seconds=None: (True, None),
     )
     monkeypatch.setattr(
         "gateway.status.release_scoped_lock",

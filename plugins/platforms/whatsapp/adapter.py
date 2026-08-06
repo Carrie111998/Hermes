@@ -594,23 +594,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
         """WhatsApp gates DM/group access at intake via dm_policy/group_policy."""
         return True
 
-    def _is_dm_allowed(self, sender_id: str) -> bool:
-        """Check whether a DM from the given sender should be processed."""
-        if self._dm_policy == "disabled":
-            return False
-        if self._dm_policy == "allowlist":
-            return sender_id in self._allow_from
-        # "open" — all DMs allowed
-        return True
-
-    def _is_group_allowed(self, chat_id: str) -> bool:
-        """Check whether a group chat should be processed."""
-        if self._group_policy == "disabled":
-            return False
-        if self._group_policy == "allowlist":
-            return chat_id in self._group_allow_from
-        # "open" — all groups allowed
-        return True
+    # NOTE: _is_dm_allowed / _is_dm_intake_allowed / _is_group_allowed are
+    # inherited from WhatsAppBehaviorMixin (gateway/platforms/whatsapp_common.py).
+    # They enforce the hardened fail-closed pairing semantics; do NOT re-add a
+    # class-local override here — a stale copy silently re-opened unknown DMs
+    # (`pairing → return True`). See test_whatsapp_adapter_does_not_shadow_
+    # hardened_access_helpers.
 
     def _compile_mention_patterns(self):
         patterns = self.config.extra.get("mention_patterns")
@@ -718,9 +707,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 return False
         else:
             sender_id = str(data.get("senderId") or data.get("from") or "")
-            if not self._is_dm_allowed(sender_id):
+            # Intake gate (not the strict auth gate): pairing DMs must reach the
+            # gateway so the handshake can complete; downstream authorization
+            # still runs the strict _is_dm_allowed check.
+            if not self._is_dm_intake_allowed(sender_id):
                 return False
-            # DMs that pass the policy gate are always processed
+            # DMs that pass the intake gate are always processed
             return True
         # Group messages: check mention / free-response settings
         chat_id = str(data.get("chatId") or "")

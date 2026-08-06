@@ -10,6 +10,15 @@ import pytest
 
 from gateway import cgroup_cleanup
 
+# The cgroup reaper is a systemd ExecStopPost hook — Linux-only by design
+# (gateway/cgroup_cleanup.py carries a `# windows-footgun: ok` marker). Tests
+# that assert on signal.SIGKILL cannot even be evaluated on Windows, where the
+# attribute is absent; skip them there rather than mask a real regression.
+_requires_sigkill = pytest.mark.skipif(
+    not hasattr(signal, "SIGKILL"),
+    reason="cgroup reaper is Linux-only; signal.SIGKILL absent on Windows",
+)
+
 
 class TestOwnCgroupPath:
     def test_parses_v2_cgroup_path(self, tmp_path, monkeypatch):
@@ -32,6 +41,7 @@ class TestOwnCgroupPath:
 
 
 class TestReapCgroup:
+    @_requires_sigkill
     def test_skips_own_pid_and_kills_the_rest(self, tmp_path, monkeypatch):
         own = os.getpid()
         cgroup_path = "/test.slice/hermes-gateway.service"
@@ -55,6 +65,7 @@ class TestReapCgroup:
         assert (1001, signal.SIGKILL) in killed_pids
         assert (1002, signal.SIGKILL) in killed_pids
 
+    @_requires_sigkill
     def test_tolerates_already_exited_pids(self, tmp_path, monkeypatch):
         cgroup_path = "/test.slice/hermes-gateway.service"
         procs_file = tmp_path / "cgroup.procs"

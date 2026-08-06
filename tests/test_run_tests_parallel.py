@@ -309,6 +309,69 @@ def test_positional_path_not_treated_as_flag(tmp_path: Path) -> None:
     assert "test_flagprobe.py" in proc.stdout, proc.stdout
 
 
+# ── Per-file --basetemp isolation ────────────────────────────────────────────
+#
+# pytest's tmp_path fixture uses a shared per-user base
+# (``<tmp>/pytest-of-<user>/pytest-<N>/``) with retention cleanup: it keeps
+# the last 3 numbered dirs and rmtree's older ones. When N per-file pytest
+# subprocesses run concurrently, one process's retention sweep deletes another
+# live process's ``pytest-<N>`` mid-run, producing ``FileNotFoundError
+# [WinError 3]`` teardown/setup errors that have nothing to do with the tests.
+# The runner de-collides this by handing every per-file subprocess its own
+# ``--basetemp`` under a single per-run root, so no numbered-dir retention race
+# can exist.
+
+
+def test_each_file_gets_a_unique_run_scoped_basetemp() -> None:
+    """Distinct files — even with colliding basenames — get distinct basetemps
+    under one shared per-run root (so cleanup is a single rmtree)."""
+    repo_root = Path(__file__).resolve().parent.parent
+    a = repo_root / "tests" / "gateway" / "test_status.py"
+    b = repo_root / "tests" / "cron" / "test_status.py"  # same basename, diff dir
+
+    bt_a = run_tests_parallel._basetemp_for(a, repo_root)
+    bt_b = run_tests_parallel._basetemp_for(b, repo_root)
+
+    # Unique per file even when basenames collide across directories.
+    assert bt_a != bt_b, (bt_a, bt_b)
+    # Both under a single per-run root, so end-of-run cleanup is one rmtree.
+    assert bt_a.parent == bt_b.parent, (bt_a.parent, bt_b.parent)
+    # Deterministic within a run (same file → same basetemp).
+    assert run_tests_parallel._basetemp_for(a, repo_root) == bt_a
+
+
+def test_basetemp_is_wired_into_the_pytest_subprocess(tmp_path: Path) -> None:
+    """The unique basetemp actually reaches pytest — a probe reading its own
+    ``tmp_path`` reports a dir under the runner's per-run basetemp root.
+
+    Guards against the helper existing but never being threaded into the
+    subprocess command (0-hits-armed == 0-hits-unwired)."""
+    probe_dir = tmp_path / "probe"
+    probe_dir.mkdir()
+    handoff = tmp_path / "reported_basetemp.txt"
+    probe = probe_dir / "test_basetemp_probe.py"
+    probe.write_text(
+        textwrap.dedent(
+            f"""
+            from pathlib import Path
+
+            def test_reports_its_tmp_path(tmp_path):
+                Path({str(handoff)!r}).write_text(str(tmp_path))
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    proc = _run_runner(probe_dir)
+
+    assert proc.returncode == 0, proc.stdout
+    assert handoff.exists(), f"probe never reported tmp_path:\n{proc.stdout}"
+    reported = handoff.read_text().strip()
+    # tmp_path == <basetemp>/test_reports_its_tmp_path0, and <basetemp> is our
+    # per-run, per-file dir — so the marker appears in the path.
+    assert "hermes-parallel" in reported, reported
+
+
 def test_files_list_preserves_posix_and_relative_colon_syntax() -> None:
     """Colon-separated POSIX and relative file lists keep their existing grammar."""
     assert run_tests_parallel._split_file_list(

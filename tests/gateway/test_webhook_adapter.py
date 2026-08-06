@@ -20,6 +20,7 @@ import hashlib
 import hmac
 import json
 import socket
+import sys
 import time
 from collections import deque
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1656,6 +1657,7 @@ class TestDualStackBind:
         finally:
             await adapter.disconnect()
 
+    @pytest.mark.skipif(sys.platform == "win32", reason="Windows permits this dual-stack bind")
     @pytest.mark.asyncio
     async def test_default_bind_rejects_existing_ipv6_listener(self):
         """A specific IPv6 listener must block the wildcard dual-stack bind."""

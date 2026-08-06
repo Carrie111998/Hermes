@@ -4694,7 +4694,7 @@ def get_profiles_sessions_sidebar(
         return rows
 
     def _slice(db, *, source=None, exclude=None, cap):
-        return db.list_sessions_rich(
+        rows = db.list_sessions_rich(
             source=source,
             exclude_sources=exclude or None,
             limit=cap,
@@ -4705,6 +4705,12 @@ def get_profiles_sessions_sidebar(
             order_by_last_active=True,
             compact_rows=True,
         )
+        # Same best-effort bridge enrichment as /api/profiles/sessions, so
+        # imported Claude/Codex sessions keep their [Claude]/[Codex] provider
+        # badges on the batched sidebar route (perf refactor 40160e2a0 dropped
+        # this call, silently removing all badges).
+        _add_bridge_metadata_to_sessions(db, rows)
+        return rows
 
     for name, home in targets:
         db_path = Path(home) / "state.db"

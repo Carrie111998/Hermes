@@ -3973,6 +3973,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._queue_platform_for_retry(platform, platform_config)
             return
 
+        # A restart/shutdown may have been requested while this connect was in
+        # flight. The inline startup path guards its wire-in with
+        # ``_abort_startup_if_shutdown_requested`` right after connect() returns;
+        # mirror that here. Without this guard a late background connect wires a
+        # live adapter into ``self.adapters`` after ``stop()`` has already run,
+        # leaking the connection and racing the replacement gateway (Telegram
+        # joined ``_BACKGROUND_CONNECT_PLATFORMS`` after the 2026-07-16 flap).
+        if self._startup_should_abort():
+            logger.info(
+                "%s background connect finished during shutdown/restart — "
+                "disconnecting instead of wiring in",
+                platform.value,
+            )
+            await self._safe_adapter_disconnect(adapter, platform)
+            return
+
         # Connected — wire it in exactly like a late reconnect recovery.
         self.adapters[platform] = adapter
         self._sync_voice_mode_state_to_adapter(adapter)

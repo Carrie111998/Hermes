@@ -1870,6 +1870,44 @@ class TestWebServerEndpoints:
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
 
+    def test_profiles_sessions_sidebar_enriches_bridge_provider(self):
+        """Imported Claude/Codex sessions must keep their provider badge on the
+        batched sidebar route. The perf refactor 40160e2a0 added this route
+        WITHOUT the bridge-metadata enrichment, silently dropping every
+        [Claude]/[Codex] badge from the desktop sidebar; the legacy per-slice
+        endpoint was already enriched."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="claude:bridge-me", source="claude")
+            db.append_message(session_id="claude:bridge-me", role="user", content="hi")
+            with db._lock:
+                db._conn.execute(
+                    """INSERT INTO external_sessions (
+                       session_id, provider, native_id, first_indexed_at,
+                       last_indexed_at, parser_version, origin_kind
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    ("claude:bridge-me", "claude", "bridge-me", 1.0, 1.0, 1, "native"),
+                )
+        finally:
+            db.close()
+
+        resp = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all&recents_limit=20"
+            "&recents_exclude=cron,telegram"
+            "&cron_limit=50&messaging_limit=100"
+            "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+
+        recents = {s["id"]: s for s in data["recents"]["sessions"]}
+        assert "claude:bridge-me" in recents
+        assert recents["claude:bridge-me"]["bridge_provider"] == "claude"
+        assert recents["claude:bridge-me"]["bridge_origin_kind"] == "native"
+
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
         the Sessions page, not just config/skills/model pages."""

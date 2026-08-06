@@ -5013,7 +5013,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_create_message_body(*, receive_id: str, msg_type: str, content: str, uuid_value: str) -> Any:
-        if "CreateMessageRequestBody" in globals():
+        if CreateMessageRequestBody is not None:
             return (
                 CreateMessageRequestBody.builder()
                 .receive_id(receive_id)
@@ -5031,7 +5031,7 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _build_create_message_request(receive_id_type: str, request_body: Any) -> Any:
-        if "CreateMessageRequest" in globals():
+        if CreateMessageRequest is not None:
             return (
                 CreateMessageRequest.builder()
                 .receive_id_type(receive_id_type)

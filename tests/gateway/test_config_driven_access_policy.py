@@ -244,6 +244,23 @@ def test_pairing_dm_policy_strict_intake_auth_denies_unknown(
     assert getattr(adapter, dm_helper)("unknown-user") is False
 
 
+def test_whatsapp_adapter_does_not_shadow_hardened_access_helpers():
+    """WhatsAppAdapter must inherit the mixin's fail-closed DM/group gates.
+
+    A stale ``_is_dm_allowed`` / ``_is_group_allowed`` override on the adapter
+    re-introduces the fail-open ``pairing → return True`` bug the mixin fixed
+    (unknown DMs admitted). The helpers must resolve to the mixin, never a
+    class-local shadow.
+    """
+    import importlib
+
+    module = importlib.import_module("plugins.platforms.whatsapp.adapter")
+    adapter_cls = module.WhatsAppAdapter
+
+    assert "_is_dm_allowed" not in adapter_cls.__dict__
+    assert "_is_group_allowed" not in adapter_cls.__dict__
+
+
 @pytest.mark.parametrize(
     "module_path, class_name, intake_helper",
     [

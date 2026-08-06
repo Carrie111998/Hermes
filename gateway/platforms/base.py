@@ -3857,7 +3857,7 @@ class BasePlatformAdapter(ABC):
         scan_content = BasePlatformAdapter._mask_json_string_media(scan_content)
         for match in media_pattern.finditer(scan_content):
             path = _normalize_media_tag_path(match.group("path"))
-            if path:
+            if path and "\x00" not in path:
                 try:
                     media.append((os.path.expanduser(path), has_voice_tag))
                 except (OSError, RuntimeError, ValueError):

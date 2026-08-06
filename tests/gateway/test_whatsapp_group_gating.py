@@ -1,7 +1,32 @@
 import json
 from unittest.mock import AsyncMock
 
+import pytest
+
 from gateway.config import Platform, PlatformConfig, load_gateway_config
+
+
+@pytest.fixture(autouse=True)
+def _clear_whatsapp_policy_env(monkeypatch):
+    """Isolate adapter env-var fallbacks between tests.
+
+    ``load_gateway_config()`` (exercised by the config-bridge tests here)
+    writes WHATSAPP_* policy vars straight into ``os.environ`` — a production
+    side effect ``monkeypatch`` does not track. Without this, a bridge test
+    leaks e.g. WHATSAPP_REQUIRE_MENTION into a later ``_make_adapter`` and
+    flips its mention gate (green on CI where the host env is clean, red
+    whenever the bridge test ran first).
+    """
+    for key in (
+        "WHATSAPP_REQUIRE_MENTION",
+        "WHATSAPP_MENTION_PATTERNS",
+        "WHATSAPP_FREE_RESPONSE_CHATS",
+        "WHATSAPP_DM_POLICY",
+        "WHATSAPP_GROUP_POLICY",
+        "WHATSAPP_GROUP_ALLOWED_USERS",
+        "WHATSAPP_ALLOWED_USERS",
+    ):
+        monkeypatch.delenv(key, raising=False)
 
 
 def _make_adapter(require_mention=None, mention_patterns=None, free_response_chats=None,

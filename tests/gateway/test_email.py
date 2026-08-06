@@ -15,6 +15,7 @@ Covers:
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.mime.base import MIMEBase

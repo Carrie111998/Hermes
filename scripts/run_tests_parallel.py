@@ -42,8 +42,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -98,6 +100,43 @@ _DEFAULT_FILE_RETRIES = 1
 # wall-clock seconds. Used by ``--slice`` to distribute files across
 # CI jobs by estimated total time, so no one job gets all the slow files.
 _DURATIONS_FILE = "test_durations.json"
+
+# One root per runner invocation, one child per test file. Pytest's default
+# tmp_path base is shared per OS user and rotates numbered ``pytest-N`` dirs;
+# concurrent pytest subprocesses can therefore delete each other's live temp
+# roots during retention cleanup. Explicit per-file --basetemp paths remove
+# that cross-process race. Lazily created so imports/tests that only exercise
+# pure helpers don't dirty the filesystem.
+_BASETEMP_ROOT: Path | None = None
+_basetemp_lock = threading.Lock()
+
+
+def _basetemp_for(file: Path, repo_root: Path) -> Path:
+    """Return a unique, stable basetemp for *file* in this runner invocation."""
+    global _BASETEMP_ROOT  # noqa: PLW0603 — invocation-scoped lazy state
+    with _basetemp_lock:
+        if _BASETEMP_ROOT is None:
+            _BASETEMP_ROOT = Path(tempfile.mkdtemp(prefix="hermes-parallel-"))
+
+    try:
+        relative = file.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        relative = file.resolve()
+    # Include the whole normalized path rather than only the basename: files
+    # such as tests/cron/test_status.py and tests/gateway/test_status.py must
+    # not collide. The process-local hash suffix bounds accidental slug
+    # collisions without relying on randomized hash() output.
+    slug = "-".join(relative.parts).replace(":", "").replace(" ", "_")
+    safe = "".join(char if char.isalnum() or char in "-_." else "_" for char in slug)
+    return _BASETEMP_ROOT / safe
+
+
+def _cleanup_basetemps() -> None:
+    """Remove the invocation's basetemp tree after every worker has exited."""
+    global _BASETEMP_ROOT  # noqa: PLW0603 — invocation-scoped lazy state
+    if _BASETEMP_ROOT is not None:
+        shutil.rmtree(_BASETEMP_ROOT, ignore_errors=True)
+        _BASETEMP_ROOT = None
 
 
 def _split_file_list(value: str) -> List[str]:
@@ -333,7 +372,17 @@ def _run_one_file_once(
 ) -> Tuple[Path, int, str, dict[str, int], float]:
     """Single attempt of a per-file pytest subprocess (see _run_one_file)."""
     cmd = [sys.executable, "-m", "pytest", str(file), *pytest_args]
-    
+    # Give each file its own tmp_path base so concurrent subprocesses can't
+    # delete one another's numbered pytest temp roots during retention
+    # cleanup (the WinError 3 teardown-error family). Respect an explicit
+    # caller-supplied --basetemp if present.
+    if not any(
+        arg == "--basetemp" or arg.startswith("--basetemp=") for arg in pytest_args
+    ):
+        basetemp = _basetemp_for(file, repo_root)
+        basetemp.parent.mkdir(parents=True, exist_ok=True)
+        cmd.append(f"--basetemp={basetemp}")
+
     subproc_start = time.monotonic()
     # launch the pytest process
     proc = subprocess.Popen(
@@ -980,6 +1029,10 @@ def main() -> int:
         # control flow obvious.
         for fut in futures:
             fut.result() if fut.exception() is None else None
+
+    # Every worker has exited — reclaim the per-file basetemp tree so nightly
+    # runs don't accumulate temp dirs in the shared checkout's OS temp space.
+    _cleanup_basetemps()
 
     elapsed = time.monotonic() - started
     print()

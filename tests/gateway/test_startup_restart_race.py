@@ -153,26 +153,23 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
     patch_startup_side_effects(monkeypatch, tmp_path)
 
     runner = make_startup_runner(tmp_path)
-    first_disconnected = asyncio.Event()
-    telegram = StartupRaceAdapter(
-        Platform.TELEGRAM,
+    runner.config.platforms = {
+        Platform.SLACK: PlatformConfig(enabled=True, token="***"),
+        Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+    }
+    slack = StartupRaceAdapter(
+        Platform.SLACK,
         on_connect=lambda: runner.request_restart(detached=False, via_service=True),
     )
-    slack = StartupRaceAdapter(Platform.SLACK, wait_for_disconnect=first_disconnected)
-
-    async def disconnect_and_release():
-        telegram.disconnected = True
-        first_disconnected.set()
-
-    telegram.disconnect = disconnect_and_release
-    runner._create_adapter = MagicMock(side_effect=[telegram, slack])
+    discord = StartupRaceAdapter(Platform.DISCORD)
+    runner._create_adapter = MagicMock(side_effect=[slack, discord])
 
     result = await asyncio.wait_for(runner.start(), timeout=2)
 
     assert result is True
-    assert telegram.disconnected is True
-    assert telegram.background_cancelled is True
-    assert slack.connected is False
+    assert slack.disconnected is True
+    assert slack.background_cancelled is True
+    assert discord.connected is False
     assert runner._running is False
     assert runner.adapters == {}
     assert runner._update_runtime_status.call_args_list[-1].args[0] == "stopped"
@@ -181,7 +178,7 @@ async def test_startup_aborts_when_restart_begins_during_platform_connect(tmp_pa
         for call in runner._update_runtime_status.call_args_list
     )
     assert not any(
-        call.args[:2] == (Platform.SLACK.value, "connected")
+        call.args[:2] == (Platform.DISCORD.value, "connected")
         for call in runner._update_platform_runtime_status.call_args_list
     )
 
@@ -217,12 +214,16 @@ async def test_startup_abort_waits_for_existing_stop_task(tmp_path):
 async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeypatch):
     patch_startup_side_effects(monkeypatch, tmp_path)
     runner = make_startup_runner(tmp_path)
-    telegram = StartupRaceAdapter(Platform.TELEGRAM)
+    runner.config.platforms = {
+        Platform.SLACK: PlatformConfig(enabled=True, token="***"),
+        Platform.DISCORD: PlatformConfig(enabled=True, token="***"),
+    }
     slack = StartupRaceAdapter(Platform.SLACK)
-    runner._create_adapter = MagicMock(side_effect=[telegram, slack])
+    discord = StartupRaceAdapter(Platform.DISCORD)
+    runner._create_adapter = MagicMock(side_effect=[slack, discord])
 
     def update_platform_runtime_status(platform, platform_state, **kwargs):
-        if (platform, platform_state) == (Platform.TELEGRAM.value, "connected"):
+        if (platform, platform_state) == (Platform.SLACK.value, "connected"):
             runner.request_restart(detached=False, via_service=True)
 
     runner._update_platform_runtime_status = MagicMock(side_effect=update_platform_runtime_status)
@@ -230,9 +231,9 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
     result = await asyncio.wait_for(runner.start(), timeout=2)
 
     assert result is True
-    assert telegram.connected is True
-    assert telegram.disconnected is True
-    assert slack.connected is False
+    assert slack.connected is True
+    assert slack.disconnected is True
+    assert discord.connected is False
     assert runner._running is False
     assert runner.adapters == {}
     assert runner._update_runtime_status.call_args_list[-1].args[0] == "stopped"
@@ -241,7 +242,49 @@ async def test_startup_aborts_after_registered_adapter_restart(tmp_path, monkeyp
         for call in runner._update_runtime_status.call_args_list
     )
     assert not any(
-        call.args[:2] == (Platform.SLACK.value, "connected")
+        call.args[:2] == (Platform.DISCORD.value, "connected")
+        for call in runner._update_platform_runtime_status.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_background_connect_does_not_wire_in_when_restart_races(tmp_path, monkeypatch):
+    """A restart requested while a backgrounded connect is in flight must not
+    wire the freshly-connected adapter into a gateway that is tearing down.
+
+    Telegram and WhatsApp connect in the background
+    (``_BACKGROUND_CONNECT_PLATFORMS``) so a slow/offline connect can't gate the
+    api_server bind. The inline connect path guards the wire-in with
+    ``_abort_startup_if_shutdown_requested`` right after ``connect()`` returns;
+    the background path must mirror that guard. Without it a late connect wires a
+    live adapter into ``self.adapters`` after ``stop()`` has already run, leaking
+    the connection and racing a duplicate gateway (regression after Telegram
+    joined ``_BACKGROUND_CONNECT_PLATFORMS``, death forensics 2026-07-16).
+    """
+    patch_startup_side_effects(monkeypatch, tmp_path)
+    runner = make_startup_runner(tmp_path)
+
+    telegram = StartupRaceAdapter(
+        Platform.TELEGRAM,
+        on_connect=lambda: runner.request_restart(detached=False, via_service=True),
+    )
+
+    await asyncio.wait_for(
+        runner._connect_platform_in_background(
+            telegram,
+            Platform.TELEGRAM,
+            runner.config.platforms[Platform.TELEGRAM],
+        ),
+        timeout=2,
+    )
+
+    # Connect succeeded, but a restart was requested during it — the adapter must
+    # be disconnected and NOT wired into the live gateway.
+    assert Platform.TELEGRAM not in runner.adapters
+    assert telegram.disconnected is True
+    runner._sync_voice_mode_state_to_adapter.assert_not_called()
+    assert not any(
+        call.args[:2] == (Platform.TELEGRAM.value, "connected")
         for call in runner._update_platform_runtime_status.call_args_list
     )
 

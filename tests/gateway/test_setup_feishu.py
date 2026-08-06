@@ -233,7 +233,7 @@ class TestSetupFeishuAdapterIntegration:
         # pwd fallback), so pin the adapter's home lookup to a tempdir.
         self._home_tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self._home_patcher = patch(
-            "gateway.platforms.feishu.get_hermes_home",
+            "plugins.platforms.feishu.adapter.get_hermes_home",
             return_value=Path(self._home_tmp.name),
         )
         self._home_patcher.start()

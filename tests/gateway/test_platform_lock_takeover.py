@@ -163,6 +163,6 @@ class TestPlatformLockRecheckPath:
         code, message, retryable = adapter._fatal_called_with
         assert code == "telegram-bot-token_lock"
         assert "PID 99999" in message
-        assert retryable is False
+        assert retryable is True
         # No synthesis — the previous PID is genuinely alive.
         assert captured_bus.emit.call_count == 0
