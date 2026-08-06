@@ -12560,7 +12560,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         async def _stop_impl() -> None:
             def _release_kanban_worker_claims(phase: str) -> None:
-                """Release host-local Kanban claims before child-process cleanup.
+                """Release this gateway's own Kanban claims before child cleanup.
 
                 Dispatcher workers are independent subprocesses rather than
                 process_registry entries, but systemd still reaps them with the
@@ -12568,6 +12568,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 cleanup phase that can terminate children.  Repeating it is
                 intentional: the second, compare-and-swap guarded pass covers
                 claims that appeared during the preceding teardown phase.
+
+                The release is scoped to claims held by this gateway's own
+                dispatcher (``host:<gateway pid>``) and skips claims whose
+                worker PID is still alive, so it can never release a live
+                worker — see
+                ``release_running_workers_for_gateway_shutdown``.
                 """
                 try:
                     from hermes_cli import kanban_db as _kanban_db

@@ -324,16 +324,16 @@ def test_gateway_shutdown_release_requeues_without_counting_failure(
     """Gateway lifecycle restarts must not look like worker crashes.
 
     Kanban workers run as gateway child processes, so systemd restarts kill
-    them from the outside. The shutdown hook releases those host-local claims
-    with a first-class ``released`` run instead of incrementing the task's
-    consecutive-failure counter.
+    them from the outside. The shutdown hook releases this gateway's own
+    dead-worker claims with a first-class ``released`` run instead of
+    incrementing the task's consecutive-failure counter.
     """
     import hermes_cli.kanban_db as _kb
 
     with kb.connect() as conn:
-        host = _kb._claimer_id().split(":", 1)[0]
+        claimer = _kb._claimer_id()
         tid = kb.create_task(conn, title="restart", assignee="worker")
-        kb.claim_task(conn, tid, claimer=f"{host}:gateway-worker")
+        kb.claim_task(conn, tid, claimer=claimer)
         conn.execute(
             "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
             (76543, 1, tid),
@@ -361,30 +361,101 @@ def test_gateway_shutdown_release_requeues_without_counting_failure(
         assert any(e.kind == "gateway_interrupted" for e in events)
 
 
-def test_gateway_shutdown_release_ignores_nonlocal_claims(
-    kanban_home,
+def test_gateway_shutdown_release_defers_live_worker(
+    kanban_home, monkeypatch,
 ):
-    """Only workers claimed by this gateway host are released on shutdown."""
+    """A claim whose worker PID is still alive is never released.
+
+    Releasing a live worker's claim would let the next dispatcher spawn a
+    duplicate beside the still-running worker — the exact scenario the
+    reclaim paths guard against (``_defer_reclaim_for_live_worker``). The
+    live worker finishes and releases its own claim instead.
+    """
+    import hermes_cli.kanban_db as _kb
+
     with kb.connect() as conn:
-        tid = kb.create_task(conn, title="remote", assignee="worker")
-        kb.claim_task(conn, tid, claimer="other-host:worker")
+        claimer = _kb._claimer_id()
+        tid = kb.create_task(conn, title="live", assignee="worker")
+        kb.claim_task(conn, tid, claimer=claimer)
+        # This test process is alive: the claim must survive the shutdown.
         conn.execute(
-            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
-            (76544, 0, tid),
+            "UPDATE tasks SET worker_pid=? WHERE id=?",
+            (os.getpid(), tid),
         )
         conn.commit()
 
         released = kb.release_running_workers_for_gateway_shutdown(
             conn,
             "Gateway shutdown (test)",
-            host="this-host",
+        )
+
+        assert released == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock == claimer
+        assert task.worker_pid == os.getpid()
+        # No run was closed as 'released': the worker still owns it.
+        run = kb.latest_run(conn, tid)
+        assert run.status == "running"
+
+
+def test_gateway_shutdown_release_ignores_other_process_claims_on_same_host(
+    kanban_home, monkeypatch,
+):
+    """Claims held by another process on this host are left alone.
+
+    A standalone ``hermes kanban daemon`` (``kanban.dispatch_in_gateway=false``)
+    claims as its own ``host:<daemon pid>``. Its in-flight workers are not
+    children of this gateway and its claims must survive the gateway's
+    shutdown — otherwise the daemon re-dispatches beside live workers.
+    """
+    import hermes_cli.kanban_db as _kb
+
+    with kb.connect() as conn:
+        host = _kb._claimer_id().split(":", 1)[0]
+        tid = kb.create_task(conn, title="daemon", assignee="worker")
+        kb.claim_task(conn, tid, claimer=f"{host}:77777")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?",
+            (76544, tid),
+        )
+        conn.commit()
+
+        released = kb.release_running_workers_for_gateway_shutdown(
+            conn,
+            "Gateway shutdown (test)",
+        )
+
+        assert released == []
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.claim_lock == f"{host}:77777"
+        assert task.worker_pid == 76544
+
+
+def test_gateway_shutdown_release_ignores_nonlocal_claims(
+    kanban_home,
+):
+    """Claims from another host are never released on shutdown."""
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="remote", assignee="worker")
+        kb.claim_task(conn, tid, claimer="other-host:worker")
+        conn.execute(
+            "UPDATE tasks SET worker_pid=?, consecutive_failures=? WHERE id=?",
+            (76545, 0, tid),
+        )
+        conn.commit()
+
+        released = kb.release_running_workers_for_gateway_shutdown(
+            conn,
+            "Gateway shutdown (test)",
         )
 
         assert released == []
         task = kb.get_task(conn, tid)
         assert task.status == "running"
         assert task.claim_lock == "other-host:worker"
-        assert task.worker_pid == 76544
+        assert task.worker_pid == 76545
 
 
 
