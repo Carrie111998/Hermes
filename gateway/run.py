@@ -20029,7 +20029,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await rename_thread(
                     str(source.thread_id),
                     status_title,
-                    only_if_current_name=str(expected_name),
+                    only_if_current_name=expected_name,
                 )
             except Exception:
                 logger.debug(
