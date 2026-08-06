@@ -2321,9 +2321,30 @@ DEFAULT_CONFIG = {
             "lease_seconds": 180,
             "max_items_per_run": 50,
             "retry_ceiling": 3,
+            # Per-MCP-read outer timeout. The selected MCP server's own request
+            # timeout is narrowed to the same value; it may never exceed the
+            # runner's wall-clock budget.
+            # Four sequential GitHub reads fit inside the default 120-second
+            # runner budget with headroom for reconciliation and persistence.
+            "provider_timeout_seconds": 20,
             "providers": {
-                "github": {"enabled": False},
-                "slack": {"enabled": False},
+                "github": {
+                    "enabled": False,
+                    "adapter": "disabled",
+                    "mcp_server": "github",
+                    # Required when adapter=mcp. Exact owner/name entries only.
+                    "repositories": [],
+                    "coderabbit_logins": ["coderabbitai[bot]", "coderabbitai"],
+                },
+                "slack": {
+                    "enabled": False,
+                    "adapter": "disabled",
+                    "mcp_server": "slack",
+                    # Both allowlists are mandatory when adapter=mcp. Reads are
+                    # restricted to existing stored threads on these channels.
+                    "channel_ids": [],
+                    "acknowledgement_user_ids": [],
+                },
             },
         },
     },

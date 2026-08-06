@@ -13,6 +13,7 @@ from typing import Any, cast
 import pytest
 
 from hermes_cli import kanban as kc
+from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_github as github
 from hermes_cli import kanban_review_runner as runner
@@ -72,6 +73,62 @@ class NeverCalledSnapshotProvider:
         del repository, pr_number
         self.called = True
         raise AssertionError("deadline guard must stop this provider call")
+
+
+class ExactHeadReadAdapter:
+    """One deterministic provider implementing both exact-head read protocols."""
+
+    def read_snapshot(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+    ) -> github.GitHubPullRequestSnapshot:
+        return github.GitHubPullRequestSnapshot(
+            provider="fixture",
+            observation_id="github-exact-head",
+            repository=repository,
+            pr_number=pr_number,
+            pr_url=f"https://github.com/{repository}/pull/{pr_number}",
+            state="open",
+            is_draft=False,
+            base_ref="main",
+            head_ref="feature/exact-head",
+            head_sha=HEAD,
+            observed_at=NOW,
+            checks=(
+                github.GitHubCheck(
+                    check_id="checks",
+                    name="tests",
+                    head_sha=HEAD,
+                    status="completed",
+                    conclusion="success",
+                ),
+            ),
+            reviews=(),
+            review_threads=(),
+            requested_reviewers=(),
+        )
+
+    def read_review(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+        expected_head_sha: str,
+    ) -> coderabbit.CodeRabbitSnapshot:
+        assert expected_head_sha == HEAD
+        return coderabbit.CodeRabbitSnapshot(
+            provider="fixture",
+            observation_id="coderabbit-exact-head",
+            repository=repository,
+            pr_number=pr_number,
+            head_sha=expected_head_sha,
+            review_generation=1,
+            observed_at=NOW,
+            check_status="success",
+            summary=coderabbit.CodeRabbitReviewSummary("clean"),
+        )
 
 
 def _insert_github_intent(
@@ -168,6 +225,70 @@ def test_default_config_is_dry_run_and_every_mutating_surface_is_disabled():
     assert config.gateway_enabled is False
     assert config.github_provider_enabled is False
     assert config.slack_provider_enabled is False
+    assert config.provider_timeout_seconds * 4 < config.timeout_seconds
+
+
+def test_dry_run_never_constructs_configured_mcp_adapters(
+    kanban_home, monkeypatch
+) -> None:
+    def fail_if_called(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("dry-run must not discover or connect MCP servers")
+
+    monkeypatch.setattr(runner, "_build_configured_mcp_adapters", fail_if_called)
+    conn = kb.connect()
+    try:
+        receipt = runner.run_review_runner(
+            conn,
+            config=runner.ReviewRunnerConfig(
+                enabled=True,
+                mode="dry-run",
+                github_provider_enabled=True,
+                github_adapter="mcp",
+                github_repositories=("nousresearch/hermes-agent",),
+            ),
+            now=NOW,
+        )
+    finally:
+        conn.close()
+
+    assert receipt.status == "no_op"
+    assert receipt.read_only is True
+
+
+def test_shadow_runner_records_coderabbit_for_same_github_head(kanban_home) -> None:
+    conn = kb.connect()
+    try:
+        _insert_linear_ref(conn, issue_id="linear-exact-head")
+        adapter = ExactHeadReadAdapter()
+        receipt = runner.run_review_runner(
+            conn,
+            config=runner.ReviewRunnerConfig(
+                enabled=True,
+                mode="shadow",
+                github_provider_enabled=True,
+            ),
+            adapters=runner.ReviewRunnerAdapters(
+                provider_timeout_seconds=1,
+                reconciliation_snapshot_provider=adapter,
+                coderabbit_snapshot_provider=adapter,
+            ),
+            linear_issue_ids=("linear-exact-head",),
+            now=NOW,
+        )
+        assessment = coderabbit.get_head_assessment(
+            conn,
+            repository="nousresearch/hermes-agent",
+            pr_number=1,
+            head_sha=HEAD,
+        )
+    finally:
+        conn.close()
+
+    assert receipt.status == "ok"
+    assert assessment is not None
+    assert assessment.head_sha == HEAD
+    assert assessment.state == "clean"
 
 
 def test_kanban_parser_rejects_abbreviated_global_options() -> None:

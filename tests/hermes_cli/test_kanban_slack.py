@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_github as gh
+from hermes_cli import kanban_review_runner as runner
 from hermes_cli import kanban_slack as slack
 
 
@@ -236,6 +237,48 @@ def _ack_event(
     )
 
 
+def test_review_runner_ingests_allowlisted_slack_acknowledgements_replay_safely(
+    db_path: Path,
+):
+    snapshot = _snapshot()
+    transport = FakeSlackTransport(snapshot)
+    with kb.connect(db_path) as conn:
+        sent = _send_notification(conn, snapshot, transport)
+        provider = FakeAcknowledgementProvider(
+            _ack_event(sent.delivered_thread_ts or "")
+        )
+
+        first = runner._ingest_slack_acknowledgements(
+            conn,
+            provider=provider,
+            max_items=10,
+            now=NOW + 1,
+            monotonic=lambda: 0.0,
+            deadline=10.0,
+            provider_timeout_seconds=1,
+            allowed_channel_ids=(CHANNEL,),
+        )
+        second = runner._ingest_slack_acknowledgements(
+            conn,
+            provider=provider,
+            max_items=10,
+            now=NOW + 2,
+            monotonic=lambda: 0.0,
+            deadline=10.0,
+            provider_timeout_seconds=1,
+            allowed_channel_ids=(CHANNEL,),
+        )
+
+    assert first[0]["outcome"] == "recorded"
+    assert first[0]["created_count"] == 1
+    assert second[0]["outcome"] == "replayed_or_empty"
+    assert second[0]["created_count"] == 0
+    assert provider.calls == [
+        (CHANNEL, sent.delivered_thread_ts),
+        (CHANNEL, sent.delivered_thread_ts),
+    ]
+
+
 def _insert_gate(conn, *, gate_id: str = "g_test") -> None:
     conn.execute(
         """
@@ -276,10 +319,13 @@ def test_schema_and_provider_neutral_protocols_are_additive(db_path: Path):
 
     assert transport.read_snapshot(repository=REPO, pr_number=PR_NUMBER) is snapshot
     assert delivery.find_delivery(idempotency_key="missing") is None
-    assert acknowledgement.read_acknowledgements(
-        channel_id=CHANNEL,
-        thread_ts="1800000000.000001",
-    ) == ()
+    assert (
+        acknowledgement.read_acknowledgements(
+            channel_id=CHANNEL,
+            thread_ts="1800000000.000001",
+        )
+        == ()
+    )
 
     with kb.connect(db_path) as conn:
         tables = {
@@ -489,9 +535,7 @@ def test_terminal_human_gate_suppresses_notification_before_send(db_path: Path):
     transport = FakeSlackTransport(snapshot)
     with kb.connect(db_path) as conn:
         intent = _enqueue(conn, snapshot=snapshot).intent
-        conn.execute(
-            "UPDATE human_review_gates SET state='closed' WHERE id='g_test'"
-        )
+        conn.execute("UPDATE human_review_gates SET state='closed' WHERE id='g_test'")
         result = slack.process_intent(
             conn,
             intent.id,
@@ -589,10 +633,14 @@ def test_acknowledgement_normalization_and_route_binding(db_path: Path):
         slack.normalize_acknowledgement_action("reaction", "white_check_mark")
         == "acknowledged"
     )
-    assert slack.normalize_acknowledgement_action("text", "will review") == "will_review"
+    assert (
+        slack.normalize_acknowledgement_action("text", "will review") == "will_review"
+    )
     assert slack.normalize_acknowledgement_action("text", "LGTM") == "acknowledged"
     assert slack.normalize_acknowledgement_action("button", "merge") == "acknowledged"
-    assert slack.normalize_acknowledgement_action("text", "unrelated prose") == "ignored"
+    assert (
+        slack.normalize_acknowledgement_action("text", "unrelated prose") == "ignored"
+    )
     assert "approved" not in slack.ACKNOWLEDGEMENT_ACTIONS
 
     snapshot = _snapshot()

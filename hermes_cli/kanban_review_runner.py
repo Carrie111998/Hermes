@@ -18,6 +18,7 @@ from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Literal, Mapping, Optional, Sequence, cast
 
 from hermes_constants import display_hermes_home
+from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_github as github
 from hermes_cli import kanban_reconciliation as reconciliation
@@ -41,6 +42,7 @@ DEFAULT_TIMEOUT_SECONDS = 120
 DEFAULT_LEASE_SECONDS = 180
 DEFAULT_MAX_ITEMS = 50
 DEFAULT_RETRY_CEILING = 3
+DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20
 MAX_TIMEOUT_SECONDS = 15 * 60
 MAX_LEASE_SECONDS = 60 * 60
 MAX_ITEMS_PER_RUN = 500
@@ -52,6 +54,24 @@ class ReviewRunnerError(ValueError):
 
 class ReviewRunnerDeadlineExceeded(TimeoutError):
     """The runner cannot safely start another bounded provider operation."""
+
+
+def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes, bytearray)):
+        raise ReviewRunnerError(f"{field} must be an array of non-empty strings")
+    result = tuple(str(item or "").strip() for item in value)
+    if any(not item for item in result):
+        raise ReviewRunnerError(f"{field} must contain only non-empty strings")
+    return result
+
+
+def _adapter_kind(value: Any, field: str) -> str:
+    normalized = str(value or "disabled").strip().casefold()
+    if normalized not in {"disabled", "mcp"}:
+        raise ReviewRunnerError(f"{field} must be 'disabled' or 'mcp'")
+    return normalized
 
 
 def _positive_int(value: Any, field: str, *, maximum: int) -> int:
@@ -77,8 +97,17 @@ class ReviewRunnerConfig:
     lease_seconds: int = DEFAULT_LEASE_SECONDS
     max_items: int = DEFAULT_MAX_ITEMS
     retry_ceiling: int = DEFAULT_RETRY_CEILING
+    provider_timeout_seconds: int = DEFAULT_PROVIDER_TIMEOUT_SECONDS
     github_provider_enabled: bool = False
     slack_provider_enabled: bool = False
+    github_adapter: str = "disabled"
+    github_mcp_server: str = "github"
+    github_repositories: tuple[str, ...] = ()
+    coderabbit_logins: tuple[str, ...] = ("coderabbitai[bot]", "coderabbitai")
+    slack_adapter: str = "disabled"
+    slack_mcp_server: str = "slack"
+    slack_channel_ids: tuple[str, ...] = ()
+    slack_acknowledgement_user_ids: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         normalized_mode = str(self.mode or "").strip().casefold()
@@ -111,6 +140,38 @@ class ReviewRunnerConfig:
             "retry_ceiling",
             _positive_int(self.retry_ceiling, "retry_ceiling", maximum=20),
         )
+        provider_timeout = _positive_int(
+            self.provider_timeout_seconds,
+            "provider_timeout_seconds",
+            maximum=MAX_TIMEOUT_SECONDS,
+        )
+        object.__setattr__(self, "provider_timeout_seconds", provider_timeout)
+        object.__setattr__(
+            self,
+            "github_adapter",
+            _adapter_kind(self.github_adapter, "providers.github.adapter"),
+        )
+        object.__setattr__(
+            self,
+            "slack_adapter",
+            _adapter_kind(self.slack_adapter, "providers.slack.adapter"),
+        )
+        for field_name in ("github_mcp_server", "slack_mcp_server"):
+            normalized = str(getattr(self, field_name) or "").strip()
+            if not normalized:
+                raise ReviewRunnerError(f"{field_name} must be a non-empty string")
+            object.__setattr__(self, field_name, normalized)
+        for field_name in (
+            "github_repositories",
+            "coderabbit_logins",
+            "slack_channel_ids",
+            "slack_acknowledgement_user_ids",
+        ):
+            object.__setattr__(
+                self,
+                field_name,
+                _string_tuple(getattr(self, field_name), field_name),
+            )
         for field_name in (
             "enabled",
             "gateway_enabled",
@@ -140,11 +201,38 @@ class ReviewRunnerConfig:
             lease_seconds=raw.get("lease_seconds", DEFAULT_LEASE_SECONDS),
             max_items=raw.get("max_items_per_run", DEFAULT_MAX_ITEMS),
             retry_ceiling=raw.get("retry_ceiling", DEFAULT_RETRY_CEILING),
+            provider_timeout_seconds=raw.get(
+                "provider_timeout_seconds",
+                DEFAULT_PROVIDER_TIMEOUT_SECONDS,
+            ),
             github_provider_enabled=is_truthy_value(
                 github_cfg.get("enabled"), default=False
             ),
             slack_provider_enabled=is_truthy_value(
                 slack_cfg.get("enabled"), default=False
+            ),
+            github_adapter=str(github_cfg.get("adapter") or "disabled"),
+            github_mcp_server=str(github_cfg.get("mcp_server") or "github"),
+            github_repositories=_string_tuple(
+                github_cfg.get("repositories"),
+                "providers.github.repositories",
+            ),
+            coderabbit_logins=_string_tuple(
+                github_cfg.get(
+                    "coderabbit_logins",
+                    ("coderabbitai[bot]", "coderabbitai"),
+                ),
+                "providers.github.coderabbit_logins",
+            ),
+            slack_adapter=str(slack_cfg.get("adapter") or "disabled"),
+            slack_mcp_server=str(slack_cfg.get("mcp_server") or "slack"),
+            slack_channel_ids=_string_tuple(
+                slack_cfg.get("channel_ids"),
+                "providers.slack.channel_ids",
+            ),
+            slack_acknowledgement_user_ids=_string_tuple(
+                slack_cfg.get("acknowledgement_user_ids"),
+                "providers.slack.acknowledgement_user_ids",
             ),
         )
 
@@ -175,20 +263,23 @@ class ReviewRunnerConfig:
 
 @dataclass(frozen=True)
 class ReviewRunnerAdapters:
-    """Explicit injection point; no live adapter is constructed in this phase."""
+    """Explicit adapter surface; write-capable transports remain separate."""
 
     # Every future live adapter must enforce this request-level timeout in its
     # own HTTP/client layer. A runner wall-clock budget alone cannot safely
     # cancel an in-flight side effect, so missing/oversized declarations fail
     # closed before any provider call.
     provider_timeout_seconds: Optional[int] = None
+    reconciliation_provider_call_count: int = 1
     reconciliation_snapshot_provider: Optional[
         reconciliation.ReconciliationSnapshotProvider
     ] = None
     github_snapshot_provider: Optional[github.GitHubSnapshotProvider] = None
+    coderabbit_snapshot_provider: Optional[coderabbit.CodeRabbitSnapshotProvider] = None
     github_delivery_transport: Optional[github.GitHubDeliveryTransport] = None
     slack_snapshot_provider: Optional[slack.PullRequestSnapshotProvider] = None
     slack_delivery_transport: Optional[slack.SlackDeliveryTransport] = None
+    slack_acknowledgement_provider: Optional[slack.SlackAcknowledgementProvider] = None
 
     @property
     def has_registered_adapter(self) -> bool:
@@ -197,9 +288,11 @@ class ReviewRunnerAdapters:
             for adapter in (
                 self.reconciliation_snapshot_provider,
                 self.github_snapshot_provider,
+                self.coderabbit_snapshot_provider,
                 self.github_delivery_transport,
                 self.slack_snapshot_provider,
                 self.slack_delivery_transport,
+                self.slack_acknowledgement_provider,
             )
         )
 
@@ -212,7 +305,14 @@ class ReviewRunnerAdapters:
             timeout = int(self.provider_timeout_seconds)
         except (TypeError, ValueError):
             return False
-        return 1 <= timeout <= runner_timeout_seconds
+        try:
+            call_count = int(self.reconciliation_provider_call_count)
+        except (TypeError, ValueError):
+            return False
+        return (
+            1 <= timeout <= runner_timeout_seconds
+            and 1 <= call_count <= MAX_ITEMS_PER_RUN
+        )
 
 
 @dataclass(frozen=True)
@@ -304,6 +404,170 @@ class _DisabledReconciliationSnapshotProvider:
 
 
 @dataclass(frozen=True)
+class _CodeRabbitRecordingSnapshotProvider:
+    """Bind CodeRabbit evidence to the exact head returned by the same PR read."""
+
+    conn: sqlite3.Connection
+    github_provider: reconciliation.ReconciliationSnapshotProvider
+    coderabbit_provider: coderabbit.CodeRabbitSnapshotProvider
+    persist: bool
+    now: int
+
+    def read_snapshot(
+        self,
+        *,
+        repository: str,
+        pr_number: int,
+    ) -> Optional[github.GitHubPullRequestSnapshot]:
+        snapshot = self.github_provider.read_snapshot(
+            repository=repository,
+            pr_number=pr_number,
+        )
+        if snapshot is None:
+            return None
+        review = self.coderabbit_provider.read_review(
+            repository=snapshot.repository,
+            pr_number=snapshot.pr_number,
+            expected_head_sha=snapshot.head_sha,
+        )
+        if not isinstance(review, coderabbit.CodeRabbitSnapshot):
+            raise ReviewRunnerError(
+                "CodeRabbit provider returned an invalid normalized snapshot"
+            )
+        if review.head_sha != snapshot.head_sha:
+            raise ReviewRunnerError(
+                "CodeRabbit provider returned evidence for a non-current head"
+            )
+        if self.persist:
+            coderabbit.record_snapshot(
+                self.conn,
+                snapshot=review,
+                current_head_sha=snapshot.head_sha,
+                current_head_observed_at=snapshot.observed_at,
+                now=self.now,
+            )
+        return snapshot
+
+
+def _build_configured_mcp_adapters(
+    config: ReviewRunnerConfig,
+    *,
+    clock: Callable[[], float] = time.time,
+) -> ReviewRunnerAdapters:
+    """Construct read-only MCP adapters only after explicit operator opt-in."""
+
+    github_server = (
+        config.github_mcp_server
+        if config.github_provider_enabled and config.github_adapter == "mcp"
+        else None
+    )
+    slack_server = (
+        config.slack_mcp_server
+        if config.slack_provider_enabled and config.slack_adapter == "mcp"
+        else None
+    )
+    if github_server is None and slack_server is None:
+        return ReviewRunnerAdapters()
+
+    from hermes_cli.kanban_mcp_adapters import build_review_runner_mcp_bundle
+
+    bundle = build_review_runner_mcp_bundle(
+        provider_timeout_seconds=config.provider_timeout_seconds,
+        github_server_name=github_server,
+        github_repositories=config.github_repositories,
+        coderabbit_logins=config.coderabbit_logins,
+        slack_server_name=slack_server,
+        slack_channel_ids=config.slack_channel_ids,
+        slack_user_ids=config.slack_acknowledgement_user_ids,
+        clock=clock,
+    )
+    return ReviewRunnerAdapters(
+        provider_timeout_seconds=bundle.provider_timeout_seconds,
+        # One GitHub snapshot collection is exactly four allowlisted MCP reads;
+        # CodeRabbit normalization reuses that same in-memory exact-head bundle.
+        reconciliation_provider_call_count=(
+            4 if bundle.github_adapter is not None else 1
+        ),
+        reconciliation_snapshot_provider=bundle.github_adapter,
+        github_snapshot_provider=bundle.github_adapter,
+        coderabbit_snapshot_provider=bundle.github_adapter,
+        slack_snapshot_provider=bundle.github_adapter,
+        slack_acknowledgement_provider=bundle.slack_acknowledgement_provider,
+        # Delivery transports intentionally remain None: this phase cannot
+        # perform GitHub or Slack external writes.
+    )
+
+
+def _ingest_slack_acknowledgements(
+    conn: sqlite3.Connection,
+    *,
+    provider: slack.SlackAcknowledgementProvider,
+    max_items: int,
+    now: int,
+    monotonic: Callable[[], float],
+    deadline: float,
+    provider_timeout_seconds: int,
+    allowed_channel_ids: Sequence[str] = (),
+) -> list[dict[str, Any]]:
+    """Read existing stored Slack threads and persist replay-safe local acks."""
+
+    rows = conn.execute(
+        "SELECT * FROM slack_human_review_outbox "
+        "WHERE state='sent' AND delivered_thread_ts IS NOT NULL "
+        "ORDER BY sent_at, id LIMIT ?",
+        (max_items,),
+    ).fetchall()
+    allowed_channels = frozenset(str(item) for item in allowed_channel_ids)
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        intent = slack.SlackOutboxIntent.from_row(row)
+        if not intent.delivered_thread_ts:
+            continue
+        if allowed_channels and intent.channel_id not in allowed_channels:
+            results.append({
+                "surface": "slack_acknowledgement",
+                "intent_id": intent.id,
+                "outcome": "channel_outside_allowlist",
+                "observed_count": 0,
+                "created_count": 0,
+                "external_write": False,
+            })
+            continue
+        if deadline - monotonic() < provider_timeout_seconds:
+            raise ReviewRunnerDeadlineExceeded(
+                "runner deadline cannot accommodate another Slack MCP read"
+            )
+        events = provider.read_acknowledgements(
+            channel_id=intent.channel_id,
+            thread_ts=intent.delivered_thread_ts,
+        )
+        if not isinstance(events, tuple) or any(
+            not isinstance(event, slack.SlackAcknowledgementEvent) for event in events
+        ):
+            raise ReviewRunnerError(
+                "Slack acknowledgement provider returned invalid normalized events"
+            )
+        created = 0
+        for event in events:
+            receipt = slack.record_acknowledgement(
+                conn,
+                source_intent_id=intent.id,
+                event=event,
+                now=now,
+            )
+            created += int(receipt.created)
+        results.append({
+            "surface": "slack_acknowledgement",
+            "intent_id": intent.id,
+            "outcome": "recorded" if created else "replayed_or_empty",
+            "observed_count": len(events),
+            "created_count": created,
+            "external_write": False,
+        })
+    return results
+
+
+@dataclass(frozen=True)
 class _DeadlineSnapshotProvider:
     """Refuse to start a read that cannot finish inside the runner budget.
 
@@ -317,6 +581,7 @@ class _DeadlineSnapshotProvider:
     monotonic: Callable[[], float]
     deadline: float
     provider_timeout_seconds: int
+    provider_call_count: int = 1
 
     def read_snapshot(
         self,
@@ -325,7 +590,8 @@ class _DeadlineSnapshotProvider:
         pr_number: int,
     ) -> Optional[github.GitHubPullRequestSnapshot]:
         remaining = self.deadline - self.monotonic()
-        if remaining < self.provider_timeout_seconds:
+        required_window = self.provider_timeout_seconds * self.provider_call_count
+        if remaining < required_window:
             raise ReviewRunnerDeadlineExceeded(
                 "runner deadline exhausted before the next reconciliation read"
             )
@@ -617,14 +883,19 @@ def diagnose_review_runner(
             "expires_at": int(lease["expires_at"]),
             "stale": int(lease["expires_at"]) <= checked_at,
         }
-    github_registered = (
+    github_write_registered = (
         registered.github_snapshot_provider is not None
         and registered.github_delivery_transport is not None
     )
-    slack_registered = (
+    github_read_registered = (
+        registered.github_snapshot_provider is not None
+        and registered.coderabbit_snapshot_provider is not None
+    )
+    slack_write_registered = (
         registered.slack_snapshot_provider is not None
         and registered.slack_delivery_transport is not None
     )
+    slack_read_registered = registered.slack_acknowledgement_provider is not None
     timeout_bounded = registered.timeout_is_bounded(
         runner_timeout_seconds=config.timeout_seconds
     )
@@ -632,14 +903,14 @@ def diagnose_review_runner(
         "disabled"
         if not config.github_provider_enabled
         else "registered_unprobed"
-        if github_registered
+        if github_read_registered or github_write_registered
         else "adapter_not_registered"
     )
     slack_connectivity = (
         "disabled"
         if not config.slack_provider_enabled
         else "registered_unprobed"
-        if slack_registered
+        if slack_read_registered or slack_write_registered
         else "adapter_not_registered"
     )
     return {
@@ -657,27 +928,40 @@ def diagnose_review_runner(
             "lease_seconds": config.lease_seconds,
             "max_items_per_run": config.max_items,
             "retry_ceiling": config.retry_ceiling,
+            "provider_timeout_seconds": config.provider_timeout_seconds,
+            "external_writes_enabled": (
+                github_write_registered or slack_write_registered
+            ),
         },
         "providers": {
             "github": {
                 "enabled": config.github_provider_enabled,
-                "registered": github_registered,
+                "adapter": config.github_adapter,
+                "read_registered": github_read_registered,
+                "write_registered": github_write_registered,
+                "repository_allowlist_count": len(config.github_repositories),
                 "connectivity": github_connectivity,
                 "connectivity_probe_performed": False,
                 "ready": (
                     config.github_provider_enabled
-                    and github_registered
+                    and github_read_registered
                     and timeout_bounded
                 ),
             },
             "slack": {
                 "enabled": config.slack_provider_enabled,
-                "registered": slack_registered,
+                "adapter": config.slack_adapter,
+                "read_registered": slack_read_registered,
+                "write_registered": slack_write_registered,
+                "channel_allowlist_count": len(config.slack_channel_ids),
+                "acknowledgement_user_allowlist_count": len(
+                    config.slack_acknowledgement_user_ids
+                ),
                 "connectivity": slack_connectivity,
                 "connectivity_probe_performed": False,
                 "ready": (
                     config.slack_provider_enabled
-                    and slack_registered
+                    and slack_read_registered
                     and timeout_bounded
                 ),
             },
@@ -691,12 +975,12 @@ def diagnose_review_runner(
             and (
                 (
                     config.github_provider_enabled
-                    and github_registered
+                    and github_write_registered
                     and timeout_bounded
                 )
                 or (
                     config.slack_provider_enabled
-                    and slack_registered
+                    and slack_write_registered
                     and timeout_bounded
                 )
             ),
@@ -809,7 +1093,6 @@ def run_review_runner(
 ) -> ReviewRunnerReceipt:
     """Run one bounded audit/outbox pass without creating follow-up work."""
     started_at = int(time.time()) if now is None else int(now)
-    effective_adapters = adapters or ReviewRunnerAdapters()
     candidates, _counts = list_runner_candidates(
         conn,
         now=started_at,
@@ -817,6 +1100,35 @@ def run_review_runner(
         retry_ceiling=config.retry_ceiling,
     )
     mode = config.mode
+    if adapters is None and mode != "dry-run":
+        try:
+            effective_adapters = _build_configured_mcp_adapters(
+                config,
+                clock=lambda: float(started_at),
+            )
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            kind = getattr(exc, "kind", None)
+            error = f"configured MCP adapter setup failed: {type(exc).__name__}"
+            if kind:
+                error += f" ({kind})"
+            return ReviewRunnerReceipt(
+                "failed",
+                mode,
+                False,
+                None,
+                None,
+                None,
+                None,
+                0,
+                candidates,
+                (),
+                (),
+                (error,),
+            )
+    else:
+        effective_adapters = adapters or ReviewRunnerAdapters()
     if not effective_adapters.timeout_is_bounded(
         runner_timeout_seconds=config.timeout_seconds
     ):
@@ -887,6 +1199,22 @@ def run_review_runner(
     status: RunnerStatus = "no_op"
     lease_owner = lease.owner_id if lease is not None else None
     try:
+        if effective_adapters.slack_acknowledgement_provider is not None:
+            assert effective_adapters.provider_timeout_seconds is not None
+            results.extend(
+                _ingest_slack_acknowledgements(
+                    conn,
+                    provider=effective_adapters.slack_acknowledgement_provider,
+                    max_items=config.max_items,
+                    now=started_at,
+                    monotonic=monotonic,
+                    deadline=deadline,
+                    provider_timeout_seconds=int(
+                        effective_adapters.provider_timeout_seconds
+                    ),
+                    allowed_channel_ids=config.slack_channel_ids,
+                )
+            )
         provider = effective_adapters.reconciliation_snapshot_provider
         if provider is None:
             provider = effective_adapters.github_snapshot_provider
@@ -894,11 +1222,20 @@ def run_review_runner(
             provider = _DisabledReconciliationSnapshotProvider()
         else:
             assert effective_adapters.provider_timeout_seconds is not None
+            if effective_adapters.coderabbit_snapshot_provider is not None:
+                provider = _CodeRabbitRecordingSnapshotProvider(
+                    conn,
+                    provider,
+                    effective_adapters.coderabbit_snapshot_provider,
+                    mode in {"shadow", "live"},
+                    started_at,
+                )
             provider = _DeadlineSnapshotProvider(
                 provider,
                 monotonic,
                 deadline,
                 int(effective_adapters.provider_timeout_seconds),
+                effective_adapters.reconciliation_provider_call_count,
             )
         completed_execution = reconciliation.reconcile(
             conn,
@@ -987,7 +1324,13 @@ def run_review_runner(
         errors.append(str(exc))
         status = "timed_out"
     except Exception as exc:
-        errors.append(f"unexpected {type(exc).__name__}")
+        kind = getattr(exc, "kind", None)
+        error = f"unexpected {type(exc).__name__}"
+        if kind:
+            error += f" ({kind})"
+        elif isinstance(exc, ReviewRunnerError):
+            error += f": {str(exc)[:200]}"
+        errors.append(error)
         status = "failed"
     finally:
         if lease_owner is not None:

@@ -359,7 +359,7 @@ class CodeRabbitSnapshot:
 
 
 class CodeRabbitSnapshotProvider(Protocol):
-    """Read-only adapter protocol; no implementation is installed in this phase."""
+    """Read-only adapter protocol for exact-head CodeRabbit evidence."""
 
     def read_review(
         self,
