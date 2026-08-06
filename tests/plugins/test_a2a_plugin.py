@@ -546,6 +546,44 @@ class TestClientTools:
         out = tools.a2a_list({})
         assert "No peers configured" in out
 
+    def test_list_probes_peers(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr(
+            tools, "_load_config",
+            lambda: {"a2a_agents": {"peer": {"url": "http://localhost:9999"}}},
+        )
+        monkeypatch.setattr(tools, "_probe_peer", lambda url, auth_header, timeout=3: "online (5ms, test)")
+        out = tools.a2a_list({})
+        assert "online (5ms, test)" in out
+        assert "http://localhost:9999" in out
+
+
+class TestProbePeer:
+    def test_online(self, monkeypatch):
+        monkeypatch.setattr(tools, "_fetch_card", lambda url, h, t: {"name": "hermes-x"})
+        status = tools._probe_peer("http://x:1", {})
+        assert status.startswith("online (")
+        assert "hermes-x" in status
+
+    def test_http_error(self, monkeypatch):
+        def boom(url, h, t):
+            raise urllib.error.HTTPError(url, 401, "unauthorized", None, None)
+        monkeypatch.setattr(tools, "_fetch_card", boom)
+        assert tools._probe_peer("http://x:1", {}) == "offline: HTTP 401"
+
+    def test_connection_error(self, monkeypatch):
+        def boom(url, h, t):
+            raise urllib.error.URLError("connection refused")
+        monkeypatch.setattr(tools, "_fetch_card", boom)
+        assert "offline:" in tools._probe_peer("http://x:1", {})
+        assert "connection refused" in tools._probe_peer("http://x:1", {})
+
+    def test_never_raises_on_garbage(self, monkeypatch):
+        def boom(url, h, t):
+            raise ValueError("bad json")
+        monkeypatch.setattr(tools, "_fetch_card", boom)
+        assert "offline:" in tools._probe_peer("http://x:1", {})
+
 
 class TestRegistryDispatchConvention:
     """Tools must accept the args-as-dict positional that registry.dispatch
