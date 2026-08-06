@@ -28,6 +28,7 @@ import logging
 import re
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -3451,12 +3452,81 @@ def sanitize_api_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
             deduped.append(msg)
         else:
             deduped.append(msg)
+    # Always take the deduped list — mutations are only present when
+    # removed_dupes > 0, but keeping the assignment unconditional makes the
+    # adjacency rebuild below operate on a single known list.
+    messages = deduped
     if removed_dupes:
-        messages = deduped
         _ra().logger.debug(
             "Pre-call sanitizer: removed %d duplicate tool_call_id reference(s)",
             removed_dupes,
         )
+
+    # 4. Enforce immediate tool adjacency (DeepSeek / Kimi / strict OpenAI-compat).
+    # KAI-ADJACENCY-V1
+    # Steps 1–3 ensure each tool_call_id has some result somewhere and strip
+    # duplicates, but providers that require tool messages to IMMEDIATELY follow
+    # the assistant.tool_calls turn still 400 when a result was parked later
+    # (compression splice, resume, intervening user/assistant). Rebuild on the
+    # per-call copy only — do not rewrite persisted trajectory.
+    # Prefer relocating the real tool result next to its call; stub only when
+    # no matching result remains. Related: #24328; supersedes stale #24374 /
+    # #24330 / #24405 which targeted pre-extraction run_agent.py.
+    tools_by_id: dict = defaultdict(list)
+    non_tool: List[Dict[str, Any]] = []
+    dropped_empty_tool_ids = 0
+    for msg in messages:
+        if msg.get("role") == "tool":
+            cid = (msg.get("tool_call_id") or "").strip()
+            if not cid:
+                dropped_empty_tool_ids += 1
+                continue
+            # Normalize id on the relocated copy so provider string-equality
+            # matches the assistant tool_call id (strip asymmetry scar).
+            if msg.get("tool_call_id") != cid:
+                msg = {**msg, "tool_call_id": cid}
+            tools_by_id[cid].append(msg)
+            continue
+        non_tool.append(msg)
+
+    rebuilt: List[Dict[str, Any]] = []
+    stubs_adjacent = 0
+    for msg in non_tool:
+        if (
+            isinstance(msg, dict)
+            and msg.get("role") == "assistant"
+            and "tool_calls" in msg
+            and not (isinstance(msg.get("tool_calls"), list) and msg.get("tool_calls"))
+        ):
+            msg = {k: v for k, v in msg.items() if k != "tool_calls"}
+        rebuilt.append(msg)
+        if msg.get("role") != "assistant":
+            continue
+        for tc in msg.get("tool_calls") or []:
+            cid = (_ra().AIAgent._get_tool_call_id_static(tc) or "").strip()
+            if not cid:
+                continue
+            q = tools_by_id.get(cid) or []
+            if q:
+                rebuilt.append(q.pop(0))
+            else:
+                rebuilt.append({
+                    "role": "tool",
+                    "name": _ra().AIAgent._get_tool_call_name_static(tc),
+                    "content": "[Result unavailable — see context summary above]",
+                    "tool_call_id": cid,
+                })
+                stubs_adjacent += 1
+    leftover = sum(len(v) for v in tools_by_id.values())
+    if stubs_adjacent or leftover or dropped_empty_tool_ids:
+        _ra().logger.debug(
+            "Pre-call sanitizer: adjacency pass stubs=%d "
+            "dropped_leftover_tools=%d dropped_empty_tool_ids=%d",
+            stubs_adjacent,
+            leftover,
+            dropped_empty_tool_ids,
+        )
+    messages = rebuilt
     return messages
 
 

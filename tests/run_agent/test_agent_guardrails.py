@@ -106,6 +106,110 @@ class TestSanitizeApiMessages:
     def test_empty_list_is_safe(self):
         assert AIAgent._sanitize_api_messages([]) == []
 
+    def test_api_sanitizer_relocates_parked_tool_result(self):
+        """Result with matching id later must move next to assistant.tool_calls.
+
+        Strict providers (DeepSeek / Kimi) reject assistant(tool_calls) followed
+        by a user turn even when a matching tool result exists later. Prefer
+        relocating the real result over stubbing it away.
+        """
+        messages = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_old",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "second"},
+            {"role": "tool", "tool_call_id": "call_old", "content": "late real result"},
+        ]
+        out = AIAgent._sanitize_api_messages(messages)
+        assistant_idx = next(i for i, m in enumerate(out) if m.get("tool_calls"))
+        assert out[assistant_idx + 1]["role"] == "tool"
+        assert out[assistant_idx + 1]["tool_call_id"] == "call_old"
+        assert out[assistant_idx + 1]["content"] == "late real result"
+        assert any(m.get("role") == "user" and m.get("content") == "second" for m in out)
+
+    def test_api_sanitizer_stubs_when_result_missing_after_user(self):
+        messages = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_miss",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "second"},
+        ]
+        out = AIAgent._sanitize_api_messages(messages)
+        assistant_idx = next(i for i, m in enumerate(out) if m.get("tool_calls"))
+        assert out[assistant_idx + 1]["role"] == "tool"
+        assert out[assistant_idx + 1]["tool_call_id"] == "call_miss"
+        assert "Result unavailable" in out[assistant_idx + 1]["content"]
+
+    def test_api_sanitizer_emits_tool_results_in_call_order(self):
+        messages = [
+            {"role": "user", "content": "go"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_a",
+                        "type": "function",
+                        "function": {"name": "a", "arguments": "{}"},
+                    },
+                    {
+                        "id": "call_b",
+                        "type": "function",
+                        "function": {"name": "b", "arguments": "{}"},
+                    },
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_b", "content": "B"},
+            {"role": "tool", "tool_call_id": "call_a", "content": "A"},
+        ]
+        out = AIAgent._sanitize_api_messages(messages)
+        assistant_idx = next(i for i, m in enumerate(out) if m.get("tool_calls"))
+        assert out[assistant_idx + 1]["tool_call_id"] == "call_a"
+        assert out[assistant_idx + 1]["content"] == "A"
+        assert out[assistant_idx + 2]["tool_call_id"] == "call_b"
+        assert out[assistant_idx + 2]["content"] == "B"
+
+    def test_api_sanitizer_strips_whitespace_tool_call_id_on_relocate(self):
+        messages = [
+            {"role": "user", "content": "first"},
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_ws",
+                        "type": "function",
+                        "function": {"name": "read_file", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "user", "content": "second"},
+            {"role": "tool", "tool_call_id": " call_ws ", "content": "padded"},
+        ]
+        out = AIAgent._sanitize_api_messages(messages)
+        assistant_idx = next(i for i, m in enumerate(out) if m.get("tool_calls"))
+        assert out[assistant_idx + 1]["role"] == "tool"
+        assert out[assistant_idx + 1]["tool_call_id"] == "call_ws"
+        assert out[assistant_idx + 1]["content"] == "padded"
+
 
     def test_sdk_object_tool_calls(self):
         tc_obj = types.SimpleNamespace(id="c6", function=types.SimpleNamespace(
