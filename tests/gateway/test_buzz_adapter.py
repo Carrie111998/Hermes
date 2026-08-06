@@ -573,6 +573,86 @@ class TestBuzzAdapterSend:
         assert result.retryable is False
         assert "response" in result.error.lower()
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "receipt",
+        [
+            [],
+            {},
+            {"event_id": "evt-without-acceptance"},
+            {"accepted": True},
+            {"accepted": True, "event_id": ""},
+            {"accepted": True, "event_id": "   "},
+            {"accepted": 1, "event_id": "evt-non-boolean-acceptance"},
+        ],
+        ids=[
+            "non-dict",
+            "missing-accepted-and-id",
+            "missing-accepted",
+            "missing-event-id",
+            "empty-event-id",
+            "blank-event-id",
+            "non-boolean-accepted",
+        ],
+    )
+    async def test_send_document_rejects_invalid_zero_exit_receipt(self, tmp_path, receipt):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script("messages", "send", receipt)
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert result.message_id is None
+        assert result.retryable is False
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejection_is_useful_and_bounded(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        external_message = "relay rejected: " + ("x" * 100_000)
+        cli.script(
+            "messages",
+            "send",
+            {
+                "accepted": False,
+                "event_id": "evt-rejected",
+                "message": external_message,
+                "external": "y" * 100_000,
+            },
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert result.message_id is None
+        assert result.retryable is False
+        assert result.error.startswith("relay rejected:")
+        assert len(result.error) <= 1_024
+        assert result.raw_response is None
+
+    @pytest.mark.asyncio
+    async def test_send_document_valid_receipt_preserves_success_payload(self, tmp_path):
+        document = tmp_path / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        receipt = {"accepted": True, "event_id": "evt-valid", "message": "delivered"}
+        cli.script("messages", "send", receipt)
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is True
+        assert result.message_id == "evt-valid"
+        assert result.raw_response == receipt
+
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────
 

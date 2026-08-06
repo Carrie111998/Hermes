@@ -344,6 +344,24 @@ def _cli_retryable(raw: str, exit_code: int) -> bool:
     return exit_code == 2
 
 
+_MAX_DOCUMENT_RECEIPT_ERROR_CHARS = 900
+
+
+def _document_receipt_error(data: Dict[str, Any], local: Path) -> str:
+    """Return useful, bounded detail for an invalid document-send receipt."""
+    message = data.get("message")
+    if isinstance(message, str) and message.strip():
+        detail = message.strip()
+    elif data.get("accepted") is False:
+        detail = "Buzz CLI rejected the document"
+    else:
+        detail = "Incomplete response from Buzz CLI"
+    detail = detail.replace(str(local), local.name)
+    if len(detail) > _MAX_DOCUMENT_RECEIPT_ERROR_CHARS:
+        detail = f"{detail[: _MAX_DOCUMENT_RECEIPT_ERROR_CHARS - 3]}..."
+    return detail
+
+
 def _parse_json_list(stdout: str) -> List[dict]:
     """Parse CLI stdout expected to be a JSON array of objects."""
     try:
@@ -714,12 +732,14 @@ class BuzzAdapter(BasePlatformAdapter):
         if not isinstance(data, dict):
             return SendResult(success=False, error="Invalid response from Buzz CLI")
         event_id = data.get("event_id")
-        if data.get("accepted") is not True or not isinstance(event_id, str) or not event_id:
-            error = str(data.get("message") or "Incomplete response from Buzz CLI")
+        if (
+            data.get("accepted") is not True
+            or not isinstance(event_id, str)
+            or not event_id.strip()
+        ):
             return SendResult(
                 success=False,
-                error=error.replace(str(local), local.name),
-                raw_response=data,
+                error=_document_receipt_error(data, local),
             )
         self._mark_seen(str(chat_id), event_id)
         return SendResult(
