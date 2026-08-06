@@ -2878,6 +2878,88 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def resolve_assignee_skills(assignee: str, skill_names: Iterable[str]) -> list[str]:
+    """Resolve forced skills in a target profile without switching process state."""
+    from agent.skill_utils import (
+        iter_skill_index_files,
+        parse_frontmatter,
+        skill_matches_platform,
+        yaml_load,
+    )
+    from hermes_cli.profiles import get_profile_dir, profile_exists
+
+    requested = [str(name).strip() for name in skill_names if str(name).strip()]
+    if not requested or not assignee or not profile_exists(assignee):
+        return []
+
+    profile_home = get_profile_dir(assignee)
+    roots = [profile_home / "skills"]
+    try:
+        config = yaml_load((profile_home / "config.yaml").read_text(encoding="utf-8")) or {}
+        external = (config.get("skills") or {}).get("external_dirs") or []
+    except Exception:
+        external = []
+    if isinstance(external, str):
+        external = [external]
+    if isinstance(external, list):
+        for value in external:
+            path = Path(os.path.expanduser(os.path.expandvars(str(value).strip())))
+            path = path if path.is_absolute() else profile_home / path
+            try:
+                path = path.resolve()
+            except OSError:
+                continue
+            if path.is_dir() and path not in roots:
+                roots.append(path)
+
+    matches: dict[str, set[Path]] = {name: set() for name in requested}
+    for root in roots:
+        for skill_md in iter_skill_index_files(root, "SKILL.md"):
+            try:
+                frontmatter, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
+            except Exception:
+                continue
+            if not skill_matches_platform(frontmatter):
+                continue
+            declared = str(frontmatter.get("name") or skill_md.parent.name)
+            for name in requested:
+                categorized = name.replace(":", "/", 1)
+                if (
+                    name == declared
+                    or name == skill_md.parent.name
+                    or root / categorized == skill_md.parent
+                ):
+                    matches[name].add(skill_md.resolve())
+    return [name for name in requested if len(matches[name]) == 1]
+
+
+def _missing_assignee_skills(assignee: Optional[str], skills: Iterable[str]) -> list[str]:
+    """Return forced task skills unavailable to a spawnable card assignee."""
+    requested = [str(name).strip() for name in skills if str(name).strip()]
+    if not requested:
+        return []
+    if not assignee:
+        return requested
+    # Non-profile assignees are intentional pull-only control-plane lanes; the
+    # dispatcher already never spawns them, so they have no profile estate to
+    # preflight here.
+    from hermes_cli.profiles import profile_exists
+
+    if not profile_exists(assignee):
+        return []
+    resolved = set(resolve_assignee_skills(assignee, requested))
+    return [name for name in requested if name not in resolved]
+
+
+def _missing_skills_reason(assignee: Optional[str], missing: Iterable[str]) -> str:
+    display_assignee = assignee or "unassigned"
+    return (
+        f"Assignee {display_assignee} is missing required skill(s): "
+        + ", ".join(missing)
+        + f". Install them in profile {display_assignee} or reassign the task."
+    )
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3115,6 +3197,14 @@ def create_task(
                 "capabilities (e.g. `web`, `browser`, `terminal`)."
             )
         skills_list = cleaned
+
+    # Forced skills are evaluated in the target worker's profile, never the
+    # creator/dispatcher profile.  Refuse before the idempotency/insert path so
+    # a bad request cannot leave a card that will only fail after a spawn.
+    if skills_list and assignee:
+        missing_skills = _missing_assignee_skills(assignee, skills_list)
+        if missing_skills:
+            raise ValueError(_missing_skills_reason(assignee, missing_skills))
 
     # Idempotency check — return the existing task instead of creating a
     # duplicate. Done BEFORE entering write_txn to keep the fast path fast
@@ -5622,6 +5712,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    synthesize_run: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -5649,12 +5740,16 @@ def block_task(
 
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
+
+    ``synthesize_run=False`` is for preflight rejections that happen before a
+    worker ever starts; it keeps those capability events out of run history.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
     recurrences = 0
+    run_id: Optional[int] = None
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -5696,7 +5791,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and synthesize_run:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -5749,7 +5844,7 @@ def block_task(
                 outcome="blocked", status="blocked",
                 summary=reason,
             )
-            if run_id is None and reason:
+            if run_id is None and reason and synthesize_run:
                 run_id = _synthesize_ended_run(
                     conn, task_id, outcome="blocked", summary=reason,
                 )
@@ -5804,7 +5899,7 @@ def block_task(
             )
             # Synthesize a run when blocking a never-claimed task so the
             # reason is preserved in attempt history.
-            if run_id is None and reason:
+            if run_id is None and reason and synthesize_run:
                 run_id = _synthesize_ended_run(
                     conn, task_id,
                     outcome="blocked",
@@ -8517,6 +8612,32 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        # A task may predate create-time preflight, lose a profile skill after
+        # it was created, or be reassigned by another board client. Resolve
+        # against the row's current assignee immediately before any claim so a
+        # missing forced skill becomes an actionable capability block rather
+        # than a worker startup crash/retry loop.
+        candidate = get_task(conn, row["id"])
+        if (
+            candidate is None
+            or candidate.status != "ready"
+            or candidate.claim_lock is not None
+        ):
+            continue
+        missing_skills = _missing_assignee_skills(
+            candidate.assignee, candidate.skills or []
+        )
+        if missing_skills:
+            if not dry_run:
+                block_task(
+                    conn,
+                    candidate.id,
+                    reason=_missing_skills_reason(candidate.assignee, missing_skills),
+                    kind="capability",
+                    # This never started a worker, so leave no run/attempt record.
+                    synthesize_run=False,
+                )
+            continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -8528,7 +8649,7 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(conn, candidate.id, ttl_seconds=ttl_seconds)
         if claimed is None:
             continue
         try:

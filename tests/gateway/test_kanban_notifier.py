@@ -167,6 +167,33 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     assert "blocked" in message
 
 
+def test_capability_block_notification_says_worker_never_started(tmp_path, monkeypatch):
+    """Dispatcher preflight blocks are actionable, not a worker crash/retry."""
+    db_path = tmp_path / "capability-preflight.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    reason = "Assignee alpha is missing required skill(s): release-notes, api-review"
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="release", assignee="alpha")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason=reason, kind="capability")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    message = adapter.sent[0]["text"]
+    assert "blocked before start" in message
+    assert "alpha" in message
+    assert "release-notes, api-review" in message
+    assert "gave up" not in message
+    assert "crashed" not in message
+
+
 def test_non_dispatch_gateway_claims_only_its_profile_subscriptions(
     tmp_path, monkeypatch,
 ):

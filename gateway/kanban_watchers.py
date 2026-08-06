@@ -436,7 +436,13 @@ class GatewayKanbanWatchersMixin:
                             reason = ""
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
-                            msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
+                            if ev.payload and ev.payload.get("kind") == "capability":
+                                msg = (
+                                    f"⏸ {board_tag}{tag}Kanban {sub['task_id']} "
+                                    f"blocked before start{reason}"
+                                )
+                            else:
+                                msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
                         elif kind == "gave_up":
                             err = ""
                             if ev.payload and ev.payload.get("error"):
