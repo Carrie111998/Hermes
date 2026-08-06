@@ -1472,6 +1472,35 @@ def _cmd_assignees(args: argparse.Namespace) -> int:
     return 0
 
 
+def _maybe_cli_auto_subscribe(conn, task_id: str) -> bool:
+    """Subscribe the originating chat to ``task_id`` when configured.
+
+    Gated by ``kanban.cli_auto_subscribe`` (default False). ``hermes kanban
+    create`` deliberately does not auto-subscribe by default — subscribing
+    every CLI call was reverted upstream (#19718 / #19721) because scripts
+    and cron jobs also drive the CLI. When the knob is on, only a create
+    carrying a full gateway session identity (HERMES_SESSION_PLATFORM +
+    HERMES_SESSION_CHAT_ID, read via the stale-safe
+    ``gateway.session_context.get_session_env``) subscribes; bare CLI /
+    cron / script creates stay silent regardless of the knob.
+
+    Returns True when a subscription row was written. Never raises — a
+    notification bookkeeping failure must not fail the create.
+    """
+    try:
+        from hermes_cli.config import cfg_get, load_config
+
+        if not cfg_get(load_config(), "kanban", "cli_auto_subscribe", default=False):
+            return False
+        from tools.kanban_tools import subscribe_calling_session
+
+        return subscribe_calling_session(
+            conn, task_id, require_platform_identity=True
+        )
+    except Exception:
+        return False
+
+
 def _cmd_create(args: argparse.Namespace) -> int:
     try:
         ws_kind, ws_path = _parse_workspace_flag(args.workspace)
@@ -1521,10 +1550,16 @@ def _cmd_create(args: argparse.Namespace) -> int:
             initial_status=getattr(args, "initial_status", "running"),
         )
         task = kb.get_task(conn, task_id)
+        auto_subscribed = _maybe_cli_auto_subscribe(conn, task_id)
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
+        if auto_subscribed:
+            print(
+                "Subscribed the calling session for finish notifications "
+                "(kanban.cli_auto_subscribe)."
+            )
 
         # Warn when the task would sit in `ready` because no dispatcher is
         # present. Only warn on ready+assigned tasks — triage/todo are
@@ -2481,6 +2516,18 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
         )
+        # Spawned cards nobody is watching will finish silently — surface
+        # that at the point of confusion (every dispatch run) instead of
+        # relying on the operator remembering to notify-subscribe. Computed
+        # regardless of kanban.cli_auto_subscribe; best-effort so a
+        # notification bookkeeping failure never fails the dispatch.
+        spawned_unwatched: list[str] = []
+        for _tid, _who, _ws in res.spawned:
+            try:
+                if not kb.list_notify_subs(conn, _tid):
+                    spawned_unwatched.append(_tid)
+            except Exception:
+                pass
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -2493,6 +2540,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "workspace": ws}
                 for (tid, who, ws) in res.spawned
             ],
+            "spawned_unwatched": spawned_unwatched,
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
             "skipped_per_profile_capped": [
@@ -2520,6 +2568,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     for tid, who, ws in res.spawned:
         tag = " (dry)" if args.dry_run else ""
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if spawned_unwatched:
+        print(
+            f"{len(spawned_unwatched)} spawned card(s) have no notify "
+            "subscription — finishes will be silent "
+            "(kanban.cli_auto_subscribe or notify-subscribe)"
+        )
     if res.auto_assigned_default:
         print(
             f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "

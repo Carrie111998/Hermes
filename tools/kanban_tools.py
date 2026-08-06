@@ -1397,6 +1397,30 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         # user-friendly behaviour that mirrors the pre-gate implementation.
         pass
 
+    return subscribe_calling_session(conn, task_id)
+
+
+def subscribe_calling_session(
+    conn: Any, task_id: str, *, require_platform_identity: bool = False
+) -> bool:
+    """Resolve the calling session's delivery identity and write a notify sub.
+
+    Shared by the agent-tool auto-subscribe path (:func:`_maybe_auto_subscribe`,
+    gated by ``kanban.auto_subscribe_on_create``) and the CLI create path
+    (``hermes kanban create``, gated by ``kanban.cli_auto_subscribe`` in
+    ``hermes_cli.kanban._cmd_create``). Identity is read through
+    ``gateway.session_context.get_session_env`` so an explicitly cleared
+    session context ("" ContextVar) suppresses a stale ``os.environ``
+    mirror instead of subscribing a foreign chat.
+
+    ``require_platform_identity=True`` (the CLI path) accepts only a full
+    gateway identity (platform + chat id) and skips the TUI
+    ``HERMES_SESSION_KEY`` fallback below: a bare CLI/cron/script create
+    has no delivery channel and must stay silent (#19718).
+
+    Returns True if a subscription row was written; any exception is
+    logged at WARNING and swallowed (returns False).
+    """
     platform = ""
     chat_id = ""
     try:
@@ -1404,6 +1428,8 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         platform = get_session_env("HERMES_SESSION_PLATFORM", "")
         chat_id = get_session_env("HERMES_SESSION_CHAT_ID", "")
         if not platform or not chat_id:
+            if require_platform_identity:
+                return False
             # TUI / desktop fallback: platform/chat_id ContextVars are
             # cleared for TUI sessions, but the parent process exports
             # HERMES_SESSION_KEY into the subprocess env. Treat that
@@ -1468,7 +1494,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         return True
     except Exception as _exc:
         logger.warning(
-            "_maybe_auto_subscribe failed: %r (platform=%r key_set=%r)",
+            "subscribe_calling_session failed: %r (platform=%r key_set=%r)",
             _exc, platform, bool(chat_id),
         )
         return False
