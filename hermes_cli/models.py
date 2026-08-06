@@ -2013,17 +2013,19 @@ def _fetch_kilocode_pricing(
     When ``isFree`` is True, pricing is set to ``"0"`` so the downstream
     ``_apply_pricing()`` logic naturally marks the model as free.
 
-    Results are cached keyed on the resolved base URL so a custom
-    ``KILOCODE_BASE_URL`` never serves another endpoint's pricing.
+    Results are cached keyed on a provider-namespaced resolved base URL so a
+    custom ``KILOCODE_BASE_URL`` never serves another endpoint's pricing —
+    and a base URL shared with another provider (e.g. a proxy) can't collide
+    in the shared cache.
     """
     api_key = _resolve_kilocode_api_key()
 
     base_url = os.getenv("KILOCODE_BASE_URL", "").strip() or "https://api.kilo.ai/api/gateway"
-    cache_key = base_url.rstrip("/")
+    cache_key = "kilocode:" + base_url.rstrip("/")
     if not force_refresh and cache_key in _pricing_cache:
         return _pricing_cache[cache_key]
 
-    url = cache_key + "/models"
+    url = base_url.rstrip("/") + "/models"
     headers: dict[str, str] = {
         "Accept": "application/json",
         "User-Agent": _HERMES_USER_AGENT,
