@@ -20,6 +20,7 @@ import json
 import multiprocessing
 import threading
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -938,6 +939,441 @@ def test_removed_source_revokes_cached_borrower_on_every_pool_path(
         for item in _read_store(root_path)["credential_pool"]["openai-codex"]
     }
     assert remaining_root_ids == {"root-independent"}
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "status",
+        "reset",
+        "rotation",
+        "select",
+        "current",
+        "peek",
+        "lease",
+        "refresh",
+        "persistence",
+    ],
+)
+def test_provider_only_removal_revokes_cached_singleton_but_keeps_root_manual(
+    profile_and_root, monkeypatch, operation
+):
+    """A borrowed singleton never downgrades to an independent root row."""
+    profile_path, root_path = profile_and_root
+    root_store = _healthy_root_manual_store()
+    if operation == "reset":
+        singleton = next(
+            item
+            for item in root_store["credential_pool"]["openai-codex"]
+            if item["id"] == "root-device"
+        )
+        singleton.update(
+            {
+                "last_status": "exhausted",
+                "last_status_at": "2026-08-06T03:00:00+00:00",
+                "last_error_code": 429,
+            }
+        )
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("work"))
+    profile_before = profile_path.read_bytes()
+
+    pool = CP.load_pool("openai-codex")
+    cached = next(item for item in pool.entries() if item.id == "root-device")
+    assert cached.source_store_path == root_path
+    if operation == "current":
+        pool._current_id = cached.id
+
+    removed = _read_store(root_path)
+    removed["providers"].pop("openai-codex")
+    _write_store(root_path, removed)
+    root_after_removal = root_path.read_bytes()
+    post_count = 0
+
+    def fake_refresh(*_args, **_kwargs):
+        nonlocal post_count
+        post_count += 1
+        return {
+            "access_token": "must-not-be-used-access",
+            "refresh_token": "must-not-be-used-refresh",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+
+    result = None
+    if operation == "status":
+        pool._mark_exhausted(cached, 429)
+    elif operation == "reset":
+        pool.reset_statuses()
+    elif operation == "rotation":
+        result = pool.mark_exhausted_and_rotate(
+            status_code=429,
+            credential_id="root-device",
+        )
+    elif operation == "select":
+        result = pool.select()
+    elif operation == "current":
+        result = pool.current()
+    elif operation == "peek":
+        result = pool.peek()
+    elif operation == "lease":
+        result = pool.acquire_lease("root-device")
+    elif operation == "refresh":
+        result = pool._refresh_entry(cached, force=True)
+    else:
+        pool.add_entry(
+            PooledCredential(
+                provider="openai-codex",
+                id="profile-work-added",
+                label="profile work added",
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=99,
+                source="manual:device_code",
+                access_token="profile-work-added-access",
+                refresh_token="profile-work-added-refresh",
+            )
+        )
+
+    assert post_count == 0
+    assert "root-device" not in {item.id for item in pool.entries()}
+    if operation in {"current", "lease", "refresh"}:
+        assert result is None
+    elif operation in {"rotation", "select", "peek"}:
+        assert result is not None
+        assert result.id == "root-independent"
+
+    survivor = pool.select()
+    assert survivor is not None
+    assert survivor.id == "root-independent"
+    assert survivor.access_token == "root-independent-access"
+    assert root_path.read_bytes() == root_after_removal
+
+    if operation == "persistence":
+        profile_ids = {
+            item["id"]
+            for item in _read_store(profile_path)["credential_pool"]["openai-codex"]
+        }
+        assert profile_ids == {"profile-work-added"}
+    else:
+        assert profile_path.read_bytes() == profile_before
+
+
+def _run_refresh_overlap(
+    *,
+    profile_path,
+    root_path,
+    monkeypatch,
+    operation,
+    manual_only=False,
+):
+    root_store = _healthy_root_manual_store()
+    credential_id = "root-independent" if manual_only else "root-device"
+    old_access = (
+        "root-independent-access" if manual_only else "root-old-access"
+    )
+    old_refresh = (
+        "root-independent-refresh" if manual_only else "root-old-refresh"
+    )
+    if manual_only:
+        root_store["providers"].pop("openai-codex")
+        root_store["credential_pool"]["openai-codex"] = [
+            item
+            for item in root_store["credential_pool"]["openai-codex"]
+            if item["id"] == credential_id
+        ]
+        root_store["credential_pool"]["openai-codex"][0]["priority"] = 0
+    elif operation == "reset":
+        singleton = next(
+            item
+            for item in root_store["credential_pool"]["openai-codex"]
+            if item["id"] == credential_id
+        )
+        singleton.update(
+            {
+                "last_status": "exhausted",
+                "last_status_at": "2026-08-06T03:00:00+00:00",
+                "last_error_code": 429,
+            }
+        )
+
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("overlap"))
+    profile_before = profile_path.read_bytes()
+    pool = CP.load_pool("openai-codex")
+    cached = next(item for item in pool.entries() if item.id == credential_id)
+    if operation == "current":
+        pool._current_id = credential_id
+
+    post_entered = threading.Event()
+    allow_post_return = threading.Event()
+    operation_transaction_entered = threading.Event()
+    validation_timed_out = threading.Event()
+    refresh_done = threading.Event()
+    operation_done = threading.Event()
+    post_count = 0
+    results = {}
+    errors = []
+
+    def fake_refresh(access_token, refresh_token, **_kwargs):
+        nonlocal post_count
+        assert access_token == old_access
+        assert refresh_token == old_refresh
+        post_count += 1
+        post_entered.set()
+        assert allow_post_return.wait(timeout=3)
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2026-08-06T04:00:00Z",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", fake_refresh)
+    real_transaction = A._provider_state_transaction
+    real_auth_lock = A._auth_store_lock
+
+    @contextmanager
+    def bounded_auth_lock(*args, **kwargs):
+        is_operation = threading.current_thread().name == "pool-operation"
+        if is_operation:
+            kwargs["timeout_seconds"] = 1.0
+        try:
+            with real_auth_lock(*args, **kwargs):
+                yield
+        except TimeoutError:
+            if is_operation:
+                validation_timed_out.set()
+            raise
+
+    monkeypatch.setattr(A, "_auth_store_lock", bounded_auth_lock)
+
+    @contextmanager
+    def tracked_transaction(*args, **kwargs):
+        is_operation = threading.current_thread().name == "pool-operation"
+        if is_operation:
+            operation_transaction_entered.set()
+            kwargs["timeout_seconds"] = 1.0
+        try:
+            with real_transaction(*args, **kwargs) as transaction:
+                yield transaction
+        except TimeoutError:
+            if is_operation:
+                validation_timed_out.set()
+            raise
+
+    monkeypatch.setattr(A, "_provider_state_transaction", tracked_transaction)
+
+    def refresh_worker():
+        try:
+            results["refresh"] = pool._refresh_entry(cached, force=True)
+        except BaseException as exc:
+            errors.append(("refresh", exc))
+        finally:
+            refresh_done.set()
+
+    def operation_worker():
+        try:
+            if operation == "select":
+                results["operation"] = pool.select()
+            elif operation == "peek":
+                results["operation"] = pool.peek()
+            elif operation == "current":
+                results["operation"] = pool.current()
+            elif operation == "lease":
+                results["lease_id"] = pool.acquire_lease(credential_id)
+                results["operation"] = pool.current()
+            elif operation == "rotation":
+                results["operation"] = pool.mark_exhausted_and_rotate(
+                    status_code=429,
+                    credential_id=credential_id,
+                )
+            elif operation == "status":
+                results["operation"] = pool._mark_exhausted(cached, 429)
+            elif operation == "reset":
+                results["operation"] = pool.reset_statuses()
+            else:
+                results["operation"] = pool.add_entry(
+                    PooledCredential(
+                        provider="openai-codex",
+                        id="profile-overlap-added",
+                        label="profile overlap added",
+                        auth_type=AUTH_TYPE_OAUTH,
+                        priority=99,
+                        source="manual:device_code",
+                        access_token="profile-overlap-access",
+                        refresh_token="profile-overlap-refresh",
+                    )
+                )
+        except BaseException as exc:
+            errors.append(("operation", exc))
+        finally:
+            operation_done.set()
+
+    refresher = threading.Thread(target=refresh_worker, name="pool-refresh")
+    operator = threading.Thread(target=operation_worker, name="pool-operation")
+    refresher.start()
+    assert post_entered.wait(timeout=3)
+    operator.start()
+    assert operation_transaction_entered.wait(timeout=3)
+    allow_post_return.set()
+    refresher.join(timeout=3)
+    operator.join(timeout=3)
+
+    assert refresh_done.is_set()
+    assert operation_done.is_set()
+    assert not refresher.is_alive()
+    assert not operator.is_alive()
+    assert not errors
+    assert not validation_timed_out.is_set()
+    assert post_count == 1
+    assert results["refresh"] is not None
+    assert results["refresh"].access_token == "rotated-access"
+
+    root_after = _read_store(root_path)
+    root_entry = next(
+        item
+        for item in root_after["credential_pool"]["openai-codex"]
+        if item["id"] == credential_id
+    )
+    assert root_entry["access_token"] == "rotated-access"
+    assert root_entry["refresh_token"] == "rotated-refresh"
+    in_memory = next(item for item in pool.entries() if item.id == credential_id)
+    assert in_memory.access_token == "rotated-access"
+    assert in_memory.refresh_token == "rotated-refresh"
+
+    if operation in {"select", "peek", "current", "lease"}:
+        assert results["operation"] is not None
+        assert results["operation"].id == credential_id
+        assert results["operation"].access_token == "rotated-access"
+    elif operation == "rotation":
+        assert results["operation"] is not None
+        assert results["operation"].id == "root-independent"
+
+    if operation == "persistence":
+        profile_ids = {
+            item["id"]
+            for item in _read_store(profile_path)["credential_pool"]["openai-codex"]
+        }
+        assert profile_ids == {"profile-overlap-added"}
+    else:
+        assert profile_path.read_bytes() == profile_before
+
+
+@pytest.mark.parametrize(
+    "operation",
+    ["select", "peek", "current", "lease", "rotation", "status", "reset", "persistence"],
+)
+def test_singleton_refresh_overlap_never_inverts_pool_and_auth_locks(
+    profile_and_root, monkeypatch, operation
+):
+    profile_path, root_path = profile_and_root
+    _run_refresh_overlap(
+        profile_path=profile_path,
+        root_path=root_path,
+        monkeypatch=monkeypatch,
+        operation=operation,
+    )
+
+
+def test_source_owned_manual_refresh_overlap_never_inverts_selection_lock(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    _run_refresh_overlap(
+        profile_path=profile_path,
+        root_path=root_path,
+        monkeypatch=monkeypatch,
+        operation="select",
+        manual_only=True,
+    )
+
+
+@pytest.mark.parametrize("failure", [TimeoutError, RuntimeError])
+@pytest.mark.parametrize("operation", ["select", "peek", "current", "lease", "rotation"])
+def test_source_validation_failure_fails_borrowed_selection_closed(
+    profile_and_root, monkeypatch, operation, failure
+):
+    profile_path, root_path = profile_and_root
+    _write_store(root_path, _healthy_root_manual_store())
+    _write_store(profile_path, _profile_without_codex_store("validation"))
+    profile_before = profile_path.read_bytes()
+    root_before = root_path.read_bytes()
+    pool = CP.load_pool("openai-codex")
+    if operation == "current":
+        pool._current_id = "root-device"
+
+    @contextmanager
+    def fail_validation(*_args, **_kwargs):
+        raise failure("fake source validation failure")
+        yield
+
+    monkeypatch.setattr(A, "_provider_state_transaction", fail_validation)
+
+    if operation == "select":
+        result = pool.select()
+    elif operation == "peek":
+        result = pool.peek()
+    elif operation == "current":
+        result = pool.current()
+    elif operation == "lease":
+        result = pool.acquire_lease("root-device")
+    else:
+        result = pool.mark_exhausted_and_rotate(
+            status_code=429,
+            credential_id="root-device",
+        )
+
+    assert result is None
+    assert root_path.read_bytes() == root_before
+    assert profile_path.read_bytes() == profile_before
+
+
+@pytest.mark.parametrize("construction", ["direct", "replace_then_add"])
+@pytest.mark.parametrize("target_kind", ["arbitrary", "known_global"])
+def test_untrusted_runtime_source_path_never_gains_owner_write_authority(
+    profile_and_root, construction, target_kind
+):
+    profile_path, root_path = profile_and_root
+    if target_kind == "arbitrary":
+        source_path = profile_path.parent / "arbitrary-owner" / "auth.json"
+        source_store = _healthy_root_manual_store()
+        source_store["credential_pool"]["openai-codex"] = [
+            item
+            for item in source_store["credential_pool"]["openai-codex"]
+            if item["id"] == "root-independent"
+        ]
+        _write_store(source_path, source_store)
+    else:
+        source_path = root_path
+        _write_store(source_path, _healthy_root_manual_store())
+    source_before = source_path.read_bytes()
+    _write_store(profile_path, _profile_without_codex_store("untrusted"))
+
+    untrusted = PooledCredential(
+        provider="openai-codex",
+        id="root-independent",
+        label="untrusted runtime path",
+        auth_type=AUTH_TYPE_OAUTH,
+        priority=0,
+        source="manual:device_code",
+        access_token="root-independent-access",
+        refresh_token="root-independent-refresh",
+        source_store_path=source_path,
+    )
+    if construction == "direct":
+        pool = CredentialPool("openai-codex", [untrusted])
+        entry = untrusted
+    else:
+        pool = CredentialPool("openai-codex", [])
+        entry = pool.add_entry(replace(untrusted))
+
+    pool._mark_exhausted(entry, 429)
+
+    assert source_path.read_bytes() == source_before
+    persisted = _read_store(profile_path)["credential_pool"]["openai-codex"]
+    assert [item["id"] for item in persisted] == ["root-independent"]
+    assert persisted[0]["last_status"] == "exhausted"
+    assert persisted[0]["last_error_code"] == 429
+    assert "source_store_path" not in persisted[0]
 
 
 def test_load_pool_waiter_treats_removed_root_source_as_revoked(
