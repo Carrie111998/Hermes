@@ -701,16 +701,18 @@ export function ChatSidebar({
 
     // The live-session overlay (creates/evictions) is applied per-repo in
     // RepoFlatSection, AFTER the visual git-worktree lanes are merged in (so
-    // out-of-tree worktrees can be placed). Here we just order the snapshot and
-    // drop pinned rows — the hydrated lanes come straight from the backend, so
-    // they haven't been through projectModel's filter.
+    // out-of-tree worktrees can be placed). Here we just order the snapshot —
+    // the hydrated lanes come straight from the backend, so they haven't been
+    // through projectModel's filter. Pinned sessions stay in their project
+    // group (#80013): pinning adds a Pinned-section accelerator, it does not
+    // remove the session from the project tree.
     // The label comes from the overview node either way — that's the model's
     // presentation copy (Home is translated there), not the raw payload's.
     return excludeProjectSessions(
       { ...hydrated, label: overviewEnteredProject.label, repos: orderRepos(hydrated.repos) },
-      isPinnedSession
+      () => false
     )
-  }, [overviewEnteredProject, enteredProjectTree, orderRepos, isPinnedSession])
+  }, [overviewEnteredProject, enteredProjectTree, orderRepos])
 
   // Overlay live `$sessions` onto the entered project so a just-created session
   // (which the backend snapshot hasn't folded in yet) counts as content and

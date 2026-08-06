@@ -964,4 +964,33 @@ describe('excludeProjectSessions', () => {
 
     expect(overlaid.repos[0].groups.map(g => g.id)).toEqual(['wt'])
   })
+
+  it('a never-matching filter keeps pinned sessions in their project group (#80013)', () => {
+    // The sidebar no longer passes isPinnedSession to the project-tree filter:
+    // pinning ADDS a Pinned-section accelerator, it does not remove the
+    // session from its project group. The flat recents list keeps its own
+    // pinned exclusion.
+    const pinnedRow = makeSession('/www/app', { id: 'pinned', pinned: true } as never)
+
+    const project = projectNode({
+      id: '/www/app',
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          sessionCount: 1,
+          groups: [lane({ id: 'main', isMain: true, label: 'main', path: '/www/app', sessions: [pinnedRow] })]
+        }
+      ],
+      sessionCount: 1
+    })
+
+    // The project-tree call sites pass () => false (no pinned exclusion).
+    const filtered = excludeProjectSessions(project, () => false)
+
+    expect(filtered.repos[0].groups[0].sessions.map(s => s.id)).toEqual(['pinned'])
+    expect(filtered.repos[0].sessionCount).toBe(1)
+    expect(filtered.sessionCount).toBe(1)
+  })
 })
