@@ -6820,6 +6820,10 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_node_capped: list[tuple[str, str, str]] = field(default_factory=list)
+    """Tasks deferred by physical-node capacity as
+    ``(task_id, assignee, node)``. Profiles sharing one backend therefore
+    share one real concurrency budget rather than independent alias budgets."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8214,6 +8218,8 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    node_leases: Optional[dict[str, Any]] = None,
+    node_lease_pool: Any = None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -8248,6 +8254,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            node_leases=node_leases,
+            node_lease_pool=node_lease_pool,
         )
     with _dispatch_tick_lock(db_path) as held:
         if not held:
@@ -8264,6 +8272,8 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            node_leases=node_leases,
+            node_lease_pool=node_lease_pool,
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
@@ -8284,6 +8294,8 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    node_leases: Optional[dict[str, Any]] = None,
+    node_lease_pool: Any = None,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -8341,6 +8353,58 @@ def _dispatch_once_locked(
         result.rate_limited.extend(_crash_rate_limited)
     result.timed_out = enforce_max_runtime(conn)
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # Physical-node leases are process-shared under HERMES_KANBAN_HOME. This
+    # closes the alias gap where two profiles both look idle while routing to
+    # the same capacity-1 inference backend.
+    _node_cfg = node_leases if isinstance(node_leases, dict) else {}
+    _node_leases_enabled = bool(_node_cfg.get("enabled", False))
+    _profile_to_node = _node_cfg.get("profile_to_node", {})
+    _node_capacities = _node_cfg.get("capacities", {})
+    if not isinstance(_profile_to_node, dict):
+        _profile_to_node = {}
+    if not isinstance(_node_capacities, dict):
+        _node_capacities = {}
+    try:
+        _node_ttl = max(
+            1,
+            int(_node_cfg.get("ttl_seconds", ttl_seconds or DEFAULT_CLAIM_TTL_SECONDS)),
+        )
+    except (TypeError, ValueError):
+        _node_ttl = int(ttl_seconds or DEFAULT_CLAIM_TTL_SECONDS)
+    _node_pool = node_lease_pool
+    if _node_leases_enabled and _node_pool is None:
+        from hermes_cli.node_leases import default_pool
+
+        _node_pool = default_pool()
+    _db_owner_prefix = f"{kanban_db_path(board=board).resolve()}:"
+    if _node_leases_enabled:
+        # Reconcile this board before new work: finished tasks release now;
+        # running tasks refresh before a ready task can take their slot.
+        running_rows = conn.execute(
+            "SELECT id, assignee FROM tasks WHERE status = 'running'"
+        ).fetchall()
+        running_owners = {_db_owner_prefix + row["id"] for row in running_rows}
+        for node_state in _node_pool.snapshot().values():
+            for owner in node_state.get("owners", []):
+                if owner.startswith(_db_owner_prefix) and owner not in running_owners:
+                    _node_pool.release(owner=owner)
+        for running in running_rows:
+            _node_pool.try_acquire(
+                profile=running["assignee"] or "",
+                owner=_db_owner_prefix + running["id"],
+                profile_to_node=_profile_to_node,
+                capacities=_node_capacities,
+                ttl_seconds=_node_ttl,
+            )
+    _dry_node_counts = (
+        {
+            name: int(data.get("in_use", 0))
+            for name, data in _node_pool.snapshot().items()
+        }
+        if _node_leases_enabled and dry_run
+        else {}
+    )
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -8517,6 +8581,38 @@ def _dispatch_once_locked(
                         {"reason": guard_reason},
                     )
             continue
+        _node_lease = None
+        _node_name = str(_profile_to_node.get(row_assignee) or "").strip()
+        if _node_leases_enabled:
+            if dry_run:
+                try:
+                    _node_capacity = int(_node_capacities.get(_node_name, 0))
+                except (TypeError, ValueError):
+                    _node_capacity = 0
+                _node_current = _dry_node_counts.get(_node_name, 0)
+                if (
+                    not _node_name
+                    or _node_capacity < 1
+                    or _node_current >= _node_capacity
+                ):
+                    result.skipped_node_capped.append(
+                        (row["id"], row_assignee, _node_name)
+                    )
+                    continue
+                _dry_node_counts[_node_name] = _node_current + 1
+            else:
+                _node_lease = _node_pool.try_acquire(
+                    profile=row_assignee,
+                    owner=_db_owner_prefix + row["id"],
+                    profile_to_node=_profile_to_node,
+                    capacities=_node_capacities,
+                    ttl_seconds=_node_ttl,
+                )
+                if _node_lease is None:
+                    result.skipped_node_capped.append(
+                        (row["id"], row_assignee, _node_name)
+                    )
+                    continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
             # Increment per-profile counter even in dry_run so the cap
@@ -8530,6 +8626,8 @@ def _dispatch_once_locked(
             continue
         claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if _node_lease is not None:
+                _node_lease.release()
             continue
         try:
             resolved_branch_name = None
@@ -8538,6 +8636,8 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            if _node_lease is not None:
+                _node_lease.release()
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -8583,6 +8683,8 @@ def _dispatch_once_locked(
                     _per_profile_running.get(claimed.assignee, 0) + 1
                 )
         except Exception as exc:
+            if _node_lease is not None:
+                _node_lease.release()
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,
@@ -8617,11 +8719,45 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        _review_node_lease = None
+        _review_node_name = str(_profile_to_node.get(row["assignee"]) or "").strip()
+        if _node_leases_enabled:
+            if dry_run:
+                try:
+                    _review_capacity = int(_node_capacities.get(_review_node_name, 0))
+                except (TypeError, ValueError):
+                    _review_capacity = 0
+                _review_current = _dry_node_counts.get(_review_node_name, 0)
+                if (
+                    not _review_node_name
+                    or _review_capacity < 1
+                    or _review_current >= _review_capacity
+                ):
+                    result.skipped_node_capped.append(
+                        (row["id"], row["assignee"], _review_node_name)
+                    )
+                    continue
+                _dry_node_counts[_review_node_name] = _review_current + 1
+            else:
+                _review_node_lease = _node_pool.try_acquire(
+                    profile=row["assignee"],
+                    owner=_db_owner_prefix + row["id"],
+                    profile_to_node=_profile_to_node,
+                    capacities=_node_capacities,
+                    ttl_seconds=_node_ttl,
+                )
+                if _review_node_lease is None:
+                    result.skipped_node_capped.append(
+                        (row["id"], row["assignee"], _review_node_name)
+                    )
+                    continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
+            if _review_node_lease is not None:
+                _review_node_lease.release()
             continue
         try:
             resolved_branch_name = None
@@ -8630,6 +8766,8 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
+            if _review_node_lease is not None:
+                _review_node_lease.release()
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
                 failure_limit=failure_limit,
@@ -8664,6 +8802,8 @@ def _dispatch_once_locked(
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
+            if _review_node_lease is not None:
+                _review_node_lease.release()
             auto = _record_spawn_failure(
                 conn, claimed.id, str(exc),
                 failure_limit=failure_limit,

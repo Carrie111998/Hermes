@@ -1138,6 +1138,19 @@ class GatewayKanbanWatchersMixin:
                         max_in_progress_per_profile,
                     )
 
+        node_leases = kanban_cfg.get("node_leases", {})
+        if not isinstance(node_leases, dict):
+            logger.warning(
+                "kanban dispatcher: invalid kanban.node_leases=%r; disabling",
+                node_leases,
+            )
+            node_leases = {}
+        elif node_leases.get("enabled"):
+            logger.info(
+                "kanban dispatcher: physical node leases enabled for %d profile(s)",
+                len(node_leases.get("profile_to_node", {}) or {}),
+            )
+
         # Initial delay so the gateway finishes wiring adapters before the
         # dispatcher spawns workers (those workers may hit gateway notify
         # subscriptions etc.). Matches the notifier watcher's delay.
@@ -1231,6 +1244,7 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    node_leases=node_leases,
                 )
             except sqlite3.DatabaseError as exc:
                 if _is_corrupt_board_db_error(exc):

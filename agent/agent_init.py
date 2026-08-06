@@ -456,6 +456,69 @@ def _merge_custom_provider_extra_body(agent, custom_providers: List[Dict[str, An
     agent.request_overrides = overrides
 
 
+def _resolve_startup_model_context_length(
+    *,
+    model_cfg: Any,
+    active_model: str,
+    active_provider: str,
+    active_base_url: str,
+) -> Optional[int]:
+    """Resolve a startup context pin scoped to the actual runtime model.
+
+    ``model.context_length`` belongs to ``model.default`` and must not leak to
+    a different ``--model`` override.  Profiles can declare truthful metadata
+    for startup overrides under ``model.models.<id>.context_length``; this
+    helper selects that value only when the configured and active routes still
+    match.
+    """
+    if not isinstance(model_cfg, dict):
+        return None
+
+    configured_provider = str(model_cfg.get("provider") or "").strip()
+    configured_base_url = model_cfg.get("base_url")
+    if _context_route_mismatch(
+        configured_base_url,
+        active_base_url,
+        configured_provider,
+        active_provider,
+    ):
+        return None
+
+    active_runtime_model = str(active_model or "").strip()
+    configured_runtime_model = str(model_cfg.get("default") or "").strip()
+    try:
+        from hermes_cli.model_normalize import normalize_model_for_provider
+
+        active_runtime_model = normalize_model_for_provider(
+            active_runtime_model, active_provider
+        )
+        configured_runtime_model = normalize_model_for_provider(
+            configured_runtime_model, active_provider
+        )
+    except Exception:
+        pass
+
+    raw_context_length: Any = None
+    if configured_runtime_model and active_runtime_model == configured_runtime_model:
+        raw_context_length = model_cfg.get("context_length")
+    else:
+        models = model_cfg.get("models")
+        if isinstance(models, dict):
+            entry = models.get(active_model)
+            if entry is None:
+                entry = models.get(active_runtime_model)
+            if isinstance(entry, dict):
+                raw_context_length = entry.get("context_length")
+
+    try:
+        if isinstance(raw_context_length, bool):
+            return None
+        parsed = int(raw_context_length)
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
+
+
 def init_agent(
     agent,
     base_url: str = None,
@@ -2304,6 +2367,19 @@ def init_agent(
                 _configured_base_url or _model_cfg.get("provider"),
             )
             _config_context_length = None
+
+    # A direct ``--model`` override may carry its own truthful profile-level
+    # metadata. Resolve it after rejecting the default model's pin so the
+    # override never inherits stale context while still avoiding a weak
+    # endpoint/catalog fallback (commonly 8K for local aliases).
+    _startup_model_context_length = _resolve_startup_model_context_length(
+        model_cfg=_model_cfg,
+        active_model=agent.model,
+        active_provider=agent.provider,
+        active_base_url=agent.base_url,
+    )
+    if _startup_model_context_length is not None:
+        _config_context_length = _startup_model_context_length
 
     # Store for reuse by _check_compression_model_feasibility (auxiliary
     # compression model context-length detection needs the same list).

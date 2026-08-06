@@ -2460,6 +2460,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             _kanban_cfg.get("max_in_progress_per_profile")
         )
         max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
+        node_leases = _kanban_cfg.get("node_leases", {})
+        if not isinstance(node_leases, dict):
+            node_leases = {}
         # CLI --max overrides config kanban.max_spawn when both are present;
         # CLI is the more explicit signal so it wins.
         cli_max = getattr(args, "max", None)
@@ -2470,6 +2473,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
+        node_leases = {}
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
         res = kb.dispatch_once(
@@ -2480,6 +2484,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            node_leases=node_leases,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2498,6 +2503,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "skipped_node_capped": [
+                {"task_id": tid, "assignee": who, "node": node}
+                for (tid, who, node) in res.skipped_node_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
@@ -2532,6 +2541,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    if res.skipped_node_capped:
+        for tid, who, node in res.skipped_node_capped:
+            print(f"Deferred ({who} waiting for physical node {node or '<unmapped>'}): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
