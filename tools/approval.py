@@ -615,11 +615,19 @@ def _save_blocked_payload(command: str) -> Optional[str]:
             except OSError:
                 pass
         path = script_dir / f"blocked-{int(_time.time())}-{_uuid.uuid4().hex[:8]}.sh"
+        # The 'run it via: bash <path>' hint must use the Git-Bash-safe form
+        # (/c/Users/... on Windows) — a raw C:\... path in the hint would hit
+        # the same backslash-mangling (exit 127) the cron .sh fix addresses.
+        try:
+            from tools.environments.local import _bash_safe_path
+            hint_path = _bash_safe_path(str(path))
+        except Exception:
+            hint_path = str(path)
         path.write_text(
             "#!/bin/bash\n"
             "# Auto-saved by Hermes: this command exceeded the inline command\n"
             "# parser limit and was blocked from direct execution. Review it,\n"
-            "# then run it via: bash " + str(path) + "\n"
+            "# then run it via: bash " + hint_path + "\n"
             + command
             + ("\n" if not command.endswith("\n") else ""),
             encoding="utf-8", errors="replace",

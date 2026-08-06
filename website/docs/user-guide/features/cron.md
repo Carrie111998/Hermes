@@ -482,6 +482,8 @@ Semantics:
 
 `.sh` / `.bash` files run under `bash` from `PATH` when available, otherwise `/bin/bash` (important on Windows Git Bash). Anything else runs under the current Python interpreter (`sys.executable`). Scripts must resolve inside `$HERMES_HOME/scripts/` — relative names, absolute paths, and `~`-prefixed paths are accepted when the resolved target stays in that directory; paths that escape it are rejected. Subprocess env is sanitized (`_sanitize_subprocess_env`): provider API credentials and other Hermes-managed secrets are **not** inherited by cron scripts.
 
+**Windows note:** on native Windows, the script path handed to Git Bash is rewritten to the MSYS form (`C:\Users\...\script.sh` → `/c/Users/.../script.sh`). A raw backslash path would be mangled by bash (`\U`, `\A`, `\s` become escapes) and fail with exit 127 "No such file or directory". This matches the codebase's MSYS path-handling convention (`tools/environments/local.py`). If a `.sh` cron job fails with exit 127 on Windows, confirm the script exists and that Git for Windows is installed (which ships Git Bash); the scheduler will say so explicitly when bash itself is missing.
+
 ### The agent sets these up for you
 
 The `cronjob` tool's schema exposes `no_agent` to Hermes directly, so you can describe a watchdog in chat and let the agent wire it up:
