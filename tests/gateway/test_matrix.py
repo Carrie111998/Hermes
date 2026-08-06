@@ -3342,3 +3342,636 @@ class TestCryptoPickleKeyMigration:
         # start still sees a legacy-key account and retries the migration.
         store.put_account.assert_not_awaited()
         assert "retried on the next start" in caplog.text
+
+
+# ---------------------------------------------------------------------------
+# Reply / thread context injection
+# ---------------------------------------------------------------------------
+
+
+class TestMatrixReplyAnchors:
+    """Which event a reply or thread message points at for quoting.
+
+    ``reply_to_message_id`` and the quote anchor diverge inside threads: a
+    thread reply's ``m.in_reply_to`` is a rendering fallback aimed at the last
+    event in the thread, while the message the user actually opened the thread
+    on is the root.
+    """
+
+    def _resolve(self, relates_to, event_id="$self"):
+        from plugins.platforms.matrix.adapter import MatrixAdapter
+
+        return MatrixAdapter._resolve_reply_anchors(relates_to, event_id)
+
+    def test_plain_message_has_no_anchors(self):
+        assert self._resolve({}) == (None, None)
+
+    def test_explicit_reply_quotes_the_replied_to_event(self):
+        reply_to, quote = self._resolve(
+            {"m.in_reply_to": {"event_id": "$parent"}}
+        )
+        assert reply_to == "$parent"
+        assert quote == "$parent"
+
+    def test_thread_fallback_quotes_the_root_not_the_last_event(self):
+        """The bug the user hit: quoting the fallback target loses the root."""
+        reply_to, quote = self._resolve(
+            {
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": "$latest-in-thread"},
+            }
+        )
+        assert quote == "$root"
+        assert reply_to == "$latest-in-thread"
+
+    def test_explicit_reply_inside_thread_wins_over_root(self):
+        reply_to, quote = self._resolve(
+            {
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "m.in_reply_to": {"event_id": "$deliberate-target"},
+            }
+        )
+        assert quote == "$deliberate-target"
+        assert reply_to == "$deliberate-target"
+
+    def test_thread_without_in_reply_to_still_anchors_on_root(self):
+        """gateway.run gates the pointer on reply_to_message_id being set."""
+        reply_to, quote = self._resolve(
+            {"rel_type": "m.thread", "event_id": "$root"}
+        )
+        assert reply_to == "$root"
+        assert quote == "$root"
+
+    def test_self_reference_is_not_quoted(self):
+        reply_to, quote = self._resolve(
+            {"m.in_reply_to": {"event_id": "$self"}}, event_id="$self"
+        )
+        assert quote is None
+
+    def test_malformed_in_reply_to_is_tolerated(self):
+        assert self._resolve({"m.in_reply_to": "not-a-dict"}) == (None, None)
+
+
+class TestMatrixQuotedEventFetch:
+    """``_fetch_quoted_event`` resolves an event id to text for injection."""
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+
+    @pytest.mark.asyncio
+    async def test_returns_body_and_sender(self):
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "type": "m.room.message",
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.text", "body": "the original post"},
+            }
+        )
+        self.adapter._client = client
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert quoted.text == "the original post"
+        assert quoted.sender == "@alice:example.org"
+
+    @pytest.mark.asyncio
+    async def test_result_is_cached(self):
+        """A thread root is referenced by every message in the thread."""
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.text", "body": "root"},
+            }
+        )
+        self.adapter._client = client
+
+        await self.adapter._fetch_quoted_event("!r:x", "$e")
+        await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert client.get_event.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_nested_reply_fallback_is_stripped(self):
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "sender": "@alice:example.org",
+                "content": {
+                    "msgtype": "m.text",
+                    "body": "> <@bob:example.org> older\n\nactual quoted text",
+                },
+            }
+        )
+        self.adapter._client = client
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert quoted.text == "actual quoted text"
+
+    @pytest.mark.asyncio
+    async def test_non_image_media_body_is_labelled(self):
+        """A media body is a filename; unlabelled it reads as the user's words."""
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.file", "body": "report.pdf"},
+            }
+        )
+        self.adapter._client = client
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert quoted.text == "[file: report.pdf]"
+
+    @pytest.mark.asyncio
+    async def test_fetch_failure_degrades_to_no_quote(self):
+        client = MagicMock()
+        client.get_event = AsyncMock(side_effect=RuntimeError("410 gone"))
+        self.adapter._client = client
+
+        assert (await self.adapter._fetch_quoted_event("!r:x", "$e")).text is None
+
+    @pytest.mark.asyncio
+    async def test_hung_homeserver_lookup_times_out(self, monkeypatch):
+        """The lookup runs inside ``wait_sync`` dispatch, so it must be bounded.
+
+        A homeserver that accepts the request and never answers would
+        otherwise stall all Matrix sync-event processing.
+        """
+        import plugins.platforms.matrix.adapter as matrix_adapter
+
+        monkeypatch.setattr(matrix_adapter, "_QUOTED_FETCH_TIMEOUT", 0.01)
+
+        async def _hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        client = MagicMock()
+        client.get_event = _hang
+        self.adapter._client = client
+
+        quoted = await asyncio.wait_for(
+            self.adapter._fetch_quoted_event("!r:x", "$e"), timeout=5
+        )
+
+        assert quoted.text is None
+        assert quoted.media_path is None
+
+    @pytest.mark.asyncio
+    async def test_no_client_or_no_anchor_is_a_noop(self):
+        self.adapter._client = None
+        assert (await self.adapter._fetch_quoted_event("!r:x", "$e")).text is None
+
+        self.adapter._client = MagicMock()
+        assert (await self.adapter._fetch_quoted_event("!r:x", None)).text is None
+
+    @pytest.mark.asyncio
+    async def test_encrypted_event_is_decrypted(self):
+        crypto = MagicMock()
+        crypto.decrypt_megolm_event = AsyncMock(
+            return_value={
+                "sender": "@alice:example.org",
+                "content": {"msgtype": "m.text", "body": "secret original"},
+            }
+        )
+        client = MagicMock()
+        client.crypto = crypto
+        client.get_event = AsyncMock(
+            return_value={"type": "m.room.encrypted", "content": {}}
+        )
+        self.adapter._client = client
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert quoted.text == "secret original"
+
+    @pytest.mark.asyncio
+    async def test_undecryptable_event_degrades_to_no_quote(self):
+        client = MagicMock()
+        client.crypto = None
+        client.get_event = AsyncMock(
+            return_value={"type": "m.room.encrypted", "content": {}}
+        )
+        self.adapter._client = client
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$e")
+        assert quoted.text is None
+        assert quoted.media_path is None
+
+
+class TestMatrixReplyContextOnMessageEvent:
+    """End-to-end: the dispatched MessageEvent carries the quoted text.
+
+    ``gateway.run`` gates its ``[Replying to: "..."]`` injection on
+    ``reply_to_text`` AND ``reply_to_message_id``; without both the agent gets
+    an event id it cannot dereference.
+    """
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._text_batch_delay_seconds = 0
+        self.adapter._require_mention = False
+        self.adapter._free_rooms = set()
+
+    def _install_client(self, body="the original post", sender="@alice:example.org"):
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "sender": sender,
+                "content": {"msgtype": "m.text", "body": body},
+            }
+        )
+        self.adapter._client = client
+        return client
+
+    async def _dispatch(self, relates_to, body="what do you think?"):
+        captured = {}
+
+        async def capture(msg_event):
+            captured["event"] = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@user:example.org",
+            event_id="$trigger",
+            event_ts=0.0,
+            source_content={"msgtype": "m.text", "body": body},
+            relates_to=relates_to,
+        )
+        return captured.get("event")
+
+    @pytest.mark.asyncio
+    async def test_thread_message_carries_root_text(self):
+        client = self._install_client()
+
+        event = await self._dispatch(
+            {
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": "$latest"},
+            }
+        )
+
+        assert event.reply_to_text == "the original post"
+        assert event.reply_to_message_id  # both required by the run.py gate
+        client.get_event.assert_awaited_once()
+        assert "$root" in str(client.get_event.await_args.args)
+
+    @pytest.mark.asyncio
+    async def test_plain_reply_carries_parent_text(self):
+        self._install_client()
+
+        event = await self._dispatch({"m.in_reply_to": {"event_id": "$parent"}})
+
+        assert event.reply_to_text == "the original post"
+        assert event.reply_to_message_id == "$parent"
+
+    @pytest.mark.asyncio
+    async def test_reply_to_own_message_is_flagged(self):
+        self.adapter._user_id = "@bot:example.org"
+        self._install_client(sender="@bot:example.org")
+
+        event = await self._dispatch({"m.in_reply_to": {"event_id": "$parent"}})
+
+        assert event.reply_to_is_own_message is True
+
+    @pytest.mark.asyncio
+    async def test_reply_to_other_user_is_not_flagged_as_own(self):
+        self.adapter._user_id = "@bot:example.org"
+        self._install_client(sender="@alice:example.org")
+
+        event = await self._dispatch({"m.in_reply_to": {"event_id": "$parent"}})
+
+        assert event.reply_to_is_own_message is False
+
+    @pytest.mark.asyncio
+    async def test_plain_message_fetches_nothing(self):
+        client = self._install_client()
+
+        event = await self._dispatch({})
+
+        assert event.reply_to_text is None
+        client.get_event.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_trigger_text_keeps_its_own_body(self):
+        """Quoting must not contaminate the user's actual message text."""
+        self._install_client()
+
+        event = await self._dispatch(
+            {"m.in_reply_to": {"event_id": "$parent"}},
+            body="> <@alice:example.org> the original post\n\nwhat do you think?",
+        )
+
+        assert event.text == "what do you think?"
+
+    @pytest.mark.asyncio
+    async def test_redacted_root_is_negatively_cached(self):
+        """A bodyless root must not be re-fetched for every thread message."""
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={"sender": "@alice:example.org", "content": {}}
+        )
+        self.adapter._client = client
+
+        first = await self.adapter._fetch_quoted_event("!r:x", "$e")
+        assert first.text is None
+        assert first.sender == "@alice:example.org"
+        await self.adapter._fetch_quoted_event("!r:x", "$e")
+
+        assert client.get_event.await_count == 1
+
+
+class TestMatrixEventContentExtraction:
+    """``content`` arrives as a dict, a typed attrs object, or a dict-like Obj.
+
+    ``get_event``/``get_messages`` return *deserialized* mautrix events whose
+    content is a ``TextMessageEventContent``, not a dict. The previous
+    ``dict(content) if hasattr(content, "items")`` probe silently yielded ``{}``
+    for those, so every fetched body came back empty.
+    """
+
+    def test_plain_dict_content(self):
+        from plugins.platforms.matrix.adapter import _matrix_content_dict
+
+        event = {"content": {"msgtype": "m.text", "body": "hi"}}
+        assert _matrix_content_dict(event) == {"msgtype": "m.text", "body": "hi"}
+
+    def test_typed_content_via_serialize(self):
+        from plugins.platforms.matrix.adapter import _matrix_content_dict
+
+        class _TypedContent:
+            def serialize(self):
+                return {"msgtype": "m.text", "body": "typed"}
+
+        event = types.SimpleNamespace(content=_TypedContent())
+        assert _matrix_content_dict(event) == {"msgtype": "m.text", "body": "typed"}
+
+    def test_unrecognized_content_yields_empty_dict_not_an_exception(self):
+        from plugins.platforms.matrix.adapter import _matrix_content_dict
+
+        assert _matrix_content_dict(types.SimpleNamespace(content=object())) == {}
+        assert _matrix_content_dict(None) == {}
+
+    def test_serialize_failure_falls_through(self):
+        from plugins.platforms.matrix.adapter import _matrix_content_dict
+
+        class _Broken:
+            def serialize(self):
+                raise RuntimeError("nope")
+
+        assert _matrix_content_dict(types.SimpleNamespace(content=_Broken())) == {}
+
+    def test_real_mautrix_event_body_is_extracted(self):
+        """Pins the contract against the actual SDK, not our idea of it."""
+        pytest.importorskip("mautrix")
+        from mautrix.types import Event
+        from plugins.platforms.matrix.adapter import _matrix_content_dict
+
+        event = Event.deserialize(
+            {
+                "type": "m.room.message",
+                "event_id": "$root",
+                "sender": "@alice:example.org",
+                "room_id": "!r:example.org",
+                "origin_server_ts": 1700000000000,
+                "content": {"msgtype": "m.text", "body": "the original post"},
+            }
+        )
+
+        content = _matrix_content_dict(event)
+        assert content.get("body") == "the original post"
+        assert content.get("msgtype") == "m.text"
+
+    def test_fetch_history_reads_bodies_from_typed_events(self):
+        """``fetch_history`` shares the extraction path and was equally blind."""
+        pytest.importorskip("mautrix")
+        from mautrix.types import Event
+
+        adapter = _make_adapter()
+        event = Event.deserialize(
+            {
+                "type": "m.room.message",
+                "event_id": "$e1",
+                "sender": "@alice:example.org",
+                "room_id": "!r:example.org",
+                "origin_server_ts": 1700000000000,
+                "content": {"msgtype": "m.text", "body": "historical message"},
+            }
+        )
+
+        serialized = adapter._serialize_history_event(event)
+
+        assert serialized["body"] == "historical message"
+        assert serialized["sender"] == "@alice:example.org"
+        assert serialized["event_id"] == "$e1"
+
+
+class TestMatrixQuotedImage:
+    """A quoted image must reach the agent as pixels, not as a filename.
+
+    Naming the file without supplying it is worse than saying nothing: the
+    agent treats the name as a lead and burns turns searching the filesystem
+    for a file that was never on disk.
+    """
+
+    def setup_method(self):
+        self.adapter = _make_adapter()
+        self.adapter._is_dm_room = AsyncMock(return_value=True)
+        self.adapter._get_display_name = AsyncMock(return_value="Alice")
+        self.adapter._background_read_receipt = MagicMock()
+        self.adapter._text_batch_delay_seconds = 0
+        self.adapter._require_mention = False
+        self.adapter._free_rooms = set()
+
+    def _install_client(self, body="1000081302.jpg"):
+        client = MagicMock()
+        client.get_event = AsyncMock(
+            return_value={
+                "sender": "@rolf:example.org",
+                "content": {
+                    "msgtype": "m.image",
+                    "body": body,
+                    "url": "mxc://example.org/abc",
+                    "info": {"mimetype": "image/jpeg", "size": 1234},
+                },
+            }
+        )
+        self.adapter._client = client
+        return client
+
+    @pytest.mark.asyncio
+    async def test_quoted_image_is_downloaded_and_attached(self):
+        self._install_client()
+        self.adapter._extract_media_payload = AsyncMock(
+            return_value=types.SimpleNamespace(
+                cached_path="/cache/img.jpg",
+                http_url="",
+                media_type="image/jpeg",
+                msg_type=MessageType.PHOTO,
+                is_voice=False,
+                is_encrypted=False,
+            )
+        )
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$root")
+
+        assert quoted.media_path == "/cache/img.jpg"
+        assert quoted.media_type == "image/jpeg"
+
+    @pytest.mark.asyncio
+    async def test_hung_media_download_degrades_to_marker(self, monkeypatch):
+        """A stalled image download must not block sync dispatch either."""
+        import plugins.platforms.matrix.adapter as matrix_adapter
+
+        monkeypatch.setattr(matrix_adapter, "_QUOTED_FETCH_TIMEOUT", 0.01)
+        self._install_client()
+
+        async def _hang(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        self.adapter._extract_media_payload = _hang
+
+        quoted = await asyncio.wait_for(
+            self.adapter._fetch_quoted_event("!r:x", "$root"), timeout=5
+        )
+
+        assert quoted.media_path is None
+        assert quoted.text == "[image]"
+
+    @pytest.mark.asyncio
+    async def test_bare_filename_is_not_echoed_into_the_prompt(self):
+        """'1000081302.jpg' in the text is what sent the agent file-hunting."""
+        self._install_client(body="1000081302.jpg")
+        self.adapter._extract_media_payload = AsyncMock(
+            return_value=types.SimpleNamespace(
+                cached_path="/cache/img.jpg", http_url="", media_type="image/jpeg",
+                msg_type=MessageType.PHOTO, is_voice=False, is_encrypted=False,
+            )
+        )
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$root")
+
+        assert quoted.text == "[image]"
+        assert "1000081302" not in (quoted.text or "")
+
+    @pytest.mark.asyncio
+    async def test_real_caption_is_preserved(self):
+        self._install_client(body="the oak by the lake")
+        self.adapter._extract_media_payload = AsyncMock(
+            return_value=types.SimpleNamespace(
+                cached_path="/cache/img.jpg", http_url="", media_type="image/jpeg",
+                msg_type=MessageType.PHOTO, is_voice=False, is_encrypted=False,
+            )
+        )
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$root")
+
+        assert quoted.text == "[image: the oak by the lake]"
+
+    @pytest.mark.asyncio
+    async def test_failed_download_degrades_to_bare_marker(self):
+        """No file behind the name means the name must not be shown."""
+        self._install_client(body="1000081302.jpg")
+        self.adapter._extract_media_payload = AsyncMock(return_value=None)
+
+        quoted = await self.adapter._fetch_quoted_event("!r:x", "$root")
+
+        assert quoted.text == "[image]"
+        assert quoted.media_path is None
+
+    @pytest.mark.asyncio
+    async def test_thread_on_image_attaches_it_to_the_text_message(self):
+        """The end-to-end shape of 'what tree is this?' in an image thread."""
+        self._install_client()
+        self.adapter._extract_media_payload = AsyncMock(
+            return_value=types.SimpleNamespace(
+                cached_path="/cache/img.jpg", http_url="", media_type="image/jpeg",
+                msg_type=MessageType.PHOTO, is_voice=False, is_encrypted=False,
+            )
+        )
+        captured = {}
+
+        async def capture(msg_event):
+            captured["event"] = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@user:example.org",
+            event_id="$trigger",
+            event_ts=0.0,
+            source_content={
+                "msgtype": "m.text",
+                "body": "wat voor boom is dit en hoe oud is die",
+            },
+            relates_to={
+                "rel_type": "m.thread",
+                "event_id": "$root",
+                "is_falling_back": True,
+                "m.in_reply_to": {"event_id": "$root"},
+            },
+        )
+
+        event = captured["event"]
+        assert event.media_urls == ["/cache/img.jpg"]
+        assert event.media_types == ["image/jpeg"]
+        assert event.reply_to_text == "[image]"
+
+    @pytest.mark.asyncio
+    async def test_plain_text_message_still_gets_list_media_fields(self):
+        """None would break the in-place extend in _enqueue_text_event."""
+        self.adapter._client = MagicMock()
+        captured = {}
+
+        async def capture(msg_event):
+            captured["event"] = msg_event
+
+        self.adapter.handle_message = capture
+        await self.adapter._handle_text_message(
+            room_id="!room:example.org",
+            sender="@user:example.org",
+            event_id="$trigger",
+            event_ts=0.0,
+            source_content={"msgtype": "m.text", "body": "hello"},
+            relates_to={},
+        )
+
+        assert captured["event"].media_urls == []
+        assert captured["event"].media_types == []
+
+    @pytest.mark.asyncio
+    async def test_stale_cached_media_path_is_refetched(self, tmp_path):
+        """Cache cleanup can sweep the file out from under a cached entry."""
+        real = tmp_path / "img.jpg"
+        real.write_bytes(b"x")
+        self._install_client()
+        self.adapter._extract_media_payload = AsyncMock(
+            return_value=types.SimpleNamespace(
+                cached_path=str(real), http_url="", media_type="image/jpeg",
+                msg_type=MessageType.PHOTO, is_voice=False, is_encrypted=False,
+            )
+        )
+
+        first = await self.adapter._fetch_quoted_event("!r:x", "$root")
+        assert first.media_path == str(real)
+        assert self.adapter._client.get_event.await_count == 1
+
+        # Second call is served from cache while the file is still there.
+        await self.adapter._fetch_quoted_event("!r:x", "$root")
+        assert self.adapter._client.get_event.await_count == 1
+
+        # Once the cached file is gone the entry must not be handed out again.
+        real.unlink()
+        await self.adapter._fetch_quoted_event("!r:x", "$root")
+        assert self.adapter._client.get_event.await_count == 2
