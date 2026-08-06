@@ -6,7 +6,8 @@ no stderr chatter.  Just the agent's final text to stdout.
 Toolsets = explicit --toolsets when provided, otherwise whatever the user has
 configured for "cli" in `hermes tools`.
 Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn.
-Approvals = auto-bypassed (HERMES_YOLO_MODE=1 is set for the call).
+Approvals fail closed by default. Set approvals.oneshot_yolo: true to opt into
+auto-bypass for trusted one-shot environments.
 Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
 
 Model / provider selection mirrors `hermes chat`:
@@ -167,6 +168,31 @@ def _write_usage_file(path: Optional[str], result: dict, failure: Optional[str] 
         pass
 
 
+def _configure_oneshot_yolo() -> bool:
+    """Apply the explicit one-shot YOLO policy and return whether it is enabled.
+
+    A one-shot run has no interactive approval surface. The safe default is
+    therefore to leave dangerous-command and plugin approval gates active so
+    approval-required actions fail closed. Trusted automation can explicitly
+    opt into the historical auto-bypass with ``approvals.oneshot_yolo: true``.
+    """
+    enabled = False
+    try:
+        from hermes_cli.config import load_config
+
+        approvals = (load_config() or {}).get("approvals")
+        if isinstance(approvals, dict):
+            enabled = approvals.get("oneshot_yolo") is True
+    except Exception:
+        enabled = False
+    if enabled:
+        os.environ["HERMES_YOLO_MODE"] = "1"
+    else:
+        # Clear inherited YOLO as well: approval state may be frozen at import.
+        os.environ.pop("HERMES_YOLO_MODE", None)
+    return enabled
+
+
 def run_oneshot(
     prompt: str,
     model: Optional[str] = None,
@@ -216,9 +242,9 @@ def run_oneshot(
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
 
-    # Auto-approve any shell / tool approvals.  Non-interactive by
-    # definition — a prompt would hang forever.
-    os.environ["HERMES_YOLO_MODE"] = "1"
+    # One-shot is non-interactive, so approval-required actions must either be
+    # explicitly auto-approved or fail closed rather than waiting for input.
+    _configure_oneshot_yolo()
     os.environ["HERMES_ACCEPT_HOOKS"] = "1"
 
     # One-shot prints a single final response and exits: there is no later turn

@@ -2098,6 +2098,11 @@ DEFAULT_CONFIG = {
         "mode": "smart",
         "timeout": 300,
         "cron_mode": "deny",
+        # One-shot (`hermes -z`) has no interactive approval surface. Keep
+        # approval gates active by default so gated actions fail closed; set
+        # true only for trusted unattended environments that intentionally
+        # accept YOLO behaviour.
+        "oneshot_yolo": False,
         # Operator-customizable policy text for smart approvals. When
         # non-empty, this is appended to the smart-approval guardian's
         # SYSTEM prompt (trusted channel) as additional rules — e.g.
