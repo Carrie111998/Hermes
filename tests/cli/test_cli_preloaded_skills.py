@@ -106,6 +106,96 @@ def test_main_raises_for_unknown_preloaded_skill(monkeypatch):
         cli_mod.main(skills="missing-skill", list_tools=True)
 
 
+def test_kanban_worker_blocks_removed_forced_skill_before_cli_construction(
+    tmp_path, monkeypatch,
+):
+    """A dispatcher claim cannot start the model after a skill vanishes."""
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "alpha"
+    skill_md = profile / "skills" / "vanished" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\nname: vanished\n---\nbody\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="startup gate", assignee="alpha", skills=["vanished"]
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        skill_md.unlink()
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "dispatcher")
+
+        import cli as cli_mod
+
+        constructed = []
+        monkeypatch.setattr(
+            cli_mod, "HermesCLI", lambda **kwargs: constructed.append(kwargs)
+        )
+        cli_mod.main(skills="vanished", list_tools=True)
+
+        row = conn.execute(
+            "SELECT status, block_kind, claim_lock, current_run_id, consecutive_failures "
+            "FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        assert constructed == []
+        assert row["status"] == "blocked"
+        assert row["block_kind"] == "capability"
+        assert row["claim_lock"] is None
+        run = conn.execute(
+            "SELECT status, outcome FROM task_runs WHERE id = ?",
+            (claimed.current_run_id,),
+        ).fetchone()
+        assert dict(run) == {"status": "blocked", "outcome": "blocked"}
+        assert row["consecutive_failures"] == 0
+    finally:
+        conn.close()
+
+
+def test_nested_cli_skill_mismatch_cannot_block_parent_kanban_claim(
+    tmp_path, monkeypatch,
+):
+    from hermes_cli import kanban_db as kb
+
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "alpha"
+    skill_md = profile / "skills" / "parent-skill" / "SKILL.md"
+    skill_md.parent.mkdir(parents=True)
+    skill_md.write_text("---\nname: parent-skill\n---\nbody\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(
+            conn, title="parent claim", assignee="alpha", skills=["parent-skill"]
+        )
+        claimed = kb.claim_task(conn, task_id, claimer="dispatcher")
+        assert claimed is not None
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+        monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "dispatcher")
+
+        import cli as cli_mod
+
+        assert cli_mod._block_missing_kanban_forced_skills(["nested-missing"]) is False
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        assert task.claim_lock == "dispatcher"
+    finally:
+        conn.close()
+
+
 def test_show_banner_does_not_print_skills():
     """show_banner() no longer prints the activated skills line — it moved to run()."""
     cli_obj = _make_real_cli(compact=False)

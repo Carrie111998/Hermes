@@ -2879,13 +2879,7 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
 
 
 def resolve_assignee_skills(assignee: str, skill_names: Iterable[str]) -> list[str]:
-    """Resolve forced skills in a target profile without switching process state."""
-    from agent.skill_utils import (
-        iter_skill_index_files,
-        parse_frontmatter,
-        skill_matches_platform,
-        yaml_load,
-    )
+    """Resolve forced skills through the target profile's runtime resolver."""
     from hermes_cli.profiles import get_profile_dir, profile_exists
 
     requested = [str(name).strip() for name in skill_names if str(name).strip()]
@@ -2893,44 +2887,57 @@ def resolve_assignee_skills(assignee: str, skill_names: Iterable[str]) -> list[s
         return []
 
     profile_home = get_profile_dir(assignee)
-    roots = [profile_home / "skills"]
+    env = dict(os.environ)
+    env["HERMES_HOME"] = str(profile_home)
+    env["HERMES_PROFILE"] = assignee
+    script = (
+        "import json, sys\n"
+        "from hermes_cli.env_loader import load_hermes_dotenv\n"
+        "from hermes_constants import get_hermes_home\n"
+        "load_hermes_dotenv(hermes_home=get_hermes_home())\n"
+        "from agent.skill_commands import resolve_forced_preload_skills\n"
+        "resolved, missing = resolve_forced_preload_skills(json.loads(sys.argv[1]))\n"
+        "print('__HERMES_SKILL_RESOLUTION__' + json.dumps({\n"
+        "    'resolved': [name for _payload, _dir, name in resolved],\n"
+        "    'missing': missing,\n"
+        "}))\n"
+    )
     try:
-        config = yaml_load((profile_home / "config.yaml").read_text(encoding="utf-8")) or {}
-        external = (config.get("skills") or {}).get("external_dirs") or []
-    except Exception:
-        external = []
-    if isinstance(external, str):
-        external = [external]
-    if isinstance(external, list):
-        for value in external:
-            path = Path(os.path.expanduser(os.path.expandvars(str(value).strip())))
-            path = path if path.is_absolute() else profile_home / path
-            try:
-                path = path.resolve()
-            except OSError:
-                continue
-            if path.is_dir() and path not in roots:
-                roots.append(path)
-
-    matches: dict[str, set[Path]] = {name: set() for name in requested}
-    for root in roots:
-        for skill_md in iter_skill_index_files(root, "SKILL.md"):
-            try:
-                frontmatter, _ = parse_frontmatter(skill_md.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            if not skill_matches_platform(frontmatter):
-                continue
-            declared = str(frontmatter.get("name") or skill_md.parent.name)
-            for name in requested:
-                categorized = name.replace(":", "/", 1)
-                if (
-                    name == declared
-                    or name == skill_md.parent.name
-                    or root / categorized == skill_md.parent
-                ):
-                    matches[name].add(skill_md.resolve())
-    return [name for name in requested if len(matches[name]) == 1]
+        completed = subprocess.run(
+            [sys.executable, "-c", script, json.dumps(requested)],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=15,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(
+            f"could not run target-profile skill resolver: {exc}"
+        ) from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or completed.stdout.strip()
+        raise RuntimeError(
+            "target-profile skill resolver failed"
+            + (f": {detail[-500:]}" if detail else "")
+        )
+    marker = "__HERMES_SKILL_RESOLUTION__"
+    payload_line = next(
+        (line[len(marker):] for line in reversed(completed.stdout.splitlines())
+         if line.startswith(marker)),
+        None,
+    )
+    try:
+        payload = json.loads(payload_line or "")
+        resolved = payload["resolved"]
+        missing = payload["missing"]
+        if not isinstance(resolved, list) or not isinstance(missing, list):
+            raise ValueError("invalid resolver result")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError("target-profile skill resolver returned no usable result") from exc
+    missing_names = {str(name) for name in missing}
+    return [name for name in requested if name not in missing_names]
 
 
 def _missing_assignee_skills(assignee: Optional[str], skills: Iterable[str]) -> list[str]:
@@ -2947,7 +2954,13 @@ def _missing_assignee_skills(assignee: Optional[str], skills: Iterable[str]) -> 
 
     if not profile_exists(assignee):
         return []
-    resolved = set(resolve_assignee_skills(assignee, requested))
+    try:
+        resolved = set(resolve_assignee_skills(assignee, requested))
+    except RuntimeError as exc:
+        raise ValueError(
+            f"Could not verify required skills for profile {assignee}: {exc}. "
+            "Fix the profile's skill configuration and retry."
+        ) from exc
     return [name for name in requested if name not in resolved]
 
 
@@ -4319,11 +4332,13 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_ready_snapshot: tuple[Optional[str], Optional[str]] | None = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
-    already claimed (or is not in ``ready`` status).
+    already claimed (or is not in ``ready`` status). When supplied,
+    ``expected_ready_snapshot`` also CAS-binds assignee and raw skills JSON.
     """
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -4362,6 +4377,26 @@ def claim_task(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status = 'ready'",
             (task_id,),
         ).fetchone()
+        snapshot_clause = ""
+        snapshot_params: tuple[Optional[str], Optional[str]] = ()
+        if expected_ready_snapshot is not None:
+            snapshot_clause = " AND assignee IS ? AND skills IS ?"
+            snapshot_params = expected_ready_snapshot
+        cur = conn.execute(
+            """
+            UPDATE tasks
+               SET status        = 'running',
+                   claim_lock    = ?,
+                   claim_expires = ?,
+                   started_at    = COALESCE(started_at, ?)
+             WHERE id = ?
+               AND status = 'ready'
+               AND claim_lock IS NULL
+            """ + snapshot_clause,
+            (lock, expires, now, task_id, *snapshot_params),
+        )
+        if cur.rowcount != 1:
+            return None
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -4374,21 +4409,6 @@ def claim_task(
                 """,
                 (now, int(stale["current_run_id"])),
             )
-        cur = conn.execute(
-            """
-            UPDATE tasks
-               SET status        = 'running',
-                   claim_lock    = ?,
-                   claim_expires = ?,
-                   started_at    = COALESCE(started_at, ?)
-             WHERE id = ?
-               AND status = 'ready'
-               AND claim_lock IS NULL
-            """,
-            (lock, expires, now, task_id),
-        )
-        if cur.rowcount != 1:
-            return None
         # Look up the current task row so we can populate the run with
         # its assignee / step / runtime cap.
         trow = conn.execute(
@@ -5712,6 +5732,7 @@ def block_task(
     reason: Optional[str] = None,
     kind: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    expected_ready_snapshot: tuple[Optional[str], Optional[str]] | None = None,
     synthesize_run: bool = True,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -5743,6 +5764,8 @@ def block_task(
 
     ``synthesize_run=False`` is for preflight rejections that happen before a
     worker ever starts; it keeps those capability events out of run history.
+    ``expected_ready_snapshot`` makes a dispatcher preflight verdict a no-op
+    if another writer changed or claimed the ready row in the meantime.
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
@@ -5750,6 +5773,18 @@ def block_task(
         )
     recurrences = 0
     run_id: Optional[int] = None
+    snapshot_clause = ""
+    snapshot_params: tuple[Optional[str], Optional[str]] = ()
+    if expected_ready_snapshot is not None:
+        snapshot_clause = (
+            " AND status = 'ready' AND claim_lock IS NULL"
+            " AND assignee IS ? AND skills IS ?"
+        )
+        snapshot_params = expected_ready_snapshot
+
+    def _with_snapshot(*params: object) -> tuple[object, ...]:
+        return params + snapshot_params
+
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
@@ -5780,9 +5815,10 @@ def block_task(
                        block_kind    = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, task_id) if expected_run_id is None
-                else (kind, task_id, int(expected_run_id)),
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + snapshot_clause,
+                _with_snapshot(kind, task_id) if expected_run_id is None
+                else _with_snapshot(kind, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5833,9 +5869,10 @@ def block_task(
                        block_recurrences = ?
                  WHERE id = ?
                    AND status IN ('running', 'ready')
-                """ + ("" if expected_run_id is None else " AND current_run_id = ?"),
-                (kind, recurrences, task_id) if expected_run_id is None
-                else (kind, recurrences, task_id, int(expected_run_id)),
+                """ + ("" if expected_run_id is None else " AND current_run_id = ?")
+                + snapshot_clause,
+                _with_snapshot(kind, recurrences, task_id) if expected_run_id is None
+                else _with_snapshot(kind, recurrences, task_id, int(expected_run_id)),
             )
             if cur.rowcount != 1:
                 return False
@@ -5871,8 +5908,8 @@ def block_task(
                            block_recurrences = ?
                      WHERE id = ?
                        AND status IN ('running', 'ready')
-                    """,
-                    (kind, recurrences, task_id),
+                    """ + snapshot_clause,
+                    _with_snapshot(kind, recurrences, task_id),
                 )
             else:
                 cur = conn.execute(
@@ -5887,8 +5924,8 @@ def block_task(
                      WHERE id = ?
                        AND status IN ('running', 'ready')
                        AND current_run_id = ?
-                    """,
-                    (kind, recurrences, task_id, int(expected_run_id)),
+                    """ + snapshot_clause,
+                    _with_snapshot(kind, recurrences, task_id, int(expected_run_id)),
                 )
             if cur.rowcount != 1:
                 return False
@@ -8453,7 +8490,7 @@ def _dispatch_once_locked(
         )
 
     ready_rows = conn.execute(
-        "SELECT id, assignee FROM tasks "
+        "SELECT id, assignee, skills FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
@@ -8617,23 +8654,40 @@ def _dispatch_once_locked(
         # against the row's current assignee immediately before any claim so a
         # missing forced skill becomes an actionable capability block rather
         # than a worker startup crash/retry loop.
-        candidate = get_task(conn, row["id"])
+        snapshot = conn.execute(
+            "SELECT status, claim_lock, assignee, skills FROM tasks WHERE id = ?",
+            (row["id"],),
+        ).fetchone()
         if (
-            candidate is None
-            or candidate.status != "ready"
-            or candidate.claim_lock is not None
+            snapshot is None
+            or snapshot["status"] != "ready"
+            or snapshot["claim_lock"] is not None
         ):
             continue
-        missing_skills = _missing_assignee_skills(
-            candidate.assignee, candidate.skills or []
-        )
+        snapshot_skills: list[str] = []
+        try:
+            parsed_snapshot_skills = json.loads(snapshot["skills"] or "[]")
+            if not isinstance(parsed_snapshot_skills, list):
+                raise ValueError("task skills snapshot is not a list")
+            snapshot_skills = parsed_snapshot_skills
+            missing_skills = _missing_assignee_skills(
+                snapshot["assignee"], snapshot_skills
+            )
+        except ValueError as exc:
+            missing_skills = snapshot_skills or ["<invalid skills snapshot>"]
+            capability_reason = str(exc)
+        else:
+            capability_reason = _missing_skills_reason(
+                snapshot["assignee"], missing_skills
+            )
         if missing_skills:
             if not dry_run:
                 block_task(
                     conn,
-                    candidate.id,
-                    reason=_missing_skills_reason(candidate.assignee, missing_skills),
+                    row["id"],
+                    reason=capability_reason,
                     kind="capability",
+                    expected_ready_snapshot=(snapshot["assignee"], snapshot["skills"]),
                     # This never started a worker, so leave no run/attempt record.
                     synthesize_run=False,
                 )
@@ -8649,7 +8703,12 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, candidate.id, ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            expected_ready_snapshot=(snapshot["assignee"], snapshot["skills"]),
+        )
         if claimed is None:
             continue
         try:

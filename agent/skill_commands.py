@@ -229,6 +229,44 @@ def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tu
     return loaded_skill, skill_dir, skill_name
 
 
+def resolve_forced_preload_skills(
+    skill_identifiers: list[str],
+    task_id: str | None = None,
+) -> tuple[list[tuple[dict[str, Any], Path | None, str]], list[str]]:
+    """Resolve forced preloads without recording usage or building a prompt.
+
+    This is the runtime authority for ``--skills``: it deliberately follows
+    ``skill_view`` through :func:`_load_skill_payload`, then applies the same
+    disabled-name gate as session preloading.
+    """
+    try:
+        from agent.skill_utils import get_disabled_skill_names
+        disabled_names = get_disabled_skill_names()
+    except Exception:
+        disabled_names = set()
+
+    resolved: list[tuple[dict[str, Any], Path | None, str]] = []
+    missing: list[str] = []
+    seen: set[str] = set()
+    for raw_identifier in skill_identifiers:
+        identifier = (raw_identifier or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        seen.add(identifier)
+
+        loaded = _load_skill_payload(identifier, task_id=task_id)
+        if not loaded:
+            missing.append(identifier)
+            continue
+        loaded_skill, skill_dir, skill_name = loaded
+        if skill_name in disabled_names or identifier in disabled_names:
+            missing.append(identifier)
+            continue
+        resolved.append((loaded_skill, skill_dir, skill_name))
+
+    return resolved, missing
+
+
 def _inject_skill_config(loaded_skill: dict[str, Any], parts: list[str]) -> None:
     """Resolve and inject skill-declared config values into the message parts.
 
@@ -761,31 +799,8 @@ def build_preloaded_skills_prompt(
     """
     prompt_parts: list[str] = []
     loaded_names: list[str] = []
-    missing: list[str] = []
-
-    try:
-        from agent.skill_utils import get_disabled_skill_names
-        disabled_names = get_disabled_skill_names()
-    except Exception:
-        disabled_names = set()
-
-    seen: set[str] = set()
-    for raw_identifier in skill_identifiers:
-        identifier = (raw_identifier or "").strip()
-        if not identifier or identifier in seen:
-            continue
-        seen.add(identifier)
-
-        loaded = _load_skill_payload(identifier, task_id=task_id)
-        if not loaded:
-            missing.append(identifier)
-            continue
-
-        loaded_skill, skill_dir, skill_name = loaded
-
-        if skill_name in disabled_names or identifier in disabled_names:
-            missing.append(identifier)
-            continue
+    resolved, missing = resolve_forced_preload_skills(skill_identifiers, task_id)
+    for loaded_skill, skill_dir, skill_name in resolved:
 
         # Track active usage for Curator lifecycle management (#17782)
         try:

@@ -4097,6 +4097,52 @@ def _parse_skills_argument(skills: str | list[str] | tuple[str, ...] | None) -> 
     return parsed
 
 
+def _block_missing_kanban_forced_skills(skill_identifiers: list[str]) -> bool:
+    """Block an exact dispatcher claim whose forced skills vanished at startup."""
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id_raw = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    claim_lock = (os.environ.get("HERMES_KANBAN_CLAIM_LOCK") or "").strip()
+    if not task_id or not run_id_raw or not claim_lock or not skill_identifiers:
+        return False
+    try:
+        run_id = int(run_id_raw)
+    except ValueError:
+        return False
+
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, task_id)
+        if (
+            task is None
+            or task.status != "running"
+            or task.current_run_id != run_id
+            or task.claim_lock != claim_lock
+            or (task.skills or []) != skill_identifiers
+        ):
+            return False
+        from agent.skill_commands import resolve_forced_preload_skills
+
+        _resolved, missing = resolve_forced_preload_skills(skill_identifiers)
+        if not missing:
+            return False
+        reason = kb._missing_skills_reason(task.assignee, missing)
+        blocked = kb.block_task(
+            conn,
+            task_id,
+            reason=reason,
+            kind="capability",
+            expected_run_id=run_id,
+            synthesize_run=False,
+        )
+        if blocked:
+            logger.error("Kanban worker blocked before startup: %s", reason)
+        return blocked
+    finally:
+        conn.close()
+
+
 def save_config_value(key_path: str, value: any) -> bool:
     """
     Save a value to the active config file at the specified key path.
@@ -18169,6 +18215,8 @@ def main(
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
     parsed_skills = _parse_skills_argument(skills)
+    if _block_missing_kanban_forced_skills(parsed_skills):
+        return
 
     # Create CLI instance
     cli = HermesCLI(
