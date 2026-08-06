@@ -484,10 +484,18 @@ def check_all(repo_root: Path | None = None) -> dict:
 # a placeholder the translator fills; every technical span is preserved.
 # ─────────────────────────────────────────────────────────────────────────────
 
-def germinate_template(en_text: str, locale: str) -> str:
+def germinate_template(en_text: str, locale: str, doc: str | None = None) -> str:
+    """Prose-placeholder template. Every technical span is preserved; prose
+    becomes a ⟪locale:...⟫ marker the translator replaces.
+
+    Convention injected for README templates: the locale README carries an
+    English language badge (its back-link to the canonical README.md) — the
+    same convention every existing locale README follows (es, zh-CN, ur-pk,
+    fr). The gate's backlink_parity check enforces it."""
     lines = en_text.split("\n")
     out: list[str] = []
     in_fence = False
+    added_en_badge = False
     for line in lines:
         if FENCE_RE.match(line) or line.startswith(("```", "~~~")):
             in_fence = not in_fence
@@ -496,6 +504,13 @@ def germinate_template(en_text: str, locale: str) -> str:
         if in_fence:
             out.append(line)  # code bodies are never translated
             continue
+        if doc == "README.md" and locale != "en" and not added_en_badge and "Lang-" in line:
+            out.append(
+                '  <a href="README.md"><img '
+                'src="https://img.shields.io/badge/Lang-English-blue?style=for-the-badge" '
+                'alt="English"></a>'
+            )
+            added_en_badge = True
         if not line.strip():
             out.append(line)
             continue
@@ -505,7 +520,7 @@ def germinate_template(en_text: str, locale: str) -> str:
         if re.match(r"^\s*(<\|?\s*[-|]|\|?\s*[-|])", line):
             out.append(line)  # table rows: translator edits cells in place
             continue
-        if line.startswith(("<", "<!--")):
+        if line.lstrip().startswith(("<", "<!--")):
             out.append(line)  # HTML/badges stay verbatim
             continue
         if re.match(r"^\s*!\[", line) or re.match(r"^\s*\[", line):
@@ -515,6 +530,84 @@ def germinate_template(en_text: str, locale: str) -> str:
         # translates the quoted original.
         out.append(f"⟪{locale}:{line}⟫")
     return "\n".join(out)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Germination runner — the AUTOMATIC half of the pipeline. `germinate` takes
+# the English source, renders the prose-placeholder template, sends it to a
+# configured LLM command, captures the translation, writes the locale file,
+# and runs the parity gate on the result. The gate is the arbiter: a locale
+# that fails `check` is not germinated, no matter how the text was produced.
+# ─────────────────────────────────────────────────────────────────────────────
+
+GERMINATE_PROMPT_TEMPLATE = """You are a professional technical translator for the Hermes Agent project.
+Translate the markdown document below from English to {lang_name} ({locale}).
+
+HARD RULES (the parity gate enforces these — violations are rejected):
+1. Translate ONLY the prose. Every fenced code block stays byte-identical —
+   never translate inside ``` fences, including comments inside them.
+2. Every backtick span (technical identifier, command, path, env var) stays
+   verbatim: `hermes model`, `~/.hermes/config.yaml`, `HERMES_*`, etc.
+3. Link targets stay identical, EXCEPT root-doc links get the locale suffix:
+   README.md -> README.{locale}.md, CONTRIBUTING.md -> CONTRIBUTING.{locale}.md,
+   SECURITY.md -> SECURITY.{locale}.md. Never change other targets.
+4. Heading LEVELS stay identical in the same order. Translate heading text.
+5. Markdown table structure, HTML badges, and separator lines are preserved.
+6. Output ONLY the translated markdown document — no preamble, no commentary.
+7. Internal anchors (#...) in links must match the slugs of YOUR translated
+   headings (GitHub slug: lowercase, punctuation stripped, spaces -> '-',
+   leading/trailing hyphens removed).
+8. If any instruction is impossible, keep the English source line verbatim
+   and mark it with <!-- TODO: translate --> rather than guessing.
+
+The document follows the template form: lines wrapped in ⟪{locale}:...⟫ are
+the prose you translate IN PLACE (replace the marker with the translation).
+Lines outside the markers (fences, tables, headings, HTML, links) stay as-is
+per the rules above.
+
+=== DOCUMENT START ===
+{template}
+=== DOCUMENT END ===
+"""
+
+
+def germinate(
+    locale: str,
+    doc: str,
+    llm_cmd: list[str],
+    out_dir: Path | None = None,
+    lang_name: str | None = None,
+    timeout: int = 600,
+) -> tuple[Path, str, list[dict]]:
+    """Run the LLM, write the translation, and return (path, llm_output,
+    gate_issues). Callers decide whether the output is acceptable — the
+    gate verdict is authoritative, not the LLM."""
+    src = REPO_ROOT / doc
+    text = src.read_text(encoding="utf-8")
+    meta = MANIFEST.get(locale, {})
+    lang_name = lang_name or meta.get("name", locale)
+    prompt = GERMINATE_PROMPT_TEMPLATE.format(
+        lang_name=lang_name, locale=locale, template=germinate_template(text, locale, doc)
+    )
+    import subprocess
+
+    proc = subprocess.run(
+        llm_cmd, input=prompt, capture_output=True, text=True, encoding="utf-8", timeout=timeout
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"LLM command failed ({proc.returncode}): {proc.stderr[:500]}")
+    out = proc.stdout.strip()
+
+    target_dir = out_dir or REPO_ROOT
+    target = target_dir / locale_file(doc, locale)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(out + "\n", encoding="utf-8")
+
+    # The gate is authoritative regardless of destination: verify the LLM
+    # output against the real English source before anyone trusts it.
+    status = MANIFEST.get(locale, {}).get("status", "germinated")
+    issues = check_doc_parity(text, out, doc, locale, status)
+    return target, out, issues
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -536,9 +629,11 @@ def _status_table(repo_root: Path) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("action", choices=["check", "status", "extract", "template"])
-    ap.add_argument("--locale", default=None, help="locale code (extract/template)")
-    ap.add_argument("--doc", default=None, help="root doc name (extract/template)")
+    ap.add_argument("action", choices=["check", "status", "extract", "template", "germinate"])
+    ap.add_argument("--locale", default=None, help="locale code (extract/template/germinate)")
+    ap.add_argument("--doc", default=None, help="root doc name (extract/template/germinate)")
+    ap.add_argument("--llm", default=None, help="LLM command for germinate, e.g. 'hermes chat -Q -q' (reads prompt on stdin)")
+    ap.add_argument("--out", default=None, help="output dir for germinate (default: repo root)")
     ap.add_argument("--json", action="store_true", help="JSON output")
     args = ap.parse_args(argv)
 
@@ -586,7 +681,29 @@ def main(argv: list[str] | None = None) -> int:
             }
             print(json.dumps(payload, indent=2, ensure_ascii=False))
         else:
-            print(germinate_template(text, args.locale))
+            print(germinate_template(text, args.locale, args.doc))
+        return 0
+
+    if args.action == "germinate":
+        if not args.locale or not args.doc or not args.llm:
+            ap.error("--locale, --doc and --llm are required for germinate")
+        import shlex
+
+        llm_cmd = shlex.split(args.llm)
+        out_dir = Path(args.out) if args.out else None
+        try:
+            target, out_text, issues = germinate(
+                args.locale, args.doc, llm_cmd, out_dir=out_dir
+            )
+        except RuntimeError as e:
+            print(f"germinate failed: {e}", file=sys.stderr)
+            return 1
+        print(f"wrote {target} ({len(out_text)} chars)")
+        if issues:
+            for i in issues:
+                print(f"       {i['severity']:7} {i['class']}: {i['detail']}")
+            return 1 if any(i["severity"] == "error" for i in issues) else 0
+        print("gate: PASS (no drift)")
         return 0
     return 0
 

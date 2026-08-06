@@ -33,6 +33,7 @@ from docs_germination import (  # noqa: E402
     extract_fences,
     extract_headings,
     extract_links,
+    germinate,
     locale_file,
     rewrite_target,
     slugify,
@@ -239,3 +240,100 @@ def test_english_sources_have_no_missing_twin_targets(doc):
     for _, t in extract_links(text):
         if t.startswith("#") and t[1:]:
             assert t[1:] in anchors, f"{doc}: dangling fragment {t}"
+
+
+# ── germination runner (mocked LLM — no network in CI) ──────────────────────
+
+
+def _fake_llm_that_translates_prose(monkeypatch, translation_map):
+    """The germinate action pipes the prompt to the LLM command and treats
+    stdout as the translation. This fake verifies the prompt carried the
+    template, and returns a translation whose prose lines are the marker
+    content suffixed with the locale (a crude 'translation')."""
+    import subprocess
+
+    captured = {}
+
+    class FakeProc:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    def fake_run(cmd, input, capture_output, text, encoding, timeout):
+        captured["cmd"] = cmd
+        captured["prompt"] = input
+        # Simulate an LLM that returns ONLY the translated document (it
+        # drops the instruction preamble and the end marker) and keeps
+        # everything but prose markers, which it 'translates' by suffixing
+        # the locale code.
+        doc_lines = input.split("=== DOCUMENT START ===")[1].split(
+            "=== DOCUMENT END ==="
+        )[0].splitlines()
+        out_lines = []
+        for line in doc_lines:
+            if line.startswith("⟪"):
+                # ⟪fr:Some prose⟫ -> "Some prose [fr]"
+                inner = line.split(":", 1)[1].rsplit("⟫", 1)[0]
+                out_lines.append(f"{inner} [{translation_map.get(inner, 'fr')}]")
+            else:
+                out_lines.append(line)
+        FakeProc.stdout = "\n".join(out_lines)
+        return FakeProc
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    return captured
+
+
+def test_germinate_writes_file_and_runs_gate(monkeypatch, tmp_path):
+    """germinate() writes the LLM output to the locale file and returns the
+    gate verdict. A translation that keeps every technical edge passes; the
+    prompt must carry the template with prose placeholders."""
+    import subprocess
+
+    captured = _fake_llm_that_translates_prose(monkeypatch, {})
+    src = _read("README.md")
+    target, out, issues = germinate("fr", "README.md", ["fake-llm"], out_dir=tmp_path)
+    assert target == tmp_path / "README.fr.md"
+    assert target.exists()
+    # The prompt carried the template (markers present).
+    assert "⟪fr:" in captured["prompt"]
+    # Prose markers got replaced, technical edges preserved.
+    assert "⟪fr:" not in out
+    assert "hermes model" in out  # code span survived the LLM
+    # The gate ran on the output: prose-only translation keeps every edge.
+    errors = [i for i in issues if i["severity"] == "error"]
+    assert not errors, f"gate errors: {errors}"
+
+
+def test_germinate_rejects_llm_that_drops_code_spans(monkeypatch, tmp_path):
+    """A translator that drops a backtick identifier fails the gate — the
+    action reports the drift instead of shipping it."""
+
+    def evil_run(cmd, input, capture_output, text, encoding, timeout):
+        class P:
+            returncode = 0
+            stdout = input.replace("`hermes model`", "the model command")
+            stderr = ""
+
+        return P()
+
+    import subprocess
+
+    monkeypatch.setattr(subprocess, "run", evil_run)
+    _, out, issues = germinate("fr", "README.md", ["evil-llm"], out_dir=tmp_path)
+    assert "the model command" in out
+    classes = {i["class"] for i in issues}
+    assert "code_span_parity" in classes
+
+
+def test_germinate_fails_loudly_on_llm_error(monkeypatch, tmp_path):
+    import subprocess
+
+    class FailProc:
+        returncode = 1
+        stdout = ""
+        stderr = "boom"
+
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: FailProc())
+    with pytest.raises(RuntimeError, match="LLM command failed"):
+        germinate("fr", "README.md", ["broken-llm"], out_dir=tmp_path)
