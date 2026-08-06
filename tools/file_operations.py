@@ -524,7 +524,9 @@ LINTERS = {
     '.js': 'node --check {file} 2>&1',
     '.ts': 'npx tsc --noEmit {file} 2>&1',
     '.go': 'go vet {file} 2>&1',
-    '.rs': 'rustfmt --check {file} 2>&1',
+    # '.rs' 已移除（2026-08-07 本地补丁）：rustfmt --check 是格式检查不是类型检查，
+    # 在 /mnt/c 挂载盘上每次 patch 全文件检查慢（57s/11.6k tok 根因）。
+    # 格式统一交给 cargo fmt，类型检查交给 cargo check——patch 不再跑慢速格式 lint。
 }
 
 # Extensions where the per-file shell linter is structurally weaker than
