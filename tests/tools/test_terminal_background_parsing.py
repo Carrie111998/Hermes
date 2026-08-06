@@ -157,6 +157,41 @@ class TestShellBackgroundOperatorPositions:
         positions = _shell_background_operator_positions("cmd & # comment")
         assert len(positions) == 1
 
+    # --- Regressions flagged in code review ---
+
+    def test_pipe_stderr_operator_not_counted(self):
+        # |& is bash's pipe-stderr operator (pipes stdout+stderr to next cmd).
+        # It is not a background operator and must not be flagged.
+        assert _shell_background_operator_positions("make |& tee build.log") == []
+
+    def test_trailing_pipe_stderr_not_counted(self):
+        # A trailing |& must not be confused with a job-control &.
+        # Normalizing it would produce `cmd |` — invalid syntax.
+        assert _shell_background_operator_positions("cmd |&") == []
+
+    def test_arithmetic_bitwise_and_not_counted(self):
+        # $((5&3)) is arithmetic; the & is not a job-control operator.
+        assert _shell_background_operator_positions("x=$((5&3))") == []
+
+    def test_arithmetic_bitwise_and_in_expression_not_counted(self):
+        assert _shell_background_operator_positions("echo $((a & b))") == []
+
+    def test_case_fallthrough_semicolon_amp_not_counted(self):
+        # ;& is the case-statement fallthrough operator, not backgrounding.
+        cmd = "case $x in\n  a) echo a;&\n  b) echo b;;\nesac"
+        assert _shell_background_operator_positions(cmd) == []
+
+    def test_case_test_next_semicolon_amp_not_counted(self):
+        # ;;& tests the next pattern; also not backgrounding.
+        cmd = "case $x in\n  a) echo a;;&\n  b) echo b;;\nesac"
+        assert _shell_background_operator_positions(cmd) == []
+
+    def test_parallel_jobs_with_wait(self):
+        # `job1 & job2 & wait` is a legitimate parallel pattern.
+        # All three & are real background operators.
+        positions = _shell_background_operator_positions("job1 & job2 & wait")
+        assert len(positions) == 2
+
 
 # ---------------------------------------------------------------------------
 # _contains_shell_background_operator
