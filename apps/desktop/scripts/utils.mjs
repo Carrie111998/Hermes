@@ -1,8 +1,9 @@
+import { pathToFileURL } from 'node:url'
 
-import { pathToFileURL } from 'node:url';
-
-// returns true if the passsed file is being invoked from node,
-// not imported.
+// Returns true when the given module URL is the Node.js entrypoint rather than
+// an imported module. Some loaders do not populate process.argv[1], so treat
+// that state as imported instead of throwing while the module is evaluated.
 export function isMain(importMetaUrl) {
-    return   importMetaUrl === pathToFileURL(process.argv[1]).href;
+  const entrypoint = process.argv[1]
+  return typeof entrypoint === 'string' && importMetaUrl === pathToFileURL(entrypoint).href
 }
