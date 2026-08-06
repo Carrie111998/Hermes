@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-07-31T17:11:54Z",
+  "updated_at": "2026-08-06T01:58:05Z",
   "metadata": {
     "source": "hermes-agent repo",
     "docs": "https://hermes-agent.nousresearch.com/docs/reference/model-catalog"
@@ -101,7 +101,7 @@
           "description": "dated snapshot of v4-flash"
         },
         {
-          "id": "qwen/qwen3.7-max",
+          "id": "qwen/qwen3.8-max",
           "description": ""
         },
         {
@@ -244,7 +244,7 @@
           "id": "deepseek/deepseek-v4-flash-0731"
         },
         {
-          "id": "qwen/qwen3.7-max"
+          "id": "qwen/qwen3.8-max"
         },
         {
           "id": "moonshotai/kimi-k3"
