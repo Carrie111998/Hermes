@@ -3073,6 +3073,12 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         role = "assistant"
         reasoning_parts: list = []
         usage_obj = None
+        # Some OpenAI-compatible gateways (e.g. opencode.ai/zen/go with
+        # gpt-5.6-luna) end the stream with a usage-only chunk but never
+        # send finish_reason or [DONE].  A usage-only chunk is the spec'd
+        # terminal chunk, so record it to distinguish a graceful end from
+        # a genuine mid-stream drop.
+        _graceful_usage_end = False
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
         _writer_token = {"value": None}
@@ -3247,6 +3253,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 # Usage comes in the final chunk with empty choices
                 if hasattr(chunk, "usage") and chunk.usage:
                     usage_obj = chunk.usage
+                    _graceful_usage_end = True
                 continue
 
             delta = chunk.choices[0].delta
@@ -3506,6 +3513,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             finish_reason is None
             and content_parts
             and not tool_calls_acc
+            # A usage-only terminal chunk means the provider finished the
+            # response normally but omitted finish_reason (opencode.ai/zen/go
+            # with gpt-5.6-luna does this) — that is NOT a mid-stream drop.
+            and not _graceful_usage_end
         )
         if _text_only_dropped_no_finish:
             logger.warning(
