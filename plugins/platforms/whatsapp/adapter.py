@@ -590,7 +590,14 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     # Read timeout from environment variable, default to 300 seconds (5 minutes)
                     # to accommodate slower systems like Unraid NAS
                     npm_install_timeout = env_int("WHATSAPP_NPM_INSTALL_TIMEOUT", 300)
-                    install_result = subprocess.run(
+                    # Off the event loop: a synchronous subprocess.run here
+                    # blocks every other adapter, every in-flight turn, the
+                    # watchdogs and the SIGTERM handler for the whole install
+                    # (up to WHATSAPP_NPM_INSTALL_TIMEOUT, default 300s). It
+                    # also defeats the per-platform connect timeout, which
+                    # relies on the loop being able to run its own deadline.
+                    install_result = await asyncio.to_thread(
+                        subprocess.run,
                         [_npm_bin, "install", "--silent"],
                         cwd=str(bridge_dir),
                         capture_output=True,
