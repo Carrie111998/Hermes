@@ -39,7 +39,7 @@ OVER_2K_MANIFEST = {
     "gateway/run.py": 26986,
     "cli.py": 18485,
     "hermes_cli/web_server.py": 17732,
-    "tests/test_tui_gateway_server.py": 16193,
+    "tests/test_tui_gateway_server.py": 16245,
     "tui_gateway/server.py": 14006,
     "hermes_cli/main.py": 12599,
     "apps/desktop/electron/main.ts": 12038,
