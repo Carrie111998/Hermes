@@ -93,6 +93,39 @@ class TestReasoningCommand:
         assert runner._reasoning_config == {"enabled": False}
         assert runner._show_reasoning is True
 
+    @pytest.mark.asyncio
+    async def test_reasoning_picker_reads_per_platform_override(self, tmp_path, monkeypatch):
+        """#79885: the status card must read the per-platform override.
+
+        Global display.show_reasoning=false + per-platform
+        display.platforms.matrix.show_reasoning=true: the recap render path
+        (resolve_display_setting) shows the reasoning box, so the picker must
+        report "Display: on" — not re-read only the global key and report
+        "Display: off".
+        """
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        (hermes_home / "config.yaml").write_text(
+            "display:\n"
+            "  show_reasoning: false\n"
+            "  platforms:\n"
+            "    matrix:\n"
+            "      show_reasoning: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setattr(gateway_run, "_hermes_home", hermes_home)
+
+        runner = _make_runner()
+        event = _make_event("/reasoning", platform=Platform.MATRIX)
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert "**Display:** on ✓" in result, (
+            "picker must report on when the per-platform override enables "
+            "reasoning display"
+        )
+        assert runner._show_reasoning is True
+
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("effort", ["max", "ultra"])

@@ -8266,9 +8266,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return None
 
     @staticmethod
-    def _load_show_reasoning() -> bool:
-        """Load show_reasoning toggle from config.yaml display section."""
+    def _load_show_reasoning(platform_key: Optional[str] = None) -> bool:
+        """Load show_reasoning toggle from config.yaml display section.
+
+        When ``platform_key`` is provided, resolves through the canonical
+        per-platform chain (``resolve_display_setting``: per-platform override
+        ``display.platforms.<platform>.show_reasoning`` → global
+        ``display.show_reasoning`` → default), matching what the recap-render
+        path actually uses. Without it, falls back to the legacy global-only
+        read so callers that lack platform context keep working.
+        """
         cfg = _load_gateway_runtime_config()
+        if platform_key:
+            from gateway.display_config import resolve_display_setting
+
+            value = resolve_display_setting(
+                cfg, platform_key, "show_reasoning", fallback=False
+            )
+            if isinstance(value, str):
+                return value.strip().lower() in {"true", "yes", "1", "on"}
+            return bool(value)
         return is_truthy_value(
             cfg_get(cfg, "display", "show_reasoning"),
             default=False,
