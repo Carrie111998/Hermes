@@ -848,14 +848,9 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _handle_membership_event(self, websocket, subscriptions: Dict[str, Optional[str]], event: dict) -> None:
         """Rediscover and subscribe after a membership event p-tagged to us."""
         event_since = max(int(event.get("created_at") or 0), 0)
-        before = set(self._channel_state)
-        if not await self._discover_joined_channels(since=event_since):
-            raise ConnectionError("Buzz joined-channel discovery failed")
+        discovered = await self._discover_conversations(since=event_since)
         self._membership_since = max(self._membership_since, event_since)
-        await self._discover_dms(seed=False)
-        for channel_id in self._channel_state:
-            if channel_id in before:
-                continue
+        for channel_id in discovered:
             subscription_id = f"hermes-buzz-dm-{len(subscriptions)}"
             subscriptions[subscription_id] = channel_id
             await self._send_channel_subscription(websocket, subscription_id, channel_id)
@@ -933,7 +928,7 @@ class BuzzAdapter(BasePlatformAdapter):
                 self._poll_count += 1
                 try:
                     if self._poll_count % _DM_DISCOVERY_EVERY == 0:
-                        await self._discover_dms(seed=False)
+                        await self._discover_conversations(since=int(time.time()))
                     for channel_id in list(self._channel_state):
                         await self._poll_channel(channel_id)
                 except asyncio.CancelledError:
@@ -943,9 +938,15 @@ class BuzzAdapter(BasePlatformAdapter):
         except asyncio.CancelledError:
             raise
 
-    async def _seed_channel(self, channel_id: str, chat_type: str) -> None:
+    async def _seed_channel(self, channel_id: str, chat_type: str, *, floor_ts: int = 0) -> None:
         """Initialize a channel's high-water mark from its newest events."""
-        state = {"chat_type": chat_type, "last_ts": 0, "seen": OrderedDict()}
+        floor_ts = max(int(floor_ts), 0)
+        state = {
+            "chat_type": chat_type,
+            "last_ts": floor_ts,
+            "not_before_ts": floor_ts,
+            "seen": OrderedDict(),
+        }
         self._channel_state[channel_id] = state
         code, out, err = await self._run_cli(
             ["messages", "get", "--channel", channel_id, "--limit", str(_FETCH_LIMIT)]
@@ -956,7 +957,7 @@ class BuzzAdapter(BasePlatformAdapter):
             )
             # Fall back to "now" so a transiently unreadable channel does not
             # replay its whole history once it becomes readable.
-            state["last_ts"] = int(time.time())
+            state["last_ts"] = max(state["last_ts"], int(time.time()))
             return
         for event in _parse_json_list(out):
             event_id = event.get("id")
@@ -969,6 +970,14 @@ class BuzzAdapter(BasePlatformAdapter):
             # so it bypasses the mention gate from the very first poll.
             self._maybe_latch_dm(channel_id, state, event)
         self._trim_seen(state)
+
+    async def _discover_conversations(self, *, since: int) -> List[str]:
+        """Discover joined channels and DMs, seeding each before delivery."""
+        before = set(self._channel_state)
+        if not await self._discover_joined_channels(since=since):
+            raise ConnectionError("Buzz joined-channel discovery failed")
+        await self._discover_dms(seed=True, floor_ts=since)
+        return [channel_id for channel_id in self._channel_state if channel_id not in before]
 
     async def _discover_joined_channels(self, *, since: int) -> bool:
         """Watch newly joined channels when no explicit allowlist is set."""
@@ -989,17 +998,11 @@ class BuzzAdapter(BasePlatformAdapter):
             self._channel_names[channel_id] = str(channel.get("name") or channel_id)
             if channel_id in self._channel_state:
                 continue
-            self._channel_state[channel_id] = {
-                "chat_type": "group",
-                "last_ts": max(int(since), 0),
-                "seen": OrderedDict(),
-            }
+            await self._seed_channel(channel_id, chat_type="group", floor_ts=since)
         return True
 
-    async def _discover_dms(self, *, seed: bool) -> None:
-        """Watch DM conversations.  New ones found mid-run dispatch from their
-        beginning (a fresh conversation has no history worth suppressing);
-        ones present at startup are seeded like channels.
+    async def _discover_dms(self, *, seed: bool, floor_ts: int = 0) -> None:
+        """Watch DM conversations, optionally seeding history before delivery.
 
         ``dms list`` is only a best-effort source: on some hosted relays it
         returns ``[]`` even when DM conversations exist (#68871).  Those DMs
@@ -1016,9 +1019,14 @@ class BuzzAdapter(BasePlatformAdapter):
                 if not dm_id or dm_id in self._channel_state:
                     continue
                 if seed:
-                    await self._seed_channel(dm_id, chat_type="dm")
+                    await self._seed_channel(dm_id, chat_type="dm", floor_ts=floor_ts)
                 else:
-                    self._channel_state[dm_id] = {"chat_type": "dm", "last_ts": 0, "seen": OrderedDict()}
+                    self._channel_state[dm_id] = {
+                        "chat_type": "dm",
+                        "last_ts": floor_ts,
+                        "not_before_ts": floor_ts,
+                        "seen": OrderedDict(),
+                    }
                 self._channel_names.setdefault(dm_id, "DM")
 
         code, out, _err = await self._run_cli(["channels", "list"])
@@ -1033,9 +1041,14 @@ class BuzzAdapter(BasePlatformAdapter):
             if ch_id in self._channel_state or not self._may_reclassify_as_dm(ch_id):
                 continue
             if seed:
-                await self._seed_channel(ch_id, chat_type="group")
+                await self._seed_channel(ch_id, chat_type="group", floor_ts=floor_ts)
             else:
-                self._channel_state[ch_id] = {"chat_type": "group", "last_ts": 0, "seen": OrderedDict()}
+                self._channel_state[ch_id] = {
+                    "chat_type": "group",
+                    "last_ts": floor_ts,
+                    "not_before_ts": floor_ts,
+                    "seen": OrderedDict(),
+                }
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
@@ -1060,6 +1073,8 @@ class BuzzAdapter(BasePlatformAdapter):
         """De-dupe, filter, and dispatch a single ``messages get`` event."""
         event_id = str(event.get("id") or "")
         created_at = int(event.get("created_at") or 0)
+        if created_at < int(state.get("not_before_ts") or 0):
+            return
         if not event_id or event_id in state["seen"]:
             return
         state["seen"][event_id] = None

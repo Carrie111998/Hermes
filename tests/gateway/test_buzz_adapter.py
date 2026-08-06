@@ -281,6 +281,48 @@ class TestMentionGating:
         assert adapter._dispatched == []
 
     @pytest.mark.asyncio
+    async def test_other_channel_still_requires_mention(self):
+        other_channel = "12c81eb7-3a12-47c1-b8af-c66f1c74ca8b"
+        adapter = _make_adapter({"free_response_channels": [CHANNEL]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[other_channel] = state
+        await adapter._handle_event(
+            other_channel,
+            state,
+            _tagged_event("e1", other_channel, content="ordinary shared-room message"),
+        )
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
+    async def test_free_response_channel_preserves_author_allowlist(self):
+        adapter = _make_adapter({
+            "free_response_channels": [CHANNEL],
+            "allowed_users": ["b" * 64],
+        })
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        state = {"chat_type": "group", "last_ts": 0, "seen": {}}
+        adapter._channel_state[CHANNEL] = state
+        await adapter._handle_event(
+            CHANNEL,
+            state,
+            _event("e1", content="ordinary unauthorized message"),
+        )
+        assert adapter._dispatched == []
+
+    @pytest.mark.asyncio
     async def test_allowlist_blocks_unauthorized(self, adapter):
         adapter._allowed_pubkeys = {"b" * 64}
         await self._poll_with(adapter, _event("e1", content="@Chip hello", created_at=10))
@@ -421,6 +463,72 @@ class TestDmClassification:
 
 
 class TestChannelDiscovery:
+
+    @pytest.mark.asyncio
+    async def test_poll_discovery_seeds_new_joined_channel_without_replay(self):
+        new_channel = "4764ae67-7cd8-4f3e-967d-7dd93986b11a"
+        adapter = _make_adapter({"free_response_channels": [new_channel]})
+        adapter._dispatched = []
+
+        async def capture(**kwargs):
+            adapter._dispatched.append(kwargs)
+
+        adapter._dispatch_message = capture
+        adapter._message_handler = AsyncMock()
+        cli = _ScriptedCli()
+        cli.script("channels", "list", [
+            {"channel_id": new_channel, "name": "project", "description": "Project"},
+        ])
+        cli.script("messages", "get", [
+            _tagged_event("old", new_channel, content="old history", created_at=1500),
+        ])
+        cli.script("dms", "list", [])
+        adapter._run_cli = cli
+
+        discovered = await adapter._discover_conversations(since=2000)
+        assert discovered == [new_channel]
+        assert adapter._channel_state[new_channel]["not_before_ts"] == 2000
+        assert adapter._dispatched == []
+
+        await adapter._handle_event(
+            new_channel,
+            adapter._channel_state[new_channel],
+            _tagged_event("older-unseen", new_channel, content="older history", created_at=1600),
+        )
+        assert adapter._dispatched == []
+
+        await adapter._handle_event(
+            new_channel,
+            adapter._channel_state[new_channel],
+            _tagged_event("new", new_channel, content="new live message", created_at=2001),
+        )
+        assert [d["message_id"] for d in adapter._dispatched] == ["new"]
+
+    @pytest.mark.asyncio
+    async def test_dynamic_dm_discovery_seeds_existing_history(self):
+        adapter = _make_adapter()
+        adapter._dispatched = []
+        cli = _ScriptedCli()
+        cli.script("channels", "list", [])
+        cli.script("dms", "list", [{"dm_id": DM_CHANNEL}])
+        cli.script("messages", "get", [
+            _tagged_event(
+                "old-dm",
+                DM_CHANNEL,
+                content="old direct history",
+                created_at=1500,
+                p=SELF_PUBKEY,
+            ),
+        ])
+        adapter._run_cli = cli
+
+        discovered = await adapter._discover_conversations(since=2000)
+        assert discovered == [DM_CHANNEL]
+        state = adapter._channel_state[DM_CHANNEL]
+        assert state["chat_type"] == "dm"
+        assert state["not_before_ts"] == 2000
+        assert "old-dm" in state["seen"]
+        assert adapter._dispatched == []
 
     @pytest.mark.asyncio
     async def test_connect_lists_only_joined_channels(self, monkeypatch):
