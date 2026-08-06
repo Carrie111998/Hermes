@@ -4732,6 +4732,15 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Show $ cost in the status bar (display.show_cost, off by default —
         # documented config key that was never wired into the status bar).
         self._status_bar_show_cost = bool(CLI_CONFIG["display"].get("show_cost", False))
+        # Which 📊 session-usage buckets the status bar shows
+        # (display.session_usage_fields: requests, input, output, cache,
+        # total). None/empty → all buckets. Cost is separately gated by
+        # display.show_cost.
+        _raw_fields = CLI_CONFIG["display"].get("session_usage_fields")
+        if isinstance(_raw_fields, (list, tuple)) and _raw_fields:
+            self._session_usage_fields = {str(f).strip().lower() for f in _raw_fields}
+        else:
+            self._session_usage_fields = None
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
         # SIGWINCH cannot stamp a freshly-drawn status bar on top of one that
@@ -5905,16 +5914,43 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
     def _format_session_usage_segment(self, snapshot: Dict[str, Any]) -> str:
         """Return the session-token (+$ cost) status-bar segment, or "".
 
-        Mirrors the gateway footer's 📊 segment: cumulative session tokens,
-        with the estimated $ cost appended when ``display.show_cost`` is on
-        and the agent has a nonzero cost estimate (same formatting rules as
-        the Telegram footer: 4 decimals under $1, 2 from $1 up).
+        Mirrors the gateway footer's 📊 segment but compact for one line:
+        requests, Input, Output, Cache and Total tokens, with the estimated
+        $ cost appended when ``display.show_cost`` is on (same formatting
+        rules as the Telegram footer: 4 decimals under $1, 2 from $1 up).
+        Buckets are disjoint and add up: I (input) + C (cache) + O (output)
+        = T (total), so each figure carries information on its own. Which
+        buckets render is governed by ``display.session_usage_fields``
+        (requests, input, output, cache, total); None → all.
         """
         try:
+            api_calls = snapshot.get("session_api_calls", 0) or 0
             total = snapshot.get("session_total_tokens", 0) or 0
-            if not total:
+            if not total and not api_calls:
                 return ""
-            label = f"📊 {format_token_count_compact(total)}"
+            input_tok = snapshot.get("session_input_tokens", 0) or 0
+            output_tok = snapshot.get("session_output_tokens", 0) or 0
+            cache_tok = (
+                (snapshot.get("session_cache_read_tokens", 0) or 0)
+                + (snapshot.get("session_cache_write_tokens", 0) or 0)
+            )
+            fields = getattr(self, "_session_usage_fields", None)
+            pieces = []
+            if api_calls and (fields is None or "requests" in fields):
+                pieces.append(f"{api_calls}r")
+            if input_tok and (fields is None or "input" in fields):
+                pieces.append(f"I {format_token_count_compact(input_tok)}")
+            if output_tok and (fields is None or "output" in fields):
+                pieces.append(f"O {format_token_count_compact(output_tok)}")
+            if cache_tok and (fields is None or "cache" in fields):
+                pieces.append(f"C {format_token_count_compact(cache_tok)}")
+            if total and (fields is None or "total" in fields):
+                pieces.append(f"T {format_token_count_compact(total)}")
+            label = "📊"
+            if pieces:
+                label += " " + " · ".join(pieces)
+            else:
+                return ""
             cost = snapshot.get("session_cost_usd", 0) or 0
             if cost > 0 and self._status_bar_show_cost:
                 label += f" ${cost:.4f}" if cost < 1 else f" ${cost:.2f}"
@@ -10332,6 +10368,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 _cprint(f"  No agent running; queued as next turn: {payload[:80]}{'...' if len(payload) > 80 else ''}")
         elif canonical == "goal":
             self._handle_goal_command(cmd_original)
+        elif canonical == "heartbeat":
+            self._handle_heartbeat_command(cmd_original)
+        elif canonical == "refine":
+            self._handle_refine_command(cmd_original)
         elif canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
             # default MoA preset, then restore the prior model. To *switch* to a
@@ -10609,6 +10649,72 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
         self._goal_manager = mgr
         return mgr
+
+    def _get_heartbeat_manager(self):
+        """Return the HeartbeatManager bound to the current session_id.
+
+        Cached on ``self._heartbeat_manager`` and rebound lazily when
+        ``session_id`` changes (mirrors ``_get_goal_manager``).
+        """
+        try:
+            from hermes_cli.heartbeat import HeartbeatManager
+        except Exception as exc:
+            logging.debug("heartbeat manager unavailable: %s", exc)
+            return None
+
+        sid = getattr(self, "session_id", None) or ""
+        if not sid:
+            return None
+
+        existing = getattr(self, "_heartbeat_manager", None)
+        if existing is not None and getattr(existing, "session_id", None) == sid:
+            return existing
+
+        mgr = HeartbeatManager(session_id=sid)
+        self._heartbeat_manager = mgr
+        return mgr
+
+    def _start_heartbeat_watchdog(self):
+        """Start the idle-poll thread that fires due heartbeats.
+
+        Same pattern as the wake-word watchdog: a daemon thread polls a few
+        times a minute; when the session is idle (no agent running, empty
+        input queue) and the heartbeat is due, its prompt is injected into
+        ``_pending_input`` as a normal user turn. Missed ticks coalesce —
+        the anchor resets on fire, so a busy hour yields ONE heartbeat turn,
+        not a backlog. Idempotent; safe to call on every /heartbeat set.
+        """
+        if getattr(self, "_heartbeat_watchdog_started", False):
+            return
+        self._heartbeat_watchdog_started = True
+
+        from hermes_cli.heartbeat import POLL_SECONDS
+
+        def _loop():
+            try:
+                while not getattr(self, "_should_exit", False):
+                    time.sleep(POLL_SECONDS)
+                    try:
+                        mgr = self._get_heartbeat_manager()
+                        if mgr is None or not mgr.is_active():
+                            continue
+                        busy = (
+                            self._agent_running
+                            or getattr(self, "_voice_recording", False)
+                            or getattr(self, "_voice_processing", False)
+                            or not self._pending_input.empty()
+                        )
+                        if busy:
+                            continue
+                        prompt = mgr.due_prompt()
+                        if prompt:
+                            self._pending_input.put(prompt)
+                    except Exception as exc:
+                        logging.debug("heartbeat watchdog tick failed: %s", exc)
+            finally:
+                self._heartbeat_watchdog_started = False
+
+        threading.Thread(target=_loop, daemon=True, name="heartbeat-watchdog").start()
 
 
 
