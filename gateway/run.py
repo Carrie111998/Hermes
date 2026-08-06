@@ -2297,21 +2297,31 @@ from gateway.whatsapp_identity import (
 logger = logging.getLogger(__name__)
 
 
+def _existing_gateway_session_id(session_store, session_key: str) -> str:
+    """Best-effort read of an already-persisted opaque session identity."""
+    if session_store is None or not session_key:
+        return ""
+    try:
+        return str(session_store.peek_session_id(session_key) or "")
+    except Exception:
+        return ""
+
+
 def _record_gateway_terminal_telemetry(
     session_store,
     *,
-    session_id: str,
+    opaque_session_id: str,
     source: str,
     failure_class: str,
 ) -> None:
-    """Best-effort accounting for refusals before an AIAgent turn exists."""
+    """Best-effort accounting using only an existing opaque session identity."""
     try:
         from hermes_cli.observability.turn_telemetry import record_gateway_terminal
 
         db = getattr(session_store, "_db", session_store)
         record_gateway_terminal(
             db,
-            session_id=session_id,
+            session_id=opaque_session_id,
             source=source,
             failure_class=failure_class,
         )
@@ -4385,7 +4395,7 @@ class TurnRunner:
         except Exception as exc:
             _record_gateway_terminal_telemetry(
                 getattr(self._runner, "_session_db", None),
-                session_id=str(ctx.session_id or ctx.session_key or ""),
+                opaque_session_id=str(ctx.session_id or ""),
                 source=platform_key,
                 failure_class="gateway_preflight",
             )
@@ -15331,7 +15341,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._draining:
             _record_gateway_terminal_telemetry(
                 getattr(self, "_session_db", None),
-                session_id=str(_quick_key or ""),
+                opaque_session_id=_existing_gateway_session_id(
+                    getattr(self, "session_store", None), _quick_key
+                ),
                 source=source.platform.value,
                 failure_class="gateway_refused",
             )
@@ -15593,7 +15605,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _record_gateway_terminal_telemetry(
                 getattr(self, "_session_db", None),
-                session_id=str(_quick_key or ""),
+                opaque_session_id=_existing_gateway_session_id(
+                    getattr(self, "session_store", None), _quick_key
+                ),
                 source=source.platform.value,
                 failure_class="gateway_refused",
             )
@@ -15621,7 +15635,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             _record_gateway_terminal_telemetry(
                 getattr(self, "_session_db", None),
-                session_id=str(_quick_key or ""),
+                opaque_session_id=_existing_gateway_session_id(
+                    getattr(self, "session_store", None), _quick_key
+                ),
                 source=source.platform.value,
                 failure_class="gateway_refused",
             )

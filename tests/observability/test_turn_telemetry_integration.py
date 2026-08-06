@@ -285,7 +285,7 @@ def test_gateway_bridge_writes_through_async_store_wrapper():
     wrapper = SimpleNamespace(_db=db)
     _record_gateway_terminal_telemetry(
         wrapper,
-        session_id="gateway-session",
+        opaque_session_id="gateway-session",
         source="telegram",
         failure_class="gateway_refused",
     )
@@ -659,7 +659,7 @@ def test_gateway_bridge_isolates_only_ordinary_exceptions(monkeypatch, fault_typ
     if fault_type is RuntimeError:
         assert _record_gateway_terminal_telemetry(
             CapturingDB(),
-            session_id="session",
+            opaque_session_id="session",
             source="telegram",
             failure_class="gateway_refused",
         ) is None
@@ -667,7 +667,7 @@ def test_gateway_bridge_isolates_only_ordinary_exceptions(monkeypatch, fault_typ
         with pytest.raises(fault_type) as caught:
             _record_gateway_terminal_telemetry(
                 CapturingDB(),
-                session_id="session",
+                opaque_session_id="session",
                 source="telegram",
                 failure_class="gateway_refused",
             )
@@ -676,8 +676,13 @@ def test_gateway_bridge_isolates_only_ordinary_exceptions(monkeypatch, fault_typ
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("refusal", ["general_drain", "external_drain", "capacity"])
+@pytest.mark.parametrize(
+    "existing_session_id",
+    ["20260806_191345_a1b2c3d4", None],
+    ids=["existing-opaque-session", "no-existing-session"],
+)
 async def test_gateway_refusal_paths_record_exactly_one_zero_attempt_terminal(
-    monkeypatch, refusal
+    monkeypatch, refusal, existing_session_id
 ):
     from gateway.platforms.base import MessageEvent, MessageType
     from tests.gateway.restart_test_helpers import (
@@ -699,24 +704,126 @@ async def test_gateway_refusal_paths_record_exactly_one_zero_attempt_terminal(
             "Capacity refusal",
         )
     monkeypatch.setattr(plugins, "invoke_hook", lambda *_args, **_kwargs: [])
+
+    chat_id = f"chat-{SENSITIVE_VALUE}"
+    user_id = f"user-{SENSITIVE_VALUE}"
+    thread_id = f"thread-{SENSITIVE_VALUE}"
+    account_id = f"account-{SENSITIVE_VALUE}@s.whatsapp.net"
+    raw_key = (
+        f"agent:main:telegram:{chat_id}:{user_id}:{thread_id}:{account_id}"
+    )
+    source = make_restart_source(chat_id=chat_id, thread_id=thread_id)
+    source.user_id = user_id
+    generate_key = MagicMock(return_value=raw_key)
+    peek_session_id = MagicMock(return_value=existing_session_id)
+    monkeypatch.setattr(runner.session_store, "_generate_session_key", generate_key)
+    monkeypatch.setattr(runner.session_store, "peek_session_id", peek_session_id)
     event = MessageEvent(
-        text=SENSITIVE_VALUE,
+        text=f"prompt-{SENSITIVE_VALUE}",
         message_type=MessageType.TEXT,
-        source=make_restart_source(),
-        message_id="telemetry-refusal",
+        source=source,
+        message_id=f"message-{SENSITIVE_VALUE}",
     )
 
     result = await runner._handle_message(event)
 
     assert result
     agent_start.assert_not_awaited()
+    peek_session_id.assert_called_once_with(raw_key)
     assert len(db.rows) == 1
     row = db.rows[0]
+    serialized = json.dumps(row, sort_keys=True)
     assert row["event_type"] == "gateway_terminal"
     assert re.fullmatch(r"gateway-[0-9a-f]{32}", row["turn_id"])
     assert row["correlation_id"] == row["turn_id"]
+    if existing_session_id:
+        assert row["session_id"] == existing_session_id
+    else:
+        assert row["session_id"] == row["turn_id"]
     assert row["attempt_count"] == 0
     assert row["auxiliary_attempt_count"] == 0
     assert row["outcome"] == "refused"
     assert row["failure_class"] == "gateway_refused"
-    assert SENSITIVE_VALUE not in json.dumps(row, sort_keys=True)
+    for prohibited in (
+        raw_key,
+        chat_id,
+        user_id,
+        thread_id,
+        account_id,
+        str(event.text or ""),
+        str(event.message_id or ""),
+        SENSITIVE_VALUE,
+        "/Users/private/sensitive-path",
+        "Authorization: Bearer secret-token",
+    ):
+        assert prohibited not in serialized
+
+
+@pytest.mark.parametrize(
+    "existing_session_id",
+    ["20260806_191345_e5f6a7b8", None],
+    ids=["existing-opaque-session", "no-existing-session"],
+)
+def test_gateway_provider_preflight_uses_only_opaque_identity(
+    monkeypatch, existing_session_id
+):
+    from gateway.run import TurnRunner
+    from gateway.turn_context import TurnContext
+    from tests.gateway.restart_test_helpers import make_restart_source
+
+    db = CapturingDB()
+    chat_id = f"chat-{SENSITIVE_VALUE}"
+    user_id = f"user-{SENSITIVE_VALUE}"
+    thread_id = f"thread-{SENSITIVE_VALUE}"
+    account_id = f"account-{SENSITIVE_VALUE}@s.whatsapp.net"
+    raw_key = (
+        f"agent:main:telegram:{chat_id}:{user_id}:{thread_id}:{account_id}"
+    )
+    source = make_restart_source(chat_id=chat_id, thread_id=thread_id)
+    source.user_id = user_id
+    failure_text = f"provider-error-{SENSITIVE_VALUE}"
+    preflight_runner = MagicMock()
+    preflight_runner._session_db = db
+    preflight_runner._get_system_prompt_for_channel.return_value = ""
+    preflight_runner._resolve_session_agent_runtime.side_effect = RuntimeError(
+        failure_text
+    )
+
+    ctx = TurnContext(
+        source=source,
+        session_id=existing_session_id,
+        session_key=raw_key,
+        context_prompt=f"prompt-{SENSITIVE_VALUE}",
+        channel_prompt=f"channel-content-{SENSITIVE_VALUE}",
+    )
+
+    result = TurnRunner(preflight_runner, ctx).run_sync()
+
+    assert result["api_calls"] == 0
+    assert len(db.rows) == 1
+    row = db.rows[0]
+    serialized = json.dumps(row, sort_keys=True)
+    assert row["event_type"] == "gateway_terminal"
+    assert re.fullmatch(r"gateway-[0-9a-f]{32}", row["turn_id"])
+    assert row["correlation_id"] == row["turn_id"]
+    if existing_session_id:
+        assert row["session_id"] == existing_session_id
+    else:
+        assert row["session_id"] == row["turn_id"]
+    assert row["attempt_count"] == 0
+    assert row["outcome"] == "refused"
+    assert row["failure_class"] == "gateway_preflight"
+    for prohibited in (
+        raw_key,
+        chat_id,
+        user_id,
+        thread_id,
+        account_id,
+        failure_text,
+        str(ctx.context_prompt or ""),
+        str(ctx.channel_prompt or ""),
+        SENSITIVE_VALUE,
+        "/Users/private/sensitive-path",
+        "Authorization: Bearer secret-token",
+    ):
+        assert prohibited not in serialized

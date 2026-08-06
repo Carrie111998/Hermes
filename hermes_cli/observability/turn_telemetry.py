@@ -725,7 +725,7 @@ def record_gateway_terminal(
     started_at: Optional[float] = None,
     ended_at: Optional[float] = None,
 ) -> None:
-    """Best-effort zero-attempt row for a terminal path before AIAgent exists."""
+    """Record a terminal path with an existing opaque session ID or event ID."""
     del turn_id, error_message
     if db is None:
         return
@@ -733,13 +733,14 @@ def record_gateway_terminal(
         started = float(started_at if started_at is not None else time.time())
         ended = float(ended_at if ended_at is not None else time.time())
         terminal_turn_id = _new_gateway_turn_id()
+        terminal_session_id = _bounded_identifier(session_id, 512) or terminal_turn_id
         profile_name = _active_profile_name()
         platform = _bounded_identifier(source, 128)
         db.record_turn_telemetry(
             event_type="gateway_terminal",
             turn_id=terminal_turn_id,
             correlation_id=terminal_turn_id,
-            session_id=_bounded_identifier(session_id, 512),
+            session_id=terminal_session_id,
             parent_session_id="",
             parent_turn_id="",
             profile_name=profile_name,

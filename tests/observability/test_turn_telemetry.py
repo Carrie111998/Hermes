@@ -327,14 +327,21 @@ def test_malformed_lifecycle_metadata_is_isolated_and_content_free(
     assert SENSITIVE_VALUE not in caplog.text
 
 
+def _assert_gateway_uuid(value: str) -> None:
+    assert value.startswith("gateway-")
+    assert len(value.removeprefix("gateway-")) == 32
+    assert uuid.UUID(hex=value.removeprefix("gateway-")).version == 4
+
+
 def test_gateway_preflight_terminal_is_zero_attempt_and_drops_error_text(monkeypatch):
     telemetry = _telemetry()
     monkeypatch.setattr(telemetry, "_active_profile_name", lambda: "gateway-profile")
     db = CapturingDB()
+    opaque_session_id = "20260806_191345_5f4dcc3b"
 
     telemetry.record_gateway_terminal(
         db,
-        session_id="gateway-session",
+        session_id=opaque_session_id,
         turn_id=f"caller-controlled-{SENSITIVE_VALUE}",
         source="telegram",
         failure_class="gateway_preflight",
@@ -343,11 +350,10 @@ def test_gateway_preflight_terminal_is_zero_attempt_and_drops_error_text(monkeyp
         ended_at=4.0,
     )
 
+    assert len(db.rows) == 1
     row = db.rows[0]
-    assert row["session_id"] == "gateway-session"
-    assert row["turn_id"].startswith("gateway-")
-    assert len(row["turn_id"].removeprefix("gateway-")) == 32
-    assert uuid.UUID(hex=row["turn_id"].removeprefix("gateway-")).version == 4
+    assert row["session_id"] == opaque_session_id
+    _assert_gateway_uuid(row["turn_id"])
     assert row["correlation_id"] == row["turn_id"]
     assert row["source"] == "telegram"
     assert row["attempt_count"] == 0
@@ -358,3 +364,93 @@ def test_gateway_preflight_terminal_is_zero_attempt_and_drops_error_text(monkeyp
     assert row["outcome"] == "refused"
     assert row["failure_class"] == "gateway_preflight"
     assert SENSITIVE_VALUE not in json.dumps(row, sort_keys=True)
+
+
+def test_gateway_terminal_without_session_reuses_opaque_turn_identity(monkeypatch):
+    telemetry = _telemetry()
+    monkeypatch.setattr(telemetry, "_active_profile_name", lambda: "gateway-profile")
+    db = CapturingDB()
+
+    telemetry.record_gateway_terminal(
+        db,
+        session_id="",
+        turn_id=f"raw-route-{SENSITIVE_VALUE}",
+        source="telegram",
+        failure_class="gateway_refused",
+        error_message=f"prompt-and-error-{SENSITIVE_VALUE}",
+    )
+
+    assert len(db.rows) == 1
+    row = db.rows[0]
+    _assert_gateway_uuid(row["turn_id"])
+    assert row["session_id"] == row["turn_id"] == row["correlation_id"]
+    assert SENSITIVE_VALUE not in json.dumps(row, sort_keys=True)
+
+
+def test_distinct_gateway_terminal_events_get_distinct_opaque_identities(monkeypatch):
+    telemetry = _telemetry()
+    monkeypatch.setattr(telemetry, "_active_profile_name", lambda: "gateway-profile")
+    db = CapturingDB()
+
+    for _ in range(2):
+        telemetry.record_gateway_terminal(
+            db,
+            session_id="",
+            source="telegram",
+            failure_class="gateway_refused",
+        )
+
+    assert len(db.rows) == 2
+    identities = {row["session_id"] for row in db.rows}
+    assert len(identities) == 2
+    for row in db.rows:
+        _assert_gateway_uuid(row["session_id"])
+        assert row["session_id"] == row["turn_id"] == row["correlation_id"]
+
+
+def test_gateway_terminal_storage_schema_and_upsert_contract_are_unchanged(
+    tmp_path, monkeypatch
+):
+    from hermes_state import SessionDB
+
+    telemetry = _telemetry()
+    monkeypatch.setattr(telemetry, "_active_profile_name", lambda: "gateway-profile")
+    captured = CapturingDB()
+    telemetry.record_gateway_terminal(
+        captured,
+        session_id="",
+        source="telegram",
+        failure_class="gateway_refused",
+    )
+    row = captured.rows[0]
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        conn = db._conn
+        assert conn is not None
+        columns = {
+            item["name"]
+            for item in conn.execute("PRAGMA table_info(turn_telemetry)").fetchall()
+        }
+        assert columns == {"id", *row}
+        assert not columns & {
+            "content",
+            "prompt",
+            "messages",
+            "request",
+            "response",
+            "tool_args",
+            "tool_result",
+            "error_message",
+            "headers",
+            "api_key",
+        }
+
+        db.record_turn_telemetry(**row)
+        db.record_turn_telemetry(**row)
+        rows = db.list_turn_telemetry(session_id=row["session_id"], limit=10)
+    finally:
+        db.close()
+
+    assert len(rows) == 1
+    assert rows[0]["session_id"] == row["session_id"]
+    assert rows[0]["turn_id"] == row["turn_id"]
