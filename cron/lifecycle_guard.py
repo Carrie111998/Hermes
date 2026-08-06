@@ -283,8 +283,11 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     # (including a `ValueError: embedded null byte` from Path.resolve,
     # #76762). Treat it as "nothing to scan" rather than unsafe: a binary
     # executed by the user is not a referenced *shell script*.
+    # Return "" (not None) so callers don't mistake "binary, skip" for
+    # "local file missing" and fall back to read_remote_script, which
+    # would decode the binary as text and re-enter the junk-path loop.
     if b"\x00" in data:
-        return None, False
+        return "", False
     if len(data) > _MAX_REFERENCED_SCRIPT_BYTES:
         return None, True
     return data.decode("utf-8", errors="replace"), False
