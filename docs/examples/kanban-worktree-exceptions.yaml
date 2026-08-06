@@ -1,0 +1,12 @@
+# Copy this file outside the source checkout and replace the placeholder paths
+# before running the protected-exception import command. The importer only
+# registers a workspace when Git confirms that the exact path is an existing
+# linked worktree of repo_path; it never creates, removes, or force-adopts one.
+version: 1
+exceptions:
+  - policy_id: pkgpulse-deepsec-operational
+    repo_path: /path/to/PkgPulse
+    workspace_path: /path/to/hermes/.worktrees/operational/pkgpulse-deepsec/PkgPulse
+    owner_profile: operator
+    purpose: operational
+    expires_at: null

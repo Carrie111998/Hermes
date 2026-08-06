@@ -22,7 +22,7 @@ import shlex
 import sys
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, cast
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_swarm as ks
@@ -68,6 +68,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_kind": t.workspace_kind,
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
+        "workspace_replacement_reason": t.workspace_replacement_reason,
         "project_id": t.project_id,
         "created_by": t.created_by,
         "created_at": t.created_at,
@@ -338,6 +339,12 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(default: scratch)")
     p_create.add_argument("--branch", default=None,
                           help="Branch name for worktree tasks, e.g. wt/t6-wire")
+    p_create.add_argument(
+        "--workspace-replacement-reason",
+        default=None,
+        help="Required audit reason when replacing another active worktree "
+             "for the same task and repository",
+    )
     p_create.add_argument("--project", default=None,
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
@@ -698,6 +705,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+    p_archive.add_argument(
+        "--workspace-disposition",
+        default=None,
+        help=(
+            "Required when directly archiving a task-owned worktree that has "
+            "not already been classified"
+        ),
+    )
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -760,6 +775,60 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "stats", help="Per-status + per-assignee counts + oldest-ready age",
     )
     p_stats.add_argument("--json", action="store_true")
+
+    # --- worktrees inventory / janitor ---
+    p_worktrees = sub.add_parser(
+        "worktrees",
+        help="Inventory and safely reconcile Kanban-managed Git worktrees",
+    )
+    worktree_sub = p_worktrees.add_subparsers(dest="worktree_action", required=True)
+    p_wt_inventory = worktree_sub.add_parser(
+        "inventory",
+        help="Report deterministic Git/registry/task lifecycle findings",
+    )
+    p_wt_inventory.add_argument(
+        "--repo", action="append", required=True,
+        help="Git repository to inventory (repeatable)",
+    )
+    p_wt_inventory.add_argument(
+        "--approved-root", action="append", default=[],
+        help="Approved parent for secondary worktrees (repeatable)",
+    )
+    p_wt_inventory.add_argument(
+        "--exception-config",
+        default=None,
+        help="Versioned YAML policy file for protected operational worktrees",
+    )
+    p_wt_inventory.add_argument("--json", action="store_true")
+    p_wt_janitor = worktree_sub.add_parser(
+        "janitor",
+        help="Plan safe removals (dry-run only; never deletes worktrees)",
+    )
+    p_wt_janitor.add_argument(
+        "--repo", action="append", required=True,
+        help="Git repository to evaluate (repeatable)",
+    )
+    p_wt_janitor.add_argument(
+        "--approved-root", action="append", required=True,
+        help="Allowlisted parent for removable worktrees (repeatable)",
+    )
+    p_wt_janitor.add_argument("--json", action="store_true")
+    p_wt_exceptions = worktree_sub.add_parser(
+        "exceptions",
+        help="Manage explicit protected-worktree policies",
+    )
+    exception_sub = p_wt_exceptions.add_subparsers(
+        dest="exception_action", required=True
+    )
+    p_wt_exception_import = exception_sub.add_parser(
+        "import",
+        help="Register existing Git worktrees from a versioned policy file",
+    )
+    p_wt_exception_import.add_argument(
+        "--config", required=True,
+        help="Versioned YAML policy file to validate and import",
+    )
+    p_wt_exception_import.add_argument("--json", action="store_true")
 
     # --- notify subscribe / list / remove ---
     p_nsub = sub.add_parser(
@@ -1073,6 +1142,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "daemon":   _cmd_daemon,
             "watch":    _cmd_watch,
             "stats":    _cmd_stats,
+            "worktrees": _cmd_worktrees,
             "log":      _cmd_log,
             "runs":     _cmd_runs,
             "heartbeat": _cmd_heartbeat,
@@ -1505,6 +1575,9 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_kind=ws_kind,
             workspace_path=ws_path,
             branch_name=branch_name,
+            workspace_replacement_reason=getattr(
+                args, "workspace_replacement_reason", None
+            ),
             project_id=getattr(args, "project", None),
             tenant=args.tenant,
             priority=args.priority,
@@ -2407,7 +2480,11 @@ def _cmd_archive(args: argparse.Namespace) -> int:
                     print(f"Deleted {tid}")
             return 0 if not failed else 1
         for tid in ids:
-            if not kb.archive_task(conn, tid):
+            if not kb.archive_task(
+                conn,
+                tid,
+                workspace_disposition=getattr(args, "workspace_disposition", None),
+            ):
                 failed.append(tid)
                 print(f"cannot archive {tid}", file=sys.stderr)
             else:
@@ -2728,6 +2805,87 @@ def _cmd_watch(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print("\n(stopped)")
         return 0
+
+
+def _cmd_worktrees(args: argparse.Namespace) -> int:
+    from hermes_cli import kanban_workspaces as workspaces
+
+    action = getattr(args, "worktree_action", None)
+    if action == "inventory":
+        report = cast(
+            dict[str, Any],
+            workspaces.reconcile_inventory(
+                repo_paths=getattr(args, "repo", []) or [],
+                approved_roots=getattr(args, "approved_root", []) or [],
+                exception_config=getattr(args, "exception_config", None),
+            ),
+        )
+    elif action == "janitor":
+        report = cast(
+            dict[str, Any],
+            workspaces.plan_janitor(
+                repo_paths=getattr(args, "repo", []) or [],
+                approved_roots=getattr(args, "approved_root", []) or [],
+            ),
+        )
+    elif action == "exceptions" and getattr(args, "exception_action", None) == "import":
+        report = cast(
+            dict[str, Any],
+            workspaces.import_protected_exceptions(args.config),
+        )
+    else:
+        print(f"kanban worktrees: unknown action {action!r}", file=sys.stderr)
+        return 2
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2, ensure_ascii=False, sort_keys=True))
+        return 0
+    if action == "exceptions":
+        print(
+            "Protected worktree import: "
+            f"{len(report['imported'])} imported, {len(report['skipped'])} skipped"
+        )
+        return 0
+    if action == "janitor":
+        print(
+            "Worktree janitor dry-run: "
+            f"{len(report['candidates'])} candidate(s), "
+            f"{len(report['excluded'])} excluded, 0 removed"
+        )
+        return 0
+    totals = report["totals"]
+    print(
+        "Worktree inventory: "
+        f"{totals['git_worktrees']} Git worktree(s), "
+        f"{totals['registry_records']} registry record(s), "
+        f"{totals['estimated_bytes']} estimated byte(s)"
+    )
+    print("Repositories:")
+    for repo in report["per_repo"]:
+        print(
+            f"  {repo['repo_path']}: {repo['worktree_count']} worktree(s), "
+            f"{repo['estimated_bytes']} estimated byte(s)"
+        )
+    print("Findings:")
+    for finding in (
+        "unowned_paths",
+        "duplicate_task_repo",
+        "duplicate_heads",
+        "terminal_without_disposition",
+        "dirty_terminal",
+        "outside_approved_root",
+        "missing_expired_protected_exceptions",
+    ):
+        values = report[finding]
+        print(f"  {finding} ({len(values)}):")
+        for value in values:
+            if isinstance(value, str):
+                rendered = value
+            else:
+                rendered = json.dumps(
+                    value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
+            print(f"    {rendered}")
+    return 0
 
 
 def _cmd_stats(args: argparse.Namespace) -> int:

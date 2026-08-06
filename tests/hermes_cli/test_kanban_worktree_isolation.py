@@ -126,5 +126,35 @@ def test_resolve_worktree_falls_back_when_path_occupied(kanban_home, tmp_path):
     assert head == "wt/sibling"
 
 
+def test_resolve_canonical_path_on_foreign_branch_fails_closed(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="resume exact task",
+            workspace_kind="worktree",
+            workspace_path=str(repo),
+        )
+        own = _add_worktree(repo, repo / ".worktrees" / tid, "wt/foreign")
+        conn.execute(
+            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            (str(own), tid),
+        )
+        conn.commit()
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    with pytest.raises(ValueError, match="branch mismatch"):
+        kb._resolve_worktree_workspace(task)
+    assert subprocess.run(
+        ["git", "-C", str(own), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == "wt/foreign"
+
+
 
 

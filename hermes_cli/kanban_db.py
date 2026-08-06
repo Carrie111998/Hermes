@@ -921,6 +921,7 @@ class Task:
     claim_expires: Optional[int]
     tenant: Optional[str]
     branch_name: Optional[str] = None
+    workspace_replacement_reason: Optional[str] = None
     project_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
@@ -1020,6 +1021,12 @@ class Task:
             workspace_kind=row["workspace_kind"],
             workspace_path=row["workspace_path"],
             branch_name=row["branch_name"] if "branch_name" in keys else None,
+            workspace_replacement_reason=(
+                row["workspace_replacement_reason"]
+                if "workspace_replacement_reason" in keys
+                and row["workspace_replacement_reason"]
+                else None
+            ),
             project_id=row["project_id"] if "project_id" in keys else None,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
@@ -1196,6 +1203,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     workspace_kind       TEXT NOT NULL DEFAULT 'scratch',
     workspace_path       TEXT,
     branch_name          TEXT,
+    -- Required audit reason when a task/repository already owns a different
+    -- active worktree and creation is intentionally replacing it.
+    workspace_replacement_reason TEXT,
     -- Optional link to a first-class Project (hermes_cli/projects_db). When set,
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
@@ -2175,6 +2185,37 @@ def connect(
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    requested_board = _normalize_board_slug(board)
+    if requested_board is None:
+        resolved_path = path.expanduser().resolve(strict=False)
+        default_path = (kanban_home() / "kanban.db").resolve(strict=False)
+        if resolved_path == default_path:
+            requested_board = DEFAULT_BOARD
+        else:
+            matches = [
+                str(item["slug"])
+                for item in list_boards()
+                if str(item["slug"]) != DEFAULT_BOARD
+                and (board_dir(str(item["slug"])) / "kanban.db").resolve(
+                    strict=False
+                ) == resolved_path
+            ]
+            requested_board = matches[0] if len(matches) == 1 else get_current_board()
+
+    def _stamp_board_identity(conn: sqlite3.Connection) -> sqlite3.Connection:
+        # HERMES_KANBAN_DB can pin multiple logical boards to the same path,
+        # so reverse-mapping a connection path is not a reliable identity.
+        conn.execute(
+            "CREATE TEMP TABLE IF NOT EXISTS hermes_connection_context "
+            "(board_id TEXT NOT NULL)"
+        )
+        conn.execute("DELETE FROM temp.hermes_connection_context")
+        conn.execute(
+            "INSERT INTO temp.hermes_connection_context (board_id) VALUES (?)",
+            (requested_board,),
+        )
+        return conn
+
     # Fast path: once THIS process has initialized this path, the expensive
     # first-open work (header validation, integrity probe, schema + additive
     # migrations) is already done and cached in _INITIALIZED_PATHS. Acquiring
@@ -2201,7 +2242,7 @@ def connect(
         except Exception:
             conn.close()
             raise
-        return conn
+        return _stamp_board_identity(conn)
 
     with _cross_process_init_lock(path):
         # Read-only file/sidecar preflight (port of kilocode#12508) —
@@ -2255,7 +2296,7 @@ def connect(
         except Exception:
             conn.close()
             raise
-    return conn
+    return _stamp_board_identity(conn)
 
 
 @contextlib.contextmanager
@@ -2335,6 +2376,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(conn, "tasks", "result", "result TEXT")
     if "branch_name" not in cols:
         _add_column_if_missing(conn, "tasks", "branch_name", "branch_name TEXT")
+    if "workspace_replacement_reason" not in cols:
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "workspace_replacement_reason",
+            "workspace_replacement_reason TEXT",
+        )
     if "project_id" not in cols:
         _add_column_if_missing(conn, "tasks", "project_id", "project_id TEXT")
     if "idempotency_key" not in cols:
@@ -2888,6 +2936,7 @@ def create_task(
     workspace_kind: str = "scratch",
     workspace_path: Optional[str] = None,
     branch_name: Optional[str] = None,
+    workspace_replacement_reason: Optional[str] = None,
     tenant: Optional[str] = None,
     priority: int = 0,
     parents: Iterable[str] = (),
@@ -2965,6 +3014,14 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if workspace_replacement_reason is not None:
+        workspace_replacement_reason = (
+            str(workspace_replacement_reason).strip() or None
+        )
+    if workspace_replacement_reason and workspace_kind != "worktree":
+        raise ValueError(
+            "workspace_replacement_reason is only valid for worktree workspaces"
+        )
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
@@ -3213,12 +3270,13 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, workspace_replacement_reason,
+                        project_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3232,6 +3290,7 @@ def create_task(
                         workspace_kind,
                         workspace_path,
                         branch_name,
+                        workspace_replacement_reason,
                         project_id,
                         tenant,
                         idempotency_key,
@@ -3263,6 +3322,7 @@ def create_task(
                         "workspace_kind": workspace_kind,
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        "workspace_replacement_reason": workspace_replacement_reason,
                         "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
@@ -4900,6 +4960,37 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Worktree lifecycle gate. A task that owns registry worktrees cannot
+    # become terminal until the caller classifies each workspace explicitly.
+    # Legacy/unregistered worktree tasks remain compatible (no owned rows =
+    # no gate), while every newly materialized worktree is registered by
+    # ``_ensure_registered_git_worktree`` above.
+    _terminal_task = get_task(conn, task_id)
+    _terminal_plans = []
+    if (
+        _terminal_task is not None
+        and _terminal_task.status in {"running", "ready", "blocked"}
+        and _terminal_task.workspace_kind == "worktree"
+    ):
+        from hermes_cli import kanban_workspaces as _workspaces
+
+        _terminal_plans = _workspaces.prepare_terminal_disposition(
+            task_id=task_id,
+            board_id=_board_for_connection(conn),
+            disposition=(
+                metadata.get("workspace_disposition")
+                if isinstance(metadata, dict)
+                else None
+            ),
+            pr_numbers=(
+                metadata.get("workspace_pr_numbers")
+                if isinstance(metadata, dict)
+                else None
+            ),
+        )
+        if _terminal_plans:
+            _workspaces.attach_registry(conn)
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -4941,6 +5032,12 @@ def complete_task(
             )
         if cur.rowcount != 1:
             return False
+        if _terminal_plans:
+            from hermes_cli import kanban_workspaces as _workspaces
+
+            _workspaces.apply_terminal_disposition_in_transaction(
+                conn, _terminal_plans
+            )
         if isinstance(metadata, dict):
             _persist_scratch_completion_artifacts(conn, task_id, metadata)
             for stored_path in metadata.pop("_staged_artifacts", []):
@@ -6288,7 +6385,51 @@ def decompose_triage_task(
     return child_ids
 
 
-def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
+def _board_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve the board identity from the exact SQLite connection in use."""
+    try:
+        row = conn.execute(
+            "SELECT board_id FROM temp.hermes_connection_context"
+        ).fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is not None:
+        board_id = _normalize_board_slug(str(row["board_id"]))
+        if board_id:
+            return board_id
+    main_path = ""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if str(row[1]) == "main":
+            main_path = str(row[2] or "")
+            break
+    if not main_path:
+        raise RuntimeError("cannot resolve Kanban board from an in-memory connection")
+    resolved = Path(main_path).expanduser().resolve(strict=False)
+    for board in list_boards():
+        slug = str(board["slug"])
+        if kanban_db_path(slug).resolve(strict=False) == resolved:
+            return slug
+    raise RuntimeError(f"cannot resolve Kanban board for database {resolved}")
+
+
+def archive_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    workspace_disposition: object = None,
+) -> bool:
+    task = get_task(conn, task_id)
+    terminal_plans = []
+    if task is not None and task.status != "archived" and task.workspace_kind == "worktree":
+        from hermes_cli import kanban_workspaces as _workspaces
+
+        terminal_plans = _workspaces.prepare_terminal_disposition(
+            task_id=task_id,
+            board_id=_board_for_connection(conn),
+            disposition=workspace_disposition,
+        )
+        if terminal_plans:
+            _workspaces.attach_registry(conn)
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
@@ -6298,6 +6439,12 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         )
         if cur.rowcount != 1:
             return False
+        if terminal_plans:
+            from hermes_cli import kanban_workspaces as _workspaces
+
+            _workspaces.apply_terminal_disposition_in_transaction(
+                conn, terminal_plans
+            )
         # If archive happened while a run was still in flight (e.g. user
         # archived a running task from the dashboard), close that run with
         # outcome='reclaimed' so attempt history isn't orphaned.
@@ -6515,6 +6662,49 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
+def _ensure_registered_git_worktree(
+    task: Task,
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    board: Optional[str] = None,
+) -> Path:
+    """Reserve lifecycle ownership, materialize, then verify one worktree.
+
+    The existing branch/anchor/materialization behavior stays in
+    ``_ensure_git_worktree``.  This wrapper adds the lifecycle contract around
+    that seam: the registry reservation commits before ``git worktree add`` and
+    is finalized only after Git reports a usable checkout.
+    """
+    from hermes_cli import kanban_workspaces as workspaces
+
+    board_id = board or get_current_board()
+    reservation = workspaces.reserve_workspace(
+        repo_path=repo_root,
+        workspace_path=target,
+        task_id=task.id,
+        board_id=board_id,
+        owner_profile=task.assignee,
+        branch=branch_name,
+        replacement_reason=getattr(task, "workspace_replacement_reason", None),
+    )
+    reserved_target = Path(reservation.workspace_path)
+    try:
+        _ensure_git_worktree(repo_root, reserved_target, branch_name)
+        actual_branch = _git_current_branch(reserved_target)
+        if actual_branch != branch_name:
+            raise RuntimeError(
+                f"worktree branch mismatch at {reserved_target}: expected "
+                f"{branch_name!r}, found {actual_branch or 'detached HEAD'!r}"
+            )
+        workspaces.verify_workspace(reservation.workspace_id, reserved_target)
+    except Exception:
+        workspaces.mark_creation_failed(reservation.workspace_id)
+        raise
+    return reserved_target
+
+
 def _resolve_worktree_workspace(
     task: Task, *, board: Optional[str] = None
 ) -> tuple[Path, str]:
@@ -6555,7 +6745,9 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        target = _ensure_registered_git_worktree(
+            task, repo_root, target, branch_name, board=board_slug
+        )
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -6569,7 +6761,40 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
-            return requested_resolved, actual_branch
+            matched_branch = actual_branch or branch_name
+            existing_root = _repo_root_for_worktree_target(requested.parent)
+            if existing_root is None:
+                raise ValueError(
+                    f"task {task.id} worktree path {task.workspace_path!r} is linked "
+                    "but its primary repository cannot be resolved for lifecycle ownership"
+                )
+            registered = _ensure_registered_git_worktree(
+                task,
+                existing_root,
+                requested_resolved,
+                matched_branch,
+                board=board,
+            )
+            return registered.resolve(strict=False), matched_branch
+        # A path already registered to this exact task is not a sibling's
+        # checkout to route around: a different current branch is ownership
+        # drift. Fail closed without creating a replacement or downgrading the
+        # existing registry record.
+        from hermes_cli import kanban_workspaces as _workspaces
+
+        registered_paths = {
+            Path(record.workspace_path).resolve(strict=False)
+            for record in _workspaces.list_workspace_records(
+                task_id=task.id,
+                board_id=board or get_current_board(),
+            )
+            if record.status != "creation_failed"
+        }
+        if requested_resolved in registered_paths:
+            raise RuntimeError(
+                f"worktree branch mismatch at {requested_resolved}: expected "
+                f"{branch_name!r}, found {actual_branch or 'detached HEAD'!r}"
+            )
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
         # workspace_path verbatim, so siblings all point here; reusing
@@ -6581,17 +6806,25 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                fallback = _ensure_registered_git_worktree(
+                    task, fallback_root, fallback, branch_name, board=board
+                )
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this
-        # task's own canonical worktree): keep the legacy reuse rather
-        # than failing dispatch.
-        return requested_resolved, actual_branch or branch_name
+        # No distinct safe fallback exists (including when the occupied path
+        # is this task's canonical target). Never silently run on another
+        # branch and never auto-switch a checkout that may contain unique work.
+        raise ValueError(
+            f"task {task.id} linked worktree target {str(requested)!r} has branch "
+            f"mismatch: expected {branch_name!r}, found "
+            f"{actual_branch or 'detached HEAD'!r}"
+        )
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        target = _ensure_registered_git_worktree(
+            task, repo_root, target, branch_name, board=board
+        )
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -6600,7 +6833,9 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    requested = _ensure_registered_git_worktree(
+        task, repo_root, requested, branch_name, board=board
+    )
     return requested, branch_name
 
 

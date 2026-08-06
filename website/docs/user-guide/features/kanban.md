@@ -65,7 +65,7 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
-  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. Every new worktree is registered before Git mutates the repository. Completion preserves the path only after an explicit lifecycle disposition is recorded.
 - **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
@@ -263,6 +263,82 @@ hermes kanban complete t_abc t_def t_hij --result "batch wrap"
 hermes kanban archive  t_abc t_def t_hij
 hermes kanban unblock  t_abc t_def
 hermes kanban block    t_abc "need input" --ids t_def t_hij
+```
+
+### Managed worktree lifecycle
+
+Kanban keeps a shared, profile-aware ownership registry at
+`<Hermes root>/kanban/workspace-registry.db`. Git's
+`worktree list --porcelain` output remains the authority for physical
+checkouts; the registry is the authority for task/board ownership, purpose,
+cleanup policy, retention conditions, protected exceptions, and verification
+receipts. Inventory never adopts or deletes an unknown path.
+
+New worktree claims reuse the same compatible task/repository/path record.
+Creating a second persistent worktree for that task and repository fails
+closed unless the task has an explicit `workspace_replacement_reason` (CLI:
+`--workspace-replacement-reason`). Pressure limits under
+`kanban.worktree_lifecycle` are report-only by default.
+
+Worktree-owning tasks must classify every registered checkout before becoming
+`done` or `archived`:
+
+- `retired`
+- `retained_until:<exact condition>`
+- `preserved_dirty:artifact=<recovery artifact>;owner=<responsible owner>`
+- `operational_exception:<policy id>`
+
+A dirty checkout must name both its recovery artifact and accountable owner;
+`retained_until` cannot be used to hide recovery-owned changes. Exception
+policy IDs and workspace paths must each be unique within a policy file, and an
+`operational_exception` disposition is accepted only when that exact current,
+unexpired policy is configured for the workspace. Completion metadata may also
+record associated pull requests with `workspace_pr_numbers: [123, ...]`; the
+dry-run janitor treats every recorded PR as open or unverifiable and excludes it.
+
+For completion, include `workspace_disposition` in structured metadata. For a
+direct archive, use `--workspace-disposition` unless the completed task already
+has a valid recorded disposition:
+
+```bash
+hermes kanban complete t_abc --summary "ready for review" \
+  --metadata '{"workspace_disposition":"retained_until:review-and-pr-closeout"}'
+hermes kanban archive t_def \
+  --workspace-disposition retained_until:review-and-pr-closeout
+```
+
+Inventory is deterministic in both terminal and JSON modes:
+
+```bash
+hermes kanban worktrees inventory \
+  --repo /path/to/repo \
+  --approved-root /path/to/repo/.worktrees
+hermes kanban worktrees inventory \
+  --repo /path/to/repo \
+  --approved-root /path/to/repo/.worktrees \
+  --exception-config /path/to/worktree-exceptions.yaml \
+  --json
+```
+
+Protected operational checkouts are imported only from an explicit versioned
+YAML policy. Start from
+`docs/examples/kanban-worktree-exceptions.yaml`; the importer validates that
+each path is already a Git worktree and skips expired or missing entries:
+
+```bash
+hermes kanban worktrees exceptions import \
+  --config /path/to/worktree-exceptions.yaml --json
+```
+
+The janitor is intentionally dry-run only. It emits candidates and drift
+receipts but performs zero removals, never uses `--force`, and never mutates
+branches or stashes. Primary and locked worktrees are always excluded, even
+when an overly broad approved root is supplied:
+
+```bash
+hermes kanban worktrees janitor \
+  --repo /path/to/repo \
+  --approved-root /path/to/repo/.worktrees --json
 ```
 
 :::note Where an unblocked task lands

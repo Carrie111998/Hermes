@@ -2309,6 +2309,20 @@ DEFAULT_CONFIG = {
         # worker process (if still running host-locally) is terminated
         # before the reclaim.  0 disables stale detection entirely.
         "dispatch_stale_timeout_seconds": 14400,
+        # Canonical worktree-lifecycle ownership and pressure thresholds.
+        # The default is intentionally report-only: creation records ownership
+        # and emits warnings when thresholds are crossed, but never rejects a
+        # valid single-owner workspace solely because the host is busy. Hard
+        # enforcement requires an explicit operator policy change after dry-run
+        # inventory/janitor evidence has been reviewed.
+        "worktree_lifecycle": {
+            "enforcement": "report_only",
+            "warning_worktree_count_per_repo": 20,
+            "warning_estimated_bytes_per_repo": 100 * 1024 * 1024 * 1024,
+            "warning_free_space_floor_bytes": 50 * 1024 * 1024 * 1024,
+            "approved_roots": [],
+            "exception_config": "",
+        },
     },
 
     # execute_code settings — controls the tool used for programmatic tool calls.
