@@ -11,8 +11,8 @@ moved ``origin/main``.
 These tests exercise the REAL ``kanban_db._ensure_git_worktree`` against a real
 local "remote" repo (so ``git fetch`` works offline in the hermetic sandbox),
 proving the new-branch worktree includes commits that exist on the remote but
-not on the stale local ``HEAD`` — and that it still fails soft to ``HEAD`` when
-the remote is unreachable.
+not on the stale local ``HEAD`` — and that an unreachable remote fails soft
+(cached remote-tracking ref, then ``HEAD``) instead of hard-failing.
 """
 
 import subprocess
@@ -122,11 +122,25 @@ class TestEnsureGitWorktreeSyncBase:
 
 
 class TestEnsureGitWorktreeOfflineFallback:
-    def test_unreachable_remote_falls_back_to_head(self, remote_and_clone):
-        """A fetch hiccup must never hard-fail worktree creation: with the
-        remote pointed at a nonexistent path, resolution/fetch can't reach the
-        tip, so creation falls back to local HEAD and still succeeds."""
-        clone, _remote_head, stale_local_head = remote_and_clone
+    def test_unreachable_remote_uses_cached_tracking_ref(self, remote_and_clone):
+        """A fetch hiccup must never hard-fail worktree creation.
+
+        With the remote pointed at a nonexistent path the fetch fails, so
+        ``_resolve_worktree_base`` falls back to the locally-cached
+        ``origin/main`` — not local ``HEAD``, which on a dispatch host is
+        "whatever branch the primary checkout is parked on". Genuine staleness
+        of the cached ref is backstopped by the pre-push stale-base gate.
+
+        Local ``HEAD`` is advanced past the cached tracking ref first: without
+        that divergence both candidates resolve to the same commit and the
+        assertion cannot tell which one was chosen.
+        """
+        clone, _remote_head, _stale = remote_and_clone
+        _commit(clone, "local_only.txt", "commit only in the local clone")
+        local_head = _head(clone)
+        cached_ref = _run(["git", "rev-parse", "origin/main"], clone).stdout.strip()
+        assert local_head != cached_ref
+
         # Break the remote so `git fetch` inside _resolve_worktree_base fails.
         _run(["git", "remote", "set-url", "origin",
               str(clone.parent / "does-not-exist.git")], clone)
@@ -136,8 +150,36 @@ class TestEnsureGitWorktreeOfflineFallback:
         kanban_db._ensure_git_worktree(clone, target, "wt/card-offline")
 
         assert target.exists()
-        # Fetch failed, so the base falls back to the stale local HEAD.
-        assert _head(target) == stale_local_head
+        assert _head(target) == cached_ref, (
+            "a failed fetch should branch from the cached remote-tracking ref"
+        )
+        assert not (target / "local_only.txt").exists(), (
+            "the dispatched worktree must not inherit the primary checkout's "
+            "local-only commits"
+        )
+
+    def test_unreachable_remote_without_cached_ref_falls_back_to_head(self, tmp_path):
+        """No usable tracking ref + failed fetch: base is local ``HEAD`` and
+        worktree creation still succeeds rather than hard-failing on a bogus
+        ref."""
+        repo = tmp_path / "broken-upstream"
+        repo.mkdir()
+        _run(["git", "init"], repo)
+        _run(["git", "config", "user.email", "t@t.com"], repo)
+        _run(["git", "config", "user.name", "T"], repo)
+        _run(["git", "checkout", "-b", "main"], repo)
+        _commit(repo, "README.md", "base")
+        # A branch that claims an upstream which has no tracking ref locally.
+        _run(["git", "remote", "add", "origin", str(tmp_path / "nonexistent.git")], repo)
+        _run(["git", "config", "branch.main.remote", "origin"], repo)
+        _run(["git", "config", "branch.main.merge", "refs/heads/main"], repo)
+        head = _head(repo)
+
+        target = repo / ".worktrees" / "card-no-cache"
+        kanban_db._ensure_git_worktree(repo, target, "wt/card-no-cache")
+
+        assert target.exists()
+        assert _head(target) == head
 
     def test_unusable_base_ref_retries_from_head(self, remote_and_clone, monkeypatch):
         """If base resolution yields a ref that ``git worktree add`` can't use
