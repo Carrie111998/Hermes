@@ -227,23 +227,18 @@ RUN mkdir -p /opt/hermes/bin && \
 # `s6-setuidgid hermes` in its run script. If HERMES_UID is unset, services
 # run as the default hermes user (UID 10000).
 
-# ---------- Bake build-time git revision ----------
-# .dockerignore excludes .git, so `git rev-parse HEAD` from inside the
-# container always returns nothing — meaning `hermes dump` reports
-# "(unknown)" and the startup banner drops its `· upstream <sha>` suffix.
-# That makes support triage from container bug reports impossible:
-# we can't tell which commit the user is actually running.
+# ---------- Bake build-time Runtime provenance ----------
+# .dockerignore excludes .git, so the running process cannot recover the
+# source revision from live Git.  OCI labels are not visible from inside the
+# container either.  Persist the non-secret release contract next to the
+# immutable source tree instead.  The Runtime verifies this file against the
+# content digest of the same allowlisted files before reporting completeness.
 #
-# Fix: write the commit SHA passed via the HERMES_GIT_SHA build-arg to
-# /opt/hermes/.hermes_build_sha at build time, and have
-# hermes_cli/build_info.py read it at runtime.  Both `hermes dump` and
-# banner.get_git_banner_state() try the baked SHA first, then fall back
-# to live `git rev-parse` for source installs (unchanged behaviour).
-#
-# The arg is optional — local `docker build` without --build-arg simply
-# omits the file, and the runtime falls back to live-git lookup.  CI
-# (.github/workflows/docker.yml) passes ${{ github.sha }} so
-# every published image has it.
+# Local builds with no provenance args remain supported as incomplete
+# development images.  A SHA-only build is retained as the legacy
+# .hermes_build_sha path used by `hermes dump` and the startup banner.  Once a
+# release id or build timestamp is supplied, all three provenance values are
+# required and validated; a partial release stamp fails the image build.
 ARG HERMES_GIT_SHA=
 ARG HERMES_BUILD_TIMESTAMP=
 ARG RELEASE_ID=
@@ -251,9 +246,8 @@ LABEL org.opencontainers.image.source="https://github.com/majiayu000/hermes-agen
       org.opencontainers.image.revision="${HERMES_GIT_SHA}" \
       org.opencontainers.image.created="${HERMES_BUILD_TIMESTAMP}" \
       org.opencontainers.image.version="${RELEASE_ID}"
-RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
-        printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
-    fi
+RUN python3 gateway/runtime_provenance.py stamp-build \
+        "${HERMES_GIT_SHA}" "${RELEASE_ID}" "${HERMES_BUILD_TIMESTAMP}"
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.

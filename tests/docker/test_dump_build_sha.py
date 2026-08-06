@@ -20,11 +20,13 @@ This test handles both cases:
   still holds — defensive guard against the helper accidentally
   reporting bogus data from somewhere else.
 """
+
 from __future__ import annotations
 
+import json
 import re
 import subprocess
-
+from pathlib import Path
 
 _VERSION_LINE = re.compile(r"^version:\s+(?P<rest>.+)$", re.MULTILINE)
 _SHA_BRACKET = re.compile(r"\[(?P<sha>[^\]]+)\]\s*$")
@@ -41,7 +43,9 @@ def _run_dump(image: str) -> str:
     """
     r = subprocess.run(
         ["docker", "run", "--rm", image, "dump"],
-        capture_output=True, text=True, timeout=120,
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
     assert r.returncode == 0, (
         f"hermes dump exited {r.returncode}: "
@@ -54,14 +58,95 @@ def _read_baked_sha_from_image(image: str) -> str | None:
     """Return the ``/opt/hermes/.hermes_build_sha`` content, or None if absent."""
     r = subprocess.run(
         [
-            "docker", "run", "--rm", "--entrypoint", "cat", image,
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "cat",
+            image,
             "/opt/hermes/.hermes_build_sha",
         ],
-        capture_output=True, text=True, timeout=30,
+        capture_output=True,
+        text=True,
+        timeout=30,
     )
     if r.returncode != 0:
         return None
     return r.stdout.strip() or None
+
+
+def _read_baked_metadata_from_image(image: str) -> dict[str, object] | None:
+    """Return the release contract from the image, if this is a release build."""
+    r = subprocess.run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "--entrypoint",
+            "cat",
+            image,
+            "/opt/hermes/.hermes_build_metadata.json",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if r.returncode != 0:
+        return None
+    payload = json.loads(r.stdout)
+    assert isinstance(payload, dict)
+    return payload
+
+
+def test_dockerfile_stamps_provenance_in_code_tree_without_runtime_env() -> None:
+    """Docker delegates the contract to the one Runtime implementation."""
+    dockerfile = Path(__file__).parents[2] / "Dockerfile"
+    text = dockerfile.read_text(encoding="utf-8")
+    start = text.index("# ---------- Bake build-time Runtime provenance ----------")
+    end = text.index("# ---------- s6-overlay service wiring ----------", start)
+    provenance_stanza = text[start:end]
+
+    assert "ARG HERMES_GIT_SHA=" in provenance_stanza
+    assert "ARG HERMES_BUILD_TIMESTAMP=" in provenance_stanza
+    assert "ARG RELEASE_ID=" in provenance_stanza
+    assert "python3 gateway/runtime_provenance.py stamp-build" in provenance_stanza
+    assert '"${HERMES_GIT_SHA}" "${RELEASE_ID}"' in provenance_stanza
+    assert '"${HERMES_BUILD_TIMESTAMP}"' in provenance_stanza
+    assert "RUN <<" not in provenance_stanza
+    assert "python3 -" not in provenance_stanza
+    assert not re.search(
+        r"^\s*ENV\s+HERMES_(?:GIT_SHA|BUILD_TIMESTAMP|RELEASE_ID)=",
+        text,
+        re.MULTILINE,
+    )
+
+
+def test_image_metadata_is_allowlisted_and_legacy_sha_remains_compatible(
+    built_image: str,
+) -> None:
+    """Release images expose only the contract; local images stay incomplete."""
+    metadata = _read_baked_metadata_from_image(built_image)
+    baked_sha = _read_baked_sha_from_image(built_image)
+
+    if metadata is None:
+        # The local fixture has no provenance args.  A legacy SHA-only image
+        # is also allowed until its release build supplies the full contract.
+        assert baked_sha is None or re.fullmatch(r"[0-9a-f]{40,64}", baked_sha)
+        return
+
+    assert set(metadata) == {
+        "format_version",
+        "git_commit",
+        "release_id",
+        "build_timestamp",
+        "runtime_sha256",
+    }
+    assert metadata["format_version"] == 1
+    assert isinstance(metadata["git_commit"], str)
+    assert isinstance(metadata["release_id"], str)
+    assert isinstance(metadata["build_timestamp"], str)
+    assert re.fullmatch(r"sha256:[0-9a-f]{64}", str(metadata["runtime_sha256"]))
+    assert baked_sha == metadata["git_commit"]
 
 
 def test_dump_reports_baked_sha_when_present(built_image: str) -> None:
