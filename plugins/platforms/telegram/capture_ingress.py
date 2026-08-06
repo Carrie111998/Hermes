@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import threading
 from dataclasses import dataclass
@@ -97,6 +98,11 @@ class CapturePersistenceError(Exception):
     """Ledger/payload commit failed for a reason that must fail closed (never a coding bug)."""
 
 
+logger = logging.getLogger(__name__)
+
+_VALID_ROUTE_MODES = ("capture_only", "agent", "drop")
+
+
 @dataclass(frozen=True)
 class RouteEntry:
     chat_id: int
@@ -119,10 +125,23 @@ class RoutePolicyTable:
     def __init__(self, entries: Optional[List[Dict[str, Any]]] = None):
         self._by_key: Dict[Tuple[int, Optional[int]], RouteEntry] = {}
         for raw in entries or []:
+            mode = str(raw["mode"])
+            if mode not in _VALID_ROUTE_MODES:
+                # Fail closed on a misconfigured entry, but with a small
+                # blast radius: drop only this entry (so its chat/topic
+                # falls back to "no route configured," today's safe
+                # pass-through default) rather than raising and taking every
+                # other configured route down with it over one typo.
+                logger.error(
+                    "capture_routes: dropping entry with unrecognized mode %r "
+                    "(chat_id=%r, thread_id=%r) -- must be one of %s",
+                    mode, raw.get("chat_id"), raw.get("thread_id"), _VALID_ROUTE_MODES,
+                )
+                continue
             entry = RouteEntry(
                 chat_id=int(raw["chat_id"]),
                 thread_id=normalize_thread_id(raw.get("thread_id")),
-                mode=str(raw["mode"]),
+                mode=mode,
                 sink=str(raw["sink"]),
                 policy_version=str(raw.get("policy_version", "1.0.0")),
             )
@@ -252,13 +271,21 @@ class CaptureIngressStore:
                     (event_id, payload_hash, payload_json),
                 )
                 self._conn.execute("COMMIT")
-            except sqlite3.IntegrityError:
+            except sqlite3.IntegrityError as exc:
                 self._conn.execute("ROLLBACK")
-                # Lost a race against a concurrent insert of the same event_id.
+                # Only a genuine lost race against a concurrent insert of
+                # the same event_id -- confirmed by a row actually existing
+                # now -- is a RouteConflict. Any other IntegrityError (e.g.
+                # a NOT NULL violation on a required column) leaves no row
+                # behind and is a real persistence failure, not a duplicate;
+                # misreporting it as RouteConflict would mislead debugging
+                # even though both fail closed the same way.
                 existing = self._conn.execute(
                     "SELECT payload_hash FROM ingress_ledger WHERE event_id = ?", (event_id,)
                 ).fetchone()
-                if existing is not None and existing[0] == payload_hash:
+                if existing is None:
+                    raise CapturePersistenceError(str(exc)) from exc
+                if existing[0] == payload_hash:
                     return DUPLICATE_SAME
                 raise RouteConflict(
                     f"event_id {event_id!r} already captured with a different payload_hash"
@@ -328,7 +355,21 @@ class CaptureAwareQueue(asyncio.Queue):
         sender = getattr(message, "from_user", None)
         sender_id = getattr(sender, "id", None)
         if message_id is None or sender_id is None:
-            return await super().put(item)  # no human-authored identity to key a row on
+            # No human-authored identity to key a ledger row on (e.g. a
+            # channel post, whose identity lives in sender_chat rather than
+            # from_user -- the ingress-ledger contract requires a non-null
+            # human sender_id, so this cannot be captured). The owner
+            # directive for a capture-only route is unconditional ("must
+            # never start an agent turn... for the capture-only topic"), not
+            # conditioned on whether a row could be produced -- so still
+            # terminally deny dispatch, just without a ledger row.
+            if route.mode == "capture_only":
+                self._alert_failure(
+                    f"capture ingress: capture-only route matched update_id={item.update_id} "
+                    "with no human sender identity to key a ledger row on -- denying dispatch, not captured"
+                )
+                return
+            return await super().put(item)  # agent/no-route: existing behavior unchanged
 
         profile = self._profile_provider()
         account_id = self._account_id_provider()

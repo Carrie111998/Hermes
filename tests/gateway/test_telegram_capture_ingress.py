@@ -221,6 +221,19 @@ class TestRoutePolicyTable:
         table = RoutePolicyTable([])
         assert table.lookup(CAPTURE_CHAT_ID, CAPTURE_THREAD_ID) is None
 
+    def test_unrecognized_mode_fails_closed_not_registered(self):
+        """A typo'd/unrecognized mode (e.g. wrong case) must not silently
+        behave like 'agent' dispatch just because it fails the exact
+        string comparisons in CaptureAwareQueue.put(). Fail closed: the
+        entry is dropped, so the route is treated as unconfigured (today's
+        safe pass-through default), not as a hidden 'deliver' policy.
+        """
+        routes = [
+            {"chat_id": CAPTURE_CHAT_ID, "thread_id": CAPTURE_THREAD_ID, "mode": "Capture_Only", "sink": "s", "policy_version": "1.0.0"}
+        ]
+        table = RoutePolicyTable(routes)
+        assert table.lookup(CAPTURE_CHAT_ID, CAPTURE_THREAD_ID) is None
+
 
 class TestCaptureIngressStore:
     def _kwargs(self, **override):
@@ -270,6 +283,19 @@ class TestCaptureIngressStore:
         row = _ledger_row(store, "telegram:default:777:1000")
         assert row["payload_hash"] == "sha256:" + "a" * 64  # unchanged
 
+    def test_integrity_error_unrelated_to_a_duplicate_race_is_persistence_error_not_conflict(self, store):
+        """A NOT-NULL violation (e.g. a caller passing account_id=None,
+        which can happen if commit_capture is ever reached before the bot's
+        own id is known) is a genuine storage/programming-adjacent failure,
+        not a lost race against a concurrent insert of the same event_id --
+        raising RouteConflict here would misdiagnose it and mislead
+        debugging/alerting, even though both exception types fail closed the
+        same way (no delegation, no ack).
+        """
+        with pytest.raises(CapturePersistenceError):
+            store.commit_capture(**self._kwargs(account_id=None))
+        assert _ledger_row(store, "telegram:default:777:1000") is None
+
     def test_injected_storage_failure_raises_capture_persistence_error(self, store):
         store._conn.close()  # simulate a hard storage failure (closed handle)
         with pytest.raises(CapturePersistenceError):
@@ -289,6 +315,63 @@ class TestCaptureAwareQueueDispatchGating:
         row = _ledger_row(store, eid)
         assert row is not None
         assert row["route_mode"] == "capture_only"
+
+    @pytest.mark.asyncio
+    async def test_sender_identity_less_message_on_capture_only_route_still_denied(self, store):
+        """A message-like update with no from_user (e.g. a channel post,
+        whose identity lives in sender_chat instead) cannot be keyed into a
+        ledger row -- the ingress-ledger contract requires a non-null human
+        sender_id -- but a capture-only route's terminal deny is an
+        unconditional owner directive ("Capture must never start an agent
+        turn... for the capture-only topic"), not conditioned on whether a
+        ledger row could be produced. It must still be denied, not silently
+        delegated to dispatch just because it couldn't be captured.
+        """
+        queue = _make_queue(store, _capture_only_routes())
+        msg = _message(text="channel announcement", from_user=None)
+        msg = Message(
+            message_id=msg.message_id,
+            date=msg.date,
+            chat=msg.chat,
+            from_user=None,
+            sender_chat=_chat(chat_id=-500, chat_type="channel"),
+            text=msg.text,
+            message_thread_id=msg.message_thread_id,
+            is_topic_message=msg.is_topic_message,
+        )
+        upd = _update(update_id=16, message=msg)
+
+        await queue.put(upd)
+
+        eid = compute_event_id(PROFILE, ACCOUNT_ID, 16)
+        assert _ledger_row(store, eid) is None  # cannot be captured (no human sender_id)
+        assert queue.qsize() == 0  # but must NOT be delegated to dispatch either
+
+    @pytest.mark.asyncio
+    async def test_sender_identity_less_message_on_agent_route_passes_through(self, store):
+        """Same identity-less shape, but on an 'agent' route: existing
+        (non-capture) dispatch behavior is unaffected -- this envelope only
+        adds a new hard deny for capture_only, never a new block for agent.
+        """
+        queue = _make_queue(store, _agent_routes())
+        msg = _message(text="channel announcement", from_user=None)
+        msg = Message(
+            message_id=msg.message_id,
+            date=msg.date,
+            chat=msg.chat,
+            from_user=None,
+            sender_chat=_chat(chat_id=-500, chat_type="channel"),
+            text=msg.text,
+            message_thread_id=msg.message_thread_id,
+            is_topic_message=msg.is_topic_message,
+        )
+        upd = _update(update_id=17, message=msg)
+
+        await queue.put(upd)
+
+        eid = compute_event_id(PROFILE, ACCOUNT_ID, 17)
+        assert _ledger_row(store, eid) is None
+        assert queue.qsize() == 1  # unchanged existing behavior
 
     @pytest.mark.asyncio
     async def test_command_on_capture_only_route_captured_as_inert_text_not_dispatched(self, store):

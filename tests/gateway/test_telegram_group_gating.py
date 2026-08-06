@@ -95,6 +95,7 @@ def _group_message(
     from_user_id=111,
     from_user_name="Alice Example",
     thread_id=None,
+    is_forum=None,
     reply_to_bot=False,
     entities=None,
     caption=None,
@@ -103,6 +104,8 @@ def _group_message(
     reply_to_message = None
     if reply_to_bot:
         reply_to_message = SimpleNamespace(from_user=SimpleNamespace(id=999), message_id=10, text="previous bot reply", caption=None)
+    if is_forum is None:
+        is_forum = thread_id is not None
     return SimpleNamespace(
         message_id=42,
         text=text,
@@ -111,7 +114,7 @@ def _group_message(
         caption_entities=caption_entities or [],
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
-        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
+        chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=is_forum),
         from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
         reply_to_message=reply_to_message,
         date=None,
@@ -969,6 +972,24 @@ def test_general_topic_route_applies_to_null_thread_message():
     adapter = _with_capture_only_route(_make_adapter(), thread_id=None)
     message = _group_message("hello", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=None)
 
+    assert adapter._should_process_message(message) is False
+
+
+def test_general_topic_route_applies_to_real_forum_general_topic_message():
+    """A forum group's General topic (is_forum=True, message_thread_id=None
+    -- Telegram never assigns a message_thread_id to it, unlike every real
+    topic) must collapse to the same null route key as a non-forum chat.
+    Unlike the sibling test above (a non-forum group, is_forum=False by
+    construction), this exercises the actual sentinel-collapsing branch in
+    _effective_message_thread_id / normalize_thread_id: is_forum_group=True
+    -> _GENERAL_TOPIC_THREAD_ID ("1") -> normalized to None.
+    """
+    adapter = _with_capture_only_route(_make_adapter(), thread_id=None)
+    message = _group_message(
+        "hello", chat_id=_CAPTURE_ONLY_CHAT_ID, thread_id=None, is_forum=True,
+    )
+
+    assert adapter._effective_message_thread_id(message) == adapter._GENERAL_TOPIC_THREAD_ID
     assert adapter._should_process_message(message) is False
 
 
