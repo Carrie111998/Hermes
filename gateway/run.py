@@ -17818,7 +17818,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
             # inside _run_agent returns False, and the old sentinel-only check here
             # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            # A turn rejected as stale before transcript load is different: a
+            # newer generation may already own this routing-key slot, so its
+            # unwind must use the generation guard and preserve that successor.
+            if getattr(event, "_stale_turn_before_history", False):
+                self._release_running_agent_state(
+                    _quick_key,
+                    run_generation=_run_generation,
+                )
+            else:
+                self._release_running_agent_state(_quick_key)
             # Turn lease (#64934): release THIS turn's lease token — keyed by
             # (routing key, run generation) so this unwind can only ever free
             # the lease its own turn acquired, never a newer turn's.
@@ -18948,6 +18957,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+        # /stop and /new invalidate the generation before releasing the active
+        # slot. A turn that was waiting on the old holder can wake afterward;
+        # drop it before transcript load or compression, while keeping the
+        # acquired token registered for the dispatch finally to release.
+        if not self._is_session_run_current(_quick_key, run_generation):
+            # /stop and /new invalidate the generation before releasing the
+            # active slot. A turn already waiting on the old holder can wake
+            # afterward; stop it before transcript load or compression. Mark
+            # this event so the outer finally preserves any newer owner.
+            setattr(event, "_stale_turn_before_history", True)
+            return {"final_response": "", "api_calls": 0, "interrupted": True}
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
@@ -26140,6 +26160,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # between lifecycle transitions.  Preserves gateway_state (see
         # _persist_active_agents).
         self._persist_active_agents()
+        return True
+
+    async def _acquire_turn_lease_for_run(
+        self,
+        session_key: str,
+        session_id: str,
+        run_generation: int,
+        *,
+        timeout: float,
+    ) -> bool:
+        """Acquire the resolved-session lease and reject stale waiters.
+
+        A waiter may claim its routing-key slot before /stop invalidates the
+        generation, then resume only after the interrupted turn releases the
+        lease. Re-checking after the await closes that stale-waiter race. The
+        token is registered first so the dispatch finally releases it normally.
+        """
+        registry = getattr(self, "_turn_leases", None)
+        if registry is not None:
+            token = await registry.acquire(
+                session_id,
+                owner_key=session_key,
+                generation=run_generation,
+                timeout=timeout,
+            )
+            if token is not None:
+                turn = self._session_state(session_key).turn
+                turn.lease_token = token
+                turn.lease_generation = run_generation
+
+        if not self._is_session_run_current(session_key, run_generation):
+            logger.info(
+                "Dropping stale turn before transcript load for %s — "
+                "generation %s is no longer current",
+                session_key or "?",
+                run_generation,
+            )
+            return False
         return True
 
     def _release_turn_lease(self, session_key: str, run_generation: int) -> bool:
