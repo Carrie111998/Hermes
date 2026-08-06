@@ -30,6 +30,7 @@ def _attach_agent(
     context_tokens: int,
     context_length: int,
     compressions: int = 0,
+    estimated_cost: float = 0.0,
 ):
     cli_obj.agent = SimpleNamespace(
         model=cli_obj.model,
@@ -43,6 +44,7 @@ def _attach_agent(
         session_completion_tokens=completion_tokens,
         session_total_tokens=total_tokens,
         session_api_calls=api_calls,
+        session_estimated_cost_usd=estimated_cost,
         get_rate_limit_state=lambda: None,
         context_compressor=SimpleNamespace(
             last_prompt_tokens=context_tokens,
@@ -317,5 +319,71 @@ class TestIdleSinceLastTurn:
         cli_obj._prompt_duration = 5.0
         snapshot = cli_obj._get_status_bar_snapshot()
         assert snapshot["idle_since"].startswith("✓ ")
+
+
+class TestSessionUsageSegment:
+    """📊 session-token (+$ cost) status-bar segment (display.show_cost)."""
+
+    def _wide_cli(self, *, show_cost: bool = False, **agent_kwargs):
+        cli_obj = _attach_agent(
+            _make_cli(),
+            prompt_tokens=10_230,
+            completion_tokens=2_220,
+            total_tokens=515_000,
+            api_calls=13,
+            context_tokens=65_100,
+            context_length=256_000,
+            **agent_kwargs,
+        )
+        cli_obj._status_bar_show_cost = show_cost
+        cli_obj._status_bar_visible = True
+        return cli_obj
+
+    def test_segment_empty_without_tokens(self):
+        cli_obj = _make_cli()
+        assert cli_obj._format_session_usage_segment(
+            {"session_total_tokens": 0, "session_cost_usd": 0.0}
+        ) == ""
+
+    def test_segment_tokens_only_when_cost_off(self):
+        cli_obj = self._wide_cli(show_cost=False, estimated_cost=0.0184)
+        assert cli_obj._format_session_usage_segment(
+            cli_obj._get_status_bar_snapshot()
+        ) == "📊 515K"
+
+    def test_segment_appends_cost_under_dollar(self):
+        cli_obj = self._wide_cli(show_cost=True, estimated_cost=0.0184)
+        assert cli_obj._format_session_usage_segment(
+            cli_obj._get_status_bar_snapshot()
+        ) == "📊 515K $0.0184"
+
+    def test_segment_appends_cost_over_dollar(self):
+        cli_obj = self._wide_cli(show_cost=True, estimated_cost=1.5)
+        assert cli_obj._format_session_usage_segment(
+            cli_obj._get_status_bar_snapshot()
+        ) == "📊 515K $1.50"
+
+    def test_status_bar_text_includes_session_segment(self):
+        cli_obj = self._wide_cli(show_cost=True, estimated_cost=0.0184)
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "📊 515K $0.0184" in text
+
+    def test_status_bar_text_hides_cost_without_flag(self):
+        cli_obj = self._wide_cli(show_cost=False, estimated_cost=0.0184)
+        text = cli_obj._build_status_bar_text(width=120)
+        assert "📊 515K" in text
+        assert "$0.0184" not in text
+
+    def test_status_bar_fragments_include_session_segment(self):
+        cli_obj = self._wide_cli(show_cost=True, estimated_cost=0.0184)
+        with patch.object(cli_obj, "_get_tui_terminal_width", return_value=120):
+            frags = cli_obj._get_status_bar_fragments()
+        texts = [text for _, text in frags]
+        assert "📊 515K $0.0184" in texts
+
+    def test_snapshot_carries_cost(self):
+        cli_obj = self._wide_cli(estimated_cost=0.0184)
+        snapshot = cli_obj._get_status_bar_snapshot()
+        assert snapshot["session_cost_usd"] == 0.0184
 
 

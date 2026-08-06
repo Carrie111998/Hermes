@@ -4729,6 +4729,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # Battery read-out in the status bar (toggled via /battery, off by
         # default). Persisted to display.battery so it survives restarts.
         self._battery_visible = bool(CLI_CONFIG["display"].get("battery", False))
+        # Show $ cost in the status bar (display.show_cost, off by default —
+        # documented config key that was never wired into the status bar).
+        self._status_bar_show_cost = bool(CLI_CONFIG["display"].get("show_cost", False))
         # When True, the input separator rules and the dynamic status bar are
         # hidden until the next user input. Set by _recover_after_resize() so a
         # SIGWINCH cannot stamp a freshly-drawn status bar on top of one that
@@ -5266,6 +5269,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             "session_completion_tokens": 0,
             "session_total_tokens": 0,
             "session_api_calls": 0,
+            "session_cost_usd": 0.0,
             "compressions": 0,
             "active_background_tasks": 0,
             "active_background_processes": 0,
@@ -5360,6 +5364,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         snapshot["session_completion_tokens"] = getattr(agent, "session_completion_tokens", 0) or 0
         snapshot["session_total_tokens"] = getattr(agent, "session_total_tokens", 0) or 0
         snapshot["session_api_calls"] = getattr(agent, "session_api_calls", 0) or 0
+        snapshot["session_cost_usd"] = getattr(agent, "session_estimated_cost_usd", 0) or 0
 
         compressor = getattr(agent, "context_compressor", None)
         if compressor:
@@ -5897,6 +5902,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return f"⊙ goal {used}/{max_turns}"
         return "⊙ goal"
 
+    def _format_session_usage_segment(self, snapshot: Dict[str, Any]) -> str:
+        """Return the session-token (+$ cost) status-bar segment, or "".
+
+        Mirrors the gateway footer's 📊 segment: cumulative session tokens,
+        with the estimated $ cost appended when ``display.show_cost`` is on
+        and the agent has a nonzero cost estimate (same formatting rules as
+        the Telegram footer: 4 decimals under $1, 2 from $1 up).
+        """
+        try:
+            total = snapshot.get("session_total_tokens", 0) or 0
+            if not total:
+                return ""
+            label = f"📊 {format_token_count_compact(total)}"
+            cost = snapshot.get("session_cost_usd", 0) or 0
+            if cost > 0 and self._status_bar_show_cost:
+                label += f" ${cost:.4f}" if cost < 1 else f" ${cost:.2f}"
+            return label
+        except Exception:
+            return ""
+
     def _build_status_bar_text(self, width: Optional[int] = None) -> str:
         """Return a compact one-line session status string for the TUI footer."""
         try:
@@ -5957,6 +5982,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             parts = [f"⚕ {snapshot['model_short']}", context_label, percent_label]
             if battery_label:
                 parts.insert(0, battery_label)
+            session_segment = self._format_session_usage_segment(snapshot)
+            if session_segment:
+                parts.append(session_segment)
             if compressions:
                 parts.append(f"🗜️ {compressions}")
             bg_count = snapshot.get("active_background_tasks", 0)
@@ -6083,6 +6111,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                         ("class:status-bar-dim", " "),
                         (bar_style, percent_label),
                     ]
+                    session_segment = self._format_session_usage_segment(snapshot)
+                    if session_segment:
+                        frags.append(("class:status-bar-dim", " │ "))
+                        frags.append(("class:status-bar-strong", session_segment))
                     if compressions:
                         frags.append(("class:status-bar-dim", " │ "))
                         frags.append((self._compression_count_style(compressions), f"🗜️ {compressions}"))
