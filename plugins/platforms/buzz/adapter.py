@@ -118,10 +118,11 @@ _WS_AUTH_TIMEOUT = 20.0
 _WS_MAX_MESSAGE_BYTES = 2_000_000
 _WS_MEMBERSHIP_KIND = 44100
 _WS_MEMBERSHIP_SUB_ID = "hermes-buzz-membership"
-_WS_CHANNELS_SUB_PREFIX = "hermes-buzz-channels-"
-# Buzz advertises at most 10 filters per Nostr REQ. Chunking keeps per-channel
-# high-water marks without opening one subscription per profile.
-_WS_FILTERS_PER_SUBSCRIPTION = 10
+_WS_CHANNEL_SUB_PREFIX = "hermes-buzz-channel-"
+# Buzz admits 50 REQ/EVENT/COUNT frames per five-second window by default.
+# Profile sync can produce dozens of channels, so pace independent channel
+# subscriptions below that burst ceiling instead of sending them all at once.
+_WS_SUBSCRIBE_DELAY = 0.15
 
 # Where to look for a credentials JSON (keys: nsec / private_key_hex) when
 # BUZZ_PRIVATE_KEY is not set.  Module-level so tests can point it at a tmpdir.
@@ -1279,35 +1280,33 @@ class BuzzAdapter(BasePlatformAdapter):
                 detail = response[-1] if len(response) > 1 else "authentication failed"
                 raise ConnectionError(f"Buzz WebSocket AUTH failed: {detail}")
 
-    async def _send_channel_subscriptions(self, websocket) -> List[str]:
-        """Subscribe to all conversations in a bounded number of REQs.
-
-        Each channel remains a separate filter so it keeps its own high-water
-        mark, but the relay sees one subscription rather than one subscription
-        per Hermes profile. This keeps profile-channel sync scalable.
-        """
-        filters = []
-        for channel_id, state in self._channel_state.items():
-            since = max(int(state.get("last_ts") or time.time()) - 1, 0)
-            filters.append({"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since})
-        subscription_ids = []
-        for offset in range(0, len(filters), _WS_FILTERS_PER_SUBSCRIPTION):
-            subscription_id = f"{_WS_CHANNELS_SUB_PREFIX}{offset // _WS_FILTERS_PER_SUBSCRIPTION}"
-            request = [
-                "REQ", subscription_id,
-                *filters[offset:offset + _WS_FILTERS_PER_SUBSCRIPTION],
-            ]
-            await websocket.send(json.dumps(request, separators=(",", ":")))
-            subscription_ids.append(subscription_id)
-        return subscription_ids
+    async def _send_channel_subscription(
+        self, websocket, channel_id: str, state: dict
+    ) -> str:
+        """Open one live subscription whose id maps unambiguously to a channel."""
+        subscription_id = f"{_WS_CHANNEL_SUB_PREFIX}{channel_id}"
+        since = max(int(state.get("last_ts") or time.time()) - 1, 0)
+        request = [
+            "REQ",
+            subscription_id,
+            {"kinds": [_CHAT_KIND], "#h": [channel_id], "since": since},
+        ]
+        await websocket.send(json.dumps(request, separators=(",", ":")))
+        return subscription_id
 
     async def _subscribe_websocket(self, websocket) -> Dict[str, Optional[str]]:
         """Subscribe to every watched conversation plus membership events
         (kind 44100 p-tagged to us) for live DM discovery."""
         subscriptions: Dict[str, Optional[str]] = {}
-        for subscription_id in await self._send_channel_subscriptions(websocket):
-            subscriptions[subscription_id] = "*"
-        self._ws_subscribed_channels = set(self._channel_state)
+        channel_items = list(self._channel_state.items())
+        for index, (channel_id, state) in enumerate(channel_items):
+            subscription_id = await self._send_channel_subscription(
+                websocket, channel_id, state
+            )
+            subscriptions[subscription_id] = channel_id
+            if index + 1 < len(channel_items):
+                await asyncio.sleep(_WS_SUBSCRIBE_DELAY)
+        self._ws_subscribed_channels = {channel_id for channel_id, _ in channel_items}
         if self._self_pubkey:
             request = [
                 "REQ",
@@ -1387,16 +1386,7 @@ class BuzzAdapter(BasePlatformAdapter):
                                 if subscription_id == _WS_MEMBERSHIP_SUB_ID:
                                     await self._handle_membership_event(websocket, subscriptions, event)
                                     continue
-                                channel_id = None
-                                if subscription_id.startswith(_WS_CHANNELS_SUB_PREFIX):
-                                    for tag in event.get("tags") or []:
-                                        if (
-                                            isinstance(tag, (list, tuple))
-                                            and len(tag) > 1
-                                            and tag[0] == "h"
-                                        ):
-                                            channel_id = str(tag[1])
-                                            break
+                                channel_id = subscriptions.get(subscription_id)
                                 state = self._channel_state.get(channel_id or "")
                                 if channel_id and state is not None:
                                     await self._handle_event(channel_id, state, event)
@@ -1585,19 +1575,34 @@ class BuzzAdapter(BasePlatformAdapter):
     async def _sync_ws_subscriptions(
         self, websocket, subscriptions: Dict[str, Optional[str]]
     ) -> None:
-        """Refresh the single live subscription after channel-set changes."""
+        """Add/remove independent live subscriptions after channel changes."""
         current = set(self._channel_state)
         if current == self._ws_subscribed_channels:
             return
-        for subscription_id in list(subscriptions):
-            if not subscription_id.startswith(_WS_CHANNELS_SUB_PREFIX):
-                continue
-            await websocket.send(json.dumps(["CLOSE", subscription_id], separators=(",", ":")))
+
+        removed = self._ws_subscribed_channels - current
+        for channel_id in removed:
+            subscription_id = f"{_WS_CHANNEL_SUB_PREFIX}{channel_id}"
+            await websocket.send(
+                json.dumps(["CLOSE", subscription_id], separators=(",", ":"))
+            )
             subscriptions.pop(subscription_id, None)
-        for subscription_id in await self._send_channel_subscriptions(websocket):
-            subscriptions[subscription_id] = "*"
+
+        added = sorted(current - self._ws_subscribed_channels)
+        for index, channel_id in enumerate(added):
+            subscription_id = await self._send_channel_subscription(
+                websocket, channel_id, self._channel_state[channel_id]
+            )
+            subscriptions[subscription_id] = channel_id
+            if index + 1 < len(added):
+                await asyncio.sleep(_WS_SUBSCRIBE_DELAY)
         self._ws_subscribed_channels = current
-        logger.info("Buzz: refreshed aggregate subscription for %d conversations", len(current))
+        logger.info(
+            "Buzz: refreshed subscriptions for %d conversations (+%d, -%d)",
+            len(current),
+            len(added),
+            len(removed),
+        )
 
     async def _poll_channel(self, channel_id: str) -> None:
         state = self._channel_state.get(channel_id)
