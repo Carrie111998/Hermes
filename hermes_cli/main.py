@@ -12479,7 +12479,6 @@ def main():
 from hermes_cli.main_oneshot_exit import (  # noqa: E402,F401 — legacy re-exports; tests call these via hermes_cli.main.<name>
     _cleanup_oneshot_runtime,
     _exit_after_oneshot,
-    _oneshot_cleanup_done,
     _run_and_exit_oneshot,
 )
 

@@ -39,7 +39,6 @@ REEXPORTED_NAMES = (
     "_exit_after_oneshot",
     "_cleanup_oneshot_runtime",
     "_run_and_exit_oneshot",
-    "_oneshot_cleanup_done",
 )
 
 
