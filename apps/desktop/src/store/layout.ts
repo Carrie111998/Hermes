@@ -2,7 +2,6 @@ import { atom, computed, type ReadableAtom, type WritableAtom } from 'nanostores
 
 import { SIDEBAR_COLLAPSE_MEDIA_QUERY } from '@/app/layout-constants'
 import { PANE_TOGGLE_REVEAL_EVENT } from '@/components/pane-shell'
-import { isPaneVisible, revealTreePane } from '@/components/pane-shell/tree/store'
 import { matchesQuery } from '@/hooks/use-media-query'
 import { connectionScopedAtom } from '@/lib/connection-scoped'
 import { type Codec, Codecs, persistentAtom } from '@/lib/persisted'
@@ -57,9 +56,6 @@ const RIGHT_RAIL_ACTIVE_TAB_STORAGE_KEY = 'hermes.desktop.rightRailActiveTab'
 
 export const CHAT_SIDEBAR_PANE_ID = 'chat-sidebar'
 export const FILE_BROWSER_PANE_ID = 'file-browser'
-/** The file tree's id in the LAYOUT TREE — distinct from the pane-state id
- *  above, which keys its open/width record. Toggles need both. */
-export const FILES_PANE_ID = 'files'
 
 /** Every rail tab is a preview of something, namespaced by what backs it: a
  *  path on disk, a live URL, or an id into the in-memory artifact registry. */
@@ -504,19 +500,10 @@ export function toggleFileBrowserOpen() {
     return
   }
 
-  // Ask the TREE, not the pane's boolean. `$fileBrowserOpen` stays true while
-  // the tree pane sits behind a sibling tab in the shared right column (the
-  // preview rail, the diff) or inside a minimized zone, so ⌘J spent its press
-  // re-asserting a value it already held and read as a dead key. Only fold the
-  // side when the tree is genuinely the thing on screen; otherwise bring it
-  // forward through the reveal path, which fronts and un-minimizes.
-  if (!isPaneVisible(FILES_PANE_ID) && $fileBrowserOpen.get()) {
-    revealTreePane(FILES_PANE_ID)
-
-    return
-  }
-
-  togglePane(FILE_BROWSER_PANE_ID)
+  // No dedicated global files pane anymore — the file tree lives inside each
+  // session tile. ⌘J keeps its "right sidebar" meaning: it toggles the right
+  // column (review, right-docked panes) through the side visibility binding.
+  setFileBrowserOpen(!$fileBrowserOpen.get())
 }
 
 export function setFileBrowserOpen(open: boolean) {

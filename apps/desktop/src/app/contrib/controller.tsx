@@ -89,7 +89,7 @@ import { HudShell } from '../hud/hud-shell'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
 import { $workspaceIsPage } from '../routes'
 
-import { FilesPane, LogsPane, ReviewPaneContent } from './panes'
+import { LogsPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
 
 /**
@@ -209,22 +209,6 @@ registry.registerMany([
       lifecycleKeepAlive: true
     },
     render: () => <WiredPane part="terminal" />
-  },
-  {
-    id: 'files',
-    area: 'panes',
-    title: 'files',
-    // dock: re-adoption target after a stale dismissal (see sessions).
-    data: {
-      placement: 'right',
-      collapsible: true,
-      dock: { pane: 'workspace', pos: 'right' },
-      revealAliases: ['file-browser'],
-      width: FILE_BROWSER_DEFAULT_WIDTH,
-      minWidth: FILE_BROWSER_MIN_WIDTH,
-      maxWidth: FILE_BROWSER_MAX_WIDTH
-    },
-    render: () => idle(<FilesPane />)
   },
   {
     id: 'review',
@@ -398,8 +382,8 @@ const DEFAULT_TREE = split(
       [
         split(
           'row',
-          [group(['review'], { id: 'grp-review' }), group(['files'], { id: 'grp-files' })],
-          [1, 1.2],
+          [group(['review'], { id: 'grp-review' })],
+          [1],
           'spl-rail'
         ),
         group(['terminal'], { id: 'grp-terminal' })
@@ -412,12 +396,12 @@ const DEFAULT_TREE = split(
   'spl-root'
 )
 
-const FOCUS_TREE = split('row', [group(['sessions']), group(['workspace', 'files', 'review', 'terminal'])], [1, 4.6])
+const FOCUS_TREE = split('row', [group(['sessions']), group(['workspace', 'review', 'terminal'])], [1, 4.6])
 
 const TERMINAL_TREE = split(
   'column',
   [
-    split('row', [group(['sessions']), group(['workspace']), group(['files', 'review'])], [1, 3.2, 1.2]),
+    split('row', [group(['sessions']), group(['workspace']), group(['review'])], [1, 3.2, 1.2]),
     group(['terminal'])
   ],
   [3, 1]
@@ -426,7 +410,7 @@ const TERMINAL_TREE = split(
 const QUAD_TREE = split(
   'column',
   [
-    split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
+    split('row', [group(['sessions']), group(['workspace'])], [1, 3]),
     split('row', [group(['terminal']), group(['review'])], [1.4, 1])
   ],
   [3, 1]
@@ -590,13 +574,6 @@ const $hasWorkspace = computed($currentCwd, cwd => Boolean(cwd.trim()))
 // writes the store too. Without the opener the boolean went stale the moment
 // anything but the toggle showed the pane — the divergence this whole change
 // is about.
-bindPaneVisibility(
-  'files',
-  computed([$hasWorkspace, $fileBrowserOpen], (workspace, open) => workspace && open),
-  () => setFileBrowserOpen(false),
-  () => setFileBrowserOpen(true)
-)
-// ⌘G — the review sidebar appears/disappears (and comes to the front).
 bindPaneVisibility(
   'review',
   computed([$reviewOpen, $hasWorkspace], (open, workspace) => open && workspace),
@@ -778,9 +755,6 @@ registry.register(
 // otherwise ⌘W/Close silently no-op.
 registerPaneCloser('sessions', () =>
   paneRootSide('sessions') === 'left' ? setSidebarOpen(false) : dismissTreePane('sessions')
-)
-registerPaneCloser('files', () =>
-  paneRootSide('files') === 'right' ? setFileBrowserOpen(false) : dismissTreePane('files')
 )
 
 // ---------------------------------------------------------------------------

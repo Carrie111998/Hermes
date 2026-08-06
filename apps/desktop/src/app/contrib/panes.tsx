@@ -12,7 +12,6 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 
-import { TileFiles } from '@/app/chat/tile/tile-files'
 import { ReviewPane } from '@/app/right-sidebar/review'
 import type { GroupSetter } from '@/app/shell/group-setter'
 import type { StatusbarItem } from '@/app/shell/statusbar-controls'
@@ -22,9 +21,7 @@ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { registry } from '@/contrib/registry'
 import { getLogs } from '@/hermes'
-import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { cn } from '@/lib/utils'
-import { openPreview } from '@/store/preview'
 import { $currentCwd } from '@/store/session'
 
 // ---------------------------------------------------------------------------
@@ -69,31 +66,10 @@ export function LogsPane() {
  *  Atom-bridged: this module can't import contrib-wiring (it imports us). */
 export const $restartPreviewServer = atom<((url: string, context?: string) => Promise<string>) | null>(null)
 
-/** Open a file from the tree in the real preview pipeline. */
-function previewFile(path: string) {
-  void normalizeOrLocalPreviewTarget(path, $currentCwd.get() || undefined)
-    .then(target => {
-      if (target) {
-        openPreview(target, 'file-browser')
-      }
-    })
-    .catch(() => undefined)
-}
-
 // Layout fit for wrapped asides. Edge chrome (borders/shadows) is neutralized
 // GLOBALLY by the tree's seam invariant (see LayoutTreeRoot) — only sizing
 // and titlebar clearance are per-wrapper concerns.
 const ZONE_CONTENT = 'h-full [&>aside]:h-full [&>aside]:w-full [&>aside]:pt-0'
-
-export function FilesPane() {
-  const cwd = useStore($currentCwd)
-
-  return (
-    <div className={ZONE_CONTENT}>
-      <TileFiles cwd={cwd} onActivateFile={previewFile} onActivateFolder={previewFile} />
-    </div>
-  )
-}
 
 // ---------------------------------------------------------------------------
 // Review — the real git diff pane (⌘G / $reviewOpen)
