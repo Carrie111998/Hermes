@@ -10666,7 +10666,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         exact = 0
         fallback = 0
         try:
-            exact = await self.async_session_store.recover_interrupted_turns()
+            agent_timeout = max(1.0, _float_env("HERMES_AGENT_TIMEOUT", 1800))
+            marker_max_age = max(60 * 60, int(agent_timeout * 2))
+            exact = await self.async_session_store.recover_interrupted_turns(
+                max_age_seconds=marker_max_age
+            )
         except Exception as exc:
             logger.warning("Exact active-turn recovery on startup failed: %s", exc)
         try:
@@ -16322,17 +16326,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         try:
             if not session_key or not token:
                 return False
-            return bool(
-                await self.async_session_store.clear_turn_active(session_key, token)
-            )
-        except Exception as exc:
+            last_error: Optional[Exception] = None
+            for attempt in range(1, 4):
+                try:
+                    return bool(
+                        await self.async_session_store.clear_turn_active(
+                            session_key, token
+                        )
+                    )
+                except Exception as exc:
+                    last_error = exc
+                    if attempt < 3:
+                        logger.debug(
+                            "Retrying active-turn marker cleanup for %s (%d/3): %s",
+                            session_key,
+                            attempt,
+                            exc,
+                        )
             # Never let marker cleanup block in-memory agent/lease release.  A
-            # stale marker is safer than wedging the live routing slot and is
-            # bounded by recover_interrupted_turns' maximum age.
+            # stale marker is bounded by the configured agent timeout and the
+            # clean-start orphan-marker discard path.
             logger.warning(
-                "Could not clear active-turn marker for %s: %s",
+                "Could not clear active-turn marker for %s after 3 attempts: %s",
                 session_key,
-                exc,
+                last_error,
             )
             return False
         finally:
@@ -16665,8 +16682,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # _handle_message's finally via _release_turn_lease — granted per
         # (routing key, run generation) so a stale unwind can't release a
         # newer turn's lease.
-        await self._mark_durable_active_turn(event, session_entry.session_key)
-
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is not None:
             _lease_token = await _lease_registry.acquire(
@@ -16679,6 +16694,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+
+        # A turn only becomes durable recovery work after it owns (or has
+        # explicitly degraded past) the per-session lease.  Marking before the
+        # await above would falsely recover an alias-routed message that never
+        # began processing if the gateway died while it was still waiting.
+        await self._mark_durable_active_turn(event, session_entry.session_key)
 
         # Load conversation history from transcript
         history = await self.async_session_store.load_transcript(session_entry.session_id)
