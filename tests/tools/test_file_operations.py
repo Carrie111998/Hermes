@@ -673,3 +673,13 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_utf8_character_split_at_sample_boundary_not_flagged(self, tmp_path):
+        """A byte-limited sample may end halfway through valid UTF-8 text."""
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # The production terminal decoder uses errors="replace".  If
+        # ``head -c 1000`` ends halfway through a UTF-8 character, that produces
+        # one trailing replacement marker even though the source file is text.
+        boundary_sample = "a" * 999 + "\ufffd"
+
+        assert ops._is_likely_binary("architecture.md", boundary_sample) is False

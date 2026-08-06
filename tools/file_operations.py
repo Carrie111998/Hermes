@@ -908,9 +908,15 @@ class ShellFileOperations(FileOperations):
             # sample carries the replacement char as binary (read-only) so the
             # agent can't corrupt it. Legitimate UTF-8 text effectively never
             # contains U+FFFD.
-            if "\ufffd" in content_sample[:1000]:
+            # ``head -c 1000`` may cut a valid multi-byte UTF-8 character at
+            # the sample boundary.  The terminal decoder then appends one
+            # U+FFFD even though the file itself is valid text.  Ignore only
+            # that boundary marker; replacement chars anywhere else still
+            # prove that the sampled bytes were not valid UTF-8.
+            sampled = content_sample[:1000]
+            if "\ufffd" in sampled.rstrip("\ufffd"):
                 return True
-            non_printable = sum(1 for c in content_sample[:1000]
+            non_printable = sum(1 for c in sampled
                                if ord(c) < 32 and c not in '\n\r\t')
             return non_printable / min(len(content_sample), 1000) > 0.30
         
