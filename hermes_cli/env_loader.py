@@ -144,6 +144,18 @@ def _clear_known_keys_missing_from_dotenv(path: Path) -> None:
         if key not in defined and key in os.environ:
             del os.environ[key]
 
+# Map of env-var name → the exact value a secret source last set it to.
+# The gateway is long-lived and calls load_hermes_dotenv() (and therefore
+# _apply_external_secret_sources()) on every turn to pick up rotated
+# credentials. Without this, a stale `_SECRET_SOURCES["X"] = "onepassword"`
+# label would survive even after an operator edits ~/.hermes/.env to
+# override X locally — the next 1Password refresh would silently clobber
+# the operator's override right back, since only the label (not whether the
+# value actually still matches what we set) was checked. Comparing against
+# this recorded value lets us detect "the value changed out from under us"
+# and treat the key as no longer managed, so a local override sticks.
+_SECRET_VALUES: dict[str, str] = {}
+
 
 def get_secret_source(env_var: str) -> str | None:
     """Return the label of the secret source that supplied ``env_var``, if any.
@@ -463,6 +475,7 @@ def load_hermes_dotenv(
     *,
     hermes_home: str | os.PathLike | None = None,
     project_env: str | os.PathLike | None = None,
+    skip_external_secrets: bool = False,
 ) -> list[Path]:
     """Load Hermes environment files with user config taking precedence.
 
@@ -471,8 +484,24 @@ def load_hermes_dotenv(
     - project `.env` acts as a dev fallback and only fills missing values when
       the user env exists.
     - if no user env exists, the project `.env` also overrides stale shell vars.
+
+    ``skip_external_secrets``: pass True to load plain dotenv files only and
+    skip contacting any configured external secret source (Bitwarden,
+    1Password). ``hermes_cli.main`` calls this at import time for every
+    invocation, including ``hermes secrets <source> disable/setup/status``
+    — without this, trying to disable a hanging or misconfigured source
+    would itself have to wait through a full bootstrap attempt (SDK
+    auto-install, network fetch, timeout) before the disable command even
+    got a chance to run.
     """
     loaded: list[Path] = []
+
+    # Load master secrets if present to resolve templates correctly
+    secrets_env = Path.home() / ".secrets.env"
+    if secrets_env.exists():
+        _load_dotenv_with_fallback(secrets_env, override=True)
+        if "UNIFIED_GATEWAY_BEARER_TOKEN" not in os.environ and "UNIFIED_GATEWAY_BEARER" in os.environ:
+            os.environ["UNIFIED_GATEWAY_BEARER_TOKEN"] = os.environ["UNIFIED_GATEWAY_BEARER"]
 
     home_path = Path(hermes_home or os.getenv("HERMES_HOME", Path.home() / ".hermes"))
     user_env = home_path / ".env"

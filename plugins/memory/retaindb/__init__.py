@@ -573,7 +573,7 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     # ── Background prefetch (fires at turn-end, consumed next turn-start) ──
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+    def queue_prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> None:
         """Fire context + dialectic + agent model prefetches in background."""
         if not self._client:
             return
@@ -628,7 +628,7 @@ class RetainDBMemoryProvider(MemoryProvider):
             return "medium"
         return "high"
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> str:
         """Consume prefetched results and return them as a context block."""
         with self._lock:
             context = self._context_result
@@ -658,7 +658,7 @@ class RetainDBMemoryProvider(MemoryProvider):
 
     # ── Turn sync ──────────────────────────────────────────────────────────
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", user_id: str = "") -> None:
         """Queue turn for async ingest. Returns immediately."""
         if not self._queue or not user_content:
             return

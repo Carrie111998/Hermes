@@ -253,7 +253,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     "platform.teams": ("microsoft-teams-apps==2.0.13.4", "aiohttp==3.14.1"),  # aiohttp 3.14.1: CVE-2026-34993(RCE)/47265 + 34513/34518/34519/34520/34525
 
     # ─── Terminal backends ─────────────────────────────────────────────────
-    "terminal.modal": ("modal==1.3.4",),
+    # Both Modal and Vercel terminal backends pull cbor2 transitively; pin
+    # the audited version here so `hermes update` refreshes the vulnerable
+    # transitive package on existing installs (Codex PR #6).
+    "terminal.modal": ("modal==1.3.4", "cbor2==6.1.2"),
     "terminal.daytona": ("daytona==0.155.0",),
     "terminal.vercel": ("vercel==0.7.2",),
 
@@ -275,6 +278,10 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ACP adapter (VS Code / Zed / JetBrains integration)
     "tool.acp": ("agent-client-protocol==0.9.0",),
     # Dashboard (`hermes dashboard`)
+    # FastAPI pulls starlette transitively; pin the audited version here
+    # so a first-use dashboard lazy install doesn't leave a vulnerable
+    # starlette behind while the dashboard feature is considered satisfied
+    # (Codex PR #6).
     "tool.dashboard": (
         "fastapi==0.133.1",
         "uvicorn[standard]==0.41.0",
@@ -287,15 +294,6 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
     "tool.vision": ("Pillow==12.3.0",),
-    # Document-to-Markdown extraction for read_file (firecrawl-anydoc, Rust
-    # core, imports as `anydoc`). Widens read_file's auto-extraction beyond
-    # the stdlib .ipynb/.docx/.xlsx to PDF, legacy Office (.doc/.ppt/.xls),
-    # OpenDocument, RTF, and EPUB. Installed on first read of such a file;
-    # the call site uses prompt=False so read_file never blocks on a prompt.
-    # NOTE: lazy-only for now — no pyproject `doc-extract` extra until the
-    # package clears the uv exclude-newer 14-day quarantine (first release
-    # 2026-08-04); add the mirrored extra then.
-    "tool.doc_extract": ("firecrawl-anydoc==0.1.6",),
     # Computer Use (cua-driver) — the MCP client SDK used to spawn and talk
     # to the cua-driver process over stdio. Matches the `mcp` / `computer-use`
     # extras in pyproject.toml. The one-liner installer pulls this in via

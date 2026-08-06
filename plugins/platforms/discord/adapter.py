@@ -4149,6 +4149,23 @@ class DiscordAdapter(BasePlatformAdapter):
             return False
         guild_id = channel.guild.id
 
+        # discord.py voice connections require PyNaCl for encryption. The
+        # `voice` extra intentionally no longer ships PyNaCl (it pinned a
+        # vulnerable version and triggered Dependabot — see pyproject.toml
+        # and tools/lazy_deps.py). Rather than crash inside `channel.connect()`
+        # with an opaque missing-module error, fail fast with a message the
+        # user can act on (Codex PR #10).
+        try:
+            import nacl  # noqa: F401 — presence check only
+        except ImportError:
+            # Raise so GatewayRunner._handle_voice_channel_join can surface the
+            # PyNaCl-specific install guidance (return False falls through to the
+            # generic "Check bot permissions" message — Codex PR #25).
+            raise RuntimeError(
+                "PyNaCl is not installed. The voice extra no longer ships PyNaCl "
+                "(vulnerable pin). Install manually: pip install PyNaCl>=1.6.2"
+            ) from None
+
         async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
             # Already connected in this guild?
             existing = self._voice_clients.get(guild_id)

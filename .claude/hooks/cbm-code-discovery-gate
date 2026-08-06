@@ -1,0 +1,19 @@
+#!/bin/bash
+# codebase-memory-mcp search augmenter (Claude Code PreToolUse).
+# NOTE: the legacy filename is kept for zero-migration upgrades.
+# Despite the name this NEVER blocks a tool call - it only adds
+# graph context. Any failure is silent (exit 0, no output).
+#
+# Repo-local copy of the dotfiles-canonical script, installed into
+# ~/.claude/hooks by .claude/hooks/session-start.sh in remote
+# (Claude Code on the web) containers where dotfiles isn't present.
+BIN="/Users/danizhaky/.local/bin/codebase-memory-mcp"
+[ -x "$BIN" ] || exit 0
+# Skip in Obsidian-vault sessions: codebase-memory indexes plugin JS, not
+# notes/wikilinks — wrong tool for the vault (DAN-2078; memory:
+# codebase-memory-vault-mismatch).
+case "$PWD" in
+  "$HOME/Dev/obsidian-vault"*) exit 0 ;;
+esac
+"$BIN" hook-augment 2>/dev/null
+exit 0

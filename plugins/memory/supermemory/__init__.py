@@ -720,7 +720,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
                 lines.append(f"\n{self._custom_container_instructions}")
         return "\n".join(lines)
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> str:
         if not self._active or not self._auto_recall or not self._client or not query.strip():
             return ""
         try:
@@ -737,7 +737,7 @@ class SupermemoryMemoryProvider(MemoryProvider):
             logger.debug("Supermemory prefetch failed", exc_info=True)
             return ""
 
-    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "") -> None:
+    def sync_turn(self, user_content: str, assistant_content: str, *, session_id: str = "", user_id: str = "") -> None:
         if not self._active or not self._auto_capture or not self._write_enabled or not self._client:
             return
 

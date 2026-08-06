@@ -1,11 +1,18 @@
-"""CLI handlers for ``hermes secrets bitwarden ...``.
+"""CLI handlers for ``hermes secrets bitwarden ...`` and ``hermes secrets onepassword ...``.
 
-Subcommands:
+Bitwarden subcommands:
     setup    — interactive wizard: install bws, prompt for token + project, test fetch
     status   — show current config + binary version + token validation status
     sync     — run a fetch right now and show what would be applied (dry-run friendly)
     disable  — flip ``secrets.bitwarden.enabled`` to False
     install  — just download the bws binary (no token / project required)
+
+1Password subcommands:
+    setup    — interactive wizard: prompt for service account token, vault, item
+    status   — show current config + SDK availability + connection status
+    sync     — run a fetch right now and show what was applied (dry-run friendly)
+    disable  — flip ``secrets.onepassword.enabled`` to False
+    install  — install the ``onepassword-sdk`` Python package
 """
 
 from __future__ import annotations

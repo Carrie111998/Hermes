@@ -215,6 +215,17 @@ def run_oneshot(
         sys.stderr.write(toolsets_error)
         return 2
     use_config_toolsets = _normalize_toolsets(toolsets) is None
+    explicit_skills = _normalize_skills(skills)
+    if explicit_skills:
+        from agent.skill_commands import build_preloaded_skills_prompt
+
+        _, _, missing_skills = build_preloaded_skills_prompt(explicit_skills)
+        if missing_skills:
+            sys.stderr.write(
+                "hermes -z: unknown skill(s): "
+                f"{', '.join(missing_skills)}\n"
+            )
+            return 2
 
     # Auto-approve any shell / tool approvals.  Non-interactive by
     # definition — a prompt would hang forever.

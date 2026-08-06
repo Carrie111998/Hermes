@@ -52,8 +52,6 @@ _PROVIDER_ENV_HINTS = (
     "KIMI_CN_API_KEY",
     "GMI_API_KEY",
     "FIREWORKS_API_KEY",
-    "ACTUAL_API_KEY",
-    "ACTUAL_BASE_URL",
     "MINIMAX_API_KEY",
     "MINIMAX_CN_API_KEY",
     "KILOCODE_API_KEY",
@@ -584,6 +582,80 @@ def _check_gateway_service_linger(issues: list[str]) -> None:
         check_warn("Could not verify systemd linger", f"({linger_detail})")
 
 
+# Core first-party modules that cron jobs and the gateway rely on at runtime.
+# A long-lived gateway/desktop process can hold a stale cached copy of one of
+# these modules in memory after the on-disk source changes underneath it
+# (e.g. a function a module imports gets renamed or removed), which surfaces
+# as an ImportError only inside that stale process — never here, since
+# `hermes doctor` always re-imports from current disk. What this check *does*
+# catch is the class of regression that causes it: a first-party module that
+# no longer imports cleanly at all, which would break every fresh process
+# too (see the terminal_tool / hermes_cli.cron ImportError incidents).
+_CORE_MODULE_IMPORTS: tuple[tuple[str, str], ...] = (
+    ("tools.terminal_tool", "Terminal tool"),
+    ("hermes_cli.cron", "Cron CLI"),
+    ("cron.scheduler", "Cron scheduler"),
+    ("gateway.run", "Gateway runtime"),
+)
+
+
+def _check_core_module_imports(issues: list[str]) -> None:
+    """Verify core modules import cleanly; catches source-level ImportErrors early."""
+    import importlib
+
+    _section("Core Module Imports")
+    for module_name, label in _CORE_MODULE_IMPORTS:
+        try:
+            importlib.import_module(module_name)
+            check_ok(label, f"({module_name})")
+        except Exception as e:
+            _fail_and_issue(
+                label,
+                f"({module_name}: {type(e).__name__}: {e})",
+                f"Fix the import error in {module_name}, then restart the gateway "
+                f"(hermes gateway restart) so long-running processes pick up the fix.",
+                issues,
+            )
+
+
+def _check_slack_channel_exposure(issues: list[str]) -> None:
+    """Warn when Slack is configured with no channel allowlist.
+
+    Empty ``slack.allowed_channels`` is the documented, backward-compatible
+    default (the bot responds in every channel it's a member of) — not a
+    bug. This is a hygiene nudge for deployments where the bot has since
+    been invited to privileged channels, not a judgment on which channels
+    belong on an allowlist; that decision is the user's to make.
+    """
+    from hermes_cli.config import get_env_value, load_config_readonly
+
+    if not get_env_value("SLACK_BOT_TOKEN"):
+        return  # Slack isn't configured; nothing to warn about.
+
+    _section("Slack Configuration")
+    cfg = load_config_readonly()
+    raw = (cfg.get("slack") or {}).get("allowed_channels")
+    if raw is None:
+        raw = os.environ.get("SLACK_ALLOWED_CHANNELS", "")
+    if isinstance(raw, list):
+        channels = [str(c).strip() for c in raw if str(c).strip()]
+    else:
+        channels = [c.strip() for c in str(raw or "").split(",") if c.strip()]
+
+    if channels:
+        check_ok(f"Channel allowlist configured ({len(channels)} channel(s))")
+    else:
+        check_warn(
+            "No channel allowlist set",
+            "(bot responds in every channel it's a member of, including any privileged ones)",
+        )
+        check_info("Set slack.allowed_channels in config.yaml (or SLACK_ALLOWED_CHANNELS) to restrict it")
+        issues.append(
+            "Slack has no allowed_channels set — review which channels the bot should "
+            "respond in and set slack.allowed_channels (or SLACK_ALLOWED_CHANNELS) if any are privileged."
+        )
+
+
 _APIKEY_PROVIDERS_CACHE: list | None = None
 
 
@@ -909,7 +981,9 @@ def run_doctor(args):
             check_ok(name, "(optional)")
         except ImportError:
             check_warn(name, "(optional, not installed)")
-    
+
+    _check_core_module_imports(issues)
+
     _section("Configuration Files")
     # Managed scope (administrator-pinned config/env), when present.
     managed_scope_check()

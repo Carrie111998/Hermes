@@ -435,6 +435,18 @@ def _exhausted_until(entry: PooledCredential, *, sole_credential: bool = False) 
     return None
 
 
+def _model_exhausted_until(details: Dict[str, Any]) -> Optional[float]:
+    if details.get("last_status") != STATUS_EXHAUSTED:
+        return None
+    reset_at = _parse_absolute_timestamp(details.get("last_error_reset_at"))
+    if reset_at is not None:
+        return reset_at
+    last_status_at = details.get("last_status_at")
+    if last_status_at:
+        return last_status_at + _exhausted_ttl(details.get("last_error_code"))
+    return None
+
+
 def _normalize_custom_pool_name(name: str) -> str:
     """Normalize a custom provider name for use as a pool key suffix."""
     return name.strip().lower().replace(" ", "-")
@@ -663,7 +675,7 @@ class CredentialPool:
         with self._lock:
             return bool(self._entries)
 
-    def has_available(self) -> bool:
+    def has_available(self, model: Optional[str] = None) -> bool:
         """True if at least one entry is not currently in exhaustion cooldown."""
         # ``_available_entries`` is not read-only: it prunes aged-out DEAD
         # manual entries (rebinding ``self._entries``) and persists.  It must
@@ -2167,7 +2179,7 @@ class CredentialPool:
                 logger.info("credential pool: rotated to %s", _next_label)
             return next_entry
 
-    def acquire_lease(self, credential_id: Optional[str] = None) -> Optional[str]:
+    def acquire_lease(self, credential_id: Optional[str] = None, model: Optional[str] = None) -> Optional[str]:
         """Acquire a soft lease on a credential.
 
         If a specific credential_id is provided, lease that entry directly.

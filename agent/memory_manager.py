@@ -537,6 +537,16 @@ class MemoryManager:
                 result = self._prefetch_provider(provider, clean_query, session_id=session_id)
                 if result and result.strip():
                     parts.append(result)
+            except TypeError as e:
+                if "user_id" in str(e):
+                    try:
+                        result = provider.prefetch(query, session_id=session_id)
+                        if result and result.strip():
+                            parts.append(result)
+                    except Exception as e2:
+                        logger.debug("Memory provider '%s' prefetch failed (non-fatal): %s", provider.name, e2)
+                else:
+                    logger.debug("Memory provider '%s' prefetch failed (non-fatal): %s", provider.name, e)
             except Exception as e:
                 logger.debug(
                     "Memory provider '%s' prefetch failed (non-fatal): %s",

@@ -13,6 +13,18 @@ import pytest
 import hermes_cli.gateway as gateway
 
 
+class _TTY:
+    """Minimal stdin stand-in for tests that need an interactive session.
+
+    ``gateway_command()`` decides whether to prompt based on
+    ``sys.stdin.isatty()``; pytest's real stdin isn't a TTY, so tests that
+    exercise the interactive prompt path swap it in via monkeypatch.
+    """
+
+    def isatty(self):
+        return True
+
+
 def _install_fake_gateway_run(monkeypatch, start_gateway):
     module = ModuleType("gateway.run")
     module.start_gateway = start_gateway
@@ -253,6 +265,10 @@ def test_systemd_install_checks_linger_status(monkeypatch, tmp_path, capsys):
 
     monkeypatch.setattr(gateway.subprocess, "run", fake_run)
     monkeypatch.setattr(gateway, "_ensure_linger_enabled", lambda: helper_calls.append(True))
+    # This test doesn't exercise the temp-HERMES_HOME guard; the sandbox's
+    # own HERMES_HOME can legitimately resolve under a temp dir, which would
+    # otherwise make generate_systemd_unit()'s real output trip the guard.
+    monkeypatch.setattr(gateway, "_refuse_temp_home_service_write", lambda *a, **k: False)
 
     gateway.systemd_install(force=False)
 

@@ -368,6 +368,17 @@ _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 # immediately; cancellation-resistant tasks must not hang process exit.
 _MCP_LOOP_DRAIN_TIMEOUT = 3.0
 
+# Keepalive cadence for HTTP/SSE sessions. The MCP spec lets a server expire
+# idle sessions on any TTL it chooses (Streamable HTTP "Session Management"),
+# so a client that wants a session to survive idle periods MUST refresh faster
+# than that TTL. The default suits long LB/NAT idle windows (commonly
+# 300-600s); servers with short session TTLs (e.g. Unreal Engine's editor MCP,
+# ~15s) need a smaller ``keepalive_interval`` in their config or every idle
+# tool call lands on a dead session and pays the full reconnect path. The floor
+# stops a misconfigured tiny interval from busy-looping the keepalive.
+_DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
+_MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
+
 # Environment variables that are safe to pass to stdio subprocesses
 _SAFE_ENV_KEYS = frozenset({
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TERM", "SHELL", "TMPDIR",
@@ -4289,6 +4300,19 @@ _orphan_stdio_pid_servers: Dict[int, str] = {}
 # (``os.getpgid`` is POSIX-only).
 _stdio_pgids: Dict[int, int] = {}  # pid -> pgid
 
+# Process-group IDs of stdio MCP subprocesses, captured at spawn time.
+# The MCP SDK spawns stdio children with ``start_new_session=True`` so each
+# direct child becomes its own session/pgroup leader (PGID == its own PID).
+# Grandchildren spawned by that child (e.g. a wrapper MCP server that itself
+# launches helper subprocesses like ``claude mcp serve``) inherit that PGID
+# unless they call ``setsid`` themselves.  When the direct child exits, those
+# grandchildren reparent to init/systemd-user but keep the original PGID, so
+# ``killpg(pgid, sig)`` still reaches them.  Tracked separately from
+# ``_stdio_pids`` so we retain the PGID even after the direct child has
+# exited and been removed from the active map.  Empty on Windows
+# (``os.getpgid`` is POSIX-only).
+_stdio_pgids: Dict[int, int] = {}  # pid -> pgid
+
 
 def _snapshot_child_pids() -> set:
     """Return a set of current child process PIDs.
@@ -4883,6 +4907,18 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Auto-wrap flattened arguments for the dispatch tool
+        if tool_name == "dispatch" and "arguments" not in args:
+            server_val = args.get("server")
+            tool_val = args.get("tool")
+            if server_val and tool_val:
+                other_args = {k: v for k, v in args.items() if k not in ("server", "tool")}
+                args = {
+                    "server": server_val,
+                    "tool": tool_val,
+                    "arguments": other_args
+                }
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -4941,6 +4977,29 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                         f"immediately — give it a few seconds to come back."
                     )
                 return tool_error(f"MCP server '{server_name}' is not connected")
+
+        if not server.session:
+            # No live session — the server task is reconnecting, or it has
+            # exhausted its retry budget and parked (e.g. a dead stdio
+            # subprocess). Probing here would write into a dead/absent
+            # transport and re-arm the breaker forever (#16788). Instead,
+            # ask the (always-present) server task to rebuild the transport
+            # — which respawns a dead stdio subprocess — and return a clean
+            # "reconnecting" error so the model backs off without burning
+            # iterations. The breaker resets once the fresh session
+            # initializes (_run_stdio/_run_http call _reset_server_error).
+            _bump_server_error(server_name)
+            if _signal_reconnect(server):
+                return json.dumps({
+                    "error": (
+                        f"MCP server '{server_name}' transport is down; "
+                        f"reconnect requested. Do NOT retry this tool "
+                        f"immediately — give it a few seconds to come back."
+                    )
+                }, ensure_ascii=False)
+            return json.dumps({
+                "error": f"MCP server '{server_name}' is not connected"
+            }, ensure_ascii=False)
 
         async def _call():
             _mark_server_call_started(server)

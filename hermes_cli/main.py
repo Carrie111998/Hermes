@@ -694,7 +694,16 @@ _apply_profile_override()
 from hermes_cli.config import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
 
-load_hermes_dotenv(project_env=PROJECT_ROOT / ".env")
+# `hermes secrets ...` manages external secret sources directly (setup,
+# status, sync, disable, install) — skip auto-bootstrapping them here so
+# e.g. `hermes secrets onepassword disable` can turn off a hanging or
+# misconfigured source without first waiting through the very bootstrap
+# attempt (SDK auto-install, network fetch, timeout) it's trying to stop.
+_argv_subcommand = next((a for a in sys.argv[1:] if not a.startswith("-")), None)
+load_hermes_dotenv(
+    project_env=PROJECT_ROOT / ".env",
+    skip_external_secrets=(_argv_subcommand == "secrets"),
+)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
@@ -4801,10 +4810,12 @@ def cmd_slack(args):
             "usage: hermes slack <subcommand>\n"
             "\n"
             "subcommands:\n"
-            "  manifest   Generate a Slack app manifest with every gateway\n"
-            "             command registered as a native slash\n"
+            "  manifest   Generate a Slack app manifest (JSON or YAML) with\n"
+            "             every gateway command registered as a native slash\n"
+            "  channels   List channels and show which the bot is/isn't in\n"
+            "  invite     Add the bot to channels (--all joins all public)\n"
             "\n"
-            "Run `hermes slack manifest -h` for details.",
+            "Run `hermes slack <subcommand> -h` for details.",
             file=sys.stderr,
         )
         return 1
@@ -4816,6 +4827,16 @@ def cmd_slack(args):
         if status:
             raise SystemExit(status)
         return status
+
+    if sub == "channels":
+        from hermes_cli.slack_cli import slack_channels_command
+
+        return slack_channels_command(args)
+
+    if sub == "invite":
+        from hermes_cli.slack_cli import slack_invite_command
+
+        return slack_invite_command(args)
 
     print(f"Unknown slack subcommand: {sub}", file=sys.stderr)
     return 1

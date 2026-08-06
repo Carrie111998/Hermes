@@ -60,9 +60,6 @@ from agent.conversation_compression import (
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.i18n import t
 from agent.interrupt_compat import request_hard_interrupt
-from agent.turn_context import (
-    compression_made_progress as _compression_made_progress,
-)
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -121,67 +118,6 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
-
-
-_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS = (1, 3, 9)
-# Absolute ceiling on an escalated hygiene cooldown, mirroring
-# _RECONNECT_BACKOFF_CAP above: with an operator-raised base the multiplier
-# ladder alone would reach 9h (base 3600 -> 32400s), which is indistinguishable
-# from "compaction silently switched off". 1h is well past the point where a
-# retry is cheap and still recovers within a session.
-_HYGIENE_COOLDOWN_MAX_SECONDS = 3600.0
-
-
-def _hygiene_cooldown_for_failure(
-    gateway,
-    session_key: str,
-    base_cooldown_seconds: float,
-) -> float:
-    """Bump the hygiene failure streak and return the escalated cooldown.
-
-    The in-agent compressor escalates repeat summary timeouts 60 -> 300 -> 900s
-    (``ContextCompressor.record_timeout_failure``), but that ladder reads the
-    in-memory ``_consecutive_timeout_failures`` counter which
-    ``bind_session_state`` zeroes.  Session hygiene constructs a FRESH
-    ``AIAgent`` per run and re-binds state every time, so from the gateway the
-    streak is structurally always 0 and only the flat
-    ``hygiene_failure_cooldown_seconds`` could ever be recorded — a session
-    whose summary model always times out retried on that same fixed interval
-    forever (#79624).
-
-    The streak lives on ``PersistentState`` instead, which outlives the per-run
-    agent, so consecutive failures climb the ladder.  Multiplies the configured
-    base so operators who tuned ``hygiene_failure_cooldown_seconds`` keep their
-    first rung, then clamps to ``_HYGIENE_COOLDOWN_MAX_SECONDS``.
-    """
-    streak = 1
-    try:
-        state = gateway._session_state(session_key).persistent
-        state.hygiene_failure_streak += 1
-        streak = state.hygiene_failure_streak
-    except Exception as exc:
-        # The caller uses the return value to record the cooldown, so an
-        # escaping exception would mean NO cooldown at all (hot retry loop) —
-        # strictly worse than no escalation.  Degrade to the base rung.
-        logger.debug("hygiene failure streak update failed: %s", exc)
-    multiplier = _HYGIENE_COOLDOWN_LADDER_MULTIPLIERS[
-        min(streak, len(_HYGIENE_COOLDOWN_LADDER_MULTIPLIERS)) - 1
-    ]
-    return min(base_cooldown_seconds * multiplier, _HYGIENE_COOLDOWN_MAX_SECONDS)
-
-
-def _reset_hygiene_failure_streak(gateway, session_key: str) -> None:
-    """Clear the hygiene failure streak after a compression that reduced context.
-
-    Peeks rather than get-or-creates: writing a 0 that is already 0 must not
-    materialise a ``_sessions`` entry (those are never evicted).
-    """
-    try:
-        state = gateway._peek_session_state(session_key)
-        if state is not None:
-            state.persistent.hygiene_failure_streak = 0
-    except Exception as exc:
-        logger.debug("hygiene failure streak reset failed: %s", exc)
 
 
 def _record_hygiene_cooldown(gateway, session_id: str, cooldown_seconds: float) -> None:
@@ -14089,7 +14025,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "background": self._handle_background_command,
                 "kanban": self._handle_kanban_command,
                 "subgoal": self._handle_subgoal_command,
-                "heartbeat": self._handle_heartbeat_command,
                 "yolo": self._handle_yolo_command,
                 "verbose": self._handle_verbose_command,
                 "footer": self._handle_footer_command,
@@ -14258,13 +14193,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _goal_arg = (event.get_command_args() or "").strip().lower()
         _goal_verb = _goal_arg.split(None, 1)[0] if _goal_arg else ""
         # Exact-match control verbs (unchanged semantics), plus the
-        # wait/unwait barrier verbs which take a pid argument and the
-        # gate management verb (inspection/mutation of the gate list only —
-        # gates run at turn boundary, so editing them mid-run is safe).
+        # wait/unwait barrier verbs which take a pid argument.
         _is_control = (
             not _goal_arg
             or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done", "unwait"}
-            or _goal_verb in {"wait", "gate"}
+            or _goal_verb == "wait"
         )
         if _is_control:
             return await self._handle_goal_command(event)
@@ -15296,11 +15229,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "goal":
             return await self._handle_goal_command(event)
-
-        if canonical == "heartbeat":
-            return await self._handle_heartbeat_command(event)
-        if canonical == "refine":
-            return await self._handle_refine_command(event)
 
         if canonical == "moa":
             # /moa is one-shot sugar only: run a single prompt through the
@@ -16984,10 +16912,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                             if _hyg_failure_cooldown_seconds >= 0:
                                                 _record_hygiene_cooldown(
                                                     self, session_entry.session_id,
-                                                    _hygiene_cooldown_for_failure(
-                                                        self, session_key,
-                                                        _hyg_failure_cooldown_seconds,
-                                                    ),
+                                                    _hyg_failure_cooldown_seconds,
                                                 )
                                             from agent.session_activity import (
                                                 ActivityProvenance,
@@ -17178,40 +17103,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     # /compress to retry or /reset to start
                                     # fresh.
                                     _comp = getattr(_hyg_agent, "context_compressor", None)
-                                    _hyg_aborted = _comp is not None and getattr(
-                                        _comp, "_last_compress_aborted", False
-                                    )
-                                    if not _hyg_aborted:
-                                        # Only a run that materially reduced the
-                                        # request counts as recovery.  The
-                                        # degenerate "did not rotate or compact
-                                        # in place" branch above leaves both
-                                        # counts equal and is NOT aborted, so
-                                        # gating on "not aborted" alone would
-                                        # clear the streak on every wedged run
-                                        # and the cooldown could never escalate
-                                        # (#79624).  Reuse the canonical
-                                        # progress predicate rather than a
-                                        # hand-rolled token comparison: rows
-                                        # dropping is progress even when the
-                                        # summary keeps the token estimate flat,
-                                        # and a sub-5% token wobble is noise,
-                                        # not recovery (#39548).
-                                        if _compression_made_progress(
-                                            _msg_count, _new_count,
-                                            _approx_tokens, _new_tokens,
-                                        ):
-                                            _reset_hygiene_failure_streak(
-                                                self, session_key
-                                            )
-                                    if _hyg_aborted:
+                                    if _comp is not None and getattr(_comp, "_last_compress_aborted", False):
                                         if _hyg_failure_cooldown_seconds >= 0:
                                             _record_hygiene_cooldown(
                                                 self, session_entry.session_id,
-                                                _hygiene_cooldown_for_failure(
-                                                    self, session_key,
-                                                    _hyg_failure_cooldown_seconds,
-                                                ),
+                                                _hyg_failure_cooldown_seconds,
                                             )
                                         from agent.session_activity import (
                                             ActivityProvenance,
@@ -18665,99 +18561,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return None, None
         max_turns = self._goal_max_turns_from_config()
         return GoalManager(session_id=sid, default_max_turns=max_turns), session_entry
-
-    async def _get_heartbeat_manager_for_event(self, event: "MessageEvent"):
-        """Return a HeartbeatManager bound to the session for this event.
-
-        Returns ``(manager, session_entry)`` or ``(None, None)``.
-        """
-        try:
-            from hermes_cli.heartbeat import HeartbeatManager
-        except Exception as exc:
-            logger.debug("heartbeat manager unavailable: %s", exc)
-            return None, None
-        try:
-            session_entry = await self.async_session_store.get_or_create_session(event.source)
-        except Exception as exc:
-            logger.debug("heartbeat manager: session lookup failed: %s", exc)
-            return None, None
-        sid = getattr(session_entry, "session_id", None) or ""
-        if not sid:
-            return None, None
-        return HeartbeatManager(session_id=sid), session_entry
-
-    def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
-        """Track a session with an active heartbeat and start the poller.
-
-        The registry maps ``quick_key`` → ``(source, session_id)`` so the
-        poller can rebuild a MessageEvent and enqueue via the adapter FIFO.
-        In-memory by design: heartbeat STATE survives restarts in SessionDB,
-        but firing resumes when the user touches /heartbeat again in the new
-        gateway process (documented; durable schedules belong to cron).
-        """
-        watch = getattr(self, "_heartbeat_watch", None)
-        if watch is None:
-            watch = {}
-            self._heartbeat_watch = watch
-        watch[quick_key] = (source, session_id)
-        self._start_heartbeat_poller()
-
-    def _unregister_heartbeat_watch(self, quick_key: str) -> None:
-        watch = getattr(self, "_heartbeat_watch", None)
-        if watch:
-            watch.pop(quick_key, None)
-
-    def _start_heartbeat_poller(self) -> None:
-        """Start the single gateway-wide heartbeat poll task (idempotent)."""
-        existing = getattr(self, "_heartbeat_poll_task", None)
-        if existing is not None and not existing.done():
-            return
-
-        from hermes_cli.heartbeat import POLL_SECONDS
-
-        async def _poll_loop():
-            while True:
-                await asyncio.sleep(POLL_SECONDS)
-                watch = getattr(self, "_heartbeat_watch", None)
-                if not watch:
-                    continue
-                for quick_key, (source, session_id) in list(watch.items()):
-                    try:
-                        # Busy sessions coalesce their tick to the next idle poll.
-                        if quick_key in self._running_agents:
-                            continue
-                        from hermes_cli.heartbeat import HeartbeatManager
-
-                        mgr = HeartbeatManager(session_id=session_id)
-                        if not mgr.has_heartbeat():
-                            watch.pop(quick_key, None)
-                            continue
-                        prompt = mgr.due_prompt()
-                        if not prompt:
-                            continue
-                        adapter = self._adapter_for_source(source)
-                        if adapter is None:
-                            continue
-                        hb_event = MessageEvent(
-                            text=prompt,
-                            message_type=MessageType.TEXT,
-                            source=source,
-                            message_id=None,
-                            channel_prompt=None,
-                        )
-                        self._enqueue_fifo(quick_key, hb_event, adapter)
-                    except Exception as exc:
-                        logger.debug("heartbeat poll for %s failed: %s", quick_key, exc)
-
-        try:
-            task = asyncio.create_task(_poll_loop())
-            self._heartbeat_poll_task = task
-            _bg = getattr(self, "_background_tasks", None)
-            if _bg is not None:
-                _bg.add(task)
-                task.add_done_callback(_bg.discard)
-        except Exception:
-            logger.debug("Failed to start heartbeat poller", exc_info=True)
 
 
 
@@ -25025,10 +24828,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # stream completion never reached any API call (#71643).
                 # Reconcile the recorded turn-final payload against the
                 # completed response; only a demonstrable mismatch (False)
-                # overrides the flag — including payload-less multi-message
-                # split delivery (#78541). None (no record on a non-split
-                # legacy path) keeps the legacy trust so ambiguous-timeout
-                # dedup is not regressed.
+                # overrides the flag — None (no record / multi-message split
+                # delivery) keeps the legacy trust so overflow splits are not
+                # re-sent.
                 matcher = getattr(consumer, "delivered_final_matches", None)
                 if callable(matcher):
                     try:
@@ -25819,9 +25621,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Reconcile the consumer's recorded turn-final payload against the
             # completed response: on a demonstrable mismatch (False) neither
             # final_response_sent nor final_content_delivered may suppress the
-            # normal final send. False also covers payload-less multi-message
-            # split delivery (#78541). None (no record on a non-split legacy
-            # path) keeps legacy trust; the failed-finalize family
+            # normal final send. None (no record / multi-message split
+            # delivery) keeps legacy trust; the failed-finalize family
             # (#51828 / #33793) is unaffected because those paths leave the
             # flags False or record the complete fallback payload.
             _stale_finalized = False
@@ -25865,20 +25666,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # user gets one corrected message; on edit failure fall through
                 # with already_sent unset so the normal final send delivers the
                 # complete text.
-                #
-                # Not valid for a multi-message split delivery: there
-                # ``message_id`` is only the LAST chunk, so editing it with the
-                # complete response would repeat every sealed head chunk's text
-                # inside the tail message. Fall through to the normal final send
-                # instead (#78541).
                 _sc_msg_id = _sc.message_id
                 _sc_adapter = getattr(_sc, "adapter", None)
-                if getattr(_sc, "_turn_split_delivery", False):
-                    logger.info(
-                        "Stale streamed finalize detected for session %s on a multi-message split; skipping the in-place reconciliation edit and delivering the complete response via normal final send (#78541).",
-                        session_key or "?",
-                    )
-                elif _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
+                if _sc_msg_id and _sc_msg_id != "__no_edit__" and _sc_adapter is not None:
                     try:
                         _reconcile_res = await _sc_adapter.edit_message(
                             chat_id=source.chat_id,
@@ -26296,6 +26086,272 @@ def _shutdown_gateway_health_export(runner: Any) -> None:
         runtime.shutdown()
     except Exception:
         logger.debug("gateway health OTLP export shutdown failed", exc_info=True)
+
+
+def _cron_supervisor_alerts_enabled() -> bool:
+    """Whether the supervisor should announce a stall/restart on the home channel.
+
+    Defaults to ``True`` — surfacing the otherwise-silent restart is the entire
+    point of the alert (the 17h stall went unnoticed because nothing announced
+    it). Configurable via ``cron.supervisor_alerts`` in ``config.yaml``.
+    """
+    try:
+        from hermes_cli.config import load_config
+        cfg = load_config() or {}
+        cron_cfg = cfg.get("cron", {}) if isinstance(cfg, dict) else {}
+        return bool(cron_cfg.get("supervisor_alerts", True))
+    except Exception:
+        # Fail open: a config read error must not silence the alert.
+        return True
+
+
+def _send_cron_supervisor_alert(adapters, loop, stall_age_s: float, threshold_s: float) -> None:
+    """Send a home-channel alert that the cron ticker stalled and was restarted.
+
+    Reuses cron's home-channel delivery path: it resolves each configured home
+    target and sends via the live adapter, hopping onto the gateway event loop
+    with :func:`safe_schedule_threadsafe` (the ticker/supervisor run in worker
+    threads, so the send must be scheduled onto ``loop``).
+
+    This function is fully exception-isolated: any failure — a missing loop,
+    unresolved targets, a hung send — is logged and swallowed. It must NEVER
+    propagate, because the supervisor calls it right after restarting the
+    ticker and a raised exception would kill the watchdog loop.
+    """
+    try:
+        if loop is None or not adapters:
+            logger.warning(
+                "Cron supervisor stall alert skipped: no event loop / adapters available"
+            )
+            return
+
+        from cron.scheduler import (
+            _get_home_target_chat_id,
+            _get_home_target_thread_id,
+            _iter_home_target_platforms,
+        )
+        from agent.async_utils import safe_schedule_threadsafe
+
+        text = (
+            f"⚠️ Cron ticker stalled for {stall_age_s:.0f}s "
+            f"(threshold {threshold_s:.0f}s) — automatically restarted the ticker "
+            f"thread. Scheduled jobs should resume now."
+        )
+
+        sent_any = False
+        for platform in _iter_home_target_platforms():
+            try:
+                chat_id = _get_home_target_chat_id(platform)
+                if not chat_id:
+                    continue
+                adapter = adapters.get(platform)
+                if adapter is None:
+                    continue
+                thread_id = _get_home_target_thread_id(platform)
+                metadata = {"thread_id": thread_id} if thread_id else None
+                future = safe_schedule_threadsafe(
+                    adapter.send(chat_id, text, metadata=metadata),
+                    loop,
+                )
+                if future is None:
+                    continue
+                try:
+                    future.result(timeout=30)
+                    sent_any = True
+                    logger.info(
+                        "Cron supervisor stall alert delivered to %s:%s",
+                        platform, chat_id,
+                    )
+                except TimeoutError:
+                    future.cancel()
+                    logger.warning(
+                        "Cron supervisor stall alert to %s:%s timed out",
+                        platform, chat_id,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Cron supervisor stall alert to %s:%s failed: %s",
+                        platform, chat_id, e,
+                    )
+            except Exception as e:
+                logger.warning(
+                    "Cron supervisor stall alert error for platform %s: %s",
+                    platform, e,
+                )
+
+        if not sent_any:
+            logger.warning(
+                "Cron supervisor stall alert: no home-channel targets resolved"
+            )
+    except Exception as e:
+        # Belt-and-braces: never let anything escape to the supervisor loop.
+        logger.error("Cron supervisor stall alert unexpectedly failed: %s", e)
+
+
+def _cron_ticker_supervisor(
+    stop_event: threading.Event,
+    restart_ticker,
+    adapters=None,
+    loop=None,
+    interval: int = 60,
+    stale_multiplier: float = 5.0,
+    check_interval: int = 60,
+    alert_cooldown: float = 900.0,
+):
+    """Watchdog that restarts the cron ticker if its heartbeat goes stale.
+
+    The ticker records a liveness heartbeat at the top of every tick
+    (cron.scheduler.record_ticker_heartbeat). If that heartbeat is older than
+    ``stale_multiplier`` tick intervals, the ticker thread has almost certainly
+    wedged (a hung delivery, a stuck job, a pool that never drained). We log a
+    warning and call ``restart_ticker`` to spin up a fresh ticker thread; the
+    file lock inside tick() prevents the old and new threads from overlapping.
+
+    This closes the gap behind the 17h silent-stall incident: previously a hung
+    ticker was never detected and cron simply stopped firing while the gateway
+    stayed up. On restart we also send a home-channel alert (gated behind
+    ``cron.supervisor_alerts``, default on) so the recovery is no longer silent.
+    A ``alert_cooldown``-second window suppresses repeat alerts so a flapping
+    ticker can't spam the home channel — the restart + log always happen.
+
+    ``adapters`` / ``loop`` are the live gateway adapters and event loop, used
+    only to deliver the alert; they mirror what ``_spawn_cron_ticker`` receives.
+    """
+    from cron.scheduler import get_ticker_heartbeat_age, ticker_heartbeat_is_stale
+
+    logger.info(
+        "Cron ticker supervisor started (stale after %.0fs)",
+        interval * stale_multiplier,
+    )
+    last_alert_ts = None
+    while not stop_event.is_set():
+        stop_event.wait(timeout=check_interval)
+        if stop_event.is_set():
+            break
+        try:
+            if ticker_heartbeat_is_stale(interval, stale_multiplier):
+                age = get_ticker_heartbeat_age()
+                threshold = interval * stale_multiplier
+                logger.warning(
+                    "Cron ticker heartbeat stale (%.0fs old, > %.0fs threshold) — "
+                    "restarting ticker thread",
+                    age if age is not None else -1.0,
+                    threshold,
+                )
+                # Recovery is the priority: restart the ticker FIRST so a slow
+                # or hanging alert send can never delay it.
+                restart_ticker()
+                # Then surface the (otherwise silent) restart on the home
+                # channel, subject to the enable flag and the cooldown.
+                if _cron_supervisor_alerts_enabled():
+                    now = time.monotonic()
+                    if last_alert_ts is not None and (now - last_alert_ts) < alert_cooldown:
+                        logger.info(
+                            "Cron supervisor stall alert suppressed (within %.0fs cooldown)",
+                            alert_cooldown,
+                        )
+                    else:
+                        last_alert_ts = now
+                        _send_cron_supervisor_alert(
+                            adapters,
+                            loop,
+                            age if age is not None else -1.0,
+                            threshold,
+                        )
+        except Exception as e:
+            logger.debug("Cron ticker supervisor error: %s", e)
+    logger.info("Cron ticker supervisor stopped")
+
+
+def _handle_duplicate_gateway_runtimes(replace: bool) -> bool:
+    """Reap or report ``gateway run`` processes the PID file can't see.
+
+    The duplicate-instance guard in ``start_gateway`` only knows about the
+    single PID recorded in gateway.pid/gateway.lock. If that metadata is
+    ever lost while a gateway keeps running (the flock is inode-based —
+    deleting and recreating gateway.lock orphans the holder), ``--replace``
+    kills the tracked instance and the orphan survives, stacking gateways
+    that all poll platforms and race the cron scheduler (observed as a
+    frozen scheduler with three concurrent gateways, 2026-07-04).
+
+    Must be called AFTER this process has won the pid-file claim so that
+    concurrent ``--replace`` racers cannot sweep each other: the O_EXCL
+    loser exits before reaching this point.
+
+    Returns True when startup may proceed. With ``replace=True``,
+    terminates every other same-profile ``gateway run`` process (TERM,
+    ≤10s wait, then KILL). With ``replace=False``, refuses startup when
+    duplicates exist so a bare ``gateway run`` never silently stacks
+    another instance. Scan failures fail open — a broken scan must not
+    keep the gateway down.
+    """
+    try:
+        # Lazy import mirrors the hermes_cli lazy imports elsewhere in
+        # this module (circular-import avoidance). Strict `gateway run`
+        # matching only: restart-manager command lines are transient
+        # management CLIs, not runtimes to kill.
+        from hermes_cli.gateway import _scan_gateway_pids
+
+        orphans = [
+            pid
+            for pid in _scan_gateway_pids(
+                {os.getpid()},
+                all_profiles=False,
+                include_restart_managers=False,
+            )
+            if pid and pid > 0
+        ]
+    except Exception as e:
+        logger.debug("Duplicate-gateway scan failed (skipping sweep): %s", e)
+        return True
+    if not orphans:
+        return True
+
+    pid_list = ", ".join(str(p) for p in orphans)
+    if not replace:
+        logger.error(
+            "Found %d other gateway run process(es) not tracked by the PID "
+            "file: %s. Refusing to stack another instance.",
+            len(orphans), pid_list,
+        )
+        print(
+            f"\n❌ Another gateway run process is alive but untracked "
+            f"(PID(s): {pid_list}).\n"
+            f"   Use 'hermes gateway run --replace' to take over cleanly.\n"
+        )
+        return False
+
+    from gateway.status import _pid_exists, terminate_pid, write_planned_stop_marker
+
+    logger.warning(
+        "Sweeping %d orphan gateway process(es) left behind by earlier "
+        "replace cycles: %s", len(orphans), pid_list,
+    )
+    for pid in orphans:
+        try:
+            write_planned_stop_marker(pid)
+        except Exception:
+            pass
+        try:
+            terminate_pid(pid, force=False)
+        except (ProcessLookupError, PermissionError, OSError):
+            continue
+
+    deadline = time.monotonic() + 10.0
+    survivors = list(orphans)
+    while survivors and time.monotonic() < deadline:
+        survivors = [p for p in survivors if _pid_exists(p)]
+        if survivors:
+            time.sleep(0.25)
+    for pid in survivors:
+        logger.warning(
+            "Orphan gateway PID %d ignored SIGTERM, sending SIGKILL.", pid
+        )
+        try:
+            terminate_pid(pid, force=True)
+        except (ProcessLookupError, PermissionError, OSError):
+            pass
+    return True
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False, verbosity: Optional[int] = 0) -> bool:

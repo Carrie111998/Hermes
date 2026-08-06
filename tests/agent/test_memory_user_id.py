@@ -39,10 +39,10 @@ class RecordingProvider(MemoryProvider):
     def system_prompt_block(self) -> str:
         return ""
 
-    def prefetch(self, query: str, *, session_id: str = "") -> str:
+    def prefetch(self, query: str, *, session_id: str = "", user_id: str = "") -> str:
         return ""
 
-    def sync_turn(self, user_content, assistant_content, *, session_id=""):
+    def sync_turn(self, user_content, assistant_content, *, session_id="", user_id=""):
         pass
 
     def get_tool_schemas(self):
@@ -278,4 +278,5 @@ class TestAIAgentUserIdPropagation:
             agent = object.__new__(AIAgent)
             agent._user_id = None
             assert agent._user_id is None
+
 
