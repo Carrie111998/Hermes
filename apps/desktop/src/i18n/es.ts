@@ -134,6 +134,7 @@ export const es: Translations = defineLocale({
     errors: {
       elevenLabsNeedsKey: 'ElevenLabs STT necesita ELEVENLABS_API_KEY.',
       elevenLabsRejectedKey: 'ElevenLabs rechaz\u00F3 la clave API (401).',
+      diskFull: 'Disco lleno: libera algo de espacio e inténtalo de nuevo.',
       gatewayAuthFailed: 'Error de autenticación de la pasarela: comprueba tu API_SERVER_KEY.',
       methodNotAllowed:
         'El backend del escritorio rechaz\u00F3 esa solicitud (405 M\u00E9todo no permitido). Intenta reiniciar Hermes Desktop.',
@@ -451,6 +452,12 @@ export const es: Translations = defineLocale({
       uiScaleTitle: 'Escala de interfaz',
       uiScaleDesc: percent =>
         `Escala el texto y los controles de toda la app. Cmd/Ctrl con +, - y 0 también funciona. Actual: ${percent}%`,
+      terminalFontTitle: 'Tipograf\u00EDa del terminal',
+      terminalFontDesc:
+        'Elige una tipograf\u00EDa instalada para los terminales de Desktop. Las Nerd Fonts renderizan Powerlevel10k e iconos de shell; d\u00E9jalo en blanco para usar la JetBrains Mono incluida.',
+      terminalFontPlaceholder: 'MesloLGS NF o un conjunto de fuentes CSS',
+      terminalFontPreview: 'Vista previa de glifos',
+      terminalFontReset: 'Usar la predeterminada',
       translucencyTitle: 'Translucidez de ventana',
       translucencyDesc: 'Ver el escritorio a trav\u00E9s de la ventana. Solo macOS y Windows.',
       backdropTitle: 'Fondo del chat',
@@ -734,6 +741,9 @@ export const es: Translations = defineLocale({
       sshHermesPathTitle: 'Ruta de Hermes (opcional)',
       sshHermesPathDesc: 'Ruta completa al binario hermes remoto. Vacío = detección automática.',
       sshHermesPathPlaceholder: 'detección automática',
+      sshRemoteProfileTitle: 'Perfil remoto (opcional)',
+      sshRemoteProfileDesc:
+        'Nombre del perfil en el host remoto. Vacío = usar el nombre del perfil de Desktop.',
       sshTestConnection: 'Probar SSH',
       sshConnect: 'Conectar',
       sshButtonsHint: 'Guardar se aplica en el próximo arranque. Conectar reconecta ahora.',
@@ -2091,6 +2101,7 @@ export const es: Translations = defineLocale({
       'Ajusta o continúa'
     ],
     startVoice: 'Iniciar conversaci\u00F3n por voz',
+    openDirective: 'Abrir',
     queueMessage: 'Poner en cola',
     steer: 'Redirigir la ejecuci\u00F3n actual',
     stop: 'Detener',
