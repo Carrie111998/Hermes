@@ -6632,6 +6632,41 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _primary_worktree_for_checkout(path: Path) -> Optional[Path]:
+    """Resolve a checkout's primary worktree from Git's shared metadata.
+
+    Filesystem ancestry cannot identify the owner of a linked checkout placed
+    outside the primary repository hierarchy. ``git worktree list`` is rooted
+    in the common Git directory and reports the primary checkout first, so it
+    provides the same identity from any linked checkout.
+    """
+    common_dir = _git_common_dir(path)
+    if common_dir is None:
+        return None
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(path), "worktree", "list", "--porcelain"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    for line in (result.stdout or "").splitlines():
+        if not line.startswith("worktree "):
+            continue
+        primary = Path(line.removeprefix("worktree ")).resolve(strict=False)
+        if _git_common_dir(primary) == common_dir:
+            return primary
+        return None
+    return None
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -6680,29 +6715,71 @@ def _ensure_registered_git_worktree(
     from hermes_cli import kanban_workspaces as workspaces
 
     board_id = board or get_current_board()
-    reservation = workspaces.reserve_workspace(
-        repo_path=repo_root,
-        workspace_path=target,
-        task_id=task.id,
-        board_id=board_id,
-        owner_profile=task.assignee,
-        branch=branch_name,
-        replacement_reason=getattr(task, "workspace_replacement_reason", None),
-    )
-    reserved_target = Path(reservation.workspace_path)
-    try:
-        _ensure_git_worktree(repo_root, reserved_target, branch_name)
-        actual_branch = _git_current_branch(reserved_target)
-        if actual_branch != branch_name:
-            raise RuntimeError(
-                f"worktree branch mismatch at {reserved_target}: expected "
-                f"{branch_name!r}, found {actual_branch or 'detached HEAD'!r}"
-            )
-        workspaces.verify_workspace(reservation.workspace_id, reserved_target)
-    except Exception:
-        workspaces.mark_creation_failed(reservation.workspace_id)
-        raise
-    return reserved_target
+    pending_error: Optional[Exception] = None
+    for _attempt in range(2):
+        reservation = workspaces.reserve_workspace(
+            repo_path=repo_root,
+            workspace_path=target,
+            task_id=task.id,
+            board_id=board_id,
+            owner_profile=task.assignee,
+            branch=branch_name,
+            replacement_reason=getattr(task, "workspace_replacement_reason", None),
+        )
+        reserved_target = Path(reservation.workspace_path)
+
+        # An active checkout still passes through the existing materialization
+        # policy seam. This intentionally leaves branch realignment policy to
+        # _ensure_git_worktree (and compatible fixes such as PR #71978) while
+        # lifecycle ownership remains wrapped around it.
+        if reservation.owns_materialization or reservation.status == "active":
+            try:
+                if reservation.owns_materialization:
+                    workspaces.renew_reservation(
+                        reservation.workspace_id,
+                        reservation.reservation_token,
+                    )
+                _ensure_git_worktree(repo_root, reserved_target, branch_name)
+                workspaces.verify_workspace(
+                    reservation.workspace_id,
+                    reserved_target,
+                    reservation_token=reservation.reservation_token,
+                )
+            except Exception:
+                if reservation.owns_materialization:
+                    workspaces.mark_creation_failed(
+                        reservation.workspace_id,
+                        reservation.reservation_token,
+                    )
+                raise
+            return reserved_target
+
+        # Another process owns this still-reserved row. Never run a second
+        # materialization attempt and never infer completion from Git metadata:
+        # HEAD/branch can become visible before `git worktree add` exits. Wait
+        # for the owner to publish active or creation_failed explicitly.
+        deadline = time.monotonic() + workspaces.RESERVATION_LEASE_SECONDS + 1
+        while True:
+            try:
+                workspaces.verify_workspace(
+                    reservation.workspace_id, reserved_target
+                )
+                return reserved_target
+            except workspaces.WorkspaceReservationPending as exc:
+                pending_error = exc
+            except RuntimeError:
+                current = workspaces.get_workspace_record(reservation.workspace_id)
+                if current.status == "creation_failed":
+                    break
+                raise
+            current = workspaces.get_workspace_record(reservation.workspace_id)
+            if current.status == "creation_failed" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.05)
+
+    raise RuntimeError(
+        f"timed out waiting for compatible workspace reservation at {target}"
+    ) from pending_error
 
 
 def _resolve_worktree_workspace(
@@ -6762,7 +6839,7 @@ def _resolve_worktree_workspace(
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
             matched_branch = actual_branch or branch_name
-            existing_root = _repo_root_for_worktree_target(requested.parent)
+            existing_root = _primary_worktree_for_checkout(requested)
             if existing_root is None:
                 raise ValueError(
                     f"task {task.id} worktree path {task.workspace_path!r} is linked "
@@ -6776,10 +6853,11 @@ def _resolve_worktree_workspace(
                 board=board,
             )
             return registered.resolve(strict=False), matched_branch
-        # A path already registered to this exact task is not a sibling's
-        # checkout to route around: a different current branch is ownership
-        # drift. Fail closed without creating a replacement or downgrading the
-        # existing registry record.
+
+        # A path already owned by this exact task is a concrete lifecycle
+        # target, even when it is not named <repo>/.worktrees/<task-id>. Route
+        # it through the materialization policy seam rather than rejecting its
+        # current branch here; branch realignment policy composes at that seam.
         from hermes_cli import kanban_workspaces as _workspaces
 
         registered_paths = {
@@ -6791,33 +6869,46 @@ def _resolve_worktree_workspace(
             if record.status != "creation_failed"
         }
         if requested_resolved in registered_paths:
-            raise RuntimeError(
-                f"worktree branch mismatch at {requested_resolved}: expected "
-                f"{branch_name!r}, found {actual_branch or 'detached HEAD'!r}"
-            )
-        # The requested path is an existing checkout of a DIFFERENT
-        # task's branch. Decompose children inherit the root's
-        # workspace_path verbatim, so siblings all point here; reusing
-        # the checkout as-is would run this task on the other task's
-        # branch — silent cross-task provenance corruption, and unsafe
-        # when siblings run concurrently. Fall back to a fresh worktree
-        # of our own under the same repo.
-        fallback_root = _repo_root_for_worktree_target(requested.parent)
-        if fallback_root is not None:
-            fallback = fallback_root / ".worktrees" / task.id
-            if fallback.resolve(strict=False) != requested_resolved:
-                fallback = _ensure_registered_git_worktree(
-                    task, fallback_root, fallback, branch_name, board=board
+            registered_root = _primary_worktree_for_checkout(requested)
+            if registered_root is None:
+                raise ValueError(
+                    f"task {task.id} registered worktree {requested_resolved} has no "
+                    "resolvable primary repository"
                 )
-                return fallback.resolve(strict=False), branch_name
-        # No distinct safe fallback exists (including when the occupied path
-        # is this task's canonical target). Never silently run on another
-        # branch and never auto-switch a checkout that may contain unique work.
-        raise ValueError(
-            f"task {task.id} linked worktree target {str(requested)!r} has branch "
-            f"mismatch: expected {branch_name!r}, found "
-            f"{actual_branch or 'detached HEAD'!r}"
+            registered = _ensure_registered_git_worktree(
+                task,
+                registered_root,
+                requested_resolved,
+                branch_name,
+                board=board,
+            )
+            return registered.resolve(strict=False), branch_name
+
+        # A checkout owned by the surrounding repository is a concrete target.
+        # Route siblings to their canonical target, but let an exact target pass
+        # through the materialization policy seam so branch realignment remains
+        # composable with PR #71978 rather than being rejected beforehand.
+        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        requested_common = _git_common_dir(requested)
+        if (
+            fallback_root is not None
+            and _git_common_dir(fallback_root) == requested_common
+        ):
+            fallback = fallback_root / ".worktrees" / task.id
+            fallback = _ensure_registered_git_worktree(
+                task, fallback_root, fallback, branch_name, board=board
+            )
+            return fallback.resolve(strict=False), branch_name
+
+        # A linked checkout not owned by a surrounding checkout is itself the
+        # explicit linked-root anchor (PR #70585 semantics). Materialize below
+        # that exact anchor; lifecycle canonicalizes ownership to the primary
+        # repository through Git common-dir/worktree metadata.
+        linked_target = requested_resolved / ".worktrees" / task.id
+        linked_target = _ensure_registered_git_worktree(
+            task, requested_resolved, linked_target, branch_name, board=board
         )
+        return linked_target.resolve(strict=False), branch_name
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
@@ -6854,13 +6945,16 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       compute the absolute path themselves.
     - ``worktree``: a real linked git worktree. If ``workspace_path`` names
       a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+      worktree at ``<repo>/.worktrees/<task-id>``. Existing linked checkouts are
+      identified through Git common-dir/worktree metadata: exact same-branch
+      targets are reused even outside the primary repo hierarchy, while a
+      standalone wrong-branch linked checkout acts as a linked-root anchor.
+      Exact registered targets pass through ``_ensure_git_worktree`` so branch
+      policy remains composable at that seam. With no ``workspace_path``, Hermes
+      anchors on the board's ``default_workdir`` and materializes
+      ``<repo>/.worktrees/<task-id>`` per task; if no ``default_workdir`` is
+      configured it raises rather than guessing from the dispatcher's CWD. When
+      ``branch_name`` is empty, Hermes uses ``wt/<task-id>``.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.

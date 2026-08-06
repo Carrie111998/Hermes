@@ -44,6 +44,7 @@ ACTIVE_REGISTRY_STATUSES = {
     "retirement_queued",
     "protected",
 }
+RESERVATION_LEASE_SECONDS = 180
 
 
 @dataclass(frozen=True)
@@ -104,6 +105,38 @@ class WorkspaceRecord:
 
 
 @dataclass(frozen=True)
+class WorkspaceReservation(WorkspaceRecord):
+    """A registry record plus this caller's materialization claim.
+
+    Compatible concurrent callers can observe the same registry row, but only
+    the caller holding ``reservation_token`` may execute ``git worktree add``,
+    publish the row as active, or mark creation failed. Non-owners wait for that
+    explicit active publication before using the checkout.
+    """
+
+    reservation_token: Optional[str] = None
+    owns_materialization: bool = False
+
+    @classmethod
+    def from_record(
+        cls,
+        record: WorkspaceRecord,
+        *,
+        reservation_token: Optional[str],
+        owns_materialization: bool,
+    ) -> "WorkspaceReservation":
+        return cls(
+            **record.__dict__,
+            reservation_token=reservation_token,
+            owns_materialization=owns_materialization,
+        )
+
+
+class WorkspaceReservationPending(RuntimeError):
+    """The reservation owner has not exposed a verifiable Git checkout yet."""
+
+
+@dataclass(frozen=True)
 class _TerminalDispositionPlan:
     record: WorkspaceRecord
     disposition: str
@@ -141,6 +174,8 @@ CREATE TABLE IF NOT EXISTS workspaces (
     exception_policy_id   TEXT,
     exception_expires_at  INTEGER,
     replacement_reason    TEXT,
+    reservation_token     TEXT,
+    reservation_expires_at INTEGER,
     created_at            INTEGER NOT NULL,
     last_used_at          INTEGER NOT NULL,
     last_verified_at      INTEGER
@@ -160,6 +195,21 @@ def registry_path() -> Path:
     return kanban_db.kanban_home() / "kanban" / "workspace-registry.db"
 
 
+def _add_registry_column(
+    conn: sqlite3.Connection, columns: set[str], name: str, ddl: str
+) -> None:
+    if name in columns:
+        return
+    try:
+        conn.execute(ddl)
+    except sqlite3.OperationalError as exc:
+        # Two first-use processes can both observe the pre-migration schema.
+        # ALTER TABLE is not IF-NOT-EXISTS-capable on supported SQLite builds;
+        # the loser may safely accept the winner's identical column.
+        if "duplicate column name" not in str(exc).lower():
+            raise
+
+
 def connect_registry() -> sqlite3.Connection:
     path = registry_path()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -171,10 +221,24 @@ def connect_registry() -> sqlite3.Connection:
         str(row[1])
         for row in conn.execute("PRAGMA table_info(workspaces)").fetchall()
     }
-    if "exception_expires_at" not in columns:
-        conn.execute(
-            "ALTER TABLE workspaces ADD COLUMN exception_expires_at INTEGER"
-        )
+    _add_registry_column(
+        conn,
+        columns,
+        "exception_expires_at",
+        "ALTER TABLE workspaces ADD COLUMN exception_expires_at INTEGER",
+    )
+    _add_registry_column(
+        conn,
+        columns,
+        "reservation_token",
+        "ALTER TABLE workspaces ADD COLUMN reservation_token TEXT",
+    )
+    _add_registry_column(
+        conn,
+        columns,
+        "reservation_expires_at",
+        "ALTER TABLE workspaces ADD COLUMN reservation_expires_at INTEGER",
+    )
     return conn
 
 
@@ -340,19 +404,53 @@ def reserve_workspace(
     cleanup_policy: str = "on_task_terminal",
     retention_condition: Optional[str] = "task_terminal",
     replacement_reason: Optional[str] = None,
-) -> WorkspaceRecord:
+) -> WorkspaceReservation:
     """Reserve ownership before ``git worktree add`` can mutate the repo.
 
-    A single compatible task/repository reservation is reused. Multiple active
-    rows, or one incompatible row, are ambiguous and fail closed unless the
-    task carries an explicit replacement reason.
+    The registry row remains the durable ownership identity. A short-lived,
+    compare-and-swap reservation token separately identifies the one caller
+    allowed to materialize it. Compatible concurrent callers observe the same
+    row without receiving that token and can only verify a live checkout.
     """
     repo = _canonical_repo(repo_path)
     target = _canonical(workspace_path)
     rid = _repo_id(repo)
-    now = int(time.time())
     for warning in creation_pressure_warnings(repo):
         _log.warning("kanban worktree lifecycle (report-only): %s", warning)
+    now = int(time.time())
+    claim_token = uuid.uuid4().hex
+    claim_expires = now + RESERVATION_LEASE_SECONDS
+
+    def is_compatible(row: sqlite3.Row) -> bool:
+        return (
+            row["workspace_path"] == target
+            and row["task_id"] == task_id
+            and row["board_id"] == board_id
+            and row["repo_id"] == rid
+            and row["owner_profile"] == owner_profile
+            and row["purpose"] == purpose
+            and row["branch"] == branch
+            and row["cleanup_policy"] == cleanup_policy
+            and row["retention_condition"] == retention_condition
+        )
+
+    def result_for(
+        conn: sqlite3.Connection,
+        workspace_id: str,
+        *,
+        token: Optional[str],
+        owns: bool,
+    ) -> WorkspaceReservation:
+        row = conn.execute(
+            "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"unknown workspace reservation: {workspace_id}")
+        return WorkspaceReservation.from_record(
+            WorkspaceRecord.from_row(row),
+            reservation_token=token,
+            owns_materialization=owns,
+        )
 
     with contextlib.closing(connect_registry()) as conn:
         conn.execute("BEGIN IMMEDIATE")
@@ -363,27 +461,32 @@ def reserve_workspace(
                 "ORDER BY workspace_path, workspace_id",
                 (board_id, task_id, rid),
             ).fetchall()
-            compatible = [
-                row for row in rows
-                if row["workspace_path"] == target
-                and row["owner_profile"] == owner_profile
-                and row["purpose"] == purpose
-                and row["branch"] == branch
-                and row["cleanup_policy"] == cleanup_policy
-                and row["retention_condition"] == retention_condition
-            ]
+            compatible = [row for row in rows if is_compatible(row)]
             if len(rows) == 1 and len(compatible) == 1:
-                conn.execute(
-                    "UPDATE workspaces SET last_used_at = ? "
-                    "WHERE workspace_id = ?",
-                    (now, compatible[0]["workspace_id"]),
-                )
-                conn.execute("COMMIT")
-                return WorkspaceRecord.from_row(
+                row = compatible[0]
+                owns = False
+                token: Optional[str] = None
+                if row["status"] == "reserved" and (
+                    row["reservation_token"] is None
+                    or int(row["reservation_expires_at"] or 0) <= now
+                ):
+                    cur = conn.execute(
+                        "UPDATE workspaces SET reservation_token = ?, "
+                        "reservation_expires_at = ?, last_used_at = ? "
+                        "WHERE workspace_id = ? AND status = 'reserved' AND ("
+                        "reservation_token IS NULL OR reservation_expires_at <= ?)",
+                        (claim_token, claim_expires, now, row["workspace_id"], now),
+                    )
+                    owns = cur.rowcount == 1
+                    token = claim_token if owns else None
+                else:
                     conn.execute(
-                        "SELECT * FROM workspaces WHERE workspace_id = ?",
-                        (compatible[0]["workspace_id"],),
-                    ).fetchone()
+                        "UPDATE workspaces SET last_used_at = ? WHERE workspace_id = ?",
+                        (now, row["workspace_id"]),
+                    )
+                conn.execute("COMMIT")
+                return result_for(
+                    conn, row["workspace_id"], token=token, owns=owns
                 )
             if rows and not replacement_reason:
                 raise RuntimeError(
@@ -396,16 +499,33 @@ def reserve_workspace(
                 "SELECT * FROM workspaces WHERE workspace_path = ?", (target,)
             ).fetchone()
             if existing is not None:
+                if is_compatible(existing) and existing["status"] == "creation_failed":
+                    cur = conn.execute(
+                        "UPDATE workspaces SET status = 'reserved', reservation_token = ?, "
+                        "reservation_expires_at = ?, last_used_at = ? "
+                        "WHERE workspace_id = ? AND status = 'creation_failed'",
+                        (
+                            claim_token,
+                            claim_expires,
+                            now,
+                            existing["workspace_id"],
+                        ),
+                    )
+                    if cur.rowcount != 1:
+                        raise RuntimeError(
+                            f"workspace reservation changed while retrying: "
+                            f"{existing['workspace_id']}"
+                        )
+                    conn.execute("COMMIT")
+                    return result_for(
+                        conn,
+                        existing["workspace_id"],
+                        token=claim_token,
+                        owns=True,
+                    )
                 exact_compatible_owner = (
-                    existing["task_id"] == task_id
-                    and existing["board_id"] == board_id
-                    and existing["repo_id"] == rid
+                    is_compatible(existing)
                     and existing["status"] in {"reserved", "active"}
-                    and existing["owner_profile"] == owner_profile
-                    and existing["purpose"] == purpose
-                    and existing["branch"] == branch
-                    and existing["cleanup_policy"] == cleanup_policy
-                    and existing["retention_condition"] == retention_condition
                 )
                 if not exact_compatible_owner and not replacement_reason:
                     raise RuntimeError(
@@ -415,7 +535,9 @@ def reserve_workspace(
                     )
                 if exact_compatible_owner:
                     conn.execute("COMMIT")
-                    return WorkspaceRecord.from_row(existing)
+                    return result_for(
+                        conn, existing["workspace_id"], token=None, owns=False
+                    )
                 raise RuntimeError(
                     f"replacement reason does not authorize stealing an existing "
                     f"workspace path: {target}; choose a new path"
@@ -426,64 +548,199 @@ def reserve_workspace(
                 "INSERT INTO workspaces ("
                 "workspace_id, repo_id, repo_path, workspace_path, task_id, board_id, "
                 "owner_profile, purpose, branch, status, cleanup_policy, "
-                "retention_condition, replacement_reason, created_at, last_used_at"
-                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?)",
+                "retention_condition, replacement_reason, reservation_token, "
+                "reservation_expires_at, created_at, last_used_at"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    workspace_id, rid, repo, target, task_id, board_id,
-                    owner_profile, purpose, branch, cleanup_policy,
-                    retention_condition, replacement_reason, now, now,
+                    workspace_id,
+                    rid,
+                    repo,
+                    target,
+                    task_id,
+                    board_id,
+                    owner_profile,
+                    purpose,
+                    branch,
+                    cleanup_policy,
+                    retention_condition,
+                    replacement_reason,
+                    claim_token,
+                    claim_expires,
+                    now,
+                    now,
                 ),
             )
-            row = conn.execute(
-                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
-            ).fetchone()
             conn.execute("COMMIT")
-            return WorkspaceRecord.from_row(row)
+            return result_for(
+                conn, workspace_id, token=claim_token, owns=True
+            )
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
 
-def verify_workspace(workspace_id: str, workspace_path: Path | str) -> WorkspaceRecord:
+def get_workspace_record(workspace_id: str) -> WorkspaceRecord:
+    with contextlib.closing(connect_registry()) as conn:
+        row = conn.execute(
+            "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(f"unknown workspace reservation: {workspace_id}")
+    return WorkspaceRecord.from_row(row)
+
+
+def renew_reservation(
+    workspace_id: str, reservation_token: Optional[str]
+) -> None:
+    """Renew a materializer's lease immediately before Git mutation."""
+    if reservation_token is None:
+        raise RuntimeError(f"workspace reservation {workspace_id} has no owner token")
+    now = int(time.time())
+    with contextlib.closing(connect_registry()) as conn:
+        cur = conn.execute(
+            "UPDATE workspaces SET reservation_expires_at = ?, last_used_at = ? "
+            "WHERE workspace_id = ? AND status = 'reserved' "
+            "AND reservation_token = ?",
+            (
+                now + RESERVATION_LEASE_SECONDS,
+                now,
+                workspace_id,
+                reservation_token,
+            ),
+        )
+    if cur.rowcount != 1:
+        raise RuntimeError(
+            f"workspace reservation {workspace_id} is no longer owned by this resolver"
+        )
+
+
+def verify_workspace(
+    workspace_id: str,
+    workspace_path: Path | str,
+    *,
+    reservation_token: Optional[str] = None,
+) -> WorkspaceRecord:
+    """Verify Git facts and activate a reservation with compare-and-swap safety.
+
+    The reservation owner supplies its token and is the only caller allowed to
+    promote ``reserved`` to ``active``. Non-owners may reverify an already-active
+    checkout, but cannot infer materialization completion from Git metadata that
+    becomes visible before ``git worktree add`` exits.
+    """
     path = _canonical(workspace_path)
     now = int(time.time())
-    head = _git(path, "rev-parse", "HEAD")
-    branch = _git(path, "branch", "--show-current") or None
-    dirty_hash = dirty_manifest_hash(path)
-    size = estimated_bytes(path)
     with contextlib.closing(connect_registry()) as conn:
+        row = conn.execute(
+            "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+        ).fetchone()
+        if row is None:
+            raise RuntimeError(f"unknown workspace reservation: {workspace_id}")
+        if row["status"] not in {"reserved", "active"}:
+            raise RuntimeError(
+                f"workspace reservation {workspace_id} is not reservable or active"
+            )
+        if row["workspace_path"] != path:
+            raise RuntimeError(
+                f"workspace reservation {workspace_id} path mismatch: expected "
+                f"{row['workspace_path']}, found {path}"
+            )
+        if row["status"] == "reserved":
+            if reservation_token is None:
+                raise WorkspaceReservationPending(
+                    f"workspace reservation {workspace_id} is still materializing"
+                )
+            if row["reservation_token"] != reservation_token:
+                raise RuntimeError(
+                    f"workspace reservation {workspace_id} is owned by another resolver"
+                )
+
+        head = _git(path, "rev-parse", "HEAD")
+        actual_branch = _git(path, "branch", "--show-current") or None
+        missing_expected_branch = row["branch"] is not None and actual_branch is None
+        if head is None or missing_expected_branch:
+            if row["status"] == "reserved":
+                raise WorkspaceReservationPending(
+                    f"workspace reservation {workspace_id} is not materialized yet"
+                )
+            raise RuntimeError(
+                f"active workspace reservation {workspace_id} is not a usable checkout"
+            )
+        actual_repo = _canonical_repo(path)
+        if actual_repo != row["repo_path"]:
+            raise RuntimeError(
+                f"workspace reservation {workspace_id} repository mismatch: expected "
+                f"{row['repo_path']}, found {actual_repo}"
+            )
+        if row["branch"] is not None and actual_branch != row["branch"]:
+            raise RuntimeError(
+                f"workspace reservation {workspace_id} branch mismatch: expected "
+                f"{row['branch']!r}, found {actual_branch!r}"
+            )
+        dirty_hash = dirty_manifest_hash(path)
+        size = estimated_bytes(path)
+
         conn.execute("BEGIN IMMEDIATE")
         try:
-            cur = conn.execute(
-                "UPDATE workspaces SET workspace_path = ?, branch = COALESCE(?, branch), "
-                "head_sha = ?, status = 'active', dirty_manifest_hash = ?, "
-                "estimated_bytes = ?, last_used_at = ?, last_verified_at = ? "
-                "WHERE workspace_id = ? AND status IN ('reserved', 'active')",
-                (path, branch, head, dirty_hash, size, now, now, workspace_id),
-            )
-            if cur.rowcount != 1:
+            current = conn.execute(
+                "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
+            ).fetchone()
+            if current is None or current["status"] not in {"reserved", "active"}:
                 raise RuntimeError(
                     f"workspace reservation {workspace_id} is not reservable or active"
                 )
-            row = conn.execute(
+            if (
+                current["status"] == "reserved"
+                and reservation_token is not None
+                and current["reservation_token"] != reservation_token
+            ):
+                raise RuntimeError(
+                    f"workspace reservation {workspace_id} is owned by another resolver"
+                )
+            cur = conn.execute(
+                "UPDATE workspaces SET head_sha = ?, status = 'active', "
+                "dirty_manifest_hash = ?, estimated_bytes = ?, last_used_at = ?, "
+                "last_verified_at = ?, reservation_token = NULL, "
+                "reservation_expires_at = NULL "
+                "WHERE workspace_id = ? AND status IN ('reserved', 'active')",
+                (head, dirty_hash, size, now, now, workspace_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError(
+                    f"workspace reservation {workspace_id} changed during verification"
+                )
+            verified = conn.execute(
                 "SELECT * FROM workspaces WHERE workspace_id = ?", (workspace_id,)
             ).fetchone()
-            if row is None:
-                raise RuntimeError(f"unknown workspace reservation: {workspace_id}")
             conn.execute("COMMIT")
-            return WorkspaceRecord.from_row(row)
+            return WorkspaceRecord.from_row(verified)
         except Exception:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
 
 
-def mark_creation_failed(workspace_id: str) -> None:
+def mark_creation_failed(
+    workspace_id: str, reservation_token: Optional[str] = None
+) -> None:
+    """Fail only the still-reserved row owned by this materializer."""
     with contextlib.closing(connect_registry()) as conn:
-        conn.execute(
-            "UPDATE workspaces SET status = 'creation_failed', last_verified_at = ? "
-            "WHERE workspace_id = ? AND status = 'reserved'",
-            (int(time.time()), workspace_id),
-        )
+        if reservation_token is None:
+            conn.execute(
+                "UPDATE workspaces SET status = 'creation_failed', "
+                "last_verified_at = ?, reservation_expires_at = NULL "
+                "WHERE workspace_id = ? AND status = 'reserved' "
+                "AND reservation_token IS NULL",
+                (int(time.time()), workspace_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE workspaces SET status = 'creation_failed', "
+                "last_verified_at = ?, reservation_token = NULL, "
+                "reservation_expires_at = NULL WHERE workspace_id = ? "
+                "AND status = 'reserved' AND reservation_token = ?",
+                (int(time.time()), workspace_id, reservation_token),
+            )
 
 
 def _parse_disposition(value: object) -> tuple[str, Optional[str]]:

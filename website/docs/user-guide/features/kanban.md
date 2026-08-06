@@ -275,10 +275,24 @@ cleanup policy, retention conditions, protected exceptions, and verification
 receipts. Inventory never adopts or deletes an unknown path.
 
 New worktree claims reuse the same compatible task/repository/path record.
+A short-lived reservation token gives only one concurrent resolver permission to
+materialize and publish that record. Compatible losing resolvers wait for the
+owner's explicit `active` publication instead of inferring completion from Git
+metadata that can become visible before `git worktree add` exits. They never run
+a second materialization or change the winner's still-reserved status.
 Creating a second persistent worktree for that task and repository fails
 closed unless the task has an explicit `workspace_replacement_reason` (CLI:
 `--workspace-replacement-reason`). Pressure limits under
 `kanban.worktree_lifecycle` are report-only by default.
+
+Existing linked checkouts are identified through Git common-directory and
+`worktree list --porcelain` metadata, not filesystem parent ancestry. An exact
+checkout already on the requested branch is reused even outside the primary
+repository hierarchy. A wrong-branch checkout owned by a surrounding repository
+uses the canonical per-task target; a standalone linked checkout acts as the
+explicit linked-root anchor. Exact registered targets continue through the
+materialization policy seam so branch-realignment fixes can compose there while
+lifecycle ownership and verification remain outside that policy.
 
 Worktree-owning tasks must classify every registered checkout before becoming
 `done` or `archived`:

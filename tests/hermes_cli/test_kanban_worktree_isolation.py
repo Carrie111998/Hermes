@@ -66,6 +66,33 @@ def _add_worktree(repo: Path, target: Path, branch: str) -> Path:
     return target
 
 
+def test_public_resolver_treats_external_wrong_branch_linked_root_as_anchor(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    linked_root = _add_worktree(repo, tmp_path / "linked-root", "anchor/main")
+
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="linked root anchor",
+            workspace_kind="worktree",
+            workspace_path=str(linked_root),
+            branch_name="wt/linked-anchor-task",
+        )
+        task = kb.get_task(conn, tid)
+
+    assert task is not None
+    workspace = kb.resolve_workspace(task)
+    assert workspace == linked_root / ".worktrees" / tid
+    assert subprocess.run(
+        ["git", "-C", str(workspace), "branch", "--show-current"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip() == "wt/linked-anchor-task"
+
+
 def test_decompose_worktree_children_get_own_workspace(kanban_home):
     with kb.connect() as conn:
         root = kb.create_task(conn, title="build the feature", triage=True)
@@ -146,8 +173,8 @@ def test_resolve_canonical_path_on_foreign_branch_fails_closed(
         task = kb.get_task(conn, tid)
 
     assert task is not None
-    with pytest.raises(ValueError, match="branch mismatch"):
-        kb._resolve_worktree_workspace(task)
+    with pytest.raises(RuntimeError, match="branch mismatch"):
+        kb.resolve_workspace(task)
     assert subprocess.run(
         ["git", "-C", str(own), "branch", "--show-current"],
         capture_output=True,

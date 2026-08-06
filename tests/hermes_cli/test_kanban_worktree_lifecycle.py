@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import subprocess
+import threading
 from pathlib import Path
 
 import pytest
@@ -119,6 +121,32 @@ def test_preexisting_matching_worktree_is_adopted_only_for_its_task(
     assert records[0].status == "active"
 
 
+def test_preexisting_matching_external_linked_worktree_is_reused_via_public_resolver(
+    kanban_home, tmp_path
+):
+    repo = _make_repo(tmp_path)
+    target = tmp_path / "external-linked-checkout"
+    _git(repo, "worktree", "add", "-b", "feat/external", str(target), "HEAD")
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="reuse external linked checkout",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/external",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert kb.resolve_workspace(task) == target.resolve()
+
+    record = kw.list_workspace_records(task_id=task_id)[0]
+    assert record.repo_path == str(repo.resolve())
+    assert record.workspace_path == str(target.resolve())
+    assert record.status == "active"
+
+
 def test_existing_target_on_wrong_branch_fails_closed_without_mutating_git(
     kanban_home, tmp_path
 ):
@@ -178,6 +206,42 @@ def test_drifted_existing_registration_stays_owned_when_branch_check_fails(
     record = kw.list_workspace_records(task_id=task_id)[0]
     assert record.status == "active"
     assert record.workspace_path == str(target.resolve())
+
+
+def test_registered_branch_drift_reaches_materialization_policy_seam(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "drifted-policy-seam"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="allow branch policy integration",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/expected",
+        )
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        kb.resolve_workspace(task)
+        _git(target, "switch", "-c", "feat/drifted")
+
+        calls: list[tuple[Path, Path, str]] = []
+
+        def realign_at_materialization_seam(
+            repo_root: Path, requested: Path, branch_name: str
+        ) -> None:
+            calls.append((repo_root, requested, branch_name))
+            _git(requested, "switch", branch_name)
+
+        monkeypatch.setattr(kb, "_ensure_git_worktree", realign_at_materialization_seam)
+        current_task = kb.get_task(conn, task_id)
+        assert current_task is not None
+        assert kb.resolve_workspace(current_task) == target.resolve()
+
+    assert calls == [(repo.resolve(), target.resolve(), "feat/expected")]
+    assert _git(target, "branch", "--show-current") == "feat/expected"
+    assert kw.list_workspace_records(task_id=task_id)[0].status == "active"
 
 
 def test_duplicate_task_repo_requires_recorded_replacement_reason(
@@ -403,7 +467,11 @@ def test_inventory_reconciles_git_counts_and_reports_deterministic_findings(
             branch="feat/duplicate",
             replacement_reason="clean_replacement_after_dirty_collision",
         )
-        kw.verify_workspace(replacement.workspace_id, duplicate)
+        kw.verify_workspace(
+            replacement.workspace_id,
+            duplicate,
+            reservation_token=replacement.reservation_token,
+        )
 
         _git(repo, "worktree", "add", "--detach", str(outside), "HEAD")
         (owned / "dirty.txt").write_text("preserve me\n", encoding="utf-8")
@@ -627,7 +695,11 @@ def test_janitor_never_candidates_primary_or_locked_worktrees(
             owner_profile="developer",
             branch="main",
         )
-        kw.verify_workspace(primary_reservation.workspace_id, repo)
+        kw.verify_workspace(
+            primary_reservation.workspace_id,
+            repo,
+            reservation_token=primary_reservation.reservation_token,
+        )
         assert kb.archive_task(
             conn,
             primary_task,
@@ -1301,6 +1373,30 @@ def test_inventory_reports_expired_registered_exception_without_config(
     ]
 
 
+def test_detached_branchless_reservation_verifies_as_active(tmp_path, kanban_home):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "detached"
+    _git(repo, "worktree", "add", "--detach", str(target), "HEAD")
+
+    reservation = kw.reserve_workspace(
+        repo_path=repo,
+        workspace_path=target,
+        task_id="t_detached",
+        board_id="default",
+        owner_profile="developer",
+        branch=None,
+    )
+    verified = kw.verify_workspace(
+        reservation.workspace_id,
+        target,
+        reservation_token=reservation.reservation_token,
+    )
+
+    assert verified.status == "active"
+    assert verified.branch is None
+    assert verified.head_sha == _git(target, "rev-parse", "HEAD")
+
+
 def test_reservation_reuse_is_exact_and_creation_failure_cannot_downgrade_active(
     tmp_path, kanban_home
 ):
@@ -1318,7 +1414,11 @@ def test_reservation_reuse_is_exact_and_creation_failure_cannot_downgrade_active
         retention_condition="task_terminal",
     )
     _git(repo, "worktree", "add", "-b", "feat/concurrent", str(target), "HEAD")
-    kw.verify_workspace(reservation.workspace_id, target)
+    kw.verify_workspace(
+        reservation.workspace_id,
+        target,
+        reservation_token=reservation.reservation_token,
+    )
     kw.mark_creation_failed(reservation.workspace_id)
     assert kw.list_workspace_records(task_id="t_concurrent")[0].status == "active"
 
@@ -1334,6 +1434,78 @@ def test_reservation_reuse_is_exact_and_creation_failure_cannot_downgrade_active
             cleanup_policy="never_automatic",
             retention_condition="manual",
         )
+
+
+def test_concurrent_public_resolvers_share_one_materialization_without_poisoning(
+    tmp_path, kanban_home, monkeypatch
+):
+    repo = _make_repo(tmp_path)
+    target = repo / ".worktrees" / "shared-reservation"
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="concurrent shared reservation",
+            assignee="developer",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="feat/shared-reservation",
+        )
+        task = kb.get_task(conn, task_id)
+    assert task is not None
+
+    real_ensure = kb._ensure_git_worktree
+    real_verify = kw.verify_workspace
+    materialized = threading.Event()
+    non_owner_waiting = threading.Event()
+    release_owner = threading.Event()
+    call_lock = threading.Lock()
+    materialization_calls = 0
+
+    def controlled_materialization(
+        repo_root: Path, requested: Path, branch_name: str
+    ) -> None:
+        nonlocal materialization_calls
+        with call_lock:
+            materialization_calls += 1
+            call_number = materialization_calls
+        if call_number != 1:
+            raise RuntimeError("compatible resolver must not materialize shared reservation")
+        real_ensure(repo_root, requested, branch_name)
+        materialized.set()
+        assert release_owner.wait(timeout=10), "test did not release reservation owner"
+
+    def observed_verification(
+        workspace_id: str,
+        workspace_path: Path | str,
+        *,
+        reservation_token: str | None = None,
+    ) -> kw.WorkspaceRecord:
+        if reservation_token is None:
+            non_owner_waiting.set()
+        return real_verify(
+            workspace_id,
+            workspace_path,
+            reservation_token=reservation_token,
+        )
+
+    monkeypatch.setattr(kb, "_ensure_git_worktree", controlled_materialization)
+    monkeypatch.setattr(kw, "verify_workspace", observed_verification)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        owner = pool.submit(kb.resolve_workspace, task)
+        assert materialized.wait(timeout=10), "owner did not materialize worktree"
+        compatible = pool.submit(kb.resolve_workspace, task)
+        assert non_owner_waiting.wait(timeout=10), "losing resolver did not observe claim"
+        with pytest.raises(concurrent.futures.TimeoutError):
+            compatible.result(timeout=0.1)
+        release_owner.set()
+        owner_result = owner.result(timeout=10)
+        compatible_result = compatible.result(timeout=10)
+
+    assert owner_result == compatible_result == target.resolve()
+    assert materialization_calls == 1
+    records = kw.list_workspace_records(task_id=task_id)
+    assert len(records) == 1
+    assert records[0].status == "active"
 
 
 def test_janitor_uses_production_pr_and_task_dependency_evidence(
