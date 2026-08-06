@@ -90,3 +90,29 @@ export function quitPromptFor(work: ActiveWork, quittingForHandoff: boolean): nu
     message: work.count === 1 ? 'Hermes is still working on 1 chat.' : `Hermes is still working on ${work.count} chats.`
   }
 }
+
+/**
+ * Whether a window's 'close' event should be intercepted to show the
+ * active-work confirmation.
+ *
+ * On Windows and Linux, closing the last window triggers app.quit() →
+ * before-quit, but by then the renderer's webContents is already destroyed
+ * and its entry has been removed from the active-work map — so the existing
+ * before-quit guard finds nothing and the app exits silently. Intercepting
+ * 'close' instead catches the guard while the work data is still live.
+ *
+ * macOS is excluded: closing the primary window there is the standard
+ * "window stays in Dock" gesture, not a quit, and prompting on it would
+ * block a normal workflow.
+ */
+export function shouldGuardWindowClose(
+  work: ActiveWork,
+  quittingForHandoff: boolean,
+  isMac: boolean
+): boolean {
+  if (isMac || quittingForHandoff || work.count < 1) {
+    return false
+  }
+
+  return true
+}
