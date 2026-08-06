@@ -396,6 +396,10 @@ export const es: Translations = defineLocale({
         credits: {
           label: 'Alertas de crédito',
           description: 'El acceso a créditos está en pausa o restaurado.'
+        },
+        plugin: {
+          label: 'Notificaciones de plugins',
+          description: 'Un plugin del escritorio envió una notificación mientras Hermes estaba en segundo plano.'
         }
       },
       test: 'Enviar notificaci\u00F3n de prueba',
@@ -1677,6 +1681,12 @@ export const es: Translations = defineLocale({
     search: 'Buscar perfiles...',
     loading: 'Cargando perfiles...',
     newProfile: 'Nuevo perfil',
+    importProfile: 'Importar perfil…',
+    exportProfile: 'Exportar perfil…',
+    imported: 'Perfil importado',
+    exported: 'Perfil exportado',
+    failedImport: 'No se pudo importar el perfil',
+    failedExport: 'No se pudo exportar el perfil',
     allProfiles: 'Todos los perfiles',
     showAllProfiles: 'Mostrar todos los perfiles',
     switchToProfile: name => `Cambiar a ${name}`,
@@ -1993,6 +2003,11 @@ export const es: Translations = defineLocale({
       menuAddFolder: 'Añadir carpeta',
       menuSetActive: 'Establecer como activo',
       menuDelete: 'Eliminar',
+      moveToProject: 'Mover al proyecto',
+      movedTo: name => `Movido a ${name}`,
+      moveFailed: 'No se pudo mover la sesión',
+      moveNoFolder: 'Ese proyecto no tiene carpeta a la que mover',
+      moveNoProjects: 'No hay otros proyectos',
       reveal: 'Mostrar en la carpeta',
       copyPath: 'Copiar ruta',
       removeFromSidebar: 'Ocultar de la barra lateral',
@@ -2009,6 +2024,9 @@ export const es: Translations = defineLocale({
       baseBranchPlaceholder: 'Buscar ramas…',
       baseBranchNone: 'No se encontraron ramas',
       startWorkFailed: 'No se pudo crear el worktree',
+      worktreeProjectLabel: 'Proyecto',
+      worktreeProjectPlaceholder: 'Buscar proyectos…',
+      worktreeProjectNone: 'No hay proyectos con carpeta',
       convertBranch: 'Convertir una rama…',
       convertBranchTitle: 'Convertir una rama',
       convertBranchDesc: 'Abre las ramas comprobadas, o crea un worktree para una rama libre.',
@@ -2017,6 +2035,7 @@ export const es: Translations = defineLocale({
       branchOpenExisting: 'abrir',
       branchSwitchHome: 'cambiar a inicio',
       branchCreateWorktree: 'nuevo worktree',
+      branchTrackRemote: 'rastrear remoto',
       branchesLoading: 'Cargando ramas…',
       noBranches: 'No se encontraron ramas',
       removeWorktree: 'Quitar worktree',
@@ -2698,10 +2717,6 @@ export const es: Translations = defineLocale({
   },
   preview: {
     tab: 'Vista previa',
-    closeTab: label => `Cerrar ${label}`,
-    closeOthers: 'Cerrar las demás',
-    closeToRight: 'Cerrar a la derecha',
-    closeAll: 'Cerrar todas',
     closePane: 'Cerrar panel de vista previa',
     loading: 'Cargando vista previa',
     unavailable: 'Vista previa no disponible',
@@ -2800,6 +2815,7 @@ export const es: Translations = defineLocale({
     closeRunningBody:
       'Este chat sigue trabajando (o esperando tu entrada). Cerrar la pestaña lo oculta — la sesión conserva su progreso y puedes reabrirla.',
     closeRunningConfirm: 'Cerrar pestaña',
+    reload: 'Recargar',
     closeOthers: 'Cerrar las demás',
     closeToRight: 'Cerrar a la derecha',
     closeAll: 'Cerrar todas',
@@ -2830,7 +2846,8 @@ export const es: Translations = defineLocale({
     layoutNamePlaceholder: fallback => `Nombre del diseño (${fallback})`,
     saveApply: 'Guardar y aplicar',
     notExpressible: 'esta disposición se entrelaza (molinete) — aún no expresable como divisiones anidadas',
-    zoneCount: count => `${count} zonas`
+    zoneCount: count => `${count} zonas`,
+    tabCount: count => `${count} pestañas`
   },
   assistant: {
     thread: {
