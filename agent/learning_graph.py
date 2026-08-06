@@ -255,15 +255,22 @@ def build_learning_graph() -> dict[str, Any]:
     """Full payload for the desktop learning panel.
 
     Focus on what is profile-learned and actionable:
-    - skills that are NOT base-installed and show real learning signal
-      (agent-created or used),
+    - skills that are NOT base-installed and were created by the agent
+      (``created_by == "agent"``),
     - memory chunks as first-class graph nodes connected to those learned skills.
+
+    ``use_count`` is a telemetry counter incremented on every skill load
+    regardless of provenance (bundled, hub-installed, externally installed, or
+    agent-created).  Using it as a learning signal caused externally-installed
+    skills (e.g. via ``npx skills add``) to be mislabeled as "learned" after a
+    single load.  Only ``created_by == "agent"`` reliably identifies skills the
+    agent actually created.
     """
     all_skills = build_skill_nodes(_skill_roots())
     learned_skills = {
         name: node
         for name, node in all_skills.items()
-        if node.source != "base" and (node.created_by == "agent" or node.use_count > 0)
+        if node.source != "base" and node.created_by == "agent"
     }
     skill_edges = build_edges(learned_skills)
     memory_cards = _memory_cards()

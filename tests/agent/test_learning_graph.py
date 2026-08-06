@@ -8,6 +8,8 @@ change-detector.
 
 from __future__ import annotations
 
+import json
+
 from agent import learning_graph
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -31,6 +33,7 @@ def test_density_stats_count_isolated_nodes():
     assert stats["nodes"] == 3
     assert stats["linked_nodes"] == 2
     assert stats["isolated_pct"] == round(100 / 3, 1)
+
 
 
 
@@ -79,3 +82,53 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
     assert graph["stats"]["nodes"] == len(skill_nodes)
     assert graph["stats"]["memory_nodes"] == len(graph["memory"])
     assert all("timestamp" in n for n in graph["nodes"])
+
+
+def test_externally_installed_skill_not_learned(tmp_path):
+    """Skills installed externally (e.g. ``npx skills add``) land in
+    ``~/.hermes/skills/`` with ``source="profile"`` and ``created_by=None``.
+
+    They must NOT appear as "learned" in the graph even when ``use_count > 0``
+    from telemetry tracking — only agent-created skills should.
+    """
+    home = tmp_path / ".hermes"
+    skills_dir = home / "skills"
+    ext_category = skills_dir / "tools"
+    ext_category.mkdir(parents=True)
+
+    # Externally installed skill — created_by=None, use_count > 0
+    ext_skill = ext_category / "external-tool"
+    ext_skill.mkdir()
+    (ext_skill / "SKILL.md").write_text(
+        "---\nname: external-tool\ncategory: tools\n---\nExternal skill body.\n",
+        encoding="utf-8",
+    )
+
+    # Agent-created skill — created_by="agent"
+    agent_skill = ext_category / "agent-created"
+    agent_skill.mkdir()
+    (agent_skill / "SKILL.md").write_text(
+        "---\nname: agent-created\ncategory: tools\n---\nAgent skill body.\n",
+        encoding="utf-8",
+    )
+
+    usage = {
+        "external-tool": {"use_count": 15, "created_by": None, "state": "active"},
+        "agent-created": {"use_count": 3, "created_by": "agent", "state": "active"},
+    }
+    (skills_dir / ".usage.json").write_text(json.dumps(usage), encoding="utf-8")
+
+    token = set_hermes_home_override(home)
+    try:
+        graph = learning_graph.build_learning_graph()
+    finally:
+        reset_hermes_home_override(token)
+
+    skill_names = {
+        n["id"] for n in graph["nodes"] if n["kind"] == "skill"
+    }
+    # Agent-created skill IS in the learned graph
+    assert "agent-created" in skill_names
+    # Externally installed skill is NOT in the learned graph
+    assert "external-tool" not in skill_names
+
