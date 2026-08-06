@@ -2487,7 +2487,7 @@ class QQAdapter(BasePlatformAdapter):
             if not await self._wait_for_reconnection():
                 return SendResult(success=False, error="Not connected", retryable=True)
 
-        if not content or not content.strip():
+        if not isinstance(content, str) or not content.strip():
             return SendResult(success=True)
 
         formatted = self.format_message(content)

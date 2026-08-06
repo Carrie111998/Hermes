@@ -1004,6 +1004,31 @@ class TestSendUpdatePrompt:
         assert datas == ["update_prompt:y", "update_prompt:n"]
 
 
+class TestSendContentGuards:
+    def _make_adapter(self):
+        from gateway.platforms.qqbot.adapter import QQAdapter
+        return QQAdapter(_make_config(app_id="a", client_secret="b"))
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("content", [None, 0, [], {}])
+    async def test_nonstrings_return_success_without_sending(self, content):
+        adapter = self._make_adapter()
+        adapter.is_connected = True
+
+        called = False
+
+        async def fake_send_chunk(chat_id, chunk, reply_to=None):
+            nonlocal called
+            called = True
+            raise AssertionError("_send_chunk should not be called for invalid content")
+
+        adapter._send_chunk = fake_send_chunk  # type: ignore[assignment]
+
+        result = await adapter.send("user-1", content)  # type: ignore[arg-type]
+        assert result.success is True
+        assert called is False
+
+
 # ---------------------------------------------------------------------------
 # _send_identify includes INTERACTION intent
 # ---------------------------------------------------------------------------
