@@ -114,7 +114,7 @@ def _ephemeral_child_sql(alias: str = "s") -> str:
     )
 
 
-def _sql_session_last_active(alias: str = "s") -> str:
+def _sql_session_last_active(alias: str = "s", has_activity_col: bool = True) -> str:
     """SQL expression for session recency used by list/status surfaces.
 
     Freshest of ``last_activity_at`` (mid-turn agent activity heartbeat) and
@@ -123,32 +123,51 @@ def _sql_session_last_active(alias: str = "s") -> str:
     Must not prefer a stale heartbeat over a newer message: durable
     heartbeats are rate-limited (~60s), so after a turn writes messages
     ``last_activity_at`` can lag ``MAX(messages.timestamp)``.
+
+    Pass ``has_activity_col=False`` when the live DB predates the
+    ``last_activity_at`` column (read-only cross-profile opens skip schema
+    reconciliation, so a dormant profile's state.db may be older than this
+    binary): the expression then degrades to messages-max + started_at
+    instead of referencing a column SQLite doesn't have.
     """
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
         f"WHERE _act_m.session_id = {alias}.id)"
     )
+    activity = (
+        f"SELECT {alias}.last_activity_at AS v UNION ALL " if has_activity_col
+        # See _sql_session_last_active_by_id: UNION ALL needs a non-empty arm.
+        else "SELECT NULL AS v UNION ALL "
+    )
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("
-        f"SELECT {alias}.last_activity_at AS v "
-        f"UNION ALL "
+        f"{activity}"
         f"SELECT {msg_max}"
         f") _act_v), "
         f"{alias}.started_at)"
     )
 
 
-def _sql_session_last_active_by_id(session_id_expr: str) -> str:
+def _sql_session_last_active_by_id(
+    session_id_expr: str, has_activity_col: bool = True
+) -> str:
     """Same freshest-of expression keyed by a session-id SQL expression."""
     msg_max = (
         f"(SELECT MAX(_act_m.timestamp) FROM messages _act_m "
         f"WHERE _act_m.session_id = {session_id_expr})"
     )
-    activity = (
-        f"(SELECT last_activity_at FROM sessions _act_s "
-        f"WHERE _act_s.id = {session_id_expr})"
-    )
+    if has_activity_col:
+        activity = (
+            f"SELECT (SELECT last_activity_at FROM sessions _act_s "
+            f"WHERE _act_s.id = {session_id_expr}) AS v "
+            f"UNION ALL "
+        )
+    else:
+        # UNION ALL requires at least one SELECT; emit a NULL arm so
+        # MAX(_act_v.v) still has a well-formed subquery to scan. The NULL
+        # arm never wins MAX over a real message timestamp.
+        activity = "SELECT NULL AS v UNION ALL "
     started = (
         f"(SELECT started_at FROM sessions _act_s "
         f"WHERE _act_s.id = {session_id_expr})"
@@ -156,8 +175,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
     return (
         f"COALESCE("
         f"(SELECT MAX(_act_v.v) FROM ("
-        f"SELECT {activity} AS v "
-        f"UNION ALL "
+        f"{activity}"
         f"SELECT {msg_max}"
         f") _act_v), "
         f"{started})"

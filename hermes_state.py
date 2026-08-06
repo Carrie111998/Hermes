@@ -2042,6 +2042,10 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
         self._conn = None
+        # Stale-schema guard for list queries (see _live_session_columns):
+        # None = not probed yet; a set = live sessions columns; probe failures
+        # stay per-call (we do not cache the failure).
+        self._live_session_cols: Optional[set] = None
         # Async token accounting (see queue_token_counts). The condition
         # guards queue + writer state; it is distinct from self._lock so
         # enqueue/flush bookkeeping never contends with SQLite writes.
@@ -5862,6 +5866,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # Rows carry token/cost totals — drain queued deltas first so
         # listings (sidebar, /resume, dashboards) show exact counters.
         self.flush_token_counts()
+        # Stale-schema guard: read-only cross-profile opens skip schema
+        # reconciliation, so a dormant profile's state.db can predate this
+        # binary's columns (e.g. last_activity_at). Probe once and degrade
+        # the SQL instead of raising — the desktop sidebar's per-profile
+        # try/except would otherwise swallow the error and silently drop
+        # that whole profile from the session list.
+        live_cols = self._live_session_columns()
+        has_activity_col = "last_activity_at" in live_cols if live_cols is not None else True
         where_clauses = []
         params = []
 
@@ -5991,7 +6003,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 outer_where = (
                     f"{where_sql} AND {combined}" if where_sql else f"WHERE {combined}"
                 )
-            _sel = self._compact_session_cols() if compact_rows else "s.*"
+            _sel = (
+                self._compact_session_cols_live(live_cols) if compact_rows else "s.*"
+            )
             query = f"""
                 WITH RECURSIVE chain(root_id, cur_id) AS (
                     SELECT s.id, s.id FROM sessions s {where_sql}
@@ -6008,7 +6022,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                 chain_max AS (
                     SELECT
                         root_id,
-                        MAX({_sql_session_last_active_by_id("cur_id")}) AS effective_last_active
+                        MAX({_sql_session_last_active_by_id("cur_id", has_activity_col=has_activity_col)}) AS effective_last_active
                     FROM chain
                     GROUP BY root_id
                 )
@@ -6020,7 +6034,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active,
+                    {_sql_session_last_active("s", has_activity_col=has_activity_col)} AS last_active,
                     COALESCE(cm.effective_last_active, s.started_at) AS _effective_last_active
                 FROM sessions s
                 LEFT JOIN chain_max cm ON cm.root_id = s.id
@@ -6033,7 +6047,9 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             # only applies to the outer select.
             params = params + params + id_params + [limit, offset]
         else:
-            _sel = self._compact_session_cols() if compact_rows else "s.*"
+            _sel = (
+                self._compact_session_cols_live(live_cols) if compact_rows else "s.*"
+            )
             query = f"""
                 SELECT {_sel}{prompt_select},
                     COALESCE(
@@ -6043,7 +6059,7 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
                          ORDER BY m.timestamp, m.id LIMIT 1),
                         ''
                     ) AS _preview_raw,
-                    {_sql_session_last_active("s")} AS last_active
+                    {_sql_session_last_active("s", has_activity_col=has_activity_col)} AS last_active
                 FROM sessions s
                 {prompt_join}
                 {where_sql}
@@ -6067,12 +6083,14 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
         # back-filled root then projects to its live tip exactly like a row
         # that had made the page on its own. One extra query, bounded by the
         # number of pins (a handful), never N+1 per pin.
-        if include_pinned:
+        if include_pinned and "pinned" in (live_cols or {"pinned"}):
             seen_ids = {s["id"] for s in sessions}
             pinned_where = (
                 f"{where_sql} AND s.pinned = 1" if where_sql else "WHERE s.pinned = 1"
             )
-            _sel = self._compact_session_cols() if compact_rows else "s.*"
+            _sel = (
+                self._compact_session_cols_live(live_cols) if compact_rows else "s.*"
+            )
             pinned_query = f"""
                 SELECT {_sel}{prompt_select},
                     COALESCE(

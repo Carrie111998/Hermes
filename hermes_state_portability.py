@@ -29,11 +29,56 @@ logger = logging.getLogger("hermes_state")
 class SessionPortabilityMixin:
     """See module docstring — mixin for SessionDB (Port cluster)."""
 
+    def _live_session_columns(self) -> Optional[set]:
+        """Live ``sessions`` column names for this open DB, cached per instance.
+
+        Read-only cross-profile opens skip schema reconciliation on purpose,
+        so a dormant profile's state.db can be older than this binary. List
+        queries intersect the desired projection with this set (when known)
+        so stale DBs degrade (missing column → absent key, i.e. None) instead
+        of raising ``no such column``. Returns None when the probe failed —
+        callers then assume the full schema (normal writable open).
+        """
+        cached = getattr(self, "_live_session_cols", None)
+        if cached is not None:
+            return cached
+        try:
+            with self._read_ctx() as conn:
+                rows = conn.execute('PRAGMA table_info("sessions")').fetchall()
+            self._live_session_cols = {r[1] if not isinstance(r, dict) else r["name"] for r in rows}
+        except Exception:
+            logger.debug("live sessions-column probe failed for %s", self.db_path, exc_info=True)
+            self._live_session_cols = None
+        return self._live_session_cols
+
+    def _compact_session_cols_live(self, live_cols: Optional[set]) -> str:
+        """Compact projection restricted to columns the live DB actually has.
+
+        ``live_cols`` from ``_live_session_columns()``; None means the probe
+        failed and we trust the full declared projection (writable opens are
+        reconciled at startup, so this only matters on read-only paths).
+        """
+        full = self._compact_session_cols()
+        if live_cols is None:
+            return full
+        cols = []
+        for part in full.split(", "):
+            name = part.split(".", 1)[-1]
+            if name in live_cols:
+                cols.append(part)
+        return ", ".join(cols) if cols else "s.*"
+
     @classmethod
     def _compact_session_cols(cls) -> str:
         """SELECT list for compact_rows: every ``sessions`` column declared in
         SCHEMA_SQL except prompt storage internals, aliased with the ``s``
-        prefix used by list_sessions_rich/_get_session_rich_row queries."""
+        prefix used by list_sessions_rich/_get_session_rich_row queries.
+
+        NOTE: this is the code-side contract (what the binary *wants*). The
+        live DB may be older — schema reconciliation is skipped on read-only
+        cross-profile opens — so list queries intersect this projection with
+        ``_live_sessions_columns_sql()`` before composing SQL.
+        """
         if cls._session_compact_cols_sql is None:
             declared = cls._parse_schema_columns(SCHEMA_SQL)["sessions"]
             cls._session_compact_cols_sql = ", ".join(
@@ -175,7 +220,15 @@ class SessionPortabilityMixin:
             return result
         # Same read-your-writes guarantee as list_sessions_rich.
         self.flush_token_counts()
-        _sel = self._compact_session_cols() if compact_rows else "s.*"
+        # Same stale-schema guard as list_sessions_rich: this batch fetch is
+        # the compression-tip projection behind it, so it must honor the same
+        # live-column intersection or the projected tip rows raise on a
+        # dormant profile's older state.db.
+        live_cols = self._live_session_columns()
+        has_activity_col = "last_activity_at" in live_cols if live_cols is not None else True
+        _sel = (
+            self._compact_session_cols_live(live_cols) if compact_rows else "s.*"
+        )
         placeholders = ",".join("?" for _ in ids)
         prompt_select = (
             "" if compact_rows
@@ -194,7 +247,7 @@ class SessionPortabilityMixin:
                      ORDER BY m.timestamp, m.id LIMIT 1),
                     ''
                 ) AS _preview_raw,
-                {_sql_session_last_active("s")} AS last_active
+                {_sql_session_last_active("s", has_activity_col=has_activity_col)} AS last_active
             FROM sessions s
             {prompt_join}
             WHERE s.id IN ({placeholders})
