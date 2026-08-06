@@ -15,6 +15,7 @@ import { cn } from '@/lib/utils'
 import { $backdrop, setBackdrop } from '@/store/backdrop'
 import { $embedAllowed, $embedMode, clearEmbedAllowed, type EmbedMode, setEmbedMode } from '@/store/embed-consent'
 import { $activeGatewayProfile, $profiles, normalizeProfileKey } from '@/store/profile'
+import { $reactionsEnabled, setReactionsEnabled } from '@/store/reactions-enabled'
 import {
   $sessionListDensity,
   type SessionListDensity,
@@ -31,6 +32,7 @@ import { $marketplaceInstalls, isUserTheme, removeUserTheme } from '@/themes/use
 import { MODE_OPTIONS } from './constants'
 import { PetSettings } from './pet-settings'
 import { ListRow, SectionHeading, SettingsContent } from './primitives'
+import { TerminalFontSetting } from './terminal-font-setting'
 
 function ThemePreview({ name, mode }: { name: string; mode: 'light' | 'dark' }) {
   // Preview in the *current* mode: the dark palette in Dark, and the light
@@ -256,6 +258,7 @@ export function AppearanceSettings() {
   const embedMode = useStore($embedMode)
   const embedAllowed = useStore($embedAllowed)
   const translucency = useStore($translucency)
+  const reactionsEnabled = useStore($reactionsEnabled)
   const backdrop = useStore($backdrop)
   const installs = useStore($marketplaceInstalls)
   const profiles = useStore($profiles)
@@ -440,6 +443,8 @@ export function AppearanceSettings() {
             title={a.uiScaleTitle}
           />
 
+          <TerminalFontSetting />
+
           <ListRow
             action={
               <SegmentedControl
@@ -497,6 +502,24 @@ export function AppearanceSettings() {
             }
             description={a.backdropDesc}
             title={a.backdropTitle}
+          />
+
+          <ListRow
+            action={
+              <SegmentedControl
+                onChange={id => {
+                  triggerHaptic('selection')
+                  setReactionsEnabled(id === 'on')
+                }}
+                options={[
+                  { id: 'off', label: t.common.off },
+                  { id: 'on', label: t.common.on }
+                ]}
+                value={reactionsEnabled ? 'on' : 'off'}
+              />
+            }
+            description={a.reactionsDesc}
+            title={a.reactionsTitle}
           />
 
           <ListRow

@@ -174,6 +174,7 @@ export interface Translations {
     errors: {
       elevenLabsNeedsKey: string
       elevenLabsRejectedKey: string
+      diskFull: string
       gatewayAuthFailed: string
       methodNotAllowed: string
       microphonePermission: string
@@ -323,7 +324,7 @@ export interface Translations {
       enableAllDesc: string
       focusedHint: string
       kinds: Record<
-        'approval' | 'backgroundDone' | 'credits' | 'input' | 'turnDone' | 'turnError',
+        'approval' | 'backgroundDone' | 'credits' | 'input' | 'plugin' | 'turnDone' | 'turnError',
         { label: string; description: string }
       >
       test: string
@@ -352,10 +353,17 @@ export interface Translations {
       sessionDensityCompact: string
       sessionDensityComfortable: string
       sessionDensityDetailed: string
+      terminalFontTitle: string
+      terminalFontDesc: string
+      terminalFontPlaceholder: string
+      terminalFontPreview: string
+      terminalFontReset: string
       translucencyTitle: string
       translucencyDesc: string
       backdropTitle: string
       backdropDesc: string
+      reactionsTitle: string
+      reactionsDesc: string
       embedsTitle: string
       embedsDesc: string
       embedsAsk: string
@@ -608,6 +616,8 @@ export interface Translations {
       sshHermesPathTitle: string
       sshHermesPathDesc: string
       sshHermesPathPlaceholder: string
+      sshRemoteProfileTitle: string
+      sshRemoteProfileDesc: string
       sshTestConnection: string
       sshConnect: string
       sshButtonsHint: string
@@ -662,7 +672,7 @@ export interface Translations {
       disableServer: (name: string) => string
       serverEnabled: (name: string) => string
       serverDisabled: (name: string) => string
-      toggleFailed: (name: string) => string
+      toggleFailed: (name: string, enabled: boolean) => string
       tabServers: string
       tabCatalog: string
       catalogLoading: string
@@ -871,7 +881,7 @@ export interface Translations {
     visionModelLink: string
     toolsetsEnabled: (enabled: number, total: number) => string
     configureToolset: (label: string) => string
-    toggleToolset: (label: string) => string
+    toggleToolset: (label: string, enabled: boolean) => string
     skillsLoadFailed: string
     toolsetsRefreshFailed: string
     skillEnabled: string
@@ -1011,6 +1021,10 @@ export interface Translations {
     goTo: string
     goToSession: string
     branches: string
+    projects: string
+    openFolder: string
+    openFolderAt: (path: string) => string
+    newSessionInProject: (project: string) => string
     commands: string
     startInBranch: (branch: string) => string
     commandCenter: string
@@ -1030,7 +1044,7 @@ export interface Translations {
       installed: string
       generatedTag: string
       adoptFailed: string
-      toggleFailed: string
+      toggleFailed: (enabled: boolean) => string
       noneAvailable: string
     }
     generatePet: {
@@ -1209,6 +1223,23 @@ export interface Translations {
     failedUpdate: (name: string) => string
     failedSave: (name: string) => string
     failedClear: (key: string) => string
+    pendingRequests: (count: number) => string
+    pendingAria: (count: number) => string
+    approvedUsers: (count: number) => string
+    approve: string
+    approving: string
+    revoke: string
+    revoking: string
+    revokeAria: (name: string) => string
+    revokeTitle: string
+    revokeDesc: (name: string) => string
+    approvedUser: (name: string) => string
+    approvedHint: string
+    revokedUser: (name: string) => string
+    failedApprove: (name: string) => string
+    failedRevoke: (name: string) => string
+    pairingLockedOut: string
+    waitingSince: (minutes: number) => string
     fieldCopy: Record<string, { label?: string; help?: string; placeholder?: string }>
     platformIntro: Record<string, string>
   }
@@ -1235,7 +1266,7 @@ export interface Translations {
     deleteDescPrefix: string
     deleteDescSuffix: string
     deleteFailed: (name: string) => string
-    toggleFailed: (name: string) => string
+    toggleFailed: (name: string, enabled: boolean) => string
     newSubscription: string
     restarting: string
     restartNeeded: string
@@ -1279,6 +1310,12 @@ export interface Translations {
     search: string
     loading: string
     newProfile: string
+    importProfile: string
+    exportProfile: string
+    imported: string
+    exported: string
+    failedImport: string
+    failedExport: string
     allProfiles: string
     showAllProfiles: string
     switchToProfile: (name: string) => string
@@ -1547,6 +1584,11 @@ export interface Translations {
       menuAddFolder: string
       menuSetActive: string
       menuDelete: string
+      moveToProject: string
+      movedTo: (name: string) => string
+      moveFailed: string
+      moveNoFolder: string
+      moveNoProjects: string
       reveal: string
       copyPath: string
       removeFromSidebar: string
@@ -1561,6 +1603,9 @@ export interface Translations {
       baseBranchPlaceholder: string
       baseBranchNone: string
       startWorkFailed: string
+      worktreeProjectLabel: string
+      worktreeProjectPlaceholder: string
+      worktreeProjectNone: string
       convertBranch: string
       convertBranchTitle: string
       convertBranchDesc: string
@@ -1569,6 +1614,7 @@ export interface Translations {
       branchOpenExisting: string
       branchSwitchHome: string
       branchCreateWorktree: string
+      branchTrackRemote: string
       branchesLoading: string
       noBranches: string
       removeWorktree: string
@@ -1578,7 +1624,7 @@ export interface Translations {
       forceRemove: string
       enter: (label: string) => string
       reorder: (label: string) => string
-      toggle: (label: string) => string
+      toggle: (label: string, open: boolean) => string
       back: string
     }
     newSessionIn: (label: string) => string
@@ -1638,6 +1684,7 @@ export interface Translations {
     newSessionPlaceholders: readonly string[]
     followUpPlaceholders: readonly string[]
     startVoice: string
+    openDirective: string
     queueMessage: string
     steer: string
     stop: string
@@ -2140,10 +2187,6 @@ export interface Translations {
 
   preview: {
     tab: string
-    closeTab: (label: string) => string
-    closeOthers: string
-    closeToRight: string
-    closeAll: string
     closePane: string
     loading: string
     unavailable: string
@@ -2237,16 +2280,11 @@ export interface Translations {
     closeRunningTitle: string
     closeRunningBody: string
     closeRunningConfirm: string
+    reload: string
     closeOthers: string
     closeToRight: string
     closeAll: string
     newSessionTab: string
-    split: (dir: string) => string
-    move: (dir: string) => string
-    dirUp: string
-    dirDown: string
-    dirLeft: string
-    dirRight: string
     pluginDisabled: (pluginId: string) => string
     pluginDisabledBody: string
     missingPane: (paneId: string) => string
@@ -2273,6 +2311,7 @@ export interface Translations {
     saveApply: string
     notExpressible: string
     zoneCount: (count: number) => string
+    tabCount: (count: number) => string
   }
 
   assistant: {
@@ -2291,7 +2330,10 @@ export interface Translations {
       refresh: string
       moreActions: string
       branchNewChat: string
+      react: string
       dismissError: string
+      filesChanged: (count: number) => string
+      reviewChanges: string
       readAloudFailed: string
       preparingAudio: string
       stopReading: string
@@ -2361,6 +2403,8 @@ export interface Translations {
       statusError: string
       statusRecovered: string
       statusDone: string
+      /** Over-budget / rejected memory write title — not "Saved to memory". */
+      memoryWriteNoted: string
       actions: {
         read: string
         reading: string
@@ -2494,7 +2538,7 @@ export interface Translations {
     sidebar: {
       title: string
       description: string
-      toggle: string
+      toggle: (open: boolean) => string
     }
   }
 }
