@@ -464,6 +464,7 @@ class GatewayKanbanWatchersMixin:
                         tag = f"@{who} " if who else ""
                         delivery_metadata = sub.get("delivery_metadata")
                         _supervisor_msg = None
+                        _supervisor_delivery = False
                         if kind in {"blocked", "gave_up", "block_loop_detected"}:
                             # Collection claims the cursor before platform I/O.
                             # Re-read every blocking event at the final delivery
@@ -652,6 +653,48 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            if (
+                                _supervisor_delivery
+                                and isinstance(delivery_metadata, dict)
+                                and delivery_metadata.get("_kanban_supervisor_mode")
+                                == "protected_gate"
+                            ):
+                                delivered_message_id = str(
+                                    getattr(_send_res, "message_id", None) or ""
+                                )
+                                if not delivered_message_id:
+                                    raise RuntimeError(
+                                        "protected gate delivery did not return a message id"
+                                    )
+                                from gateway.kanban_proactive_supervisor import (
+                                    record_supervisor_delivery_message,
+                                )
+
+                                bound = await asyncio.to_thread(
+                                    record_supervisor_delivery_message,
+                                    board=board_slug or _kb.DEFAULT_BOARD,
+                                    task_id=sub["task_id"],
+                                    platform=platform_str,
+                                    chat_id=sub["chat_id"],
+                                    thread_id=sub.get("thread_id") or "",
+                                    notifier_profile=str(
+                                        sub.get("notifier_profile") or ""
+                                    ),
+                                    expected_event_id=int(ev.id),
+                                    expected_token=str(
+                                        delivery_metadata.get(
+                                            "_kanban_supervisor_gate_token"
+                                        )
+                                        or ""
+                                    ),
+                                    message_id=delivered_message_id,
+                                )
+                                if not bound:
+                                    logger.info(
+                                        "kanban notifier: gate %s changed before "
+                                        "message-id binding; delivered prompt is stale",
+                                        sub["task_id"],
+                                    )
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,

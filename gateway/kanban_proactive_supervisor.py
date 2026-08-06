@@ -330,9 +330,79 @@ def render_supervisor_event(
     )
 
 
+def record_supervisor_delivery_message(
+    *,
+    board: str,
+    task_id: str,
+    platform: str,
+    chat_id: str,
+    thread_id: str,
+    notifier_profile: str,
+    expected_event_id: int,
+    expected_token: str,
+    message_id: str,
+) -> bool:
+    """Bind a protected gate generation to the exact delivered bot message."""
+    if not message_id:
+        return False
+    conn = kb.connect(board=board)
+    try:
+        with kb.write_txn(conn):
+            row = conn.execute(
+                "SELECT notifier_profile, delivery_metadata "
+                "FROM kanban_notify_subs WHERE task_id = ? AND platform = ? "
+                "AND chat_id = ? AND thread_id = ?",
+                (task_id, platform, chat_id, thread_id or ""),
+            ).fetchone()
+            if row is None:
+                return False
+            owner = str(row["notifier_profile"] or "")
+            if notifier_profile and owner and owner != notifier_profile:
+                return False
+            metadata = _event_payload(row["delivery_metadata"])
+            if metadata.get("_kanban_supervisor_mode") != "protected_gate":
+                return False
+            if metadata.get("_kanban_supervisor_gate_token") != expected_token:
+                return False
+            try:
+                raw_event_id = metadata.get("_kanban_supervisor_event_id")
+                bound_event_id = int(str(raw_event_id))
+            except (TypeError, ValueError):
+                return False
+            if bound_event_id != int(expected_event_id):
+                return False
+            placeholders = ",".join("?" for _ in kb.SUPERVISOR_STATE_EVENT_KINDS)
+            current = conn.execute(
+                f"SELECT id FROM task_events WHERE task_id = ? "
+                f"AND kind IN ({placeholders}) ORDER BY id DESC LIMIT 1",
+                (task_id, *kb.SUPERVISOR_STATE_EVENT_KINDS),
+            ).fetchone()
+            if current is None or int(current["id"]) != int(expected_event_id):
+                return False
+            metadata["_kanban_supervisor_message_id"] = str(message_id)
+            encoded = json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+            updated = conn.execute(
+                "UPDATE kanban_notify_subs SET delivery_metadata = ? "
+                "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ? "
+                "AND delivery_metadata = ?",
+                (
+                    encoded,
+                    task_id,
+                    platform,
+                    chat_id,
+                    thread_id or "",
+                    row["delivery_metadata"],
+                ),
+            )
+            return updated.rowcount == 1
+    finally:
+        conn.close()
+
+
 def consume_supervisor_reply(
     *,
     reply_to_text: Optional[str],
+    reply_to_message_id: Optional[str],
     answer: str,
     author: str,
     platform: str,
@@ -369,6 +439,13 @@ def consume_supervisor_reply(
                 if metadata.get("_kanban_supervisor_gate_token") != token:
                     continue
                 if metadata.get("_kanban_supervisor_mode") != "protected_gate":
+                    continue
+                delivered_message_id = str(
+                    metadata.get("_kanban_supervisor_message_id") or ""
+                )
+                if not delivered_message_id or delivered_message_id != str(
+                    reply_to_message_id or ""
+                ):
                     continue
                 if str(sub.get("platform") or "").lower() != str(platform).lower():
                     continue

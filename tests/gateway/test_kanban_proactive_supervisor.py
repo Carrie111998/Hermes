@@ -8,11 +8,12 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.config import Platform
-from gateway.platforms.base import MessageEvent, MessageType
+from gateway.platforms.base import MessageEvent, MessageType, SendResult
 from gateway.kanban_proactive_supervisor import (
     ProactiveSupervisorConfig,
     consume_supervisor_reply,
     reconcile_board,
+    record_supervisor_delivery_message,
     render_supervisor_event,
 )
 from gateway.run import GatewayRunner
@@ -49,6 +50,23 @@ def _gate_token(conn, task_id: str) -> str:
     token = metadata["_kanban_supervisor_gate_token"]
     assert re.fullmatch(r"[a-f0-9]{32}", token)
     return token
+
+
+def _set_gate_message_id(conn, task_id: str, message_id: str) -> str:
+    sub = kb.list_notify_subs(conn, task_id)[0]
+    metadata = sub["delivery_metadata"]
+    assert record_supervisor_delivery_message(
+        board="default",
+        task_id=task_id,
+        platform=sub["platform"],
+        chat_id=sub["chat_id"],
+        thread_id=sub.get("thread_id") or "",
+        notifier_profile=str(sub.get("notifier_profile") or ""),
+        expected_event_id=int(metadata["_kanban_supervisor_event_id"]),
+        expected_token=str(metadata["_kanban_supervisor_gate_token"]),
+        message_id=message_id,
+    )
+    return message_id
 
 
 def test_cli_created_protected_gate_gets_profile_owned_subscription(tmp_path, monkeypatch):
@@ -516,6 +534,7 @@ def test_reply_to_protected_prompt_resumes_same_task_graph(tmp_path, monkeypatch
             notifier_profile="default",
         )
         token = _gate_token(conn, task_id)
+        delivered_message_id = _set_gate_message_id(conn, task_id, "gate-message-1")
     finally:
         conn.close()
 
@@ -526,6 +545,7 @@ def test_reply_to_protected_prompt_resumes_same_task_graph(tmp_path, monkeypatch
     )
     result = consume_supervisor_reply(
         reply_to_text=quoted,
+        reply_to_message_id=delivered_message_id,
         answer="Yes, release to current customers only.",
         author="Kevin",
         platform="discord",
@@ -548,6 +568,7 @@ def test_reply_to_protected_prompt_resumes_same_task_graph(tmp_path, monkeypatch
 
         duplicate = consume_supervisor_reply(
             reply_to_text=quoted,
+            reply_to_message_id=delivered_message_id,
             answer="duplicate",
             author="Kevin",
             platform="discord",
@@ -576,6 +597,7 @@ def test_stale_prompt_cannot_resume_a_different_block_generation(tmp_path, monke
         )
         reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
         token = _gate_token(conn, task_id)
+        delivered_message_id = _set_gate_message_id(conn, task_id, "gate-message-a")
         assert kb.unblock_task(conn, task_id)
         assert kb.block_task(
             conn, task_id,
@@ -588,6 +610,7 @@ def test_stale_prompt_cannot_resume_a_different_block_generation(tmp_path, monke
 
     result = consume_supervisor_reply(
         reply_to_text=f"[kanban-gate:{token}]",
+        reply_to_message_id=delivered_message_id,
         answer="approve old gate A",
         author="Kevin",
         platform="discord",
@@ -619,6 +642,7 @@ def test_stale_prompt_cannot_resume_a_later_protected_gate(tmp_path, monkeypatch
         )
         reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
         stale_token = _gate_token(conn, task_id)
+        stale_message_id = _set_gate_message_id(conn, task_id, "gate-message-a")
         assert kb.unblock_task(conn, task_id)
         assert kb.block_task(
             conn, task_id,
@@ -633,6 +657,7 @@ def test_stale_prompt_cannot_resume_a_later_protected_gate(tmp_path, monkeypatch
 
     assert consume_supervisor_reply(
         reply_to_text=f"[kanban-gate:{stale_token}]",
+        reply_to_message_id=stale_message_id,
         answer="approve old gate A",
         author="Kevin",
         platform="discord",
@@ -659,6 +684,7 @@ def test_forged_or_cross_route_prompt_marker_is_ignored(tmp_path, monkeypatch):
         )
         reconcile_board(conn, board="default", config=_config(), notifier_profile="default")
         token = _gate_token(conn, task_id)
+        delivered_message_id = _set_gate_message_id(conn, task_id, "gate-message-1")
     finally:
         conn.close()
 
@@ -670,10 +696,22 @@ def test_forged_or_cross_route_prompt_marker_is_ignored(tmp_path, monkeypatch):
         "notifier_profile": "default",
     }
     assert consume_supervisor_reply(
-        **common, chat_id="hermes-command-channel", reply_to_is_own_message=False
+        **common,
+        chat_id="hermes-command-channel",
+        reply_to_message_id=delivered_message_id,
+        reply_to_is_own_message=False,
     ) is None
     assert consume_supervisor_reply(
-        **common, chat_id="different-channel", reply_to_is_own_message=True
+        **common,
+        chat_id="different-channel",
+        reply_to_message_id=delivered_message_id,
+        reply_to_is_own_message=True,
+    ) is None
+    assert consume_supervisor_reply(
+        **common,
+        chat_id="hermes-command-channel",
+        reply_to_message_id="different-bot-message",
+        reply_to_is_own_message=True,
     ) is None
     conn = kb.connect()
     try:
@@ -799,10 +837,64 @@ class _RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True, message_id=f"sent-{len(self.sent)}")
 
     async def handle_message(self, event):
         self.received.append(event)
         return None
+
+
+def test_notifier_binds_gate_to_exact_delivered_message(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "kanban.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        task_id = kb.create_task(conn, title="Delivered gate", assignee="forge")
+        assert kb.block_task(
+            conn, task_id, reason="Need Kevin's decision", kind="needs_input"
+        )
+        reconcile_board(
+            conn, board="default", config=_config(), notifier_profile="default"
+        )
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(
+        hermes_config,
+        "load_config",
+        lambda: {"kanban": {"proactive_supervisor": {
+            "enabled": True,
+            "platform": "discord",
+            "chat_id": "hermes-command-channel",
+            "chat_type": "channel",
+            "recovery_limit": 1,
+        }}},
+    )
+    adapter = _RecordingAdapter()
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._running = True
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._kanban_sub_fail_counts = {}
+    runner._kanban_dispatcher_lock_handle = object()
+    runner._active_profile_name = lambda: "default"
+    real_sleep = asyncio.sleep
+
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
+        runner._running = False
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    asyncio.run(runner._kanban_notifier_watcher(interval=1))
+
+    assert len(adapter.sent) == 1
+    conn = kb.connect()
+    try:
+        metadata = kb.list_notify_subs(conn, task_id)[0]["delivery_metadata"]
+        assert metadata["_kanban_supervisor_message_id"] == "sent-1"
+    finally:
+        conn.close()
 
 
 def test_gate_resolved_before_delivery_is_silent(tmp_path, monkeypatch):

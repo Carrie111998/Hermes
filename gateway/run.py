@@ -14472,6 +14472,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _gate_reply = consume_supervisor_reply(
                     reply_to_text=getattr(event, "reply_to_text", None),
+                    reply_to_message_id=getattr(event, "reply_to_message_id", None),
                     answer=event.text or "",
                     author=source.user_name or source.user_id or "user",
                     platform=getattr(source.platform, "value", str(source.platform)),
