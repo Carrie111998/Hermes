@@ -668,7 +668,10 @@ class CredentialPool:
         # snapshots of another auth store; rewriting every snapshot on an
         # unrelated local change can erase a newer owner cooldown/quarantine.
         self._dirty_entry_ids: Set[str] = set()
+        self._dirty_entry_generations: Dict[str, int] = {}
+        self._entry_mutation_generation = 0
         self._pending_removed_entries: List[PooledCredential] = []
+        self._pending_removed_entry_generations: Dict[int, int] = {}
         self._trusted_codex_source_owners: Dict[int, _TrustedCodexSourceOwner] = {}
         self._source_status_reset_ids: Set[str] = set()
         self._active_leases: Dict[str, int] = {}
@@ -900,6 +903,56 @@ class CredentialPool:
             ]
             return matches[0].id if len(matches) == 1 else None
 
+    def _record_entry_mutation_unlocked(
+        self,
+        entry_id: str,
+        *,
+        dirty: bool,
+    ) -> int:
+        """Version one entry mutation while ``self._lock`` is held."""
+        self._entry_mutation_generation += 1
+        generation = self._entry_mutation_generation
+        self._dirty_entry_generations[entry_id] = generation
+        self._source_status_reset_ids.discard(entry_id)
+        if dirty:
+            self._dirty_entry_ids.add(entry_id)
+        else:
+            self._dirty_entry_ids.discard(entry_id)
+        return generation
+
+    def _queue_removed_entry_unlocked(self, entry: PooledCredential) -> None:
+        """Record a versioned removal while ``self._lock`` is held."""
+        generation = self._record_entry_mutation_unlocked(entry.id, dirty=False)
+        self._pending_removed_entries.append(entry)
+        self._pending_removed_entry_generations[id(entry)] = generation
+
+    def _dirty_generation_for_snapshot_unlocked(
+        self,
+        entry: PooledCredential,
+    ) -> Optional[int]:
+        current = next(
+            (candidate for candidate in self._entries if candidate.id == entry.id),
+            None,
+        )
+        if current != entry:
+            return None
+        return self._dirty_entry_generations.get(entry.id)
+
+    def _clear_dirty_generation_unlocked(
+        self,
+        entry_id: str,
+        generation: Optional[int],
+    ) -> bool:
+        if (
+            generation is None
+            or self._dirty_entry_generations.get(entry_id) != generation
+        ):
+            return False
+        self._dirty_entry_ids.discard(entry_id)
+        self._source_status_reset_ids.discard(entry_id)
+        self._dirty_entry_generations.pop(entry_id, None)
+        return True
+
     def _replace_entry(
         self,
         old: PooledCredential,
@@ -933,7 +986,7 @@ class CredentialPool:
                         ):
                             self._trusted_codex_source_owners[id(new)] = owner
                     if mark_dirty and old != new:
-                        self._dirty_entry_ids.add(new.id)
+                        self._record_entry_mutation_unlocked(new.id, dirty=True)
                     return new
             return None
 
@@ -959,22 +1012,34 @@ class CredentialPool:
 
             with self._lock:
                 pending_removed = list(self._pending_removed_entries)
+                pending_removed_generations = {
+                    id(entry): self._pending_removed_entry_generations.get(id(entry))
+                    for entry in pending_removed
+                }
                 all_removed = pending_removed + list(removed_entries or [])
                 entries_snapshot = list(self._entries)
                 entries_by_id = {entry.id: entry for entry in entries_snapshot}
                 dirty_entries = [
-                    entries_by_id[entry_id]
+                    (
+                        entries_by_id[entry_id],
+                        self._dirty_entry_generations.get(entry_id),
+                    )
                     for entry_id in self._dirty_entry_ids
                     if entry_id in entries_by_id
                 ]
+                orphan_dirty_generations = {
+                    entry_id: self._dirty_entry_generations.get(entry_id)
+                    for entry_id in self._dirty_entry_ids
+                    if entry_id not in entries_by_id
+                }
                 source_dirty = [
                     entry
-                    for entry in dirty_entries
+                    for entry, _generation in dirty_entries
                     if self._is_trusted_codex_source_owned(entry)
                 ]
                 local_dirty = any(
                     not self._is_trusted_codex_source_owned(entry)
-                    for entry in dirty_entries
+                    for entry, _generation in dirty_entries
                 )
                 source_removed = [
                     entry
@@ -1009,20 +1074,37 @@ class CredentialPool:
                 self._remove_source_owned_alias(entry)
 
             with self._lock:
-                self._dirty_entry_ids.difference_update(
-                    entry.id for entry in dirty_entries
-                )
-                self._source_status_reset_ids.difference_update(
-                    entry.id for entry in dirty_entries
-                )
-                pending_ids = {id(entry) for entry in pending_removed}
-                self._pending_removed_entries = [
-                    entry
-                    for entry in self._pending_removed_entries
-                    if id(entry) not in pending_ids
-                ]
+                for entry, generation in dirty_entries:
+                    self._clear_dirty_generation_unlocked(entry.id, generation)
+                current_ids = {entry.id for entry in self._entries}
+                for entry_id, generation in orphan_dirty_generations.items():
+                    if entry_id not in current_ids:
+                        self._clear_dirty_generation_unlocked(entry_id, generation)
+                retained_removals: List[PooledCredential] = []
+                for entry in self._pending_removed_entries:
+                    snapshot_generation = pending_removed_generations.get(id(entry))
+                    current_generation = self._pending_removed_entry_generations.get(
+                        id(entry)
+                    )
+                    if (
+                        snapshot_generation is not None
+                        and current_generation == snapshot_generation
+                    ):
+                        self._pending_removed_entry_generations.pop(id(entry), None)
+                    else:
+                        retained_removals.append(entry)
+                self._pending_removed_entries = retained_removals
                 for entry in all_removed:
                     self._forget_trusted_codex_source_owner(entry)
+                pending_entry_ids = {
+                    entry.id for entry in self._pending_removed_entries
+                }
+                for entry_id in list(self._dirty_entry_generations):
+                    if (
+                        entry_id not in self._dirty_entry_ids
+                        and entry_id not in pending_entry_ids
+                    ):
+                        self._dirty_entry_generations.pop(entry_id, None)
 
     def _persist_pending_changes(self) -> None:
         with self._lock:
@@ -1327,8 +1409,7 @@ class CredentialPool:
             if not self._entry_tokens_match(current, entry):
                 return False
             self._entries = [item for item in self._entries if item.id != entry.id]
-            self._dirty_entry_ids.discard(entry.id)
-            self._source_status_reset_ids.discard(entry.id)
+            self._record_entry_mutation_unlocked(entry.id, dirty=False)
             if self._current_id == entry.id:
                 self._current_id = None
             self._forget_trusted_codex_source_owner(current)
@@ -1577,6 +1658,8 @@ class CredentialPool:
             source_path,
         ):
             return
+        with self._lock:
+            dirty_generation = self._dirty_generation_for_snapshot_unlocked(entry)
         auth_store = _load_auth_store(source_path)
         changed = False
 
@@ -1619,8 +1702,7 @@ class CredentialPool:
         if changed:
             _save_auth_store(auth_store, target_path=source_path)
         with self._lock:
-            self._dirty_entry_ids.discard(entry.id)
-            self._source_status_reset_ids.discard(entry.id)
+            self._clear_dirty_generation_unlocked(entry.id, dirty_generation)
 
     def _persist_codex_exact_alias_refresh(
         self,
@@ -1630,6 +1712,8 @@ class CredentialPool:
         """Persist a non-singleton Codex refresh to one exact owning row."""
         if not self._codex_write_path_is_authorized(entry, source_path):
             return False
+        with self._lock:
+            dirty_generation = self._dirty_generation_for_snapshot_unlocked(entry)
         auth_store = _load_auth_store(source_path)
         persisted, index, item = self._codex_exact_pool_alias(auth_store, entry)
         if not self._codex_pool_alias_has_complete_credentials(item):
@@ -1646,8 +1730,7 @@ class CredentialPool:
             persisted[index] = updated
             _save_auth_store(auth_store, target_path=source_path)
         with self._lock:
-            self._dirty_entry_ids.discard(entry.id)
-            self._source_status_reset_ids.discard(entry.id)
+            self._clear_dirty_generation_unlocked(entry.id, dirty_generation)
         return True
 
     def _quarantine_codex_exact_alias_refresh(
@@ -2567,8 +2650,11 @@ class CredentialPool:
                         self._entries = [
                             item for item in self._entries if item.id not in removed_ids
                         ]
-                        self._dirty_entry_ids.difference_update(removed_ids)
-                        self._source_status_reset_ids.difference_update(removed_ids)
+                        for removed_id in removed_ids:
+                            self._record_entry_mutation_unlocked(
+                                removed_id,
+                                dirty=False,
+                            )
                         if self._current_id in removed_ids:
                             self._current_id = None
                     if codex_source_path is None:
@@ -2954,7 +3040,8 @@ class CredentialPool:
         else:
             pruned_entries = []
         if pruned_entries:
-            self._pending_removed_entries.extend(pruned_entries)
+            for pruned_entry in pruned_entries:
+                self._queue_removed_entry_unlocked(pruned_entry)
         return available, pending_refresh
 
     def _log_no_available_entries(self) -> None:
@@ -3036,11 +3123,12 @@ class CredentialPool:
                     )
                 ):
                     self._trusted_codex_source_owners[id(candidate)] = owner
-            self._dirty_entry_ids.update(
-                candidate.id
-                for candidate in self._entries
-                if previous_by_id.get(candidate.id) != candidate
-            )
+            for candidate in self._entries:
+                if previous_by_id.get(candidate.id) != candidate:
+                    self._record_entry_mutation_unlocked(
+                        candidate.id,
+                        dirty=True,
+                    )
             self._current_id = entry.id
             return self._current_unlocked() or entry, pending_refresh
 
@@ -3102,6 +3190,11 @@ class CredentialPool:
         failed_source_ids: Set[str],
     ) -> Optional[PooledCredential]:
         with self._lock:
+            if credential_id and credential_id in failed_source_ids:
+                self._unmatched_rotation_streak = 0
+                if self._current_id == credential_id:
+                    self._current_id = None
+                return None
             entry = None
             identity_supplied = bool(credential_id or api_key_hint)
             if credential_id and credential_id not in failed_source_ids:
@@ -3392,6 +3485,10 @@ class CredentialPool:
         """
         failed_source_ids = self._validate_source_owned_codex_entries()
         with self._lock:
+            if credential_id and credential_id in failed_source_ids:
+                if self._current_id == credential_id:
+                    self._current_id = None
+                return None
             entry = None
             if credential_id and credential_id not in failed_source_ids:
                 entry = next(
@@ -3474,7 +3571,7 @@ class CredentialPool:
                         entry,
                         replace(entry, priority=new_priority),
                     )
-            self._pending_removed_entries.append(removed)
+            self._queue_removed_entry_unlocked(removed)
             if self._current_id == removed.id:
                 self._current_id = None
         self._persist_pending_changes()
@@ -3511,7 +3608,7 @@ class CredentialPool:
         with self._lock:
             entry = replace(entry, priority=_next_priority(self._entries))
             self._entries.append(entry)
-            self._dirty_entry_ids.add(entry.id)
+            self._record_entry_mutation_unlocked(entry.id, dirty=True)
         self._persist_pending_changes()
         return entry
 
@@ -3642,32 +3739,14 @@ def _codex_source_pool_alias(
 
 
 def _loaded_codex_source_owner_kind(entry: PooledCredential) -> str:
-    """Classify trusted fallback ownership while its source state is readable."""
-    source_path = entry.source_store_path
-    if source_path is None or entry.source != "device_code":
-        return "pool"
-    try:
-        source_store = auth_mod._load_auth_store(source_path)
-        providers = source_store.get("providers")
-        state = providers.get("openai-codex") if isinstance(providers, dict) else None
-        tokens = state.get("tokens") if isinstance(state, dict) else None
-        alias = (
-            _codex_source_pool_alias(source_path, state)
-            if isinstance(state, dict) and isinstance(tokens, dict)
-            else None
-        )
-    except Exception:
-        return "pool"
-    if (
-        alias is not None
-        and str(alias.get("id") or "") == entry.id
-        and str(alias.get("access_token") or "")
-        == str(tokens.get("access_token") or "")
-        and str(alias.get("refresh_token") or "")
-        == str(tokens.get("refresh_token") or "")
-    ):
-        return "singleton"
-    return "pool"
+    """Classify trusted fallback ownership from the hydrated row snapshot.
+
+    Codex singleton aliases use the canonical ``device_code`` source. Explicit
+    independent accounts are written as ``manual:device_code``. Binding owner
+    kind to that trusted row category avoids a later unlocked provider reread;
+    an uncertain canonical row therefore fails closed as singleton-owned.
+    """
+    return "singleton" if entry.source == "device_code" else "pool"
 
 
 def _seed_from_singletons(

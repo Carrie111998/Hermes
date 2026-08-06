@@ -849,8 +849,12 @@ def test_terminal_singleton_quarantine_removes_only_matching_device_aliases(
     "operation",
     ["status", "reset", "rotation", "selection", "persistence"],
 )
+@pytest.mark.parametrize(
+    "source_removal",
+    ["alias_only", "provider_and_alias"],
+)
 def test_removed_source_revokes_cached_borrower_on_every_pool_path(
-    profile_and_root, operation
+    profile_and_root, operation, source_removal
 ):
     """A cached root row cannot survive once its exact owning source is gone."""
     profile_path, root_path = profile_and_root
@@ -877,7 +881,8 @@ def test_removed_source_revokes_cached_borrower_on_every_pool_path(
     assert cached.source_store_path == root_path
 
     removed = _read_store(root_path)
-    removed["providers"].pop("openai-codex")
+    if source_removal == "provider_and_alias":
+        removed["providers"].pop("openai-codex")
     removed["credential_pool"]["openai-codex"] = [
         item
         for item in removed["credential_pool"]["openai-codex"]
@@ -1036,9 +1041,9 @@ def test_provider_only_removal_revokes_cached_singleton_but_keeps_root_manual(
 
     assert post_count == 0
     assert "root-device" not in {item.id for item in pool.entries()}
-    if operation in {"current", "lease", "refresh"}:
+    if operation in {"current", "lease", "refresh", "rotation"}:
         assert result is None
-    elif operation in {"rotation", "select", "peek"}:
+    elif operation in {"select", "peek"}:
         assert result is not None
         assert result.id == "root-independent"
 
@@ -1325,6 +1330,506 @@ def test_source_validation_failure_fails_borrowed_selection_closed(
     assert result is None
     assert root_path.read_bytes() == root_before
     assert profile_path.read_bytes() == profile_before
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "status",
+        "reset",
+        "rotation",
+        "select",
+        "current",
+        "peek",
+        "lease",
+        "refresh",
+        "persistence",
+    ],
+)
+def test_load_time_provider_removal_never_reclassifies_singleton_as_pool_owned(
+    profile_and_root, monkeypatch, operation
+):
+    """Owner kind comes from the hydrated row, not a later unlocked reread."""
+    profile_path, root_path = profile_and_root
+    root_store = _root_codex_store()
+    root_store["credential_pool"]["openai-codex"] = [
+        root_store["credential_pool"]["openai-codex"][0]
+    ]
+    if operation == "reset":
+        root_store["credential_pool"]["openai-codex"][0].update(
+            {
+                "last_status": "exhausted",
+                "last_status_at": 1.0,
+                "last_error_code": 429,
+            }
+        )
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("load-race"))
+    profile_before = profile_path.read_bytes()
+
+    real_init = CredentialPool.__init__
+    provider_removed = threading.Event()
+
+    def init_then_remove_provider(self, provider, entries):
+        real_init(self, provider, entries)
+        if provider != "openai-codex":
+            return
+        source = _read_store(root_path)
+        source["providers"].pop("openai-codex")
+        _write_store(root_path, source)
+        provider_removed.set()
+
+    monkeypatch.setattr(CredentialPool, "__init__", init_then_remove_provider)
+    post_calls = []
+
+    def unexpected_post(access_token, refresh_token, **_kwargs):
+        post_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "must-not-be-used-access",
+            "refresh_token": "must-not-be-used-refresh",
+        }
+
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_post)
+    pool = CP.load_pool("openai-codex")
+    assert provider_removed.is_set()
+    cached = next(item for item in pool.entries() if item.id == "root-device")
+    if operation == "current":
+        pool._current_id = cached.id
+    root_after_removal = root_path.read_bytes()
+
+    result = None
+    if operation == "status":
+        pool._mark_exhausted(cached, 429)
+    elif operation == "reset":
+        pool.reset_statuses()
+    elif operation == "rotation":
+        result = pool.mark_exhausted_and_rotate(
+            status_code=429,
+            credential_id="root-device",
+        )
+    elif operation == "select":
+        result = pool.select()
+    elif operation == "current":
+        result = pool.current()
+    elif operation == "peek":
+        result = pool.peek()
+    elif operation == "lease":
+        result = pool.acquire_lease("root-device")
+    elif operation == "refresh":
+        result = pool._refresh_entry(cached, force=True)
+    else:
+        pool.add_entry(
+            PooledCredential(
+                provider="openai-codex",
+                id="profile-load-race-added",
+                label="profile load race added",
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=99,
+                source="manual:device_code",
+                access_token="profile-load-race-access",
+                refresh_token="profile-load-race-refresh",
+            )
+        )
+
+    assert result is None
+    assert post_calls == []
+    assert "root-device" not in {item.id for item in pool.entries()}
+    current = pool.current()
+    assert current is None or current.id != "root-device"
+    peeked = pool.peek()
+    assert peeked is None or peeked.id != "root-device"
+    assert pool.acquire_lease("root-device") is None
+    assert root_path.read_bytes() == root_after_removal
+    if operation == "persistence":
+        profile_ids = {
+            item["id"]
+            for item in _read_store(profile_path)["credential_pool"]["openai-codex"]
+        }
+        assert profile_ids == {"profile-load-race-added"}
+    else:
+        assert profile_path.read_bytes() == profile_before
+
+
+def test_unreadable_load_time_owner_classification_fails_singleton_closed(
+    profile_and_root, monkeypatch
+):
+    profile_path, root_path = profile_and_root
+    root_store = _root_codex_store()
+    root_store["credential_pool"]["openai-codex"] = [
+        root_store["credential_pool"]["openai-codex"][0]
+    ]
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("unreadable-kind"))
+    root_before = root_path.read_bytes()
+    profile_before = profile_path.read_bytes()
+
+    real_init = CredentialPool.__init__
+    fail_next_root_read = threading.Event()
+
+    def init_then_arm_unreadable_source(self, provider, entries):
+        real_init(self, provider, entries)
+        if provider == "openai-codex":
+            fail_next_root_read.set()
+
+    real_load = A._load_auth_store
+
+    def fail_one_root_read(path=None):
+        if (
+            fail_next_root_read.is_set()
+            and path is not None
+            and A._same_path(path, root_path)
+        ):
+            fail_next_root_read.clear()
+            raise RuntimeError("fake unreadable owner classification")
+        return real_load(path)
+
+    monkeypatch.setattr(CredentialPool, "__init__", init_then_arm_unreadable_source)
+    monkeypatch.setattr(A, "_load_auth_store", fail_one_root_read)
+
+    pool = CP.load_pool("openai-codex")
+    assert pool.select() is None
+    assert not fail_next_root_read.is_set()
+    assert root_path.read_bytes() == root_before
+    assert profile_path.read_bytes() == profile_before
+
+
+def test_root_manual_row_remains_independently_pool_owned_without_singleton(
+    profile_and_root,
+):
+    profile_path, root_path = profile_and_root
+    root_store = _healthy_root_manual_store()
+    root_store["providers"].pop("openai-codex")
+    root_store["credential_pool"]["openai-codex"] = [
+        item
+        for item in root_store["credential_pool"]["openai-codex"]
+        if item["id"] == "root-independent"
+    ]
+    root_store["credential_pool"]["openai-codex"][0]["priority"] = 0
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("manual-control"))
+
+    pool = CP.load_pool("openai-codex")
+    manual = next(item for item in pool.entries() if item.id == "root-independent")
+    owner = pool._trusted_codex_source_owner(manual)
+    assert owner is not None
+    assert owner.owner_kind == "pool"
+    assert pool.select() == manual
+
+
+@pytest.mark.parametrize("operation", ["rotation", "refresh", "lease"])
+def test_exact_failed_source_id_never_falls_back_to_unrelated_survivors(
+    profile_and_root, monkeypatch, operation
+):
+    profile_path, root_path = profile_and_root
+    root_store = _root_codex_store()
+    root_store["credential_pool"]["openai-codex"] = [
+        root_store["credential_pool"]["openai-codex"][0]
+    ]
+    _write_store(root_path, root_store)
+    _write_store(profile_path, _profile_without_codex_store("exact-failed"))
+    pool = CP.load_pool("openai-codex")
+    for suffix in ("a", "b"):
+        pool.add_entry(
+            PooledCredential(
+                provider="openai-codex",
+                id=f"local-{suffix}",
+                label=f"local {suffix}",
+                auth_type=AUTH_TYPE_OAUTH,
+                priority=99,
+                source="manual:device_code",
+                access_token=f"local-{suffix}-access",
+                refresh_token=f"local-{suffix}-refresh",
+            )
+        )
+    survivor_before = {
+        item.id: item
+        for item in pool.entries()
+        if item.id in {"local-a", "local-b"}
+    }
+
+    @contextmanager
+    def fail_validation(*_args, **_kwargs):
+        raise TimeoutError("fake source validation timeout")
+        yield
+
+    post_calls = []
+
+    def unexpected_post(access_token, refresh_token, **_kwargs):
+        post_calls.append((access_token, refresh_token))
+        return {
+            "access_token": "must-not-be-used-access",
+            "refresh_token": "must-not-be-used-refresh",
+        }
+
+    monkeypatch.setattr(A, "_provider_state_transaction", fail_validation)
+    monkeypatch.setattr(A, "refresh_codex_oauth_pure", unexpected_post)
+
+    if operation == "rotation":
+        result = pool.mark_exhausted_and_rotate(
+            status_code=429,
+            credential_id="root-device",
+        )
+    elif operation == "refresh":
+        result = pool.try_refresh_matching(credential_id="root-device")
+    else:
+        result = pool.acquire_lease("root-device")
+
+    assert result is None
+    assert post_calls == []
+    assert pool.current() is None
+    assert {
+        item.id: item
+        for item in pool.entries()
+        if item.id in {"local-a", "local-b"}
+    } == survivor_before
+
+
+def _local_pool_for_persistence_race(
+    tmp_path,
+    monkeypatch,
+    *,
+    initial_status=None,
+):
+    auth_path = tmp_path / "profile" / "auth.json"
+    monkeypatch.setattr(A, "_auth_file_path", lambda: auth_path)
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    entry = PooledCredential(
+        provider="openrouter",
+        id="local-entry",
+        label="local entry",
+        auth_type="api_key",
+        priority=0,
+        source="manual:api_key",
+        access_token="local-access",
+        last_status=initial_status,
+        last_status_at=1.0 if initial_status else None,
+        last_error_code=429 if initial_status else None,
+        last_error_reason="old_rate_limit" if initial_status else None,
+    )
+    _write_store(
+        auth_path,
+        {
+            "version": 1,
+            "credential_pool": {"openrouter": [entry.to_dict()]},
+        },
+    )
+    return auth_path, CredentialPool("openrouter", [entry])
+
+
+def _run_two_generation_persistence_race(
+    tmp_path,
+    monkeypatch,
+    *,
+    first_mutation,
+    initial_status=None,
+):
+    auth_path, pool = _local_pool_for_persistence_race(
+        tmp_path,
+        monkeypatch,
+        initial_status=initial_status,
+    )
+    first_write_entered = threading.Event()
+    allow_first_write = threading.Event()
+    newer_mutation_done = threading.Event()
+    writes = []
+    errors = []
+    real_write = CP.write_credential_pool
+
+    def paused_write(provider, entries, *, removed_ids=None):
+        writes.append(
+            {
+                "statuses": [entry.get("last_status") for entry in entries],
+                "reasons": [entry.get("last_error_reason") for entry in entries],
+                "removed_ids": list(removed_ids or []),
+            }
+        )
+        if len(writes) == 1:
+            first_write_entered.set()
+            assert allow_first_write.wait(timeout=5)
+        return real_write(provider, entries, removed_ids=removed_ids)
+
+    real_replace = pool._replace_entry
+
+    def tracked_replace(old, new, **kwargs):
+        result = real_replace(old, new, **kwargs)
+        if threading.current_thread().name == "newer-terminal-mutation":
+            newer_mutation_done.set()
+        return result
+
+    monkeypatch.setattr(CP, "write_credential_pool", paused_write)
+    pool._replace_entry = tracked_replace
+
+    def first_worker():
+        try:
+            if first_mutation == "reset":
+                assert pool.reset_statuses() == 1
+            else:
+                current = pool.entries()[0]
+                pool._mark_exhausted(
+                    current,
+                    429,
+                    {"reason": "rate_limit"},
+                )
+        except BaseException as exc:
+            errors.append(("first", exc))
+
+    def newer_worker():
+        try:
+            current = pool.entries()[0]
+            pool._mark_exhausted(
+                current,
+                401,
+                {"reason": "invalid_grant"},
+            )
+        except BaseException as exc:
+            errors.append(("newer", exc))
+
+    first = threading.Thread(target=first_worker, name="older-persistence")
+    newer = threading.Thread(target=newer_worker, name="newer-terminal-mutation")
+    first.start()
+    assert first_write_entered.wait(timeout=5)
+    assert pool._lock.acquire(timeout=1)
+    pool._lock.release()
+    newer.start()
+    assert newer_mutation_done.wait(timeout=5)
+    allow_first_write.set()
+    first.join(timeout=5)
+    newer.join(timeout=5)
+
+    assert not first.is_alive()
+    assert not newer.is_alive()
+    assert errors == []
+    memory_entry = pool.entries()[0]
+    disk_entry = _read_store(auth_path)["credential_pool"]["openrouter"][0]
+    assert memory_entry.last_status == "dead"
+    assert memory_entry.last_error_reason == "invalid_grant"
+    assert disk_entry["last_status"] == "dead"
+    assert disk_entry["last_error_reason"] == "invalid_grant"
+    expected_first_status = None if first_mutation == "reset" else "exhausted"
+    expected_first_reason = None if first_mutation == "reset" else "rate_limit"
+    assert [write["statuses"] for write in writes] == [
+        [expected_first_status],
+        ["dead"],
+    ]
+    assert [write["reasons"] for write in writes] == [
+        [expected_first_reason],
+        ["invalid_grant"],
+    ]
+    pool._persist_pending_changes()
+    assert len(writes) == 2
+
+
+def test_reset_snapshot_cannot_clear_newer_terminal_dirty_generation(
+    tmp_path, monkeypatch
+):
+    _run_two_generation_persistence_race(
+        tmp_path,
+        monkeypatch,
+        first_mutation="reset",
+        initial_status="exhausted",
+    )
+
+
+def test_cooldown_snapshot_cannot_clear_newer_terminal_dirty_generation(
+    tmp_path, monkeypatch
+):
+    _run_two_generation_persistence_race(
+        tmp_path,
+        monkeypatch,
+        first_mutation="cooldown",
+    )
+
+
+def test_removal_persistence_converges_after_same_id_readd(
+    tmp_path, monkeypatch
+):
+    auth_path, pool = _local_pool_for_persistence_race(tmp_path, monkeypatch)
+    first_write_entered = threading.Event()
+    allow_first_write = threading.Event()
+    readd_mutated = threading.Event()
+    writes = []
+    errors = []
+    real_write = CP.write_credential_pool
+    real_pending = pool._persist_pending_changes
+
+    def paused_write(provider, entries, *, removed_ids=None):
+        writes.append(
+            {
+                "ids": [entry.get("id") for entry in entries],
+                "tokens": [entry.get("access_token") for entry in entries],
+                "removed_ids": list(removed_ids or []),
+            }
+        )
+        if len(writes) == 1:
+            first_write_entered.set()
+            assert allow_first_write.wait(timeout=5)
+        return real_write(provider, entries, removed_ids=removed_ids)
+
+    def tracked_pending():
+        if threading.current_thread().name == "same-id-readd":
+            readd_mutated.set()
+        return real_pending()
+
+    monkeypatch.setattr(CP, "write_credential_pool", paused_write)
+    pool._persist_pending_changes = tracked_pending
+
+    def remove_worker():
+        try:
+            removed = pool.remove_index(1)
+            assert removed is not None
+            assert removed.id == "local-entry"
+        except BaseException as exc:
+            errors.append(("remove", exc))
+
+    def readd_worker():
+        try:
+            pool.add_entry(
+                PooledCredential(
+                    provider="openrouter",
+                    id="local-entry",
+                    label="replacement entry",
+                    auth_type="api_key",
+                    priority=0,
+                    source="manual:api_key",
+                    access_token="replacement-access",
+                )
+            )
+        except BaseException as exc:
+            errors.append(("readd", exc))
+
+    remover = threading.Thread(target=remove_worker, name="remove-entry")
+    readd = threading.Thread(target=readd_worker, name="same-id-readd")
+    remover.start()
+    assert first_write_entered.wait(timeout=5)
+    assert pool._lock.acquire(timeout=1)
+    pool._lock.release()
+    readd.start()
+    assert readd_mutated.wait(timeout=5)
+    allow_first_write.set()
+    remover.join(timeout=5)
+    readd.join(timeout=5)
+
+    assert not remover.is_alive()
+    assert not readd.is_alive()
+    assert errors == []
+    memory_entries = pool.entries()
+    assert [(entry.id, entry.access_token) for entry in memory_entries] == [
+        ("local-entry", "replacement-access")
+    ]
+    disk_entries = _read_store(auth_path)["credential_pool"]["openrouter"]
+    assert [(entry["id"], entry["access_token"]) for entry in disk_entries] == [
+        ("local-entry", "replacement-access")
+    ]
+    assert writes == [
+        {"ids": [], "tokens": [], "removed_ids": ["local-entry"]},
+        {
+            "ids": ["local-entry"],
+            "tokens": ["replacement-access"],
+            "removed_ids": [],
+        },
+    ]
+    pool._persist_pending_changes()
+    assert len(writes) == 2
 
 
 @pytest.mark.parametrize("construction", ["direct", "replace_then_add"])
