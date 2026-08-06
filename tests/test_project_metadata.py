@@ -153,8 +153,15 @@ def test_pyproject_pins_match_lazy_deps_pins():
     )
 
 
+def test_firecrawl_dependency_sets_pin_aiohttp():
+    """Firecrawl imports aiohttp.ClientResponse while its module loads."""
+    from tools.lazy_deps import LAZY_DEPS
 
+    optional_dependencies = _load_optional_dependencies()
+    expected = "3.14.1"
 
+    assert _exact_pins(optional_dependencies["firecrawl"]).get("aiohttp") == expected
+    assert _exact_pins(LAZY_DEPS["search.firecrawl"]).get("aiohttp") == expected
 
 
 def test_dingtalk_extra_includes_qrcode_for_qr_auth():

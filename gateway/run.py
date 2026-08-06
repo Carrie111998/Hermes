@@ -285,6 +285,7 @@ def _ensure_windows_gateway_venv_imports() -> None:
     if os.environ.get("VIRTUAL_ENV"):
         candidates.append(Path(os.environ["VIRTUAL_ENV"]))
     candidates.append(project_root / "venv")
+    candidates.append(project_root / ".venv")
 
     seen: set[str] = set()
     for venv_dir in candidates:
