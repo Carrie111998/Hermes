@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
-import { offsetFromPosition } from './inputMetrics.js'
+import { composerLocalPoint, offsetFromPosition } from './inputMetrics.js'
 
 // offsetFromPosition maps a click at a visual (row, col) back to a character
 // offset in the composer value. It backs textInput's click-to-position and
@@ -62,5 +62,61 @@ describe('offsetFromPosition', () => {
 
   it('floors fractional row/column inputs', () => {
     expect(offsetFromPosition('hello world', 0.9, 6.4, 80)).toBe(6)
+  })
+})
+
+// Presses that land on the composer PARENT row (prompt gutter, the gap right
+// of the input) or on the spacer above it bubble past TextInput's own handler,
+// so appLayout has to translate them itself. This used to call
+// startAtBeginning() and drop the caret at offset 0 no matter where the user
+// clicked — the parent-row half of #30536. composerLocalPoint is that mapping;
+// composed with offsetFromPosition it must land on the clicked cell.
+
+describe('composerLocalPoint', () => {
+  const promptWidth = 3 // e.g. "> " plus the gap column
+
+  describe("parent composer row ('shared' origin)", () => {
+    it('backs the prompt gutter out of the column and keeps the row', () => {
+      expect(composerLocalPoint({ localCol: 9, localRow: 1 }, promptWidth, 'shared')).toEqual({ col: 6, row: 1 })
+    })
+
+    it('maps a press on the parent row to the clicked offset, not offset 0', () => {
+      // "ab\ncd": clicking row 1, terminal column 4 → local column 1 → 'd'.
+      const at = composerLocalPoint({ localCol: promptWidth + 1, localRow: 1 }, promptWidth, 'shared')
+
+      expect(offsetFromPosition('ab\ncd', at.row, at.col, 80)).toBe(4)
+    })
+
+    it('resolves a press on the prompt cell to column 0 of that row, not the buffer start', () => {
+      // Negative local column (inside the gutter) clamps to the row start —
+      // row 1 of "ab\ncd" begins at offset 3, so the caret must NOT go to 0.
+      const at = composerLocalPoint({ localCol: 0, localRow: 1 }, promptWidth, 'shared')
+
+      expect(at.col).toBe(-promptWidth)
+      expect(offsetFromPosition('ab\ncd', at.row, at.col, 80)).toBe(3)
+    })
+
+    it('honors soft-wrapped rows', () => {
+      // "abcdef" at cols=3 wraps to "abc" / "def"; row 1, local col 2 → 'f'.
+      const at = composerLocalPoint({ localCol: promptWidth + 2, localRow: 1 }, promptWidth, 'shared')
+
+      expect(offsetFromPosition('abcdef', at.row, at.col, 3)).toBe(5)
+    })
+  })
+
+  describe("spacer row ('row-zero' origin)", () => {
+    it('pins the row to 0 so a vertical offset cannot pick the wrong wrapped line', () => {
+      expect(composerLocalPoint({ localCol: 9, localRow: 4 }, promptWidth, 'row-zero')).toEqual({ col: 6, row: 0 })
+    })
+
+    it('still maps the column onto the first visual row', () => {
+      const at = composerLocalPoint({ localCol: promptWidth + 1, localRow: 2 }, promptWidth, 'row-zero')
+
+      expect(offsetFromPosition('ab\ncd', at.row, at.col, 80)).toBe(1) // 'b'
+    })
+  })
+
+  it('treats missing coordinates as the origin', () => {
+    expect(composerLocalPoint({}, promptWidth, 'shared')).toEqual({ col: -promptWidth, row: 0 })
   })
 })
