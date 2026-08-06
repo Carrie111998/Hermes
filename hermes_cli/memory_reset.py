@@ -47,6 +47,15 @@ def _iter_session_id_batches(db: Any) -> Iterable[list[str]]:
         yield ids
 
 
+def _close_db(db: Any) -> None:
+    if db is None:
+        return
+    try:
+        db.close()
+    except Exception:
+        pass
+
+
 def _delete_conversations(db: Any, sessions_dir: Path) -> int:
     deleted = 0
     for session_ids in _iter_session_id_batches(db):
@@ -58,10 +67,12 @@ def _delete_conversations(db: Any, sessions_dir: Path) -> int:
             )
         deleted += removed
 
-    remaining = db.session_count(include_archived=True)
-    if remaining:
+    remaining_sessions = db.session_count(include_archived=True)
+    remaining_messages = db.message_count()
+    if remaining_sessions or remaining_messages:
         raise RuntimeError(
-            f"{remaining} session(s) remained; stop the gateway and retry"
+            f"{remaining_sessions} session(s) and {remaining_messages} message(s) "
+            "remained; stop the gateway and retry"
         )
     return deleted
 
@@ -96,15 +107,13 @@ def cmd_memory_reset(args: Any) -> int:
             session_count = db.session_count(include_archived=True)
             message_count = db.message_count()
         except Exception as exc:
-            if db is not None:
-                db.close()
+            _close_db(db)
             print(f"\n  ✗ Could not inspect conversation history: {exc}\n")
             return 1
 
     has_conversations = bool(db is not None and (session_count or message_count))
     if not existing_files and not has_conversations:
-        if db is not None:
-            db.close()
+        _close_db(db)
         print("\n  Nothing to reset.\n")
         return 0
 
@@ -128,8 +137,7 @@ def cmd_memory_reset(args: Any) -> int:
         except (EOFError, KeyboardInterrupt):
             answer = ""
         if answer != "yes":
-            if db is not None:
-                db.close()
+            _close_db(db)
             print("  Cancelled.\n")
             return 0
 
@@ -140,16 +148,20 @@ def cmd_memory_reset(args: Any) -> int:
             print(f"  ✗ Failed to clear conversation history: {exc}")
             return 1
         finally:
-            db.close()
+            _close_db(db)
         print(
             "  ✓ Cleared conversation history "
             f"({deleted_sessions:,} sessions, {message_count:,} messages)"
         )
     elif db is not None:
-        db.close()
+        _close_db(db)
 
     for name, description in existing_files:
-        (memories_dir / name).unlink()
+        try:
+            (memories_dir / name).unlink()
+        except OSError as exc:
+            print(f"  ✗ Failed to delete {name}: {exc}")
+            return 1
         print(f"  ✓ Deleted {name} ({description})")
 
     print("\n  Memory reset complete.")
