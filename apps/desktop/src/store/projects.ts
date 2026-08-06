@@ -13,9 +13,10 @@ import { desktopGit } from '@/lib/desktop-git'
 import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isUnderPath } from '@/lib/path-compare'
 import { persistentAtom } from '@/lib/persisted'
+import type { ComposerAttachment } from '@/store/composer'
 import { $gateway, activeGateway, ensureActiveGatewayOpen } from '@/store/gateway'
 import { setSidebarAgentsGrouped } from '@/store/layout'
-import { notify } from '@/store/notifications'
+import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, requestFreshSession } from '@/store/profile'
 import {
   $selectedStoredSessionId,
@@ -192,7 +193,9 @@ export function goToProject(id: string, options?: { newSession?: boolean }): voi
   const cwd = projectRootCwd($projectTree.get().find(node => node.id === id))
 
   if (cwd) {
-    requestStartWorkSession(cwd, undefined, { openTab: true })
+    void startIsolatedWorkSession(cwd, 'new project chat').catch(error => {
+      notifyError(error, 'Create isolated project chat')
+    })
   } else {
     requestFreshSession()
   }
@@ -1077,6 +1080,7 @@ export async function switchBranchInRepo(repoPath: string, branch: string): Prom
 // task. A monotonic token lets a rapid second request re-fire the controller's
 // effect even if the path repeats.
 export interface StartWorkSessionRequest {
+  attachments?: ComposerAttachment[]
   draft?: string
   /** Stack the fresh session as a tab when main already holds a chat (palette/⌘O opens-from-nowhere). */
   openTab?: boolean
@@ -1110,7 +1114,11 @@ export function closeWorktreeDialog(): void {
 
 let startWorkToken = 0
 
-export function requestStartWorkSession(path: string, draft?: string, options?: { openTab?: boolean }): void {
+export function requestStartWorkSession(
+  path: string,
+  draft?: string,
+  options?: { attachments?: ComposerAttachment[]; openTab?: boolean }
+): void {
   const target = path.trim()
 
   if (!target) {
@@ -1119,11 +1127,64 @@ export function requestStartWorkSession(path: string, draft?: string, options?: 
 
   startWorkToken += 1
   $startWorkSessionRequest.set({
+    attachments: options?.attachments?.map(attachment => ({ ...attachment })),
     draft: draft?.trim() || undefined,
     openTab: options?.openTab || undefined,
     path: target,
     token: startWorkToken
   })
+}
+
+let isolatedWorkSequence = 0
+
+function isolatedWorkSlug(draft: string): string {
+  const slug = draft
+    .normalize('NFKD')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 32)
+    .replace(/-+$/g, '')
+
+  return slug || 'task'
+}
+
+/**
+ * Start a coding chat only after Git has created its dedicated worktree.
+ * Fails closed when Git/worktree creation is unavailable: falling back to the
+ * shared repository root would let concurrent chats mutate the same checkout.
+ */
+export async function startIsolatedWorkSession(
+  repoPath: string,
+  draft: string,
+  attachments: ComposerAttachment[] = [],
+  options?: { base?: string }
+): Promise<{ branch: string; path: string }> {
+  const root = repoPath.trim()
+
+  if (!root) {
+    throw new Error('A repository is required to create an isolated worktree.')
+  }
+
+  isolatedWorkSequence += 1
+
+  const prefix = isolatedWorkSlug(draft)
+  const suffix = `${Date.now().toString(36)}-${isolatedWorkSequence.toString(36)}`
+  const name = `${prefix}-${suffix}`
+
+  const started = await startWorkInRepo(root, {
+    base: options?.base,
+    branch: `hermes/${name}`,
+    name
+  })
+
+  if (!started) {
+    throw new Error('A dedicated Git worktree could not be created.')
+  }
+
+  requestStartWorkSession(started.path, draft, { attachments, openTab: true })
+
+  return started
 }
 
 export async function removeWorktreePath(

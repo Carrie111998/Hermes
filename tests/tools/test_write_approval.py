@@ -155,6 +155,35 @@ _SKILL = (
 # ---------------------------------------------------------------------------
 
 
+def test_background_writes_are_always_proposal_only_and_require_repetition(hermes_home):
+    from hermes_cli.workspace_learning import LearningStore
+    from tools import write_approval as wa
+    from tools.skill_provenance import reset_current_write_origin, set_current_write_origin
+
+    token = set_current_write_origin("background_review")
+    try:
+        decision = wa.evaluate_gate(wa.MEMORY)
+        assert decision.stage is True
+        payload = {"action": "add", "target": "user", "content": "Prefer concise replies"}
+        first = wa.stage_write(wa.MEMORY, payload, summary="preference", origin="background_review")
+        assert first["candidate_id"] is None
+        assert wa.pending_count(wa.MEMORY) == 0
+        second = wa.stage_write(wa.MEMORY, payload, summary="preference", origin="background_review")
+        assert second["candidate_id"].startswith("candidate_")
+        assert wa.pending_count(wa.MEMORY) == 0
+    finally:
+        reset_current_write_origin(token)
+
+    store = LearningStore(os.path.join(hermes_home, "workspace-learning.db"))
+    try:
+        candidates = store.list_candidates(include_terminal=True)
+        assert len(candidates) == 1
+        assert candidates[0]["status"] == "staged"
+        assert candidates[0]["destination"] == "user_memory"
+    finally:
+        store.close()
+
+
 def test_handle_approve_all(hermes_home):
     from hermes_cli.write_approval_commands import handle_pending_subcommand
     from tools.memory_tool import MemoryStore

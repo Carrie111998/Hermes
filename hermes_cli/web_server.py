@@ -2760,6 +2760,13 @@ def _git_path(path: str) -> str:
 from hermes_cli.web_routers import git as _git_routes  # noqa: E402
 
 app.include_router(_git_routes.router)
+from hermes_cli.web_routers import workspace as _workspace_routes  # noqa: E402
+from hermes_cli.web_routers import workspace_learning as _workspace_learning_routes  # noqa: E402
+from hermes_cli.web_routers import workspace_runners as _workspace_runner_routes  # noqa: E402
+
+app.include_router(_workspace_routes.router)
+app.include_router(_workspace_learning_routes.router)
+app.include_router(_workspace_runner_routes.router)
 from hermes_cli.web_routers.git import (  # noqa: E402,F401 — legacy re-exports; tests call these via web_server.<name>
     git_status_route,
     git_worktrees_route,
@@ -15901,6 +15908,11 @@ async def pty_ws(ws: WebSocket) -> None:
     raw_resume = ws.query_params.get("resume") or None
     resume = raw_resume
     profile = ws.query_params.get("profile") or None
+    workspace_binding = ws.query_params.get("binding") or None
+    if workspace_binding and resume:
+        await ws.send_text("\r\n\x1b[31mChat unavailable: binding cannot be combined with resume.\x1b[0m\r\n")
+        await ws.close(code=1008)
+        return
     channel = _channel_or_close_code(ws)
     sidecar_url = _build_sidecar_url(channel) if channel else None
     force_fresh = (ws.query_params.get("fresh") or "").strip().lower() in {
@@ -15929,10 +15941,31 @@ async def pty_ws(ws: WebSocket) -> None:
 
     try:
         argv, cwd, env = await _resolve_chat_argv_async(**resolve_kwargs)
+        if workspace_binding:
+            cwd = str(
+                _workspace_routes.resolve_workspace_binding_for_profile(
+                    workspace_binding,
+                    profile,
+                )
+            )
+        scoped_project_id = None
+        if cwd:
+            scoped_project_id, _scoped_binding_id = _workspace_routes.workspace_scope_for_path(
+                cwd,
+                profile,
+            )
+        env = dict(env or os.environ)
+        env.pop("HERMES_WORKSPACE_PROJECT_ID", None)
+        if scoped_project_id:
+            env["HERMES_WORKSPACE_PROJECT_ID"] = scoped_project_id
     except HTTPException as exc:
         # Unknown/invalid profile from _resolve_profile_dir.
         await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc.detail}\x1b[0m\r\n")
         await ws.close(code=1011)
+        return
+    except ValueError as exc:
+        await ws.send_text(f"\r\n\x1b[31mChat unavailable: {exc}\x1b[0m\r\n")
+        await ws.close(code=1008)
         return
     except SystemExit as exc:
         # _make_tui_argv calls sys.exit(1) when node/npm is missing.
@@ -15945,9 +15978,12 @@ async def pty_ws(ws: WebSocket) -> None:
     registry_resume = raw_resume
     if raw_resume and env:
         registry_resume = env.get("HERMES_TUI_RESUME") or raw_resume
-    if attach_token is not None and (registry_resume or profile):
+    if attach_token is not None and (registry_resume or profile or workspace_binding):
         # Key explicit resumes on their canonical target, never the active-session fallback.
-        attach_token = f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+        attach_token = (
+            f"{attach_token}\0{profile or ''}\0{registry_resume or ''}"
+            f"\0{workspace_binding or ''}"
+        )
 
     def _spawn():
         return PtyBridge.spawn(argv, cwd=cwd, env=env)

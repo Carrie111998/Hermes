@@ -254,11 +254,15 @@ declare global {
           unstage: (repoPath: string, filePath?: null | string) => Promise<{ ok: boolean }>
           revert: (repoPath: string, filePath?: null | string) => Promise<{ ok: boolean }>
           revParse: (repoPath: string, ref?: null | string) => Promise<null | string>
-          commit: (repoPath: string, message: string, push: boolean) => Promise<{ ok: boolean }>
+          commit: (repoPath: string, message: string) => Promise<{ ok: boolean }>
           // Diff (staged-or-all) + recent commit subjects for drafting a
           // commit message. Reads only; empty strings off-repo.
           commitContext: (repoPath: string) => Promise<{ diff: string; recent: string }>
-          push: (repoPath: string) => Promise<{ ok: boolean }>
+          createPushRequest: (repoPath: string) => Promise<HermesPushRequest>
+          pushApproved: (
+            repoPath: string,
+            decision: HermesPushApprovalDecision
+          ) => Promise<{ commitSha: string; ok: boolean }>
           shipInfo: (repoPath: string) => Promise<HermesReviewShipInfo>
           // The PR on each of the given branches — plus any known only by
           // number — for badging a list of sessions in one request instead of
@@ -961,6 +965,25 @@ export interface HermesRepoPullRequests {
 export interface HermesReviewShipInfo {
   ghReady: boolean
   pr: HermesReviewPr | null
+  pushAvailable: boolean
+}
+
+export interface HermesPushRequest {
+  changeSetDigest: string
+  commitSha: string
+  createdAt: string
+  destinationBranch: string
+  expiresAt: string
+  remote: string
+  remoteUrl: string
+  remoteUrlDigest: string
+  requestId: string
+}
+
+export interface HermesPushApprovalDecision extends HermesPushRequest {
+  approved: boolean
+  approvedBy: string
+  decidedAt: string
 }
 
 export interface HermesReadDirEntry {

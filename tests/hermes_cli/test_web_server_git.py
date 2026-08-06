@@ -31,6 +31,16 @@ def _git(repo: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True)
 
 
+def _git_out(repo: Path, *args: str) -> str:
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True, text=True).stdout.strip()
+
+
+def _git_ref_exists(repo: Path, ref: str) -> bool:
+    return subprocess.run(
+        ["git", "show-ref", "--verify", "--quiet", ref], cwd=repo, check=False
+    ).returncode == 0
+
+
 @pytest.fixture
 def repo(tmp_path):
     root = tmp_path / "repo"
@@ -46,6 +56,29 @@ def repo(tmp_path):
     (root / "a.txt").write_text("one\ntwo\nthree\n")
     (root / "new.py").write_text("print(1)\nprint(2)\n")
     return root
+
+
+@pytest.fixture
+def push_repo(tmp_path):
+    root = tmp_path / "push-repo"
+    remote = tmp_path / "remote.git"
+    root.mkdir()
+    remote.mkdir()
+    _git(root, "init", "-q")
+    _git(root, "config", "user.email", "t@example.com")
+    _git(root, "config", "user.name", "Test")
+    (root / "a.txt").write_text("initial\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "initial")
+    _git(root, "branch", "-M", "main")
+    _git(remote, "init", "--bare", "-q")
+    _git(root, "remote", "add", "origin", str(remote))
+    _git(root, "push", "-qu", "origin", "main")
+    (root / "a.txt").write_text("approved\n")
+    _git(root, "add", "-A")
+    _git(root, "commit", "-qm", "approved")
+
+    return root, remote
 
 
 
@@ -69,6 +102,81 @@ def test_stage_commit_roundtrip_clears_changes(client, repo):
     # The tracked change is committed; only the untracked file remains.
     assert after["changed"] == 1
     assert after["untracked"] == 1
+
+
+def test_direct_push_endpoint_cannot_bypass_approval(client, push_repo):
+    root, remote = push_repo
+    remote_before = _git_out(remote, "rev-parse", "refs/heads/main")
+
+    response = client.post("/api/git/review/push", json={"path": str(root)})
+
+    assert response.status_code == 400
+    assert "approval" in response.json()["detail"].lower()
+    assert _git_out(remote, "rev-parse", "refs/heads/main") == remote_before
+
+
+def test_push_request_approval_roundtrip_is_single_use(client, push_repo):
+    root, remote = push_repo
+    request_response = client.post("/api/git/review/push-request", json={"path": str(root)})
+
+    assert request_response.status_code == 200
+    request = request_response.json()
+    assert request["commitSha"] == _git_out(root, "rev-parse", "HEAD")
+    assert len(request["changeSetDigest"]) == 64
+
+    decision = {
+        **request,
+        "approved": True,
+        "approvedBy": "remote-user",
+        "decidedAt": "2026-08-06T00:00:00.000Z",
+    }
+    approved = client.post(
+        "/api/git/review/push-approved", json={"path": str(root), "decision": decision}
+    )
+
+    assert approved.status_code == 200
+    assert approved.json()["commitSha"] == request["commitSha"]
+    assert _git_out(remote, "rev-parse", "refs/heads/main") == request["commitSha"]
+
+    replay = client.post(
+        "/api/git/review/push-approved", json={"path": str(root), "decision": decision}
+    )
+    assert replay.status_code == 400
+
+
+@pytest.mark.parametrize("remote_setting", ["url", "pushurl"])
+def test_push_approval_rejects_destination_substitution(
+    client, push_repo, tmp_path, remote_setting
+):
+    root, approved_remote = push_repo
+    substituted_remote = tmp_path / f"substituted-{remote_setting}.git"
+    substituted_remote.mkdir()
+    _git(substituted_remote, "init", "--bare", "-q")
+    approved_before = _git_out(approved_remote, "rev-parse", "refs/heads/main")
+    request = client.post(
+        "/api/git/review/push-request", json={"path": str(root)}
+    ).json()
+    args = ["remote", "set-url"]
+    if remote_setting == "pushurl":
+        args.append("--push")
+    _git(root, *args, "origin", str(substituted_remote))
+
+    response = client.post(
+        "/api/git/review/push-approved",
+        json={
+            "path": str(root),
+            "decision": {
+                **request,
+                "approved": True,
+                "approvedBy": "remote-user",
+                "decidedAt": "2026-08-06T00:00:00.000Z",
+            },
+        },
+    )
+
+    assert response.status_code == 400
+    assert _git_out(approved_remote, "rev-parse", "refs/heads/main") == approved_before
+    assert not _git_ref_exists(substituted_remote, "refs/heads/main")
 
 
 

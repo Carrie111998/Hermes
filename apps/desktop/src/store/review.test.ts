@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { HermesReviewFile, HermesReviewShipInfo } from '@/global'
+import type { HermesPushRequest, HermesReviewFile, HermesReviewShipInfo } from '@/global'
 
 import {
   $reviewCommitDefault,
@@ -12,23 +12,26 @@ import {
   $reviewLoading,
   $reviewMaxChurn,
   $reviewOpen,
+  $reviewPushRequest,
   $reviewRevertTarget,
   $reviewScopeCwd,
   $reviewSelectedPath,
   $reviewShipBusy,
   $reviewShipInfo,
   $reviewTreeMode,
+  cancelPushApproval,
   cancelRevert,
   clearReviewSelection,
   closeReview,
   commitChanges,
+  confirmPushApproval,
   confirmRevert,
   createOrOpenPr,
   generateCommitMessage,
   openReview,
-  pushChanges,
   refreshReview,
   refreshShipInfo,
+  requestPushApproval,
   requestRevert,
   revertReviewFile,
   selectReviewFile,
@@ -53,6 +56,18 @@ function file(path: string, over: Partial<HermesReviewFile> = {}): HermesReviewF
   return { path, status: 'modified', staged: false, added: 1, removed: 0, ...over } as HermesReviewFile
 }
 
+const pushRequest: HermesPushRequest = {
+  changeSetDigest: 'digest',
+  commitSha: 'abc123',
+  createdAt: '2026-08-06T00:00:00.000Z',
+  destinationBranch: 'feature/work',
+  expiresAt: '2026-08-06T00:10:00.000Z',
+  remote: 'origin',
+  remoteUrl: 'https://github.com/example/project.git',
+  remoteUrlDigest: 'url-digest',
+  requestId: 'request-1'
+}
+
 type ReviewStub = Record<string, ReturnType<typeof vi.fn>>
 
 // Install a review bridge on window.hermesDesktop. Any op not supplied defaults
@@ -66,8 +81,9 @@ function stubReview(over: ReviewStub = {}) {
     revert: vi.fn(async () => undefined),
     commit: vi.fn(async () => undefined),
     commitContext: vi.fn(async () => ({ diff: 'd', recent: 'r' })),
-    push: vi.fn(async () => undefined),
-    shipInfo: vi.fn(async () => ({ ghReady: false, pr: null })),
+    createPushRequest: vi.fn(async () => pushRequest),
+    pushApproved: vi.fn(async () => ({ commitSha: pushRequest.commitSha, ok: true })),
+    shipInfo: vi.fn(async () => ({ ghReady: false, pr: null, pushAvailable: false })),
     createPr: vi.fn(async () => ({ url: 'https://example.com/pr/1' })),
     ...over
   }
@@ -91,8 +107,9 @@ beforeEach(() => {
   $reviewDiff.set(null)
   $reviewDiffLoading.set(false)
   $reviewSelectedPath.set(null)
-  $reviewShipInfo.set({ ghReady: false, pr: null })
+  $reviewShipInfo.set({ ghReady: false, pr: null, pushAvailable: false })
   $reviewShipBusy.set(false)
+  $reviewPushRequest.set(null)
   $reviewCommitMsgBusy.set(false)
   $reviewRevertTarget.set(undefined)
   $reviewScopeCwd.set(null)
@@ -365,9 +382,9 @@ describe('ship flow', () => {
     const seen: boolean[] = []
     const unsub = $reviewShipBusy.subscribe(v => seen.push(v))
 
-    await commitChanges('  a message  ', { push: true })
+    await commitChanges('  a message  ')
 
-    expect(review.commit).toHaveBeenCalledWith('/repo', 'a message', true)
+    expect(review.commit).toHaveBeenCalledWith('/repo', 'a message')
     expect(seen).toContain(true)
     expect($reviewShipBusy.get()).toBe(false)
     unsub()
@@ -379,10 +396,37 @@ describe('ship flow', () => {
     expect(review.commit).not.toHaveBeenCalled()
   })
 
-  it('pushChanges pushes and refreshes ship info', async () => {
+  it('requestPushApproval stores the host-derived immutable request', async () => {
     const review = stubReview()
-    await pushChanges()
-    expect(review.push).toHaveBeenCalledWith('/repo')
+    await requestPushApproval()
+    expect(review.createPushRequest).toHaveBeenCalledWith('/repo')
+    expect($reviewPushRequest.get()).toEqual(pushRequest)
+  })
+
+  it('confirmPushApproval sends an explicit decision and clears the request', async () => {
+    const review = stubReview()
+    $reviewPushRequest.set(pushRequest)
+
+    await confirmPushApproval()
+
+    expect(review.pushApproved).toHaveBeenCalledWith(
+      '/repo',
+      expect.objectContaining({
+        ...pushRequest,
+        approved: true,
+        approvedBy: 'local-desktop-user',
+        decidedAt: expect.any(String)
+      })
+    )
+    expect($reviewPushRequest.get()).toBeNull()
+  })
+
+  it('cancelPushApproval clears the renderer request without pushing', () => {
+    const review = stubReview()
+    $reviewPushRequest.set(pushRequest)
+    cancelPushApproval()
+    expect($reviewPushRequest.get()).toBeNull()
+    expect(review.pushApproved).not.toHaveBeenCalled()
   })
 
   it('createOrOpenPr opens the existing PR without creating a new one', async () => {
@@ -399,7 +443,7 @@ describe('ship flow', () => {
 
   it('createOrOpenPr creates a PR when none exists, then opens it', async () => {
     const review = stubReview({ createPr: vi.fn(async () => ({ url: 'https://example.com/pr/new' })) })
-    $reviewShipInfo.set({ ghReady: true, pr: null })
+    $reviewShipInfo.set({ ghReady: true, pr: null, pushAvailable: false })
 
     await createOrOpenPr()
 
@@ -414,8 +458,9 @@ describe('refreshShipInfo', () => {
   it('populates ship info from the bridge', async () => {
     const info: HermesReviewShipInfo = {
       ghReady: true,
-      pr: { url: 'https://example.com/pr/3' }
-    } as HermesReviewShipInfo
+      pr: { number: 3, state: 'OPEN', url: 'https://example.com/pr/3' },
+      pushAvailable: true
+    }
 
     stubReview({ shipInfo: vi.fn(async () => info) })
 
@@ -430,7 +475,7 @@ describe('refreshShipInfo', () => {
 
     await refreshShipInfo()
 
-    expect($reviewShipInfo.get()).toEqual({ ghReady: false, pr: null })
+    expect($reviewShipInfo.get()).toEqual({ ghReady: false, pr: null, pushAvailable: false })
   })
 
   it('resets ship info when the bridge throws', async () => {
@@ -443,7 +488,7 @@ describe('refreshShipInfo', () => {
 
     await refreshShipInfo()
 
-    expect($reviewShipInfo.get()).toEqual({ ghReady: false, pr: null })
+    expect($reviewShipInfo.get()).toEqual({ ghReady: false, pr: null, pushAvailable: false })
   })
 })
 

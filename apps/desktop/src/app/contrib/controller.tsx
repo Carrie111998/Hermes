@@ -5,6 +5,7 @@ import type { CSSProperties, ReactElement, PointerEvent as ReactPointerEvent } f
 import { SessionDraftTitle } from '@/app/chat/session-draft-title'
 import { SessionStatusDot } from '@/app/chat/session-status-dot'
 import { PALETTE_AREA, type PaletteContribution, paletteToggle } from '@/app/command-palette/contrib'
+import { ProjectWorkspaceView } from '@/app/project-workspace'
 import { type StatusbarItem } from '@/app/shell/statusbar-controls'
 import { IdleMount } from '@/components/idle-mount'
 import { $layoutEditMode, toggleLayoutEditMode } from '@/components/pane-shell/edit-mode'
@@ -73,7 +74,7 @@ import {
 } from '../chat/session-tile'
 import { HudShell } from '../hud/hud-shell'
 import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
-import { $workspaceIsPage } from '../routes'
+import { $workspaceIsPage, PROJECT_WORKSPACE_ROUTE, ROUTES_AREA, SIDEBAR_NAV_AREA } from '../routes'
 
 import { FilesPane, LogsPane, ReviewPaneContent } from './panes'
 import { ContribWiring, WiredPane } from './wiring'
@@ -136,6 +137,28 @@ const workspaceTabDrag = (event: ReactPointerEvent<HTMLElement>, onTap: () => vo
 
   return true
 }
+
+registry.registerMany([
+  {
+    id: 'project-workspace',
+    area: ROUTES_AREA,
+    source: 'core',
+    title: 'Project workspace',
+    data: { path: PROJECT_WORKSPACE_ROUTE },
+    render: () => <ProjectWorkspaceView />
+  },
+  {
+    id: 'project-workspace.nav',
+    area: SIDEBAR_NAV_AREA,
+    source: 'core',
+    order: 15,
+    data: {
+      codicon: 'layers',
+      label: 'Workspace',
+      path: PROJECT_WORKSPACE_ROUTE
+    }
+  }
+])
 
 registry.registerMany([
   {

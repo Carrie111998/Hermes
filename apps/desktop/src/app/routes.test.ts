@@ -1,6 +1,14 @@
 import { describe, expect, it } from 'vitest'
 
-import { NEW_CHAT_ROUTE, primaryRouteSelectedSessionId, sessionRoute, SETTINGS_ROUTE } from './routes'
+import {
+  appViewForPath,
+  NEW_CHAT_ROUTE,
+  primaryRouteSelectedSessionId,
+  PROJECT_WORKSPACE_ROUTE,
+  routeSessionId,
+  sessionRoute,
+  SETTINGS_ROUTE
+} from './routes'
 
 const SESS_A = 'sess-a'
 const SESS_B = 'sess-b'
@@ -26,5 +34,12 @@ describe('primaryRouteSelectedSessionId', () => {
 
   it('returns null on a non-chat route with no store selection', () => {
     expect(primaryRouteSelectedSessionId(SETTINGS_ROUTE, null)).toBeNull()
+  })
+})
+
+describe('project workspace route', () => {
+  it('is a reserved non-chat page and never parses as a stored session', () => {
+    expect(routeSessionId(PROJECT_WORKSPACE_ROUTE)).toBeNull()
+    expect(appViewForPath(PROJECT_WORKSPACE_ROUTE)).toBe('project-workspace')
   })
 })

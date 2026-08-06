@@ -12,14 +12,25 @@ can surface a toast. Callers pass an already path-hardened ``cwd``.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import sqlite3
 import subprocess
+import threading
+import time
+import uuid
+from datetime import UTC, datetime
 from pathlib import Path
+from urllib.parse import urlsplit, urlunsplit
+
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from hermes_cli._subprocess_compat import noninteractive_git_env
+from hermes_constants import get_hermes_home
 
 _GIT_TIMEOUT = 30
 _GH_TIMEOUT = 30
@@ -29,6 +40,147 @@ _UNTRACKED_SCAN_CAP = 500
 _COMMIT_CONTEXT_DIFF_MAX_CHARS = 120_000
 _COMMIT_CONTEXT_UNTRACKED_MAX = 80
 _TRUNK_BRANCHES = ("main", "master")
+_PUSH_APPROVAL_TTL_SECONDS = 10 * 60
+_push_approvals: dict[str, dict] = {}
+_push_approvals_lock = threading.Lock()
+
+
+def _push_store_connection() -> sqlite3.Connection:
+    home = get_hermes_home()
+    home.mkdir(parents=True, exist_ok=True)
+    database = home / "workspace-push-requests.db"
+    connection = sqlite3.connect(database, timeout=30)
+    if os.name != "nt":
+        database.chmod(0o600)
+    connection.row_factory = sqlite3.Row
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workspace_push_requests (
+            request_id TEXT PRIMARY KEY,
+            ciphertext BLOB NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            expires_at REAL NOT NULL,
+            created_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        )
+        """
+    )
+    connection.commit()
+    return connection
+
+
+def _push_store_key() -> bytes:
+    path = get_hermes_home() / "workspace-push-requests.key"
+    if path.exists():
+        key = path.read_bytes()
+        if len(key) != 32:
+            raise RuntimeError("Push approval key is invalid.")
+        return key
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = secrets.token_bytes(32)
+    try:
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        existing = path.read_bytes()
+        if len(existing) != 32:
+            raise RuntimeError("Push approval key is invalid.")
+        return existing
+    try:
+        os.write(descriptor, key)
+    finally:
+        os.close(descriptor)
+    return key
+
+
+def _encrypt_push_record(request_id: str, record: dict) -> bytes:
+    nonce = secrets.token_bytes(12)
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return nonce + AESGCM(_push_store_key()).encrypt(nonce, payload, request_id.encode("utf-8"))
+
+
+def _decrypt_push_record(request_id: str, ciphertext: bytes) -> dict:
+    nonce, encrypted = ciphertext[:12], ciphertext[12:]
+    payload = AESGCM(_push_store_key()).decrypt(
+        nonce,
+        encrypted,
+        request_id.encode("utf-8"),
+    )
+    value = json.loads(payload.decode("utf-8"))
+    if not isinstance(value, dict):
+        raise RuntimeError("Push approval record is invalid.")
+    return value
+
+
+def _persist_push_record(record: dict, *, timestamp: float) -> None:
+    request = record["request"]
+    request_id = str(request["requestId"])
+    expires_at = datetime.fromisoformat(str(request["expiresAt"]).replace("Z", "+00:00")).timestamp()
+    with _push_store_connection() as connection:
+        connection.execute(
+            """
+            INSERT OR REPLACE INTO workspace_push_requests(
+                request_id,ciphertext,consumed,expires_at,created_at,updated_at
+            ) VALUES(?,?,?,?,?,?)
+            """,
+            (
+                request_id,
+                _encrypt_push_record(request_id, record),
+                int(bool(record.get("consumed"))),
+                expires_at,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            "DELETE FROM workspace_push_requests WHERE consumed=1 OR expires_at<=?",
+            (timestamp,),
+        )
+
+
+def _load_push_record(request_id: str) -> dict | None:
+    with _push_store_connection() as connection:
+        row = connection.execute(
+            "SELECT ciphertext,consumed FROM workspace_push_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    record = _decrypt_push_record(request_id, bytes(row["ciphertext"]))
+    record["consumed"] = bool(row["consumed"])
+    return record
+
+
+def _consume_push_record(request_id: str, *, timestamp: float) -> dict:
+    connection = _push_store_connection()
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT ciphertext,consumed,expires_at FROM workspace_push_requests WHERE request_id=?",
+            (request_id,),
+        ).fetchone()
+        if row is None or bool(row["consumed"]):
+            raise RuntimeError("Push approval request is unknown or already consumed.")
+        if float(row["expires_at"]) <= timestamp:
+            connection.execute(
+                "UPDATE workspace_push_requests SET consumed=1,updated_at=? WHERE request_id=?",
+                (timestamp, request_id),
+            )
+            connection.commit()
+            raise RuntimeError("Push approval request expired.")
+        connection.execute(
+            "UPDATE workspace_push_requests SET consumed=1,updated_at=? "
+            "WHERE request_id=? AND consumed=0",
+            (timestamp, request_id),
+        )
+        connection.commit()
+        record = _decrypt_push_record(request_id, bytes(row["ciphertext"]))
+        record["consumed"] = True
+        return record
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
 
 
 def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
@@ -372,29 +524,212 @@ def review_rev_parse(cwd: str, ref: str | None) -> str | None:
 
 
 def review_commit(cwd: str, message: str, push: bool) -> dict:
-    """Commit the working tree; stage everything first when nothing is staged."""
+    """Commit locally; network writes always require a separate approval."""
+    if push:
+        raise RuntimeError("Push approval is required; commit and push are separate actions.")
+
     _, raw, _ = _git(cwd, ["status", "--porcelain=v2", "-z"])
     if not any(_entry_staged(tag, xy) for tag, xy, _ in _walk_entries(raw)):
         _git_ok(cwd, ["add", "-A"])
     _git_ok(cwd, ["commit", "-m", message])
-    if push:
-        _review_push(cwd)
     return {"ok": True}
 
 
-def _review_push(cwd: str) -> None:
-    upstream = _git_out(cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).strip()
-    if upstream:
-        _git_ok(cwd, ["push"])
-        return
+def _iso_timestamp(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _push_url_identity(cwd: str, raw_url: str) -> tuple[str, str, str]:
+    effective = raw_url.strip()
+    parsed = urlsplit(effective)
+    if parsed.scheme:
+        if parsed.scheme == "file":
+            display = f"local:{Path(parsed.path).name}"
+        else:
+            hostname = parsed.hostname or ""
+            netloc = f"{hostname}:{parsed.port}" if parsed.port else hostname
+            display = urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    elif re.match(r"^(?:[^@\s]+@)?[^:/\s]+:.+", effective):
+        display = re.sub(r"^[^@\s]+@", "", effective)
+    else:
+        effective = os.path.realpath(os.path.join(cwd, effective))
+        display = f"local:{Path(effective).name}"
+    return effective, display, hashlib.sha256(effective.encode()).hexdigest()
+
+
+def _derive_push_snapshot(cwd: str) -> dict:
+    if _git_out(cwd, ["status", "--porcelain"]).strip():
+        raise RuntimeError("Commit or discard working tree changes before requesting push approval.")
+
     branch = _git_out(cwd, ["rev-parse", "--abbrev-ref", "HEAD"]).strip()
-    if branch and branch != "HEAD":
-        _git_ok(cwd, ["push", "-u", "origin", branch])
+    if not branch or branch == "HEAD":
+        raise RuntimeError("A named branch is required before pushing.")
+
+    tracking = _git_out(
+        cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
+    ).strip()
+    remote = tracking.split("/", 1)[0] if "/" in tracking else "origin"
+    if not _git_out(cwd, ["remote", "get-url", remote]).strip():
+        raise RuntimeError(f"Git remote '{remote}' is not configured.")
+
+    push_urls = [
+        value.strip()
+        for value in _git_out(cwd, ["remote", "get-url", "--push", "--all", remote]).splitlines()
+        if value.strip()
+    ]
+    if len(push_urls) != 1:
+        raise RuntimeError("Exactly one Git push destination is required before push approval.")
+    effective_push_url, remote_url, remote_url_digest = _push_url_identity(cwd, push_urls[0])
+
+    commit_sha = _git_out(cwd, ["rev-parse", "HEAD"]).strip()
+    base_ref = tracking or _branch_base(cwd)
+    commit_range = f"{base_ref}..HEAD" if base_ref else "HEAD"
+    commits = _git_out(cwd, ["log", "--format=%H%x00%P%x00%s", commit_range])
+    if not commits.strip():
+        raise RuntimeError("There are no local commits to push.")
+
+    diff = (
+        _git_out(cwd, ["diff", "--binary", f"{base_ref}...HEAD"])
+        if base_ref
+        else _git_out(cwd, ["show", "--binary", "--format=fuller", "--no-ext-diff", "HEAD"])
+    )
+    digest_payload = {
+        "baseRef": base_ref,
+        "commitSha": commit_sha,
+        "commits": commits,
+        "destinationBranch": branch,
+        "diff": diff,
+        "remote": remote,
+        "remoteUrl": remote_url,
+        "remoteUrlDigest": remote_url_digest,
+    }
+    change_set_digest = hashlib.sha256(
+        json.dumps(digest_payload, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return {
+        "changeSetDigest": change_set_digest,
+        "commitSha": commit_sha,
+        "destinationBranch": branch,
+        "effectivePushUrl": effective_push_url,
+        "remote": remote,
+        "remoteUrl": remote_url,
+        "remoteUrlDigest": remote_url_digest,
+    }
+
+
+def review_create_push_request(cwd: str, now: float | None = None) -> dict:
+    timestamp = time.time() if now is None else now
+    snapshot = _derive_push_snapshot(cwd)
+    effective_push_url = snapshot.pop("effectivePushUrl")
+    request = {
+        **snapshot,
+        "createdAt": _iso_timestamp(timestamp),
+        "expiresAt": _iso_timestamp(timestamp + _PUSH_APPROVAL_TTL_SECONDS),
+        "requestId": str(uuid.uuid4()),
+    }
+    record = {
+        "consumed": False,
+        "cwd": os.path.realpath(cwd),
+        "effectivePushUrl": effective_push_url,
+        "request": request,
+    }
+
+    with _push_approvals_lock:
+        for request_id, existing in list(_push_approvals.items()):
+            expires_at = datetime.fromisoformat(
+                existing["request"]["expiresAt"].replace("Z", "+00:00")
+            ).timestamp()
+            if existing["consumed"] or expires_at <= timestamp:
+                del _push_approvals[request_id]
+        _push_approvals[request["requestId"]] = record
+        _persist_push_record(record, timestamp=timestamp)
+
+    return request
+
+
+def review_push_approved(cwd: str, decision: dict, now: float | None = None) -> dict:
+    timestamp = time.time() if now is None else now
+    request_id = str(decision.get("requestId") or "")
+
+    with _push_approvals_lock:
+        record = _consume_push_record(request_id, timestamp=timestamp)
+        _push_approvals[request_id] = record
+
+    request = record["request"]
+    expires_at = datetime.fromisoformat(request["expiresAt"].replace("Z", "+00:00")).timestamp()
+    if expires_at <= timestamp:
+        raise RuntimeError("Push approval request expired.")
+    if os.path.realpath(cwd) != record["cwd"]:
+        raise RuntimeError("Push approval repository changed.")
+    if decision.get("approved") is not True or not str(decision.get("approvedBy") or "").strip():
+        raise RuntimeError("Push approval was not granted.")
+
+    bound_fields = (
+        "requestId",
+        "changeSetDigest",
+        "commitSha",
+        "remote",
+        "remoteUrl",
+        "remoteUrlDigest",
+        "destinationBranch",
+        "createdAt",
+        "expiresAt",
+    )
+    if any(decision.get(field) != request[field] for field in bound_fields):
+        raise RuntimeError("Push approval no longer matches the requested change set.")
+
+    live = _derive_push_snapshot(cwd)
+    live_fields = (
+        "changeSetDigest",
+        "commitSha",
+        "remote",
+        "remoteUrl",
+        "remoteUrlDigest",
+        "destinationBranch",
+    )
+    if any(live[field] != request[field] for field in live_fields):
+        raise RuntimeError("Repository changed after push approval was requested.")
+
+    _git_ok(
+        cwd,
+        [
+            "push",
+            record["effectivePushUrl"],
+            f'{request["commitSha"]}:refs/heads/{request["destinationBranch"]}',
+        ],
+    )
+    _git_ok(
+        cwd,
+        [
+            "update-ref",
+            f'refs/remotes/{request["remote"]}/{request["destinationBranch"]}',
+            request["commitSha"],
+        ],
+    )
+    _git_ok(
+        cwd,
+        [
+            "branch",
+            "--set-upstream-to",
+            f'{request["remote"]}/{request["destinationBranch"]}',
+            request["destinationBranch"],
+        ],
+    )
+    return {"commitSha": request["commitSha"], "ok": True}
+
+
+def review_push_approved_by_request_id(decision: dict, now: float | None = None) -> dict:
+    request_id = str(decision.get("requestId") or "")
+    with _push_approvals_lock:
+        record = _push_approvals.get(request_id) or _load_push_record(request_id)
+        cwd = str(record.get("cwd") or "") if record else ""
+    if not cwd:
+        raise RuntimeError("Push approval request is unknown or already consumed.")
+    return review_push_approved(cwd, decision, now=now)
 
 
 def review_push(cwd: str) -> dict:
-    _review_push(cwd)
-    return {"ok": True}
+    raise RuntimeError("Push approval is required.")
 
 
 def review_commit_context(cwd: str) -> dict:
@@ -445,22 +780,37 @@ def _gh(cwd: str, args: list[str]) -> tuple[bool, str]:
 
 
 def review_ship_info(cwd: str) -> dict:
-    """gh availability/auth + this branch's PR. ghReady false when gh missing/unauthed."""
+    """Git push readiness plus gh availability/auth and this branch's PR."""
     if not _is_dir(cwd):
-        return {"ghReady": False, "pr": None}
+        return {"ghReady": False, "pr": None, "pushAvailable": False}
+
+    try:
+        _derive_push_snapshot(cwd)
+        push_available = True
+    except RuntimeError:
+        push_available = False
+
     auth_ok, _ = _gh(cwd, ["auth", "status"])
     if not auth_ok:
-        return {"ghReady": False, "pr": None}
+        return {"ghReady": False, "pr": None, "pushAvailable": push_available}
     view_ok, out = _gh(cwd, ["pr", "view", "--json", "url,state,number"])
     if not view_ok:
-        return {"ghReady": True, "pr": None}
+        return {"ghReady": True, "pr": None, "pushAvailable": push_available}
     try:
         pr = json.loads(out)
     except json.JSONDecodeError:
-        return {"ghReady": True, "pr": None}
+        return {"ghReady": True, "pr": None, "pushAvailable": push_available}
     if pr and pr.get("url"):
-        return {"ghReady": True, "pr": {"url": pr["url"], "state": pr.get("state"), "number": pr.get("number")}}
-    return {"ghReady": True, "pr": None}
+        return {
+            "ghReady": True,
+            "pr": {
+                "url": pr["url"],
+                "state": pr.get("state"),
+                "number": pr.get("number"),
+            },
+            "pushAvailable": push_available,
+        }
+    return {"ghReady": True, "pr": None, "pushAvailable": push_available}
 
 
 # GraphQL asks per branch, so the answer can't be crowded out the way a
@@ -554,12 +904,30 @@ def review_pr_list(cwd: str, branches: list[str], numbers: list[int] = None) -> 
 
 
 def review_create_pr(cwd: str) -> dict:
-    """Create a PR for the current branch (push first), letting gh fill title/body."""
-    try:
-        _review_push(cwd)
-    except RuntimeError:
-        pass
-    created, out = _gh(cwd, ["pr", "create", "--fill"])
+    """Create a PR only after the approved commit is already pushed."""
+    upstream = _git_out(
+        cwd, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]
+    ).strip()
+    ahead = _git_out(cwd, ["rev-list", "--count", "@{u}..HEAD"]).strip() if upstream else ""
+    if not upstream or ahead != "0":
+        raise RuntimeError("Approve and complete the push before creating a pull request.")
+
+    branch = _git_out(cwd, ["branch", "--show-current"]).strip()
+    remote = _git_out(cwd, ["config", "--get", f"branch.{branch}.remote"]).strip()
+    remote_url = _git_out(cwd, ["remote", "get-url", "--push", remote]).strip()
+    parsed = urlsplit(remote_url)
+    if parsed.scheme:
+        host = (parsed.hostname or "").lower()
+        repo_path = parsed.path
+    else:
+        match = re.fullmatch(r"(?:[^@\s]+@)?([^:/\s]+):(.+)", remote_url)
+        host = match.group(1).lower() if match else ""
+        repo_path = match.group(2) if match else ""
+    github_repo = repo_path.lstrip("/").removesuffix(".git")
+    if host != "github.com" or not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", github_repo):
+        raise RuntimeError("The upstream remote is not a canonical GitHub repository.")
+
+    created, out = _gh(cwd, ["pr", "create", "--fill", "--repo", github_repo])
     if not created:
         raise RuntimeError("gh pr create failed (is gh installed and authenticated?)")
     url = next((line for line in reversed(out.strip().splitlines()) if line.strip()), "")

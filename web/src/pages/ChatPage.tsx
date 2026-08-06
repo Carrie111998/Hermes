@@ -319,13 +319,14 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
   // treat the current resume target as part of the PTY identity and rebuild the
   // terminal session when it changes.
   const resumeParam = searchParams.get("resume");
+  const bindingParam = searchParams.get("binding");
   // Profile-scoped chat: spawn the PTY under the globally selected
   // management profile. Changing it remounts the terminal (key below /
   // effect dep) so the user explicitly starts a fresh scoped session.
   const { profile: scopedProfile } = useProfileScope();
   const channel = useMemo(
-    () => generateChannelId(`${resumeParam ?? ""}\0${scopedProfile}`),
-    [resumeParam, scopedProfile],
+    () => generateChannelId(`${resumeParam ?? ""}\0${bindingParam ?? ""}\0${scopedProfile}`),
+    [bindingParam, resumeParam, scopedProfile],
   );
   const titleScope = `${channel}\0${reconnectNonce}`;
   const sessionTitle =
@@ -993,6 +994,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
       if (unmounting) return;
       const params: Record<string, string> = { channel };
       if (resumeParam) params.resume = resumeParam;
+      if (bindingParam) params.binding = bindingParam;
       if (forceFresh) params.fresh = "1";
       // Keep-alive identity: reattach to this tab's living PTY across
       // refresh/transient drops. A forced-fresh start rotates the token so
@@ -1319,6 +1321,7 @@ export default function ChatPage({ isActive = true }: { isActive?: boolean }) {
     hasActivated,
     channel,
     clearReconnectTimer,
+    bindingParam,
     resumeParam,
     scopedProfile,
     reconnectNonce,

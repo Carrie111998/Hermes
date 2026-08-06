@@ -225,9 +225,10 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
       unstage: (repoPath, filePath) => ipcRenderer.invoke('hermes:git:review:unstage', repoPath, filePath),
       revert: (repoPath, filePath) => ipcRenderer.invoke('hermes:git:review:revert', repoPath, filePath),
       revParse: (repoPath, ref) => ipcRenderer.invoke('hermes:git:review:revParse', repoPath, ref),
-      commit: (repoPath, message, push) => ipcRenderer.invoke('hermes:git:review:commit', repoPath, message, push),
+      commit: (repoPath, message) => ipcRenderer.invoke('hermes:git:review:commit', repoPath, message),
       commitContext: repoPath => ipcRenderer.invoke('hermes:git:review:commitContext', repoPath),
-      push: repoPath => ipcRenderer.invoke('hermes:git:review:push', repoPath),
+      createPushRequest: repoPath => ipcRenderer.invoke('hermes:git:review:createPushRequest', repoPath),
+      pushApproved: (repoPath, decision) => ipcRenderer.invoke('hermes:git:review:pushApproved', repoPath, decision),
       shipInfo: repoPath => ipcRenderer.invoke('hermes:git:review:shipInfo', repoPath),
       prList: (repoPath, branches, numbers) =>
         ipcRenderer.invoke('hermes:git:review:prList', repoPath, branches, numbers),

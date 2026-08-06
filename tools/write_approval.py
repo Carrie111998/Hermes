@@ -111,6 +111,65 @@ def _pending_dir(subsystem: str) -> Path:
     return get_hermes_home() / "pending" / subsystem
 
 
+def _stage_background_learning(
+    subsystem: str,
+    payload: Dict[str, Any],
+    *,
+    summary: str,
+) -> Dict[str, Any]:
+    """Stage an autonomous review write in the role-separated M4 store only."""
+    from hermes_cli.workspace_learning import LearningStore
+
+    store = LearningStore(get_hermes_home() / "workspace-learning.db")
+    try:
+        proposal_text = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        signal = store.record_signal(
+            actor_id="background-review-proposer",
+            content=proposal_text,
+            kind=f"background_{subsystem}_proposal",
+            project_id=None,
+            provenance=[
+                {
+                    "source": "background_review",
+                    "ref": f"review_{uuid.uuid4().hex}",
+                }
+            ],
+            reusable=True,
+        )
+        evidence = store.matching_signal_ids(str(signal["fingerprint"]))
+        candidate = None
+        if len(evidence) >= 2:
+            destination = (
+                "user_memory"
+                if subsystem == MEMORY and payload.get("target") == "user"
+                else "memory"
+                if subsystem == MEMORY
+                else "skill"
+            )
+            risk = "medium" if subsystem == SKILLS or payload.get("action") in {"delete", "remove"} else "low"
+            candidate = store.propose_candidate(
+                destination=destination,
+                proposer_id="background-review-proposer",
+                proposal=payload,
+                risk=risk,
+                signal_ids=evidence,
+            )
+        record_id = str(candidate["candidate_id"] if candidate else signal["signal_id"])
+        return {
+            "action": payload.get("action", ""),
+            "candidate_id": candidate["candidate_id"] if candidate else None,
+            "created_at": signal["created_at"],
+            "id": record_id,
+            "learning_signal_id": signal["signal_id"],
+            "origin": "background_review",
+            "staged": True,
+            "subsystem": subsystem,
+            "summary": (summary or "").strip(),
+        }
+    finally:
+        store.close()
+
+
 def stage_write(subsystem: str, payload: Dict[str, Any],
                 *, summary: str, origin: str) -> Dict[str, Any]:
     """Persist a pending write and return a short record describing it.
@@ -129,6 +188,9 @@ def stage_write(subsystem: str, payload: Dict[str, Any],
     logs and still returns a record (the write is simply lost, which is the
     safe failure for an approval gate — nothing is silently committed).
     """
+    if (origin or "") == "background_review":
+        return _stage_background_learning(subsystem, payload, summary=summary)
+
     pid = uuid.uuid4().hex[:8]
     record = {
         "id": pid,
@@ -271,10 +333,15 @@ def evaluate_gate(subsystem: str, *, inline_summary: str = "",
     delays a write for approval, never silently refuses it. ``blocked`` is
     still produced when the user *actively denies* an inline prompt.
     """
+    background = is_background()
+    if background:
+        return GateDecision(
+            stage=True,
+            message="Staged as a self-improvement signal; no live memory or skill was changed.",
+        )
+
     if not write_approval_enabled(subsystem):
         return GateDecision(allow=True)
-
-    background = is_background()
 
     # Skills always stage — a SKILL.md is too large to review inline, and a
     # background skill write happens in a daemon thread with no user present.

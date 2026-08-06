@@ -5,6 +5,7 @@
 // non-repo / remote backend; mutations reject so the renderer can toast.
 
 import { execFile } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import fs from 'node:fs/promises'
 import path from 'node:path'
 
@@ -17,6 +18,94 @@ const COMMIT_CONTEXT_UNTRACKED_MAX = 80
 const REVIEW_FILE_CAP = 2_000
 const UNTRACKED_LINE_COUNT_CONCURRENCY = 16
 const UNTRACKED_LINE_COUNT_MAX_BYTES = 1024 * 1024
+const PUSH_APPROVAL_TTL_MS = 10 * 60 * 1000
+
+interface PushRequest {
+  changeSetDigest: string
+  commitSha: string
+  createdAt: string
+  destinationBranch: string
+  expiresAt: string
+  remote: string
+  remoteUrl: string
+  remoteUrlDigest: string
+  requestId: string
+}
+
+interface PushApprovalDecision extends PushRequest {
+  approved: boolean
+  approvedBy: string
+  decidedAt: string
+}
+
+interface PushApprovalRecord {
+  consumed: boolean
+  cwd: string
+  effectivePushUrl: string
+  request: PushRequest
+}
+
+interface PushSnapshot {
+  changeSetDigest: string
+  commitSha: string
+  destinationBranch: string
+  effectivePushUrl: string
+  remote: string
+  remoteUrl: string
+  remoteUrlDigest: string
+}
+
+const pushApprovalRegistry = new Map<string, PushApprovalRecord>()
+
+function displayPushUrl(cwd: string, rawUrl: string): string {
+  try {
+    const parsed = new URL(rawUrl)
+
+    if (parsed.protocol === 'file:') {
+      return `local:${path.basename(parsed.pathname)}`
+    }
+
+    parsed.username = ''
+    parsed.password = ''
+
+    return parsed.toString()
+  } catch {
+    if (/^(?:[^@\s]+@)?[^:/\s]+:.+/.test(rawUrl)) {
+      return rawUrl.replace(/^[^@\s]+@/, '')
+    }
+
+    return `local:${path.basename(path.resolve(cwd, rawUrl))}`
+  }
+}
+
+function githubRepoFromUrl(rawUrl: string): string | null {
+  let host = ''
+  let repoPath = ''
+
+  try {
+    const parsed = new URL(rawUrl)
+
+    host = parsed.hostname.toLowerCase()
+    repoPath = parsed.pathname
+  } catch {
+    const match = /^(?:[^@\s]+@)?([^:/\s]+):(.+)$/.exec(rawUrl)
+
+    if (!match) {
+      return null
+    }
+
+    host = match[1].toLowerCase()
+    repoPath = match[2]
+  }
+
+  if (host !== 'github.com') {
+    return null
+  }
+
+  const normalized = repoPath.replace(/^\/+/, '').replace(/\.git$/, '')
+
+  return /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(normalized) ? normalized : null
+}
 
 // GUI-launched Electron apps on macOS inherit only a minimal PATH (no
 // /opt/homebrew/bin or /usr/local/bin), so `gh` — and the `git` gh shells out
@@ -459,9 +548,13 @@ async function reviewRevParse(repoPath, ref, gitBin) {
 }
 
 // Commit the working tree. Mirrors VS Code: if nothing is staged, stage
-// everything first ("commit all"), then commit. Optionally push afterward,
-// setting upstream on the first push.
+// everything first ("commit all"), then commit. Push is deliberately a
+// separate, snapshot-bound approval operation.
 async function reviewCommit(repoPath, message, push, gitBin) {
+  if (push) {
+    throw new Error('Push approval is required after the local commit.')
+  }
+
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review commit' })
   const git = gitFor(cwd, gitBin)
   const status = await git.status()
@@ -471,16 +564,6 @@ async function reviewCommit(repoPath, message, push, gitBin) {
   }
 
   await git.commit(message)
-
-  if (push) {
-    const fresh = await git.status()
-
-    if (fresh.tracking) {
-      await git.push()
-    } else if (fresh.current) {
-      await git.raw(['push', '-u', 'origin', fresh.current])
-    }
-  }
 
   return { ok: true }
 }
@@ -536,51 +619,196 @@ async function reviewCommitContext(repoPath, gitBin) {
   return { diff: diff || '', recent: String(recent || '').trim() }
 }
 
-async function reviewPush(repoPath, gitBin) {
-  const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review push' })
+async function derivePushSnapshot(cwd: string, gitBin): Promise<PushSnapshot> {
   const git = gitFor(cwd, gitBin)
   const status = await git.status()
 
-  if (status.tracking) {
-    await git.push()
-  } else if (status.current) {
-    await git.raw(['push', '-u', 'origin', status.current])
+  if (!status.current || status.detached) {
+    throw new Error('A named local branch is required before push approval.')
   }
 
-  return { ok: true }
+  if (!status.isClean()) {
+    throw new Error('Commit or discard working-tree changes before requesting push approval.')
+  }
+
+  const remotes = await git.getRemotes(true)
+  const trackingRemote = status.tracking?.includes('/') ? status.tracking.slice(0, status.tracking.indexOf('/')) : ''
+  const remote = trackingRemote || (remotes.some(candidate => candidate.name === 'origin') ? 'origin' : remotes[0]?.name)
+
+  if (!remote) {
+    throw new Error('A Git remote is required before push approval.')
+  }
+
+  const pushUrls = String(await git.raw(['remote', 'get-url', '--push', '--all', remote]))
+    .split(/\r?\n/)
+    .map(value => value.trim())
+    .filter(Boolean)
+
+  if (pushUrls.length !== 1) {
+    throw new Error('Exactly one Git push destination is required before push approval.')
+  }
+
+  const effectivePushUrl = pushUrls[0]
+  const remoteUrl = displayPushUrl(cwd, effectivePushUrl)
+  const remoteUrlDigest = createHash('sha256').update(effectivePushUrl).digest('hex')
+
+  const commitSha = (await git.revparse(['HEAD'])).trim()
+  const baseRef = status.tracking || (await branchBase(git))
+  const commitRange = baseRef ? `${baseRef}..HEAD` : 'HEAD'
+  const commits = await git.raw(['log', '--format=%H%x00%P%x00%s', commitRange])
+
+  if (!commits.trim()) {
+    throw new Error('There are no local commits to push.')
+  }
+
+  const diff = baseRef
+    ? await git.diff(['--binary', `${baseRef}...HEAD`])
+    : await git.raw(['show', '--binary', '--format=fuller', '--no-ext-diff', 'HEAD'])
+
+  const destinationBranch = status.current
+
+  const changeSetDigest = createHash('sha256')
+    .update(JSON.stringify({ baseRef, commitSha, commits, destinationBranch, diff, remote, remoteUrl, remoteUrlDigest }))
+    .digest('hex')
+
+  return { changeSetDigest, commitSha, destinationBranch, effectivePushUrl, remote, remoteUrl, remoteUrlDigest }
+}
+
+async function reviewCreatePushRequest(repoPath, gitBin, nowMs = Date.now()): Promise<PushRequest> {
+  const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Push approval request' })
+  const snapshot = await derivePushSnapshot(cwd, gitBin)
+  const { effectivePushUrl, ...publicSnapshot } = snapshot
+
+  const request: PushRequest = {
+    ...publicSnapshot,
+    createdAt: new Date(nowMs).toISOString(),
+    expiresAt: new Date(nowMs + PUSH_APPROVAL_TTL_MS).toISOString(),
+    requestId: randomUUID()
+  }
+
+  for (const [requestId, record] of pushApprovalRegistry) {
+    if (record.consumed || Date.parse(record.request.expiresAt) <= nowMs) {
+      pushApprovalRegistry.delete(requestId)
+    }
+  }
+
+  pushApprovalRegistry.set(request.requestId, { consumed: false, cwd, effectivePushUrl, request })
+
+  return request
+}
+
+async function reviewPushApproved(repoPath, decision: PushApprovalDecision, gitBin, nowMs = Date.now()) {
+  const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Approved review push' })
+  const record = pushApprovalRegistry.get(decision?.requestId)
+
+  if (!record) {
+    throw new Error('Push approval is unknown or already used.')
+  }
+
+  if (record.consumed) {
+    throw new Error('Push approval was already used.')
+  }
+
+  if (record.cwd !== cwd || Date.parse(record.request.expiresAt) <= nowMs) {
+    record.consumed = true
+    throw new Error('Push approval is expired or invalid for this repository.')
+  }
+
+  const requestFields: Array<keyof PushRequest> = [
+    'changeSetDigest',
+    'commitSha',
+    'createdAt',
+    'destinationBranch',
+    'expiresAt',
+    'remote',
+    'remoteUrl',
+    'remoteUrlDigest',
+    'requestId'
+  ]
+
+  if (!decision.approved || !decision.approvedBy?.trim() || requestFields.some(field => decision[field] !== record.request[field])) {
+    record.consumed = true
+    throw new Error('Push approval decision is invalid.')
+  }
+
+  const live = await derivePushSnapshot(cwd, gitBin)
+
+  if (
+    live.commitSha !== record.request.commitSha ||
+    live.changeSetDigest !== record.request.changeSetDigest ||
+    live.remote !== record.request.remote ||
+    live.remoteUrl !== record.request.remoteUrl ||
+    live.remoteUrlDigest !== record.request.remoteUrlDigest ||
+    live.destinationBranch !== record.request.destinationBranch
+  ) {
+    record.consumed = true
+    throw new Error('The Git change set changed after approval was requested.')
+  }
+
+  // Consume before the network mutation. A failed or interrupted push requires
+  // a fresh request and cannot be replayed later.
+  record.consumed = true
+
+  const git = gitFor(cwd, gitBin)
+  await git.raw([
+    'push',
+    record.effectivePushUrl,
+    `${record.request.commitSha}:refs/heads/${record.request.destinationBranch}`
+  ])
+  await git.raw([
+    'update-ref',
+    `refs/remotes/${record.request.remote}/${record.request.destinationBranch}`,
+    record.request.commitSha
+  ])
+  await git.raw([
+    'branch',
+    '--set-upstream-to',
+    `${record.request.remote}/${record.request.destinationBranch}`,
+    record.request.destinationBranch
+  ])
+
+  return { commitSha: record.request.commitSha, ok: true }
 }
 
 // gh availability + auth + whether this branch already has a PR. Reads only;
 // drives the PR button's enabled/label state. `ghReady` is false when gh is
 // missing OR not authenticated — either way the PR action can't run.
-async function reviewShipInfo(repoPath, ghBin) {
+async function reviewShipInfo(repoPath, gitBin, ghBin) {
   let cwd
 
   try {
     cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review ship info' })
   } catch {
-    return { ghReady: false, pr: null }
+    return { ghReady: false, pr: null, pushAvailable: false }
   }
+
+  const pushAvailable = await derivePushSnapshot(cwd, gitBin)
+    .then(() => true)
+    .catch(() => false)
 
   const auth = await runGh(['auth', 'status'], cwd, ghBin)
 
   if (!auth.ok) {
-    return { ghReady: false, pr: null }
+    return { ghReady: false, pr: null, pushAvailable }
   }
 
   const view = await runGh(['pr', 'view', '--json', 'url,state,number'], cwd, ghBin)
 
   if (!view.ok) {
     // gh exits non-zero when no PR exists for the branch — that's not an error.
-    return { ghReady: true, pr: null }
+    return { ghReady: true, pr: null, pushAvailable }
   }
 
   try {
     const pr = JSON.parse(view.stdout)
 
-    return { ghReady: true, pr: pr && pr.url ? { url: pr.url, state: pr.state, number: pr.number } : null }
+    return {
+      ghReady: true,
+      pr: pr && pr.url ? { url: pr.url, state: pr.state, number: pr.number } : null,
+      pushAvailable
+    }
   } catch {
-    return { ghReady: true, pr: null }
+    return { ghReady: true, pr: null, pushAvailable }
   }
 }
 
@@ -689,14 +917,27 @@ async function reviewPrList(repoPath, ghBin, branches, numbers) {
   return { ghReady: true, prs }
 }
 
-// Create a PR for the current branch (pushing first so gh has a remote ref),
-// letting gh fill title/body from the commits. Returns the new PR url.
+// Create a PR only after an approved push. This must never hide a network write.
 async function reviewCreatePr(repoPath, gitBin, ghBin) {
   const cwd = resolveRequestedPathForIpc(repoPath, { purpose: 'Review create PR' })
+  const status = await gitFor(cwd, gitBin).status()
 
-  await reviewPush(repoPath, gitBin).catch(() => undefined)
+  if (!status.tracking || status.ahead > 0) {
+    throw new Error('Approve and complete the push before creating a pull request.')
+  }
 
-  const created = await runGh(['pr', 'create', '--fill'], cwd, ghBin)
+  const remote = String(
+    await gitFor(cwd, gitBin).raw(['config', '--get', `branch.${status.current}.remote`])
+  ).trim()
+
+  const remoteUrl = String(await gitFor(cwd, gitBin).raw(['remote', 'get-url', '--push', remote])).trim()
+  const githubRepo = githubRepoFromUrl(remoteUrl)
+
+  if (!githubRepo) {
+    throw new Error('The upstream remote is not a canonical GitHub repository.')
+  }
+
+  const created = await runGh(['pr', 'create', '--fill', '--repo', githubRepo], cwd, ghBin)
 
   if (!created.ok) {
     throw new Error('gh pr create failed (is gh installed and authenticated?)')
@@ -819,10 +1060,11 @@ export {
   reviewCommit,
   reviewCommitContext,
   reviewCreatePr,
+  reviewCreatePushRequest,
   reviewDiff,
   reviewList,
   reviewPrList,
-  reviewPush,
+  reviewPushApproved,
   reviewRevert,
   reviewRevParse,
   reviewShipInfo,

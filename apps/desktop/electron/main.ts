@@ -103,10 +103,11 @@ import {
   reviewCommit,
   reviewCommitContext,
   reviewCreatePr,
+  reviewCreatePushRequest,
   reviewDiff,
   reviewList,
   reviewPrList,
-  reviewPush,
+  reviewPushApproved,
   reviewRevert,
   reviewRevParse,
   reviewShipInfo,
@@ -115,7 +116,6 @@ import {
 } from './git-review-ops'
 import { gitRootForIpc } from './git-root'
 import {
-  addWorktree,
   listBaseBranches,
   listBranches,
   listWorktrees,
@@ -255,6 +255,7 @@ import {
 import { installWindowsSystemCaTrust } from './windows-system-ca'
 import { readWindowsUserEnvVar } from './windows-user-env'
 import { isPackagedInstallPath as isPackagedInstallPathUnderRoots } from './workspace-cwd'
+import { WorkspaceRunnerProcess } from './workspace-runner-process'
 import { readWslWindowsClipboardImage } from './wsl-clipboard-image'
 import { resolvePickerDefaultPath } from './wsl-path-bridge'
 
@@ -3902,20 +3903,26 @@ function writeDefaultProjectDir(dir) {
 }
 
 function createPythonBackend(root, label, backendArgs, options: any = {}) {
-  const python = findPythonForRoot(root)
+  const venvCandidates = [path.join(root, 'venv'), path.join(root, '.venv')]
+  const localVenvRoot = venvCandidates.find(candidate => fileExists(getVenvPython(candidate))) || venvCandidates[0]
+  const fallbackVenvRoot = options.fallbackVenvRoot
+  const fallbackVenvPython = fallbackVenvRoot ? getVenvPython(fallbackVenvRoot) : null
+  const useFallbackVenv = Boolean(fallbackVenvPython && !fileExists(getVenvPython(localVenvRoot)))
+  const venvRoot = useFallbackVenv ? fallbackVenvRoot : localVenvRoot
+  const python = useFallbackVenv ? fallbackVenvPython : findPythonForRoot(root)
 
   if (!python) {
     return null
   }
 
-  const venvRoot = path.join(root, 'venv')
-  const venvPython = getVenvPython(venvRoot)
-  const command = IS_WINDOWS && fileExists(venvPython) ? venvPython : python
+  if (useFallbackVenv) {
+    rememberLog(`[hermes] Using managed venv ${venvRoot} for source checkout ${root}`)
+  }
 
   return {
     kind: 'python',
     label,
-    command,
+    command: python,
     args: ['-m', 'hermes_cli.main', ...backendArgs],
     env: buildDesktopBackendEnv({
       hermesHome: HERMES_HOME,
@@ -3970,7 +3977,7 @@ function resolveHermesBackend(backendArgs) {
   //    installed `hermes` on PATH so local Python edits are actually exercised.
   //    (In dev with no checkout, SOURCE_REPO_ROOT won't pass isHermesSourceRoot.)
   if (!IS_PACKAGED && isHermesSourceRoot(SOURCE_REPO_ROOT)) {
-    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs)
+    const backend = createPythonBackend(SOURCE_REPO_ROOT, `Hermes source at ${SOURCE_REPO_ROOT}`, backendArgs, { fallbackVenvRoot: VENV_ROOT })
 
     if (backend) {
       return backend
@@ -11762,11 +11769,42 @@ ipcMain.handle('hermes:fs:trash', async (_event, targetPath) => {
 
 // Git-driven worktree management ("Start work" flow). Errors surface to the
 // renderer as rejected promises so it can toast a friendly message.
+let workspaceRunnerProcess: null | WorkspaceRunnerProcess = null
+
+async function activeWorkspaceRunnerProcess() {
+  if (workspaceRunnerProcess) {
+    return workspaceRunnerProcess
+  }
+
+  const backend = await ensureRuntime(resolveHermesBackend([]))
+
+  if (backend.kind !== 'python' || !backend.command || !backend.root) {
+    throw new Error('The isolated workspace runner requires a Python Hermes runtime.')
+  }
+
+  workspaceRunnerProcess = new WorkspaceRunnerProcess({
+    backend: {
+      command: backend.command,
+      env: backend.env,
+      root: backend.root
+    },
+    stateDirectory: path.join(app.getPath('userData'), 'workspace-runner')
+  })
+
+  return workspaceRunnerProcess
+}
+
+app.on('before-quit', () => {
+  workspaceRunnerProcess?.stop()
+})
+
 ipcMain.handle('hermes:git:worktreeList', async (_event, repoPath) => listWorktrees(repoPath, resolveGitBinary()))
 
-ipcMain.handle('hermes:git:worktreeAdd', async (_event, repoPath, options) =>
-  addWorktree(repoPath, options || {}, resolveGitBinary())
-)
+ipcMain.handle('hermes:git:worktreeAdd', async (_event, repoPath, options) => {
+  const runner = await activeWorkspaceRunnerProcess()
+
+  return runner.worktreeAdd(repoPath, options || {})
+})
 
 ipcMain.handle('hermes:git:worktreeRemove', async (_event, repoPath, worktreePath, options) =>
   removeWorktree(repoPath, worktreePath, options || {}, resolveGitBinary())
@@ -11810,14 +11848,21 @@ ipcMain.handle('hermes:git:review:revert', async (_event, repoPath, filePath) =>
 ipcMain.handle('hermes:git:review:revParse', async (_event, repoPath, ref) =>
   reviewRevParse(repoPath, ref, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:commit', async (_event, repoPath, message, push) =>
-  reviewCommit(repoPath, message, Boolean(push), resolveGitBinary())
+ipcMain.handle('hermes:git:review:commit', async (_event, repoPath, message) =>
+  reviewCommit(repoPath, message, false, resolveGitBinary())
 )
 ipcMain.handle('hermes:git:review:commitContext', async (_event, repoPath) =>
   reviewCommitContext(repoPath, resolveGitBinary())
 )
-ipcMain.handle('hermes:git:review:push', async (_event, repoPath) => reviewPush(repoPath, resolveGitBinary()))
-ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) => reviewShipInfo(repoPath, resolveGhBinary()))
+ipcMain.handle('hermes:git:review:createPushRequest', async (_event, repoPath) =>
+  reviewCreatePushRequest(repoPath, resolveGitBinary())
+)
+ipcMain.handle('hermes:git:review:pushApproved', async (_event, repoPath, decision) =>
+  reviewPushApproved(repoPath, decision, resolveGitBinary())
+)
+ipcMain.handle('hermes:git:review:shipInfo', async (_event, repoPath) =>
+  reviewShipInfo(repoPath, resolveGitBinary(), resolveGhBinary())
+)
 ipcMain.handle('hermes:git:review:prList', async (_event, repoPath, branches, numbers) =>
   reviewPrList(repoPath, resolveGhBinary(), branches, numbers)
 )

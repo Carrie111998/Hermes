@@ -33,7 +33,7 @@ import { activateWakeIndicator } from '@/lib/wake-indicator'
 import { playWakeSound } from '@/lib/wake-sound'
 import { $billingSettingsRequest } from '@/store/billing-block'
 import { $desktopBoot } from '@/store/boot'
-import { requestVoiceConversationStart } from '@/store/composer'
+import { addComposerAttachment, clearComposerAttachments, requestVoiceConversationStart } from '@/store/composer'
 import { setCronFocusJobId } from '@/store/cron'
 import { $pinnedSessionIds, pinSession, restoreWorktree, unpinSession } from '@/store/layout'
 import { $previewTarget } from '@/store/preview'
@@ -542,6 +542,14 @@ export function ContribWiring({ children }: { children: ReactNode }) {
 
     lastStartWorkTokenRef.current = startWorkSessionRequest.token
     startSessionInWorkspace(startWorkSessionRequest.path, { openTab: startWorkSessionRequest.openTab })
+
+    if (startWorkSessionRequest.attachments?.length) {
+      clearComposerAttachments()
+
+      for (const attachment of startWorkSessionRequest.attachments) {
+        addComposerAttachment({ ...attachment })
+      }
+    }
 
     if (startWorkSessionRequest.draft) {
       requestComposerInsert(startWorkSessionRequest.draft, { target: 'main' })

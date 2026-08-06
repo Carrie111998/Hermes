@@ -13,6 +13,7 @@ import {
   $projectTree,
   $removedSessionIds,
   $sessionMutationsInFlight,
+  $startWorkSessionRequest,
   $worktreeRefreshToken,
   ALL_PROJECTS,
   beginSessionMutation,
@@ -29,6 +30,7 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
+  startIsolatedWorkSession,
   tombstoneSessions
 } from './projects'
 
@@ -37,7 +39,8 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@/store/notifications', () => ({
-  notify: vi.fn()
+  notify: vi.fn(),
+  notifyError: vi.fn()
 }))
 
 vi.mock('@/lib/desktop-fs', () => ({
@@ -505,6 +508,60 @@ describe('project tree profile isolation', () => {
     await pendingA
 
     expect($projectTree.get().map(project => project.id)).toEqual(['profile-b'])
+  })
+})
+
+describe('isolated workspace sessions', () => {
+  beforeEach(() => {
+    $startWorkSessionRequest.set(null)
+  })
+
+  it('creates a dedicated worktree before issuing the new chat request', async () => {
+    const worktreeAdd = vi.fn(async (_repoPath: string, options: { base?: string; branch: string }) => ({
+      branch: options.branch,
+      path: '/repo/.worktrees/implement-login'
+    }))
+
+    desktopGit.mockReturnValue({ worktreeAdd } as never)
+
+    const attachment = {
+      id: 'file:brief',
+      kind: 'file' as const,
+      label: 'brief.pdf',
+      refText: '@file:brief.pdf'
+    }
+
+    const started = await startIsolatedWorkSession(
+      '/repo',
+      'Implement login',
+      [attachment],
+      { base: 'origin/main' }
+    )
+
+    expect(worktreeAdd).toHaveBeenCalledWith(
+      '/repo',
+      expect.objectContaining({
+        base: 'origin/main',
+        branch: expect.stringMatching(/^hermes\/implement-login-/),
+        name: expect.stringMatching(/^implement-login-/)
+      })
+    )
+    expect(started?.path).toBe('/repo/.worktrees/implement-login')
+    expect($startWorkSessionRequest.get()).toEqual(
+      expect.objectContaining({
+        draft: 'Implement login',
+        attachments: [attachment],
+        openTab: true,
+        path: '/repo/.worktrees/implement-login'
+      })
+    )
+  })
+
+  it('does not start a chat when a dedicated worktree cannot be created', async () => {
+    desktopGit.mockReturnValue(null as never)
+
+    await expect(startIsolatedWorkSession('/repo', 'Task')).rejects.toThrow('worktree')
+    expect($startWorkSessionRequest.get()).toBeNull()
   })
 })
 
