@@ -722,7 +722,7 @@ def _wrap_command_with_watchdog(command: str, args: list) -> tuple[str, list]:
         "--ppid", str(my_pid),
         "--",
         command,
-        *args,
+        *(args or []),
     ]
     return sys.executable, watchdog_args
 
@@ -2384,7 +2384,7 @@ class MCPServerTask:
             )
 
         command = config.get("command")
-        args = config.get("args", [])
+        args = config.get("args") or []
         user_env = config.get("env")
 
         if not command:
