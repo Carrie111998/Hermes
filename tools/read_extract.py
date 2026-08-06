@@ -16,6 +16,7 @@ import importlib
 import json
 import os
 import posixpath
+import tempfile
 import threading
 import time
 import zipfile
@@ -23,7 +24,13 @@ from pathlib import Path
 from typing import Any, Optional
 from xml.etree import ElementTree as ET
 
-__all__ = ["EXTRACTABLE_EXTENSIONS", "ExtractionError", "extract_document_text", "is_extractable_document"]
+__all__ = [
+    "EXTRACTABLE_EXTENSIONS",
+    "ExtractionError",
+    "extract_document_bytes",
+    "extract_document_text",
+    "is_extractable_document",
+]
 
 EXTRACTABLE_EXTENSIONS = frozenset({".ipynb", ".docx", ".xlsx"})
 # Formats handled only when the optional anydoc converter is installed.
@@ -39,6 +46,7 @@ MAX_XLSX_BYTES = 50 * 1024 * 1024
 # Rust core with no streaming, and the read_file char budget only applies
 # after conversion, so an unbounded input can pin a tool turn and spike RAM.
 MAX_ANYDOC_BYTES = 50 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 _MAX_XLSX_ROWS_PER_SHEET = 5000
 _MAX_XLSX_COLS = 256
 
@@ -95,12 +103,14 @@ def _anydoc() -> Optional[Any]:
             # prompt=False: read_file must never block on an install prompt.
             _lazy_ensure("tool.doc_extract", prompt=False)
         except Exception:
-            pass  # lazy install unavailable — fall through to a plain import
+            _anydoc_failed_at = time.monotonic()
+            return None
         try:
             _anydoc_module = importlib.import_module("anydoc")
         except Exception:  # ImportError or a broken native binding
             _anydoc_failed_at = time.monotonic()
             return None
+        _anydoc_failed_at = None
     return _anydoc_module  # type: ignore[return-value]
 
 
@@ -119,6 +129,34 @@ def extract_document_text(path: str) -> str:
     if ext in ANYDOC_EXTENSIONS:
         return _extract_anydoc(path)
     raise ExtractionError(f"Unsupported document type: {path!r}")
+
+
+def extract_document_bytes(data: bytes, path: str) -> str:
+    """Extract a document already fetched across a file backend boundary."""
+    if len(data) > MAX_DOCUMENT_BYTES:
+        raise ExtractionError(
+            f"Document too large to convert ({len(data):,} bytes, limit is {MAX_DOCUMENT_BYTES:,})"
+        )
+    ext = _extension(path)
+    if ext in ANYDOC_EXTENSIONS:
+        return _extract_anydoc_bytes(data, path)
+    if ext not in EXTRACTABLE_EXTENSIONS:
+        raise ExtractionError(f"Unsupported document type: {path!r}")
+
+    # The stdlib extractors are path-oriented. Materialize backend bytes in a
+    # private host temp file, then remove it even when parsing fails.
+    temp_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as fh:
+            fh.write(data)
+            temp_path = fh.name
+        return extract_document_text(temp_path)
+    finally:
+        if temp_path:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
 
 
 def _extract_anydoc(path: str) -> str:
@@ -142,6 +180,23 @@ def _extract_anydoc(path: str) -> str:
         # (Unsupported, Malformed, Encrypted, ResourceLimit, MissingPart).
         # Any of them means "no meaningful text": fall back to the normal
         # path/binary handling rather than crash read_file.
+        raise ExtractionError(f"{type(exc).__name__}: {exc}") from exc
+    if not isinstance(text, str) or not text.strip():
+        raise ExtractionError("Document contains no extractable text")
+    return text.rstrip("\n") + "\n"
+
+
+def _extract_anydoc_bytes(data: bytes, path: str) -> str:
+    mod = _anydoc()
+    if mod is None:
+        raise ExtractionError(f"Unsupported document type: {path!r}")
+    if len(data) > MAX_ANYDOC_BYTES:
+        raise ExtractionError(
+            f"Document too large to convert ({len(data):,} bytes, limit is {MAX_ANYDOC_BYTES:,})"
+        )
+    try:
+        text = mod.to_markdown_bytes(data)
+    except Exception as exc:
         raise ExtractionError(f"{type(exc).__name__}: {exc}") from exc
     if not isinstance(text, str) or not text.strip():
         raise ExtractionError("Document contains no extractable text")
