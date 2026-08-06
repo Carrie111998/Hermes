@@ -1,0 +1,53 @@
+name: Doc Links
+
+# Rejects PRs where a doc cites a repo file that does not exist.
+#
+# Docs rot when *code* moves, not when docs change. When the messaging
+# platforms migrated from `gateway/platforms/<name>.py` to
+# `plugins/platforms/<name>/adapter.py`, ADDING_A_PLATFORM.md kept sending new
+# contributors to files that were already gone, §11 kept describing an opt-in
+# discovery list that had become an opt-out frozenset, and the Matrix E2E
+# README kept telling readers to diff against a deleted symbol. None of it
+# failed anything, because nothing checked.
+#
+# Note there is deliberately NO path filter on this job. Gating it on
+# "markdown changed" would miss the entire failure class above — the diff that
+# breaks a reference is a rename in the code, and it does not touch the doc.
+# The check is pure stdlib over `git ls-files`, so running it every time is
+# cheap (no venv, no install step).
+#
+# The resolver is deliberately generous — repo root, the doc's directory or any
+# ancestor, a directory declared in backticks by the nearest heading, or an
+# explicit `<!-- doc-links: base=... -->` override. A false positive gets a
+# check like this switched off; a missed dead link costs one confused reader.
+# See scripts/ci/check_doc_links.py for the model and the exemption tables.
+
+on:
+  workflow_call:
+    outputs:
+      review_status:
+        description: "JSON array of review_status objects for the synthesizer."
+        value: ${{ jobs.check-doc-links.outputs.review_status }}
+
+permissions:
+  contents: read
+
+jobs:
+  check-doc-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.doc-links.outputs.review_status }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - id: doc-links
+        name: Check documentation file references
+        run: |
+          if python3 scripts/ci/check_doc_links.py --stats; then
+            echo "review_status=[]" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          STATUS='[{"source":"doc links","results":[{"kind":"action_required","title":"Documentation references a file that does not exist","summary":"A doc cites a repo path that is not in the tree — usually because the code moved and the doc did not.","detail":"","how_to_fix":"Run it locally to see the exact doc and line:\n```\npython3 scripts/ci/check_doc_links.py --stats\n```\nThen, in order of preference:\n1. The file moved — update the path in the doc.\n2. The path is correct but addressed from elsewhere — declare a base in the nearest heading, ``## Section (`some/dir/`)``, or add ``<!-- doc-links: base=some/dir -->`` near the top of the doc.\n3. It genuinely lives outside this repo (another repo, a runtime path under HERMES_HOME, a placeholder the reader creates) — add it to `EXEMPT_REFS` in `scripts/ci/check_doc_links.py` with a reason.\n"}]}]'
+          echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+          exit 1

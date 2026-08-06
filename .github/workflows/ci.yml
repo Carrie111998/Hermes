@@ -141,6 +141,14 @@ jobs:
     needs: detect
     uses: ./.github/workflows/infographic-check.yml
 
+  # Intentionally ungated: the diff that breaks a doc reference is a rename in
+  # the code, which does not touch the doc. A path filter would miss the whole
+  # failure class. Pure stdlib, no install step.
+  doc-links:
+    name: Check doc file references
+    needs: detect
+    uses: ./.github/workflows/doc-links.yml
+
   lockfile-diff:
     name: package-lock.json diff
     needs: detect
@@ -252,6 +260,7 @@ jobs:
       - history-check
       - contributor-check
       - uv-lockfile
+      - doc-links
       - lockfile-diff
       - docker-lint
       - supply-chain
