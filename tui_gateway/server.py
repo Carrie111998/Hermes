@@ -16,7 +16,7 @@ import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, Callable, NamedTuple, Optional
 
 from agent.secret_scope import (
     build_profile_secret_scope,
@@ -274,6 +274,9 @@ _LONG_HANDLERS = frozenset(
         "session.compress",
         "session.list",
         "session.resume",
+        # Workspace re-home runs git branch/root subprocess probes against an
+        # arbitrary folder — inline they'd stall the reader on a slow mount.
+        "session.workspace.move",
         "shell.exec",
         "skills.manage",
         "slash.exec",
@@ -291,6 +294,12 @@ _pool = concurrent.futures.ThreadPoolExecutor(
     thread_name_prefix="tui-rpc",
 )
 atexit.register(lambda: _pool.shutdown(wait=False, cancel_futures=True))
+
+# Exact in-memory session generation executing on the current turn thread.
+# Unlike a public session id, this object identity cannot be supplied by RPC.
+_current_runtime_session_record: contextvars.ContextVar[dict | None] = (
+    contextvars.ContextVar("hermes_gateway_runtime_session_record", default=None)
+)
 
 # Reserve real stdout for JSON-RPC only; redirect Python's stdout to stderr
 # so stray print() from libraries/tools becomes harmless gateway.stderr instead
@@ -903,17 +912,33 @@ def _teardown_popped_session(
     return True
 
 
-def _close_session_by_id(sid: str, *, end_reason: str = "tui_close") -> bool:
+def _close_session_by_id(
+    sid: str,
+    *,
+    end_reason: str = "tui_close",
+    predicate: Callable[[dict], bool] | None = None,
+) -> bool:
     """Single idempotent teardown funnel for callers needing no resume race.
 
     Resume-sensitive callers first pop under ``_session_resume_lock`` and then
     call ``_teardown_popped_session`` after releasing it.  Other reapers can use
     this convenience wrapper directly.  The pop remains the single atomic
     ownership claim, so concurrent/repeat close attempts stay harmless.
+
+    Automatic reapers can pass ``predicate`` to revalidate under
+    ``_sessions_lock`` immediately before the ownership claim. This prevents a
+    stale scan result from closing a session that reattached or gained active
+    delegated work before teardown.
     """
-    return _teardown_popped_session(
-        _pop_session_by_id(sid), end_reason=end_reason
-    )
+    if predicate is None:
+        session = _pop_session_by_id(sid)
+    else:
+        with _sessions_lock:
+            current = _sessions.get(sid)
+            if current is None or not predicate(current):
+                return False
+            session = _pop_session_by_id(sid)
+    return _teardown_popped_session(session, end_reason=end_reason)
 
 
 def _ws_session_is_orphaned(session: dict | None) -> bool:
@@ -928,6 +953,81 @@ def _ws_session_is_orphaned(session: dict | None) -> bool:
     if session.get("running"):
         return False
     return session.get("transport") is _detached_ws_transport
+
+
+def _session_owns_durable_lifecycle(session_id: str | None) -> bool:
+    """Whether this TUI/desktop session may end its durable DB row by key."""
+    if not session_id:
+        return True
+    try:
+        db = _get_db()
+        if db is None:
+            return True
+        # Don't end gateway-originated sessions — the gateway owns their
+        # lifecycle. The TUI is only a viewer there (#60609).
+        row = db.get_session(session_id)
+        source = (row or {}).get("source", "")
+        return not _is_gateway_owned_source(source)
+    except Exception:
+        return True
+
+
+def _session_async_delegation_selectors(
+    session: dict | None, *, sid_hint: str = ""
+) -> tuple[str, str]:
+    """Ownership selectors for async background work tied to one UI session."""
+    if not session:
+        return "", ""
+    own_sid = str(sid_hint or session.get("_sid") or "")
+    if not own_sid:
+        try:
+            with _sessions_lock:
+                for _cand_sid, _cand in _sessions.items():
+                    if _cand is session:
+                        own_sid = _cand_sid
+                        break
+        except Exception:
+            own_sid = ""
+    agent = session.get("agent")
+    session_key = str(session.get("session_key") or "")
+    session_id = getattr(agent, "session_id", None) or session_key
+    owned_session_key = session_key if _session_owns_durable_lifecycle(session_id) else ""
+    return own_sid, owned_session_key
+
+
+def _session_has_active_delegations(sid: str, session: dict | None = None) -> bool:
+    """True when UI session ``sid`` still owns live background work.
+
+    Matches by the live UI sid AND — when the TUI owns the durable lifecycle
+    (never for gateway-viewer tabs, #60609) — by the durable session_key, so a
+    delegation dispatched from an earlier tab of the same resumed session still
+    keeps it alive.
+    """
+    if session is None:
+        with _sessions_lock:
+            session = _sessions.get(sid)
+    own_sid, owned_session_key = _session_async_delegation_selectors(
+        session, sid_hint=sid
+    )
+    if not own_sid and not owned_session_key:
+        return False
+    try:
+        from tools.async_delegation import has_live_for_session
+
+        return has_live_for_session(
+            session_key=owned_session_key,
+            origin_ui_session_id=own_sid,
+        )
+    except Exception:
+        logger.debug(
+            "Failed to query active delegations for UI session %s",
+            sid,
+            exc_info=True,
+        )
+        # A transient registry/import failure must not turn into destructive
+        # cleanup. Conservatively keep the detached session and let the next
+        # orphan timer retry the lookup.
+        return True
 
 
 def _schedule_ws_orphan_reap(sid: str) -> None:
@@ -951,10 +1051,19 @@ def _schedule_ws_orphan_reap(sid: str) -> None:
         # mutual exclusion against _init_session / _close_session_by_id, which
         # guard with _sessions_lock). _sessions_lock is an RLock and the global
         # ordering is always resume_lock -> sessions_lock, so nesting is safe.
+        reschedule = False
+        session = None
         with _session_resume_lock:
-            if not _ws_session_is_orphaned(_sessions.get(sid)):
+            current = _sessions.get(sid)
+            if not _ws_session_is_orphaned(current):
                 return
-            session = _pop_session_by_id(sid)
+            if _session_has_active_delegations(sid, current):
+                reschedule = True
+            else:
+                session = _pop_session_by_id(sid)
+        if reschedule:
+            _schedule_ws_orphan_reap(sid)
+            return
         _teardown_popped_session(session, end_reason="ws_orphan_reap")
 
     timer = threading.Timer(_WS_ORPHAN_REAP_GRACE_S, _reap)
@@ -1034,6 +1143,8 @@ def _transport_is_dead(transport) -> bool:
 def _session_is_evictable(sid: str, session: dict, now: float) -> bool:
     if session.get("running") or _session_pending_kind(sid):
         return False
+    if _session_has_active_delegations(sid, session):
+        return False
     ready = session.get("agent_ready")
     # Lazy watch sessions (subagent spectator windows) never start a build,
     # so their forever-unset agent_ready must not make them immortal.
@@ -1051,7 +1162,13 @@ def _reap_idle_sessions() -> None:
     with _sessions_lock:
         victims = [sid for sid, s in _sessions.items() if _session_is_evictable(sid, s, now)]
     for sid in victims:
-        _close_session_by_id(sid, end_reason="idle_timeout")
+        _close_session_by_id(
+            sid,
+            end_reason="idle_timeout",
+            predicate=lambda session, victim_sid=sid: _session_is_evictable(
+                victim_sid, session, time.time()
+            ),
+        )
     _enforce_session_cap()
     _reclaim_orphaned_leases()
     # Periodic heap release for long-lived gateway processes.  Even when no
@@ -1114,9 +1231,12 @@ def _max_live_sessions() -> int:
 
 def _session_is_lru_evictable(sid: str, session: dict) -> bool:
     # Same hard exemptions as the TTL reaper (never evict a session mid-turn,
-    # awaiting input, or still building), but WITHOUT the hours-scale age gate:
-    # a detached session is eligible the moment it loses its client.
+    # awaiting input, still building, or owning active delegated work), but
+    # WITHOUT the hours-scale age gate: a detached session is eligible the
+    # moment it loses its client.
     if session.get("running") or _session_pending_kind(sid):
+        return False
+    if _session_has_active_delegations(sid, session):
         return False
     ready = session.get("agent_ready")
     if ready is not None and not ready.is_set() and not session.get("lazy"):
@@ -1138,9 +1258,17 @@ def _enforce_session_cap() -> None:
     # Oldest-touched first; only evict down to the cap (live/focused sessions on
     # a live transport are never eligible, so we may stop short of the cap).
     evictable.sort(key=lambda kv: float(kv[1].get("last_active") or 0.0))
-    overflow = total - cap
-    for sid, _s in evictable[:overflow]:
-        _close_session_by_id(sid, end_reason="lru_evict")
+    for sid, _s in evictable:
+        with _sessions_lock:
+            if len(_sessions) <= cap:
+                break
+        _close_session_by_id(
+            sid,
+            end_reason="lru_evict",
+            predicate=lambda session, victim_sid=sid: _session_is_lru_evictable(
+                victim_sid, session
+            ),
+        )
 
 
 def _schedule_session_cap_enforcement() -> None:
@@ -1776,6 +1904,31 @@ def handle_request(req: dict) -> dict | None:
     if not fn:
         return _err(rid, -32601, f"unknown method: {method}")
     return fn(rid, params)
+
+
+def _current_session_steer_authority(
+    session_id: str,
+) -> tuple[Transport | None, dict | None]:
+    """Resolve unforgeable steering authority for this exact RPC context.
+
+    The public session id is only a lookup hint. Authority is the identity of
+    both the request's ContextVar-bound transport and the live in-memory
+    session record currently stored under that id. Session transport rebinding,
+    removal, or id reuse therefore invalidates an earlier generation.
+    """
+    transport = current_transport()
+    if transport is None or not session_id:
+        return None, None
+    expected_session = _current_runtime_session_record.get()
+    with _sessions_lock:
+        session = _sessions.get(session_id)
+        if (
+            session is None
+            or (expected_session is not None and session is not expected_session)
+            or session.get("transport") is not transport
+        ):
+            return None, None
+        return transport, session
 
 
 def dispatch(req: dict, transport: Optional[Transport] = None) -> dict | None:
@@ -2630,16 +2783,26 @@ def _persist_branch_seed(session: dict) -> None:
         if db is None:
             return
         try:
-            for msg in seed:
-                db.append_message(
-                    session_id=key,
-                    role=msg.get("role", "user"),
-                    content=msg.get("content"),
-                    # Preserve the parent's original message timestamps —
-                    # append_message would otherwise stamp time.time() and the
-                    # branch's copied history would all appear authored "now".
-                    timestamp=msg.get("timestamp"),
-                )
+            # Bounded-chunk transactions (see #23254): a branch seed can be
+            # hundreds of rows; chunking keeps each BEGIN IMMEDIATE short so
+            # concurrent writers aren't starved. Recovery semantics match the
+            # old per-row loop (mid-copy failure leaves a partial seed with
+            # _branch_seed_persisted unset).
+            db.append_messages_batch(
+                key,
+                [
+                    {
+                        "role": msg.get("role", "user"),
+                        "content": msg.get("content"),
+                        # Preserve the parent's original message timestamps —
+                        # append_message would otherwise stamp time.time() and the
+                        # branch's copied history would all appear authored "now".
+                        "timestamp": msg.get("timestamp"),
+                    }
+                    for msg in seed
+                ],
+                chunk_rows=500,
+            )
             session["_branch_seed_persisted"] = True
         except Exception as exc:
             from hermes_state import is_disk_full_error
@@ -2944,6 +3107,7 @@ def _set_session_context(
             source=source,
             cwd=resolved,
             ui_session_id=ui_session_id,
+            cron_session="",
         )
     except Exception:
         return []
@@ -3005,6 +3169,7 @@ def _block(event: str, sid: str, payload: dict, timeout: float | None = 300) -> 
         "sudo.request",
         "clarify.request",
         "terminal.read.request",
+        "preview.read.request",
     }:
         _emit(
             f"{event.removesuffix('.request')}.expire",
@@ -5541,6 +5706,16 @@ def _agent_cbs(sid: str) -> dict:
             {k: v for k, v in (("start", start), ("count", count)) if v is not None},
             timeout=30,
         ),
+        # read_preview tool (desktop GUI): the renderer serializes the active
+        # preview tab (a Browser webview's readable text, a file's identity)
+        # and answers preview.read.respond. Longer timeout than the terminal
+        # read — a URL tab extracts text from a live page.
+        "read_preview_callback": lambda start=None, count=None: _block(
+            "preview.read.request",
+            sid,
+            {k: v for k, v in (("start", start), ("count", count)) if v is not None},
+            timeout=45,
+        ),
     }
 
     # Interim assistant commentary (text alongside tool calls, or the attempted
@@ -7793,6 +7968,7 @@ def _live_session_payload(
     cols: int | None = None,
     touch: bool = False,
     transport: Transport | None = None,
+    omit_messages: bool = False,
 ) -> dict:
     with session["history_lock"]:
         if cols is not None:
@@ -7810,11 +7986,16 @@ def _live_session_payload(
     # Prefer the persisted display lineage (candidate-inclusive) so this payload
     # matches the eager session.resume + REST transcript; the DB has its own
     # lock, so read it outside the session history lock.
-    history = _live_visible_history(session, _get_db(), in_memory_history)
+    history = (
+        in_memory_history
+        if omit_messages
+        else _live_visible_history(session, _get_db(), in_memory_history)
+    )
     payload = {
         "info": _fallback_session_info(session),
         "message_count": len(history),
-        "messages": _history_to_messages(history),
+        "messages": [] if omit_messages else _history_to_messages(history),
+        "messages_omitted": omit_messages,
         "running": running,
         "session_id": sid,
         "session_key": _session_lookup_key(session, fallback=sid),
@@ -8784,6 +8965,20 @@ def _collect_kanban_notifications(session: dict) -> list:
         if resolved in seen_db_paths:
             continue
         seen_db_paths.add(resolved)
+        # A poller runs per live TUI/Desktop session. Avoid opening this board
+        # writable unless it has a subscription owned by this exact session;
+        # subscriptions for gateways or other sessions are not actionable here.
+        try:
+            if _kb.count_notify_subs(
+                board=slug,
+                platform="tui",
+                chat_id=session_key,
+            ) == 0:
+                continue
+        except Exception:
+            # Preserve delivery if the read-only probe cannot inspect a
+            # locked, corrupt, or otherwise unusual database.
+            pass
         try:
             conn = _kb.connect(board=slug)
         except Exception:
@@ -9203,8 +9398,6 @@ def _run_prompt_submit(
         ):
             session["running"] = False
             return
-        history = list(session["history"])
-        history_version = int(session.get("history_version", 0))
         if image_paths is None:
             images = list(session.get("attached_images", []))
             session["attached_images"] = []
@@ -9224,6 +9417,12 @@ def _run_prompt_submit(
     _emit("message.start", sid)
 
     def run():
+        # The conversation runs on a fresh thread, so ContextVars from the RPC
+        # dispatcher do not follow automatically. Rebind the exact transport
+        # stored on this session generation before any tool can commission a
+        # child; delegate_task then captures it as non-serializable authority.
+        transport_token = bind_transport(session.get("transport"))
+        runtime_session_token = _current_runtime_session_record.set(session)
         approval_token = None
         session_tokens = []
         home_token = None  # per-turn HERMES_HOME override for a resumed remote profile
@@ -9284,6 +9483,11 @@ def _run_prompt_submit(
                 # config sync so an explicit pick wins over a config.yaml change.
                 _apply_pending_model_switch(sid, session)
                 _sync_agent_model_with_config(sid, session)
+            # Snapshot after turn-start model sync. A deferred switch mutates
+            # history and its version; that mutation belongs to this turn.
+            with session["history_lock"]:
+                history = list(session["history"])
+                history_version = int(session.get("history_version", 0))
             cwd = _session_cwd(session)
             _register_session_cwd(session)
             cols = session.get("cols", 80)
@@ -9566,24 +9770,59 @@ def _run_prompt_submit(
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
                         else:
-                            # History mutated externally during the turn
-                            # (undo/compress/retry/rollback now guard on
-                            # session.running, but this is the defensive
-                            # backstop for any path that slips past).
-                            # Surface the desync rather than silently
-                            # dropping the agent's output — the UI can
-                            # show the response and warn that it was
-                            # not persisted.
-                            print(
-                                f"[tui_gateway] prompt.submit: history_version mismatch "
-                                f"(expected={history_version} current={current_version}) — "
-                                f"agent output NOT written to session history",
-                                file=sys.stderr,
+                            # History mutated externally during the turn.
+                            # Check if the only mutation was a model-switch
+                            # marker inserted mid-turn (#76870).  If so the
+                            # agent output is still valid — merge it into the
+                            # current history that now contains the marker.
+                            #
+                            # _append_model_switch_marker strips prior markers
+                            # in-place then appends a new one, so the delta
+                            # is NOT a simple tail-slice — we must compare
+                            # content, not indices.
+                            current_history = list(session["history"])
+                            history_no_markers = [
+                                e for e in history if not _is_model_switch_marker(e)
+                            ]
+                            current_no_markers = [
+                                e for e in current_history if not _is_model_switch_marker(e)
+                            ]
+                            model_switch_only = (
+                                current_no_markers == history_no_markers
+                                and any(
+                                    _is_model_switch_marker(e)
+                                    for e in current_history
+                                )
                             )
-                            status_note = (
-                                "History changed during this turn — the response above is visible "
-                                "but was not saved to session history."
-                            )
+                            if model_switch_only:
+                                # The agent's new messages start after the
+                                # turn-start history.  Guard against
+                                # auto-compression making result["messages"]
+                                # shorter than history (#77274 review).
+                                if len(result["messages"]) > len(history):
+                                    new_messages = result["messages"][len(history):]
+                                else:
+                                    # Compression rebound the messages list —
+                                    # use the full result as the base.
+                                    new_messages = list(result["messages"])
+                                session["history"] = current_history + new_messages
+                                session["history_version"] = current_version + 1
+                            else:
+                                # Genuine desync (undo/compress/retry/rollback).
+                                # Surface the desync rather than silently
+                                # dropping the agent's output — the UI can
+                                # show the response and warn that it was
+                                # not persisted.
+                                print(
+                                    f"[tui_gateway] prompt.submit: history_version mismatch "
+                                    f"(expected={history_version} current={current_version}) — "
+                                    f"agent output NOT written to session history",
+                                    file=sys.stderr,
+                                )
+                                status_note = (
+                                    "History changed during this turn — the response above is visible "
+                                    "but was not saved to session history."
+                                )
 
                 # If auto-compression fired inside run_conversation(), agent.session_id
                 # may have rotated. Sync session_key before downstream title/goal/finalize
@@ -9887,6 +10126,8 @@ def _run_prompt_submit(
             if secret_token is not None:
                 reset_secret_scope(secret_token)
             _clear_session_context(session_tokens)
+            _current_runtime_session_record.reset(runtime_session_token)
+            reset_transport(transport_token)
             # Clear the per-turn interim callback so a stale closure from
             # this turn can't fire during a later turn on the same agent.
             agent.interim_assistant_callback = None
@@ -12928,8 +13169,10 @@ def _(rid, params: dict) -> dict:
         from tools.wake_word import (
             WakeWordInUse,
             check_wake_word_requirements,
+            detector_frame_info,
             load_wake_word_config,
             owns_listener,
+            resolve_capture_mode,
             start_listening,
             wake_phrase,
             wake_surface_enabled,
@@ -12938,16 +13181,25 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5026, f"wake module unavailable: {e}")
 
     cfg = load_wake_word_config()
+    # Desktop remote (gui) prefers client capture: Mac mic → wake.feed PCM,
+    # while the engine still runs on the backend. CLI/TUI stay local.
+    prefer_client = surface in ("gui", "desktop") or bool(params.get("client_capture"))
+    capture_mode = resolve_capture_mode(cfg, prefer_client=prefer_client)
+    external_audio = capture_mode == "client"
     # Requirements first: a gesture on an unarmed-able setup (no STT/TTS, no
     # mic, missing key) must refuse WITHOUT flipping wake_word.enabled — else
     # config says on while nothing can ever arm, and auto-arm paths churn.
-    reqs = check_wake_word_requirements(cfg)
+    # Temporarily stamp capture so the probe matches the arm mode.
+    probe_cfg = dict(cfg)
+    probe_cfg["capture"] = capture_mode
+    reqs = check_wake_word_requirements(probe_cfg)
     if not reqs["available"]:
         logger.warning("wake.start(%s): not available — %s", surface, reqs.get("hint"))
         return _ok(rid, {
             "started": False,
             "reason": "unavailable",
             "hint": reqs.get("hint") or "",
+            "capture": capture_mode,
         })
     enabled_persisted = False
     if persist and not cfg.get("enabled"):
@@ -13011,7 +13263,12 @@ def _(rid, params: dict) -> dict:
             reset_transport(token)
 
     try:
-        start_listening(_on_detect, owner=transport, config=cfg)
+        start_listening(
+            _on_detect,
+            owner=transport,
+            config=cfg,
+            external_audio=external_audio,
+        )
     except WakeWordInUse:
         return _ok(rid, {
             "started": False,
@@ -13025,13 +13282,20 @@ def _(rid, params: dict) -> dict:
     with _wake_lock:
         _wake_owner_transport = transport
         _wake_owner_surface = surface
-    logger.info("wake.start(%s): listening for %r (%s)", surface, reqs["phrase"], reqs["provider"])
+    frame = detector_frame_info()
+    logger.info(
+        "wake.start(%s): listening for %r (%s) capture=%s frame=%s",
+        surface, reqs["phrase"], reqs["provider"], capture_mode, frame.get("frame_length"),
+    )
     return _ok(rid, {
         "started": True,
         "phrase": reqs["phrase"],
         "provider": reqs["provider"],
         "owner_surface": surface,
         "enabled_persisted": enabled_persisted,
+        "capture": capture_mode,
+        "sample_rate": frame.get("sample_rate", 16000),
+        "frame_length": frame.get("frame_length", 1280),
     })
 
 
@@ -13098,14 +13362,22 @@ def _(rid, params: dict) -> dict:
         from tools.wake_word import (
             audio_is_silent,
             check_wake_word_requirements,
+            detector_frame_info,
             get_input_device_status,
             is_listening,
             load_wake_word_config,
             owns_listener,
+            resolve_capture_mode,
             silent_audio_hint,
         )
         cfg = load_wake_word_config()
-        reqs = check_wake_word_requirements(cfg)
+        # Prefer client when the GUI asks (desktop remote re-arm / status).
+        prefer_client = bool(params.get("client_capture")) or str(
+            params.get("surface") or ""
+        ).strip().lower() in ("gui", "desktop")
+        probe_cfg = dict(cfg)
+        probe_cfg["capture"] = resolve_capture_mode(cfg, prefer_client=prefer_client)
+        reqs = check_wake_word_requirements(probe_cfg)
         transport = current_transport() or _stdio_transport
         owner, owner_surface = _wake_owner_snapshot()
         owned_by_caller = owns_listener(transport)
@@ -13117,6 +13389,19 @@ def _(rid, params: dict) -> dict:
             hint = f"Wake-word input device could not be resolved: {input_device['error']}"
         if silent and not hint:
             hint = silent_audio_hint(input_device)
+        # Effective capture: prefer the *armed* detector over config/auto.
+        # With capture:auto the GUI arms client mode, but a bare status probe
+        # would otherwise report "local" and the desktop would not reattach
+        # the PCM feeder after wake.detected.
+        frame = detector_frame_info()
+        if owned_by_caller and frame.get("external_audio"):
+            capture = "client"
+        elif owned_by_caller and listening:
+            capture = "local"
+        else:
+            capture = probe_cfg.get("capture") or reqs.get("capture") or str(
+                cfg.get("capture") or "auto"
+            )
         return _ok(rid, {
             "listening": listening,
             "owned_by_caller": owned_by_caller,
@@ -13132,9 +13417,52 @@ def _(rid, params: dict) -> dict:
             "enabled": bool(cfg.get("enabled")),
             # Armed but deaf despite an open stream; see platform-specific hint.
             "audio_silent": silent,
+            "capture": capture,
+            "local_input_available": bool(reqs.get("local_input_available")),
+            "sample_rate": frame.get("sample_rate", 16000),
+            "frame_length": frame.get("frame_length", 1280),
         })
     except Exception as e:
         return _err(rid, 5026, str(e))
+
+
+@method("wake.feed")
+def _(rid, params: dict) -> dict:
+    """Push client-captured PCM into the armed wake detector.
+
+    Params:
+      pcm: base64-encoded int16 mono little-endian samples (preferred), OR
+      pcm_b64: alias of pcm
+    Optional:
+      sample_rate: must be 16000 (ignored if missing; mismatched rates rejected)
+
+    Used when ``wake.start`` returned ``capture: "client"`` so remote backends
+    without a microphone can still run openWakeWord on Mac/desktop audio.
+    """
+    transport = current_transport() or _stdio_transport
+    raw_b64 = params.get("pcm") or params.get("pcm_b64") or ""
+    if not isinstance(raw_b64, str) or not raw_b64.strip():
+        return _err(rid, 4001, "wake.feed requires base64 pcm")
+    try:
+        import base64
+        pcm = base64.b64decode(raw_b64, validate=False)
+    except Exception as e:
+        return _err(rid, 4001, f"invalid base64 pcm: {e}")
+    if not pcm:
+        return _ok(rid, {"fed": False, "reason": "empty"})
+    # Soft size cap: 64000 bytes = 2s of 16 kHz int16 mono
+    if len(pcm) > 64000:
+        return _err(rid, 4001, "pcm frame too large")
+    sr = params.get("sample_rate")
+    if sr is not None and int(sr) not in (0, 16000):
+        return _err(rid, 4001, "wake.feed only accepts 16 kHz PCM")
+    try:
+        from tools.wake_word import feed_audio
+        ok = feed_audio(owner=transport, pcm_int16=pcm)
+    except Exception as e:
+        logger.debug("wake.feed failed: %s", e)
+        return _err(rid, 5026, str(e))
+    return _ok(rid, {"fed": bool(ok), "reason": None if ok else "not_owner"})
 
 
 @method("voice.toggle")
