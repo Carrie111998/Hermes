@@ -59,6 +59,7 @@ class _ModelCall:
     handle: Any
     task_id: str
     fields: dict[str, str]
+    started_ns: int
     retry_ordinal: int | None = None
 
 
@@ -284,6 +285,7 @@ class _Runtime:
                 handle=handle,
                 task_id=str(event.get("task_id") or ""),
                 fields=fields,
+                started_ns=monotonic_ns(),
                 retry_ordinal=retry_ordinal,
             )
 
@@ -536,6 +538,12 @@ class _Runtime:
         if model_call is None:
             return
         try:
+            self.subscriber.store.record_latency_sample(
+                "model_call", max(0, (monotonic_ns() - model_call.started_ns) // 1_000_000)
+            )
+        except Exception:
+            logger.warning("Hermes local model timing write failed", exc_info=True)
+        try:
             task = session.tasks.get(model_call.task_id)
             if task is not None:
                 self._run_in_task(
@@ -583,13 +591,18 @@ class _Runtime:
         if task is None:
             return False
         self._end_pending_model_calls(session, {**event, "task_id": task_id})
+        duration_ms = max(0, (monotonic_ns() - task.started_ns) // 1_000_000)
         fields = task_terminal_fields(
             {**task.start_fields, **event},
-            duration_ms=max(0, (monotonic_ns() - task.started_ns) // 1_000_000),
+            duration_ms=duration_ms,
             model_call_count=len(task.model_call_ids),
             tool_call_count=len(task.tool_call_ids) + task.unidentified_tool_calls,
             retry_count=task.retry_count,
         )
+        try:
+            self.subscriber.store.record_latency_sample("task", duration_ms)
+        except Exception:
+            logger.warning("Hermes local task timing write failed", exc_info=True)
         try:
             self._run_in_task(
                 task,
