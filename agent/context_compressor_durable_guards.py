@@ -89,6 +89,7 @@ class ContextCompressorDurableGuardsMixin:
 
     def on_session_start(self, session_id: str, **kwargs) -> None:
         """Bind session-scoped compression state for a new or resumed session."""
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         super().on_session_start(session_id, **kwargs)
         boundary_reason = kwargs.get("boundary_reason")
         old_session_id = kwargs.get("old_session_id")
@@ -103,7 +104,6 @@ class ContextCompressorDurableGuardsMixin:
                     if isinstance(stored_streak, (int, float, str)):
                         previous_fallback_streak = max(0, int(stored_streak))
                 except (TypeError, ValueError, sqlite3.Error) as exc:
-                    from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                     logger.debug("compression parent fallback streak lookup failed: %s", exc)
                 except Exception as exc:
                     logger.debug(
@@ -143,6 +143,7 @@ class ContextCompressorDurableGuardsMixin:
                 self._persist_ineffective_compression_count()
 
     def _load_fallback_compression_streak(self) -> None:
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         getter = getattr(session_db, "get_compression_fallback_streak", None)
@@ -157,13 +158,13 @@ class ContextCompressorDurableGuardsMixin:
                 else 0,
             )
         except (TypeError, ValueError, sqlite3.Error) as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression fallback streak lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak lookup failed (non-sqlite): %s", exc)
 
     def _load_proactive_prune_rearm_tokens(self) -> None:
         """Restore the cache-boundary runway for a resumed durable session."""
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         getter = getattr(session_db, "get_session_model_config_value", None)
@@ -176,7 +177,6 @@ class ContextCompressorDurableGuardsMixin:
                 int(value) if isinstance(value, (int, float, str)) else 0,
             )
         except (TypeError, ValueError, json.JSONDecodeError, sqlite3.Error) as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("proactive prune runway lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("proactive prune runway lookup failed (non-sqlite): %s", exc)
@@ -188,6 +188,7 @@ class ContextCompressorDurableGuardsMixin:
         void the runway (model switch): without it a restart would reload a
         runway computed under thresholds that no longer apply.
         """
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         patcher = getattr(session_db, "patch_session_model_config", None)
@@ -196,10 +197,10 @@ class ContextCompressorDurableGuardsMixin:
         try:
             patcher(session_id, {PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY: None})
         except Exception as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("proactive prune runway clear failed: %s", exc)
 
     def _persist_fallback_compression_streak(self) -> None:
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         setter = getattr(session_db, "set_compression_fallback_streak", None)
@@ -208,7 +209,6 @@ class ContextCompressorDurableGuardsMixin:
         try:
             setter(session_id, self._fallback_compression_streak)
         except sqlite3.Error as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression fallback streak persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression fallback streak persist failed (non-sqlite): %s", exc)
@@ -224,6 +224,7 @@ class ContextCompressorDurableGuardsMixin:
         (#54923). The counter now round-trips through the session row like
         the failure cooldown and the fallback streak.
         """
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         getter = getattr(session_db, "get_compression_ineffective_count", None)
@@ -238,12 +239,12 @@ class ContextCompressorDurableGuardsMixin:
                 else 0,
             )
         except (TypeError, ValueError, sqlite3.Error) as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression ineffective count lookup failed: %s", exc)
         except Exception as exc:
             logger.debug("compression ineffective count lookup failed (non-sqlite): %s", exc)
 
     def _persist_ineffective_compression_count(self) -> None:
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         setter = getattr(session_db, "set_compression_ineffective_count", None)
@@ -252,7 +253,6 @@ class ContextCompressorDurableGuardsMixin:
         try:
             setter(session_id, self._ineffective_compression_count)
         except sqlite3.Error as exc:
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression ineffective count persist failed: %s", exc)
         except Exception as exc:
             logger.debug("compression ineffective count persist failed (non-sqlite): %s", exc)
@@ -281,6 +281,7 @@ class ContextCompressorDurableGuardsMixin:
         exactly the incompressible-transcript case the ineffective-strike
         breaker exists for, and its recovery probe bounds the block.
         """
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         self._verify_compaction_cleared_threshold = True
         if feasibility_skip:
             # A deliberate pre-LLM feasibility skip (#60451) is not a
@@ -290,7 +291,6 @@ class ContextCompressorDurableGuardsMixin:
             # dropping the skip exists to reach) nor reset one (a skip proves
             # nothing about the summary model's health).
             if not self.quiet_mode:
-                from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                 logger.info(
                     "Compaction completed via pre-LLM feasibility skip; "
                     "fallback_compression_streak unchanged (%d)",
@@ -315,6 +315,7 @@ class ContextCompressorDurableGuardsMixin:
         refresh: bool = False,
     ) -> Optional[Dict[str, Any]]:
         """Return the live compression-failure cooldown for the bound session."""
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         if refresh:
             # Transaction rollback must distinguish an authoritative empty row
             # from a failed/unavailable durable read. The public return value
@@ -346,7 +347,6 @@ class ContextCompressorDurableGuardsMixin:
         except sqlite3.Error as exc:
             if refresh:
                 self._last_cooldown_refresh_was_authoritative = False
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression failure cooldown lookup failed: %s", exc)
             return local_state
         except Exception:
@@ -392,6 +392,7 @@ class ContextCompressorDurableGuardsMixin:
         cooldown_seconds: float,
         error: Optional[str],
     ) -> None:
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         cooldown_until = time.time() + cooldown_seconds
         self._summary_failure_cooldown_until = time.monotonic() + cooldown_seconds
         self._last_summary_error = error
@@ -410,7 +411,6 @@ class ContextCompressorDurableGuardsMixin:
             self._cooldown_persist_failed = False
         except sqlite3.Error as exc:
             self._cooldown_persist_failed = True
-            from agent.context_compressor import logger  # noqa: E402 — round-trip seam
             logger.debug("compression failure cooldown persist failed: %s", exc)
         except Exception as exc:
             self._cooldown_persist_failed = True
@@ -440,11 +440,11 @@ class ContextCompressorDurableGuardsMixin:
         # not undo that cooldown when its summary eventually succeeds. The
         # hook is installed by compress_context for the duration of the
         # fenced call; when it reports cancellation, keep the host's cooldown.
+        from agent.context_compressor import logger  # noqa: E402 — round-trip seam
         cancelled_check = getattr(self, "_compression_cancelled_check", None)
         if callable(cancelled_check):
             try:
                 if cancelled_check():
-                    from agent.context_compressor import logger  # noqa: E402 — round-trip seam
                     logger.info(
                         "Skipping compression cooldown clear: host already "
                         "cancelled this compression attempt"
