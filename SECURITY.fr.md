@@ -193,10 +193,7 @@ s'appliquent uniformément.
 
 **Surfaces dans Hermes Agent :**
 
-- **Adaptateurs de plateforme du gateway.** Les intégrations de
-  messagerie dans `gateway/platforms/` (Telegram, Discord, Slack,
-  e-mail, SMS, etc.) et les adaptateurs analogues livrés sous forme de
-  plugins.
+- **Adaptateurs de plateforme du gateway.** La plupart des intégrations de messagerie sont livrées comme plugins embarqués sous `plugins/platforms/<name>/` (Telegram, Discord, Slack, e-mail, SMS, etc.). Les types de base partagés et un petit ensemble d'adaptateurs directs/hérités vivent sous `gateway/platforms/` (`base.py`, Signal, serveur API, webhooks, …), avec découverte et chargement différé via `gateway/platform_registry.py`.
 - **Surfaces HTTP exposées au réseau.** L'adaptateur du serveur API, le
   plugin du dashboard, les endpoints HTTP du plugin kanban, et tout
   autre plugin qui ouvre un socket d'écoute.

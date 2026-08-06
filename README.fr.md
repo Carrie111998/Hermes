@@ -27,7 +27,7 @@ Utilisez le modèle de votre choix — [Nous Portal](https://portal.nousresearch
 <tr><td><b>Une boucle d'apprentissage fermée</b></td><td>Mémoire organisée par l'agent, avec des rappels périodiques. Création autonome de compétences après les tâches complexes. Les compétences s'améliorent d'elles-mêmes à l'usage. Recherche de sessions FTS5 avec résumé par LLM pour retrouver des informations d'une session à l'autre. Modélisation dialectique de l'utilisateur via <a href="https://github.com/plastic-labs/honcho">Honcho</a>. Compatible avec le standard ouvert <a href="https://agentskills.io">agentskills.io</a>.</td></tr>
 <tr><td><b>Automatisations planifiées</b></td><td>Planificateur cron intégré avec livraison sur n'importe quelle plateforme. Rapports quotidiens, sauvegardes nocturnes, audits hebdomadaires — le tout en langage naturel, sans aucune surveillance.</td></tr>
 <tr><td><b>Il délègue et parallélise</b></td><td>Lancez des sous-agents isolés pour mener plusieurs chantiers en parallèle. Écrivez des scripts Python qui appellent les outils via RPC, condensant des pipelines à plusieurs étapes en tours sans aucun coût de contexte.</td></tr>
-<tr><td><b>Tourne partout, pas seulement sur votre laptop</b></td><td>Six backends de terminal — local, Docker, SSH, Singularity, Modal et Daytona. Daytona et Modal offrent une persistance serverless : l'environnement de votre agent hiberne quand il est inactif et se réveille à la demande, pour un coût quasi nul entre les sessions. Faites-le tourner sur un VPS à 5 $ ou un cluster GPU.</td></tr>
+<tr><td><b>Tourne partout, pas seulement sur votre laptop</b></td><td>Sept backends de terminal — local, Docker, SSH, Singularity, Modal, Daytona et Vercel Sandbox. Daytona et Modal offrent une persistance serverless : l'environnement de votre agent hiberne quand il est inactif et se réveille à la demande, pour un coût quasi nul entre les sessions. Faites-le tourner sur un VPS à 5 $ ou un cluster GPU.</td></tr>
 <tr><td><b>Prêt pour la recherche</b></td><td>Génération de trajectoires par lots, compression de trajectoires pour entraîner la prochaine génération de modèles d'appel d'outils.</td></tr>
 </table>
 
@@ -110,6 +110,7 @@ hermes              # Interactive CLI — start a conversation
 hermes model        # Choose your LLM provider and model
 hermes tools        # Configure which tools are enabled
 hermes config set   # Set individual config values
+hermes config get   # Print individual config values
 hermes gateway      # Start the messaging gateway (Telegram, Discord, etc.)
 hermes setup        # Run the full setup wizard (configures everything at once)
 hermes claw migrate # Migrate from OpenClaw (if coming from OpenClaw)

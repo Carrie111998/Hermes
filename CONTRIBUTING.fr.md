@@ -12,7 +12,7 @@ Nous valorisons les contributions dans cet ordre :
 2. **Compatibilité multiplateforme** — macOS, différentes distributions Linux et WSL2 sous Windows. Nous voulons qu'Hermes fonctionne partout.
 3. **Durcissement de la sécurité** — injection shell, injection de prompt, traversée de chemins, élévation de privilèges. Voir [Sécurité](#considérations-de-sécurité).
 4. **Performance et robustesse** — logique de nouvelle tentative, gestion des erreurs, dégradation contrôlée.
-5. **Nouvelles compétences** — mais uniquement celles largement utiles. Voir [Compétence ou outil ?](#compétence-ou-outil-)
+5. **Nouvelles compétences** — mais uniquement celles largement utiles. Voir [Compétence ou outil ?](#compétence-ou-outil)
 6. **Nouveaux outils** — rarement nécessaires. La plupart des capacités devraient être des compétences. Voir plus bas.
 7. **Documentation** — corrections, clarifications, nouveaux exemples.
 
@@ -203,7 +203,8 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 ### Lancer les tests
 
 ```bash
-# Preferred — matches CI (hermetic env, 4 xdist workers); see AGENTS.md
+# Preferred — matches CI (hermetic `env -i`, per-file subprocess isolation
+# via run_tests_parallel.py, worker count auto-scaled); see AGENTS.md
 scripts/run_tests.sh
 
 # Alternative (activate the venv first). The wrapper is still recommended
@@ -339,7 +340,7 @@ User message → AIAgent._run_agent_loop()
 
 ## Ajouter un nouvel outil
 
-Avant d'écrire un outil, demandez-vous : [ne devrait-ce pas être une compétence ?](#compétence-ou-outil-)
+Avant d'écrire un outil, demandez-vous : [ne devrait-ce pas être une compétence ?](#compétence-ou-outil)
 
 Les outils s'enregistrent eux-mêmes auprès du registre central. Chaque fichier d'outil regroupe au même endroit son schéma, son handler et son enregistrement :
 
@@ -862,7 +863,7 @@ emprunter votre chemin de code.
 Les tests qui utilisent des appels système exclusivement POSIX ont besoin d'un marqueur de skip. Les cas courants :
 - Liens symboliques → `@pytest.mark.skipif(sys.platform == "win32", ...)`
 - Modes de fichiers `0o600` → `@pytest.mark.skipif(sys.platform.startswith("win"), ...)`
-- `signal.SIGALRM` → Unix uniquement (voir `tests/conftest.py::_enforce_test_timeout`)
+- `signal.SIGALRM` → Unix uniquement (les délais par test ne l'utilisent plus directement ; voir le shim de délai win32 dans `tests/conftest.py::pytest_configure`)
 - `os.setsid` / `os.fork` → Unix uniquement
 - Tests de régression Winsock réels / propres à Windows →
   `@pytest.mark.skipif(sys.platform != "win32", reason="Windows-specific regression")`
