@@ -18,6 +18,8 @@ import html as _html
 import re
 import threading
 import time
+
+from hermes_constants import get_hermes_home
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
@@ -274,7 +276,7 @@ except ImportError:
     ContextTypes = _MockContextTypes
 
 import sys
-from pathlib import Path as _Path
+from pathlib import Path, Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.authz_mixin import _coerce_allow_set
@@ -3398,7 +3400,6 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> None:
         """Save a newly created thread_id back into config.yaml so it persists across restarts."""
         try:
-            from hermes_constants import get_hermes_home
             config_path = get_hermes_home() / "config.yaml"
             if not config_path.exists():
                 logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
