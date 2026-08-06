@@ -2021,8 +2021,31 @@ def list_authenticated_providers(
     _current_provider_norm = str(current_provider or "").strip().lower()
     _current_base_url_norm = str(current_base_url or "").strip().rstrip("/").lower()
 
-    def _can_probe_custom_provider(*, row_is_current: bool) -> bool:
-        return bool(probe_custom_providers or (probe_current_custom_provider and row_is_current))
+    def _can_probe_custom_provider(*, row_is_current: bool, url: str = "") -> bool:
+        if probe_custom_providers or (probe_current_custom_provider and row_is_current):
+            return True
+        # Local endpoints (localhost Ollama, LM Studio, llama.cpp, ...) are
+        # always worth probing: they are cheap to hit and their catalog
+        # changes whenever the user pulls/loads a model. A saved allowlist
+        # ``models:`` list would otherwise pin the row to stale entries and
+        # hide every model pulled after the config was written.
+        if url:
+            try:
+                from agent.model_metadata import is_local_endpoint as _ile
+                if _ile(url):
+                    return True
+            except Exception:
+                pass
+        return False
+
+    def _is_local_endpoint_url(url: str) -> bool:
+        if not url:
+            return False
+        try:
+            from agent.model_metadata import is_local_endpoint as _ile
+            return bool(_ile(url))
+        except Exception:
+            return False
 
     # Normalize the excluded-providers list once for fast membership checks.
     # Compared against hermes_id / mdev_id (section 1), pid / hermes_slug
@@ -2690,6 +2713,9 @@ def list_authenticated_providers(
             # - With an api_key: always probe (user opted into the endpoint).
             # - Without an api_key but with an allowlist-shaped ``models:``
             #   (list/string): skip — the user narrowed a public endpoint.
+            #   LOCAL endpoints (localhost Ollama / LM Studio / llama.cpp)
+            #   are exempt: their allowlist pins stale entries, so probe
+            #   live so newly pulled/loaded models stay visible.
             #   A singular ``default_model``/``model`` does NOT count as
             #   narrowing (mirrors section 4 / #40542).
             # - A dict-shaped ``models:`` is per-model metadata
@@ -2720,8 +2746,10 @@ def list_authenticated_providers(
                     and _ep_url_norm == _current_base_url_norm
                 )
             )
-            should_probe = _can_probe_custom_provider(row_is_current=_ep_is_current) and bool(api_url) and discover and (
-                bool(api_key) or not has_explicit_models
+            should_probe = _can_probe_custom_provider(row_is_current=_ep_is_current, url=api_url) and bool(api_url) and discover and (
+                bool(api_key)
+                or not has_explicit_models
+                or bool(api_url) and _is_local_endpoint_url(api_url)
             )
             if should_probe:
                 try:
@@ -3009,7 +3037,11 @@ def list_authenticated_providers(
             #   live catalog (Bifrost / aggregator-gateway case).
             # - Without an api_key but with an allowlist-shaped ``models:``
             #   (list/string), the user narrowed a public endpoint (e.g.
-            #   ollama.com). Preserve that list and skip live discovery.
+            #   ollama.com). Preserve that list and skip live discovery —
+            #   unless the endpoint is LOCAL (localhost Ollama / LM Studio /
+            #   llama.cpp): there the allowlist only pins stale entries and
+            #   hides models pulled after the config was written, so probe
+            #   live regardless (cheap, local, fast).
             # - A dict-shaped ``models:`` is per-model metadata written by
             #   ``_save_custom_provider`` for context_length — not an
             #   allowlist. Still probe so Desktop/Telegram match
@@ -3032,9 +3064,13 @@ def list_authenticated_providers(
                 and _current_base_url_group_count == 1
             )
             should_probe = (
-                _can_probe_custom_provider(row_is_current=_grp_is_current)
+                _can_probe_custom_provider(row_is_current=_grp_is_current, url=api_url)
                 and bool(api_url)
-                and (bool(api_key) or not grp.get("has_explicit_models"))
+                and (
+                    bool(api_key)
+                    or not grp.get("has_explicit_models")
+                    or _is_local_endpoint_url(api_url)
+                )
                 and grp.get("discover_models", True)
             )
             if should_probe:
