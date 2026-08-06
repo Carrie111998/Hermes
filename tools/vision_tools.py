@@ -1263,13 +1263,23 @@ async def vision_analyze_tool(
                 vision_temperature = float(_vtemp)
         except Exception:
             pass
+        # Do NOT hardcode max_tokens — auxiliary_client.py's own policy says
+        # "We do NOT cap output by default" for auxiliary tasks (vision,
+        # compression, etc.).  An explicit cap silently truncates long image
+        # analyses (#80025).  Only pass max_tokens when the user explicitly
+        # configures auxiliary.vision.max_tokens (treat unset/"auto" as omit).
+        _vmax = _vision_cfg.get("max_tokens")
         call_kwargs = {
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 2000,
             "timeout": vision_timeout,
         }
+        if _vmax is not None and str(_vmax).strip().lower() != "auto":
+            try:
+                call_kwargs["max_tokens"] = int(_vmax)
+            except (TypeError, ValueError):
+                pass
         if model:
             call_kwargs["model"] = model
         _load_auxiliary_client()
@@ -1770,13 +1780,20 @@ async def video_analyze_tool(
         except Exception:
             pass
 
+        # Do NOT hardcode max_tokens — same rationale as image analysis
+        # above (#80025).  Only pass max_tokens when explicitly configured.
+        _vmax = _vision_cfg.get("max_tokens")
         call_kwargs = {
             "task": "vision",
             "messages": messages,
             "temperature": vision_temperature,
-            "max_tokens": 4000,
             "timeout": vision_timeout,
         }
+        if _vmax is not None and str(_vmax).strip().lower() != "auto":
+            try:
+                call_kwargs["max_tokens"] = int(_vmax)
+            except (TypeError, ValueError):
+                pass
         if model:
             call_kwargs["model"] = model
 
