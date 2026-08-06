@@ -29,7 +29,10 @@ Configuration in config.yaml::
 Or via environment variables (overrides config.yaml):
     BUZZ_RELAY_URL, BUZZ_CHANNELS, BUZZ_HOME_CHANNEL, BUZZ_POLL_INTERVAL,
     BUZZ_CLI_PATH, BUZZ_CREDENTIALS_FILE, BUZZ_ALLOWED_USERS,
-    BUZZ_ALLOW_ALL_USERS
+    BUZZ_ALLOW_ALL_USERS, BUZZ_PROFILE_CHANNEL_SYNC,
+    BUZZ_PROFILE_CHANNEL_ADOPT_EXISTING,
+    BUZZ_PROFILE_CHANNEL_ARCHIVE_ON_DELETE, BUZZ_PROFILE_CHANNEL_STATE_FILE,
+    BUZZ_PROFILE_CHANNEL_MAP_FILE
 
 The only secret is BUZZ_PRIVATE_KEY (nsec or hex) — it belongs in
 ``~/.hermes/.env``.  It is passed to the CLI via the subprocess
@@ -101,10 +104,10 @@ _WS_SUB_SYNC_INTERVAL = 10.0
 # Include a small history overlap when adopting a channel so a message posted
 # immediately after channel/DM creation is not lost before discovery.
 _DISCOVERY_LOOKBACK_SECONDS = 30
+_PROFILE_CHANNEL_SYNC_INTERVAL = 30.0
 # Bound on the per-message thread-root resolution cache.
 _THREAD_ROOT_CACHE_CAP = 2000
 _THREAD_ROOT_LOOKUP_DELAYS = (0.0, 0.25, 0.75)
-
 _DEFAULT_POLL_INTERVAL = 4.0
 _MIN_POLL_INTERVAL = 1.0
 _CLI_TIMEOUT = 30.0
@@ -357,6 +360,14 @@ def _parse_json_list(stdout: str) -> List[dict]:
     return [item for item in data if isinstance(item, dict)]
 
 
+def _parse_json_object(stdout: str) -> Optional[dict]:
+    try:
+        data = json.loads(stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 # ---------------------------------------------------------------------------
 # Buzz Adapter
 # ---------------------------------------------------------------------------
@@ -450,6 +461,71 @@ class BuzzAdapter(BasePlatformAdapter):
             if state_override
             else hermes_home / "shared" / "buzz" / "auto-joined-channels.json"
         )
+
+        # Optional two-way lifecycle reconciliation between local Hermes
+        # profiles and Buzz channels.  The portable convention is deliberately
+        # simple: the channel name is the canonical profile id.  Only channels
+        # recorded in the registry are ever renamed or archived.
+        _pcs_raw = os.getenv("BUZZ_PROFILE_CHANNEL_SYNC")
+        if _pcs_raw is None:
+            _pcs_cfg = extra.get("profile_channel_sync", False)
+        else:
+            _pcs_cfg = _pcs_raw
+        self.profile_channel_sync = str(_pcs_cfg).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
+        _adopt_raw = os.getenv("BUZZ_PROFILE_CHANNEL_ADOPT_EXISTING")
+        _adopt_cfg = (
+            extra.get("profile_channel_adopt_existing", False)
+            if _adopt_raw is None else _adopt_raw
+        )
+        self.profile_channel_adopt_existing = str(_adopt_cfg).strip().lower() in (
+            "true", "1", "yes", "on"
+        )
+        _archive_raw = os.getenv("BUZZ_PROFILE_CHANNEL_ARCHIVE_ON_DELETE")
+        _archive_cfg = (
+            extra.get("profile_channel_archive_on_delete", True)
+            if _archive_raw is None else _archive_raw
+        )
+        self.profile_channel_archive_on_delete = str(_archive_cfg).strip().lower() not in (
+            "false", "0", "no", "off"
+        )
+        try:
+            self.profile_channel_sync_interval = max(
+                5.0,
+                float(
+                    os.getenv("BUZZ_PROFILE_CHANNEL_SYNC_INTERVAL")
+                    or extra.get("profile_channel_sync_interval", _PROFILE_CHANNEL_SYNC_INTERVAL)
+                ),
+            )
+        except (TypeError, ValueError):
+            self.profile_channel_sync_interval = _PROFILE_CHANNEL_SYNC_INTERVAL
+        profile_state_override = str(
+            os.getenv("BUZZ_PROFILE_CHANNEL_STATE_FILE")
+            or extra.get("profile_channel_state_file", "")
+            or ""
+        ).strip()
+        try:
+            from hermes_constants import get_default_hermes_root
+
+            default_hermes_home = Path(get_default_hermes_root())
+        except Exception:
+            default_hermes_home = hermes_home
+        self._profile_channel_state_file = (
+            Path(profile_state_override).expanduser()
+            if profile_state_override
+            else default_hermes_home / "shared" / "buzz" / "profile-channels.json"
+        )
+        profile_map_override = str(
+            os.getenv("BUZZ_PROFILE_CHANNEL_MAP_FILE")
+            or extra.get("profile_channel_map_file", "")
+            or ""
+        ).strip()
+        self._profile_channel_map_file = (
+            Path(profile_map_override).expanduser() if profile_map_override else None
+        )
+        self._profile_channel_sync_lock = asyncio.Lock()
+        self._profile_channel_last_sync = 0.0
 
         # Inbound transport: "auto" (WebSocket with poll fallback, default),
         # "websocket" (require WS; fail connect when it can't authenticate),
@@ -563,6 +639,268 @@ class BuzzAdapter(BasePlatformAdapter):
             except OSError:
                 pass
 
+    def _profile_channel_scope_key(self) -> str:
+        return f"{self.relay_url}|{self._self_pubkey}"
+
+    def _read_profile_channel_state(self) -> dict:
+        try:
+            data = json.loads(self._profile_channel_state_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"version": 1, "scopes": {}}
+        except (OSError, ValueError) as exc:
+            logger.warning("Buzz: could not read profile-channel state: %s", exc)
+            return {"version": 1, "scopes": {}}
+        if not isinstance(data, dict) or not isinstance(data.get("scopes"), dict):
+            return {"version": 1, "scopes": {}}
+        return data
+
+    def _write_profile_channel_state(self, data: dict) -> bool:
+        tmp = self._profile_channel_state_file.with_name(
+            f".{self._profile_channel_state_file.name}.{os.getpid()}.tmp"
+        )
+        try:
+            self._profile_channel_state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            tmp.replace(self._profile_channel_state_file)
+            self._write_profile_channel_map(data)
+            return True
+        except OSError as exc:
+            logger.warning("Buzz: could not persist profile-channel state: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return False
+
+    def _write_profile_channel_map(self, data: dict) -> None:
+        """Optionally publish a flat active profile-to-channel map for jobs."""
+        path = self._profile_channel_map_file
+        if path is None:
+            return
+        scope = (data.get("scopes") or {}).get(self._profile_channel_scope_key(), {})
+        profiles = scope.get("profiles") if isinstance(scope, dict) else {}
+        channels = {
+            str(name): str(entry.get("channel_id"))
+            for name, entry in (profiles or {}).items()
+            if isinstance(entry, dict)
+            and entry.get("channel_id")
+            and not entry.get("archived")
+        }
+        payload = {
+            "relay_url": self.relay_url,
+            "updated_at": datetime.now().astimezone().isoformat(),
+            "channels": dict(sorted(channels.items())),
+        }
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            os.chmod(tmp, 0o600)
+            tmp.replace(path)
+        except OSError as exc:
+            logger.warning("Buzz: could not publish profile-channel map: %s", exc)
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    @staticmethod
+    def _local_profiles() -> Dict[str, str]:
+        """Return canonical profile ids keyed to rename-stable file identities."""
+        try:
+            from hermes_cli.profiles import profiles_to_serve
+
+            entries = profiles_to_serve(True)
+        except Exception as exc:
+            logger.warning("Buzz: could not enumerate Hermes profiles: %s", exc)
+            return {}
+        result = {}
+        for name, path in entries:
+            try:
+                stat = Path(path).stat()
+                identity = f"{stat.st_dev}:{stat.st_ino}"
+            except OSError:
+                identity = ""
+            result[str(name)] = identity
+        return result
+
+    async def _find_profile_channel(self, name: str) -> Optional[dict]:
+        code, out, _err = await self._run_cli(
+            ["channels", "search", "--query", name, "--exact", "--include-archived"]
+        )
+        if code != 0:
+            return None
+        matches = [
+            item for item in _parse_json_list(out)
+            if str(item.get("name") or "").casefold() == name.casefold()
+            and item.get("channel_id")
+        ]
+        if len(matches) > 1:
+            logger.warning("Buzz: multiple channels exactly match profile %s; skipping", name)
+            return None
+        return matches[0] if matches else None
+
+    async def _sync_profile_channels(self, *, force: bool = False) -> None:
+        """Reconcile opt-in managed Buzz channels with local Hermes profiles."""
+        if not self.profile_channel_sync or not self._self_pubkey:
+            return
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._profile_channel_last_sync < self.profile_channel_sync_interval
+        ):
+            return
+        async with self._profile_channel_sync_lock:
+            now = time.monotonic()
+            if (
+                not force
+                and now - self._profile_channel_last_sync < self.profile_channel_sync_interval
+            ):
+                return
+            profiles = self._local_profiles()
+            if not profiles:
+                # Never interpret an enumeration failure as "delete all".
+                return
+            list_code, list_out, _list_err = await self._run_cli([
+                "channels", "search", "--query", "", "--include-archived", "--limit", "1000"
+            ])
+            if list_code != 0:
+                # Older buzz-cli builds may not expose search yet. Active
+                # channels can still reconcile; archived restoration waits
+                # until the CLI is upgraded.
+                list_code, list_out, _list_err = await self._run_cli(["channels", "list"])
+            if list_code != 0:
+                return
+            listed = _parse_json_list(list_out)
+            listed_by_id = {
+                str(item.get("channel_id")): item
+                for item in listed if item.get("channel_id")
+            }
+            listed_names: Dict[str, List[dict]] = {}
+            for item in listed:
+                name = str(item.get("name") or "").casefold()
+                if name:
+                    listed_names.setdefault(name, []).append(item)
+            self._profile_channel_last_sync = now
+            data = self._read_profile_channel_state()
+            scopes = data.setdefault("scopes", {})
+            scope = scopes.setdefault(self._profile_channel_scope_key(), {"profiles": {}})
+            managed = scope.setdefault("profiles", {})
+            if not isinstance(managed, dict):
+                managed = scope["profiles"] = {}
+
+            # A normal `hermes profile rename` preserves the directory inode.
+            # Move its registry record before processing additions/deletions.
+            by_identity = {
+                str(entry.get("identity")): old_name
+                for old_name, entry in managed.items()
+                if isinstance(entry, dict) and entry.get("identity")
+            }
+            changed = False
+            for new_name, identity in profiles.items():
+                old_name = by_identity.get(identity) if identity else None
+                if old_name and old_name != new_name and new_name not in managed:
+                    managed[new_name] = managed.pop(old_name)
+                    changed = True
+
+            for name, identity in profiles.items():
+                entry = managed.get(name)
+                channel = None
+                if isinstance(entry, dict) and entry.get("channel_id"):
+                    channel = listed_by_id.get(str(entry["channel_id"]))
+                if channel is None:
+                    exact_matches = listed_names.get(name.casefold(), [])
+                    if len(exact_matches) == 1:
+                        channel = exact_matches[0]
+                    elif len(exact_matches) > 1:
+                        logger.warning("Buzz: multiple channels exactly match profile %s; skipping", name)
+                        continue
+                if channel is None:
+                    # Registry entries beyond the directory query's limit get
+                    # one exact fallback rather than silently duplicating.
+                    channel = await self._find_profile_channel(name)
+                if channel is None and isinstance(entry, dict) and entry.get("channel_id"):
+                    code, out, _err = await self._run_cli(
+                        ["channels", "get", "--channel", str(entry["channel_id"])]
+                    )
+                    if code == 0:
+                        channel = _parse_json_object(out)
+                if channel is not None and not isinstance(entry, dict):
+                    if channel is not None and not self.profile_channel_adopt_existing:
+                        # Watchable, but not ours to rename/archive.
+                        continue
+                if channel is None:
+                    code, out, err = await self._run_cli([
+                        "channels", "create", "--name", name,
+                        "--type", "stream", "--visibility", "open",
+                        "--description", f"Hermes profile: {name}",
+                    ])
+                    if code != 0:
+                        logger.warning(
+                            "Buzz: could not create channel for profile %s — %s",
+                            name, _cli_error_message(err, code),
+                        )
+                        continue
+                    try:
+                        created = json.loads(out or "{}")
+                    except ValueError:
+                        created = {}
+                    channel_id = str(created.get("channel_id") or "")
+                    if not channel_id:
+                        logger.warning("Buzz: channel create for profile %s returned no id", name)
+                        continue
+                    channel = {"channel_id": channel_id, "name": name, "archived": False}
+                    logger.info("Buzz: created managed channel %s for profile %s", channel_id, name)
+
+                channel_id = str(channel.get("channel_id") or "")
+                if not channel_id:
+                    continue
+                if str(channel.get("name") or "") != name:
+                    code, _, err = await self._run_cli(
+                        ["channels", "update", "--channel", channel_id, "--name", name]
+                    )
+                    if code != 0:
+                        logger.warning("Buzz: could not rename managed channel %s — %s", channel_id, _cli_error_message(err, code))
+                        continue
+                if bool(channel.get("archived") or channel.get("is_archived")):
+                    code, _, err = await self._run_cli(
+                        ["channels", "unarchive", "--channel", channel_id]
+                    )
+                    if code != 0:
+                        logger.warning("Buzz: could not restore managed channel %s — %s", channel_id, _cli_error_message(err, code))
+                        continue
+                next_entry = {"channel_id": channel_id, "identity": identity, "archived": False}
+                if managed.get(name) != next_entry:
+                    managed[name] = next_entry
+                    changed = True
+
+            if self.profile_channel_archive_on_delete:
+                for name, entry in list(managed.items()):
+                    if name in profiles or not isinstance(entry, dict) or entry.get("archived"):
+                        continue
+                    channel_id = str(entry.get("channel_id") or "")
+                    if not channel_id:
+                        continue
+                    code, _, err = await self._run_cli(
+                        ["channels", "archive", "--channel", channel_id]
+                    )
+                    if code != 0:
+                        logger.warning("Buzz: could not archive channel for removed profile %s — %s", name, _cli_error_message(err, code))
+                        continue
+                    entry["archived"] = True
+                    changed = True
+                    logger.info("Buzz: archived managed channel for removed profile %s", name)
+
+            if changed:
+                self._write_profile_channel_state(data)
+
     # ── buzz-cli plumbing ─────────────────────────────────────────────────
 
     async def _run_cli(self, args: List[str], *, input_text: Optional[str] = None) -> Tuple[int, str, str]:
@@ -634,6 +972,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
         # Reconcile opt-in profile channels before building the watch set so
         # channels created or restored during startup are seeded immediately.
+        await self._sync_profile_channels(force=True)
 
         # Map channel ids to names and pick the watch set.
         code, out, err = await self._run_cli(["channels", "list"])
@@ -1180,6 +1519,7 @@ class BuzzAdapter(BasePlatformAdapter):
 
     async def _discover_group_channels(self, *, seed: bool) -> None:
         """Join and watch newly-created open Buzz channels."""
+        await self._sync_profile_channels()
         if not self.auto_join_channels:
             return
 
