@@ -362,6 +362,51 @@ class TestProfileSharedBlocks:
                     continue
                 assert rules[n] == base[n], f"{p}: hard rule {n} diverged from the base"
 
+    def test_memory_provider_has_a_config_to_resolve(self):
+        """A profile declaring memory.provider: hindsight with no
+        hindsight/config.json falls through to the plugin's default -- cloud
+        mode with no API key -- and its memory is silently dead. The plugin
+        resolves $HERMES_HOME/hindsight/config.json first, and HERMES_HOME is
+        the profile dir for a worker, so the control plane's copy is invisible
+        to them. Found by a read-only audit, not by the smoke test: no card
+        had exercised memory."""
+        import json
+        import yaml
+
+        for p in WORKER_PROFILES:
+            cfg = yaml.safe_load((_PROFILES_ROOT / p / "config.yaml").read_text())
+            provider = (cfg.get("memory") or {}).get("provider")
+            if not provider or provider == "none":
+                continue
+            hs = _PROFILES_ROOT / p / "hindsight" / "config.json"
+            assert hs.is_file(), (
+                f"{p}: memory.provider is {provider!r} but {hs} does not exist — "
+                "the worker will fall back to cloud mode with no key"
+            )
+            data = json.loads(hs.read_text())
+            assert data.get("bank_id"), f"{p}: hindsight config has no bank_id"
+            assert data.get("auto_retain") is False, (
+                f"{p}: auto_retain is on — a worker's card output would land in "
+                "Patrick's curated personal bank. Workers read memory; they do not write it"
+            )
+
+    def test_browser_toolset_comes_with_its_skill(self):
+        """The runbook requires loading the browser-stack skill before choosing
+        a browser tool. A profile with the toolset and without the skill is a
+        rule pointing at something that is not there."""
+        import yaml
+
+        for p in WORKER_PROFILES:
+            cfg = yaml.safe_load((_PROFILES_ROOT / p / "config.yaml").read_text())
+            if "browser" not in (cfg.get("platform_toolsets") or {}).get("cli", []):
+                continue
+            skill = _PROFILES_ROOT / p / "skills" / "browser-stack-operations" / "SKILL.md"
+            assert skill.exists(), (
+                f"{p}: has the browser toolset but not browser-stack-operations — "
+                "it can reach for a browser without the operating instructions the "
+                "runbook demands"
+            )
+
     def test_no_bundled_skills_marker_present(self):
         """--no-skills is what keeps the skills index at ~470 tokens instead of
         ~10,500. A profile that loses the marker gets re-seeded on the next
