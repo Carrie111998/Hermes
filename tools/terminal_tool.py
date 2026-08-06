@@ -2565,6 +2565,11 @@ def terminal_tool(
                             # Binary content from a remote `cat`: skip for the
                             # same reason as the local branch above (#77703).
                             return None
+                        if len(output) > 1024 * 1024:
+                            # Same size bound as the local branch: never feed
+                            # oversized content (e.g. a large remote binary)
+                            # into the scanner recursion (#77780).
+                            return None
                         return output
                 except Exception:
                     pass

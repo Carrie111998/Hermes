@@ -332,6 +332,15 @@ def _contains_unsafe_gateway_action(
         if script_text is None and read_remote_script is not None:
             # Local path missing; try the remote backend if one is available.
             script_text = read_remote_script(str(script_path))
+        if script_text and "\x00" in script_text:
+            # Any read_remote_script callback (terminal_tool's env-based
+            # fallback, SSH/Modal/Daytona backends) may return binary
+            # content. A NUL byte in the text marks machine code, not a
+            # shell script: feeding it to the recursion re-tokenizes it
+            # into NUL-bearing paths that crash os.open with
+            # `ValueError: embedded null byte` (#77703, #77780). Treat it
+            # as "nothing to scan", mirroring _read_referenced_script.
+            continue
         if not script_text:
             continue
         # Relative references inside a script resolve against that script's
