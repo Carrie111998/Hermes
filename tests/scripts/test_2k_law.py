@@ -78,7 +78,7 @@ OVER_2K_MANIFEST = {
     "agent/chat_completion_helpers.py": 4363,
     "hermes_cli/config_defaults.py": 4313,
     "scripts/install.ps1": 4262,
-    "tests/test_hermes_state.py": 4254,
+    "tests/test_hermes_state.py": 4283,
     "tests/hermes_cli/test_web_server.py": 4232,
     "agent/agent_runtime_helpers.py": 4067,
     "agent/conversation_compression.py": 4008,
