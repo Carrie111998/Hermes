@@ -170,21 +170,23 @@ class TestImportabilityWithoutSlackSdk:
 
 
 def test_golden_window_sha_unchanged_at_pin():
-    """The extracted window bytes at the pin still match the golden receipt.
+    """The extracted window bytes still match the golden receipt.
 
-    Reads the window from the extraction commit's parent (the original pin
-    aaf9688519) -- HEAD itself no longer contains the window.
+    The golden sha was captured at pin aaf9688519 (window 8034-8229 of
+    plugins/platforms/slack/adapter.py). The window now lives verbatim in
+    slack_file_download_mixin.py (lines 43-238, byte-identical), so the
+    receipt is verified against the SHIPPED module instead of the git
+    object -- this also works in CI's shallow checkout, where the parent
+    commit object may be absent.
     """
-    import subprocess
-
-    pin = subprocess.run(
-        ["git", "show", "HEAD~1:plugins/platforms/slack/adapter.py"],
-        capture_output=True,
-        check=True,
-    ).stdout.decode("utf-8")
-    window = "".join(pin.splitlines(keepends=True)[8033:8229])
     import hashlib
 
+    module_text = pathlib.Path(
+        __file__
+    ).resolve().parent.parent.parent.parent / "plugins" / "platforms" / "slack" / "slack_file_download_mixin.py"
+    lines = module_text.read_text(encoding="utf-8").split("\n")
+    # 196-line window: 0-indexed lines 43..238 (1-indexed 44..239) + trailing newline
+    window = "\n".join(lines[43:239]) + "\n"
     assert hashlib.sha256(window.encode("utf-8")).hexdigest() == (
         "2a7edfc04118cf5c3300f5d25ae70e029f3c02ce7a9709263e2ce78cf6ee6e34"
     )
