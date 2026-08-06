@@ -323,19 +323,43 @@ def test_xai_pool_restarts_when_local_owner_disappears_before_lock(
             yield transaction
 
     monkeypatch.setattr(A, "_provider_state_transaction", scheduled_transaction)
-    calls, first_post, second_post, release_post = _install_xai_refresh(
+    calls, first_post, _second_post, release_post = _install_xai_refresh(
         monkeypatch,
         new_access=new_access,
         new_refresh="shared-refresh-new",
     )
     results: list[PooledCredential | None] = []
     errors: list[BaseException] = []
+    root_empty_selection = threading.Event()
+    release_empty_selection = threading.Event()
+    real_select_under_lock = CP.CredentialPool._select_under_lock
+
+    def scheduled_select_under_lock(
+        pool: CP.CredentialPool,
+        excluded_source_ids: set[str] | None = None,
+    ) -> tuple[PooledCredential | None, list[tuple[Any, Any]]]:
+        selected = real_select_under_lock(pool, excluded_source_ids)
+        if (
+            threading.current_thread().name == "root-selector"
+            and selected == (None, [])
+            and not root_empty_selection.is_set()
+        ):
+            root_empty_selection.set()
+            assert release_empty_selection.wait(timeout=5)
+        return selected
+
+    monkeypatch.setattr(
+        CP.CredentialPool,
+        "_select_under_lock",
+        scheduled_select_under_lock,
+    )
 
     def select(profile: Path, *, wait_for_removal: bool) -> None:
         token = set_hermes_home_override(profile)
         try:
             if wait_for_removal:
                 assert removed.wait(timeout=5)
+                assert first_post.wait(timeout=5)
             pool = CP.load_pool("xai-oauth")
             results.append(pool.select())
         except BaseException as exc:
@@ -359,10 +383,12 @@ def test_xai_pool_restarts_when_local_owner_disappears_before_lock(
         worker.start()
     assert removed.wait(timeout=5)
     assert first_post.wait(timeout=5)
-    second_post.wait(timeout=1)
+    assert root_empty_selection.wait(timeout=5)
     release_post.set()
-    for worker in workers:
-        worker.join(timeout=5)
+    workers[0].join(timeout=5)
+    assert not workers[0].is_alive()
+    release_empty_selection.set()
+    workers[1].join(timeout=5)
 
     assert all(not worker.is_alive() for worker in workers)
     assert errors == []

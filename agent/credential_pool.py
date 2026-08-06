@@ -3607,11 +3607,117 @@ class CredentialPool:
             )
             self._replace_entry(entry, cleared)
 
+    def _converge_empty_xai_source_selection(self) -> bool:
+        """Adopt a durable xAI singleton winner after an in-flight reservation.
+
+        A pool loaded while another process owns the source refresh transaction
+        sees the deliberately secret-free reservation row and therefore has no
+        selectable entry. Wait for that exact source transaction, snapshot its
+        finalized row while still locked, then hydrate this pool only after the
+        source lock is released. A stranded reservation remains fail-closed.
+        """
+        if self.provider != "xai-oauth":
+            return False
+
+        try:
+            with auth_mod._provider_state_transaction(
+                "xai-oauth",
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+            ) as (_auth_store, state, source_path):
+                if (
+                    source_path is None
+                    or not isinstance(state, dict)
+                    or auth_mod._source_state_is_reserved(state)
+                ):
+                    return False
+                tokens = state.get("tokens")
+                if not isinstance(tokens, dict):
+                    return False
+                access_token = str(tokens.get("access_token") or "").strip()
+                if not access_token:
+                    return False
+
+                source_path = Path(source_path)
+                source_store = _load_auth_store(source_path)
+                source_pool = source_store.get("credential_pool")
+                source_rows = (
+                    source_pool.get("xai-oauth")
+                    if isinstance(source_pool, dict)
+                    else None
+                )
+                candidates = [
+                    PooledCredential.from_dict("xai-oauth", row)
+                    for row in source_rows or []
+                    if isinstance(row, dict)
+                ]
+                _upsert_entry(
+                    candidates,
+                    "xai-oauth",
+                    "device_code",
+                    {
+                        "source": "device_code",
+                        "auth_type": AUTH_TYPE_OAUTH,
+                        "access_token": access_token,
+                        "refresh_token": tokens.get("refresh_token"),
+                        "base_url": auth_mod.DEFAULT_XAI_OAUTH_BASE_URL,
+                        "last_refresh": state.get("last_refresh"),
+                        "label": label_from_token(access_token, "device_code"),
+                    },
+                )
+                winner = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if candidate.source == "device_code"
+                    ),
+                    None,
+                )
+                if winner is None:
+                    return False
+                winner = replace(winner, source_store_path=source_path)
+        except Exception as exc:
+            logger.debug("Failed to converge empty xAI OAuth pool: %s", exc)
+            return False
+
+        # The source transaction is intentionally over before pool mutation.
+        # Another selector may already have converged this instance; preserve
+        # its complete entry instead of replacing a newer in-memory snapshot.
+        with self._external_state_lock:
+            with self._lock:
+                if any(
+                    entry.source == "device_code" and entry.access_token
+                    for entry in self._entries
+                ):
+                    return True
+                stale_ids = {
+                    entry.id
+                    for entry in self._entries
+                    if entry.source == "device_code"
+                }
+                self._entries = [
+                    entry
+                    for entry in self._entries
+                    if entry.source != "device_code"
+                ]
+                self._entries.append(winner)
+                if self._current_id in stale_ids:
+                    self._current_id = None
+        return True
+
     def select(self) -> Optional[PooledCredential]:
         failed_source_ids = self._validate_source_owned_codex_entries()
         self._sync_external_status_entries(probe_quota=True)
         entry, pending_refresh = self._select_under_lock(failed_source_ids)
         self._persist_pending_changes()
+        if (
+            entry is None
+            and not pending_refresh
+            and self._converge_empty_xai_source_selection()
+        ):
+            failed_source_ids = self._validate_source_owned_codex_entries()
+            self._sync_external_status_entries(probe_quota=True)
+            entry, pending_refresh = self._select_under_lock(failed_source_ids)
+            self._persist_pending_changes()
         if pending_refresh:
             self._refresh_pending_entries(pending_refresh)
         if entry is not None:
