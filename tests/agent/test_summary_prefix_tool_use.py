@@ -19,7 +19,7 @@ class TestSummaryPrefixToolUseClause:
         """Per the module contract: whenever SUMMARY_PREFIX changes, the prior
         generation must be frozen into _HISTORICAL_SUMMARY_PREFIXES so old
         persisted summaries still get the directive-strip on re-compaction."""
-        assert len(_HISTORICAL_SUMMARY_PREFIXES) >= 3
+        assert len(_HISTORICAL_SUMMARY_PREFIXES) >= 4
         # The pre-clause generation (#65848 incident era): same framing, no
         # tools-active clause. Newer generations are prepended ahead of it as
         # the prefix evolves (tuple is newest-first), so match by content,
