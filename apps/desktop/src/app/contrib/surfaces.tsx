@@ -15,11 +15,15 @@ import { ContribBoundary, ContribRender } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { $activeConnectionId } from '@/store/connections'
 import { $gateway } from '@/store/gateway'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
-import { $freshDraftReady, $gatewayState } from '@/store/session'
+import { $currentCwd, $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
+import { TileFiles } from '../chat/tile/tile-files'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
 import { useStatusSnapshot } from '../shell/hooks/use-status-snapshot'
@@ -138,13 +142,39 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
   const chatActions = useMemo(() => latestChatActions(actions), [actions])
 
+  // The workspace pane's components area: the same per-tile file tree the
+  // session tiles carry, rooted at the primary session's cwd. Full-page views
+  // (messaging/artifacts/…) skip it — it's a chat-surface component.
+  const workspaceCwd = useStore($currentCwd).trim()
+
+  const openFilePreview = async (path: string) => {
+    try {
+      const preview = await normalizeOrLocalPreviewTarget(path, workspaceCwd || undefined)
+
+      if (!preview) {
+        throw new Error('Could not preview')
+      }
+
+      openPreview(preview, 'file-browser')
+    } catch (error) {
+      notifyError(error, 'Preview unavailable')
+    }
+  }
+
   const chatView = (
-    <ChatView
-      gateway={gateway}
-      maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
-      modelMenuContent={modelMenuContent}
-      {...chatActions}
-    />
+    <div className="flex h-full min-w-0">
+      <div className="min-w-0 flex-1">
+        <ChatView
+          gateway={gateway}
+          maxVoiceRecordingSeconds={maxVoiceRecordingSeconds}
+          modelMenuContent={modelMenuContent}
+          {...chatActions}
+        />
+      </div>
+      <div className="flex w-80 shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)">
+        <TileFiles cwd={workspaceCwd} onActivateFile={openFilePreview} onActivateFolder={openFilePreview} />
+      </div>
+    </div>
   )
 
   // FULL-PAGE views (not chat): a page is not a tab-able surface, so the zone's

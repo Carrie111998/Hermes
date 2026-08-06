@@ -2,11 +2,11 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { HermesReadDirResult } from '@/global'
-import { $connection, setCurrentCwd } from '@/store/session'
+import { $connection } from '@/store/session'
 
 import { resetProjectTreeState } from './files/use-project-tree'
 
-import { RightSidebarPane } from './index'
+import { TileFiles } from './tile-files'
 
 const readDir = vi.fn<(path: string) => Promise<HermesReadDirResult>>()
 
@@ -14,7 +14,7 @@ function installBridge() {
   ;(window as unknown as { hermesDesktop: { readDir: typeof readDir } }).hermesDesktop = { readDir }
 }
 
-describe('RightSidebarPane', () => {
+describe('TileFiles', () => {
   beforeEach(() => {
     $connection.set(null)
     resetProjectTreeState()
@@ -26,15 +26,12 @@ describe('RightSidebarPane', () => {
   afterEach(() => {
     cleanup()
     $connection.set(null)
-    setCurrentCwd('')
     resetProjectTreeState()
     delete (window as unknown as { hermesDesktop?: unknown }).hermesDesktop
   })
 
   it('renders the tree whenever the session has a working dir (repo or not) — no picker', async () => {
-    setCurrentCwd('/repo')
-
-    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
+    render(<TileFiles cwd="/repo" onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
 
     const refresh = await screen.findByRole('button', { name: 'Refresh tree' })
 
@@ -47,9 +44,7 @@ describe('RightSidebarPane', () => {
   })
 
   it('shows no tree for a detached chat (no working dir)', async () => {
-    setCurrentCwd('')
-
-    render(<RightSidebarPane onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
+    render(<TileFiles cwd="" onActivateFile={vi.fn()} onActivateFolder={vi.fn()} />)
 
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Refresh tree' })).toBeNull())
     expect(readDir).not.toHaveBeenCalled()

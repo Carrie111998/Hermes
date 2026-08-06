@@ -33,8 +33,8 @@ import {
   unstageReviewFile
 } from '@/store/review'
 
+import { PaneEmptyState, RightSidebarSectionHeader } from '../../chat/tile/tile-files'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
-import { PaneEmptyState, RightSidebarSectionHeader } from '../index'
 
 import { ReviewFileTree } from './file-tree'
 import { ReviewShipBar } from './ship-bar'

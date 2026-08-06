@@ -12,7 +12,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import { atom } from 'nanostores'
 
-import { RightSidebarPane } from '@/app/right-sidebar'
+import { TileFiles } from '@/app/chat/tile/tile-files'
 import { ReviewPane } from '@/app/right-sidebar/review'
 import type { GroupSetter } from '@/app/shell/group-setter'
 import type { StatusbarItem } from '@/app/shell/statusbar-controls'
@@ -86,9 +86,11 @@ function previewFile(path: string) {
 const ZONE_CONTENT = 'h-full [&>aside]:h-full [&>aside]:w-full [&>aside]:pt-0'
 
 export function FilesPane() {
+  const cwd = useStore($currentCwd)
+
   return (
     <div className={ZONE_CONTENT}>
-      <RightSidebarPane onActivateFile={previewFile} onActivateFolder={previewFile} />
+      <TileFiles cwd={cwd} onActivateFile={previewFile} onActivateFolder={previewFile} />
     </div>
   )
 }

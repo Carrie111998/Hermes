@@ -34,9 +34,12 @@ import { transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { NEW_SESSION_TITLE, sessionTitle } from '@/lib/chat-runtime'
+import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
 import { transcribeAudioClientDirect } from '@/lib/voice-client-direct'
 import { createComposerAttachmentScope, draftTitleFor } from '@/store/composer'
 import { $pinnedSessionIds, pinSession, unpinSession } from '@/store/layout'
+import { notifyError } from '@/store/notifications'
+import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
 import { sessionAwaitingInput } from '@/store/prompts'
@@ -71,6 +74,7 @@ import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { SessionContextMenu } from './sidebar/session-actions-menu'
 import { lastVisibleMessageIsUser } from './thread-loading'
+import { TileFiles } from './tile/tile-files'
 
 import { ChatView } from '.'
 
@@ -290,6 +294,11 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     [storedSessionId]
   )
 
+  // Must run before any early return (rules-of-hooks): the tile's live runtime
+  // cwd, feeding the components area's file tree. '' while unresolved — the
+  // stored-row fallback below covers cold tiles.
+  const liveCwd = useStore(view.$cwd).trim()
+
   // A tab-strip "+"/⌘T tab is created UNLISTED — its session stays out of
   // $sessions (no sidebar clutter) until it's actually used, so the tab shows
   // "New session". The moment this tile has a message, pull its row into
@@ -420,7 +429,41 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
     )
   }
 
-  return <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+  // Per-tile components area: the workspace file tree (and later the preview
+  // port) lives INSIDE the tile, keyed to THIS tile's cwd — not the global
+  // `$currentCwd`. Live runtime cwd first (agent may relocate mid-turn), the
+  // stored row's cwd/git root as the cold-tile fallback.
+  const storedRow = tileStoredRow(storedSessionId)
+  const tileCwd = liveCwd || storedRow?.cwd?.trim() || storedRow?.git_repo_root?.trim() || ''
+
+  const openTileFilePreview = async (path: string) => {
+    try {
+      const preview = await normalizeOrLocalPreviewTarget(path, tileCwd || undefined)
+
+      if (!preview) {
+        throw new Error('Could not preview')
+      }
+
+      openPreview(preview, 'file-browser')
+    } catch (error) {
+      notifyError(error, 'Preview unavailable')
+    }
+  }
+
+  return (
+    <div className="flex h-full min-w-0">
+      <div className="min-w-0 flex-1">
+        <TileChat runtimeId={runtimeId} storedSessionId={storedSessionId} view={view} />
+      </div>
+      <div className="flex w-80 shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)">
+        <TileFiles
+          cwd={tileCwd}
+          onActivateFile={openTileFilePreview}
+          onActivateFolder={openTileFilePreview}
+        />
+      </div>
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
