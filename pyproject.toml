@@ -172,6 +172,14 @@ dependencies = [
 # Native Anthropic provider — only needed when provider=anthropic (not via
 # OpenRouter or other aggregators).
 anthropic = ["anthropic==0.87.0"]  # CVE-2026-34450, CVE-2026-34452
+# Claude subscription via the official Agent SDK (provider "claude-code",
+# api_mode "claude_agent_sdk"). Range-pinned per the pre-1.0 rule in
+# AGENTS.md rather than exact-pinned like its neighbours, because the SDK
+# tracks the Claude CLI's release cadence and a floor+ceiling is what the
+# policy prescribes for 0.x. Deliberately NOT in [all]: the platform wheels
+# are ~72-82 MB each (they bundle the Claude executable), so every fresh
+# install would pay for a runtime that ships default-off.
+claude-code = ["claude-agent-sdk>=0.2.140,<0.4"]
 # Web search backends — each only loaded when the user picks it as their
 # search provider (configured via `hermes tools` or config.yaml).
 exa = ["exa-py==2.10.2"]
@@ -419,7 +427,10 @@ exclude-newer = "14 days"
 # cutoff can still brick installs. Exempting exact pins is pure brick-risk
 # removal at no supply-chain cost. Guarded by
 # tests/test_packaging_metadata.py::test_build_system_requires_exempt_from_exclude_newer.
-exclude-newer-package = { vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
+# claude-agent-sdk: dated exception so the lock can see 0.2.140 (uploaded
+# 2026-08-18), the first release whose `mcp` range admits the 2.x pinned above.
+# Remove once 0.2.140 is older than the 14-day window (after 2026-09-01).
+exclude-newer-package = { claude-agent-sdk = "2026-08-19T00:00:00Z", vercel = false, nemo-relay = false, huggingface_hub = false, h2 = false, aiohttp = false, cryptography = false, defusedxml = false, python-olm = false, unpaddedbase64 = false, setuptools = false, pillow = false, mcp = false }
 
 [tool.setuptools]
 # Top-level single-file modules (not packages). Without this, uv2nix's
