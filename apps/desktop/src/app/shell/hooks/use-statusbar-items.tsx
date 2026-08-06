@@ -12,7 +12,7 @@ import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
 import { Activity, AlertCircle, Clock, Command, FolderOpen, Globe, Hash, Loader2, Terminal } from '@/lib/icons'
 import type { RuntimeReadinessResult } from '@/lib/runtime-readiness'
-import { contextBarLabel, LiveDuration, usageContextLabel } from '@/lib/statusbar'
+import { contextBarLabel, contextCapacityClassName, LiveDuration, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { resolveVersionStatus } from '@/lib/version-status'
@@ -50,7 +50,7 @@ import type { StatusResponse, UsageStats } from '@/types/hermes'
 import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
 import type { StatusbarItem } from '../statusbar-controls'
 
-const EMPTY_USAGE = { calls: 0, input: 0, output: 0, total: 0 } as const
+const EMPTY_USAGE: UsageStats = { calls: 0, input: 0, output: 0, total: 0 }
 
 interface StatusbarItemsOptions {
   agentsOpen: boolean
@@ -225,6 +225,11 @@ export function useStatusbarItems({
 
   const contextUsage = useMemo(() => usageContextLabel(currentUsage), [currentUsage])
   const contextBar = useMemo(() => contextBarLabel(currentUsage), [currentUsage])
+
+  const contextCapacityClass = useMemo(
+    () => contextCapacityClassName(currentUsage.context_percent),
+    [currentUsage.context_percent]
+  )
 
   const publishContextUsage = useCallback(
     (snapshot: Pick<UsageStats, 'context_max' | 'context_percent' | 'context_used'>) => {
@@ -525,7 +530,7 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
-        detail: contextBar || undefined,
+        detail: contextBar ? <span className={contextCapacityClass}>{contextBar}</span> : undefined,
         hidden: !contextUsage,
         id: 'context-usage',
         label: contextUsage,
@@ -577,6 +582,7 @@ export function useStatusbarItems({
       chatOpen,
       clientVersionItem,
       contextBar,
+      contextCapacityClass,
       contextUsage,
       copy,
       currentUsage,
