@@ -883,9 +883,34 @@ def _classify_by_status(
     if status_code == 403:
         # OpenRouter 403 "key limit exceeded" is actually billing. Other
         # providers also use 403 for account-plan or credit exhaustion.
+        # Kimi / Moonshot's Coding Plan (api.kimi.com/coding) returns
+        # HTTP 403 with type=permission_error and the body "You've reached
+        # your usage limit for this billing cycle. Your quota will be
+        # refreshed in the next cycle. To continue now, purchase extra usage
+        # or upgrade your plan" when the subscription quota is exhausted.
+        # The wording contains "usage limit" + "billing cycle" + "quota will
+        # be refreshed" + "purchase extra usage" + "upgrade your plan" — none
+        # of those are in the generic _BILLING_PATTERNS list (which matches
+        # "exceeded your current quota" / "insufficient balance" etc.), so
+        # without this disambiguation the error falls through to the auth
+        # branch, surfaces as "Non-retryable client error" to the user, and
+        # never triggers the billing-aware recovery path (rotate credential,
+        # activate fallback, show "credits exhausted" status). Match the
+        # Kimi-specific phrases here so the recovery is identical to a 402.
+        #
+        # Reproduction (D-003 / RCA-B):
+        #   1. Use a Kimi Coding Plan subscription until quota exhausts
+        #   2. Run: hermes chat --provider kimi-coding --model kimi-k2.7-code
+        #   3. Send any message — observe immediate fallback activation
+        #      (was: "Non-retryable client error", bot dies, no fallback)
+        # Before this branch matched, the 403 fell through to the auth path
+        # below and the bot hard-aborted without activating the fallback chain.
         if (
             "key limit exceeded" in error_msg
             or "spending limit" in error_msg
+            or ("usage limit" in error_msg and "billing cycle" in error_msg)
+            or "quota will be refreshed" in error_msg
+            or "purchase extra usage" in error_msg
             or any(p in error_msg for p in _BILLING_PATTERNS)
         ):
             return result_fn(
@@ -964,6 +989,31 @@ def _classify_by_status(
             return result_fn(
                 FailoverReason.overloaded,
                 retryable=True,
+            )
+        # Some providers mislabel account-balance exhaustion as HTTP 429
+        # instead of the standards-correct 402. Z.AI / Zhipu is the worst
+        # offender: it returns ``HTTP 429 {"error":{"code":"1113",
+        # "message":"Insufficient balance or no resource package. Please
+        # recharge."}}`` when the GLM_API_KEY account is out of credits.
+        # That body is identical in meaning to a 402 billing exhaustion — the
+        # credential is valid but the account can't pay — so retrying is
+        # pointless (3 retries waste ~10s before the loop gives up) and the
+        # right action is to rotate / fall back immediately. Check the body
+        # against the billing patterns AND the Z.AI-specific code 1113 before
+        # the rate_limit fallback so this case is handled here. (#16)
+        #
+        # Reproduction (D-002 / RCA-B):
+        #   1. Set GLM_API_KEY to a key with zero account balance
+        #   2. Run: hermes chat --provider zai --model glm-5
+        #   3. Send any message — observe 0 wasted retries (was 3 before fix)
+        # Before this branch existed, the error fell through to the catch-all
+        # rate_limit path at the bottom of this function and burned 3 retries.
+        if any(p in error_msg for p in _BILLING_PATTERNS):
+            return result_fn(
+                FailoverReason.billing,
+                retryable=False,
+                should_rotate_credential=True,
+                should_fallback=True,
             )
         # Distinguish an OpenRouter-aggregator upstream 429 (an upstream model
         # like DeepSeek rate-limited OpenRouter's aggregate traffic) from an
@@ -1278,6 +1328,12 @@ def _classify_by_error_code(
         "no_usable_credits",
         "balance_depleted",
         "model_not_supported_on_free_tier",
+        # Z.AI / Zhipu GLM returns code "1113" with "Insufficient balance
+        # or no resource package. Please recharge." — surfaced as HTTP 429
+        # (see _classify_by_status 429 branch) but also reachable here when
+        # the body shape preserves the structured code. Treat as billing so
+        # the recovery is rotate/fallback rather than retry. (#16)
+        "1113",
     }:
         return result_fn(
             FailoverReason.billing,

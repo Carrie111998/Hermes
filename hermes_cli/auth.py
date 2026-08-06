@@ -71,6 +71,20 @@ except Exception:
 AUTH_STORE_VERSION = 1
 AUTH_LOCK_TIMEOUT_SECONDS = 15.0
 
+# atomic_replace retry budget for auth.json writes (D-008 / RCA-F):
+# Windows Defender real-time protection briefly holds the destination
+# file open during scan, surfacing as PermissionError (WinError 5) on the
+# os.replace() call. Five attempts with exponential backoff (0.15s,
+# 0.30s, 0.60s, 1.20s, 2.40s) rides through the typical 50-200ms scan
+# window plus tail. Override via
+# HERMES_AUTH_REPLACE_MAX_RETRIES / HERMES_AUTH_REPLACE_BACKOFF_SECONDS.
+_AUTH_REPLACE_MAX_RETRIES = int(
+    os.environ.get("HERMES_AUTH_REPLACE_MAX_RETRIES", "5")
+)
+_AUTH_REPLACE_BACKOFF_SECONDS = float(
+    os.environ.get("HERMES_AUTH_REPLACE_BACKOFF_SECONDS", "0.15")
+)
+
 # Nous Portal defaults
 DEFAULT_NOUS_PORTAL_URL = "https://portal.nousresearch.com"
 DEFAULT_NOUS_INFERENCE_URL = "https://inference-api.nousresearch.com/v1"
@@ -1126,6 +1140,14 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # specific store — e.g. the global-root write-through for rotating xAI
     # OAuth grants (#43589) — reusing this function's atomic O_EXCL + 0o600
     # write so the root auth.json gets the same TOCTOU-safe treatment.
+    #
+    # Windows Defender retry (D-008 / RCA-F):
+    #   atomic_replace -> os.replace fails with PermissionError (WinError 5)
+    #   when Defender real-time protection opens auth.json for scanning.
+    #   The advisory cross-process lock (_auth_store_lock) does NOT protect
+    #   against AV because Defender ignores Python's msvcrt.locking. The
+    #   scan window is typically 50-200ms; a short bounded retry with
+    #   exponential backoff rides through it. See ISSUES.md D-008.
     auth_file = target_path if target_path is not None else _auth_file_path()
     auth_file.parent.mkdir(parents=True, exist_ok=True)
     # Tighten parent dir to 0o700 so siblings can't traverse to creds.
@@ -1150,7 +1172,31 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
             handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
-        atomic_replace(tmp_path, auth_file)
+        # Retry the atomic replace on PermissionError. On Windows this is
+        # almost always WinError 5 from Defender real-time scanning the
+        # destination file mid-rename. The lock we already hold protects
+        # against cooperating Python writers; the retry protects against
+        # non-cooperating AV / backup / indexer handles.
+        last_exc: Optional[Exception] = None
+        for attempt in range(_AUTH_REPLACE_MAX_RETRIES):
+            try:
+                atomic_replace(tmp_path, auth_file)
+                last_exc = None
+                break
+            except PermissionError as exc:
+                last_exc = exc
+                if attempt < _AUTH_REPLACE_MAX_RETRIES - 1:
+                    backoff = _AUTH_REPLACE_BACKOFF_SECONDS * (2 ** attempt)
+                    logger.warning(
+                        "auth.json: atomic_replace denied (attempt %d/%d, "
+                        "likely AV scan); retrying in %.2fs: %s",
+                        attempt + 1, _AUTH_REPLACE_MAX_RETRIES, backoff, exc,
+                    )
+                    time.sleep(backoff)
+        if last_exc is not None:
+            # All retries exhausted — propagate so caller knows the write
+            # didn't land. The temp file is cleaned up in the finally below.
+            raise last_exc
         try:
             dir_fd = os.open(str(auth_file.parent), os.O_RDONLY)
         except OSError:

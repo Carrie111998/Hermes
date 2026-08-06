@@ -7,6 +7,67 @@ Uses discord.py library for:
 - Receiving messages from servers and DMs
 - Sending responses back
 - Handling threads and channels
+
+──────────────────────────────────────────────────────────────────────────
+Operational RCA & failure modes (see plugins/platforms/discord/ISSUES.md):
+──────────────────────────────────────────────────────────────────────────
+
+This adapter is the primary surface for the Nous Man bot (#0498). When a
+Discord message fails to produce a response, the user sees:
+    "Sorry, I encountered an unexpected error.
+     Try again or use /reset to start a fresh session."
+That generic message masks many distinct root causes — see ISSUES.md for
+the full ticket log. The most common are summarized here so future
+maintainers don't re-derive them from logs.
+
+D-001 — "No LLM provider configured" (RED, fixed 2026-07-21)
+    Cause: An empty ``OPENROUTER_API_KEY=`` line in ~/.hermes/.env silently
+    overrides the working key in config.yaml's ``model.api_key`` field.
+    Env vars are resolved BEFORE config.yaml is read, so the runtime sees
+    an empty string and refuses to start the agent.
+    Symptom: Every Discord message produces the generic error message above.
+    Logs show: ``RuntimeError: No LLM provider configured``.
+    Fix: ``d:/projects/hermes-agent-hotreload/apply-openrouter-key.py``
+    syncs the env var from config.yaml. Idempotent — re-run after any
+    .env edit. See RCA-A in ISSUES.md.
+
+D-002 / D-003 / D-004 — Provider-specific error misclassification
+    When the primary provider (Z.AI, Kimi) returns a billing/quota error
+    with non-standard wording, the error classifier misrouted it and
+    either burned retries (D-002) or failed to activate fallback (D-003).
+    GLM-5.2 reasoning streams were killed mid-think by the default stale
+    detector (D-004).
+    Fixes: see ``agent/error_classifier.py`` (429 and 403 branches) and
+    ``agent/reasoning_timeouts.py`` (_REASONING_STALE_TIMEOUT_FLOORS).
+    Cross-ref: RCA-B, RCA-C in ISSUES.md.
+
+D-005 — "Stored system prompt for session <id> is null"
+    After the daily session_reset (cron at 04:00 local), the first message
+    of each new session triggers this warning. The bot recovers (rebuilds
+    the prompt from scratch) but the first turn is slower. Non-blocking.
+    See RCA-E in ISSUES.md.
+
+D-006 — Compression loop on long sessions
+    Long-running Discord sessions (>200K tokens) repeatedly cross the
+    threshold, trigger compression (paid API call), shrink, then climb
+    back over. Each cycle burns a paid call + ~30s latency.
+    Interim mitigation: ``/reset`` the session if compression fires more
+    than once per 15 min. See RCA-D in ISSUES.md.
+
+D-007 — Image attachment processing (active verification)
+    Image pipeline: ``_cache_discord_image`` → ``vision`` tool →
+    ``auxiliary.vision`` provider (gemma-4-31b:free). Main model receives
+    a TEXT description (``agent.image_input_mode: text``), not raw pixels.
+    If gemma-4-31b:free rate-limits, image processing fails — the fallback
+    chain has no second vision-capable free model.
+
+Diagnostic order when the bot misbehaves:
+    1. ``Get-Content $env:LOCALAPPDATA\hermes\logs\errors.log -Tail 40``
+    2. ``Get-Content $env:LOCALAPPDATA\hermes\logs\agent.log -Tail 50``
+    3. ``hermes gateway status`` — confirm Discord connected
+    4. ``hermes auth status`` — confirm OPENROUTER_API_KEY is set
+    5. ``hermes chat --provider openrouter --model nvidia/nemotron-3-super-120b-a12b:free``
+       to verify the free-tier fallback works
 """
 
 import asyncio

@@ -22,6 +22,55 @@ two enabled levels — ``high`` and ``max`` — on the OpenAI-compatible endpoin
 (per Z.AI / BigModel docs).  Hermes' richer effort scale is collapsed onto
 those two so the user's effort preference actually reaches the model instead
 of being silently dropped.
+
+──────────────────────────────────────────────────────────────────────────
+Known operational failure modes (see plugins/platforms/discord/ISSUES.md):
+──────────────────────────────────────────────────────────────────────────
+
+D-002 — Z.AI "Insufficient balance" billing 429 (code 1113)
+    Z.AI mislabels account-balance exhaustion as HTTP 429 (standards-
+    correct would be 402). Body shape:
+        {"error": {"code": "1113",
+                   "message": "Insufficient balance or no resource package.
+                                Please recharge."}}
+    The 429 branch of ``agent/error_classifier.py::_classify_by_status``
+    now checks ``_BILLING_PATTERNS`` and code ``1113`` is in
+    ``_BILLING_ERROR_CODES``, so this classifies as ``billing`` (non-
+    retryable, rotate+fallback) instead of ``rate_limit`` (retryable,
+    burns 3 retries).
+
+    Reproduction:
+        1. Set GLM_API_KEY to a key with zero account balance
+        2. Run: hermes chat --provider zai --model glm-5
+        3. Send any message — observe 0 wasted retries (was 3 before fix)
+    Cross-ref: CRITICAL-ISSUES.md #16, RCA-B, D-002.
+
+D-004 — GLM-5/5.2 "hangs without doing anything" mid-think
+    GLM-5.2 ships with thinking ON by default (see ``build_api_kwargs_extras``
+    below — emits ``extra_body.thinking.type=enabled`` when no preference
+    is set). During extended thinking, GLM emits no content tokens for
+    several minutes before producing its first output. The default
+    HERMES_STREAM_STALE_TIMEOUT of 180s and the httpx socket read timeout
+    of 120s both fire BEFORE GLM-5.2 finishes thinking, tearing down a
+    healthy reasoning stream mid-think.
+
+    Fix: ``agent/reasoning_timeouts.py::_REASONING_STALE_TIMEOUT_FLOORS``
+    now has ``("glm-5.2", 300)``, ``("glm-5", 240)``, ``("glm-4.6", 180)``,
+    ``("glm-4.5", 180)`` — see that table for the floor rationale.
+
+    Reproduction of fix:
+        >>> from agent.reasoning_timeouts import get_reasoning_stale_timeout_floor
+        >>> get_reasoning_stale_timeout_floor("glm-5.2")
+        300.0
+        >>> get_reasoning_stale_timeout_floor("glm-4-9b") is None  # non-thinking
+        True
+    Cross-ref: CRITICAL-ISSUES.md #18, RCA-C, D-004.
+
+Standing rule for future maintainers:
+    When a new GLM variant is added here, also add it to
+    ``_REASONING_STALE_TIMEOUT_FLOORS`` in ``agent/reasoning_timeouts.py``
+    if it ships with thinking ON by default. The provider profile and the
+    timeout table are maintained separately — there is no automated check.
 """
 
 from __future__ import annotations

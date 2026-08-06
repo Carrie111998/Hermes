@@ -1048,6 +1048,23 @@ def init_agent(
                         )
                 if not getattr(agent, "_fallback_activated", False):
                     # No provider configured — reject with a clear message.
+                    #
+                    # Operational note (D-001 / RCA-A in
+                    # plugins/platforms/discord/ISSUES.md):
+                    #   The most common cause of reaching this raise is NOT a
+                    #   missing config — it's an empty ``<PROVIDER>_API_KEY=``
+                    #   line in ~/.hermes/.env silently overriding a valid key
+                    #   in config.yaml. Env vars are resolved BEFORE
+                    #   config.yaml is read, so the runtime sees "" and the
+                    #   resolver returns None here.
+                    #
+                    #   Reproduction:
+                    #     1. Add ``OPENROUTER_API_KEY=`` (empty value) to .env
+                    #     2. Restart gateway — every Discord message fails
+                    #     3. errors.log shows this exact RuntimeError
+                    #
+                    #   Fix: ``d:/projects/hermes-agent-hotreload/apply-openrouter-key.py``
+                    #   (idempotent — syncs env var from config.yaml).
                     raise RuntimeError(
                         "No LLM provider configured. Run `hermes model` to "
                         "select a provider, or run `hermes setup` for first-time "

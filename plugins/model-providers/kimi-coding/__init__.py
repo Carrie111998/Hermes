@@ -5,6 +5,55 @@ Kimi has dual endpoints:
   - legacy keys → api.moonshot.ai/v1 (OpenAI chat completions)
 
 This module covers the chat_completions path (/v1 endpoint).
+
+──────────────────────────────────────────────────────────────────────────
+Known operational failure modes (see plugins/platforms/discord/ISSUES.md):
+──────────────────────────────────────────────────────────────────────────
+
+D-003 — Kimi Coding Plan "usage limit" billing 403 (permission_error)
+    Kimi's Coding Plan (api.kimi.com/coding) returns HTTP 403 with
+    type=permission_error and a body that uses none of the standard
+    billing phrases when the subscription quota is exhausted:
+
+        {"error": {
+            "type": "permission_error",
+            "message": "You've reached your usage limit for this billing
+                        cycle. Your quota will be refreshed in the next
+                        cycle. To continue now, purchase extra usage or
+                        upgrade your plan:
+                        https://www.kimi.com/code/#pricing"
+        }}
+
+    The 403 branch of ``agent/error_classifier.py::_classify_by_status``
+    now matches three Kimi-specific phrases:
+      - ("usage limit" AND "billing cycle")
+      - "quota will be refreshed"
+      - "purchase extra usage"
+    so the error classifies as ``billing`` (non-retryable, rotate+
+    fallback) instead of ``auth`` (no fallback activation).
+
+    Reproduction:
+        1. Use a Kimi Coding Plan subscription until quota exhausts
+        2. Run: hermes chat --provider kimi-coding --model kimi-k2.7-code
+        3. Send any message — observe immediate fallback activation
+           (was: "Non-retryable client error", bot dies, no fallback)
+    Cross-ref: CRITICAL-ISSUES.md #17, RCA-B, D-003.
+
+Kimi overload 429 (NOT a bug — works correctly)
+    Kimi also returns HTTP 429 with body:
+        {"error": {"type": "rate_limit_error",
+                   "message": "The engine is currently overloaded, please
+                                try again later"}}
+    The word "overloaded" matches ``_OVERLOADED_PATTERNS``, so this
+    correctly classifies as ``overloaded`` (retryable, NO credential
+    rotation). This is the right behavior — the credential is healthy,
+    the server is just busy.
+
+Standing rule for future maintainers:
+    If Kimi adds a new error code or changes the wording of the existing
+    quota-exhaustion message, update the 403 branch of
+    ``_classify_by_status`` in ``agent/error_classifier.py``. The phrase
+    list is the ONLY thing that routes this to the right recovery path.
 """
 
 from typing import Any

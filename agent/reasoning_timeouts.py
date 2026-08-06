@@ -73,6 +73,44 @@ _REASONING_STALE_TIMEOUT_FLOORS: tuple[tuple[str, int], ...] = (
     ("deepseek-reasoner", 600),
     ("deepseek-v4-flash", 600),
     ("deepseek-v4-pro", 600),
+    # Z.AI / Zhipu GLM-4.5-and-later reasoning models.  GLM-5.2 ships with
+    # thinking enabled by default on the OpenAI-compatible endpoint
+    # (api.z.ai/api/paas/v4) — see plugins/model-providers/zai/__init__.py
+    # — and routinely pauses for minutes during extended thinking before
+    # emitting the first content token.  Without a floor, the default
+    # HERMES_STREAM_STALE_TIMEOUT of 180s (and the httpx read timeout of
+    # 120s) fire *before* GLM-5.2 finishes thinking, tearing down a
+    # healthy reasoning stream mid-think.  The user-visible symptom is
+    # "GLM models just hang without doing anything" followed by a stale-
+    # stream kill — because no content tokens ever arrive inside the
+    # default window.  GLM-5.2 max-effort thinking is the slowest variant
+    # (300s floor); GLM-5 / GLM-4.6 / GLM-4.5 are progressively lighter.
+    # Slug-anchored like the rest of the table so "glm-4-9b" (a non-
+    # thinking variant) is NOT matched. (#17)
+    #
+    # Reproduction (D-004 / RCA-C):
+    #   1. Set provider=zai, model=glm-5.2 (thinking is ON by default)
+    #   2. Send a non-trivial reasoning task (e.g. "write a Python function
+    #      that solves N-queens and explain your approach")
+    #   3. BEFORE this floor existed, the bot would appear to hang for 180s,
+    #      then log "Stream stale for 180s - killing connection", then retry
+    #      the same hang, looping for ~540s+ before final failure.
+    #   4. AFTER this floor, the stale detector waits 300s — long enough for
+    #      GLM-5.2's max-effort thinking phase to complete.
+    #
+    # Why GLM was originally missing from this table:
+    #   The table was built (Fixes #52217) for cloud reasoning models with
+    #   DOCUMENTED multi-minute TTFB (NVIDIA Nemotron, OpenAI o1, Anthropic
+    #   Opus 4.x thinking, DeepSeek R1). GLM-5.2's thinking mode is opt-out
+    #   and was added separately in plugins/model-providers/zai/__init__.py.
+    #   There is no automated check linking the two — a provider profile that
+    #   emits thinking blocks does NOT auto-register here. See RCA-C in
+    #   plugins/platforms/discord/ISSUES.md for the systemic pattern.
+    ("glm-5.2", 300),
+    ("glm-5p2", 300),  # Fireworks alias spelling
+    ("glm-5", 240),
+    ("glm-4.6", 180),
+    ("glm-4.5", 180),
     # Qwen — QwQ reasoning + Qwen3 thinking variants.  QwQ-32B
     # preview is the stable slug; ``qwen3`` covers the family of
     # thinking-mode Qwen3 models (qwen3-235b-a22b, qwen3-32b, etc.)
@@ -204,6 +242,14 @@ def get_reasoning_stale_timeout_floor(model: object) -> Optional[float]:
     300.0
     >>> get_reasoning_stale_timeout_floor("anthropic/claude-opus-4-6")
     240.0
+    >>> get_reasoning_stale_timeout_floor("glm-5.2")
+    300.0
+    >>> get_reasoning_stale_timeout_floor("zai/glm-5")
+    240.0
+    >>> get_reasoning_stale_timeout_floor("glm-4.5-flash")
+    180.0
+    >>> get_reasoning_stale_timeout_floor("glm-4-9b") is None
+    True
     >>> get_reasoning_stale_timeout_floor("gpt-4o") is None
     True
     >>> get_reasoning_stale_timeout_floor("olmo-1") is None
