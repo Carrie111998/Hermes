@@ -359,6 +359,44 @@ def test_authenticated_gate_reply_failure_does_not_fall_through_to_agent(monkeyp
     assert "no action" in response.lower()
 
 
+def test_gate_reply_uses_transport_owner_not_routed_runtime_profile(monkeypatch):
+    from gateway import kanban_proactive_supervisor as supervisor
+
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._scale_to_zero_note_real_inbound = lambda: None
+    runner._is_user_authorized = lambda source: True
+    runner._adapter_profile_for_source = lambda source: None
+    runner._active_profile_name = lambda: "default"
+    event = MessageEvent(
+        text="approved",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=Platform.DISCORD,
+            chat_id="routed-channel",
+            chat_type="channel",
+            user_id="kevin",
+            user_name="Kevin",
+            profile="ops",
+        ),
+        reply_to_message_id="gate-message-1",
+        reply_to_text="[kanban-gate:0123456789abcdef0123456789abcdef]",
+        reply_to_is_own_message=True,
+    )
+    captured = {}
+
+    def capture_owner(**kwargs):
+        captured.update(kwargs)
+        return None
+
+    monkeypatch.setattr(supervisor, "consume_supervisor_reply", capture_owner)
+
+    response = asyncio.run(runner._handle_message(event))
+
+    assert captured["notifier_profile"] == "default"
+    assert response is not None
+    assert "no action" in response.lower()
+
+
 def test_supervisor_does_not_take_over_subscription_owned_by_another_profile(
     tmp_path, monkeypatch
 ):
