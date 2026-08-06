@@ -199,12 +199,13 @@ function SectionLabel({ children }: { children: string }) {
   )
 }
 
-function GatewayMenuPanel({ onClose }: { onClose: () => void }) {
+export function GatewayMenuPanel({ onClose }: { onClose: () => void }) {
   const { t } = useI18n()
   const copy = t.shell.gatewayMenu
   const gateway = useValue(host.state.gateway)
   const { readiness, ready } = useHealth()
   const [snapshot, setSnapshot] = useState<null | StatusResponse>(null)
+  const [reconnecting, setReconnecting] = useState(false)
   const recentLogs = useGatewayLogTail()
 
   useEffect(() => {
@@ -222,6 +223,18 @@ function GatewayMenuPanel({ onClose }: { onClose: () => void }) {
   const restart = () => {
     onClose()
     void host.restartGateway().catch(() => undefined)
+  }
+
+  const reconnect = () => {
+    if (reconnecting) {
+      return
+    }
+
+    setReconnecting(true)
+    void host
+      .reconnectGateway()
+      .catch(err => host.notifyError(err, copy.reconnectGateway))
+      .finally(() => setReconnecting(false))
   }
 
   const gatewayOpen = gateway === 'open'
@@ -268,6 +281,20 @@ function GatewayMenuPanel({ onClose }: { onClose: () => void }) {
           </span>
         </div>
         <div className="flex shrink-0 items-center gap-0.5">
+          {!gatewayOpen && (
+            <Tip label={copy.reconnectGateway}>
+              <Button
+                aria-label={copy.reconnectGateway}
+                className="text-muted-foreground hover:text-foreground"
+                disabled={reconnecting}
+                onClick={reconnect}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <icons.RefreshCw className={cn(reconnecting && 'animate-spin')} />
+              </Button>
+            </Tip>
+          )}
           <Tip label={t.commandCenter.restartGateway}>
             <Button
               aria-label={t.commandCenter.restartGateway}
