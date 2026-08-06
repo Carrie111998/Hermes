@@ -224,6 +224,24 @@ export async function ensureDefaultWorkspaceCwd(): Promise<void> {
   }
 }
 
+/**
+ * Boot determinism for the workspace seed. `ensureDefaultWorkspaceCwd` skips
+ * the configured default when a session id is already present — route-resume
+ * can win the race with the boot effect on slow starts (its guard exists to
+ * protect LIVE sessions: settings saves, soft gateway switches). At boot
+ * nothing is live yet: when `$currentCwd` is still the remembered value, apply
+ * the configured default so the boot workspace is deterministic instead of
+ * race-dependent. A resumed session's own cwd supersedes this when its runtime
+ * arrives.
+ */
+export function ensureBootCwdDeterminism(): void {
+  const configured = getConfiguredDefaultProjectDir()
+
+  if (configured && $currentCwd.get() === getRememberedWorkspaceCwd()) {
+    setCurrentCwd(configured)
+  }
+}
+
 export function applyConfiguredDefaultProjectDir(dir: null | string | undefined): void {
   configuredDefaultProjectDir = dir?.trim() || ''
 }

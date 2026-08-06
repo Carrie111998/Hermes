@@ -13,6 +13,7 @@ import {
   $unreadFinishedSessionIds,
   _resetLegacyDiscardForTests,
   applyConfiguredDefaultProjectDir,
+  ensureBootCwdDeterminism,
   getRememberedRoute,
   getRememberedSessionId,
   mergeSessionPage,
@@ -370,6 +371,50 @@ describe('workspaceCwdForNewSession', () => {
     // never reads the remote keys (nor inherits the sticky local workspace).
     $connection.set(null)
     expect(workspaceCwdForNewSession()).toBe('')
+  })
+})
+
+describe('ensureBootCwdDeterminism', () => {
+  afterEach(() => {
+    applyConfiguredDefaultProjectDir(null)
+    $currentCwd.set('')
+    window.localStorage.removeItem('hermes.desktop.workspace-cwd')
+  })
+
+  it('applies the configured default when the cwd is still the remembered value (route-resume won the race)', () => {
+    // The boot-seed race (#71873): route-resume sets $activeSessionId before
+    // the boot effect's ensureDefaultWorkspaceCwd runs, so its guard skips the
+    // configured default and $currentCwd keeps the remembered workspace.
+    window.localStorage.setItem('hermes.desktop.workspace-cwd', 'C:\\Users\\sonny')
+    setCurrentCwd('C:\\Users\\sonny')
+    applyConfiguredDefaultProjectDir('C:\\Hermes')
+
+    ensureBootCwdDeterminism()
+
+    expect($currentCwd.get()).toBe('C:\\Hermes')
+  })
+
+  it('does not rewrite a cwd that already left the remembered value', () => {
+    window.localStorage.setItem('hermes.desktop.workspace-cwd', 'C:\\Users\\sonny')
+    // Set the atom directly (not via setCurrentCwd, which would persist and
+    // re-align the remembered value): the boot seed already applied a real
+    // workspace, or a live session established one.
+    $currentCwd.set('C:\\Users\\sonny\\work\\repo')
+    applyConfiguredDefaultProjectDir('C:\\Hermes')
+
+    ensureBootCwdDeterminism()
+
+    // The seed (or a live session) already established a real workspace.
+    expect($currentCwd.get()).toBe('C:\\Users\\sonny\\work\\repo')
+  })
+
+  it('does nothing when no default project dir is configured', () => {
+    window.localStorage.setItem('hermes.desktop.workspace-cwd', 'C:\\Users\\sonny')
+    setCurrentCwd('C:\\Users\\sonny')
+
+    ensureBootCwdDeterminism()
+
+    expect($currentCwd.get()).toBe('C:\\Users\\sonny')
   })
 })
 

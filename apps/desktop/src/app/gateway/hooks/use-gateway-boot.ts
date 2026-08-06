@@ -32,6 +32,7 @@ import {
   $connection,
   $currentCwd,
   $sessions,
+  ensureBootCwdDeterminism,
   ensureDefaultWorkspaceCwd,
   setConnection,
   setCurrentBranch,
@@ -268,8 +269,21 @@ export function useGatewayBoot({
 
     // Seed the working dir from the backend default on a fresh view (nothing
     // open yet). Shared by boot + soft switch.
-    async function seedDefaultCwd() {
+    async function seedDefaultCwd({ boot = false }: { boot?: boolean } = {}) {
       await ensureDefaultWorkspaceCwd()
+
+      // Boot determinism: route-resume can set $activeSessionId before this
+      // seed runs on slow starts, which makes ensureDefaultWorkspaceCwd skip
+      // the configured default (its guard protects LIVE sessions — settings
+      // saves, soft gateway switches). At boot nothing is live yet, so apply
+      // the configured default when the cwd is still the remembered value —
+      // the boot workspace is deterministic instead of race-dependent. A
+      // resumed session's own cwd supersedes this when its runtime arrives.
+      // Local mode only — a remote backend owns its own default workspace.
+      if (boot && $connection.get()?.mode !== 'remote') {
+        ensureBootCwdDeterminism()
+      }
+
       const remoteDefault = await desktopDefaultCwd().catch(() => null)
 
       if (remoteDefault?.cwd && !$activeSessionId.get() && !$currentCwd.get()) {
@@ -526,7 +540,7 @@ export function useGatewayBoot({
         })
 
         await Promise.all([
-          seedDefaultCwd(),
+          seedDefaultCwd({ boot: true }),
           callbacksRef.current.refreshHermesConfig(),
           // Session-list population is never boot-fatal. The gateway WS is
           // already open by this point — a failed sidebar fetch (transient
