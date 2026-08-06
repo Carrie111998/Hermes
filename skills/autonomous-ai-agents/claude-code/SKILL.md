@@ -1,6 +1,6 @@
 ---
 name: claude-code
-description: "Delegate coding to Claude Code CLI (features, PRs)."
+description: "Use when delegating coding to Claude Code CLI — features, PRs, multi-file edits. Interactive coding agent."
 version: 2.2.1
 author: Hermes Agent + Teknium
 license: MIT

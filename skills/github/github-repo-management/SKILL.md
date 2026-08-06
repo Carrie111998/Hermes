@@ -1,6 +1,6 @@
 ---
 name: github-repo-management
-description: "Clone/create/fork repos; manage remotes, releases."
+description: "Use when cloning, creating, or forking GitHub repos; managing remotes and releases."
 version: 1.1.0
 author: Hermes Agent
 license: MIT

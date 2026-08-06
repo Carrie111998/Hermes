@@ -1,6 +1,6 @@
 ---
 name: xlsx
-description: "Create, read, edit Excel .xlsx spreadsheets and CSVs."
+description: "Use when creating, reading, or editing Excel .xlsx spreadsheets and CSVs."
 version: 1.0.0
 author: Anthropic (adapted by Nous Research)
 license: Proprietary. LICENSE.txt has complete terms
