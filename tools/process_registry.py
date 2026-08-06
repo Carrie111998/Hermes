@@ -117,18 +117,21 @@ def _worker_memory_max_bytes() -> int:
     override_bound: Optional[int] = None
     override = os.getenv("TERMINAL_LOCAL_MEMORY_MAX_MB", "").strip()
     if override:
+        override_valid = False
         try:
             parsed = int(override) * 1024 * 1024
             if parsed >= _MIN_WORKER_MEMORY_MAX_BYTES:
                 override_bound = parsed
+                override_valid = True
         except ValueError:
             pass
-        logger.warning(
-            "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; "
-            "expected an integer representing at least %d MiB",
-            override,
-            _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024),
-        )
+        if not override_valid:
+            logger.warning(
+                "Ignoring invalid TERMINAL_LOCAL_MEMORY_MAX_MB=%r; "
+                "expected an integer representing at least %d MiB",
+                override,
+                _MIN_WORKER_MEMORY_MAX_BYTES // (1024 * 1024),
+            )
 
     candidates: List[int] = []
     try:
@@ -1050,7 +1053,11 @@ class ProcessRegistry:
             except Exception as e:
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
                 if pty_scope_attempted and session.systemd_unit:
-                    _stop_systemd_unit(session.systemd_unit)
+                    if not _stop_systemd_unit(session.systemd_unit):
+                        raise RuntimeError(
+                            "PTY scope could not be reaped; refusing pipe fallback "
+                            "to avoid duplicate command execution"
+                        ) from e
                     session.systemd_unit = ""
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -2418,7 +2425,10 @@ class ProcessRegistry:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self):
+    def _write_checkpoint(
+        self,
+        extra_entries: Optional[List[Dict[str, Any]]] = None,
+    ):
         """Write running process metadata to checkpoint file atomically."""
         try:
             with self._lock:
@@ -2451,6 +2461,13 @@ class ProcessRegistry:
                             "notify_on_complete": s.notify_on_complete,
                             "watch_patterns": s.watch_patterns,
                         })
+                if extra_entries:
+                    tracked_ids = {item.get("session_id") for item in entries}
+                    entries.extend(
+                        item
+                        for item in extra_entries
+                        if item.get("session_id") not in tracked_ids
+                    )
             
             # Atomic write to avoid corruption on crash
             from utils import atomic_json_write
@@ -2473,6 +2490,7 @@ class ProcessRegistry:
             return 0
 
         recovered = 0
+        unresolved_scope_entries: List[Dict[str, Any]] = []
         for entry in entries:
             pid = entry.get("pid")
             if not pid:
@@ -2506,6 +2524,15 @@ class ProcessRegistry:
                         "an unrelated process; refusing to adopt it.",
                         entry.get("session_id", "?"), pid,
                     )
+                systemd_unit = entry.get("systemd_unit", "")
+                if systemd_unit and not _stop_systemd_unit(systemd_unit):
+                    logger.warning(
+                        "Could not reap persisted scope %s for dead wrapper pid %s; "
+                        "retaining checkpoint entry for the next startup",
+                        systemd_unit,
+                        pid,
+                    )
+                    unresolved_scope_entries.append(entry)
                 continue
 
             session = ProcessSession(
@@ -2550,7 +2577,7 @@ class ProcessRegistry:
                     "notify_on_complete": session.notify_on_complete,
                 })
 
-        self._write_checkpoint()
+        self._write_checkpoint(extra_entries=unresolved_scope_entries)
 
         return recovered
 
