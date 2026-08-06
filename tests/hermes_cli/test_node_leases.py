@@ -235,6 +235,45 @@ def test_spawn_failure_releases_node_for_next_ready_task(tmp_path, monkeypatch):
         assert kb.get_task(conn, failed_id).status == "ready"
 
 
+def test_running_task_reports_conflict_when_lease_cannot_be_refreshed(
+    tmp_path, monkeypatch
+):
+    home = _fresh_board(tmp_path, monkeypatch)
+    pool = node_leases.PosixNodeLeasePool(root=home / "node-leases")
+    config = {
+        "enabled": True,
+        "profile_to_node": {"architect": "m4-pro", "planner": "m4-pro"},
+        "capacities": {"m4-pro": 1},
+        "ttl_seconds": 60,
+    }
+    with kb.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="architecture", assignee="architect")
+        kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: os.getpid(),
+            node_leases=config,
+            node_lease_pool=pool,
+        )
+        owner = pool.snapshot()["m4-pro"]["owners"][0]
+        assert pool.release(owner=owner)
+        assert pool.try_acquire(
+            profile="planner",
+            owner="other-board:task",
+            profile_to_node=config["profile_to_node"],
+            capacities=config["capacities"],
+            ttl_seconds=60,
+        ) is not None
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: os.getpid(),
+            node_leases=config,
+            node_lease_pool=pool,
+        )
+
+    assert result.node_lease_conflicts == [(task_id, "architect", "m4-pro")]
+
+
 def test_review_worker_respects_same_physical_node_capacity(tmp_path, monkeypatch):
     home = _fresh_board(tmp_path, monkeypatch)
     with kb.connect_closing() as conn:

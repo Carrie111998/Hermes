@@ -6824,6 +6824,10 @@ class DispatchResult:
     """Tasks deferred by physical-node capacity as
     ``(task_id, assignee, node)``. Profiles sharing one backend therefore
     share one real concurrency budget rather than independent alias budgets."""
+    node_lease_conflicts: list[tuple[str, str, str]] = field(default_factory=list)
+    """Already-running tasks whose physical-node lease could not be refreshed,
+    as ``(task_id, assignee, node)``. This is an operator-actionable capacity
+    breach signal, not an ordinary ready-task deferral."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8390,13 +8394,21 @@ def _dispatch_once_locked(
                 if owner.startswith(_db_owner_prefix) and owner not in running_owners:
                     _node_pool.release(owner=owner)
         for running in running_rows:
-            _node_pool.try_acquire(
+            refreshed = _node_pool.try_acquire(
                 profile=running["assignee"] or "",
                 owner=_db_owner_prefix + running["id"],
                 profile_to_node=_profile_to_node,
                 capacities=_node_capacities,
                 ttl_seconds=_node_ttl,
             )
+            if refreshed is None:
+                result.node_lease_conflicts.append(
+                    (
+                        running["id"],
+                        running["assignee"] or "",
+                        str(_profile_to_node.get(running["assignee"] or "") or ""),
+                    )
+                )
     _dry_node_counts = (
         {
             name: int(data.get("in_use", 0))

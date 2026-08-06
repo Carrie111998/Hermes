@@ -1471,6 +1471,19 @@ class GatewayKanbanWatchersMixin:
                             slug,
                             len(node_capped),
                         )
+                    node_conflicts = (
+                        getattr(res, "node_lease_conflicts", None) or []
+                        if res is not None
+                        else []
+                    )
+                    if node_conflicts:
+                        logger.error(
+                            "kanban dispatcher [%s]: %d running task(s) lack "
+                            "their configured physical-node lease: %s",
+                            slug,
+                            len(node_conflicts),
+                            node_conflicts,
+                        )
                     if res is not None and getattr(res, "spawned", None):
                         any_spawned = True
                         # Quiet by default — only log when something actually

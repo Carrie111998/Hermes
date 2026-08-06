@@ -2508,6 +2508,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "node": node}
                 for (tid, who, node) in res.skipped_node_capped
             ],
+            "node_lease_conflicts": [
+                {"task_id": tid, "assignee": who, "node": node}
+                for (tid, who, node) in res.node_lease_conflicts
+            ],
             "auto_assigned_default": res.auto_assigned_default,
         }, indent=2))
         return 0
@@ -2544,6 +2548,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     if res.skipped_node_capped:
         for tid, who, node in res.skipped_node_capped:
             print(f"Deferred ({who} waiting for physical node {node or '<unmapped>'}): {tid}")
+    if res.node_lease_conflicts:
+        for tid, who, node in res.node_lease_conflicts:
+            print(
+                f"CONFLICT (running {who} lacks physical-node lease "
+                f"{node or '<unmapped>'}): {tid}"
+            )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
