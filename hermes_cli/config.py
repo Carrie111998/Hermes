@@ -989,6 +989,18 @@ def get_missing_env_vars(required_only: bool = False) -> List[Dict[str, Any]]:
     return missing
 
 
+# Sub-tree names whose immediate children are user-supplied keys that may
+# legitimately contain dots (e.g. Matrix room IDs ``!abc:server.tld``).
+# ``_set_nested`` stops splitting the dotted path after crossing one of
+# these segments and treats the remainder as a single opaque key.  Keep
+# the list narrow — adding a name here changes the meaning of every
+# ``hermes config set <name>.<anything>`` invocation that contains a dot
+# in ``<anything>``.
+_OPEN_DICT_LEAF_CONTAINERS = frozenset({
+    "channel_prompts",
+})
+
+
 def _set_nested(config, dotted_key: str, value):
     """Set a value at an arbitrarily nested dotted key path.
 
@@ -1010,8 +1022,25 @@ def _set_nested(config, dotted_key: str, value):
     replaced any non-dict value (including lists) with ``{}``, silently
     destroying list-typed config like ``custom_providers`` whenever a
     caller used an indexed path.
+
+    Open-dict containers (#80006): certain sub-trees are flat dicts whose
+    *keys* may themselves contain dots (e.g. ``matrix.channel_prompts``
+    keyed by Matrix room IDs like ``!abc:server.tld``).  A naive
+    ``split(".")`` would slice the room ID into nested path segments and
+    silently write the value into a wrong nested shape.  When the path
+    crosses one of these container names, everything after the container
+    segment is treated as a single opaque key.
     """
     parts = dotted_key.split(".")
+    # Find the earliest open-dict container segment; everything after it
+    # is the user-supplied key, dots and all.  The container's position
+    # varies by platform (``matrix.channel_prompts`` vs top-level
+    # ``channel_prompts``), so match by name regardless of depth.
+    for idx, part in enumerate(parts[:-1]):
+        if part in _OPEN_DICT_LEAF_CONTAINERS:
+            # Re-partition: path to the container, then one opaque key.
+            parts = parts[: idx + 1] + [".".join(parts[idx + 1 :])]
+            break
     current = config
     for part in parts[:-1]:
         if isinstance(current, list):

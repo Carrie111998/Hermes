@@ -723,3 +723,83 @@ class TestMalformedYAMLConfigPreservation:
         assert "Cannot parse" in captured.out or "Cannot parse" in captured.err
         raw = _read_config(_isolated_hermes_home)
         assert raw == self.BROKEN_CONFIG
+
+
+# ---------------------------------------------------------------------------
+# Open-dict leaf containers — keys containing dots must not be split
+# ---------------------------------------------------------------------------
+
+class TestOpenDictLeafContainers:
+    """``channel_prompts`` and similar flat-dict subtrees are keyed by
+    user-supplied identifiers that may legitimately contain dots (Matrix
+    room IDs like ``!abc:server.tld``, bridged-channel IDs, etc.).
+
+    A naive ``split(".")`` on the dotted path slices the identifier into
+    nested path segments and silently writes the value into a wrong
+    nested shape — the user sees ``✓ Set …`` but the runtime reads no
+    value.  ``_set_nested`` must stop splitting after crossing a known
+    open-dict container name and treat the remainder as a single opaque
+    key.
+    """
+
+    def _write_config(self, tmp_path, body):
+        (tmp_path / "config.yaml").write_text(body)
+
+    def test_matrix_room_id_with_dots_lands_as_single_key(self, _isolated_hermes_home):
+        """matrix.channel_prompts.!abc:server.tld writes ONE key, not nested."""
+        self._write_config(_isolated_hermes_home, "matrix:\n  channel_prompts: {}\n")
+
+        set_config_value(
+            "matrix.channel_prompts.!TestRoom:chat.changwt.cc",
+            "be brief",
+        )
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        # The full room ID is preserved as one key under channel_prompts.
+        assert reloaded["matrix"]["channel_prompts"] == {
+            "!TestRoom:chat.changwt.cc": "be brief",
+        }
+
+    def test_channel_prompts_value_replaces_existing_room_id_entry(self, _isolated_hermes_home):
+        """Re-setting the same room ID replaces the value in place."""
+        self._write_config(_isolated_hermes_home, (
+            "matrix:\n"
+            "  channel_prompts:\n"
+            "    '!OldRoom:example.org': old prompt\n"
+        ))
+
+        set_config_value(
+            "matrix.channel_prompts.!OldRoom:example.org",
+            "new prompt",
+        )
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["matrix"]["channel_prompts"] == {
+            "!OldRoom:example.org": "new prompt",
+        }
+
+    def test_top_level_channel_prompts_also_protects_dotted_key(self, _isolated_hermes_home):
+        """The protection is keyed by container NAME, not by full path —
+        a top-level ``channel_prompts.<dotted>`` is protected too."""
+        self._write_config(_isolated_hermes_home, "channel_prompts: {}\n")
+
+        set_config_value("channel_prompts.!abc:example.org", "hi")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["channel_prompts"] == {"!abc:example.org": "hi"}
+
+    def test_other_dotted_keys_still_split_normally(self, _isolated_hermes_home):
+        """The open-dict protection must NOT leak into other paths —
+        ordinary nested keys like ``model.provider`` keep splitting."""
+        self._write_config(_isolated_hermes_home, "model:\n  default: x\n")
+
+        set_config_value("model.provider", "anthropic")
+
+        import yaml
+        reloaded = yaml.safe_load(_read_config(_isolated_hermes_home))
+        assert reloaded["model"]["provider"] == "anthropic"
+        # The original sibling is preserved.
+        assert reloaded["model"]["default"] == "x"
