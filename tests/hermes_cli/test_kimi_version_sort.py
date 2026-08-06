@@ -44,3 +44,37 @@ def test_kimi_uppercase_k_prefix_parses():
     models = ["moonshotai/kimi-K2.6", "moonshotai/kimi-K3"]
     models.sort(key=lambda m: _model_sort_key(m, KIMI_PREFIX))
     assert models[0] == "moonshotai/kimi-K3"
+
+
+def test_kimi_non_numeric_k_suffix_keeps_its_text():
+    """k/K is a version marker only when it introduces a numeric version.
+
+    Regression for review feedback on #78892: ``kimi-king`` and ``kimi-ing``
+    must keep distinct sort keys — otherwise alias resolution can let catalog
+    order pick the model.
+    """
+    king = _model_sort_key("moonshotai/kimi-king", KIMI_PREFIX)
+    ing = _model_sort_key("moonshotai/kimi-ing", KIMI_PREFIX)
+    assert king != ing
+    # The leading k is not consumed as a version marker; both suffixes keep
+    # their full text.
+    assert king[-1] == "king"
+    assert ing[-1] == "ing"
+
+
+def test_kimi_k_marker_requires_following_digit():
+    """k/K introduces a version only when the next char is a digit."""
+    versioned = _model_sort_key("moonshotai/kimi-k3", KIMI_PREFIX)
+    suffix = _model_sort_key("moonshotai/kimi-kx", KIMI_PREFIX)
+    # k3 parses as a numeric version; kx keeps the k in the suffix.
+    assert versioned[0] == -3.0
+    assert suffix[-1] == "kx"
+
+
+def test_kimi_k_suffix_after_version_keeps_text():
+    """k/K after a version separator is not consumed as a new version marker."""
+    models = ["moonshotai/kimi-k2.6-king", "moonshotai/kimi-k2.6-ing"]
+    keys = [_model_sort_key(m, KIMI_PREFIX) for m in models]
+    assert keys[0] != keys[1]
+    assert keys[0][-1] == "king"
+    assert keys[1][-1] == "ing"
