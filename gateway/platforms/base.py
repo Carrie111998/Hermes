@@ -3411,7 +3411,12 @@ class BasePlatformAdapter(ABC):
         if not user_id or self._authorization_check is None:
             return None
         try:
-            return bool(self._authorization_check(user_id, chat_type, chat_id))
+            result = self._authorization_check(user_id, chat_type, chat_id)
+            if result is True:
+                return True
+            if result is False:
+                return False
+            return None
         except Exception:
             logger.warning(
                 "[%s] Authorization check raised for user %s; treating as unknown",
