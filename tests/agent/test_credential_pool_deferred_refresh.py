@@ -198,6 +198,20 @@ def _install_claude_source(monkeypatch, initial):
         }
         return True
 
+    def write_locked(
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        *,
+        expected_refresh_token,
+        allow_missing=False,
+    ):
+        del allow_missing
+        current = state["credentials"]
+        if current.get("refreshToken") != expected_refresh_token:
+            raise auth_mod.SourceCredentialLineageChanged("anthropic")
+        return write_credentials(access_token, refresh_token, expires_at_ms)
+
     monkeypatch.setattr(
         anthropic_adapter,
         "read_claude_code_credentials",
@@ -205,8 +219,18 @@ def _install_claude_source(monkeypatch, initial):
     )
     monkeypatch.setattr(
         anthropic_adapter,
+        "_read_claude_code_credentials_from_file",
+        read_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
         "_write_claude_code_credentials",
         write_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_write_claude_code_credentials_locked",
+        write_locked,
     )
     return state
 
@@ -431,8 +455,14 @@ def test_removed_inflight_candidate_is_not_written_or_resurrected(tmp_path, monk
 
     assert not selector.is_alive()
     assert results == [None]
-    assert source["writes"] == []
-    assert source["credentials"]["refreshToken"] == "old-refresh"
+    assert source["writes"] == [
+        (
+            "removed-rotated-access",
+            "removed-rotated-refresh",
+            9_999_999_999_999,
+        )
+    ]
+    assert source["credentials"]["refreshToken"] == "removed-rotated-refresh"
     assert pool.entries() == []
     assert _disk_entries(auth_path) == []
 
@@ -601,11 +631,13 @@ def test_post_cas_lineage_mutation_cannot_write_or_return_stale_refresh(
 
     assert not selector.is_alive()
     assert errors == []
-    assert source["writes"] == []
+    assert source["writes"] == [
+        ("obsolete-access", "obsolete-refresh", 9_999_999_999_999)
+    ]
     if expected is None:
         assert results == [None]
         assert pool.entries() == []
-        assert source["credentials"]["refreshToken"] == "old-refresh"
+        assert source["credentials"]["refreshToken"] == "obsolete-refresh"
     else:
         assert len(results) == 1 and results[0] is not None
         assert _tokens(results[0]) == _tokens(expected)
@@ -644,19 +676,18 @@ def test_source_lineage_change_after_commit_read_wins_before_write(
 
     commit_read = threading.Event()
     allow_commit = threading.Event()
-    reads = 0
-    real_sync = pool._sync_anthropic_entry_from_credentials_file
+    real_write_locked = anthropic_adapter._write_claude_code_credentials_locked
 
-    def pause_after_commit_read(entry, *, persist=True):
-        nonlocal reads
-        result = real_sync(entry, persist=persist)
-        reads += 1
-        if reads == 2:
-            commit_read.set()
-            assert allow_commit.wait(timeout=5)
-        return result
+    def pause_at_commit_boundary(*args, **kwargs):
+        commit_read.set()
+        assert allow_commit.wait(timeout=5)
+        return real_write_locked(*args, **kwargs)
 
-    pool._sync_anthropic_entry_from_credentials_file = pause_after_commit_read
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_write_claude_code_credentials_locked",
+        pause_at_commit_boundary,
+    )
     results = []
     selector = threading.Thread(target=lambda: results.append(pool.select()))
     selector.start()

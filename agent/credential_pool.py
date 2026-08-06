@@ -2292,22 +2292,7 @@ class CredentialPool:
             return None
 
         if self.provider == "anthropic" and entry.source == "claude_code":
-            from agent.anthropic_adapter import _claude_code_credentials_path
-
-            with _auth_store_lock(
-                target_path=_claude_code_credentials_path(),
-                timeout_seconds=self._single_use_refresh_lock_timeout(),
-            ):
-                synced = self._sync_anthropic_entry_from_credentials_file(
-                    entry,
-                    persist=False,
-                )
-                if not self._entry_tokens_match(synced, entry):
-                    return synced
-                current = self._current_refresh_candidate(entry)
-                if current is None:
-                    return None
-                return self._refresh_entry_impl(current, force=force)
+            return self._refresh_anthropic_source_entry(entry, force=force)
 
         # Codex and xAI OAuth refresh tokens are single-use.  The
         # sync→POST→write-back sequence below must run atomically across Hermes
@@ -2442,48 +2427,385 @@ class CredentialPool:
                     timeout_seconds=self._single_use_refresh_lock_timeout()
                 ):
                     return self._refresh_entry_impl(entry, force=force)
-            auth_store = _load_auth_store()
-            _state, source_path = _load_provider_state_with_source(
-                auth_store,
-                "xai-oauth",
-            )
-            with auth_mod._provider_state_transaction(
-                "xai-oauth",
-                timeout_seconds=self._single_use_refresh_lock_timeout(),
-                expected_source_path=source_path,
-            ):
-                synced = self._sync_xai_oauth_entry_from_auth_store(
-                    entry,
-                    persist=False,
-                )
-                if not self._entry_tokens_match(synced, entry):
-                    return synced
-                current = self._current_refresh_candidate(entry)
-                if current is None:
-                    return None
-                return self._refresh_entry_impl(current, force=force)
+            return self._refresh_xai_source_entry(entry, force=force)
         if self.provider == "nous" and entry.source == "device_code":
-            auth_store = _load_auth_store()
-            _state, source_path = _load_provider_state_with_source(
-                auth_store,
-                "nous",
-            )
-            with auth_mod._provider_state_transaction(
-                "nous",
-                timeout_seconds=self._single_use_refresh_lock_timeout(),
-                expected_source_path=source_path,
-            ):
-                synced = self._sync_nous_entry_from_auth_store(
-                    entry,
-                    persist=False,
+            # The real resolver owns the complete provider-state transaction.
+            # Do not nest a second source lock around its network operation.
+            return self._refresh_entry_impl(entry, force=force)
+        return self._refresh_entry_impl(entry, force=force)
+
+    def _mark_source_persistence_dead(
+        self,
+        entry: PooledCredential,
+    ) -> None:
+        updated = replace(
+            entry,
+            last_status=STATUS_DEAD,
+            last_status_at=time.time(),
+            last_error_reason="source_persistence_failed",
+            last_error_message=(
+                "Refreshed credentials were not persisted to their owning source."
+            ),
+        )
+        self._replace_entry(
+            entry,
+            updated,
+            preserve_routing=True,
+        )
+
+    def _quarantine_terminal_xai_lineage(
+        self,
+        entry: PooledCredential,
+        source_path: Optional[Path],
+        exc: Exception,
+    ) -> None:
+        """Remove one terminal singleton lineage without pool-lock I/O."""
+        if source_path is not None:
+            try:
+                with auth_mod._provider_state_transaction(
+                    "xai-oauth",
+                    timeout_seconds=self._single_use_refresh_lock_timeout(),
+                    expected_source_path=source_path,
+                ) as (_auth_store, state, locked_source_path):
+                    tokens = state.get("tokens") if isinstance(state, dict) else None
+                    if (
+                        locked_source_path is not None
+                        and isinstance(tokens, dict)
+                        and str(tokens.get("refresh_token") or "").strip()
+                        == str(entry.refresh_token or "").strip()
+                    ):
+                        source_store = _load_auth_store(Path(locked_source_path))
+                        providers = source_store.get("providers")
+                        if isinstance(providers, dict):
+                            providers.pop("xai-oauth", None)
+                        pool = source_store.get("credential_pool")
+                        if isinstance(pool, dict) and isinstance(
+                            pool.get("xai-oauth"), list
+                        ):
+                            pool["xai-oauth"] = [
+                                item
+                                for item in pool["xai-oauth"]
+                                if not (
+                                    isinstance(item, dict)
+                                    and item.get("source") == "device_code"
+                                )
+                            ]
+                        _save_auth_store(
+                            source_store,
+                            target_path=Path(locked_source_path),
+                        )
+            except Exception as clear_exc:
+                logger.debug(
+                    "Failed to clear terminal xAI OAuth state after %s: %s",
+                    exc,
+                    clear_exc,
                 )
-                if not self._entry_tokens_match(synced, entry):
-                    return synced
+
+        singleton_sources = {"device_code"}
+        with self._lock:
+            removed_entries = [
+                item for item in self._entries if item.source in singleton_sources
+            ]
+            for removed in removed_entries:
+                self._queue_removed_entry_unlocked(removed)
+            self._entries = [
+                item for item in self._entries if item.source not in singleton_sources
+            ]
+            if self._current_id == entry.id:
+                self._current_id = None
+
+    def _anthropic_entry_from_locked_credentials(
+        self,
+        entry: PooledCredential,
+        creds: Dict[str, Any],
+    ) -> PooledCredential:
+        access_token = str(creds.get("accessToken", "") or "")
+        refresh_token = str(creds.get("refreshToken", "") or "")
+        changed = (
+            access_token != entry.access_token
+            or refresh_token != (entry.refresh_token or "")
+        )
+        return replace(
+            entry,
+            access_token=access_token or entry.access_token,
+            refresh_token=refresh_token or entry.refresh_token,
+            expires_at_ms=creds.get("expiresAt", 0) or entry.expires_at_ms,
+            last_status=None if changed else entry.last_status,
+            last_status_at=None if changed else entry.last_status_at,
+            last_error_code=None if changed else entry.last_error_code,
+            last_error_reason=None if changed else entry.last_error_reason,
+            last_error_message=None if changed else entry.last_error_message,
+            last_error_reset_at=None if changed else entry.last_error_reset_at,
+        )
+
+    def _refresh_anthropic_source_entry(
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
+    ) -> Optional[PooledCredential]:
+        from agent.anthropic_adapter import (
+            _read_claude_code_credentials_from_file,
+            _write_claude_code_credentials_locked,
+            claude_code_credentials_transaction,
+            is_claude_code_token_valid,
+            refresh_anthropic_oauth_pure,
+        )
+
+        persistence_failure = False
+        for _attempt in range(3):
+            with claude_code_credentials_transaction(
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+            ) as (_source_path, creds):
+                if not creds:
+                    return None
+                authoritative = self._anthropic_entry_from_locked_credentials(
+                    entry,
+                    creds,
+                )
+                if not self._entry_tokens_match(authoritative, entry):
+                    return self._replace_entry(
+                        entry,
+                        authoritative,
+                        preserve_routing=True,
+                    )
                 current = self._current_refresh_candidate(entry)
                 if current is None:
                     return None
-                return self._refresh_entry_impl(current, force=force)
-        return self._refresh_entry_impl(entry, force=force)
+                if not force and is_claude_code_token_valid(creds):
+                    return current
+                consumed_refresh_token = str(
+                    creds.get("refreshToken", "") or ""
+                )
+                if not consumed_refresh_token:
+                    return None
+                refreshed = refresh_anthropic_oauth_pure(
+                    consumed_refresh_token,
+                    use_json=False,
+                )
+                try:
+                    _write_claude_code_credentials_locked(
+                        refreshed["access_token"],
+                        refreshed["refresh_token"],
+                        refreshed["expires_at_ms"],
+                        expected_refresh_token=consumed_refresh_token,
+                    )
+                except auth_mod.SourceCredentialLineageChanged:
+                    winner = _read_claude_code_credentials_from_file()
+                    if winner:
+                        authoritative = self._anthropic_entry_from_locked_credentials(
+                            entry,
+                            winner,
+                        )
+                        if is_claude_code_token_valid(winner):
+                            return self._replace_entry(
+                                entry,
+                                authoritative,
+                                preserve_routing=True,
+                            )
+                    continue
+                except auth_mod.SourceCredentialPersistenceError:
+                    persistence_failure = True
+                    break
+                updated = replace(
+                    current,
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    expires_at_ms=refreshed["expires_at_ms"],
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                return self._replace_entry(
+                    current,
+                    updated,
+                    preserve_routing=True,
+                )
+        if persistence_failure:
+            self._mark_source_persistence_dead(entry)
+            return None
+        return None
+
+    def _xai_entry_from_locked_state(
+        self,
+        entry: PooledCredential,
+        state: Dict[str, Any],
+        source_path: Path,
+    ) -> Optional[PooledCredential]:
+        tokens = state.get("tokens")
+        if not isinstance(tokens, dict):
+            return None
+        access_token = str(tokens.get("access_token", "") or "")
+        refresh_token = str(tokens.get("refresh_token", "") or "")
+        if not access_token or not refresh_token:
+            return None
+        changed = (
+            access_token != entry.access_token
+            or refresh_token != (entry.refresh_token or "")
+        )
+        return replace(
+            entry,
+            access_token=access_token,
+            refresh_token=refresh_token,
+            last_refresh=state.get("last_refresh") or entry.last_refresh,
+            source_store_path=source_path,
+            last_status=None if changed else entry.last_status,
+            last_status_at=None if changed else entry.last_status_at,
+            last_error_code=None if changed else entry.last_error_code,
+            last_error_reason=None if changed else entry.last_error_reason,
+            last_error_message=None if changed else entry.last_error_message,
+            last_error_reset_at=None if changed else entry.last_error_reset_at,
+        )
+
+    def _refresh_xai_source_entry(
+        self,
+        entry: PooledCredential,
+        *,
+        force: bool,
+    ) -> Optional[PooledCredential]:
+        expected_source_path = (
+            entry.source_store_path or auth_mod._auth_file_path()
+        )
+        persistence_failure = False
+        terminal_failure: Optional[Exception] = None
+        consumed_refresh_token = ""
+        failed_source_path: Optional[Path] = None
+
+        for _attempt in range(3):
+            with auth_mod._provider_state_transaction(
+                "xai-oauth",
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                expected_source_path=expected_source_path,
+            ) as (auth_store, state, source_path):
+                if source_path is None or state is None:
+                    expected_source_path = None
+                    continue
+                authoritative = self._xai_entry_from_locked_state(
+                    entry,
+                    state,
+                    Path(source_path),
+                )
+                if authoritative is None:
+                    return None
+                if not self._entry_tokens_match(authoritative, entry):
+                    return self._replace_entry(
+                        entry,
+                        authoritative,
+                        preserve_routing=True,
+                    )
+                current = self._current_refresh_candidate(entry)
+                if current is None:
+                    return None
+                if not force and not self._entry_needs_refresh(authoritative):
+                    return current
+                discovery = dict(state.get("discovery") or {})
+                token_endpoint = str(
+                    discovery.get("token_endpoint", "") or ""
+                ).strip()
+                if not token_endpoint:
+                    token_endpoint = auth_mod._xai_oauth_discovery(
+                        auth_mod.env_float("HERMES_XAI_REFRESH_TIMEOUT_SECONDS", 20)
+                    )["token_endpoint"]
+                consumed_refresh_token = authoritative.refresh_token or ""
+                try:
+                    refreshed = auth_mod.refresh_xai_oauth_pure(
+                        authoritative.access_token,
+                        consumed_refresh_token,
+                        token_endpoint=token_endpoint,
+                        timeout_seconds=auth_mod.env_float(
+                            "HERMES_XAI_REFRESH_TIMEOUT_SECONDS",
+                            20,
+                        ),
+                    )
+                except Exception as exc:
+                    if auth_mod._is_terminal_xai_oauth_refresh_error(exc):
+                        terminal_failure = exc
+                        failed_source_path = Path(source_path)
+                        break
+                    raise
+                updated_state = auth_mod._xai_oauth_state_with_refreshed_tokens(
+                    state,
+                    refreshed,
+                    token_endpoint=token_endpoint,
+                )
+                try:
+                    auth_mod._save_provider_state_to_locked_source(
+                        auth_store,
+                        "xai-oauth",
+                        updated_state,
+                        source_path,
+                        expected_refresh_token=consumed_refresh_token,
+                        set_active=False,
+                    )
+                except auth_mod.SourceCredentialLineageChanged:
+                    expected_source_path = None
+                    continue
+                except (OSError, auth_mod.SourceCredentialPersistenceError):
+                    persistence_failure = True
+                    failed_source_path = Path(source_path)
+                    break
+                updated = replace(
+                    current,
+                    access_token=refreshed["access_token"],
+                    refresh_token=refreshed["refresh_token"],
+                    last_refresh=refreshed.get("last_refresh"),
+                    source_store_path=Path(source_path),
+                    last_status=STATUS_OK,
+                    last_status_at=None,
+                    last_error_code=None,
+                    last_error_reason=None,
+                    last_error_message=None,
+                    last_error_reset_at=None,
+                )
+                return self._replace_entry(
+                    current,
+                    updated,
+                    preserve_routing=True,
+                )
+
+        if terminal_failure:
+            with auth_mod._provider_state_transaction(
+                "xai-oauth",
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+            ) as (_auth_store, winner_state, winner_source_path):
+                if winner_state is not None and winner_source_path is not None:
+                    winner = self._xai_entry_from_locked_state(
+                        entry,
+                        winner_state,
+                        Path(winner_source_path),
+                    )
+                    if (
+                        winner is not None
+                        and winner.refresh_token != consumed_refresh_token
+                    ):
+                        return self._replace_entry(
+                            entry,
+                            winner,
+                            preserve_routing=True,
+                        )
+            self._quarantine_terminal_xai_lineage(
+                entry,
+                failed_source_path,
+                terminal_failure,
+            )
+            return None
+
+        if persistence_failure:
+            try:
+                auth_mod._quarantine_xai_consumed_source(
+                    failed_source_path,
+                    consumed_refresh_token,
+                )
+            except Exception:
+                logger.debug(
+                    "Failed to persist xAI source quarantine",
+                    exc_info=True,
+                )
+            self._mark_source_persistence_dead(entry)
+        return None
 
     def _current_refresh_candidate(
         self,
@@ -2725,6 +3047,76 @@ class CredentialPool:
     ) -> Optional[PooledCredential]:
         """Return only a current row that still matches its owning source."""
 
+        if self.provider == "anthropic" and refreshed.source == "claude_code":
+            from agent.anthropic_adapter import claude_code_credentials_transaction
+
+            with claude_code_credentials_transaction(
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+            ) as (_source_path, creds):
+                if not creds:
+                    return None
+                with self._external_state_lock:
+                    with self._lock:
+                        current = next(
+                            (
+                                item
+                                for item in self._entries
+                                if item.id == refreshed.id
+                            ),
+                            None,
+                        )
+                    if current is None or current.source != refreshed.source:
+                        return None
+                    authoritative = self._anthropic_entry_from_locked_credentials(
+                        current,
+                        creds,
+                    )
+                    if not self._entry_tokens_match(authoritative, current):
+                        return self._replace_entry(
+                            current,
+                            authoritative,
+                            preserve_routing=True,
+                        )
+                    return current
+
+        if self.provider == "xai-oauth" and refreshed.source == "device_code":
+            expected_source_path = (
+                refreshed.source_store_path or auth_mod._auth_file_path()
+            )
+            with auth_mod._provider_state_transaction(
+                "xai-oauth",
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
+                expected_source_path=expected_source_path,
+            ) as (_auth_store, state, source_path):
+                if state is None or source_path is None:
+                    return None
+                with self._external_state_lock:
+                    with self._lock:
+                        current = next(
+                            (
+                                item
+                                for item in self._entries
+                                if item.id == refreshed.id
+                            ),
+                            None,
+                        )
+                    if current is None or current.source != refreshed.source:
+                        return None
+                    authoritative = self._xai_entry_from_locked_state(
+                        current,
+                        state,
+                        Path(source_path),
+                    )
+                    if authoritative is None:
+                        return None
+                    if not self._entry_tokens_match(authoritative, current):
+                        return self._replace_entry(
+                            current,
+                            authoritative,
+                            preserve_routing=True,
+                        )
+                    return current
+
         def revalidate_source() -> Optional[PooledCredential]:
             with self._external_state_lock:
                 with self._lock:
@@ -2745,16 +3137,7 @@ class CredentialPool:
                     )
                 return current
 
-        if self.provider == "anthropic" and refreshed.source == "claude_code":
-            from agent.anthropic_adapter import _claude_code_credentials_path
-
-            with _auth_store_lock(
-                target_path=_claude_code_credentials_path(),
-                timeout_seconds=self._single_use_refresh_lock_timeout(),
-            ):
-                return revalidate_source()
-
-        if self.provider in {"nous", "xai-oauth"} and refreshed.source == "device_code":
+        if self.provider == "nous" and refreshed.source == "device_code":
             auth_store = _load_auth_store()
             _state, source_path = _load_provider_state_with_source(
                 auth_store,
@@ -2877,6 +3260,15 @@ class CredentialPool:
                 return entry
         except Exception as exc:
             logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
+            if (
+                self.provider == "nous"
+                and isinstance(exc, auth_mod.SourceCredentialPersistenceError)
+            ):
+                # The resolver's source transaction is already released here.
+                # Quarantine the exact consumed row and let the caller persist
+                # pool state after all source locks have been dropped.
+                self._mark_source_persistence_dead(entry)
+                return None
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.

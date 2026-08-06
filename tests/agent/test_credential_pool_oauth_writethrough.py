@@ -2014,9 +2014,26 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
         )
         return True
 
+    def write_credentials_locked(
+        access_token,
+        refresh_token,
+        expires_at_ms,
+        *,
+        expected_refresh_token,
+        allow_missing=False,
+    ):
+        del allow_missing
+        assert credentials["refreshToken"] == expected_refresh_token
+        return write_credentials(access_token, refresh_token, expires_at_ms)
+
     monkeypatch.setattr(
         anthropic_adapter,
         "read_claude_code_credentials",
+        fresh_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_read_claude_code_credentials_from_file",
         fresh_credentials,
     )
     monkeypatch.setattr(
@@ -2028,6 +2045,11 @@ def test_public_pool_mutations_drain_persistence_after_releasing_pool_lock(
         anthropic_adapter,
         "_write_claude_code_credentials",
         write_credentials,
+    )
+    monkeypatch.setattr(
+        anthropic_adapter,
+        "_write_claude_code_credentials_locked",
+        write_credentials_locked,
     )
     monkeypatch.setattr(CP, "write_credential_pool", recording_write)
 
@@ -2899,6 +2921,11 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
             "read_claude_code_credentials",
             lambda: dict(claude_credentials),
         )
+        monkeypatch.setattr(
+            anthropic_adapter,
+            "_read_claude_code_credentials_from_file",
+            lambda: dict(claude_credentials),
+        )
         pool = CredentialPool(provider, [old])
         monkeypatch.setattr(
             anthropic_adapter,
@@ -2909,10 +2936,18 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
                 "expires_at_ms": 9_999_999_999_999,
             },
         )
+
+        def reject_claude_source_write(*_args, **_kwargs):
+            raise A.SourceCredentialPersistenceError(
+                "anthropic",
+                source_path=None,
+                consumed_refresh_token="old-refresh",
+            )
+
         monkeypatch.setattr(
             anthropic_adapter,
-            "_write_claude_code_credentials",
-            lambda *_args, **_kwargs: False,
+            "_write_claude_code_credentials_locked",
+            reject_claude_source_write,
         )
     elif provider == "xai-oauth":
         pool = CredentialPool(provider, [old])
@@ -2925,7 +2960,24 @@ def test_source_write_failure_fails_refresh_closed_and_fresh_load_uses_source(
                 "last_refresh": "2026-08-06T05:00:00Z",
             },
         )
-        pool._sync_device_code_entry_to_auth_store = lambda entry: False
+        real_locked_save = A._save_provider_state_to_locked_source
+
+        def reject_xai_source_write(auth_store, provider_id, state, source_path, **kwargs):
+            if provider_id == "xai-oauth":
+                raise OSError("simulated source persistence failure")
+            return real_locked_save(
+                auth_store,
+                provider_id,
+                state,
+                source_path,
+                **kwargs,
+            )
+
+        monkeypatch.setattr(
+            A,
+            "_save_provider_state_to_locked_source",
+            reject_xai_source_write,
+        )
     else:
         pool = CredentialPool(provider, [old])
         nous_refreshed = False

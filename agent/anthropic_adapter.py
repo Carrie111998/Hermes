@@ -18,6 +18,7 @@ import platform
 import secrets
 import stat
 import subprocess
+from contextlib import contextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -1170,42 +1171,44 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
     has already produced a valid token, adopt it and skip the POST entirely.
     Only fall back to refreshing ourselves when no fresh credential is found.
     """
-    # Claude Code may have already refreshed — adopt its token rather than
-    # racing it with our (possibly already-rotated) refresh token. Only adopt
-    # when the live re-read produced a DIFFERENT token with a real future
-    # expiry: re-adopting the same credential we were just handed would be a
-    # no-op, and a 0/absent ``expiresAt`` means "managed key / unknown expiry"
-    # (see is_claude_code_token_valid) which must NOT be treated as a fresh
-    # refresh here.
-    current = read_claude_code_credentials()
-    if current:
-        current_token = current.get("accessToken", "")
-        current_exp = current.get("expiresAt", 0) or 0
-        if (
-            current_token
-            and current_token != creds.get("accessToken", "")
-            and current_exp > 0
-            and is_claude_code_token_valid(current)
-        ):
-            logger.debug("Adopted Claude Code's already-refreshed OAuth token")
-            return current_token
-
-    refresh_token = (current or {}).get("refreshToken", "") or creds.get("refreshToken", "")
-    if not refresh_token:
-        logger.debug("No refresh token available — cannot refresh")
-        return None
-
     try:
-        refreshed = refresh_anthropic_oauth_pure(refresh_token, use_json=False)
-        write_result = _write_claude_code_credentials(
-            refreshed["access_token"],
-            refreshed["refresh_token"],
-            refreshed["expires_at_ms"],
-        )
-        if write_result is False:
-            return None
-        logger.debug("Successfully refreshed Claude Code OAuth token")
-        return refreshed["access_token"]
+        with claude_code_credentials_transaction() as (_source_path, current):
+            authoritative = current or creds
+            current_token = authoritative.get("accessToken", "")
+            current_exp = authoritative.get("expiresAt", 0) or 0
+            if (
+                current is not None
+                and current_token
+                and current_token != creds.get("accessToken", "")
+                and current_exp > 0
+                and is_claude_code_token_valid(authoritative)
+            ):
+                logger.debug("Adopted Claude Code's already-refreshed OAuth token")
+                return current_token
+
+            refresh_token = authoritative.get("refreshToken", "")
+            if not refresh_token:
+                logger.debug("No refresh token available — cannot refresh")
+                return None
+            refreshed = refresh_anthropic_oauth_pure(
+                refresh_token,
+                use_json=False,
+            )
+            try:
+                _write_claude_code_credentials_locked(
+                    refreshed["access_token"],
+                    refreshed["refresh_token"],
+                    refreshed["expires_at_ms"],
+                    expected_refresh_token=refresh_token,
+                    allow_missing=current is None,
+                )
+            except _claude_lineage_changed_type():
+                winner = _read_claude_code_credentials_from_file()
+                if winner and is_claude_code_token_valid(winner):
+                    return str(winner.get("accessToken", "") or "") or None
+                return None
+            logger.debug("Successfully refreshed Claude Code OAuth token")
+            return refreshed["access_token"]
     except Exception as e:
         logger.debug("Failed to refresh Claude Code token: %s", e)
         return None
@@ -1213,6 +1216,137 @@ def _refresh_oauth_token(creds: Dict[str, Any]) -> Optional[str]:
 
 def _claude_code_credentials_path() -> Path:
     return Path.home() / ".claude" / ".credentials.json"
+
+
+def _claude_lineage_changed_type():
+    from hermes_cli.auth import SourceCredentialLineageChanged
+
+    return SourceCredentialLineageChanged
+
+
+@contextmanager
+def claude_code_credentials_transaction(timeout_seconds: float = 30.0):
+    """Lock and read the exact Claude Code credentials-file source."""
+    from hermes_cli.auth import _auth_store_lock
+
+    source_path = _claude_code_credentials_path()
+    with _auth_store_lock(
+        timeout_seconds=timeout_seconds,
+        target_path=source_path,
+    ):
+        yield source_path, _read_claude_code_credentials_from_file()
+
+
+_EXPECTED_CLAUDE_REFRESH_UNSET = object()
+
+
+def _write_claude_code_credentials_file(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    scopes: Optional[list] = None,
+    expected_refresh_token: Any = _EXPECTED_CLAUDE_REFRESH_UNSET,
+    allow_missing: bool = False,
+) -> None:
+    """Write the credentials file without acquiring or swallowing errors."""
+    cred_path = _claude_code_credentials_path()
+    existing = {}
+    if cred_path.exists():
+        existing = json.loads(cred_path.read_text(encoding="utf-8"))
+    raw_current = existing.get("claudeAiOauth")
+    current = raw_current if isinstance(raw_current, dict) else None
+    if expected_refresh_token is not _EXPECTED_CLAUDE_REFRESH_UNSET:
+        current_refresh = str((current or {}).get("refreshToken", "") or "")
+        if current_refresh != expected_refresh_token and not (
+            allow_missing and current is None
+        ):
+            from hermes_cli.auth import SourceCredentialLineageChanged
+
+            raise SourceCredentialLineageChanged("anthropic")
+
+    oauth_data: Dict[str, Any] = {
+        "accessToken": access_token,
+        "refreshToken": refresh_token,
+        "expiresAt": expires_at_ms,
+    }
+    if scopes is not None:
+        oauth_data["scopes"] = scopes
+    elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
+        oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
+
+    existing["claudeAiOauth"] = oauth_data
+    cred_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_cred = cred_path.with_suffix(
+        f".tmp.{os.getpid()}.{secrets.token_hex(4)}"
+    )
+    try:
+        fd = os.open(
+            str(tmp_cred),
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            stat.S_IRUSR | stat.S_IWUSR,
+        )
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(existing, fh, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_cred, cred_path)
+    except OSError:
+        try:
+            tmp_cred.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+
+
+def _write_claude_code_credentials_locked(
+    access_token: str,
+    refresh_token: str,
+    expires_at_ms: int,
+    *,
+    expected_refresh_token: str,
+    allow_missing: bool = False,
+    scopes: Optional[list] = None,
+) -> None:
+    """Conditionally write while ``claude_code_credentials_transaction`` is held."""
+    from hermes_cli.auth import (
+        SourceCredentialLineageChanged,
+        SourceCredentialPersistenceError,
+    )
+
+    current = _read_claude_code_credentials_from_file()
+    if current is None:
+        if not allow_missing:
+            raise SourceCredentialLineageChanged("anthropic")
+    elif current.get("refreshToken", "") != expected_refresh_token:
+        raise SourceCredentialLineageChanged("anthropic")
+    try:
+        _write_claude_code_credentials_file(
+            access_token,
+            refresh_token,
+            expires_at_ms,
+            scopes=scopes,
+            expected_refresh_token=expected_refresh_token,
+            allow_missing=allow_missing,
+        )
+    except OSError as exc:
+        raise SourceCredentialPersistenceError(
+            "anthropic",
+            source_path=_claude_code_credentials_path(),
+            consumed_refresh_token=expected_refresh_token,
+        ) from exc
+
+    persisted = _read_claude_code_credentials_from_file()
+    if (
+        persisted is None
+        or persisted.get("accessToken", "") != access_token
+        or persisted.get("refreshToken", "") != refresh_token
+    ):
+        raise SourceCredentialPersistenceError(
+            "anthropic",
+            source_path=_claude_code_credentials_path(),
+            consumed_refresh_token=expected_refresh_token,
+        )
 
 
 def _write_claude_code_credentials(
@@ -1229,56 +1363,13 @@ def _write_claude_code_credentials(
     as valid.  Claude Code >=2.1.81 gates on the presence of ``"user:inference"``
     in the stored scopes before it will use the token.
     """
-    cred_path = _claude_code_credentials_path()
     try:
-        # Read existing file to preserve other fields
-        existing = {}
-        if cred_path.exists():
-            existing = json.loads(cred_path.read_text(encoding="utf-8"))
-
-        oauth_data: Dict[str, Any] = {
-            "accessToken": access_token,
-            "refreshToken": refresh_token,
-            "expiresAt": expires_at_ms,
-        }
-        if scopes is not None:
-            oauth_data["scopes"] = scopes
-        elif "claudeAiOauth" in existing and "scopes" in existing["claudeAiOauth"]:
-            # Preserve previously-stored scopes when the refresh response
-            # does not include a scope field.
-            oauth_data["scopes"] = existing["claudeAiOauth"]["scopes"]
-
-        existing["claudeAiOauth"] = oauth_data
-
-        cred_path.parent.mkdir(parents=True, exist_ok=True)
-        # Per-process random suffix avoids collisions between concurrent
-        # writers and stale leftovers from a prior crashed write.
-        _tmp_cred = cred_path.with_suffix(f".tmp.{os.getpid()}.{secrets.token_hex(4)}")
-        try:
-            # Create the temp file atomically at 0o600. The previous
-            # write_text + post-replace chmod opened a TOCTOU window where
-            # both the temp file and the destination briefly inherited the
-            # process umask (commonly 0o644 = world-readable), exposing
-            # Claude Code OAuth tokens to other local users between create
-            # and chmod. Mirrors agent/google_oauth.py (#19673) and
-            # tools/mcp_oauth.py (#21148). Parent dir (~/.claude/) is
-            # owned by Claude Code itself, so we leave its mode alone.
-            fd = os.open(
-                str(_tmp_cred),
-                os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-                stat.S_IRUSR | stat.S_IWUSR,
-            )
-            with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(existing, fh, indent=2)
-                fh.flush()
-                os.fsync(fh.fileno())
-            os.replace(_tmp_cred, cred_path)
-        except OSError:
-            try:
-                _tmp_cred.unlink(missing_ok=True)
-            except OSError:
-                pass
-            raise
+        _write_claude_code_credentials_file(
+            access_token,
+            refresh_token,
+            expires_at_ms,
+            scopes=scopes,
+        )
         return True
     except (OSError, IOError) as e:
         logger.debug("Failed to write refreshed credentials: %s", e)

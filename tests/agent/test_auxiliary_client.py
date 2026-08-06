@@ -2541,19 +2541,30 @@ class TestAuxiliaryAuthRefreshRetry:
                 "refreshToken": "refresh-token",
                 "expiresAt": 0,
             }),
+            patch("agent.anthropic_adapter._read_claude_code_credentials_from_file", return_value={
+                "accessToken": "expired-token",
+                "refreshToken": "refresh-token",
+                "expiresAt": 0,
+            }),
             patch("agent.anthropic_adapter.refresh_anthropic_oauth_pure", return_value={
                 "access_token": "fresh-token",
                 "refresh_token": "refresh-token-2",
                 "expires_at_ms": 9999999999999,
             }) as mock_refresh_oauth,
-            patch("agent.anthropic_adapter._write_claude_code_credentials") as mock_write,
+            patch("agent.anthropic_adapter._write_claude_code_credentials_locked") as mock_write,
         ):
             from agent.auxiliary_client import _refresh_provider_credentials
 
             assert _refresh_provider_credentials("anthropic") is True
 
         mock_refresh_oauth.assert_called_once_with("refresh-token", use_json=False)
-        mock_write.assert_called_once_with("fresh-token", "refresh-token-2", 9999999999999)
+        mock_write.assert_called_once_with(
+            "fresh-token",
+            "refresh-token-2",
+            9999999999999,
+            expected_refresh_token="refresh-token",
+            allow_missing=False,
+        )
         stale_client.close.assert_called_once()
 
     def test_refresh_provider_credentials_remints_vertex_token_and_evicts_cache(self):
