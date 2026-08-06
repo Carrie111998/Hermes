@@ -46,6 +46,17 @@ class TestStore:
         assert pending[0]["title"] == "Test"
         assert pending[0]["status"] == "pending"
 
+    def test_store_override_is_profile_local(self, store, tmp_path):
+        _add(store, key="current")
+        other_home = tmp_path / "other-profile"
+
+        with store.use_suggestions_store(other_home):
+            _add(store, key="other", title="Other profile")
+            assert [item["title"] for item in store.list_pending()] == ["Other profile"]
+
+        assert [item["title"] for item in store.list_pending()] == ["Test"]
+        assert (other_home / "cron" / "suggestions.json").exists()
+
     def test_dedup_blocks_duplicate_pending(self, store):
         assert _add(store, key="dup") is not None
         assert _add(store, key="dup") is None  # same key already pending
@@ -86,7 +97,7 @@ class TestStore:
         assert len(store.list_pending()) == store.MAX_PENDING
 
     def test_accept_creates_job_and_marks_accepted(self, store):
-        _add(store, key="acc", title="My Job")
+        record = _add(store, key="acc", title="My Job")
         created = {}
 
         def fake_create_job(**kwargs):
@@ -98,11 +109,41 @@ class TestStore:
 
         assert job is not None
         assert created["schedule"] == "0 9 * * *"
-        assert created["origin"] == {"platform": "telegram", "chat_id": "5"}
+        assert created["origin"]["platform"] == "telegram"
+        assert created["origin"]["chat_id"] == "5"
+        assert created["origin"]["_learning_suggestion_id"] == record["id"]
         # No longer pending.
         assert store.list_pending() == []
         # And accepting again is a no-op (not pending anymore).
         assert store.accept_suggestion("acc") is None
+
+    def test_accept_retry_reuses_job_if_status_save_failed(self, store):
+        record = _add(store, key="retry", title="Retryable Job")
+        jobs = []
+
+        def fake_create_job(**kwargs):
+            job = {"id": "job-retry", **kwargs}
+            jobs.append(job)
+            return job
+
+        real_set_status = store._set_status
+        status_results = iter([False, True])
+
+        def flaky_set_status(suggestion_id, status):
+            if not next(status_results):
+                return False
+            return real_set_status(suggestion_id, status)
+
+        with patch("cron.jobs.create_job", fake_create_job), \
+             patch("cron.jobs.load_jobs", lambda: list(jobs)), \
+             patch.object(store, "_set_status", flaky_set_status):
+            with pytest.raises(RuntimeError, match="retrying this approval is safe"):
+                store.accept_suggestion(record["id"])
+            job = store.accept_suggestion(record["id"])
+
+        assert job is not None
+        assert len(jobs) == 1
+        assert store.list_pending() == []
 
     def test_get_by_id_and_index_and_title(self, store):
         rec = _add(store, key="byref", title="Findable")

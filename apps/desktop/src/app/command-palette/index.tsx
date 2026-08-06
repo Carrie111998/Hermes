@@ -25,6 +25,7 @@ import {
   AppWindow,
   Archive,
   BarChart3,
+  Brain,
   Check,
   ChevronLeft,
   ChevronRight,
@@ -90,6 +91,7 @@ import {
   ARTIFACTS_ROUTE,
   COMMAND_CENTER_ROUTE,
   CRON_ROUTE,
+  LEARNING_INBOX_ROUTE,
   MESSAGING_ROUTE,
   navigateToWorkspacePage,
   NEW_CHAT_ROUTE,
@@ -814,6 +816,13 @@ function CommandPaletteBody({ onExited }: { onExited: () => void }) {
             keywords: ['star map', 'memory', 'memories', 'skills', 'graph', 'learning', 'constellation'],
             label: t.starmap.title,
             run: go(STARMAP_ROUTE)
+          },
+          {
+            icon: Brain,
+            id: 'nav-learning',
+            keywords: ['learning', 'learn', 'suggestions', 'approvals', 'memory', 'skills', 'automations'],
+            label: t.learningInbox.title,
+            run: go(LEARNING_INBOX_ROUTE)
           }
         ]
       },

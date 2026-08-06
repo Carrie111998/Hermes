@@ -33,8 +33,11 @@ import os
 import tempfile
 import threading
 import uuid
+from contextlib import contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -48,9 +51,54 @@ logger = logging.getLogger(__name__)
 CRON_DIR = get_hermes_home().resolve() / "cron"
 SUGGESTIONS_FILE = CRON_DIR / "suggestions.json"
 
+
+@dataclass(frozen=True)
+class _SuggestionStorePaths:
+    cron_dir: Path
+    suggestions_file: Path
+
+
+_IMPORT_STORE = _SuggestionStorePaths(CRON_DIR, SUGGESTIONS_FILE)
+_suggestions_store_override: ContextVar[Optional[_SuggestionStorePaths]] = ContextVar(
+    "suggestions_store_override",
+    default=None,
+)
+
+
+def _current_store() -> _SuggestionStorePaths:
+    """Resolve the suggestion store for the active profile/request context."""
+    override = _suggestions_store_override.get()
+    if override is not None:
+        return override
+
+    live_constants = _SuggestionStorePaths(CRON_DIR, SUGGESTIONS_FILE)
+    if live_constants != _IMPORT_STORE:
+        return live_constants
+
+    home = get_hermes_home().resolve()
+    if home == _IMPORT_STORE.cron_dir.parent:
+        return live_constants
+    cron_dir = home / "cron"
+    return _SuggestionStorePaths(cron_dir, cron_dir / "suggestions.json")
+
+
+@contextmanager
+def use_suggestions_store(home: Union[str, Path]):
+    """Route suggestion storage to a profile without mutating module globals."""
+    home_path = Path(home).expanduser().resolve()
+    cron_dir = home_path / "cron"
+    token = _suggestions_store_override.set(
+        _SuggestionStorePaths(cron_dir, cron_dir / "suggestions.json")
+    )
+    try:
+        yield
+    finally:
+        _suggestions_store_override.reset(token)
+
 # In-process lock protecting load->modify->save cycles (the background review
 # fork and the main agent can both write).
-_suggestions_lock = threading.Lock()
+_suggestions_lock = threading.RLock()
+_SUGGESTION_JOB_MARKER = "_learning_suggestion_id"
 
 # Cap pending suggestions so the list never becomes a nag wall. When full,
 # new suggestions are dropped (the user should clear the backlog first).
@@ -70,14 +118,15 @@ def _secure_file(path: Path) -> None:
 
 
 def _ensure_dir() -> None:
-    CRON_DIR.mkdir(parents=True, exist_ok=True)
+    _current_store().cron_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _load_raw() -> Dict[str, Any]:
-    if not SUGGESTIONS_FILE.exists():
+    suggestions_file = _current_store().suggestions_file
+    if not suggestions_file.exists():
         return {"suggestions": []}
     try:
-        with open(SUGGESTIONS_FILE, "r", encoding="utf-8") as f:
+        with open(suggestions_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except (json.JSONDecodeError, OSError) as e:
         logger.warning("suggestions.json unreadable (%s); starting empty", e)
@@ -91,8 +140,9 @@ def _load_raw() -> Dict[str, Any]:
 
 
 def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
+    suggestions_file = _current_store().suggestions_file
     _ensure_dir()
-    fd, tmp_path = tempfile.mkstemp(dir=str(SUGGESTIONS_FILE.parent), suffix=".tmp", prefix=".sugg_")
+    fd, tmp_path = tempfile.mkstemp(dir=str(suggestions_file.parent), suffix=".tmp", prefix=".sugg_")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(
@@ -102,8 +152,8 @@ def _save_raw(suggestions: List[Dict[str, Any]]) -> None:
             )
             f.flush()
             os.fsync(f.fileno())
-        atomic_replace(tmp_path, SUGGESTIONS_FILE)
-        _secure_file(SUGGESTIONS_FILE)
+        atomic_replace(tmp_path, suggestions_file)
+        _secure_file(suggestions_file)
     except BaseException:
         try:
             os.unlink(tmp_path)
@@ -228,19 +278,54 @@ def accept_suggestion(ref: str, *, origin: Optional[Dict[str, Any]] = None) -> O
     an ``origin`` (platform/chat) is merged so "origin" delivery routes back to
     the chat where the user accepted.
     """
-    s = get_suggestion(ref)
-    if not s or s.get("status") != _STATUS_PENDING:
-        return None
+    with _suggestions_lock:
+        s = get_suggestion(ref)
+        if not s or s.get("status") != _STATUS_PENDING:
+            return None
 
-    from cron.jobs import create_job
+        from cron.jobs import _jobs_lock, create_job, load_jobs
 
-    spec = dict(s.get("job_spec") or {})
-    if origin is not None and "origin" not in spec:
-        spec["origin"] = origin
+        spec = dict(s.get("job_spec") or {})
+        if origin is not None and "origin" not in spec:
+            spec["origin"] = origin
 
-    job = create_job(**spec)
-    _set_status(s["id"], _STATUS_ACCEPTED)
-    return job
+        # Keep approval replay idempotent across a crash after cron job
+        # creation but before the suggestion status is persisted. The marker is
+        # nested in origin so it is retained with the existing job record while
+        # remaining invisible to delivery routing.
+        job_origin = spec.get("origin")
+        if isinstance(job_origin, dict):
+            marked_origin = dict(job_origin)
+            marked_origin[_SUGGESTION_JOB_MARKER] = s["id"]
+            spec["origin"] = marked_origin
+        else:
+            # Adding a marker-only origin would change create_job's implicit
+            # delivery default from local to origin, so preserve that default
+            # explicitly before attaching the durable marker.
+            if "deliver" not in spec:
+                spec["deliver"] = "local"
+            spec["origin"] = {_SUGGESTION_JOB_MARKER: s["id"]}
+
+        with _jobs_lock():
+            jobs = load_jobs()
+            job = next(
+                (
+                    candidate
+                    for candidate in jobs
+                    if isinstance(candidate.get("origin"), dict)
+                    and candidate["origin"].get(_SUGGESTION_JOB_MARKER) == s["id"]
+                ),
+                None,
+            )
+            if job is None:
+                job = create_job(**spec)
+
+        if not _set_status(s["id"], _STATUS_ACCEPTED):
+            raise RuntimeError(
+                "Cron job exists, but the learning suggestion could not be marked accepted; "
+                "retrying this approval is safe."
+            )
+        return job
 
 
 def clear_resolved() -> int:
