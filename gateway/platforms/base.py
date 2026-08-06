@@ -4095,11 +4095,12 @@ class BasePlatformAdapter(ABC):
         blocks, or compact symbols to the speech provider.  It should receive
         a transcript-like script: reasoning blocks removed, headings and
         bullets flattened into sentence pauses, and units like ``°C``
-        expanded to words such as ``degrees Celsius``.
+        expanded according to the configured TTS language.
         """
         try:
-            from tools.tts_text_normalize import prepare_spoken_text
-            return prepare_spoken_text(text, max_chars=4000)
+            from tools.tts_tool import _prepare_spoken_text_for_tts
+
+            return _prepare_spoken_text_for_tts(text, max_chars=4000)
         except Exception:
             # Keep auto-TTS best-effort if the normalizer ever fails.
             text = re.sub(r'<think[\s>].*?</think>', ' ', text, flags=re.DOTALL)

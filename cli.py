@@ -12541,15 +12541,17 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             return
         self._voice_tts_done.clear()
         try:
-            from tools.tts_tool import text_to_speech_tool
+            from tools.tts_tool import (
+                _prepare_spoken_text_for_tts,
+                text_to_speech_tool,
+            )
             from tools.voice_mode import play_audio_file
 
             # Strip markdown and non-speech content for cleaner TTS via the
             # shared cleaner (tools/tts_text_normalize): markdown, emoji,
             # <think> blocks, verifier footer, units, newline flattening.
             try:
-                from tools.tts_text_normalize import prepare_spoken_text
-                tts_text = prepare_spoken_text(text, max_chars=4000)
+                tts_text = _prepare_spoken_text_for_tts(text, max_chars=4000)
             except Exception:
                 # Legacy fallback pipeline — keep voice replies best-effort.
                 tts_text = text[:4000] if len(text) > 4000 else text

@@ -977,8 +977,9 @@ def speak_text(text: str, stop_event: Optional[threading.Event] = None) -> None:
         # Shared cleaner (tools/tts_text_normalize): markdown, emoji,
         # <think> blocks, verifier footer, units, newline flattening.
         try:
-            from tools.tts_text_normalize import prepare_spoken_text
-            tts_text = prepare_spoken_text(text, max_chars=4000)
+            from tools.tts_tool import _prepare_spoken_text_for_tts
+
+            tts_text = _prepare_spoken_text_for_tts(text, max_chars=4000)
         except Exception:
             # Legacy fallback pipeline — keep speak_text best-effort.
             tts_text = text[:4000] if len(text) > 4000 else text
