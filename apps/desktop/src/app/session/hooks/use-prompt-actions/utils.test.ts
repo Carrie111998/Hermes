@@ -7,6 +7,7 @@ import {
   appendText,
   base64FromDataUrl,
   friendlyRemoteAttachError,
+  type GatewayRequest,
   imageFilenameFromPath,
   inlineErrorMessage,
   isSessionBusyError,
@@ -16,7 +17,8 @@ import {
   renderRpcResult,
   slashStatusText,
   visibleUserIndexAtOrdinal,
-  visibleUserOrdinal
+  visibleUserOrdinal,
+  withSessionNotFoundResume
 } from './utils'
 
 describe('isSessionIdCandidate', () => {
@@ -51,6 +53,63 @@ describe('session error classifiers', () => {
     expect(isSessionBusyError(new Error('session busy'))).toBe(true)
     expect(isSessionNotFoundError(new Error('other'))).toBe(false)
     expect(isSessionBusyError(new Error('other'))).toBe(false)
+  })
+})
+
+describe('withSessionNotFoundResume', () => {
+  it('returns the first-call result without resume when the RPC succeeds', async () => {
+    const requestGateway = vi.fn(async () => ({})) as unknown as GatewayRequest
+
+    const call = vi.fn(async (sid: string) => `ok:${sid}`)
+    const out = await withSessionNotFoundResume(requestGateway, 'stored-1', 'rt-stale', call)
+
+    expect(out).toEqual({ result: 'ok:rt-stale', sessionId: 'rt-stale' })
+    expect(call).toHaveBeenCalledTimes(1)
+    expect(requestGateway).not.toHaveBeenCalled()
+  })
+
+  it('resumes the stored session and retries once on "session not found"', async () => {
+    const requestGateway = vi.fn(async (method: string) => {
+      if (method === 'session.resume') {
+        return { session_id: 'rt-fresh' }
+      }
+
+      throw new Error(`unexpected ${method}`)
+    }) as unknown as GatewayRequest
+
+    let attempts = 0
+
+    const call = vi.fn(async (sid: string) => {
+      attempts += 1
+
+      if (attempts === 1) {
+        throw new Error('session not found')
+      }
+
+      return `ok:${sid}`
+    })
+
+    const out = await withSessionNotFoundResume(requestGateway, 'stored-1', 'rt-stale', call)
+
+    expect(out).toEqual({ result: 'ok:rt-fresh', sessionId: 'rt-fresh' })
+    expect(call.mock.calls.map(c => c[0])).toEqual(['rt-stale', 'rt-fresh'])
+    expect(requestGateway).toHaveBeenCalledWith(
+      'session.resume',
+      expect.objectContaining({ session_id: 'stored-1', source: 'desktop', omit_messages: true })
+    )
+  })
+
+  it('rethrows when no stored session id is available', async () => {
+    const requestGateway = vi.fn() as unknown as GatewayRequest
+
+    const call = vi.fn(async () => {
+      throw new Error('session not found')
+    })
+
+    await expect(withSessionNotFoundResume(requestGateway, null, 'rt-stale', call)).rejects.toThrow(
+      'session not found'
+    )
+    expect(requestGateway).not.toHaveBeenCalled()
   })
 })
 

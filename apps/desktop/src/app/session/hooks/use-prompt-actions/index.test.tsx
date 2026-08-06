@@ -2745,6 +2745,116 @@ describe('usePromptActions sleep/wake session recovery', () => {
     expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
   })
 
+  it('resumes before attach when image.attach_bytes reports "session not found"', async () => {
+    // Attach runs *before* prompt.submit. Without recovery here, text still
+    // works after sleep but image send fails with "session not found".
+    $connection.set({ mode: 'remote' } as never)
+    Object.defineProperty(window, 'hermesDesktop', {
+      configurable: true,
+      value: {
+        readFileDataUrl: vi.fn(async () => 'data:image/png;base64,aaaa')
+      }
+    })
+
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    let attachAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'image.attach_bytes') {
+        attachAttempts += 1
+
+        if (attachAttempts === 1) {
+          throw new Error('session not found')
+        }
+
+        return { attached: true, path: '/remote/pic.png' } as never
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: RECOVERED_SESSION_ID } as never
+      }
+
+      return {} as never
+    })
+
+    const attachment: ComposerAttachment = {
+      id: 'image:pic.png',
+      kind: 'image',
+      label: 'pic.png',
+      path: '/Users/alice/Pictures/pic.png',
+      refText: '@image:`/Users/alice/Pictures/pic.png`'
+    }
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    const ok = await handle!.submitText('what is this', { attachments: [attachment] })
+
+    expect(ok).toBe(true)
+    expect(calls.map(c => c.method)).toEqual([
+      'image.attach_bytes',
+      'session.resume',
+      'image.attach_bytes',
+      'prompt.submit'
+    ])
+    expect(calls[0]?.params).toMatchObject({ session_id: RUNTIME_SESSION_ID })
+    expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
+    expect(calls[3]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
+  })
+
+  it('resumes and retries once when session.compress reports "session not found"', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    let compressAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'session.compress') {
+        compressAttempts += 1
+
+        if (compressAttempts === 1) {
+          throw new Error('session not found')
+        }
+
+        return {
+          removed: 2,
+          summary: { headline: 'Compressed: 10 → 8 messages' }
+        } as never
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: RECOVERED_SESSION_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    await actRender(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    await handle!.submitText('/compress')
+
+    expect(calls.map(c => c.method)).toEqual(['session.compress', 'session.resume', 'session.compress'])
+    expect(calls[0]?.params).toMatchObject({ session_id: RUNTIME_SESSION_ID })
+    expect(calls[2]?.params).toMatchObject({ session_id: RECOVERED_SESSION_ID })
+  })
+
   // #67603 (second symptom): a recovery resume must re-register on the session's
   // OWNING profile. Resuming on whichever profile is live forks the conversation
   // into the wrong profile's DB — the session then appears under both profiles.
