@@ -99,15 +99,16 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
                     # Continue with the merged node so that further repairs
                     # (boolean→string, missing type, etc.) apply.
                 else:
+                    # Keep the reduced union (all non-null branches) and fall
+                    # through to the common cleanup so outer ``nullable`` /
+                    # ``default`` keywords are still stripped.
                     repaired[kw] = non_null
-                    return repaired
             elif not non_null:
                 # Everything was null; collapse to a string schema.
                 repaired.pop(kw, None)
                 repaired["type"] = "string"
-            else:
-                # No null branches — already clean.  Recurse done above.
-                return repaired
+            # else: no null branches — union is already clean; fall through to
+            # the common cleanup for the outer keywords.
 
     # Rule 2: Strip non-standard keywords that MiniMax rejects.
     repaired.pop("nullable", None)
@@ -151,8 +152,14 @@ def _repair_schema(node: Any, is_schema: bool = True) -> Any:
             else:
                 repaired.pop("enum")
 
-    # Rule 5: $ref nodes are exempt from type inference.
-    if "$ref" not in repaired:
+    # Rule 5: $ref nodes and retained union nodes are exempt from type
+    # inference.  A kept anyOf/oneOf has no single type — synthesizing one
+    # (e.g. the ``string`` fallback) would wrongly constrain the union.
+    if (
+        "$ref" not in repaired
+        and "anyOf" not in repaired
+        and "oneOf" not in repaired
+    ):
         repaired = _fill_missing_type(repaired)
 
     # Rule 6: Object schemas must carry a `required` array.

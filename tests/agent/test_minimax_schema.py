@@ -132,6 +132,59 @@ class TestSanitizeMiniMaxToolParameters:
         assert "anyOf" not in value
         assert value["type"] == "string"
 
+    def test_multibranch_null_union_strips_outer_keywords(self):
+        """A retained multi-branch union still loses outer nullable/default.
+
+        Regression for the review finding: the union-handling path returned
+        early, so ``nullable`` and ``default`` survived on
+        ``anyOf: [string, integer, null]`` schemas and MiniMax would still
+        reject the emitted tool schema.
+        """
+        params = {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "anyOf": [
+                        {"type": "string"},
+                        {"type": "integer"},
+                        {"type": "null"},
+                    ],
+                    "nullable": True,
+                    "default": "auto",
+                    "description": "Mode",
+                }
+            },
+            "required": [],
+        }
+        result = sanitize_minimax_tool_parameters(params)
+        mode = result["properties"]["mode"]
+        assert "nullable" not in mode
+        assert "default" not in mode
+        # Union kept (two non-null branches) without a synthetic type.
+        assert mode["anyOf"] == [{"type": "string"}, {"type": "integer"}]
+        assert "type" not in mode
+        # Common cleanup ran: default folded into the description.
+        assert "default:" in mode["description"]
+
+    def test_clean_union_strips_outer_keywords(self):
+        """Even a union with no null branches gets outer keyword cleanup."""
+        params = {
+            "type": "object",
+            "properties": {
+                "mode": {
+                    "anyOf": [{"type": "string"}, {"type": "integer"}],
+                    "nullable": True,
+                    "default": "auto",
+                }
+            },
+            "required": [],
+        }
+        result = sanitize_minimax_tool_parameters(params)
+        mode = result["properties"]["mode"]
+        assert "nullable" not in mode
+        assert "default" not in mode
+        assert mode["anyOf"] == [{"type": "string"}, {"type": "integer"}]
+
     def test_missing_type_filled(self):
         """Missing type on property → inferred type."""
         params = {
