@@ -298,6 +298,21 @@
     ]
   },
   {
+    "id": "minimum_reservation_alternative",
+    "source_threads": [
+      "1534808319217107014"
+    ],
+    "principle": "When a customer is worried that an experience may not happen because current public detail states minimum reservations/jumps/participants, state the original restriction accurately, then use catalog/search and product-detail facts to look for the closest purchasable comparable alternative whose current public detail does not state the same minimum condition. Different provider alone is not proof that the condition is absent. If a verified alternative exists, offer it proactively with location, type, price, and weather caveats; if none is factually supported, say that and offer human help without inventing a restriction-free same-location product.",
+    "scoring": [
+      "restriction_accuracy",
+      "alternative_recovery",
+      "detail_refresh",
+      "provider_boundary",
+      "material_caveats",
+      "no_overpromise"
+    ]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": [
       "architecture"
