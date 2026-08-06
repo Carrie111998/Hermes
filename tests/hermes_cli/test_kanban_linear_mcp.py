@@ -140,6 +140,25 @@ def test_oauth_discovery_registers_only_explicit_read_tools() -> None:
     assert len(bundle.registered_read_tools) == len(linear_mcp.LINEAR_MCP_READ_TOOLS)
 
 
+def test_oauth_discovery_blocks_preexisting_non_allowlisted_tool() -> None:
+    def register(_servers: dict[str, dict[str, Any]]) -> list[str]:
+        return [
+            *(f"mcp__linear__{name}" for name in linear_mcp.LINEAR_MCP_READ_TOOLS),
+            "mcp__linear__update_issue",
+        ]
+
+    with pytest.raises(linear_mcp.LinearMCPReadError) as exc_info:
+        linear_mcp.build_linear_mcp_adapter(
+            config=_config(),
+            mcp_servers={"linear": {"url": LINEAR_URL, "auth": "oauth"}},
+            register_servers=register,
+            caller_factory=lambda *_args: FakeMCPCaller({}),
+        )
+
+    assert exc_info.value.kind == "permission"
+    assert exc_info.value.stage == "discovery"
+
+
 def test_issue_read_normalizes_identity_state_labels_links_and_revision(
     issue_payload: dict[str, Any],
 ) -> None:
@@ -435,6 +454,17 @@ def test_health_distinguishes_all_readiness_stages(
         "discovered": True,
         "resource_authorized": True,
         "write_enabled": False,
+    }
+    assert payload["polling_runner"] == {
+        "mode": "operator_scheduled_read_probe",
+        "command": (
+            "hermes kanban linear-mcp health --team <team> "
+            "--issue-id <issue-id> --json"
+        ),
+        "recommended_schedule": "every 5m",
+        "kanban_mutation": False,
+        "snapshot_ingestion_implemented": False,
+        "production_activation": "blocked_until_snapshot_ingestion_is_reviewed",
     }
     assert payload["resource"]["team_id"] == TEAM_ID
     assert payload["resource"]["issue_identifier"] == "ECH-288"

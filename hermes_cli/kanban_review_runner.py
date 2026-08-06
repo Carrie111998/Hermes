@@ -11,6 +11,7 @@ or perform recursive scheduling.
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -46,6 +47,16 @@ DEFAULT_PROVIDER_TIMEOUT_SECONDS = 20
 MAX_TIMEOUT_SECONDS = 15 * 60
 MAX_LEASE_SECONDS = 60 * 60
 MAX_ITEMS_PER_RUN = 500
+_ADAPTER_FAILURE_KINDS = frozenset({
+    "auth",
+    "permission",
+    "not_found",
+    "rate_limited",
+    "timeout",
+    "unavailable",
+    "validation",
+})
+_ADAPTER_FAILURE_TYPE_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 
 
 class ReviewRunnerError(ValueError):
@@ -54,6 +65,27 @@ class ReviewRunnerError(ValueError):
 
 class ReviewRunnerDeadlineExceeded(TimeoutError):
     """The runner cannot safely start another bounded provider operation."""
+
+
+def _redacted_adapter_setup_failure(
+    value: Optional[BaseException | Mapping[str, Any]],
+) -> dict[str, str]:
+    """Reduce an adapter failure to a fixed, non-secret diagnostic envelope."""
+
+    if value is None:
+        return {}
+    if isinstance(value, BaseException):
+        error_type = type(value).__name__
+        raw_kind = getattr(value, "kind", None)
+    else:
+        error_type = str(value.get("type") or "Exception")
+        raw_kind = value.get("kind")
+    if not _ADAPTER_FAILURE_TYPE_RE.fullmatch(error_type):
+        error_type = "Exception"
+    kind = str(raw_kind or "").strip().casefold()
+    if kind not in _ADAPTER_FAILURE_KINDS:
+        kind = "unknown"
+    return {"type": error_type, "kind": kind}
 
 
 def _string_tuple(value: Any, field: str) -> tuple[str, ...]:
@@ -280,6 +312,7 @@ class ReviewRunnerAdapters:
     slack_snapshot_provider: Optional[slack.PullRequestSnapshotProvider] = None
     slack_delivery_transport: Optional[slack.SlackDeliveryTransport] = None
     slack_acknowledgement_provider: Optional[slack.SlackAcknowledgementProvider] = None
+    mcp_credential_preflight: Optional[Mapping[str, Mapping[str, Any]]] = None
 
     @property
     def has_registered_adapter(self) -> bool:
@@ -493,6 +526,7 @@ def _build_configured_mcp_adapters(
         coderabbit_snapshot_provider=bundle.github_adapter,
         slack_snapshot_provider=bundle.github_adapter,
         slack_acknowledgement_provider=bundle.slack_acknowledgement_provider,
+        mcp_credential_preflight=bundle.credential_preflight,
         # Delivery transports intentionally remain None: this phase cannot
         # perform GitHub or Slack external writes.
     )
@@ -860,9 +894,11 @@ def diagnose_review_runner(
     config: ReviewRunnerConfig,
     now: Optional[int] = None,
     adapters: Optional[ReviewRunnerAdapters] = None,
+    adapter_setup_failure: Optional[Mapping[str, str]] = None,
 ) -> dict[str, Any]:
     checked_at = int(time.time()) if now is None else int(now)
     registered = adapters or ReviewRunnerAdapters()
+    redacted_setup_failure = _redacted_adapter_setup_failure(adapter_setup_failure)
     candidates, counts = list_runner_candidates(
         conn,
         now=checked_at,
@@ -913,6 +949,61 @@ def diagnose_review_runner(
         if slack_read_registered or slack_write_registered
         else "adapter_not_registered"
     )
+    enabled_provider_count = sum((
+        config.github_provider_enabled,
+        config.slack_provider_enabled,
+    ))
+    github_shadow_ready = (
+        config.github_provider_enabled
+        and config.github_adapter == "mcp"
+        and bool(config.github_repositories)
+        and github_read_registered
+        and timeout_bounded
+    )
+    slack_shadow_ready = (
+        config.slack_provider_enabled
+        and config.slack_adapter == "mcp"
+        and bool(config.slack_channel_ids)
+        and bool(config.slack_acknowledgement_user_ids)
+        and slack_read_registered
+        and timeout_bounded
+    )
+    all_enabled_reads_ready = (
+        enabled_provider_count > 0
+        and (not config.github_provider_enabled or github_shadow_ready)
+        and (not config.slack_provider_enabled or slack_shadow_ready)
+    )
+    blockers: list[str] = []
+    if redacted_setup_failure:
+        blockers.append(
+            "adapter_setup_failed:"
+            f"{redacted_setup_failure['kind']}:"
+            f"{redacted_setup_failure['type']}"
+        )
+    if not config.enabled:
+        blockers.append("runner_disabled")
+    if enabled_provider_count == 0:
+        blockers.append("no_provider_enabled")
+    if config.github_provider_enabled:
+        if config.github_adapter != "mcp":
+            blockers.append("github_mcp_adapter_not_selected")
+        if not config.github_repositories:
+            blockers.append("github_repository_allowlist_required")
+        if not github_read_registered:
+            blockers.append("github_read_adapter_not_registered")
+        blockers.append("github_private_repository_authorization_unprobed")
+    if config.slack_provider_enabled:
+        if config.slack_adapter != "mcp":
+            blockers.append("slack_mcp_adapter_not_selected")
+        if not config.slack_channel_ids:
+            blockers.append("slack_channel_allowlist_required")
+        if not config.slack_acknowledgement_user_ids:
+            blockers.append("slack_acknowledgement_user_allowlist_required")
+        if not slack_read_registered:
+            blockers.append("slack_read_adapter_not_registered")
+        blockers.append("slack_resource_authorization_unprobed")
+    if not github_write_registered and not slack_write_registered:
+        blockers.append("live_delivery_transport_not_registered")
     return {
         "schema_version": 1,
         "checked_at": checked_at,
@@ -967,10 +1058,12 @@ def diagnose_review_runner(
             },
             "provider_timeout_seconds": registered.provider_timeout_seconds,
             "timeout_bounded": timeout_bounded,
+            "credential_preflight": registered.mcp_credential_preflight or {},
+            "adapter_setup_failure": redacted_setup_failure,
         },
         "readiness": {
             "dry_run_ready": timeout_bounded,
-            "shadow_ready": config.enabled and timeout_bounded,
+            "shadow_ready": config.enabled and all_enabled_reads_ready,
             "live_ready": config.enabled
             and (
                 (
@@ -984,6 +1077,44 @@ def diagnose_review_runner(
                     and timeout_bounded
                 )
             ),
+            "production_ready": False,
+            "blockers": blockers,
+        },
+        "provider_limitations": {
+            "github_null_review_commit_id": "fail_closed",
+            "github_null_review_comment_commit_id": "fail_closed",
+            "github_authoritative_thread_resolution": False,
+            "github_thread_policy": (
+                "current review comments remain unresolved/actionable until an "
+                "authoritative thread-resolution provider is available"
+            ),
+            "github_write_tools_registered": False,
+            "slack_write_tools_registered": False,
+            "slack_is_approval_authority": False,
+            "merge_or_branch_write_capability": False,
+        },
+        "operator_input_checklist": [
+            "approved private repository owner/name allowlist",
+            "approved Slack staging channel ID",
+            "approved Slack acknowledgement user IDs",
+            "GitHub and Slack credentials stored as env/OAuth references, never plaintext config",
+            "resource probes proving private-repo and Slack channel/thread access",
+            "separate approval before any live delivery adapter or cron/gateway routing change",
+        ],
+        "shadow_validation": {
+            "command": (
+                "hermes kanban review-runner run --mode shadow "
+                "--linear-issue-id <issue-id> --json"
+            ),
+            "external_provider_writes": False,
+            "local_writes": "immutable reconciliation and acknowledgement audit rows",
+            "success_evidence": [
+                "status is ok or no_op",
+                "errors is empty",
+                "private GitHub repository snapshot is returned for the exact head",
+                "CodeRabbit evidence is classified without null commit_id",
+                "Slack acknowledgement reads stay inside configured channel/user allowlists",
+            ],
         },
         "outbox": {
             **counts,
@@ -1109,10 +1240,11 @@ def run_review_runner(
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
-            kind = getattr(exc, "kind", None)
-            error = f"configured MCP adapter setup failed: {type(exc).__name__}"
-            if kind:
-                error += f" ({kind})"
+            failure = _redacted_adapter_setup_failure(exc)
+            error = (
+                "configured MCP adapter setup failed: "
+                f"{failure['type']} ({failure['kind']})"
+            )
             return ReviewRunnerReceipt(
                 "failed",
                 mode,

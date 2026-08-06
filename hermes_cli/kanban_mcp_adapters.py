@@ -19,9 +19,11 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Literal, Mapping, Optional, Protocol, Sequence, cast
 
+from hermes_constants import get_hermes_home
 from hermes_cli import kanban_coderabbit as coderabbit
 from hermes_cli import kanban_github as github
 from hermes_cli import kanban_slack as slack
+from utils import fast_safe_load
 
 
 MCPFailureKind = Literal[
@@ -44,6 +46,7 @@ _SLACK_READ_TOOLS = frozenset({"slack_get_thread_replies"})
 _FULL_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 _REPOSITORY_RE = re.compile(r"^[^/\s]+/[^/\s]+$")
 _SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_ENV_REFERENCE_RE = re.compile(r"^\$\{(?:env:)?[A-Za-z_][A-Za-z0-9_]*\}$")
 _ACTIONABLE_COUNT_RE = re.compile(r"\b(\d+)\s+actionable\s+comments?\b", re.IGNORECASE)
 _RATE_LIMIT_RE = re.compile(
     r"rate[- ]?limit|quota\s+(?:reached|exceeded)", re.IGNORECASE
@@ -74,6 +77,89 @@ class MCPToolCaller(Protocol):
     """Minimal typed MCP boundary used by provider-specific normalizers."""
 
     def call(self, tool_name: str, arguments: Mapping[str, Any]) -> Any: ...
+
+
+def _load_raw_mcp_servers() -> Mapping[str, Any]:
+    """Read unexpanded MCP config so credential-source policy can be verified.
+
+    ``load_config()`` expands ``${env:...}`` references.  Runtime diagnostics
+    need the unexpanded form to distinguish an approved credential reference
+    from plaintext embedded in ``config.yaml``.  Values are never returned in
+    diagnostics or exception messages.
+    """
+
+    path = get_hermes_home() / "config.yaml"
+    try:
+        if not path.exists():
+            return {}
+        parsed = fast_safe_load(path.read_text(encoding="utf-8")) or {}
+    except Exception as exc:
+        raise MCPAdapterError(
+            "active config cannot be inspected for MCP credential policy",
+            kind="validation",
+        ) from exc
+    if not isinstance(parsed, Mapping):
+        raise MCPAdapterError(
+            "active config must be an object for MCP credential policy",
+            kind="validation",
+        )
+    servers = parsed.get("mcp_servers")
+    return servers if isinstance(servers, Mapping) else {}
+
+
+def _credential_preflight(
+    *,
+    provider: Literal["github", "slack"],
+    server_name: str,
+    raw_server: Mapping[str, Any],
+    expanded_server: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Return redacted credential readiness and fail closed on plaintext secrets."""
+
+    auth_mode = str(raw_server.get("auth") or "").strip().casefold()
+    if auth_mode == "oauth":
+        return {
+            "provider": provider,
+            "server_name": server_name,
+            "ready": True,
+            "auth_mode": "oauth",
+            "credential_storage": "oauth_token_store",
+            "checked_keys": [],
+        }
+
+    raw_env = raw_server.get("env")
+    expanded_env = expanded_server.get("env")
+    raw_env = raw_env if isinstance(raw_env, Mapping) else {}
+    expanded_env = expanded_env if isinstance(expanded_env, Mapping) else {}
+    required_keys = (
+        ("GITHUB_PERSONAL_ACCESS_TOKEN",)
+        if provider == "github"
+        else ("SLACK_BOT_TOKEN", "SLACK_TEAM_ID")
+    )
+    secret_keys = frozenset({"GITHUB_PERSONAL_ACCESS_TOKEN", "SLACK_BOT_TOKEN"})
+    blockers: list[str] = []
+    for key in required_keys:
+        raw_value = raw_env.get(key)
+        expanded_value = expanded_env.get(key)
+        if key in secret_keys and not (
+            isinstance(raw_value, str)
+            and _ENV_REFERENCE_RE.fullmatch(raw_value.strip())
+        ):
+            blockers.append(f"{key}:approved_credential_reference_required")
+            continue
+        if not isinstance(expanded_value, str) or not expanded_value.strip():
+            blockers.append(f"{key}:value_unavailable")
+        elif _ENV_REFERENCE_RE.fullmatch(expanded_value.strip()):
+            blockers.append(f"{key}:environment_reference_unresolved")
+    return {
+        "provider": provider,
+        "server_name": server_name,
+        "ready": not blockers,
+        "auth_mode": "environment",
+        "credential_storage": "environment_reference",
+        "checked_keys": list(required_keys),
+        "blockers": blockers,
+    }
 
 
 def _canonical_repository(value: str) -> str:
@@ -607,6 +693,11 @@ class GitHubMCPReadAdapter:
             head_sha = _full_sha(item.get("commit_id"))
             submitted_at = _parse_timestamp(item.get("submitted_at"))
             state = str(item.get("state") or "").strip().casefold()
+            if author and head_sha is None:
+                raise MCPAdapterError(
+                    "GitHub review commit_id is unavailable; exact-head review evidence is blocked",
+                    kind="validation",
+                )
             if (
                 not author
                 or head_sha is None
@@ -639,6 +730,11 @@ class GitHubMCPReadAdapter:
             author = user.get("login") if isinstance(user, Mapping) else None
             head_sha = _full_sha(item.get("commit_id"))
             created_at = _parse_timestamp(item.get("created_at"))
+            if author and head_sha is None:
+                raise MCPAdapterError(
+                    "GitHub review comment commit_id is unavailable; exact-head thread evidence is blocked",
+                    kind="validation",
+                )
             if not author or head_sha is None or created_at is None:
                 continue
             outdated = head_sha != current_head_sha or (
@@ -996,6 +1092,7 @@ class ReviewRunnerMCPBundle:
     provider_timeout_seconds: int
     github_adapter: Optional[GitHubMCPReadAdapter] = None
     slack_acknowledgement_provider: Optional[SlackMCPAcknowledgementProvider] = None
+    credential_preflight: Optional[Mapping[str, Mapping[str, Any]]] = None
 
 
 def build_review_runner_mcp_bundle(
@@ -1008,6 +1105,7 @@ def build_review_runner_mcp_bundle(
     slack_channel_ids: Sequence[str] = (),
     slack_user_ids: Sequence[str] = (),
     mcp_servers: Optional[Mapping[str, Any]] = None,
+    raw_mcp_servers: Optional[Mapping[str, Any]] = None,
     clock: Callable[[], float] = time.time,
 ) -> ReviewRunnerMCPBundle:
     """Connect only explicitly selected MCP servers and return read-only adapters."""
@@ -1028,6 +1126,21 @@ def build_review_runner_mcp_bundle(
     for name in selected_names:
         if not _SERVER_NAME_RE.fullmatch(str(name)):
             raise MCPAdapterError("MCP server name is invalid", kind="validation")
+    if github_server_name and not tuple(github_repositories):
+        raise MCPAdapterError(
+            "GitHub repository allowlist is required before MCP registration",
+            kind="permission",
+        )
+    if slack_server_name and not tuple(slack_channel_ids):
+        raise MCPAdapterError(
+            "Slack channel allowlist is required before MCP registration",
+            kind="permission",
+        )
+    if slack_server_name and not tuple(slack_user_ids):
+        raise MCPAdapterError(
+            "Slack acknowledgement user allowlist is required before MCP registration",
+            kind="permission",
+        )
 
     if mcp_servers is None:
         from hermes_cli.config import load_config
@@ -1035,8 +1148,13 @@ def build_review_runner_mcp_bundle(
         loaded = load_config() or {}
         configured = loaded.get("mcp_servers")
         mcp_servers = configured if isinstance(configured, Mapping) else {}
+        if raw_mcp_servers is None:
+            raw_mcp_servers = _load_raw_mcp_servers()
+    elif raw_mcp_servers is None:
+        raw_mcp_servers = mcp_servers
 
     selected: dict[str, dict[str, Any]] = {}
+    credential_preflight: dict[str, Mapping[str, Any]] = {}
     for name in selected_names:
         raw = mcp_servers.get(name) if isinstance(mcp_servers, Mapping) else None
         if not isinstance(raw, Mapping):
@@ -1045,11 +1163,39 @@ def build_review_runner_mcp_bundle(
                 kind="unavailable",
             )
         server_config = dict(raw)
+        raw_unexpanded = (
+            raw_mcp_servers.get(name) if isinstance(raw_mcp_servers, Mapping) else None
+        )
+        if not isinstance(raw_unexpanded, Mapping):
+            raise MCPAdapterError(
+                f"MCP server {name} credential source cannot be verified",
+                kind="auth",
+            )
+        providers: list[Literal["github", "slack"]] = []
+        if name == github_server_name:
+            providers.append("github")
+        if name == slack_server_name:
+            providers.append("slack")
+        for provider in providers:
+            credential_report = _credential_preflight(
+                provider=provider,
+                server_name=name,
+                raw_server=raw_unexpanded,
+                expanded_server=server_config,
+            )
+            credential_preflight[provider] = credential_report
+            if not credential_report["ready"]:
+                raise MCPAdapterError(
+                    f"MCP server {name} credential readiness is blocked",
+                    kind="auth",
+                )
         # Explicit registration must not widen the runner process to the MCP
         # server's write tools. Registry dispatch is independently allowlisted,
         # but restricting discovery keeps the global tool registry read-only too.
         server_config["tools"] = {
             "include": sorted(required_tools_by_server[name]),
+            "prompts": False,
+            "resources": False,
         }
         server_config["timeout"] = timeout
         server_config["connect_timeout"] = min(
@@ -1063,7 +1209,33 @@ def build_review_runner_mcp_bundle(
 
     from tools.mcp_tool import register_mcp_servers
 
-    register_mcp_servers(selected)
+    registered_names = frozenset(register_mcp_servers(selected))
+    expected_names = frozenset(
+        _tool_name(server_name, tool)
+        for server_name, tools in required_tools_by_server.items()
+        for tool in tools
+    )
+    missing_names = sorted(expected_names - registered_names)
+    if missing_names:
+        raise MCPAdapterError(
+            "required MCP read tools were not discovered for the review runner",
+            kind="unavailable",
+        )
+    selected_prefixes = tuple(f"mcp__{name}__" for name in selected_names)
+    unexpected_names = sorted(
+        name
+        for name in registered_names - expected_names
+        if name.startswith(selected_prefixes)
+    )
+    if unexpected_names:
+        # ``register_mcp_servers`` is idempotent by server name. If another
+        # startup path already registered a selected server with a wider tool
+        # surface, the narrower config above cannot retroactively remove it.
+        # Refuse the adapter rather than coexisting with provider write tools.
+        raise MCPAdapterError(
+            "selected MCP servers exposed non-allowlisted tools to the review runner",
+            kind="permission",
+        )
 
     github_adapter: Optional[GitHubMCPReadAdapter] = None
     if github_server_name:
@@ -1102,7 +1274,8 @@ def build_review_runner_mcp_bundle(
         )
 
     return ReviewRunnerMCPBundle(
-        timeout,
+        provider_timeout_seconds=timeout,
         github_adapter=github_adapter,
         slack_acknowledgement_provider=slack_provider,
+        credential_preflight=credential_preflight,
     )

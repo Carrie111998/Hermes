@@ -850,7 +850,18 @@ def build_linear_mcp_adapter(
     required = frozenset(
         _tool_name(config.server_name, tool) for tool in LINEAR_MCP_READ_TOOLS
     )
-    discovered = tuple(sorted(required.intersection(registered)))
+    selected_prefix = f"mcp__{config.server_name}__"
+    registered_for_selected_server = frozenset(
+        name for name in registered if name.startswith(selected_prefix)
+    )
+    unexpected = sorted(registered_for_selected_server.difference(required))
+    if unexpected:
+        raise LinearMCPReadError(
+            "Linear MCP discovery exposed non-allowlisted tools for the selected server",
+            kind="permission",
+            stage="discovery",
+        )
+    discovered = tuple(sorted(required.intersection(registered_for_selected_server)))
     missing = sorted(required.difference(discovered))
     if missing:
         raise LinearMCPReadError(
@@ -943,6 +954,17 @@ def diagnose_linear_mcp(
         "oauth_configured": oauth_configured,
         "webhooks_implemented": False,
         "oauth_event_delivery": False,
+        "polling_runner": {
+            "mode": "operator_scheduled_read_probe",
+            "command": (
+                "hermes kanban linear-mcp health --team <team> "
+                "--issue-id <issue-id> --json"
+            ),
+            "recommended_schedule": "every 5m",
+            "kanban_mutation": False,
+            "snapshot_ingestion_implemented": False,
+            "production_activation": "blocked_until_snapshot_ingestion_is_reviewed",
+        },
         "external_side_effects": "none",
         "requires_gateway_restart": False,
         "resource": None,

@@ -312,6 +312,28 @@ def test_github_mcp_rejects_head_change_between_expected_and_readback() -> None:
         )
 
 
+@pytest.mark.parametrize("surface", ["review", "comment"])
+def test_github_mcp_fails_closed_when_exact_head_commit_id_is_null(
+    surface: str,
+) -> None:
+    reviews: list[Mapping[str, Any]] = []
+    comments: list[Mapping[str, Any]] = []
+    if surface == "review":
+        item = _review_payload("No actionable comments")
+        item["commit_id"] = None
+        reviews.append(item)
+    else:
+        item = _comment_payload()
+        item["commit_id"] = None
+        comments.append(item)
+    adapter = _github_adapter(_github_caller(reviews=reviews, comments=comments))
+
+    with pytest.raises(github.GitHubTransportFailure, match="commit_id") as exc_info:
+        adapter.read_snapshot(repository=REPOSITORY, pr_number=41)
+
+    assert exc_info.value.kind == "validation"
+
+
 def test_slack_mcp_acknowledgements_are_channel_and_user_allowlisted() -> None:
     caller = FakeCaller({
         "mcp__slack__slack_get_thread_replies": {
@@ -422,7 +444,11 @@ def test_bundle_registers_only_selected_servers_and_overrides_timeouts(
 
     def fake_register(config: Mapping[str, Any]) -> list[str]:
         registered.update(config)
-        return []
+        return [
+            f"mcp__{server_name}__{tool_name}"
+            for server_name, server_config in config.items()
+            for tool_name in server_config["tools"]["include"]
+        ]
 
     import tools.mcp_tool as mcp_tool
 
@@ -438,14 +464,34 @@ def test_bundle_registers_only_selected_servers_and_overrides_timeouts(
             "github": {
                 "command": "github",
                 "timeout": 99,
+                "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token"},
                 "tools": {"include": ["merge_pull_request"]},
             },
             "slack": {
                 "command": "slack",
                 "connect_timeout": 90,
+                "env": {
+                    "SLACK_BOT_TOKEN": "slack-test-token",
+                    "SLACK_TEAM_ID": "T_TEST",
+                },
                 "tools": {"include": ["slack_post_message"]},
             },
             "notion": {"command": "notion", "secret": "must-not-cross-boundary"},
+        },
+        raw_mcp_servers={
+            "github": {
+                "command": "github",
+                "env": {
+                    "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+                },
+            },
+            "slack": {
+                "command": "slack",
+                "env": {
+                    "SLACK_BOT_TOKEN": "${env:SLACK_BOT_TOKEN}",
+                    "SLACK_TEAM_ID": "T_TEST",
+                },
+            },
         },
     )
 
@@ -457,13 +503,22 @@ def test_bundle_registers_only_selected_servers_and_overrides_timeouts(
             "get_pull_request_comments",
             "get_pull_request_reviews",
             "get_pull_request_status",
-        ]
+        ],
+        "prompts": False,
+        "resources": False,
     }
     assert registered["slack"]["timeout"] == 7
     assert registered["slack"]["connect_timeout"] == 7
-    assert registered["slack"]["tools"] == {"include": ["slack_get_thread_replies"]}
+    assert registered["slack"]["tools"] == {
+        "include": ["slack_get_thread_replies"],
+        "prompts": False,
+        "resources": False,
+    }
     assert bundle.github_adapter is not None
     assert bundle.slack_acknowledgement_provider is not None
+    assert bundle.credential_preflight is not None
+    assert bundle.credential_preflight["github"]["ready"] is True
+    assert bundle.credential_preflight["slack"]["ready"] is True
 
 
 def test_bundle_requires_explicit_repository_channel_and_user_allowlists(
@@ -490,3 +545,146 @@ def test_bundle_requires_explicit_repository_channel_and_user_allowlists(
             mcp_servers=servers,
         )
     assert channel_error.value.kind == "permission"
+
+
+def test_bundle_blocks_plaintext_credentials_before_mcp_registration(
+    monkeypatch,
+) -> None:
+    called = False
+
+    def fake_register(config: Mapping[str, Any]) -> list[str]:
+        nonlocal called
+        called = True
+        return []
+
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", fake_register)
+    with pytest.raises(MCPAdapterError) as exc_info:
+        build_review_runner_mcp_bundle(
+            provider_timeout_seconds=5,
+            github_server_name="github",
+            github_repositories=(REPOSITORY,),
+            mcp_servers={
+                "github": {
+                    "command": "github",
+                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "plaintext-test-token"},
+                }
+            },
+        )
+
+    assert exc_info.value.kind == "auth"
+    assert called is False
+    assert "plaintext-test-token" not in str(exc_info.value)
+
+
+def test_bundle_fails_when_required_read_tools_are_not_discovered(monkeypatch) -> None:
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(mcp_tool, "register_mcp_servers", lambda config: [])
+    with pytest.raises(MCPAdapterError) as exc_info:
+        build_review_runner_mcp_bundle(
+            provider_timeout_seconds=5,
+            github_server_name="github",
+            github_repositories=(REPOSITORY,),
+            mcp_servers={
+                "github": {
+                    "command": "github",
+                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token"},
+                }
+            },
+            raw_mcp_servers={
+                "github": {
+                    "command": "github",
+                    "env": {
+                        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+                    },
+                }
+            },
+        )
+
+    assert exc_info.value.kind == "unavailable"
+
+
+def test_bundle_fails_when_selected_server_was_registered_with_write_tools(
+    monkeypatch,
+) -> None:
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "register_mcp_servers",
+        lambda config: [
+            *(f"mcp__github__{name}" for name in config["github"]["tools"]["include"]),
+            "mcp__github__merge_pull_request",
+            "mcp__other__unrelated_tool",
+        ],
+    )
+    with pytest.raises(MCPAdapterError) as exc_info:
+        build_review_runner_mcp_bundle(
+            provider_timeout_seconds=5,
+            github_server_name="github",
+            github_repositories=(REPOSITORY,),
+            mcp_servers={
+                "github": {
+                    "command": "github",
+                    "env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token"},
+                }
+            },
+            raw_mcp_servers={
+                "github": {
+                    "command": "github",
+                    "env": {
+                        "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}"
+                    },
+                }
+            },
+        )
+
+    assert exc_info.value.kind == "permission"
+
+
+def test_bundle_preflights_both_providers_when_they_share_a_server(monkeypatch) -> None:
+    import tools.mcp_tool as mcp_tool
+
+    monkeypatch.setattr(
+        mcp_tool,
+        "register_mcp_servers",
+        lambda config: [
+            f"mcp__combined__{name}" for name in config["combined"]["tools"]["include"]
+        ],
+    )
+    expanded = {
+        "combined": {
+            "command": "combined",
+            "env": {
+                "GITHUB_PERSONAL_ACCESS_TOKEN": "github-test-token",
+                "SLACK_BOT_TOKEN": "slack-test-token",
+                "SLACK_TEAM_ID": "T_TEST",
+            },
+        }
+    }
+    raw = {
+        "combined": {
+            "command": "combined",
+            "env": {
+                "GITHUB_PERSONAL_ACCESS_TOKEN": "${env:GITHUB_PERSONAL_ACCESS_TOKEN}",
+                "SLACK_BOT_TOKEN": "${env:SLACK_BOT_TOKEN}",
+                "SLACK_TEAM_ID": "T_TEST",
+            },
+        }
+    }
+
+    bundle = build_review_runner_mcp_bundle(
+        provider_timeout_seconds=5,
+        github_server_name="combined",
+        github_repositories=(REPOSITORY,),
+        slack_server_name="combined",
+        slack_channel_ids=("C_STAGING",),
+        slack_user_ids=("U_REVIEWER",),
+        mcp_servers=expanded,
+        raw_mcp_servers=raw,
+    )
+
+    assert bundle.credential_preflight is not None
+    assert set(bundle.credential_preflight) == {"github", "slack"}

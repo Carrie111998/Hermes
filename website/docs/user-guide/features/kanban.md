@@ -8,6 +8,8 @@ description: "Durable SQLite-backed task board for coordinating multiple Hermes 
 
 > **Want a walkthrough?** Read the [Kanban tutorial](./kanban-tutorial) — four user stories (solo dev, fleet farming, role pipeline with retry, circuit breaker) with dashboard screenshots of each. This page is the reference; the tutorial is the narrative.
 
+> **Operating the exact-head human-review workflow?** Use the [Kanban review runner operations runbook](./kanban-review-runner) for fail-closed MCP preflight, shadow validation, rollout, and rollback.
+
 Hermes Kanban is a durable task board, shared across all your Hermes profiles, that lets multiple named agents collaborate on work without fragile in-process subagent swarms. Every task is a row in `~/.hermes/kanban.db`; every handoff is a row anyone can read and write; every worker is a full OS process with its own identity.
 
 ### Two surfaces: the model talks through tools, you talk through the CLI

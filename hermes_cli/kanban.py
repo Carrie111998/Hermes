@@ -2146,7 +2146,25 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
 
     with kb.connect_closing() as conn:
         if getattr(args, "runner_action", "run") == "health":
-            payload = runner.diagnose_review_runner(conn, config=review_config)
+            health_adapters = None
+            adapter_setup_failure = None
+            if review_config.github_provider_enabled or review_config.slack_provider_enabled:
+                try:
+                    health_adapters = runner._build_configured_mcp_adapters(
+                        review_config
+                    )
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    # Health diagnostics must not echo provider exception text:
+                    # MCP failures can contain credentials or remote payloads.
+                    adapter_setup_failure = runner._redacted_adapter_setup_failure(exc)
+            payload = runner.diagnose_review_runner(
+                conn,
+                config=review_config,
+                adapters=health_adapters,
+                adapter_setup_failure=adapter_setup_failure,
+            )
             if getattr(args, "json", False):
                 print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
             else:
@@ -2163,9 +2181,11 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
                 print(
                     "Providers: "
                     f"github enabled={providers['github']['enabled']} "
-                    f"registered={providers['github']['registered']}; "
+                    f"read_registered={providers['github']['read_registered']} "
+                    f"write_registered={providers['github']['write_registered']}; "
                     f"slack enabled={providers['slack']['enabled']} "
-                    f"registered={providers['slack']['registered']}"
+                    f"read_registered={providers['slack']['read_registered']} "
+                    f"write_registered={providers['slack']['write_registered']}"
                 )
                 print(
                     "Outbox: "
@@ -2180,6 +2200,11 @@ def _cmd_review_runner(args: argparse.Namespace) -> int:
                     "code deployment restart command: "
                     f"{gateway['external_operator_restart_command']}"
                 )
+                if payload["readiness"]["blockers"]:
+                    print(
+                        "Blockers: "
+                        + ", ".join(payload["readiness"]["blockers"])
+                    )
             return 0
 
         receipt = runner.run_review_runner(

@@ -646,11 +646,22 @@ def test_health_reports_script_only_readiness_and_restart_contract(kanban_home):
     assert health["script_only"] is True
     assert health["llm_required"] is False
     assert health["recursive_scheduling"] is False
-    assert health["readiness"] == {
-        "dry_run_ready": True,
-        "shadow_ready": False,
-        "live_ready": False,
-    }
+    assert health["readiness"]["dry_run_ready"] is True
+    assert health["readiness"]["shadow_ready"] is False
+    assert health["readiness"]["live_ready"] is False
+    assert health["readiness"]["production_ready"] is False
+    assert health["readiness"]["blockers"] == [
+        "runner_disabled",
+        "no_provider_enabled",
+        "live_delivery_transport_not_registered",
+    ]
+    assert health["provider_limitations"]["github_null_review_commit_id"] == (
+        "fail_closed"
+    )
+    assert (
+        health["provider_limitations"]["github_authoritative_thread_resolution"]
+        is False
+    )
     assert health["gateway"]["requires_gateway_restart"] is False
     assert health["gateway"]["code_deployment_requires_gateway_restart"] is True
     assert health["gateway"]["external_operator_restart_command"] == (
@@ -677,11 +688,10 @@ def test_health_does_not_claim_ready_for_unbounded_registered_adapter(kanban_hom
         )
 
     assert health["providers"]["timeout_bounded"] is False
-    assert health["readiness"] == {
-        "dry_run_ready": False,
-        "shadow_ready": False,
-        "live_ready": False,
-    }
+    assert health["readiness"]["dry_run_ready"] is False
+    assert health["readiness"]["shadow_ready"] is False
+    assert health["readiness"]["live_ready"] is False
+    assert health["readiness"]["production_ready"] is False
 
 
 def test_cli_health_json_and_quiet_noop(kanban_home, capsys):
@@ -699,6 +709,122 @@ def test_cli_health_json_and_quiet_noop(kanban_home, capsys):
     captured = capsys.readouterr()
     assert captured.out == ""
     assert captured.err == ""
+
+
+def test_cli_health_human_output_uses_read_and_write_registration_keys(
+    kanban_home,
+    capsys,
+):
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "review-runner", "health"])
+    assert kc.kanban_command(args) == 0
+    output = capsys.readouterr().out
+
+    assert "github enabled=False read_registered=False write_registered=False" in output
+    assert "slack enabled=False read_registered=False write_registered=False" in output
+    assert "Blockers: runner_disabled" in output
+
+
+def test_cli_health_redacts_adapter_setup_failure(
+    kanban_home,
+    capsys,
+    monkeypatch,
+):
+    from hermes_cli.kanban_mcp_adapters import MCPAdapterError
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "review_runner": {
+                    "enabled": True,
+                    "mode": "shadow",
+                    "providers": {
+                        "github": {
+                            "enabled": True,
+                            "adapter": "mcp",
+                            "repositories": ["owner/private"],
+                        }
+                    },
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_build_configured_mcp_adapters",
+        lambda _config: (_ for _ in ()).throw(
+            MCPAdapterError("credential ghp_DO_NOT_PRINT", kind="auth")
+        ),
+    )
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "review-runner", "health", "--json"])
+    assert kc.kanban_command(args) == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert "ghp_DO_NOT_PRINT" not in output
+    assert payload["providers"]["adapter_setup_failure"] == {
+        "type": "MCPAdapterError",
+        "kind": "auth",
+    }
+    assert (
+        "adapter_setup_failed:auth:MCPAdapterError" in payload["readiness"]["blockers"]
+    )
+
+
+def test_cli_health_normalizes_untrusted_failure_kind(
+    kanban_home,
+    capsys,
+    monkeypatch,
+):
+    class ProviderError(RuntimeError):
+        kind = "auth:ghp_DO_NOT_PRINT"
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {
+            "kanban": {
+                "review_runner": {
+                    "enabled": True,
+                    "mode": "shadow",
+                    "providers": {
+                        "github": {
+                            "enabled": True,
+                            "adapter": "mcp",
+                            "repositories": ["owner/private"],
+                        }
+                    },
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        runner,
+        "_build_configured_mcp_adapters",
+        lambda _config: (_ for _ in ()).throw(ProviderError("secret provider text")),
+    )
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+
+    args = parser.parse_args(["kanban", "review-runner", "health", "--json"])
+    assert kc.kanban_command(args) == 0
+    output = capsys.readouterr().out
+    payload = json.loads(output)
+
+    assert "ghp_DO_NOT_PRINT" not in output
+    assert "secret provider text" not in output
+    assert payload["providers"]["adapter_setup_failure"] == {
+        "type": "ProviderError",
+        "kind": "unknown",
+    }
 
 
 @pytest.mark.asyncio
