@@ -278,6 +278,10 @@ def run_oneshot(
     _write_usage_file(usage_file, result)
 
     if response:
+        # Replace lone surrogates (e.g. U+D800 from a malformed provider
+        # response) with U+FFFD so stdout.write() does not crash.
+        # See #80366.
+        response = response.encode("utf-8", "surrogatepass").decode("utf-8", "replace")
         real_stdout.write(response)
         if not response.endswith("\n"):
             real_stdout.write("\n")
