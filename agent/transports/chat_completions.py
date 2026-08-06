@@ -77,16 +77,29 @@ def _add_prompt_cache_key(
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
-    """Return the model's wire-compatible reasoning config."""
+    """Return the model's wire-compatible reasoning config.
+
+    ``ultra`` and ``max`` are OpenAI-specific effort levels for gpt-5.6.
+    Custom OpenAI-compatible providers typically accept only ``low``,
+    ``medium``, and ``high``; passing ``ultra`` or ``max`` to them triggers
+    HTTP 422.  Clamp unsupported levels down to ``high`` for non-gpt-5.6
+    models so the agent degrades gracefully instead of crashing.
+    """
     if not isinstance(reasoning_config, dict):
         return reasoning_config
-    if (
-        "gpt-5.6" in (model or "").lower()
-        and str(reasoning_config.get("effort") or "").strip().lower() == "ultra"
-    ):
-        normalized = dict(reasoning_config)
-        normalized["effort"] = "max"
-        return normalized
+    effort = str(reasoning_config.get("effort") or "").strip().lower()
+    if "gpt-5.6" in (model or "").lower():
+        if effort == "ultra":
+            normalized = dict(reasoning_config)
+            normalized["effort"] = "max"
+            return normalized
+    else:
+        # Non-gpt-5.6 models: clamp ultra/max to high to avoid 422s
+        # from providers that only accept low/medium/high.
+        if effort in {"ultra", "max"}:
+            normalized = dict(reasoning_config)
+            normalized["effort"] = "high"
+            return normalized
     return reasoning_config
 
 

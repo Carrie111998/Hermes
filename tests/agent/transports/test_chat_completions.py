@@ -39,6 +39,79 @@ class TestChatCompletionsBasic:
         assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
 
 
+    @pytest.mark.parametrize("effort", ["ultra", "max"])
+    def test_non_gpt56_ultra_max_clamped_to_high(self, transport, effort):
+        """Custom providers that only accept low/medium/high get HTTP 422
+        when ultra or max is passed through.  The transport must clamp
+        these to high for non-gpt-5.6 models.  Regression test for #80242.
+        """
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        kw = transport.build_kwargs(
+            model="agnes-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": effort},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="custom",
+            base_url=profile.base_url,
+        )
+        # Custom provider surfaces reasoning as top-level reasoning_effort
+        assert kw["reasoning_effort"] == "high"
+
+    @pytest.mark.parametrize("effort", ["low", "medium", "high"])
+    def test_non_gpt56_valid_efforts_pass_through(self, transport, effort):
+        """Standard effort levels must not be altered for non-gpt-5.6 models."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("custom")
+        kw = transport.build_kwargs(
+            model="agnes-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": effort},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="custom",
+            base_url=profile.base_url,
+        )
+        assert kw["reasoning_effort"] == effort
+
+    def test_gpt56_max_passes_through_unchanged(self, transport):
+        """gpt-5.6 with effort=max should pass through as-is (not clamped)."""
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        kw = transport.build_kwargs(
+            model="openai/gpt-5.6-sol",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "max"},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="nous",
+            base_url=profile.base_url,
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "max"}
+
+    def test_nous_non_gpt56_ultra_clamped_to_high(self, transport):
+        """Via the Nous provider, a non-gpt-5.6 model with ultra should
+        also be clamped to high (reasoning surfaces in extra_body there).
+        """
+        from providers import get_provider_profile
+        profile = get_provider_profile("nous")
+        kw = transport.build_kwargs(
+            model="agnes-2.5-flash",
+            messages=[{"role": "user", "content": "Hi"}],
+            tools=[],
+            reasoning_config={"enabled": True, "effort": "ultra"},
+            supports_reasoning=True,
+            provider_profile=profile,
+            provider_name="nous",
+            base_url=profile.base_url,
+        )
+        assert kw["extra_body"]["reasoning"] == {"enabled": True, "effort": "high"}
+
+
     def test_convert_messages_no_codex_leaks(self, transport):
         msgs = [{"role": "user", "content": "hi"}]
         result = transport.convert_messages(msgs)
