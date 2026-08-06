@@ -605,6 +605,26 @@ def _bare_adapter():
     return A2AAdapter(PlatformConfig(enabled=True))
 
 
+class TestAutoTtsDisabled:
+    """A2A is an agent-to-agent text protocol: audio replies are not
+    deliverable, so auto-TTS must never fire for an A2A chat. Without this
+    override, gateway auto-tts would synthesize a voice reply, fail to
+    deliver the audio attachment, and swallow the real text reply."""
+
+    def test_should_auto_tts_is_false_for_any_chat(self):
+        adapter = _bare_adapter()
+        assert adapter._should_auto_tts_for_chat("ctx-any") is False
+        assert adapter._should_auto_tts_for_chat("") is False
+
+    def test_override_exists_on_adapter(self):
+        from plugins.platforms.a2a.adapter import A2AAdapter
+        from gateway.platforms.base import BasePlatformAdapter
+        # Explicit override (not inherited default): the default base
+        # implementation consults voice config, which would enable TTS on
+        # the A2A platform — exactly what must not happen.
+        assert A2AAdapter._should_auto_tts_for_chat is not BasePlatformAdapter._should_auto_tts_for_chat
+
+
 class TestReplyCapture:
     def test_send_waits_for_notify_marked_final_reply(self):
         """Interim/editable sends must not satisfy the blocked A2A RPC future."""

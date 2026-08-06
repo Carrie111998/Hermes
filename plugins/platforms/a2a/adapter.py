@@ -1268,5 +1268,11 @@ class A2AAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         return None
 
+    def _should_auto_tts_for_chat(self, chat_id: str) -> bool:
+        """A2A is an agent-to-agent text protocol — audio replies are not
+        supported on this platform. Disable auto-TTS so real text replies
+        are not swallowed by a voice fallback error."""
+        return False
+
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         return {"name": f"a2a:{chat_id}", "type": "dm"}
