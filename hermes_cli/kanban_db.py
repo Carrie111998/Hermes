@@ -1683,6 +1683,41 @@ CREATE TABLE IF NOT EXISTS slack_human_review_acknowledgements (
     recorded_at           INTEGER NOT NULL
 );
 
+-- Cross-system reconciliation is an audit/recommendation boundary only. A
+-- run stores deterministic machine and human reports, but never mutates the
+-- Linear, GitHub, CodeRabbit, human-gate, or Slack source rows it inspected.
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    id                       TEXT PRIMARY KEY,
+    schema_version           INTEGER NOT NULL,
+    policy_version           TEXT NOT NULL,
+    input_sha256             TEXT NOT NULL,
+    status                   TEXT NOT NULL,
+    finding_count            INTEGER NOT NULL,
+    report_json              TEXT NOT NULL,
+    report_sha256            TEXT NOT NULL,
+    report_markdown          TEXT NOT NULL,
+    markdown_sha256          TEXT NOT NULL,
+    created_at               INTEGER NOT NULL
+);
+
+-- Findings are copied out of the immutable report for indexed querying. The
+-- stable finding key is scoped to one idempotent run and contains no action
+-- capability; later migration/delivery phases must re-read source truth.
+CREATE TABLE IF NOT EXISTS reconciliation_findings (
+    run_id                    TEXT NOT NULL,
+    finding_key               TEXT NOT NULL,
+    category                  TEXT NOT NULL,
+    severity                  TEXT NOT NULL,
+    source                    TEXT NOT NULL,
+    linear_issue_id           TEXT,
+    repository                TEXT,
+    pr_number                 INTEGER,
+    expected_head_sha         TEXT,
+    observed_head_sha         TEXT,
+    finding_json              TEXT NOT NULL,
+    PRIMARY KEY (run_id, finding_key)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1750,6 +1785,12 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_ack_semantic_replay
     ON slack_human_review_acknowledgements(source_intent_id, payload_sha256);
 CREATE INDEX IF NOT EXISTS idx_slack_ack_thread
     ON slack_human_review_acknowledgements(channel_id, thread_ts, observed_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_reconciliation_run_input
+    ON reconciliation_runs(policy_version, input_sha256);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_run_status
+    ON reconciliation_runs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_reconciliation_finding_category
+    ON reconciliation_findings(category, severity, repository, pr_number);
 """
 
 

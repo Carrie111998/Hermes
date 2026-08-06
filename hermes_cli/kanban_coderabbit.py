@@ -869,6 +869,17 @@ def _assessment_from_row(row: sqlite3.Row) -> CodeRabbitAssessment:
     )
 
 
+def list_assessments(
+    conn: sqlite3.Connection,
+) -> tuple[CodeRabbitAssessment, ...]:
+    """Return all immutable per-head assessment aggregates for reconciliation."""
+    rows = conn.execute(
+        "SELECT * FROM coderabbit_head_assessments "
+        "ORDER BY repository, pr_number, head_sha"
+    ).fetchall()
+    return tuple(_assessment_from_row(row) for row in rows)
+
+
 def record_snapshot(
     conn: sqlite3.Connection,
     *,
