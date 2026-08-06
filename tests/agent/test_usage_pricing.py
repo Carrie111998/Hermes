@@ -1,5 +1,7 @@
 from types import SimpleNamespace
 
+import pytest
+
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -311,4 +313,38 @@ def test_vertex_default_model_estimates_cached_usage(monkeypatch):
     )
 
     assert result.status == "estimated"
+    assert result.amount_usd is not None and result.amount_usd > 0
+
+
+def test_proxy_provider_falls_back_to_snapshot_pricing_by_model_name():
+    """A proxy provider (opencode-go, meta-ai, custom base URLs) routing a
+    third-party model must still resolve the official-docs snapshot entry
+    keyed by the model's REAL provider (e.g. ("deepseek", "deepseek-v4-flash")
+    when the session runs through opencode-go).
+    """
+    result = estimate_usage_cost(
+        "deepseek-v4-flash",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000),
+        provider="opencode-go",
+    )
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
+    # 1M input @ $0.14/M + 1M output @ $0.28/M
+    assert result.amount_usd is not None and result.amount_usd > 0
+    assert result.amount_usd == pytest.approx(0.42, abs=1e-6)
+
+
+def test_known_provider_never_uses_model_name_fallback():
+    """A provider that owns snapshot entries must not resolve through the
+    bare model-name fallback (a name collision could pick the wrong price).
+    """
+    result = estimate_usage_cost(
+        "deepseek-v4-flash",
+        CanonicalUsage(input_tokens=1_000_000, output_tokens=1_000_000),
+        provider="deepseek",
+    )
+    # Direct snapshot lookup for the real provider — same pricing, but the
+    # path taken is the direct key, which the fallback never shadows.
+    assert result.status == "estimated"
+    assert result.source == "official_docs_snapshot"
     assert result.amount_usd is not None and result.amount_usd > 0

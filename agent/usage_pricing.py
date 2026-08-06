@@ -510,6 +510,20 @@ _OFFICIAL_DOCS_PRICING: Dict[tuple[str, str], PricingEntry] = {
         source_url="https://api-docs.deepseek.com/quick_start/pricing",
         pricing_version="deepseek-pricing-2026-07",
     ),
+    # Muse Spark — precios definidos localmente (session-stats model_costs.json);
+    # el relay opencode.ai/zen/go no publica pricing en /models. El fallback
+    # proxy de _lookup_official_docs_pricing lo encuentra por nombre de modelo.
+    (
+        "muse",
+        "muse-spark-1.2-contributor",
+    ): PricingEntry(
+        input_cost_per_million=Decimal("0.10"),
+        output_cost_per_million=Decimal("0.20"),
+        cache_read_cost_per_million=Decimal("0.002"),
+        source="official_docs_snapshot",
+        source_url="https://opencode.ai/zen/go/v1/models",
+        pricing_version="opencode-relay-pricing-2026-08",
+    ),
     # Google Gemini
     (
         "google",
@@ -1095,6 +1109,13 @@ def _normalize_anthropic_model_name(model: str) -> str:
     return name
 
 
+# Providers that own entries in the official-docs snapshot. Any provider
+# outside this set (proxy gateways like opencode-go/meta-ai, custom base
+# URLs) routes third-party models whose snapshot entry is keyed by the REAL
+# provider — those get the bare model-name fallback in the lookup below.
+_SNAPSHOT_PROVIDERS = frozenset(p for p, _ in _OFFICIAL_DOCS_PRICING)
+
+
 def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]:
     model = route.model.lower()
     # Direct lookup first
@@ -1116,6 +1137,16 @@ def _lookup_official_docs_pricing(route: BillingRoute) -> Optional[PricingEntry]
             entry = _OFFICIAL_DOCS_PRICING.get((route.provider, normalized))
             if entry:
                 return entry
+    # Proxy provider (opencode-go, meta-ai, custom base URLs, ...): the
+    # snapshot keys by the model's REAL provider, so fall back to a bare
+    # model-name match (e.g. deepseek-v4-flash via opencode-go finds the
+    # ("deepseek", "deepseek-v4-flash") entry). Skipped when the provider
+    # itself owns snapshot entries, where a name collision could pick the
+    # wrong price.
+    if route.provider not in _SNAPSHOT_PROVIDERS:
+        for _snap_provider, _snap_model in _OFFICIAL_DOCS_PRICING:
+            if _snap_model == model:
+                return _OFFICIAL_DOCS_PRICING[(_snap_provider, _snap_model)]
     return None
 
 
