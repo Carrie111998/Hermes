@@ -18,6 +18,8 @@ SILENT_REPLY_TOKEN = "NO_REPLY"
 # error/empty-response path, not silence.
 LIVE_GATEWAY_SILENT_MARKERS = frozenset({
     "[SILENT]",
+    "[SILENT",
+    "SILENT]",
     "SILENT",
     "NO_REPLY",
     "NO REPLY",
@@ -31,9 +33,8 @@ def _canonical_silence_candidate(text: str) -> str:
 def _strip_edge_silence_punctuation(text: str) -> str:
     """Strip stray edge punctuation without erasing marker structure.
 
-    Models sometimes emit ``.NO_REPLY`` or ``*NO_REPLY*`` instead of the exact
-    marker. Keep square brackets structural so malformed ``[SILENT`` does not
-    become ``SILENT``.
+    Models sometimes emit ``.NO_REPLY``, ``*NO_REPLY*``, or malformed ``[SILENT``
+    without closing brackets. Strip edge punctuation and handle unclosed brackets.
     """
     start = 0
     end = len(text)
@@ -41,7 +42,12 @@ def _strip_edge_silence_punctuation(text: str) -> str:
         start += 1
     while end > start and text[end - 1] not in "[]" and unicodedata.category(text[end - 1]).startswith("P"):
         end -= 1
-    return text[start:end].strip()
+    res = text[start:end].strip()
+    if res.startswith("[") and not res.endswith("]"):
+        res = res[1:].strip()
+    elif res.endswith("]") and not res.startswith("["):
+        res = res[:-1].strip()
+    return res
 
 
 def _canonical_silence_candidates(text: str) -> tuple[str, ...]:
@@ -106,7 +112,7 @@ def is_autonomous_silence_response(response: Any) -> bool:
     # Bracketed sentinel used as a same-line prefix — the documented pattern
     # "[SILENT] No changes detected".  Restricted to the bracketed form so a
     # bare word like "Silent retry succeeded" is NOT swallowed.
-    if stripped.upper().startswith("[SILENT]"):
+    if stripped.upper().startswith("[SILENT]") or stripped.upper().startswith("[SILENT"):
         return True
     return False
 

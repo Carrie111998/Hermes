@@ -7365,6 +7365,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             return 0
 
+    def get_profile_adapters(self, profile_name: str) -> Dict[Platform, Any]:
+        """Return the adapter map for a specific profile under multiplexing."""
+        if not getattr(self.config, "multiplex_profiles", False):
+            return self.adapters
+        from hermes_cli.profiles import get_active_profile_name
+        if profile_name in ("default", get_active_profile_name()):
+            return self.adapters
+        prof_map = getattr(self, "_profile_adapters", {}).get(profile_name)
+        return prof_map if prof_map else self.adapters
+
     # ── scale-to-zero idle detection / dormant-quiesce (Phase 0) ──────────────
     # The gateway-side BEHAVIOUR that consumes the relay scale-to-zero primitives
     # (gateway-gateway Phase 5). Pure logic lives in gateway/scale_to_zero.py; the
@@ -26816,7 +26826,11 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     from cron.scheduler_provider import InProcessCronScheduler, resolve_cron_scheduler
     cron_stop = threading.Event()
     cron_provider = resolve_cron_scheduler()
-    cron_start_kwargs: Dict[str, Any] = {"adapters": runner.adapters, "loop": asyncio.get_running_loop()}
+    cron_start_kwargs: Dict[str, Any] = {
+        "adapters": runner.adapters,
+        "loop": asyncio.get_running_loop(),
+        "get_profile_adapters": runner.get_profile_adapters,
+    }
 
     # Multiplex profiles: tell the built-in ticker which profile homes to
     # tick so secondary-profile cron jobs actually fire (#69377).

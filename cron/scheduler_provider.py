@@ -178,6 +178,7 @@ class InProcessCronScheduler(CronScheduler):
         stop_event,
         *,
         adapters=None,
+        get_profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -206,6 +207,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event,
                 profile_homes=profile_homes,
                 adapters=adapters,
+                get_profile_adapters=get_profile_adapters,
                 loop=loop,
                 interval=interval,
                 can_dispatch=can_dispatch,
@@ -252,12 +254,12 @@ class InProcessCronScheduler(CronScheduler):
                 # uid went unnoticed for ~14h with the reason buried in the
                 # gateway log (#68483).
                 record_ticker_error(f"{type(e).__name__}: {e}")
+            else:
+                clear_ticker_error()
             # Record liveness every iteration; bump the success marker only on a
             # clean tick, so status can tell "alive but failing every tick" from
             # "actually firing jobs" (#32612, #32895).
             record_ticker_heartbeat(success=ok)
-            if ok:
-                clear_ticker_error()
             stop_event.wait(interval)
 
     def _start_multiplex(
@@ -266,6 +268,7 @@ class InProcessCronScheduler(CronScheduler):
         *,
         profile_homes,
         adapters=None,
+        get_profile_adapters=None,
         loop=None,
         interval=60,
         can_dispatch=None,
@@ -319,13 +322,22 @@ class InProcessCronScheduler(CronScheduler):
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
                     for entry in profile_homes:
+                        profile_name = entry[0] if isinstance(entry, tuple) else None
                         home = entry[1] if isinstance(entry, tuple) else entry
                         home_token = set_hermes_home_override(str(home))
+                        tick_adapters = adapters
+                        if profile_name and get_profile_adapters is not None:
+                            try:
+                                prof_adapters = get_profile_adapters(profile_name)
+                                if prof_adapters:
+                                    tick_adapters = prof_adapters
+                            except Exception:
+                                pass
                         try:
                             with use_cron_store(home):
                                 cron_tick(
                                     verbose=False,
-                                    adapters=adapters,
+                                    adapters=tick_adapters,
                                     loop=loop,
                                     sync=False,
                                     can_dispatch=can_dispatch,
