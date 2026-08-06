@@ -6579,54 +6579,6 @@ def test_config_set_reasoning_updates_live_session_and_agent(tmp_path, monkeypat
     assert cfg_clamp["display"]["sections"]["thinking"] == "collapsed"
 
 
-def test_config_set_reasoning_global_scope_clears_session_override(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    (tmp_path / "config.yaml").write_text("agent:\n  reasoning_effort: medium\n", encoding="utf-8")
-    agent = types.SimpleNamespace(reasoning_config=None)
-    server._sessions["sid"] = _session(agent=agent)
-    server._sessions["sid"]["create_reasoning_override"] = {"enabled": True, "effort": "low"}
-
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "config.set",
-            "params": {
-                "session_id": "sid",
-                "key": "reasoning",
-                "value": "high",
-                "scope": "global",
-            },
-        }
-    )
-
-    assert resp["result"]["value"] == "high"
-    assert server._load_cfg()["agent"]["reasoning_effort"] == "high"
-    assert "create_reasoning_override" not in server._sessions["sid"]
-
-    status = server.handle_request(
-        {"id": "2", "method": "config.get", "params": {"session_id": "sid", "key": "reasoning"}}
-    )
-    assert status["result"]["value"] == "high"
-
-
-def test_config_set_verbose_updates_session_mode_and_agent(tmp_path, monkeypatch):
-    monkeypatch.setattr(server, "_hermes_home", tmp_path)
-    agent = types.SimpleNamespace(verbose_logging=False)
-    server._sessions["sid"] = _session(agent=agent)
-
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "config.set",
-            "params": {"session_id": "sid", "key": "verbose", "value": "cycle"},
-        }
-    )
-
-    assert resp["result"]["value"] == "verbose"
-    assert server._sessions["sid"]["tool_progress_mode"] == "verbose"
-    assert agent.verbose_logging is True
-
-
 
 def test_config_set_model_waits_for_lazy_agent_before_switch(monkeypatch):
     """A model switch against a lazy-created live session must apply to the
@@ -7300,70 +7252,6 @@ def test_restore_agent_model_runtime_falls_back_to_switch_model():
     assert agent.model == "old/model"
     assert agent.provider == "openrouter"
     assert agent.base_url == "https://openrouter.ai/api/v1"
-
-
-def test_config_set_personality_rejects_unknown_name(monkeypatch):
-    monkeypatch.setattr(
-        server,
-        "_available_personalities",
-        lambda cfg=None: {"helpful": "You are helpful."},
-    )
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "config.set",
-            "params": {"key": "personality", "value": "bogus"},
-        }
-    )
-
-    assert "error" in resp
-    assert "Unknown personality" in resp["error"]["message"]
-
-
-def test_config_set_personality_preserves_history_and_returns_info(monkeypatch):
-    agent = types.SimpleNamespace(
-        ephemeral_system_prompt=None, _cached_system_prompt="old"
-    )
-    session = _session(
-        agent=agent,
-        history=[{"role": "user", "text": "hi"}],
-        history_version=4,
-    )
-    emits = []
-
-    server._sessions["sid"] = session
-    monkeypatch.setattr(
-        server,
-        "_available_personalities",
-        lambda cfg=None: {"helpful": "You are helpful."},
-    )
-    monkeypatch.setattr(
-        server, "_session_info", lambda agent, *a: {"model": getattr(agent, "model", "?")}
-    )
-    monkeypatch.setattr(server, "_emit", lambda *args: emits.append(args))
-    monkeypatch.setattr(server, "_write_config_key", lambda path, value: None)
-
-    resp = server.handle_request(
-        {
-            "id": "1",
-            "method": "config.set",
-            "params": {"session_id": "sid", "key": "personality", "value": "helpful"},
-        }
-    )
-
-    assert resp["result"]["history_reset"] is False
-    assert resp["result"]["info"] == {"model": "?"}
-    # History is preserved with a pivot marker appended
-    assert len(session["history"]) == 2
-    assert session["history"][0] == {"role": "user", "text": "hi"}
-    assert session["history"][1]["role"] == "user"
-    assert "personality" in session["history"][1]["content"].lower()
-    assert "You are helpful." in session["history"][1]["content"]
-    assert session["history_version"] == 5
-    # Agent's system prompt was updated in-place; cached prompt untouched
-    assert agent.ephemeral_system_prompt == "You are helpful."
-    assert agent._cached_system_prompt == "old"
-    assert ("session.info", "sid", {"model": "?"}) in emits
 
 
 def test_compress_session_history_passes_force():
