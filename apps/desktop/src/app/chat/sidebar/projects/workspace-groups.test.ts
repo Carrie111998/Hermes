@@ -6,6 +6,7 @@ import type { ProjectInfo, SessionInfo } from '@/types/hermes'
 import {
   baseName,
   excludeProjectSessions,
+  KEEP_ALL_PROJECT_SESSIONS,
   kanbanWorktreeDir,
   liveSessionProjectId,
   mergeRepoWorktreeGroups,
@@ -937,7 +938,32 @@ describe('excludeProjectSessions', () => {
       sessionCount: 1
     })
 
-    expect(excludeProjectSessions(project, () => false)).toBe(project)
+    expect(excludeProjectSessions(project, KEEP_ALL_PROJECT_SESSIONS)).toBe(project)
+  })
+
+  it('KEEP_ALL_PROJECT_SESSIONS keeps pinned sessions in the project tree', () => {
+    // #80013 contract: both the overview and drill-in pass this predicate so
+    // a pinned session stays in its project group (pinning adds a Pinned
+    // accelerator, it never removes the session from the project tree).
+    const pinnedRow = makeSession('/www/app', { id: 'pinned' })
+
+    const project = projectNode({
+      id: '/www/app',
+      previewSessions: [pinnedRow],
+      repos: [
+        {
+          id: '/www/app',
+          label: 'app',
+          path: '/www/app',
+          sessionCount: 1,
+          groups: [lane({ id: 'main', isMain: true, label: 'main', sessions: [pinnedRow] })]
+        }
+      ],
+      sessionCount: 1
+    })
+
+    expect(excludeProjectSessions(project, KEEP_ALL_PROJECT_SESSIONS)).toBe(project)
+    expect(excludeProjectSessions(project, KEEP_ALL_PROJECT_SESSIONS).repos[0].groups[0].sessions.map(s => s.id)).toEqual(['pinned'])
   })
 
   it('survives the live overlay: a lane left empty by the filter is not pruned', () => {

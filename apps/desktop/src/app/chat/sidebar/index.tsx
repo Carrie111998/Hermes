@@ -115,6 +115,7 @@ import { ProfileRail } from './profile-switcher'
 import { ProjectDialog } from './project-dialog'
 import {
   excludeProjectSessions,
+  KEEP_ALL_PROJECT_SESSIONS,
   orderProjectsByIds,
   overlayLiveLanes,
   overlayLivePreviews,
@@ -621,7 +622,10 @@ export function ChatSidebar({
             label: project.isNoProject ? s.projects.home : project.label,
             repos: orderRepos(project.repos)
           },
-          isPinnedSession
+          // Pinned sessions stay in their project group (#80013): pinning
+          // adds a Pinned-section accelerator, it does not remove the
+          // session from the project tree. Same contract as the drill-in.
+          KEEP_ALL_PROJECT_SESSIONS
         )
       ),
       activeProjectId
@@ -638,7 +642,6 @@ export function ChatSidebar({
     orderRepos,
     activeProjectId,
     projectOrderIds,
-    isPinnedSession,
     s
   ])
 
@@ -710,7 +713,7 @@ export function ChatSidebar({
     // presentation copy (Home is translated there), not the raw payload's.
     return excludeProjectSessions(
       { ...hydrated, label: overviewEnteredProject.label, repos: orderRepos(hydrated.repos) },
-      () => false
+      KEEP_ALL_PROJECT_SESSIONS
     )
   }, [overviewEnteredProject, enteredProjectTree, orderRepos])
 
