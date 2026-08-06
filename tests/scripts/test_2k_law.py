@@ -32,7 +32,7 @@ EXCLUDED_PREFIXES = ("venv.", "\.venv", "node_modules", "site-packages")
 
 # God-files on the kill track — the FULL 2K surface (the Pantheon of False Gods).
 # Every code file over 2,000 lines is tracked here, measured at origin/main
-# 2026-08-05 (118 entries). Each entry MUST be removed when its kill ships
+# 2026-08-05 (119 entries). Each entry MUST be removed when its kill ships
 # (monotonic shrink = the completion record). Vendor trees are excluded
 # (third-party). The full ledger with tracking state is posted on epic #78647.
 OVER_2K_MANIFEST = {
