@@ -1611,6 +1611,78 @@ CREATE TABLE IF NOT EXISTS github_human_review_attempts (
     attempted_at      INTEGER NOT NULL
 );
 
+-- Slack is a notification and acknowledgement surface only. Routing identity
+-- is explicit and immutable: no channel, thread, mention, or acknowledgement
+-- is inferred from ambient gateway state. The outbox contains no credentials
+-- and exposes no GitHub approval, merge, branch-write, or channel-management
+-- capability.
+CREATE TABLE IF NOT EXISTS slack_human_review_outbox (
+    id                         TEXT PRIMARY KEY,
+    gate_id                    TEXT NOT NULL,
+    source_intent_id           TEXT,
+    repository                 TEXT NOT NULL,
+    pr_number                  INTEGER NOT NULL,
+    head_sha                   TEXT NOT NULL,
+    channel_id                 TEXT NOT NULL,
+    thread_ts                  TEXT NOT NULL DEFAULT '',
+    surface                    TEXT NOT NULL,
+    operation                  TEXT NOT NULL,
+    payload_json               TEXT NOT NULL,
+    payload_sha256             TEXT NOT NULL,
+    idempotency_key            TEXT NOT NULL,
+    state                      TEXT NOT NULL,
+    attempt_count              INTEGER NOT NULL DEFAULT 0,
+    max_attempts               INTEGER NOT NULL DEFAULT 3,
+    next_attempt_at            INTEGER,
+    external_message_ts        TEXT,
+    delivered_thread_ts        TEXT,
+    last_snapshot_sha256       TEXT,
+    last_snapshot_observed_at  INTEGER,
+    last_failure_kind          TEXT,
+    last_error                 TEXT,
+    created_at                 INTEGER NOT NULL,
+    updated_at                 INTEGER NOT NULL,
+    sent_at                    INTEGER
+);
+
+-- Append-only delivery outcomes preserve timeout-after-send/readback evidence
+-- and make each independently retryable Slack destination auditable.
+CREATE TABLE IF NOT EXISTS slack_human_review_attempts (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    intent_id         TEXT NOT NULL,
+    attempt_number    INTEGER NOT NULL,
+    outcome           TEXT NOT NULL,
+    retryable         INTEGER NOT NULL,
+    snapshot_sha256   TEXT,
+    external_message_ts TEXT,
+    failure_kind      TEXT,
+    error             TEXT,
+    attempted_at      INTEGER NOT NULL
+);
+
+-- Inbound Slack reactions/text/buttons are normalized to acknowledgement-only
+-- evidence tied to the stored notification route and exact PR head. Raw text is
+-- not persisted, and these receipts never mutate GitHub review authority.
+CREATE TABLE IF NOT EXISTS slack_human_review_acknowledgements (
+    id                    TEXT PRIMARY KEY,
+    source_intent_id      TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    event_id              TEXT NOT NULL,
+    gate_id               TEXT NOT NULL,
+    repository            TEXT NOT NULL,
+    pr_number             INTEGER NOT NULL,
+    head_sha              TEXT NOT NULL,
+    channel_id            TEXT NOT NULL,
+    thread_ts             TEXT NOT NULL,
+    message_ts            TEXT NOT NULL,
+    user_id               TEXT NOT NULL,
+    source                TEXT NOT NULL,
+    normalized_action     TEXT NOT NULL,
+    payload_sha256        TEXT NOT NULL,
+    observed_at           INTEGER NOT NULL,
+    recorded_at           INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1662,6 +1734,22 @@ CREATE INDEX IF NOT EXISTS idx_github_outbox_due
     ON github_human_review_outbox(state, next_attempt_at, created_at);
 CREATE UNIQUE INDEX IF NOT EXISTS uq_github_attempt_number
     ON github_human_review_attempts(intent_id, attempt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_outbox_semantic_identity
+    ON slack_human_review_outbox(
+        channel_id, thread_ts, repository, pr_number, head_sha, surface, operation
+    );
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_outbox_idempotency_key
+    ON slack_human_review_outbox(idempotency_key);
+CREATE INDEX IF NOT EXISTS idx_slack_outbox_due
+    ON slack_human_review_outbox(state, next_attempt_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_attempt_number
+    ON slack_human_review_attempts(intent_id, attempt_number);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_ack_provider_event
+    ON slack_human_review_acknowledgements(provider, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_slack_ack_semantic_replay
+    ON slack_human_review_acknowledgements(source_intent_id, payload_sha256);
+CREATE INDEX IF NOT EXISTS idx_slack_ack_thread
+    ON slack_human_review_acknowledgements(channel_id, thread_ts, observed_at);
 """
 
 
