@@ -535,6 +535,11 @@ class ComputeHost:
                 session["profile_home"] = str(frame.get("profile_home"))
             if isinstance(frame.get("attached_images"), list):
                 session["attached_images"] = list(frame.get("attached_images") or [])
+            # Adopt a model switch queued on the server side while this
+            # session was busy. _run_prompt_submit's turn thread applies it via
+            # _apply_pending_model_switch — HERE the live agent exists.
+            if frame.get("pending_model_switch"):
+                session["pending_model_switch"] = dict(frame["pending_model_switch"])
             return session
 
         history = frame.get("history") if isinstance(frame.get("history"), list) else []
@@ -622,6 +627,10 @@ class ComputeHost:
             session["attached_images"] = list(frame.get("attached_images") or [])
         if frame.get("model_override") is not None:
             session["model_override"] = frame.get("model_override")
+        # See the existing-session branch above — queued model switch
+        # crosses the process boundary and applies at this child's turn start.
+        if frame.get("pending_model_switch"):
+            session["pending_model_switch"] = dict(frame["pending_model_switch"])
         return session
 
     def _handle_reload_mcp(self, frame: dict[str, Any]) -> None:
