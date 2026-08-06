@@ -345,6 +345,41 @@ def _normalize_matrix_bang_command(text: str) -> str:
     return f"/{resolved}{match.group(2) or ''}"
 
 
+# Phantom interrupt / redirect / self-improvement-review messages emitted by
+# the gateway's own orchestrator (or leaked from upstream runtime scaffolding)
+# arrive at intake as if they were user messages. If we dispatch them they
+# trigger another phantom notice, forming a self-perpetuating loop until
+# the homeserver rate-limits the connection.
+#
+# Filter at intake. Full-prefix match only — a real user message that
+# happens to mention one of these tokens mid-sentence (e.g. "⚡ Interrupting
+# my workout to ask you…") must still pass through. See
+# ``test_matrix_phantom_intake_filter.py``.
+PHANTOM_INTAKE_PREFIXES = (
+    "[This response was interrupted by a user correction.]",
+    "↪ Redirected current run",
+    "⚡ Interrupting current task.",
+    "⚡ Interrupting current task:",  # occasional trailing-colon variant
+    "⚡ Stopped.",
+    "No active task to stop.",
+    "♻️ Recovered reply",
+    "💾 Self-improvement review:",
+    "💭 Reasoning:",
+)
+
+
+def _is_phantom_intake_message(body: str) -> bool:
+    """Return True if ``body`` matches a phantom notice shape that should
+    be dropped at intake instead of dispatched to the model."""
+    if not body:
+        return False
+    stripped = body.lstrip()
+    for prefix in PHANTOM_INTAKE_PREFIXES:
+        if stripped.startswith(prefix):
+            return True
+    return False
+
+
 class _MatrixHtmlSanitizer(HTMLParser):
     """Allowlist sanitizer for Matrix-compatible formatted HTML."""
 
@@ -3087,6 +3122,34 @@ class MatrixAdapter(BasePlatformAdapter):
             sender,
             room_id,
         )
+
+        # Phantom intake filter — drop orchestrator-emitted notices
+        # (interrupts, redirects, self-improvement reviews, recovered
+        # replies, reasoning bubbles) before any sender/room gating so
+        # they never reach the model. See _is_phantom_intake_message
+        # for the full shape list.
+        _content_for_phantom_check = getattr(event, "content", None)
+        if _content_for_phantom_check is not None:
+            if hasattr(_content_for_phantom_check, "body"):
+                _phantom_body = str(
+                    getattr(_content_for_phantom_check, "body", "") or ""
+                )
+            elif isinstance(_content_for_phantom_check, dict):
+                _phantom_body = str(
+                    _content_for_phantom_check.get("body", "") or ""
+                )
+            else:
+                _phantom_body = ""
+            if _is_phantom_intake_message(_phantom_body):
+                logger.debug(
+                    "Matrix: dropping phantom notice at intake (event=%s sender=%s "
+                    "room=%s head=%r)",
+                    getattr(event, "event_id", "?"),
+                    sender,
+                    room_id,
+                    _phantom_body[:40],
+                )
+                return
 
         # Ignore own messages (case-insensitive; also drops when our own
         # user_id hasn't been resolved yet — see _is_self_sender docstring
