@@ -2802,6 +2802,9 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    model: Optional[str] = None,
+    provider: Optional[str] = None,
+    reasoning_effort: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2877,10 +2880,14 @@ def delegate_task(
     # used by CLI/gateway startup.  When unconfigured, returns None values so
     # children inherit from the parent.
     try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
+        creds = _resolve_delegation_credentials(
+            cfg, 
+            parent_agent, 
+            model_override=model, 
+            provider_override=provider
+        )
     except ValueError as exc:
         return tool_error(str(exc))
-
     # Normalize to task list
     max_children = _get_max_concurrent_children()
     recovered_tasks, tasks_error = _recover_tasks_from_json_string(tasks)
@@ -3495,7 +3502,12 @@ def _resolve_child_credential_pool(
     return None
 
 
-def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
+def _resolve_delegation_credentials(
+    cfg: dict, 
+    parent_agent, 
+    model_override: Optional[str] = None, 
+    provider_override: Optional[str] = None
+) -> dict:
     """Resolve credentials for subagent delegation.
 
     If ``delegation.base_url`` is configured, subagents use that direct
@@ -3516,8 +3528,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
 
     Raises ValueError with a user-friendly message on credential failure.
     """
-    configured_model = str(cfg.get("model") or "").strip() or None
-    configured_provider = str(cfg.get("provider") or "").strip() or None
+    configured_model = (model_override or "").strip() or str(cfg.get("model") or "").strip() or None
+    configured_provider = (provider_override or "").strip() or str(cfg.get("provider") or "").strip() or None
     configured_base_url = str(cfg.get("base_url") or "").strip() or None
     configured_api_key = str(cfg.get("api_key") or "").strip() or None
     configured_api_mode = str(cfg.get("api_mode") or "").strip().lower() or None
@@ -3838,6 +3850,18 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "model": {
+                            "type": "string",
+                            "description": "Per-task model override.",
+                        },
+                        "provider": {
+                            "type": "string",
+                            "description": "Per-task provider override.",
+                        },
+                        "reasoning_effort": {
+                            "type": "string",
+                            "description": "Per-task reasoning effort override ('low', 'medium', 'high').",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3850,6 +3874,27 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Optional model override for this delegation call "
+                    "(e.g., 'gpt-4o', 'claude-3-5-sonnet')."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Optional provider override for this delegation call "
+                    "(e.g., 'openai', 'anthropic')."
+                ),
+            },
+            "reasoning_effort": {
+                "type": "string",
+                "description": (
+                    "Optional reasoning effort override for this delegation call "
+                    "('low', 'medium', 'high')."
+                ),
             },
             "background": {
                 "type": "boolean",
@@ -3867,7 +3912,6 @@ DELEGATE_TASK_SCHEMA = {
         "required": [],
     },
 }
-
 
 # --- Registry ---
 from tools.registry import registry, tool_error
