@@ -171,9 +171,24 @@ def contains_launchctl_submit_command(command: str) -> bool:
 
 
 def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
+    try:
+        path = Path(candidate).expanduser()
+    except RuntimeError:
+        # expanduser() raises RuntimeError (not OSError) when the home directory
+        # cannot be determined — e.g. a process started with `env -i`, a service
+        # account, or a stripped container environment. This guard runs on every
+        # terminal command, so letting that propagate turns an unresolvable `~`
+        # into a hard failure for commands that have nothing to do with gateway
+        # lifecycle. Fall back to the literal path: an unexpanded `~/x.sh` simply
+        # will not be readable, which the caller already handles.
+        path = Path(candidate)
     if not path.is_absolute():
-        path = Path(cwd or Path.cwd()) / path
+        try:
+            base = Path(cwd) if cwd else Path.cwd()
+        except OSError:
+            # A deleted or inaccessible cwd must not break the scan either.
+            return path
+        path = base / path
     return path
 
 
