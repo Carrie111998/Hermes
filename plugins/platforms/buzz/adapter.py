@@ -320,24 +320,35 @@ async def _exec_buzz(
 _MAX_CLI_MESSAGE_CHARS = 900
 
 
-def _bounded_cli_message(message: str) -> str:
+def _bounded_cli_message(message: str, redact_path: Optional[Path] = None) -> str:
+    if redact_path is not None:
+        message = message.replace(str(redact_path), redact_path.name)
     if len(message) <= _MAX_CLI_MESSAGE_CHARS:
         return message
     return f"{message[: _MAX_CLI_MESSAGE_CHARS - 3]}..."
 
 
-def _cli_error_message(stderr: str, returncode: int) -> str:
+def _cli_error_message(
+    stderr: str,
+    returncode: int,
+    *,
+    redact_path: Optional[Path] = None,
+) -> str:
     """Extract a bounded human-readable message from the CLI error contract."""
     text = (stderr or "").strip()
     try:
         data = json.loads(text)
         if isinstance(data, dict) and data.get("message"):
             return _bounded_cli_message(
-                f"{data.get('error', 'error')}: {data['message']} (exit {returncode})"
+                f"{data.get('error', 'error')}: {data['message']} (exit {returncode})",
+                redact_path,
             )
     except ValueError:
         pass
-    return _bounded_cli_message(text or f"buzz CLI failed with exit code {returncode}")
+    return _bounded_cli_message(
+        text or f"buzz CLI failed with exit code {returncode}",
+        redact_path,
+    )
 
 
 def _cli_retryable(raw: str, exit_code: int) -> bool:
@@ -726,7 +737,7 @@ class BuzzAdapter(BasePlatformAdapter):
             args += ["--reply-to", str(reply_target)]
         code, out, err = await self._run_cli(args, input_text=caption or "")
         if code != 0:
-            error = _cli_error_message(err, code).replace(str(local), local.name)
+            error = _cli_error_message(err, code, redact_path=local)
             return SendResult(
                 success=False,
                 error=error,

@@ -528,6 +528,41 @@ class TestBuzzAdapterSend:
         assert "handoff.txt" in result.error
 
     @pytest.mark.asyncio
+    async def test_send_document_redacts_long_path_before_bounding(self, tmp_path):
+        parent = tmp_path
+        private_parts = []
+        for index in range(6):
+            part = f"private-{index}-" + ("x" * 150)
+            private_parts.append(part)
+            parent = parent / part
+            parent.mkdir()
+        document = parent / "handoff.txt"
+        document.write_text("safe handoff", encoding="utf-8")
+        adapter = _make_adapter()
+        cli = _ScriptedCli()
+        cli.script(
+            "messages",
+            "send",
+            "",
+            code=2,
+            stderr=json.dumps(
+                {
+                    "error": "network",
+                    "message": f"upload failed for {document}: " + ("z" * 1_000),
+                    "retryable": True,
+                }
+            ),
+        )
+        adapter._run_cli = cli
+
+        result = await adapter.send_document(CHANNEL, str(document))
+
+        assert result.success is False
+        assert all(part not in result.error for part in private_parts)
+        assert "handoff.txt" in result.error
+        assert len(result.error) <= 900
+
+    @pytest.mark.asyncio
     async def test_send_document_honors_non_retryable_cli_error(self, tmp_path):
         document = tmp_path / "handoff.txt"
         document.write_text("safe handoff", encoding="utf-8")
