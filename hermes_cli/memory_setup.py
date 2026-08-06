@@ -475,6 +475,25 @@ def _write_env_vars(env_path: Path, env_writes: dict) -> None:
 # Status
 # ---------------------------------------------------------------------------
 
+def _provider_runtime_missing(provider_name: str) -> tuple[str, ...]:
+    """Specs the provider's runtime lazy-install gate would still try to install.
+
+    Memory providers gate their retain/recall path on
+    ``tools.lazy_deps.ensure(f"memory.{name}")`` (e.g. hindsight's
+    ``_get_client`` calls ``ensure("memory.hindsight")``). The status
+    command must run that same predicate or it reports "available ✓" while
+    every write fails on a version/install check the runtime enforces
+    (#80388). Returns () when the provider has no matching lazy feature or
+    lazy_deps can't be imported — the runtime guards its ``ensure`` import
+    the same way, so both fail open together.
+    """
+    try:
+        from tools.lazy_deps import feature_missing
+        return feature_missing(f"memory.{provider_name}")
+    except Exception:
+        return ()
+
+
 def cmd_status(args) -> None:
     """Show current memory provider config."""
     from hermes_cli.config import load_config
@@ -528,8 +547,17 @@ def cmd_status(args) -> None:
 
         if provider:
             print("\n  Plugin:    installed ✓")
-            if provider.is_available():
+            runtime_missing = _provider_runtime_missing(provider_name)
+            if provider.is_available() and not runtime_missing:
                 print("  Status:    available ✓")
+            elif runtime_missing:
+                # The runtime's lazy-install gate would still fail (missing
+                # package or off-pin install it can't fix) — status must not
+                # claim availability while every retain is dropped (#80388).
+                print("  Status:    degraded ✗ — runtime dependencies missing:")
+                for spec in runtime_missing:
+                    print(f"    {spec}")
+                print("    Run 'hermes memory setup' to install them.")
             else:
                 print("  Status:    not available ✗")
                 schema = provider.get_config_schema() if hasattr(provider, "get_config_schema") else []

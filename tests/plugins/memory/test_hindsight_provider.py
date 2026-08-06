@@ -356,6 +356,91 @@ class TestConfig:
         assert captured["llm_provider"] == "openai"
 
 
+class TestMemoryStatusUsesRuntimePredicate:
+    """#80388 — `hermes memory status` must use the same predicate as retain.
+
+    The runtime retain/recall path gates on ensure("memory.<provider>")
+    (the version-aware lazy-deps check). cmd_status() must run that same
+    check or it prints "available ✓" while every retain is dropped.
+    """
+
+    class _FakeProvider:
+        name = "hindsight"
+
+        def __init__(self, available: bool = True):
+            self._available = available
+
+        def is_available(self) -> bool:
+            return self._available
+
+        def get_status_config(self, cfg):
+            return {}
+
+        def get_config_schema(self):
+            return []
+
+    def _run_status(self, monkeypatch, capsys, *, provider_available=True, missing=()):
+        import hermes_cli.memory_setup as ms
+
+        monkeypatch.setattr(
+            "hermes_cli.config.load_config",
+            lambda: {"memory": {"provider": "hindsight"}},
+        )
+        monkeypatch.setattr(
+            ms,
+            "_get_available_providers",
+            lambda: [
+                ("hindsight", "API key / local", self._FakeProvider(provider_available))
+            ],
+        )
+        monkeypatch.setattr(
+            "hermes_cli.tools_config._get_platform_tools", lambda *a, **k: []
+        )
+        monkeypatch.setattr("tools.lazy_deps.feature_missing", lambda feature: missing)
+        ms.cmd_status(None)
+        return capsys.readouterr().out
+
+    def test_status_available_when_runtime_deps_satisfied(self, monkeypatch, capsys):
+        out = self._run_status(monkeypatch, capsys, missing=())
+        assert "available ✓" in out
+        assert "degraded" not in out
+
+    def test_status_degraded_when_runtime_deps_missing(self, monkeypatch, capsys):
+        # Provider imports fine but the runtime's lazy-deps gate would fail
+        # (client absent or off-pin) → status must not claim availability.
+        out = self._run_status(
+            monkeypatch, capsys, missing=("hindsight-client>=0.6.1",)
+        )
+        assert "available ✓" not in out
+        assert "degraded ✗" in out
+        assert "hindsight-client>=0.6.1" in out
+
+    def test_status_not_available_when_provider_unavailable(self, monkeypatch, capsys):
+        out = self._run_status(monkeypatch, capsys, provider_available=False, missing=())
+        assert "available ✓" not in out
+        assert "not available ✗" in out
+
+    def test_provider_runtime_missing_maps_name_to_lazy_feature(self, monkeypatch):
+        from hermes_cli.memory_setup import _provider_runtime_missing
+
+        calls = []
+        monkeypatch.setattr(
+            "tools.lazy_deps.feature_missing",
+            lambda feature: calls.append(feature) or ("hindsight-client>=0.6.1",),
+        )
+        assert _provider_runtime_missing("hindsight") == ("hindsight-client>=0.6.1",)
+        assert calls == ["memory.hindsight"]
+
+    def test_provider_runtime_missing_fails_open(self, monkeypatch):
+        from hermes_cli.memory_setup import _provider_runtime_missing
+
+        def boom(feature):
+            raise KeyError(f"no lazy feature for {feature!r}")
+
+        monkeypatch.setattr("tools.lazy_deps.feature_missing", boom)
+        assert _provider_runtime_missing("no-such-provider") == ()
+
+
 class TestPostSetup:
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"

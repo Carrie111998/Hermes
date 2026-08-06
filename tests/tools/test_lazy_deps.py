@@ -209,6 +209,71 @@ class TestIsSatisfiedVersionAware:
         self._fake_version(monkeypatch, {"mautrix": "0.20.0"})
         assert ld._is_satisfied("mautrix[encryption]==0.21.0") is False
 
+    # --- "never downgrade" (#80390) ---
+    def test_newer_than_exact_pin_returns_true(self, monkeypatch):
+        # An operator-installed NEWER client must never read as "missing" —
+        # ensure() would otherwise attempt an unattended downgrade. The
+        # embedded hindsight stack migrates its Postgres data forward on
+        # every release, so a downgrade is destructive (#80390).
+        self._fake_version(monkeypatch, {"hindsight-client": "0.8.6"})
+        assert ld._is_satisfied("hindsight-client>=0.6.1") is True
+        assert ld._is_satisfied("hindsight-client==0.6.1") is True
+
+    def test_older_than_pin_returns_false(self, monkeypatch):
+        # Older than the floor → still missing → ensure() upgrades (allowed;
+        # pin propagation for `hermes update` depends on this).
+        self._fake_version(monkeypatch, {"hindsight-client": "0.5.0"})
+        assert ld._is_satisfied("hindsight-client>=0.6.1") is False
+
+    def test_newer_than_upper_bounded_range_returns_true(self, monkeypatch):
+        # mautrix-style >=A,<B: an installed 2.x must not be downgraded to <1.
+        self._fake_version(monkeypatch, {"mautrix": "2.0.0"})
+        assert ld._is_satisfied("mautrix[encryption]>=0.20,<1") is True
+
+    def test_below_range_returns_false(self, monkeypatch):
+        self._fake_version(monkeypatch, {"mautrix": "0.15.0"})
+        assert ld._is_satisfied("mautrix[encryption]>=0.20,<1") is False
+
+    def test_missing_package_returns_false(self, monkeypatch):
+        self._fake_version(monkeypatch, {})
+        assert ld._is_satisfied("hindsight-client>=0.6.1") is False
+
+
+class TestNeverDowngradeEnsure:
+    """#80390 — ensure() must never reinstall (downgrade) a newer install."""
+
+    def _fake_version(self, monkeypatch, installed_versions: dict):
+        from importlib.metadata import PackageNotFoundError
+
+        def _version(pkg):
+            if pkg in installed_versions:
+                return installed_versions[pkg]
+            raise PackageNotFoundError(pkg)
+
+        import importlib.metadata as _md
+        monkeypatch.setattr(_md, "version", _version)
+
+    def test_newer_install_is_not_missing(self, monkeypatch):
+        # feature_missing() is the predicate ensure() AND `hermes memory
+        # status` share: with a newer client installed, nothing is missing,
+        # so no install (and no downgrade) is ever attempted (#80390/#80388).
+        self._fake_version(monkeypatch, {"hindsight-client": "0.8.6"})
+        assert ld.feature_missing("memory.hindsight") == ()
+
+    def test_absent_install_is_missing(self, monkeypatch):
+        self._fake_version(monkeypatch, {})
+        assert ld.feature_missing("memory.hindsight") == ("hindsight-client>=0.6.1",)
+
+    def test_ensure_is_noop_on_newer_install(self, monkeypatch):
+        # The observable bug: ensure() on a newer install must return without
+        # invoking pip at all — no downgrade, no install attempt.
+        self._fake_version(monkeypatch, {"hindsight-client": "0.8.6"})
+        monkeypatch.setattr(
+            ld, "_venv_pip_install",
+            lambda *a, **kw: pytest.fail("ensure() must not reinstall a newer client"),
+        )
+        ld.ensure("memory.hindsight", prompt=False)  # must not raise
+
     def test_trace_upload_hub_at_core_locked_version_is_current(self, monkeypatch):
         """#60783 regression: refresh must not churn the shared hub install.
 

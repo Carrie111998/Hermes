@@ -191,7 +191,16 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
 
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.2.0",),
-    "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Floor, not an exact pin: local_embedded users install the whole
+    # hindsight stack (hindsight-all) from PyPI, which tracks a moving
+    # release train (0.8.x today) and is never in the image lockfile, so an
+    # operator-installed client is routinely newer than any pin we could
+    # write here. Worse, the embedded stack migrates its Postgres (pg0) data
+    # directory forward on every release — once 0.8.x has run the database
+    # cannot go back to 0.6.1, so a forced downgrade is destructive. The
+    # >= floor lets ensure() upgrade a stale client but never downgrade a
+    # newer one the operator installed (#80390).
+    "memory.hindsight": ("hindsight-client>=0.6.1",),
     # supermemory + mem0 are opt-in cloud memory providers with their own
     # SDKs. On the published Docker image the agent venv is sealed
     # (HERMES_DISABLE_LAZY_INSTALLS=1) and lazy installs are redirected to the
@@ -590,10 +599,17 @@ def _is_satisfied(spec: str) -> bool:
     """Is ``spec`` already satisfied in the current env?
 
     Checks both presence AND version. If the package is installed at a
-    version outside the spec's range, returns False so the caller will
-    upgrade/downgrade to the pinned version. This is what makes
-    ``hermes update`` propagate pin bumps in :data:`LAZY_DEPS` to already-
-    installed backends instead of silently leaving stale versions in place.
+    version *below* the spec's range, returns False so the caller will
+    upgrade to the pinned version. This is what makes ``hermes update``
+    propagate pin bumps in :data:`LAZY_DEPS` to already-installed backends
+    instead of silently leaving stale versions in place.
+
+    If the installed version is *newer* than every version the spec allows,
+    the spec counts as satisfied: :func:`ensure` must never attempt an
+    automatic downgrade of a package the operator installed. The embedded
+    Hindsight stack, for example, migrates its Postgres data directory
+    forward on every release — once 0.8.x has run, the database cannot go
+    back to 0.6.1, so a forced downgrade is destructive (#80390).
 
     If ``packaging`` is unavailable for any reason (it's a transitive of
     pip so this should never happen), we fall back to a presence-only check
@@ -624,10 +640,58 @@ def _is_satisfied(spec: str) -> bool:
         return True
 
     try:
-        return Version(installed) in SpecifierSet(spec_tail)
+        installed_v = Version(installed)
+        spec_set = SpecifierSet(spec_tail)
     except (InvalidSpecifier, InvalidVersion, Exception):
         # Malformed spec or installed version we can't parse — don't churn.
         return True
+
+    if installed_v in spec_set:
+        return True
+
+    # Never downgrade: an installed version newer than everything the spec
+    # allows is the operator's deliberate choice, not a missing package.
+    return _newer_than_allowed(installed_v, spec_set)
+
+
+def _newer_than_allowed(installed: Version, spec_set: SpecifierSet) -> bool:
+    """True when *installed* is strictly newer than every version ``spec_set`` allows.
+
+    Implements the "never downgrade" rule for :func:`_is_satisfied`: if the
+    installed version outranks the whole pinned range, the feature counts as
+    satisfied and :func:`ensure` leaves it alone instead of attempting an
+    unattended downgrade. Upgrades stay possible — anything installed *below*
+    the range still reports as missing, so pin bumps can be pulled forward
+    (``hermes update`` propagation).
+    """
+    saw_upper_bound = False
+    try:
+        from packaging.version import Version
+
+        for specifier in spec_set:
+            op, ver = specifier.operator, specifier.version
+            if op in (">=", ">"):
+                # Lower bound: for "newer than everything allowed" to hold,
+                # the installed version must at least clear it.
+                if installed < Version(ver):
+                    return False
+                continue
+            # Upper-bounding specifier ("<", "<=", "==", "~="): the
+            # installed version must be at or beyond its top. A trailing
+            # ".*" wildcard ("==1.4.5.*") is normalized to its "1.4.5"
+            # prefix — everything above it is already newer than allowed.
+            saw_upper_bound = True
+            top = Version(ver.rstrip(".*"))
+            if op == "<":
+                # "<2" allows everything below 2 — 2.0 is already newer.
+                if installed < top:
+                    return False
+            elif installed <= top:
+                return False
+    except Exception:
+        # Unparseable specifier or version — be conservative.
+        return False
+    return saw_upper_bound
 
 
 def _is_present(spec: str) -> bool:
