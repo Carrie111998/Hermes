@@ -10,14 +10,12 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
-import hashlib
 import json
 import logging
 import os
 import random
 import re
 import time
-import uuid
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Any, Tuple, List
 
@@ -58,45 +56,27 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_video_from_bytes,
 )
-from tools.todo_tool import MAX_TODO_ITEMS
-
 try:  # sibling module; support both package and flat plugin-dir import
     from .block_kit import render_blocks
     from .plan_cards import (
-        MAX_INTERACTIVE_TASKS,
-        MAX_USER_TASK_CONTENT_LENGTH,
-        PLAN_ACTION_ADD_USER_TASK,
-        PLAN_ACTION_CANCEL,
-        PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
-        _is_slack_human_user_id,
         build_plan_blocks,
-        is_interactive_user_task,
-        is_user_task_id,
-        sign_private_metadata,
-        verify_private_metadata,
     )
 except ImportError:  # pragma: no cover - plugin loaded outside package context
     from block_kit import render_blocks  # type: ignore
     from plan_cards import (  # type: ignore
-        MAX_INTERACTIVE_TASKS,
-        MAX_USER_TASK_CONTENT_LENGTH,
-        PLAN_ACTION_ADD_USER_TASK,
-        PLAN_ACTION_CANCEL,
-        PLAN_ACTION_COMPLETE_REOPEN,
         PlanCardStore,
         _RetryScheduleKind,
-        _is_slack_human_user_id,
         build_plan_blocks,
-        is_interactive_user_task,
-        is_user_task_id,
-        sign_private_metadata,
-        verify_private_metadata,
     )
 
 
 logger = logging.getLogger(__name__)
+
+_PLAN_CARD_READ_ONLY_MESSAGE = (
+    "This Plan Card is now read-only; use Clarify or reply in Slack."
+)
 
 
 def _profile_from_hermes_home(home: Any) -> Optional[str]:
@@ -1285,8 +1265,8 @@ class SlackAdapter(BasePlatformAdapter):
 
             self._app.action("hermes_feedback")(self._handle_feedback_action)
 
-            # Always register these ACK handlers so controls posted before a
-            # config rollback do not time out or retry after the feature is off.
+            # Keep compatibility ACK handlers for cards posted before Plan
+            # Cards became read-only. They only return a migration notice.
             for _action_id in (
                 "hermes_plan_complete",
                 "hermes_plan_cancel",
@@ -4135,20 +4115,6 @@ class SlackAdapter(BasePlatformAdapter):
             return True
         return _env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
-    def _plan_signing_secret(self) -> Optional[bytes]:
-        override = getattr(self, "_plan_signing_secret_override", ...)
-        if override is not ...:
-            return str(override).encode("utf-8") if override else None
-        try:
-            value = get_secret("SLACK_SIGNING_SECRET")
-        except UnscopedSecretError:
-            value = None
-        except Exception:
-            value = None
-        if not value and isinstance(self.config.extra, dict):
-            value = self.config.extra.get("native_plan_cards_signing_secret")
-        return str(value).encode("utf-8") if value else None
-
     def record_desired_plan_snapshot(
         self,
         *,
@@ -4179,23 +4145,10 @@ class SlackAdapter(BasePlatformAdapter):
         )
 
     def _render_plan_state(self, state: Dict[str, Any]):
-        context = {
-            "session_key": state.get("session_key", ""),
-            "session_id": state.get("session_id", ""),
-            "team_id": state.get("team_id", ""),
-            "channel_id": state.get("channel_id", ""),
-            "thread_ts": state.get("thread_ts", ""),
-            "message_ts": state.get("message_ts", ""),
-            "route_user_id": state.get("route_user_id", ""),
-            "chat_type": state.get("chat_type", "group"),
-            "profile": state.get("profile"),
-        }
         return build_plan_blocks(
             state.get("last_desired_snapshot") or [],
             revision=int(state.get("desired_revision") or 0),
             snapshot_hash=str(state.get("desired_hash") or ""),
-            signing_secret=self._plan_signing_secret(),
-            action_context=context,
         )
 
     @staticmethod
@@ -4698,402 +4651,62 @@ class SlackAdapter(BasePlatformAdapter):
             self._plan_reconcile_task = None
 
     def validate_plan_action_metadata(self, metadata: Dict[str, Any]) -> bool:
-        try:
-            state = self._plan_store.validate_action(metadata)
-        except Exception:
-            logger.warning(
-                "[Slack] Claim-time plan action state lookup failed",
-                exc_info=True,
-            )
-            return False
-        if not state:
-            return False
-        if state.get("profile") != self._plan_profile:
-            return False
-        action_user_id = metadata.get("action_user_id")
-        if (
-            not isinstance(action_user_id, str)
-            or not action_user_id
-            or action_user_id != action_user_id.strip()
-        ):
-            return False
-        channel_id = str(state.get("channel_id") or "")
-        team_id = str(state.get("team_id") or "")
-        if not channel_id or not team_id:
-            return False
-        try:
-            return self._is_interactive_user_authorized(
-                action_user_id,
-                channel_id=channel_id,
-                user_name=None,
-                team_id=team_id,
-                profile=state.get("profile"),
-                thread_id=str(state.get("thread_ts") or "") or None,
-                fail_closed_on_lookup_error=True,
-            )
-        except Exception:
-            logger.warning(
-                "[Slack] Claim-time plan action authorization lookup failed",
-                exc_info=True,
-            )
-            return False
-
-    def _plan_state_from_interaction(
-        self,
-        body: Dict[str, Any],
-        action: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        team_id = self._event_team_id({}, body)
-        channel_id = str((body.get("channel") or {}).get("id") or "")
-        message = body.get("message") or {}
-        message_ts = str(message.get("ts") or "")
-        state = self._plan_store.lookup_route(team_id, channel_id, message_ts)
-        if not state:
-            return None
-        if state.get("profile") != self._plan_profile:
-            return None
-        if (
-            team_id != str(state.get("team_id") or "")
-            or channel_id != str(state.get("channel_id") or "")
-            or message_ts != str(state.get("message_ts") or "")
-        ):
-            return None
-        body_thread = str(message.get("thread_ts") or "")
-        if body_thread != str(state.get("thread_ts") or ""):
-            return None
-        block_id = str(action.get("block_id") or "")
-        expected_prefix = (
-            f"hermes-plan-controls-r{int(state.get('applied_render_revision') or 0)}-"
-            f"{str(state.get('desired_hash') or '')[:10]}"
-        )
-        if block_id != expected_prefix:
-            return None
-        return state
-
-    @staticmethod
-    def _plan_interaction_owner_matches(state: Dict[str, Any], user_id: str) -> bool:
-        route_user_id = str(state.get("route_user_id") or "")
-        return (
-            _is_slack_human_user_id(route_user_id)
-            and route_user_id == str(user_id or "")
-        )
-
-    @staticmethod
-    def _plan_action_dedupe_id(body: Dict[str, Any], action: Dict[str, Any]) -> str:
-        action_ts = str(action.get("action_ts") or "")
-        if not action_ts:
-            actions = body.get("actions") or []
-            if actions and isinstance(actions[0], dict):
-                action_ts = str(actions[0].get("action_ts") or "")
-        pieces = (
-            str((body.get("team") or {}).get("id") or body.get("team_id") or ""),
-            str((body.get("channel") or {}).get("id") or ""),
-            str((body.get("message") or {}).get("ts") or ""),
-            str((body.get("user") or {}).get("id") or ""),
-            str(action.get("action_id") or ""),
-            action_ts or str(body.get("trigger_id") or ""),
-        )
-        return hashlib.sha256("\x1f".join(pieces).encode("utf-8")).hexdigest()
-
-    async def _dispatch_plan_action_event(
-        self,
-        *,
-        state: Dict[str, Any],
-        body: Dict[str, Any],
-        action_kind: str,
-        action_dedupe_id: str,
-        changes: Dict[str, Any],
-    ) -> None:
-        task_ids = sorted({
-            str(task_id)
-            for key, value in changes.items()
-            if key.endswith("task_ids")
-            for task_id in (value or [])
-        })
-        trusted = {
-            "session_key": state["session_key"],
-            "session_id": state["session_id"],
-            "team_id": state["team_id"],
-            "channel_id": state["channel_id"],
-            "thread_ts": state.get("thread_ts", ""),
-            "profile": state.get("profile"),
-            "message_ts": state["message_ts"],
-            "revision": state["desired_revision"],
-            "snapshot_hash": state["desired_hash"],
-            "task_ids": task_ids,
-            "action_kind": action_kind,
-            "action_dedupe_id": action_dedupe_id,
-            "action_user_id": str((body.get("user") or {}).get("id") or ""),
-            **changes,
-        }
-        source = self.build_source(
-            chat_id=state["channel_id"],
-            chat_type=str(state.get("chat_type") or "group"),
-            user_id=str(state.get("route_user_id") or "") or None,
-            thread_id=str(state.get("thread_ts") or "") or None,
-            scope_id=str(state.get("team_id") or "") or None,
-        )
-        source.profile = state.get("profile")
-        prompt = (
-            "[Trusted Slack plan action]\n"
-            "Use the todo tool to apply exactly this structured change to the current full todo list. "
-            "Preserve every task not named by the action. Set each named task to the exact status "
-            "specified by its *_task_status field. For add_task_ids, create exactly one Todo with "
-            "the supplied ID, add_task_content, and add_task_status.\n"
-            + json.dumps(changes, ensure_ascii=False, sort_keys=True)
-        )
-        await self.handle_message(MessageEvent(
-            text=prompt,
-            message_type=MessageType.TEXT,
-            source=source,
-            message_id=str(state.get("message_ts") or ""),
-            internal=True,
-            metadata={
-                "slack_plan_action": trusted,
-                "gateway_session_id": str(state.get("session_id") or ""),
-            },
-        ))
+        # Internal plan-action events may still be queued from a gateway that
+        # posted interactive cards before this read-only renderer shipped.
+        # They are no longer valid mutation requests.
+        return False
 
     async def _handle_plan_action(self, ack, body, action) -> None:
-        """Ack immediately and isolate all plan-card interaction failures."""
+        """Acknowledge legacy controls and fail closed without mutating state."""
         await ack()
         try:
-            await self._handle_plan_action_after_ack(body, action)
+            action_id = str(action.get("action_id") or "")
+            if action_id not in {
+                "hermes_plan_complete",
+                "hermes_plan_cancel",
+                "hermes_plan_add",
+                "hermes_plan_refresh",
+            }:
+                return
+            team_id = self._event_team_id({}, body)
+            channel_id = str((body.get("channel") or {}).get("id") or "")
+            user_id = str((body.get("user") or {}).get("id") or "")
+            message = body.get("message") or {}
+            action_ts = str(action.get("action_ts") or "")
+            if not action_ts:
+                actions = body.get("actions") or []
+                if actions and isinstance(actions[0], dict):
+                    action_ts = str(actions[0].get("action_ts") or "")
+            dedupe_key = "\x1f".join((
+                "legacy-plan-action",
+                team_id,
+                channel_id,
+                str(message.get("ts") or ""),
+                user_id,
+                action_id,
+                action_ts or str(body.get("trigger_id") or ""),
+            ))
+            if self._dedup.is_duplicate(dedupe_key) or not channel_id or not user_id:
+                return
+            kwargs = {
+                "channel": channel_id,
+                "user": user_id,
+                "text": _PLAN_CARD_READ_ONLY_MESSAGE,
+                "mrkdwn": True,
+            }
+            thread_ts = str(message.get("thread_ts") or "")
+            if thread_ts:
+                kwargs["thread_ts"] = thread_ts
+            await self._get_client(
+                channel_id, team_id=team_id or None
+            ).chat_postEphemeral(**kwargs)
         except Exception:
-            logger.warning("[Slack] Plan-card action failed", exc_info=True)
-
-    async def _handle_plan_action_after_ack(self, body, action) -> None:
-        if not self._plan_cards_enabled:
-            return
-        action_id = str(action.get("action_id") or "")
-        if action_id not in {
-            "hermes_plan_complete",
-            "hermes_plan_cancel",
-            "hermes_plan_add",
-            "hermes_plan_refresh",
-        }:
-            return
-        team_id = self._event_team_id({}, body)
-        channel_id = str((body.get("channel") or {}).get("id") or "")
-        state = self._plan_state_from_interaction(body, action)
-        if not state:
-            return
-        user = body.get("user") or {}
-        if not self._is_interactive_user_authorized(
-            str(user.get("id") or ""),
-            channel_id=channel_id,
-            user_name=user.get("name"),
-            team_id=team_id,
-            profile=state.get("profile"),
-            thread_id=str(state.get("thread_ts") or "") or None,
-        ):
-            return
-        if (
-            action_id != "hermes_plan_refresh"
-            and not self._plan_interaction_owner_matches(
-                state, str(user.get("id") or "")
-            )
-        ):
-            return
-        dedupe_id = self._plan_action_dedupe_id(body, action)
-        if not self._plan_store.consume_action_id(dedupe_id):
-            return
-        tasks = state.get("last_desired_snapshot") or []
-        if action_id == "hermes_plan_refresh":
-            self._plan_store.request_refresh(state["session_key"])
-            self.request_plan_reconcile()
-            return
-        snapshot_ids = [str(task.get("id") or "") for task in tasks]
-        if (
-            len(snapshot_ids) != len(set(snapshot_ids))
-            or sum(is_interactive_user_task(task) for task in tasks)
-            > MAX_INTERACTIVE_TASKS
-        ):
-            return
-        if action_id == "hermes_plan_add":
-            secret = self._plan_signing_secret()
-            if not secret:
-                return
-            if (
-                len(tasks) >= MAX_TODO_ITEMS
-                or sum(is_interactive_user_task(task) for task in tasks)
-                >= MAX_INTERACTIVE_TASKS
-            ):
-                return
-            existing_ids = set(snapshot_ids)
-            generated_id = f"user:{uuid.uuid4()}"
-            while generated_id in existing_ids:
-                generated_id = f"user:{uuid.uuid4()}"
-            payload = {
-                "session_key": state["session_key"],
-                "session_id": state["session_id"],
-                "team_id": state["team_id"],
-                "channel_id": state["channel_id"],
-                "thread_ts": state.get("thread_ts", ""),
-                "message_ts": state["message_ts"],
-                "revision": state["desired_revision"],
-                "snapshot_hash": state["desired_hash"],
-                "profile": state.get("profile"),
-                "task_ids": [generated_id],
-                "action_kind": PLAN_ACTION_ADD_USER_TASK,
-                "add_task_ids": [generated_id],
-                "action_user_id": str(user.get("id") or ""),
-                "action_dedupe_id": dedupe_id,
-            }
-            private_metadata = sign_private_metadata(payload, secret)
-            if not private_metadata:
-                return
-            await self._get_client(channel_id, team_id=team_id or None).views_open(
-                trigger_id=body.get("trigger_id"),
-                view={
-                    "type": "modal",
-                    "callback_id": "hermes_plan_add_task",
-                    "private_metadata": private_metadata,
-                    "title": {"type": "plain_text", "text": "Add user task"},
-                    "submit": {"type": "plain_text", "text": "Add"},
-                    "close": {"type": "plain_text", "text": "Cancel"},
-                    "blocks": [{
-                        "type": "input",
-                        "block_id": "task",
-                        "label": {"type": "plain_text", "text": "User task"},
-                        "element": {
-                            "type": "plain_text_input",
-                            "action_id": "content",
-                            "multiline": True,
-                            "max_length": MAX_USER_TASK_CONTENT_LENGTH,
-                        },
-                    }],
-                },
-            )
-            return
-        if action_id == "hermes_plan_cancel":
-            selected = action.get("selected_option") or {}
-            task_id = str(selected.get("value") or "")
-            eligible_cancel = {
-                task["id"] for task in tasks
-                if is_user_task_id(task["id"]) and task["status"] == "in_progress"
-            }
-            if task_id in eligible_cancel:
-                await self._dispatch_plan_action_event(
-                    state=state,
-                    body=body,
-                    action_kind=PLAN_ACTION_CANCEL,
-                    action_dedupe_id=dedupe_id,
-                    changes={
-                        "cancel_task_ids": [task_id],
-                        "cancel_task_status": "cancelled",
-                    },
-                )
-            return
-        if action_id == "hermes_plan_complete":
-            raw_selected = action.get("selected_options")
-            if not isinstance(raw_selected, list) or any(
-                not isinstance(option, dict) or not option.get("value")
-                for option in raw_selected
-            ):
-                return
-            selected_ids = [str(option["value"]) for option in raw_selected]
-            if len(selected_ids) != len(set(selected_ids)):
-                return
-            selected = set(selected_ids)
-            eligible = {
-                task["id"] for task in tasks
-                if is_user_task_id(task["id"])
-                and task["status"] in {"in_progress", "completed"}
-            }
-            completed = {
-                task["id"] for task in tasks
-                if is_user_task_id(task["id"]) and task["status"] == "completed"
-            }
-            if not selected.issubset(eligible):
-                return
-            complete_ids = sorted(selected - completed)
-            reopen_ids = sorted(completed - selected)
-            if not complete_ids and not reopen_ids:
-                return
-            await self._dispatch_plan_action_event(
-                state=state,
-                body=body,
-                action_kind=PLAN_ACTION_COMPLETE_REOPEN,
-                action_dedupe_id=dedupe_id,
-                changes={
-                    "complete_task_ids": complete_ids,
-                    "complete_task_status": "completed",
-                    "reopen_task_ids": reopen_ids,
-                    "reopen_task_status": "in_progress",
-                },
-            )
+            logger.warning("[Slack] Legacy Plan Card notice failed", exc_info=True)
 
     async def _handle_plan_add_view(self, ack, body, view=None, client=None) -> None:
-        await ack()
-        try:
-            await self._handle_plan_add_view_after_ack(body)
-        except Exception:
-            logger.warning("[Slack] Plan-card modal submission failed", exc_info=True)
-
-    async def _handle_plan_add_view_after_ack(self, body) -> None:
-        if not self._plan_cards_enabled:
-            return
-        payload = verify_private_metadata(
-            str((body.get("view") or {}).get("private_metadata") or ""),
-            self._plan_signing_secret(),
-        )
-        if not payload:
-            return
-        user = body.get("user") or {}
-        user_id = str(user.get("id") or "")
-        if user_id != str(payload.get("action_user_id") or ""):
-            return
-        values = ((body.get("view") or {}).get("state") or {}).get("values") or {}
-        content = str((((values.get("task") or {}).get("content") or {}).get("value")) or "").strip()
-        if not content or len(content) > MAX_USER_TASK_CONTENT_LENGTH:
-            return
-        validated_metadata = {
-            **payload,
-            "add_task_content": content,
-            "add_task_status": "in_progress",
-        }
-        state = self._plan_store.validate_action(validated_metadata)
-        if not state:
-            return
-        if state.get("profile") != self._plan_profile:
-            return
-        if not self._is_interactive_user_authorized(
-            user_id,
-            channel_id=str(state.get("channel_id") or ""),
-            user_name=user.get("name"),
-            team_id=str(state.get("team_id") or ""),
-            profile=state.get("profile"),
-            thread_id=str(state.get("thread_ts") or "") or None,
-        ):
-            return
-        if not self._plan_interaction_owner_matches(
-            state, user_id
-        ):
-            return
-        view_body = body.get("view") or {}
-        dedupe_id = hashlib.sha256(
-            "\x1f".join((
-                "view_submission",
-                str(view_body.get("id") or ""),
-                str(view_body.get("hash") or ""),
-                user_id,
-                str(payload.get("session_key") or ""),
-                str(payload.get("revision") or ""),
-            )).encode("utf-8")
-        ).hexdigest()
-        if not self._plan_store.consume_action_id(dedupe_id):
-            return
-        await self._dispatch_plan_action_event(
-            state=state,
-            body=body,
-            action_kind=PLAN_ACTION_ADD_USER_TASK,
-            action_dedupe_id=str(payload.get("action_dedupe_id") or ""),
-            changes={
-                "add_task_ids": list(payload["add_task_ids"]),
-                "add_task_content": content,
-                "add_task_status": "in_progress",
-            },
+        await ack(
+            response_action="errors",
+            errors={"task": _PLAN_CARD_READ_ONLY_MESSAGE},
         )
 
     async def _handle_slash_confirm_action(self, ack, body, action) -> None:

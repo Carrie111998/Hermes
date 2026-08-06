@@ -2,30 +2,18 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import json
 import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from agent import secret_scope
-from gateway.config import Platform, PlatformConfig, load_gateway_config
-from gateway.platforms.base import MessageEvent
-from gateway.run import GatewayRunner
-from gateway.session import build_session_key
+from gateway.config import PlatformConfig
 from plugins.platforms.slack.adapter import SlackAdapter
-from plugins.platforms.slack.plan_cards import (
-    is_user_task_id,
-    sign_private_metadata,
-    verify_private_metadata,
-)
-from tools.todo_tool import MAX_TODO_ITEMS
 
 
 def _adapter(
     tmp_path,
     *,
-    secret: str | None = "signing-secret",
     enabled: bool = True,
 ) -> SlackAdapter:
     config = PlatformConfig(
@@ -38,7 +26,6 @@ def _adapter(
     adapter._app = MagicMock()
     adapter._team_clients = {"T1": AsyncMock()}
     adapter._channel_team = {"C1": "T1"}
-    adapter._plan_signing_secret_override = secret
     return adapter
 
 
@@ -81,7 +68,11 @@ def _state(
         thread_ts="10.0",
         route_user_id=route_user_id,
         chat_type=chat_type,
-        todos=todos or [{"id": "a", "content": "A", "status": "pending"}],
+        todos=(
+            todos
+            if todos is not None
+            else [{"id": "a", "content": "A", "status": "pending"}]
+        ),
     )
 
 
@@ -634,35 +625,6 @@ async def test_reconcile_creates_updates_and_dedupes_hash(tmp_path) -> None:
     client.chat_update.assert_awaited_once()
 
 
-@pytest.mark.asyncio
-async def test_hash_dedupe_keeps_existing_card_actions_valid(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    client = adapter._team_clients["T1"]
-    client.chat_postMessage = AsyncMock(return_value={"ts": "20.0"})
-    first = _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
-    assert await _reconcile(adapter, "sk", first["desired_revision"])
-    same = _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
-    assert await _reconcile(adapter, "sk", same["desired_revision"])
-    client.chat_update.assert_not_awaited()
-
-    events = []
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    await adapter._handle_plan_action(AsyncMock(), {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "same-hash"}],
-    }, {
-        "action_id": "hermes_plan_complete",
-        "block_id": "hermes-plan-controls-r1-" + first["desired_hash"][:10],
-        "selected_options": [{"value": "user:a"}],
-    })
-    await asyncio.sleep(0)
-    assert len(events) == 1
-    assert events[0].metadata["slack_plan_action"]["revision"] == same["desired_revision"]
 
 
 @pytest.mark.asyncio
@@ -1690,1027 +1652,133 @@ async def test_disconnect_during_worker_error_backoff_exits_same_task(tmp_path) 
 
 
 @pytest.mark.asyncio
-async def test_stale_schedule_applies_latest_and_refresh_forces_update(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    client = adapter._team_clients["T1"]
-    client.chat_postMessage = AsyncMock(return_value={"ts": "20.0"})
-    first = _state(adapter)
-    second = _state(adapter, [{"id": "b", "content": "latest", "status": "pending"}])
-    assert await _reconcile(adapter, "sk", first["desired_revision"])
-    assert adapter._plan_store.get_session("sk")["applied_revision"] == second["desired_revision"]
-
-    client.chat_update = AsyncMock(return_value={"ts": "20.0"})
-    refreshed = adapter._plan_store.request_refresh("sk")
-    assert refreshed["desired_revision"] == second["desired_revision"] + 1
-    assert await _reconcile(adapter, "sk")
-    client.chat_update.assert_awaited_once()
-    assert (
-        client.chat_update.call_args.kwargs["blocks"][0]["block_id"]
-        != f"hermes-plan-r{second['desired_revision']}-{second['desired_hash'][:10]}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_plan_action_acks_authorizes_validates_dedupes_and_emits_internal_event(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
+@pytest.mark.parametrize("enabled", [True, False])
+@pytest.mark.parametrize(
+    "action_id",
+    [
+        "hermes_plan_complete",
+        "hermes_plan_cancel",
+        "hermes_plan_add",
+        "hermes_plan_refresh",
+    ],
+)
+async def test_legacy_plan_actions_ack_read_only_without_dispatch_or_state_mutation(
+    tmp_path, enabled, action_id,
+) -> None:
+    adapter = _adapter(tmp_path, enabled=enabled)
     _state(adapter, [
-        {"id": "agent:a", "content": "Agent", "status": "pending"},
         {"id": "user:a", "content": "A", "status": "in_progress"},
         {"id": "user:b", "content": "B", "status": "completed"},
     ])
-    adapter._plan_store.mark_applied(
-        "sk",
-        revision=1,
-        snapshot_hash=adapter._plan_store.get_session("sk")["desired_hash"],
-        message_ts="20.0",
-    )
-    events: list[MessageEvent] = []
-
-    async def handle(event: MessageEvent):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    ack = AsyncMock()
-    body = {
-        "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner", "name": "owner"},
-        "actions": [{"action_ts": "99.1"}],
-    }
-    action = {
-        "action_id": "hermes_plan_complete",
-        "block_id": "hermes-plan-controls-r1-" + adapter._plan_store.get_session("sk")["desired_hash"][:10],
-        "selected_options": [{"value": "user:a"}],
-    }
-
-    await adapter._handle_plan_action(ack, body, action)
-    await asyncio.sleep(0)
-    assert ack.await_count == 1
-    assert len(events) == 1
-    event = events[0]
-    assert event.internal is True
-    assert event.source.chat_id == "C1"
-    assert event.source.thread_id == "10.0"
-    assert event.source.user_id == "U-owner"
-    assert event.metadata["gateway_session_id"] == "sid"
-    trusted = event.metadata["slack_plan_action"]
-    assert trusted["action_user_id"] == "U-owner"
-    assert trusted["action_kind"] == "complete_reopen"
-    assert trusted["task_ids"] == ["user:a", "user:b"]
-    assert trusted["complete_task_ids"] == ["user:a"]
-    assert trusted["complete_task_status"] == "completed"
-    assert trusted["reopen_task_ids"] == ["user:b"]
-    assert trusted["reopen_task_status"] == "in_progress"
-    assert trusted["revision"] == 1
-    assert "todo" in event.text.lower()
-    assert '"complete_task_status": "completed"' in event.text
-    assert '"reopen_task_status": "in_progress"' in event.text
-    assert adapter.validate_plan_action_metadata(trusted)
-
-    await adapter._handle_plan_action(ack, body, action)
-    assert len(events) == 1
-
-
-@pytest.mark.asyncio
-async def test_plan_action_rejects_mixed_duplicate_and_ineligible_ids_atomically(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    _state(adapter, [
-        {"id": "agent:a", "content": "Agent", "status": "pending"},
-        {"id": "user:pending", "content": "Pending", "status": "pending"},
-        {"id": "user:done", "content": "Done", "status": "completed"},
-        {"id": "user:active", "content": "Active", "status": "in_progress"},
-    ])
-    state = adapter._plan_store.get_session("sk")
-    adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    body = {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "mixed"}],
-    }
-    block_id = "hermes-plan-controls-r1-" + state["desired_hash"][:10]
-
-    for index, action in enumerate((
-        {
-            "action_id": "hermes_plan_complete", "block_id": block_id,
-            "selected_options": [
-                {"value": "user:pending"}, {"value": "agent:a"},
-            ],
-        },
-        {
-            "action_id": "hermes_plan_complete", "block_id": block_id,
-            "selected_options": [{"value": "user:pending"}],
-        },
-        {
-            "action_id": "hermes_plan_complete", "block_id": block_id,
-            "selected_options": [
-                {"value": "user:active"}, {"value": "user:active"},
-            ],
-        },
-        {
-            "action_id": "hermes_plan_complete", "block_id": block_id,
-            "selected_options": [{"value": "user:missing"}],
-        },
-        {
-            "action_id": "hermes_plan_cancel", "block_id": block_id,
-            "selected_option": {"value": "agent:a"},
-        },
-        {
-            "action_id": "hermes_plan_cancel", "block_id": block_id,
-            "selected_option": {"value": "user:pending"},
-        },
-    )):
-        body["actions"][0]["action_ts"] = f"invalid-{index}"
-        await adapter._handle_plan_action(AsyncMock(), body, action)
-
-    await asyncio.sleep(0)
-    assert events == []
-
-    body["actions"][0]["action_ts"] = "valid-cancel"
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_cancel", "block_id": block_id,
-        "selected_option": {"value": "user:active"},
-    })
-    await asyncio.sleep(0)
-    assert len(events) == 1
-    assert events[0].metadata["slack_plan_action"]["action_kind"] == "cancel"
-    assert events[0].metadata["slack_plan_action"]["cancel_task_ids"] == ["user:active"]
-    assert events[0].metadata["slack_plan_action"]["cancel_task_status"] == "cancelled"
-
-
-def test_adapter_claim_validator_rejects_direct_forged_plan_metadata(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    state = _state(adapter, [
-        {"id": "agent:a", "content": "Agent", "status": "pending"},
-        {"id": "user:a", "content": "User", "status": "in_progress"},
-    ])
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    base = {
-        "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0", "message_ts": "20.0",
-        "revision": 1, "snapshot_hash": state["desired_hash"],
-        "action_user_id": "U-owner", "action_dedupe_id": "dedupe",
-    }
-    assert adapter._plan_store.consume_action_id("dedupe")
-    assert not adapter.validate_plan_action_metadata({
-        **base, "action_kind": "complete_reopen",
-        "task_ids": ["agent:a", "user:a"],
-        "complete_task_ids": ["agent:a", "user:a"],
-        "complete_task_status": "completed", "reopen_task_ids": [],
-        "reopen_task_status": "in_progress",
-    })
-    assert not adapter.validate_plan_action_metadata({
-        **base, "action_kind": "complete_reopen", "task_ids": ["agent:a"],
-        "complete_task_ids": [], "complete_task_status": "completed",
-        "reopen_task_ids": ["agent:a"], "reopen_task_status": "in_progress",
-    })
-    assert not adapter.validate_plan_action_metadata({
-        **base, "action_kind": "add_user_task", "task_ids": ["user:new"],
-        "add_task_ids": ["user:replacement"], "add_task_content": "New",
-        "add_task_status": "in_progress",
-    })
-
-
-@pytest.mark.asyncio
-async def test_plan_action_rejects_wrong_route_or_unauthorized_user(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    _state(adapter)
-    adapter._plan_store.mark_applied(
-        "sk", revision=1,
-        snapshot_hash=adapter._plan_store.get_session("sk")["desired_hash"],
-        message_ts="20.0",
-    )
+    state_path = adapter._plan_store.state_path
+    before = state_path.read_bytes() if state_path.exists() else None
     adapter.set_message_handler(AsyncMock())
-    ack = AsyncMock()
-    body = {
-        "team": {"id": "T1"}, "channel": {"id": "WRONG"},
-        "message": {"ts": "20.0"}, "user": {"id": "U1"},
-        "actions": [{"action_ts": "1"}],
-    }
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    block_id = "hermes-plan-controls-r1-" + adapter._plan_store.get_session("sk")["desired_hash"][:10]
-    await adapter._handle_plan_action(ack, body, {
-        "action_id": "hermes_plan_refresh", "block_id": block_id,
-    })
-    adapter._message_handler.assert_not_awaited()
-
-    body["channel"]["id"] = "C1"
-    adapter._is_interactive_user_authorized.return_value = False
-    await adapter._handle_plan_action(ack, body, {
-        "action_id": "hermes_plan_refresh", "block_id": block_id,
-    })
-    adapter._message_handler.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("chat_type", ["group", "dm"])
-async def test_plan_action_requires_persisted_route_owner_for_group_and_dm(tmp_path, chat_type) -> None:
-    adapter = _adapter(tmp_path)
-    _state(
-        adapter,
-        [{"id": "user:a", "content": "A", "status": "in_progress"}],
-        route_user_id="U-owner",
-        chat_type=chat_type,
-    )
-    state = adapter._plan_store.get_session("sk")
-    adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    body = {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-other"}, "actions": [{"action_ts": f"other-{chat_type}"}],
-    }
-    action = {
-        "action_id": "hermes_plan_complete",
-        "block_id": "hermes-plan-controls-r1-" + state["desired_hash"][:10],
-        "selected_options": [{"value": "user:a"}],
-    }
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    await asyncio.sleep(0)
-    assert events == []
-
-    body["user"]["id"] = "U-owner"
-    body["actions"][0]["action_ts"] = f"owner-{chat_type}"
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    await asyncio.sleep(0)
-    assert len(events) == 1
-    assert events[0].source.user_id == "U-owner"
-    assert events[0].source.chat_type == chat_type
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("action_id", "selection"),
-    [
-        ("hermes_plan_complete", {"selected_options": [{"value": "user:a"}]}),
-        ("hermes_plan_cancel", {"selected_option": {"value": "user:a"}}),
-        ("hermes_plan_add", {}),
-    ],
-)
-async def test_same_channel_unrelated_allowlisted_user_cannot_mutate_owner_card(
-    tmp_path, action_id, selection,
-) -> None:
-    adapter = _adapter(tmp_path)
-    state = _state(
-        adapter,
-        [{"id": "user:a", "content": "A", "status": "in_progress"}],
-    )
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=state["desired_revision"],
-        snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
     client = adapter._team_clients["T1"]
+    client.chat_postEphemeral = AsyncMock(return_value={"message_ts": "notice"})
     client.views_open = AsyncMock()
+    ack = AsyncMock()
     body = {
         "trigger_id": "trigger",
         "team": {"id": "T1"},
         "channel": {"id": "C1"},
         "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-other"},
-        "actions": [{"action_ts": action_id}],
+        "user": {"id": "U-owner"},
+        "actions": [{"action_ts": "legacy-action"}],
     }
     action = {
         "action_id": action_id,
-        "block_id": (
-            f"hermes-plan-controls-r{state['desired_revision']}-"
-            f"{state['desired_hash'][:10]}"
-        ),
-        **selection,
+        "block_id": "hermes-plan-controls-r1-legacy",
+        "selected_options": [{"value": "user:a"}],
+        "selected_option": {"value": "user:a"},
     }
 
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    await asyncio.sleep(0)
+    await adapter._handle_plan_action(ack, body, action)
+    await adapter._handle_plan_action(ack, body, action)
 
-    assert events == []
+    assert ack.await_count == 2
+    client.chat_postEphemeral.assert_awaited_once()
+    notice = client.chat_postEphemeral.call_args.kwargs
+    assert notice["channel"] == "C1"
+    assert notice["user"] == "U-owner"
+    assert notice["thread_ts"] == "10.0"
+    assert "read-only" in notice["text"]
+    assert "Clarify or reply in Slack" in notice["text"]
     client.views_open.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_empty_owner_route_is_read_only_but_refresh_remains_available(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    state = _state(
-        adapter,
-        [{"id": "user:a", "content": "A", "status": "in_progress"}],
-        route_user_id="",
-    )
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=state["desired_revision"],
-        snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    rendered = adapter._render_plan_state(adapter._plan_store.get_session("sk"))
-    assert [
-        element["action_id"]
-        for block in rendered.native_blocks
-        if block["type"] == "actions"
-        for element in block["elements"]
-    ] == ["hermes_plan_refresh"]
-
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    body = {
-        "trigger_id": "trigger",
-        "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-allowlisted"},
-        "actions": [{"action_ts": "empty-owner"}],
-    }
-    block_id = (
-        f"hermes-plan-controls-r{state['desired_revision']}-"
-        f"{state['desired_hash'][:10]}"
-    )
-    for index, action in enumerate((
-        {
-            "action_id": "hermes_plan_complete",
-            "selected_options": [{"value": "user:a"}],
-        },
-        {
-            "action_id": "hermes_plan_cancel",
-            "selected_option": {"value": "user:a"},
-        },
-        {"action_id": "hermes_plan_add"},
-    )):
-        body["actions"][0]["action_ts"] = f"empty-owner-{index}"
-        await adapter._handle_plan_action(
-            AsyncMock(), body, {**action, "block_id": block_id}
-        )
-
-    assert events == []
-    client.views_open.assert_not_awaited()
-    before_refresh = adapter._plan_store.get_session("sk")["desired_revision"]
-    body["actions"][0]["action_ts"] = "empty-owner-refresh"
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_refresh", "block_id": block_id,
-    })
-    assert adapter._plan_store.get_session("sk")["desired_revision"] == before_refresh + 1
-
-
-@pytest.mark.asyncio
-async def test_route_owner_change_reanchors_and_only_new_owner_can_use_new_card(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    old = _state(
-        adapter,
-        [{"id": "user:a", "content": "A", "status": "in_progress"}],
-        route_user_id="U-owner",
-    )
-    old_create = adapter._plan_store.prepare_create("sk", expected_route=old)
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=old["desired_revision"], snapshot_hash=old["desired_hash"],
-        message_ts="20.0", expected_message_ts="",
-        expected_client_msg_id=old_create["client_msg_id"],
-    )
-
-    new = adapter.record_desired_plan_snapshot(
-        session_key="sk", session_id="sid", team_id="T1", channel_id="C1",
-        thread_ts="10.0", route_user_id="U-new", chat_type="group",
-        todos=[{"id": "user:a", "content": "A", "status": "in_progress"}],
-    )
-    assert new["message_ts"] == ""
-    assert new["retired_anchors"][0]["message_ts"] == "20.0"
-    assert new["retired_anchors"][0]["route_user_id"] == "U-owner"
-    assert adapter._plan_store.lookup_route("T1", "C1", "20.0") is None
-    new_create = adapter._plan_store.prepare_create("sk", expected_route=new)
-    assert new_create["client_msg_id"] != old_create["client_msg_id"]
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=new["desired_revision"], snapshot_hash=new["desired_hash"],
-        message_ts="30.0", rendered_revision=new["desired_revision"],
-        expected_message_ts="",
-        expected_client_msg_id=new_create["client_msg_id"],
-    )
-
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    action = {
-        "action_id": "hermes_plan_complete",
-        "block_id": (
-            f"hermes-plan-controls-r{new['desired_revision']}-"
-            f"{new['desired_hash'][:10]}"
-        ),
-        "selected_options": [{"value": "user:a"}],
-    }
-    body = {
-        "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"},
-        "actions": [{"action_ts": "old-card"}],
-    }
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    body["message"]["ts"] = "30.0"
-    body["actions"][0]["action_ts"] = "old-owner-new-card"
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    assert events == []
-
-    body["user"]["id"] = "U-new"
-    body["actions"][0]["action_ts"] = "new-owner-new-card"
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    await asyncio.sleep(0)
-    assert len(events) == 1
-    assert events[0].metadata["slack_plan_action"]["action_user_id"] == "U-new"
-
-
-@pytest.mark.asyncio
-async def test_wildcard_allowlist_does_not_bypass_exact_plan_owner(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    state = _state(
-        adapter,
-        [{"id": "user:a", "content": "A", "status": "in_progress"}],
-        route_user_id="U-owner",
-    )
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=state["desired_revision"],
-        snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    body = {
-        "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-other"},
-        "actions": [{"action_ts": "wildcard"}],
-    }
-    action = {
-        "action_id": "hermes_plan_complete",
-        "block_id": (
-            f"hermes-plan-controls-r{state['desired_revision']}-"
-            f"{state['desired_hash'][:10]}"
-        ),
-        "selected_options": [{"value": "user:a"}],
-    }
-
-    with patch.dict("os.environ", {"SLACK_ALLOWED_USERS": "*"}, clear=False):
-        assert adapter._is_interactive_user_authorized(
-            "U-other", channel_id="C1", team_id="T1", thread_id="10.0"
-        )
-        await adapter._handle_plan_action(AsyncMock(), body, action)
-
-    await asyncio.sleep(0)
-    assert events == []
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("invalid_field", ["team", "channel", "message", "thread", "block"])
-async def test_plan_action_rejects_each_stale_or_wrong_route_dimension(tmp_path, invalid_field) -> None:
-    adapter = _adapter(tmp_path)
-    _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
-    state = adapter._plan_store.get_session("sk")
-    adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    adapter.set_message_handler(AsyncMock())
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    body = {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U1"}, "actions": [{"action_ts": invalid_field}],
-    }
-    block_id = "hermes-plan-controls-r1-" + state["desired_hash"][:10]
-    if invalid_field == "team":
-        body["team"]["id"] = "WRONG"
-    elif invalid_field == "channel":
-        body["channel"]["id"] = "WRONG"
-    elif invalid_field == "message":
-        body["message"]["ts"] = "WRONG"
-    elif invalid_field == "thread":
-        body["message"]["thread_ts"] = "WRONG"
-    else:
-        block_id = "hermes-plan-controls-r0-stale"
-
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_complete", "block_id": block_id,
-        "selected_options": [{"value": "user:a"}],
-    })
     adapter._message_handler.assert_not_awaited()
+    after = state_path.read_bytes() if state_path.exists() else None
+    assert after == before
 
 
 @pytest.mark.asyncio
-async def test_plan_action_queues_silently_when_original_session_is_busy(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    _state(adapter, [{"id": "user:a", "content": "A", "status": "in_progress"}])
-    state = adapter._plan_store.get_session("sk")
-    adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    adapter.set_message_handler(AsyncMock())
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    adapter.set_busy_session_handler(AsyncMock(return_value=False))
-    source = adapter.build_source(
-        chat_id="C1", chat_type="group", user_id="U-owner",
-        thread_id="10.0", scope_id="T1",
-    )
-    session_key = build_session_key(source)
-    adapter._active_sessions[session_key] = asyncio.Event()
-    body = {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "busy"}],
-    }
-    action = {
-        "action_id": "hermes_plan_complete",
-        "block_id": "hermes-plan-controls-r1-" + state["desired_hash"][:10],
-        "selected_options": [{"value": "user:a"}],
-    }
-
-    await adapter._handle_plan_action(AsyncMock(), body, action)
-    await asyncio.sleep(0)
-    assert adapter._pending_messages[session_key].internal is True
-    adapter._message_handler.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_add_modal_is_signed_and_submission_tamper_fails_closed(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    _state(adapter)
-    adapter._plan_store.mark_applied(
-        "sk", revision=1,
-        snapshot_hash=adapter._plan_store.get_session("sk")["desired_hash"],
-        message_ts="20.0",
-    )
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    body = {
-        "trigger_id": "trigger",
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "1"}],
-    }
-    block_id = "hermes-plan-controls-r1-" + adapter._plan_store.get_session("sk")["desired_hash"][:10]
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_add", "block_id": block_id,
-    })
-    view = client.views_open.call_args.kwargs["view"]
-    assert view["callback_id"] == "hermes_plan_add_task"
-    assert view["title"]["text"] == "Add user task"
-    envelope = json.loads(view["private_metadata"])
-    assert envelope["signature"]
-    payload = verify_private_metadata(view["private_metadata"], b"signing-secret")
-    generated_id = payload["add_task_ids"][0]
-    assert is_user_task_id(generated_id)
-    assert payload["task_ids"] == [generated_id]
-    assert payload["action_kind"] == "add_user_task"
-    assert payload["action_user_id"] == "U-owner"
-    assert generated_id not in {
-        task["id"] for task in adapter._plan_store.get_session("sk")["last_desired_snapshot"]
-    }
-
-    events = []
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    rejected_body = {
-        "team": {"id": "T1"}, "user": {"id": "U-other"},
-        "view": {
-            "id": "V-other", "hash": "H-other",
-            "private_metadata": view["private_metadata"],
-            "state": {"values": {"task": {"content": {"value": "Wrong owner"}}}},
-        },
-    }
-    await adapter._handle_plan_add_view(AsyncMock(), rejected_body, AsyncMock())
-    await asyncio.sleep(0)
-    assert events == []
-
-    submit_body = {
-        "team": {"id": "T1"}, "user": {"id": "U-owner"},
-        "view": {
-            "private_metadata": view["private_metadata"],
-            "state": {"values": {"task": {"content": {"value": "New task"}}}},
-        },
-    }
-    ack = AsyncMock()
-    await adapter._handle_plan_add_view(ack, submit_body, AsyncMock())
-    await asyncio.sleep(0)
-    assert ack.await_count == 1
-    assert len(events) == 1
-    trusted = events[0].metadata["slack_plan_action"]
-    assert trusted["action_kind"] == "add_user_task"
-    assert trusted["add_task_ids"] == [generated_id]
-    assert trusted["task_ids"] == [generated_id]
-    assert trusted["add_task_content"] == "New task"
-    assert trusted["add_task_status"] == "in_progress"
-    assert f'"add_task_ids": ["{generated_id}"]' in events[0].text
-    assert '"add_task_content": "New task"' in events[0].text
-    assert '"add_task_status": "in_progress"' in events[0].text
-
-    await adapter._handle_plan_add_view(ack, submit_body, AsyncMock())
-    assert len(events) == 1
-
-    tampered = json.loads(view["private_metadata"])
-    tampered["payload"]["add_task_ids"] = ["user:replacement"]
-    submit_body["view"]["private_metadata"] = json.dumps(tampered)
-    await adapter._handle_plan_add_view(ack, submit_body, AsyncMock())
-    assert len(events) == 1
-
-
-@pytest.mark.asyncio
-async def test_future_user_tasks_do_not_block_active_action_or_add_modal(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    read_only = [
-        {
-            "id": f"user:read-only-{index}",
-            "content": str(index),
-            "status": "cancelled" if index % 2 else "pending",
-        }
-        for index in range(15)
-    ]
-    state = _state(adapter, read_only + [
-        {"id": "user:active", "content": "Active", "status": "in_progress"},
-    ])
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=state["desired_revision"],
-        snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    body = {
-        "trigger_id": "trigger", "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "complete"}],
-    }
-    block_id = "hermes-plan-controls-r1-" + state["desired_hash"][:10]
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_complete", "block_id": block_id,
-        "selected_options": [{"value": "user:active"}],
-    })
-    await asyncio.sleep(0)
-    assert len(events) == 1
-    assert events[0].metadata["slack_plan_action"]["complete_task_ids"] == ["user:active"]
-
-    body["actions"][0]["action_ts"] = "add"
-    await adapter._handle_plan_action(AsyncMock(), body, {
-        "action_id": "hermes_plan_add", "block_id": block_id,
-    })
-    client.views_open.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("count", "opens_modal"),
-    [(MAX_TODO_ITEMS - 1, True), (MAX_TODO_ITEMS, False)],
-)
-async def test_add_modal_preflight_follows_authoritative_todo_capacity(
-    tmp_path, count: int, opens_modal: bool,
-) -> None:
-    adapter = _adapter(tmp_path)
-    state = _state(adapter, [
-        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
-        for index in range(count)
-    ])
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=state["desired_revision"],
-        snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    await adapter._handle_plan_action(AsyncMock(), {
-        "trigger_id": "trigger", "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"},
-        "actions": [{"action_ts": f"capacity-{count}"}],
-    }, {
-        "action_id": "hermes_plan_add",
-        "block_id": (
-            f"hermes-plan-controls-r{state['desired_revision']}-"
-            f"{state['desired_hash'][:10]}"
-        ),
-    })
-    assert (client.views_open.await_count == 1) is opens_modal
-
-
-@pytest.mark.asyncio
-async def test_add_modal_submission_fails_after_desired_snapshot_reaches_todo_capacity(
+async def test_legacy_plan_modal_submission_acks_read_only_without_dispatch_or_mutation(
     tmp_path,
 ) -> None:
     adapter = _adapter(tmp_path)
-    original = _state(adapter, [
-        {"id": f"agent:{index}", "content": str(index), "status": "pending"}
-        for index in range(MAX_TODO_ITEMS - 1)
-    ])
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=original["desired_revision"],
-        snapshot_hash=original["desired_hash"], message_ts="20.0",
-    )
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    action_body = {
-        "trigger_id": "trigger", "team": {"id": "T1"},
-        "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "open"}],
-    }
-    await adapter._handle_plan_action(AsyncMock(), action_body, {
-        "action_id": "hermes_plan_add",
-        "block_id": (
-            f"hermes-plan-controls-r{original['desired_revision']}-"
-            f"{original['desired_hash'][:10]}"
-        ),
-    })
-    view = client.views_open.call_args.kwargs["view"]
-
-    adapter.record_desired_plan_snapshot(
-        session_key="sk", session_id="sid", team_id="T1", channel_id="C1",
-        thread_ts="10.0", route_user_id="U-owner", chat_type="group",
-        todos=[
-            {"id": f"agent:{index}", "content": str(index), "status": "pending"}
-            for index in range(MAX_TODO_ITEMS)
-        ],
-    )
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    await adapter._handle_plan_add_view(AsyncMock(), {
-        "team": {"id": "T1"}, "user": {"id": "U-owner"},
-        "view": {
-            "id": "V-capacity", "hash": "H-capacity",
-            "private_metadata": view["private_metadata"],
-            "state": {"values": {"task": {"content": {"value": "Too late"}}}},
-        },
-    })
-    await asyncio.sleep(0)
-    assert events == []
-
-
-@pytest.mark.asyncio
-async def test_add_modal_keeps_validated_lineage_across_concurrent_route_change(tmp_path) -> None:
-    adapter = _adapter(tmp_path)
-    original = _state(adapter)
-    assert adapter._plan_store.mark_applied(
-        "sk", revision=original["desired_revision"],
-        snapshot_hash=original["desired_hash"], message_ts="20.0",
-    )
-    payload = {
-        "session_key": "sk", "session_id": "sid", "team_id": "T1",
-        "channel_id": "C1", "thread_ts": "10.0", "message_ts": "20.0",
-        "revision": original["desired_revision"],
-        "snapshot_hash": original["desired_hash"], "task_ids": ["user:new"],
-        "action_kind": "add_user_task", "add_task_ids": ["user:new"],
-        "action_user_id": "U-owner", "action_dedupe_id": "open-dedupe",
-    }
-    private_metadata = sign_private_metadata(payload, b"signing-secret")
-    assert adapter._plan_store.consume_action_id("open-dedupe")
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    events = []
-
-    async def handle(event):
-        events.append(event)
-
-    adapter.set_message_handler(handle)
-    validate = adapter._plan_store.validate_action
-    changed = False
-
-    def validate_then_change(metadata):
-        nonlocal changed
-        validated = validate(metadata)
-        if validated and not changed:
-            changed = True
-            adapter.record_desired_plan_snapshot(
-                session_key="sk", session_id="sid-new", team_id="T1",
-                channel_id="C2", thread_ts="11.0", route_user_id="U-owner",
-                chat_type="group",
-                todos=[{"id": "b", "content": "New", "status": "pending"}],
-            )
-        return validated
-
-    adapter._plan_store.validate_action = MagicMock(side_effect=validate_then_change)
-    await adapter._handle_plan_add_view(AsyncMock(), {
-        "team": {"id": "T1"}, "user": {"id": "U-owner"},
-        "view": {
-            "id": "V-race", "hash": "H-race", "private_metadata": private_metadata,
-            "state": {"values": {"task": {"content": {"value": "Old modal"}}}},
-        },
-    })
-    await asyncio.sleep(0)
-
-    assert len(events) == 1
-    trusted = events[0].metadata["slack_plan_action"]
-    assert trusted["session_id"] == "sid"
-    assert trusted["channel_id"] == "C1"
-    assert trusted["thread_ts"] == "10.0"
-    assert trusted["revision"] == original["desired_revision"]
-    assert trusted["snapshot_hash"] == original["desired_hash"]
-    assert trusted["add_task_ids"] == ["user:new"]
-    assert trusted["add_task_status"] == "in_progress"
-
-    runner = object.__new__(GatewayRunner)
-    runner.adapters = {events[0].source.platform: adapter}
-    runner.session_store = MagicMock()
-    runner.session_store._entries = {
-        "sk": type("Entry", (), {"session_id": "sid-new"})()
-    }
-    adapter.send = AsyncMock()
-    assert not await runner._validate_slack_plan_action_after_claim(events[0], "sk")
-    adapter.send.assert_awaited_once()
-
-
-def test_add_control_unavailable_without_signing_secret(tmp_path) -> None:
-    adapter = _adapter(tmp_path, secret=None)
-    state = _state(adapter)
-    rendered = adapter._render_plan_state(state)
-    action_ids = [
-        element["action_id"]
-        for block in rendered.native_blocks
-        if block["type"] == "actions"
-        for element in block["elements"]
-    ]
-    assert "hermes_plan_add" not in action_ids
-
-
-@pytest.mark.asyncio
-async def test_crafted_add_action_is_rejected_without_signing_secret(tmp_path) -> None:
-    adapter = _adapter(tmp_path, secret=None)
     _state(adapter)
-    state = adapter._plan_store.get_session("sk")
-    adapter._plan_store.mark_applied(
-        "sk", revision=1, snapshot_hash=state["desired_hash"], message_ts="20.0",
-    )
-    adapter._is_interactive_user_authorized = MagicMock(return_value=True)
-    client = adapter._team_clients["T1"]
-    client.views_open = AsyncMock()
-    await adapter._handle_plan_action(AsyncMock(), {
-        "trigger_id": "trigger", "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0", "thread_ts": "10.0"},
-        "user": {"id": "U-owner"}, "actions": [{"action_ts": "no-secret"}],
-    }, {
-        "action_id": "hermes_plan_add",
-        "block_id": "hermes-plan-controls-r1-" + state["desired_hash"][:10],
-    })
-    client.views_open.assert_not_awaited()
-
-
-@pytest.mark.asyncio
-async def test_disabled_plan_handlers_ack_without_mutation(tmp_path) -> None:
-    adapter = _adapter(tmp_path, enabled=False)
+    before = adapter._plan_store.state_path.read_bytes()
     adapter.set_message_handler(AsyncMock())
     ack = AsyncMock()
+    body = {
+        "user": {"id": "U-owner"},
+        "view": {
+            "id": "V1",
+            "hash": "H1",
+            "private_metadata": "legacy-signed-or-tampered-data",
+            "state": {"values": {"task": {"content": {"value": "New task"}}}},
+        },
+    }
 
-    await adapter._handle_plan_action(ack, {
-        "team": {"id": "T1"}, "channel": {"id": "C1"},
-        "message": {"ts": "20.0"}, "user": {"id": "U1"},
-    }, {"action_id": "hermes_plan_refresh", "block_id": "stale"})
-    await adapter._handle_plan_add_view(ack, {
-        "team": {"id": "T1"}, "user": {"id": "U1"}, "view": {},
-    })
+    await adapter._handle_plan_add_view(ack, body, AsyncMock())
+    await adapter._handle_plan_add_view(ack, body, AsyncMock())
 
     assert ack.await_count == 2
+    for call in ack.await_args_list:
+        assert call.kwargs["response_action"] == "errors"
+        assert "read-only" in call.kwargs["errors"]["task"]
+        assert "Clarify or reply in Slack" in call.kwargs["errors"]["task"]
     adapter._message_handler.assert_not_awaited()
-    assert adapter._plan_store.list_dirty() == []
-    assert adapter._plan_reconcile_task is None
+    assert adapter._plan_store.state_path.read_bytes() == before
+
+
+def test_legacy_internal_plan_action_metadata_always_fails_closed(tmp_path) -> None:
+    adapter = _adapter(tmp_path)
+    assert not adapter.validate_plan_action_metadata({
+        "session_key": "sk",
+        "session_id": "sid",
+        "action_kind": "complete_reopen",
+    })
+
+
+@pytest.mark.parametrize("route_user_id", ["", "U-owner", "B-bot"])
+@pytest.mark.parametrize("count", [0, 1, 10, 100])
+def test_adapter_render_is_read_only_for_all_owner_and_capacity_combinations(
+    tmp_path, route_user_id, count,
+) -> None:
+    adapter = _adapter(tmp_path)
+    statuses = ("pending", "in_progress", "completed", "cancelled")
+    state = _state(
+        adapter,
+        [
+            {
+                "id": f"task-{index}",
+                "content": f"Task {index}",
+                "status": statuses[index % len(statuses)],
+            }
+            for index in range(count)
+        ],
+        route_user_id=route_user_id,
+    )
+    rendered = adapter._render_plan_state(state)
+
+    assert all(block["type"] != "actions" for block in rendered.native_blocks)
+    assert all(block["type"] != "actions" for block in rendered.fallback_blocks)
 
 
 def test_feature_gate_defaults_off_and_coerces_false_string(tmp_path) -> None:
     with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
-        assert SlackAdapter(PlatformConfig(enabled=True, token="x", extra={}))._plan_cards_enabled is False
+        assert SlackAdapter(
+            PlatformConfig(enabled=True, token="x", extra={})
+        )._plan_cards_enabled is False
         assert SlackAdapter(PlatformConfig(
             enabled=True, token="x", extra={"native_plan_cards": "false"}
         ))._plan_cards_enabled is False
-
-
-def test_loaded_config_constructs_enabled_adapter_with_signing_key(
-    tmp_path, monkeypatch
-) -> None:
-    hermes_home = tmp_path / ".hermes"
-    hermes_home.mkdir()
-    secret = "loaded-plan-signing-secret"
-    (hermes_home / "config.yaml").write_text(
-        "slack:\n"
-        "  native_plan_cards: true\n"
-        f"  native_plan_cards_signing_secret: {secret}\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    monkeypatch.delenv("SLACK_SIGNING_SECRET", raising=False)
-
-    config = load_gateway_config()
-    adapter = SlackAdapter(config.platforms[Platform.SLACK])
-
-    assert adapter._plan_cards_enabled is True
-    assert adapter._plan_signing_secret() == secret.encode("utf-8")
-
-
-def _adapter_with_config_signing_secret(tmp_path, secret: str | None) -> SlackAdapter:
-    extra = {}
-    if secret is not None:
-        extra["native_plan_cards_signing_secret"] = secret
-    with patch("hermes_constants.get_hermes_home", return_value=tmp_path):
-        return SlackAdapter(PlatformConfig(enabled=True, token="x", extra=extra))
-
-
-def test_unscoped_multiplex_signing_secret_uses_adapter_config_not_global_env(
-    tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret-from-other-profile")
-    adapter = _adapter_with_config_signing_secret(tmp_path, "adapter-local-secret")
-    was_multiplex_active = secret_scope.is_multiplex_active()
-    scope_token = secret_scope.set_secret_scope(None)
-    secret_scope.set_multiplex_active(True)
-    try:
-        assert adapter._plan_signing_secret() == b"adapter-local-secret"
-    finally:
-        secret_scope.reset_secret_scope(scope_token)
-        secret_scope.set_multiplex_active(was_multiplex_active)
-
-
-def test_unscoped_multiplex_signing_secret_fails_closed_without_adapter_config(
-    tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret-from-other-profile")
-    adapter = _adapter_with_config_signing_secret(tmp_path, None)
-    was_multiplex_active = secret_scope.is_multiplex_active()
-    scope_token = secret_scope.set_secret_scope(None)
-    secret_scope.set_multiplex_active(True)
-    try:
-        assert adapter._plan_signing_secret() is None
-    finally:
-        secret_scope.reset_secret_scope(scope_token)
-        secret_scope.set_multiplex_active(was_multiplex_active)
-
-
-def test_scoped_signing_secret_takes_priority_over_adapter_config(
-    tmp_path, monkeypatch
-) -> None:
-    monkeypatch.setenv("SLACK_SIGNING_SECRET", "secret-from-other-profile")
-    adapter = _adapter_with_config_signing_secret(tmp_path, "adapter-local-secret")
-    was_multiplex_active = secret_scope.is_multiplex_active()
-    scope_token = secret_scope.set_secret_scope(
-        {"SLACK_SIGNING_SECRET": "properly-scoped-secret"}
-    )
-    secret_scope.set_multiplex_active(True)
-    try:
-        assert adapter._plan_signing_secret() == b"properly-scoped-secret"
-    finally:
-        secret_scope.reset_secret_scope(scope_token)
-        secret_scope.set_multiplex_active(was_multiplex_active)
-
-
-def test_signing_secret_store_failure_uses_adapter_config(tmp_path) -> None:
-    adapter = _adapter_with_config_signing_secret(tmp_path, "adapter-local-secret")
-
-    with patch(
-        "plugins.platforms.slack.adapter.get_secret",
-        side_effect=RuntimeError("secret store unavailable"),
-    ):
-        assert adapter._plan_signing_secret() == b"adapter-local-secret"
-
-
-def test_plan_signing_secret_has_no_direct_process_env_fallback() -> None:
-    source = inspect.getsource(SlackAdapter._plan_signing_secret)
-
-    assert "os.getenv" not in source
