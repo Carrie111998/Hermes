@@ -28,7 +28,9 @@ PR_TOKEN_RE = re.compile(r"#(\d{3,6})")
 
 
 def gh(args: list[str]) -> str:
-    r = subprocess.run(["gh", *args], capture_output=True, text=True, timeout=60)
+    r = subprocess.run(
+        ["gh", *args], capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60
+    )
     if r.returncode != 0:
         raise RuntimeError(f"gh {' '.join(args)} failed: {r.stderr[:300]}")
     return r.stdout
