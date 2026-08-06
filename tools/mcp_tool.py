@@ -2319,7 +2319,7 @@ class MCPServerTask:
                     self._mark_session_proven()
         finally:
             for t in (shutdown_task, reconnect_task):
-                if not t.done():
+                if not t.done() and not t.get_loop().is_closed():
                     t.cancel()
                     try:
                         await t
@@ -2363,7 +2363,7 @@ class MCPServerTask:
             )
         finally:
             for t in (shutdown_task, reconnect_task):
-                if not t.done():
+                if not t.done() and not t.get_loop().is_closed():
                     t.cancel()
                     try:
                         await t
