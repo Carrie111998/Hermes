@@ -273,7 +273,10 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
         # chunk tells us if this is a binary (NUL bytes) that should be
         # skipped as "nothing to scan" rather than failing closed (#76762).
         data = os.read(descriptor, _MAX_REFERENCED_SCRIPT_BYTES + 1)
-    except OSError:
+    except (OSError, ValueError):
+        # OSError: unreadable/long paths. ValueError: embedded NUL byte from
+        # a binary's decoded contents tokenized as a path — a guarded path
+        # must never crash the guard (#76762).
         return None, False
     finally:
         os.close(descriptor)
