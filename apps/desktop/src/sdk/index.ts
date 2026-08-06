@@ -79,9 +79,9 @@ export const host = {
     /** Live usage snapshot of the focused session (`context_used` /
      *  `context_max` / `context_percent`, token counts, `cost_usd`) —
      *  streamed by the backend, no RPC needed. Null while unresolved.
-     *  Partial: the backend streams whichever fields changed, so every
-     *  field read needs a fallback. */
-    focusedUsage: readonlyAtom<null | Partial<UsageStats>>($focusedUsage),
+     *  The UsageStats-optional fields (context_*, cost_usd) arrive as the
+     *  backend reports them, so read them with a fallback. */
+    focusedUsage: readonlyAtom<null | UsageStats>($focusedUsage),
     /** Active workspace cwd ('' when detached). */
     cwd: readonlyAtom<string>($currentCwd),
     /** Gateway socket state: 'idle' | 'connecting' | 'open' | …. */
