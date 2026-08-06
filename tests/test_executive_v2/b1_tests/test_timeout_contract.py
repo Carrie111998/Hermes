@@ -77,14 +77,19 @@ def test_a_timeout_seconds_symbol_not_in_public_api():
 def test_a_timeout_seconds_kwarg_rejected_by_dry_run():
     """dry_run() does not accept timeout_seconds as a keyword argument.
 
-    Behavioral contract: caller can introspect the public signature and
-    see that timeout_seconds is absent.
+    Behavioral contract: calling ``EvidencePackEngine.dry_run`` with a
+    ``timeout_seconds`` kwarg raises ``TypeError`` (the public surface
+    does not advertise the knob). The drive invokes the documented
+    method and observes the public exception; no source/AST
+    introspection is performed.
     """
-    sig = inspect.signature(EvidencePackEngine.dry_run)
-    assert "timeout_seconds" not in sig.parameters, (
-        "dry_run must not advertise a timeout_seconds parameter; the knob "
-        "is not enforced against any provider."
-    )
+    engine = _make_engine()
+    with pytest.raises(TypeError):
+        engine.dry_run(
+            objective_id="a-timeout-rejected",
+            objective_text="alpha content",
+            timeout_seconds=30.0,
+        )
 
 
 # ── Test B: the field is gone from the dataclass ────────────────────────
@@ -99,9 +104,19 @@ def test_b_knowledge_query_has_no_timeout_field():
 
 
 def test_b_knowledge_query_constructor_rejects_timeout_kwarg():
-    """KnowledgeQuery(...) does not accept timeout_seconds=..."""
-    sig = inspect.signature(KnowledgeQuery)
-    assert "timeout_seconds" not in sig.parameters
+    """KnowledgeQuery(...) does not accept timeout_seconds=...
+
+    Behavioral contract: instantiating ``KnowledgeQuery`` with a
+    ``timeout_seconds`` kwarg raises ``TypeError`` (the public surface
+    does not advertise the knob). The drive invokes the documented
+    constructor and observes the public exception.
+    """
+    with pytest.raises(TypeError):
+        KnowledgeQuery(
+            objective_id="b-timeout-rejected",
+            objective_text="alpha content",
+            timeout_seconds=30.0,
+        )
 
 
 def test_b_knowledge_query_fingerprint_does_not_change_with_timeout_kwarg():
@@ -133,18 +148,42 @@ def test_b_knowledge_query_fingerprint_does_not_change_with_timeout_kwarg():
 
 
 def test_c_dry_run_signature_has_no_timeout_param():
-    """Signature inspection (public) confirms no timeout_seconds param."""
-    sig = inspect.signature(EvidencePackEngine.dry_run)
-    assert "timeout_seconds" not in sig.parameters
+    """dry_run() externally rejects timeout_seconds.
+
+    Behavioral contract: the canonical happy-path
+    ``EvidencePackEngine.dry_run`` invocation (without the disputed
+    kwarg) succeeds and returns the documented shape. This is the
+    positive twin of ``test_a_timeout_seconds_kwarg_rejected_by_dry_run``
+    — together, they prove the knob is gone: the call works without it
+    and rejects it when supplied.
+    """
+    engine = _make_engine()
+    pack = engine.dry_run(
+        objective_id="c-dry-run-happy",
+        objective_text="alpha content",
+    )
+    # Public surface: the call returns a pack-like object.
+    assert pack is not None
+    assert getattr(pack, "query_fingerprint", None) is not None
 
 
 def test_c_discover_propagates_no_timeout_param():
-    """discover(**kwargs) must not silently swallow a timeout kwarg into
-    the underlying _compute_fingerprint, because that would couple cache
-    identity to a knob that has no effect.
+    """discover() externally rejects timeout_seconds.
+
+    Behavioral contract: ``EvidencePackEngine.discover`` rejects
+    ``timeout_seconds`` at the public boundary with ``TypeError``
+    (the kwarg is not forwarded into the underlying cache-fingerprint
+    pipeline). The drive invokes the documented method and observes
+    the public exception; the cache identity is therefore not
+    perturbed by the (rejected) knob.
     """
-    sig = inspect.signature(EvidencePackEngine.discover)
-    assert "timeout_seconds" not in sig.parameters
+    engine = _make_engine_with_storage()
+    with pytest.raises(TypeError):
+        engine.discover(
+            objective_id="c-discover-timeout-rejected",
+            objective_text="alpha content",
+            timeout_seconds=30.0,
+        )
 
 
 # ── Test D: a caller cannot reintroduce timeout via kwargs in discover ──

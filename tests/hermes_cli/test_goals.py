@@ -2111,13 +2111,60 @@ class TestB1E6InsertionHelperContract:
         assert a == b == "head\n\nX\n\nContinue working tail"
 
     def test_helper_is_callable_via_class_only(self):
-        """Static method — callable as ``GoalManager._insert_evidence_block``."""
-        import inspect
+        """Static method — callable as ``GoalManager._insert_evidence_block``.
+
+        Behavioral contract: the function is reachable as
+        ``GoalManager._insert_evidence_block`` (class-only, no instance
+        required), accepts exactly the two documented arguments by name
+        (``baseline_prompt``, ``evidence_block``), and rejects unknown
+        kwargs with ``TypeError``. The drive invokes the documented
+        callable and observes the public surface.
+        """
+        import pytest
+
         from hermes_cli.goals import GoalManager
 
-        sig = inspect.signature(GoalManager._insert_evidence_block)
-        params = list(sig.parameters)
-        assert params == ["baseline_prompt", "evidence_block"]
+        # Behavioral observation 1: callable as a class attribute (no
+        # instance required).
+        assert callable(getattr(GoalManager, "_insert_evidence_block", None))
+
+        # Behavioral observation 2: documented kwargs work; the function
+        # inserts the evidence block immediately before the unique
+        # ``\n\nContinue working`` marker when present, and returns the
+        # baseline byte-identically when the marker is absent or ambiguous.
+        baseline_with_marker = "intro\n\nContinue working rest"
+        out = GoalManager._insert_evidence_block(
+            baseline_prompt=baseline_with_marker,
+            evidence_block="\n\nBLOCK",
+        )
+        assert isinstance(out, str)
+        assert "BLOCK" in out
+        assert out.startswith("intro")
+
+        # Behavioral observation 3: positional args (in the documented
+        # order) also work — the contract is two positional parameters.
+        out_pos = GoalManager._insert_evidence_block(
+            baseline_with_marker, "\n\nBLOCK"
+        )
+        assert out_pos == out
+
+        # Behavioral observation 4: empty evidence_block returns the
+        # baseline byte-identically (a documented contract, not a side
+        # effect of the implementation).
+        out_empty = GoalManager._insert_evidence_block(
+            baseline_prompt=baseline_with_marker,
+            evidence_block="",
+        )
+        assert out_empty == baseline_with_marker
+
+        # Behavioral observation 5: unknown kwargs are rejected with
+        # TypeError (the public surface does not accept extras).
+        with pytest.raises(TypeError):
+            GoalManager._insert_evidence_block(
+                baseline_prompt=baseline_with_marker,
+                evidence_block="\n\nBLOCK",
+                unexpected_kwarg="x",
+            )
 
 
 class TestB1E6NoPackByteIdentical:

@@ -229,33 +229,202 @@ def test_factory_borrows_storage_without_copying_or_closing():
 
 
 def test_factory_module_does_not_import_session_db():
-    """The factory must never reach into SessionDB internals."""
-    import ast
-    module = importlib.import_module(
-        "agent.executive.knowledge_discovery.factory"
+    """The factory must never reach into SessionDB / hermes_state internals.
+
+    Behavioral contract: a fresh Python subprocess installs an import
+    blocker for ``hermes_state`` (and ``hermes_state.*``) BEFORE importing
+    the factory module, then composes the engine via the public factory
+    callable and exercises it through the public ``dry_run`` method. The
+    subprocess must complete successfully without the blocker firing.
+
+    The blocker raises ``ImportError`` on any ``import hermes_state`` or
+    ``from hermes_state import ...`` triggered top-down or deferred.
+    Because the blocker is installed BEFORE any factory import, it
+    detects top-level factory imports of ``hermes_state`` as well as
+    imports triggered later during composition / ``dry_run``.
+
+    The subprocess exercises the engine through the public
+    ``dry_run(objective_id, objective_text)`` method and inspects the
+    returned public ``EvidencePack`` dataclass. The test does NOT reach
+    into private attributes like ``engine._sources``,
+    ``engine._session_db``, ``engine._storage``, ``engine._audit_sink``,
+    or any other private attribute. It does NOT take a post‑``import
+    ``sys.modules`` baseline — the only baseline is the clean subprocess
+    state itself.
+    """
+    import subprocess
+    import sys
+
+    # Build the subprocess script via string concatenation. We avoid nesting
+    # triple-quoted strings so the outer Python source is unambiguous.
+    # Each statement is appended on its own line so failure tracebacks
+    # point at the right line.
+    subprocess_script_lines = [
+        "import sys",
+        "import json",
+        "",
+        # Meta-path finder that raises ImportError on any hermes_state
+        # import. If hermes_state is reachable from the factory's
+        # transitive import closure (top-level or deferred), the very
+        # next import that touches it raises ImportError and the
+        # subprocess fails — proving the factory requires hermes_state.
+        "class _HermesStateBlocker:",
+        "    _BLOCKED_PREFIXES = ('hermes_state',)",
+        "    def find_spec(self, fullname, path, target=None):",
+        "        for prefix in self._BLOCKED_PREFIXES:",
+        "            if fullname == prefix or fullname.startswith(prefix + '.'):",
+        "                raise ImportError(",
+        "                    'blocked: hermes_state is forbidden for the '",
+        "                    'factory import-boundary probe (%r)' % fullname",
+        "                )",
+        "        return None",
+        "",
+        # Pre-emptively purge hermes_state from sys.modules so the
+        # blocker is the only path to it. Combined with the meta_path
+        # hook, this guarantees any attempt to load hermes_state raises
+        # ImportError — including imports triggered lazily.
+        "for mod_name in list(sys.modules):",
+        "    if mod_name == 'hermes_state' or mod_name.startswith('hermes_state.'):",
+        "        del sys.modules[mod_name]",
+        "",
+        "sys.meta_path.insert(0, _HermesStateBlocker())",
+        "",
+        # Real work: import the factory and exercise the canonical
+        # composition seam. The import happens AFTER the blocker is
+        # installed, so a top-level factory import of hermes_state
+        # would fire here. This must succeed without the blocker
+        # raising.
+        "from agent.executive.knowledge_discovery.factory import (",
+        "    build_evidence_pack_engine,",
+        ")",
+        "",
+        # A duck-typed storage implementing the structural contract
+        # (``get_meta`` / ``set_meta``). It never imports hermes_state
+        # or anything else.
+        "class _DuckStorage:",
+        "    def __init__(self, state=None):",
+        "        self._state = dict(state or {})",
+        "        self.close_calls = 0",
+        "    def get_meta(self, key):",
+        "        return self._state.get(key)",
+        "    def set_meta(self, key, value):",
+        "        self._state[key] = value",
+        "    def close(self):",
+        "        self.close_calls += 1",
+        "",
+        # A duck-typed audit sink implementing the structural contract
+        # (``emit(event)``). Supplying it explicitly bypasses the
+        # default emitter-resolution path so the subprocess does not
+        # depend on the monitoring subsystem's singleton.
+        "class _DuckAuditSink:",
+        "    def __init__(self):",
+        "        self.events = []",
+        "        self.close_calls = 0",
+        "    def emit(self, event):",
+        "        self.events.append(event)",
+        "    def close(self):",
+        "        self.close_calls += 1",
+        "",
+        "SESSION_ID = 'factory-import-boundary-probe'",
+        "GOAL_KEY = 'goal:' + SESSION_ID",
+        "STATE = {",
+        "    'goal': 'ship the migration',",
+        "    'contract': {",
+        "        'outcome': 'ship the migration',",
+        "        'verification': 'the auth test suite passes',",
+        "        'constraints': 'keep the public /login response shape unchanged',",
+        "        'boundaries': 'only touch services/auth and its tests',",
+        "        'stop_when': 'a schema change needs product sign-off',",
+        "    },",
+        "}",
+        "",
+        "storage = _DuckStorage(state={GOAL_KEY: json.dumps(STATE)})",
+        "audit_sink = _DuckAuditSink()",
+        "engine = build_evidence_pack_engine(",
+        "    session_id=SESSION_ID,",
+        "    config={},",
+        "    storage=storage,",
+        "    audit_sink=audit_sink,",
+        ")",
+        "",
+        # Exercise the engine via the PUBLIC ``dry_run`` method. This
+        # is the canonical public entry point; it drives every
+        # registered source and returns a public ``EvidencePack``. Any
+        # deferred import inside the loader / provider has a chance to
+        # fire here.
+        "pack = engine.dry_run(",
+        "    'obj-factory-import-boundary',",
+        "    'any objective',",
+        ")",
+        "",
+        # Inspect the PUBLIC result only. The EvidencePack dataclass
+        # exposes ``sources_queried``, ``sources_failed``,
+        # ``total_hits``, and ``overall_confidence`` as public
+        # attributes.
+        "result = {",
+        "    'engine_class': type(engine).__name__,",
+        "    'engine_module': type(engine).__module__,",
+        "    'sources_queried': list(pack.sources_queried),",
+        "    'sources_failed': list(pack.sources_failed),",
+        "    'total_hits': int(pack.total_hits),",
+        "    'overall_confidence': float(pack.overall_confidence),",
+        "    'has_summary': bool(pack.summary_text),",
+        "    'storage_close_calls': storage.close_calls,",
+        "    'audit_sink_close_calls': audit_sink.close_calls,",
+        "    'hermes_state_in_modules': any(",
+        "        m == 'hermes_state' or m.startswith('hermes_state.')",
+        "        for m in sys.modules",
+        "    ),",
+        "}",
+        "sys.stdout.write('FACTORY_IMPORT_BOUNDARY_RESULT=' + json.dumps(result))",
+    ]
+    subprocess_script = "\n".join(subprocess_script_lines)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", subprocess_script],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    src = inspect.getsource(module)
-    tree = ast.parse(src)
-    # Imports — both top-level and from-imports — must not mention SessionDB
-    # or hermes_state. A SessionDB reference can appear in the docstring,
-    # but never as an import or a constructor call.
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert "SessionDB" not in alias.name
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            for alias in node.names:
-                assert "SessionDB" not in alias.name
-                assert "SessionDB" not in module_name
-        elif isinstance(node, ast.Call):
-            # No constructor calls — e.g. ``SessionDB()`` — in the factory.
-            func = ast.unparse(node.func) if hasattr(ast, "unparse") else ""
-            assert "SessionDB" not in func
-        elif isinstance(node, ast.Name):
-            assert node.id != "SessionDB"
-        elif isinstance(node, ast.Attribute):
-            assert node.attr != "SessionDB"
+    assert completed.returncode == 0, (
+        "factory import-boundary subprocess failed:\n"
+        f"stdout={completed.stdout!r}\n"
+        f"stderr={completed.stderr!r}"
+    )
+    # The subprocess emits a JSON line on success; parse it for
+    # additional behavioral confirmations.
+    import json as _json
+
+    marker = "FACTORY_IMPORT_BOUNDARY_RESULT="
+    line = next(
+        (ln for ln in completed.stdout.splitlines() if ln.startswith(marker)),
+        None,
+    )
+    assert line is not None, (
+        "factory import-boundary subprocess did not emit a result line; "
+        f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+    )
+    report = _json.loads(line[len(marker):])
+
+    # Behavioral observation 1: the factory / engine compose
+    # successfully even though hermes_state is import-blocked, so
+    # hermes_state is NOT in the factory's transitive import closure.
+    assert report["engine_class"] == "EvidencePackEngine"
+    # Behavioral observation 2: the public dry_run result reflects
+    # that the contract source was queried, no source failed, exactly
+    # one hit was produced, and a non-empty summary was emitted.
+    assert report["sources_queried"] == ["contract"]
+    assert report["sources_failed"] == []
+    assert report["total_hits"] == 1
+    assert report["overall_confidence"] > 0.0
+    assert report["has_summary"] is True
+    # Behavioral observation 3: storage and audit sink were never
+    # closed by the factory, the engine, or the adapter.
+    assert report["storage_close_calls"] == 0
+    assert report["audit_sink_close_calls"] == 0
+    # Behavioral observation 4: hermes_state was never imported —
+    # the import blocker was never activated.
+    assert report["hermes_state_in_modules"] is False
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -866,12 +1035,135 @@ def test_cli_fallback_branch_also_passes_storage_and_factory(monkeypatch):
 
 
 def test_cli_does_not_pass_storage_none():
-    """The CLI must NOT hardcode ``storage=None``."""
-    import inspect
+    """The CLI must NOT hardcode ``storage=None`` as a kwarg literal.
+
+    Behavioral contract: when ``HermesCLI._session_db`` is set to a
+    sentinel object, invoking ``_get_goal_manager`` must transmit
+    ``storage=<that sentinel>`` to ``build_objective_services`` by
+    identity. The kwarg must reflect the actual ``_session_db`` value —
+    if production hardcoded ``storage=None``, the assertion fails
+    because the observed ``kwargs["storage"]`` would be ``None``, not
+    the sentinel.
+
+    This is the strict, identity-based version of the test: any code
+    path that bypasses ``self._session_db`` (e.g. a hardcoded
+    ``storage=None`` literal) cannot satisfy the assertion.
+    """
+    from unittest.mock import patch
+
     from cli import HermesCLI
 
-    src = inspect.getsource(HermesCLI._get_goal_manager)
-    assert "storage=None" not in src
+    from agent.executive.services import ObjectiveServices
+
+    cli = HermesCLI.__new__(HermesCLI)
+    cli.session_id = "cli-storage-none-check"
+    cli._goal_manager = None
+    # Assign a sentinel storage so the CLI does not fall back to None.
+    sentinel_storage = object()
+    cli._session_db = sentinel_storage
+
+    services = ObjectiveServices(session_id=cli.session_id)
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch(
+            "agent.executive.services.build_objective_services",
+            return_value=services,
+        ) as build,
+        patch("hermes_cli.goals.GoalManager"),
+    ):
+        cli._get_goal_manager()
+
+    # Strict identity-based contract: kwargs["storage"] must be the
+    # exact sentinel instance assigned to cli._session_db. If the CLI
+    # hardcoded storage=None, this assertion fails.
+    assert build.call_count == 1
+    kwargs = build.call_args.kwargs
+    assert "storage" in kwargs, (
+        "CLI did not transmit a storage kwarg at all — it must pass "
+        "whatever self._session_db holds (production contract)."
+    )
+    assert kwargs["storage"] is sentinel_storage, (
+        "CLI did not pass its own _session_db by identity: "
+        f"expected sentinel={sentinel_storage!r}, got "
+        f"{kwargs['storage']!r}. A hardcoded storage=None literal "
+        "would fail this assertion."
+    )
+
+
+def test_cli_does_not_pass_storage_none_when_session_db_missing():
+    """Companion behavioral check: a CLI without a stored ``_session_db``
+    attribute must still NOT hardcode ``storage=None``.
+
+    The challenge: the production CLI uses
+    ``getattr(self, "_session_db", None)``, which legitimately returns
+    ``None`` when ``_session_db`` is genuinely absent from the
+    instance. A naive assertion that simply checks
+    ``kwargs["storage"] is None`` would pass even if the CLI hardcoded
+    ``storage=None``, defeating the contract.
+
+    To distinguish the two, this test installs a HermesCLI subclass
+    whose ``__getattribute__`` synthesizes a unique sentinel for any
+    access to ``_session_db``. The production CLI's
+    ``getattr(self, "_session_db", None)`` therefore returns the
+    sentinel (not the ``None`` default), and ``kwargs["storage"]``
+    must be that sentinel. If the CLI hardcoded ``storage=None``,
+    the assertion fails.
+    """
+    from unittest.mock import patch
+
+    from cli import HermesCLI
+
+    from agent.executive.services import ObjectiveServices
+
+    # Probe subclass: every attribute lookup for "_session_db" returns
+    # _PROBE_SENTINEL regardless of whether the instance has the
+    # attribute stored. This simulates a CLI that conceptually has
+    # a non-None storage reachable via attribute access, even though
+    # nothing is stored on the instance dict.
+    class _ProbeHermesCLI(HermesCLI):
+        _PROBE_SENTINEL = object()
+
+        def __getattribute__(self, name):
+            if name == "_session_db":
+                return _ProbeHermesCLI._PROBE_SENTINEL
+            return object.__getattribute__(self, name)
+
+    cli = _ProbeHermesCLI.__new__(_ProbeHermesCLI)
+    cli.session_id = "cli-storage-none-fallback"
+    cli._goal_manager = None
+    # Deliberately do NOT set _session_db as an instance attribute —
+    # the probe's __getattribute__ synthesizes it on access. Verify by
+    # inspecting the instance dict directly (hasattr would return True
+    # via the probe, defeating the check).
+    assert "_session_db" not in cli.__dict__
+
+    services = ObjectiveServices(session_id=cli.session_id)
+    with (
+        patch("hermes_cli.config.load_config", return_value={}),
+        patch(
+            "agent.executive.services.build_objective_services",
+            return_value=services,
+        ) as build,
+        patch("hermes_cli.goals.GoalManager"),
+    ):
+        cli._get_goal_manager()
+
+    # Strict identity-based contract: kwargs["storage"] must be the
+    # probe sentinel. If production hardcoded storage=None, this fails
+    # because kwargs["storage"] would be None.
+    assert build.call_count == 1
+    kwargs = build.call_args.kwargs
+    assert "storage" in kwargs, (
+        "CLI did not transmit a storage kwarg at all — production "
+        "must pass whatever self._session_db holds (here, the probe "
+        "sentinel)."
+    )
+    assert kwargs["storage"] is _ProbeHermesCLI._PROBE_SENTINEL, (
+        "CLI did not pass its own _session_db by identity: expected "
+        f"probe sentinel={_ProbeHermesCLI._PROBE_SENTINEL!r}, got "
+        f"{kwargs['storage']!r}. A hardcoded storage=None literal "
+        "would fail this assertion."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -976,22 +1268,190 @@ def test_factory_does_not_modify_sealed_components(monkeypatch):
 
 
 def test_state_loader_does_not_import_hermes_cli():
-    """The factory's loader must not import hermes_cli."""
-    import ast
-    import agent.executive.knowledge_discovery.factory as factory_mod
-    src = inspect.getsource(factory_mod)
-    tree = ast.parse(src)
-    # Imports — both top-level and from-imports — must not mention
-    # hermes_cli. A reference in a docstring is fine; an import is not.
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert "hermes_cli" not in alias.name
-        elif isinstance(node, ast.ImportFrom):
-            module_name = node.module or ""
-            for alias in node.names:
-                assert "hermes_cli" not in alias.name
-                assert "hermes_cli" not in module_name
+    """The factory's loader must not import hermes_cli.
+
+    Behavioral contract: in a hermetic subprocess, an import blocker
+    for ``hermes_cli`` (and ``hermes_cli.*``) is installed BEFORE the
+    factory module is imported. The factory is then composed via the
+    public ``build_evidence_pack_engine`` callable and exercised through
+    the public ``dry_run`` method on the resulting engine. The
+    subprocess must complete successfully without the blocker firing.
+
+    Because the blocker is installed first, it detects both top-level
+    factory imports of ``hermes_cli`` (which would otherwise be silently
+    hidden behind a post-import ``sys.modules`` baseline) and deferred
+    imports triggered during composition or ``dry_run``. The test does
+    NOT take a post-import ``sys.modules`` baseline — the only baseline
+    is the clean subprocess state itself.
+
+    The test does NOT reach into private engine attributes such as
+    ``engine._sources``, ``engine._storage``, ``engine._session_db``,
+    or ``engine._audit_sink``. It uses only the public factory callable
+    and the public ``dry_run`` / ``discover`` / ``rollback`` API.
+    """
+    import subprocess
+    import sys
+
+    # Build the subprocess script via line concatenation. Each
+    # statement is appended on its own line so failure tracebacks
+    # point at the right line and no nested triple-quoted string
+    # confuses the outer Python parser.
+    subprocess_script_lines = [
+        "import sys",
+        "import json",
+        "",
+        # Meta-path finder that raises ImportError on any hermes_cli
+        # import. Installed BEFORE the factory module is imported, so
+        # it catches top-level hermes_cli imports from the factory
+        # itself (which a post-import ``sys.modules`` baseline would
+        # miss).
+        "class _HermesCliBlocker:",
+        "    _BLOCKED_PREFIXES = ('hermes_cli',)",
+        "    def find_spec(self, fullname, path, target=None):",
+        "        for prefix in self._BLOCKED_PREFIXES:",
+        "            if fullname == prefix or fullname.startswith(prefix + '.'):",
+        "                raise ImportError(",
+        "                    'blocked: hermes_cli is forbidden for the '",
+        "                    'state-loader import-boundary probe (%r)' % fullname",
+        "                )",
+        "        return None",
+        "",
+        # Purge any pre-existing hermes_cli modules from sys.modules so
+        # the blocker is the only path to them.
+        "for mod_name in list(sys.modules):",
+        "    if mod_name == 'hermes_cli' or mod_name.startswith('hermes_cli.'):",
+        "        del sys.modules[mod_name]",
+        "",
+        "sys.meta_path.insert(0, _HermesCliBlocker())",
+        "",
+        # Real work: import the factory and exercise it. This must
+        # succeed without the blocker raising.
+        "from agent.executive.knowledge_discovery.factory import (",
+        "    build_evidence_pack_engine,",
+        ")",
+        "",
+        "class _DuckStorage:",
+        "    def __init__(self, state=None):",
+        "        self._state = dict(state or {})",
+        "        self.close_calls = 0",
+        "    def get_meta(self, key):",
+        "        return self._state.get(key)",
+        "    def set_meta(self, key, value):",
+        "        self._state[key] = value",
+        "    def close(self):",
+        "        self.close_calls += 1",
+        "",
+        # A duck-typed audit sink so the factory does not need to
+        # resolve the monitoring emitter (which would be a hermes_cli
+        # -free but side-effecting default).
+        "class _DuckAuditSink:",
+        "    def __init__(self):",
+        "        self.events = []",
+        "        self.close_calls = 0",
+        "    def emit(self, event):",
+        "        self.events.append(event)",
+        "    def close(self):",
+        "        self.close_calls += 1",
+        "",
+        "SESSION_ID = 'state-loader-import-boundary-probe'",
+        "GOAL_KEY = 'goal:' + SESSION_ID",
+        "STATE = {",
+        "    'goal': 'ship the migration',",
+        "    'contract': {",
+        "        'outcome': 'ship the migration',",
+        "        'verification': 'the auth test suite passes',",
+        "        'constraints': 'keep the public /login response shape unchanged',",
+        "        'boundaries': 'only touch services/auth and its tests',",
+        "        'stop_when': 'a schema change needs product sign-off',",
+        "    },",
+        "}",
+        "",
+        "storage = _DuckStorage(state={GOAL_KEY: json.dumps(STATE)})",
+        "audit_sink = _DuckAuditSink()",
+        "engine = build_evidence_pack_engine(",
+        "    session_id=SESSION_ID,",
+        "    config={},",
+        "    storage=storage,",
+        "    audit_sink=audit_sink,",
+        ")",
+        "",
+        # Exercise the engine via the PUBLIC ``dry_run`` method. The
+        # result is a public ``EvidencePack`` dataclass exposing
+        # ``sources_queried``, ``sources_failed``, ``total_hits``,
+        # ``overall_confidence``, and ``summary_text``.
+        "pack = engine.dry_run(",
+        "    'obj-state-loader-import-boundary',",
+        "    'any objective',",
+        ")",
+        "",
+        "result = {",
+        "    'engine_class': type(engine).__name__,",
+        "    'sources_queried': list(pack.sources_queried),",
+        "    'sources_failed': list(pack.sources_failed),",
+        "    'total_hits': int(pack.total_hits),",
+        "    'overall_confidence': float(pack.overall_confidence),",
+        "    'has_summary': bool(pack.summary_text),",
+        "    'storage_close_calls': storage.close_calls,",
+        "    'audit_sink_close_calls': audit_sink.close_calls,",
+        "    'hermes_cli_in_modules': any(",
+        "        m == 'hermes_cli' or m.startswith('hermes_cli.')",
+        "        for m in sys.modules",
+        "    ),",
+        "}",
+        "sys.stdout.write('STATE_LOADER_IMPORT_RESULT=' + json.dumps(result))",
+    ]
+    subprocess_script = "\n".join(subprocess_script_lines)
+
+    completed = subprocess.run(
+        [sys.executable, "-c", subprocess_script],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    assert completed.returncode == 0, (
+        "state-loader import-boundary subprocess failed:\n"
+        f"stdout={completed.stdout!r}\n"
+        f"stderr={completed.stderr!r}"
+    )
+    import json as _json
+
+    marker = "STATE_LOADER_IMPORT_RESULT="
+    line = next(
+        (ln for ln in completed.stdout.splitlines() if ln.startswith(marker)),
+        None,
+    )
+    assert line is not None, (
+        "state-loader import-boundary subprocess did not emit a result "
+        f"line; stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+    )
+    report = _json.loads(line[len(marker):])
+
+    # Behavioral observation 1: the factory / engine compose
+    # successfully even though hermes_cli is import-blocked, so
+    # hermes_cli is NOT in the factory's transitive import closure.
+    assert report["engine_class"] == "EvidencePackEngine"
+    # Behavioral observation 2: the public dry_run result reflects
+    # that the contract source was queried, no source failed, exactly
+    # one hit was produced, and a non-empty summary was emitted.
+    assert report["sources_queried"] == ["contract"]
+    assert report["sources_failed"] == []
+    assert report["total_hits"] == 1
+    assert report["overall_confidence"] > 0.0
+    assert report["has_summary"] is True
+    # Behavioral observation 3: storage and audit sink were never
+    # closed by the factory, the engine, or the adapter.
+    assert report["storage_close_calls"] == 0
+    assert report["audit_sink_close_calls"] == 0
+    # Behavioral observation 4: hermes_cli was never imported — the
+    # import blocker was never activated. This is the load-bearing
+    # assertion for the defect: a hermes_cli import that fires at
+    # factory import time would either be caught by the blocker
+    # above (causing subprocess exit with ImportError) or land in
+    # sys.modules, making this assertion fail.
+    assert report["hermes_cli_in_modules"] is False, (
+        "factory transitively imported hermes_cli modules: "
+        f"{[m for m in sorted(sys.modules) if m.startswith('hermes_cli')]!r}"
+    )
 
 
 def test_state_loader_returns_fresh_mapping_without_mutating_storage():

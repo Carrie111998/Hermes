@@ -222,16 +222,44 @@ def test_get_goal_manager_per_session_rebinding_remains_authoritative():
 def test_get_goal_manager_does_not_import_hermes_cli_in_factory_call(monkeypatch):
     """The CLI must import ``build_evidence_pack_engine`` from the
     canonical factory module, not roll its own factory inline.
-    """
-    import inspect
-    from cli import HermesCLI
 
-    src = inspect.getsource(HermesCLI._get_goal_manager)
-    # The canonical factory callable must appear in the source — that's
-    # the seam the test pins.
-    assert "build_evidence_pack_engine" in src
-    # And the import must come from the canonical factory module.
-    assert "from agent.executive.knowledge_discovery.factory import" in src
+    Behavioral contract: after invoking ``HermesCLI._get_goal_manager``,
+    the ``build_objective_services`` call must carry the canonical
+    ``build_evidence_pack_engine`` factory as the
+    ``evidence_pack_engine_factory`` kwarg. The drive is a real CLI
+    invocation through a monkeypatched ``build_objective_services``;
+    the assertion observes the kwarg the CLI actually transmitted.
+    """
+    from agent.executive.services import ObjectiveServices
+    from agent.executive.knowledge_discovery.factory import (
+        build_evidence_pack_engine,
+    )
+
+    cli = _cli("cli-canonical-factory")
+    cli._session_db = object()
+    config = {"goals": {"max_turns": 7, "evidence_pack": {"enabled": True}}}
+    services = ObjectiveServices(session_id=cli.session_id)
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=config),
+        patch(
+            "agent.executive.services.build_objective_services",
+            return_value=services,
+        ) as build,
+        patch("hermes_cli.goals.GoalManager"),
+    ):
+        cli._get_goal_manager()
+
+    # Behavioral observation: the canonical factory callable is the
+    # exact object the CLI transmitted as ``evidence_pack_engine_factory``.
+    # This is the documented CLI seam — the CLI must not roll its own
+    # factory inline.
+    assert build.call_count == 1
+    kwargs = build.call_args.kwargs
+    assert kwargs["evidence_pack_engine_factory"] is build_evidence_pack_engine, (
+        "CLI must use the canonical factory callable "
+        "agent.executive.knowledge_discovery.factory.build_evidence_pack_engine"
+    )
 
 
 def test_get_goal_manager_passes_borrowed_session_db_identity_not_copy():

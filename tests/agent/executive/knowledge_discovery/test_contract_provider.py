@@ -772,20 +772,41 @@ def test_provider_constructor_arguments_are_validated():
 
 
 def test_provider_callable_has_engine_signature():
-    """Provider must match the engine source contract signature."""
-    provider = make_contract_provider(SESSION_ID, state_loader=lambda sid: None)
-    sig = inspect.signature(provider)
-    params = list(sig.parameters.values())
-    assert params[0].name == "query"
-    assert params[0].default is inspect.Parameter.empty
-    # keyword-only: max_hits, observed_at
-    kw_only = [
-        p for p in params
-        if p.kind == inspect.Parameter.KEYWORD_ONLY
-    ]
-    kw_names = [p.name for p in kw_only]
-    assert "max_hits" in kw_names
-    assert "observed_at" in kw_names
+    """Provider must match the engine source contract signature.
+
+    Behavioral contract: the provider callable accepts a positional
+    ``query`` argument followed by the keyword-only parameters
+    ``max_hits`` and ``observed_at``. Calling the provider with the
+    documented kwargs returns the expected list of hits. The drive
+    invokes the documented callable and observes its public surface.
+    """
+    # Behavioral observation 1: the documented kwargs are accepted
+    # and the call returns a list (the contract shape).
+    def loader(sid: str) -> Any:
+        return _DuckGoalState(contract=_full_contract())
+
+    provider = make_contract_provider(SESSION_ID, state_loader=loader)
+    result = provider(
+        _query(),
+        max_hits=5,
+        observed_at="2026-08-04T12:00:00+00:00",
+    )
+    assert isinstance(result, list)
+    assert all(isinstance(h, KnowledgeHitV2) for h in result)
+
+    # Behavioral observation 2: keyword-only contract — passing
+    # ``max_hits`` or ``observed_at`` positionally is rejected with
+    # TypeError (the public surface advertises keyword-only).
+    import pytest
+    with pytest.raises(TypeError):
+        provider(_query(), 5, "2026-08-04T12:00:00+00:00")  # type: ignore[misc]
+
+    # Behavioral observation 3: omitting a required kwarg is rejected
+    # with TypeError (the public surface is non-defaulting).
+    with pytest.raises(TypeError):
+        provider(_query(), max_hits=5)  # type: ignore[call-arg]
+    with pytest.raises(TypeError):
+        provider(_query(), observed_at="2026-08-04T12:00:00+00:00")  # type: ignore[call-arg]
 
 
 def test_provider_callable_returns_list_of_knowledge_hit_v2():
