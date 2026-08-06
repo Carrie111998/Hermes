@@ -1145,6 +1145,106 @@ def test_exporter_stdout_receipt_is_exact_and_count_bounded():
     assert all("sh" not in command.argv[:1] for command in commands)
 
 
+def test_projection_export_keeps_successful_invocation_until_receipt_collection(
+    tmp_path,
+    monkeypatch,
+):
+    exporter_path = tmp_path / activation.EXPORTER_UNIT
+    lifecycle = []
+    states = iter((
+        {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "MainPID": "0",
+            "UnitFileState": "static",
+            "FragmentPath": str(exporter_path),
+            "DropInPaths": "",
+            "NeedDaemonReload": "no",
+        },
+        {
+            "LoadState": "loaded",
+            "ActiveState": "active",
+            "SubState": "exited",
+            "MainPID": "0",
+            "UnitFileState": "static",
+            "FragmentPath": str(exporter_path),
+            "DropInPaths": "",
+            "NeedDaemonReload": "no",
+        },
+    ))
+    plan = SimpleNamespace(
+        paths=SimpleNamespace(
+            exporter_unit_path=exporter_path,
+            projection_export_path=tmp_path / "canonical-events.json",
+        ),
+        unit_bundle=SimpleNamespace(
+            exporter_service="[Service]\nType=oneshot\nRemainAfterExit=yes\n",
+        ),
+        digests=SimpleNamespace(
+            exporter_unit_sha256=activation._sha256_bytes(
+                b"[Service]\nType=oneshot\nRemainAfterExit=yes\n"
+            ),
+        ),
+        identities=object(),
+    )
+
+    def runner(command):
+        lifecycle.append(command.argv)
+        return subprocess.CompletedProcess(command.argv, 0, b"", b"")
+
+    monkeypatch.setattr(
+        activation,
+        "_install_exact_bytes",
+        lambda *_args, **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_systemd_show",
+        lambda _unit, *, runner: next(states),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_systemd_invocation_id",
+        lambda _unit, *, runner: lifecycle.append("invocation") or "a" * 32,
+    )
+    monkeypatch.setattr(
+        activation,
+        "_exporter_stdout_receipt",
+        lambda _invocation, *, runner: lifecycle.append("receipt")
+        or {"event_count": 2, "success": True},
+    )
+    monkeypatch.setattr(
+        activation,
+        "_validate_projection",
+        lambda _path, _identities: lifecycle.append("projection")
+        or {"event_count": 2},
+    )
+    monkeypatch.setattr(
+        activation,
+        "_unlink_exact",
+        lambda *_args, **_kwargs: lifecycle.append("unlink"),
+    )
+    monkeypatch.setattr(
+        activation,
+        "_require_off_disabled",
+        lambda *_args, **_kwargs: lifecycle.append("absent"),
+    )
+
+    result = activation.ActivationExecutor(plan, runner=runner)._run_projection_export()
+
+    assert result == {
+        "event_count": 2,
+        "stdout_receipt": {"event_count": 2, "success": True},
+    }
+    assert lifecycle.index("invocation") < lifecycle.index(
+        (activation.SYSTEMCTL, "stop", activation.EXPORTER_UNIT)
+    )
+    assert lifecycle[-2] == (activation.SYSTEMCTL, "daemon-reload")
+    assert lifecycle.index("unlink") < len(lifecycle) - 2
+    assert lifecycle[-1] == "absent"
+
+
 def test_projection_validation_binds_canonical_count_hash_and_identity(
     tmp_path,
     monkeypatch,

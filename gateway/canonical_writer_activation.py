@@ -4698,8 +4698,8 @@ class ActivationExecutor:
             completed = _systemd_show(EXPORTER_UNIT, runner=self.runner)
             if (
                 completed["LoadState"] != "loaded"
-                or completed["ActiveState"] != "inactive"
-                or completed["SubState"] != "dead"
+                or completed["ActiveState"] != "active"
+                or completed["SubState"] != "exited"
                 or completed["MainPID"] != "0"
                 or completed["FragmentPath"] != str(self.plan.paths.exporter_unit_path)
                 or completed["DropInPaths"] != ""

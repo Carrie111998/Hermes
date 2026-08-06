@@ -1994,6 +1994,7 @@ def test_hardened_writer_only_units_pin_identity_config_and_readiness():
         in bundle.writer_service
     )
     assert "Type=oneshot" in bundle.exporter_service
+    assert "RemainAfterExit=yes" in bundle.exporter_service
     assert "[Install]" not in bundle.exporter_service
     assert ".timer" not in bundle.exporter_service
     assert "SupplementaryGroups=muncho-projector" in bundle.exporter_service
