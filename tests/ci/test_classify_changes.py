@@ -68,6 +68,18 @@ CASES = {
     # SKILL.md reads like docs, but the skill-doc tests read skills/, so a
     # skill edit must still run Python.
     "skill md → python + site": (["skills/github/SKILL.md"], _lanes(python=True, site=True)),
+    "root project context → budget contract without product jobs": (
+        ["AGENTS.md"],
+        _lanes(python=True, python_prod=False),
+    ),
+    "frontend project context → budget contract + frontend": (
+        ["apps/desktop/AGENTS.md"],
+        _lanes(python=True, python_prod=False, frontend=True),
+    ),
+    "project context basename is case-insensitive": (
+        ["docs/AgEnTs.Md"],
+        _lanes(python=True, python_prod=False),
+    ),
     "dockerfile → docker meta": (["Dockerfile"], _lanes(docker_meta=True)),
     # install.ps1 is a shell script Python never imports, but it's also not
     # provably prose, so python stays on (fail-open) alongside the Windows lane.

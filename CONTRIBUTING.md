@@ -205,9 +205,8 @@ ln -sf "$(pwd)/venv/bin/hermes" ~/.local/bin/hermes
 # via run_tests_parallel.py, worker count auto-scaled); see AGENTS.md
 scripts/run_tests.sh
 
-# Alternative (activate the venv first). The wrapper is still recommended
-# for parity with GitHub Actions before you open a PR:
-pytest tests/ -v
+# Focused run through the same hermetic wrapper:
+scripts/run_tests.sh tests/agent/test_foo.py -v
 ```
 
 ---
@@ -396,8 +395,9 @@ You must still add the tool name to the appropriate list in `toolsets.py`
 registers but is never exposed to the agent. If you introduce a new toolset,
 add it in `toolsets.py` and wire it into the relevant platform presets.
 
-See `AGENTS.md` (section **Adding New Tools**) for profile-aware paths and
-plugin vs core guidance.
+See the `AGENTS.md` **Footprint ladder** and
+`website/docs/developer-guide/adding-tools.md` for profile-aware paths and
+plugin-vs-core guidance.
 
 ---
 
@@ -944,7 +944,7 @@ refactor/description   # Code restructuring
 
 ### Before submitting
 
-1. **Run tests**: `scripts/run_tests.sh` (recommended; same as CI) or `pytest tests/ -v` with the project venv activated
+1. **Run tests**: `scripts/run_tests.sh` (same as CI; pass paths/flags for focused runs)
 2. **Test manually**: Run `hermes` and exercise the code path you changed
 3. **Check cross-platform impact**: If you touch file I/O, process management, or terminal handling, consider macOS, Linux, and WSL2
 4. **Keep PRs focused**: One logical change per PR. Don't mix a bug fix with a refactor with a new feature.

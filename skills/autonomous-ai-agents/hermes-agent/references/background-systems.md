@@ -1,7 +1,8 @@
 # Durable & Background Systems
 
 Four systems run alongside the main conversation loop. Quick reference
-here; full developer notes live in `AGENTS.md`, user-facing docs under
+here; full developer notes live in `docs/development/architecture-core.md`
+and `docs/development/subsystems.md`, with user-facing docs under
 `website/docs/user-guide/features/`.
 
 ### Delegation (`delegate_task`)
@@ -11,11 +12,12 @@ Spawn a subagent with an isolated context + terminal session.
 - **Single:** `delegate_task(goal, context)`.
 - **Batch:** `delegate_task(tasks=[{goal, ...}, ...])` runs children in
   parallel, capped by `delegation.max_concurrent_children` (default 3).
-- **Background:** `delegate_task(background=true)` returns a handle
-  immediately and keeps the parent loop going; the child's result
-  re-enters the conversation as a new turn when it finishes.
-- **Roles:** `leaf` (default; cannot re-delegate) vs `orchestrator`
-  (can spawn its own workers, bounded by `delegation.max_spawn_depth`).
+- **Background:** top-level model-facing calls dispatch asynchronously
+  automatically and re-enter the result later. The model-facing `background`
+  parameter is deprecated and ignored; direct Python/orchestrator paths retain
+  synchronous semantics.
+- **Roles:** `leaf` is the default. The default spawn depth is 1 (flat), so an
+  `orchestrator` role can re-delegate only when configuration raises that cap.
 - **Not durable.** A backgrounded child is still process-local — if the
   parent process exits, the child is lost. For work that must outlive
   the process, use `cronjob` or
@@ -36,11 +38,11 @@ the `cronjob` tool, the `hermes cron` CLI (`list`, `add`, `edit`,
   job), `context_from` (chain job A's output into job B), `workdir`
   (run in a specific dir with its `AGENTS.md` / `CLAUDE.md` loaded),
   multi-platform delivery.
-- **Invariants:** 3-minute hard interrupt per run, `.tick.lock` file
-  prevents duplicate ticks across processes, cron sessions pass
-  `skip_memory=True` by default, and cron deliveries are framed with a
-  header/footer instead of being mirrored into the target gateway
-  session (keeps role alternation intact).
+- **Invariants:** a 600-second inactivity watchdog by default (`0` disables
+  it; legacy `HERMES_CRON_TIMEOUT` remains supported), while pre-run scripts
+  have a separate 3,600-second default timeout. `.tick.lock` prevents duplicate
+  ticks, cron sessions pass `skip_memory=True`, and deliveries are framed rather
+  than mirrored into the target session (preserving role alternation).
 
 User docs: https://hermes-agent.nousresearch.com/docs/user-guide/features/cron
 
@@ -54,10 +56,11 @@ so nothing is lost.
   `resume`, `pin`, `unpin`, `archive`, `restore`, `list-archived`, `prune`,
   `backup`, `rollback`.
 - **Slash:** `/curator <subcommand>` mirrors the CLI.
-- **Scope:** only touches skills with `created_by: "agent"` provenance.
-  Bundled + hub-installed skills are off-limits. **Never deletes** —
-  max destructive action is archive. Pinned skills are exempt from
-  every auto-transition and every LLM review pass.
+- **Scope:** agent-created skills are eligible. Bundled built-ins are also
+  eligible when `curator.prune_builtins: true` (the default), but skills that are
+  protected, pinned, or referenced by cron jobs remain exempt. Hub-installed
+  skills stay off-limits. **Never deletes** — max destructive action is archive.
+  Pinned skills are exempt from every auto-transition and every LLM review pass.
 - **Cost:** the deterministic inactivity/prune sweep runs for free. The
   aux-model "consolidate overlapping skills into umbrellas" pass is
   **off by default** — opt in with `curator.consolidate: true` or
@@ -91,9 +94,10 @@ sessions still have zero `kanban_*` schema footprint unless configured.
 - **Dispatcher** runs inside the gateway by default
   (`kanban.dispatch_in_gateway: true`) — reclaims stale claims,
   promotes ready tasks, atomically claims, spawns assigned profiles.
-  Auto-blocks a task after `failure_limit` consecutive spawn failures
-  (default 2; configurable via `kanban.failure_limit` or per-task
-  `max_retries`).
+  Auto-blocks a task after `failure_limit` consecutive non-success outcomes,
+  including `spawn_failed`, `crashed`, and `timed_out` (default 2;
+  configurable via `kanban.failure_limit` or per-task `max_retries`). A
+  successful completion resets the streak.
 - **Isolation:** board is the hard boundary (workers get
   `HERMES_KANBAN_BOARD` pinned in env); tenant is a soft namespace
   within a board for workspace-path + memory-key isolation.
