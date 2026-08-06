@@ -446,6 +446,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     gateway_path = staging_root / "gateway.yaml"
     native_plan_path = staging_root / "native-observation-plan.json"
     installed_native_plan_path = activation_root / "native-observation-plan.json"
+    installed_activation_plan_path = activation_root / "activation-plan.json"
     writer_unit_path = staging_root / "muncho-canonical-writer.service"
     phase_b_unit_path = (
         staging_root / "muncho-canonical-writer-phase-b-readiness.service"
@@ -459,6 +460,12 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     live_gateway_unit_path = live_root / "hermes-cloud-gateway.service"
     live_writer_config_path = live_root / "writer.json"
     live_gateway_config_path = live_root / "gateway.yaml"
+    live_deployment_manifest_path = live_root / "deployment-manifest.json"
+    live_tmpfiles_path = live_root / "muncho-canonical-writer.conf"
+    live_root_receipt_path = live_root / "root-preflight.json"
+    live_exporter_unit_path = live_root / "muncho-canonical-writer-export.service"
+    database_ca_path = live_root / "cloudsql-server-ca.pem"
+    projection_path = live_root / "projection.json"
     owner_approval_path = staging_root / "owner-approval.json"
     external_iam_path = staging_root / "external-iam-receipt.json"
     quarantine_path = tmp_path / "writer-failure" / "quarantine.json"
@@ -515,6 +522,16 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     )
     monkeypatch.setattr(
         recovery,
+        "DEFAULT_STAGED_ACTIVATION_PLAN_PATH",
+        foreign_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_INSTALLED_ACTIVATION_PLAN_PATH",
+        installed_activation_plan_path,
+    )
+    monkeypatch.setattr(
+        recovery,
         "DEFAULT_STAGED_WRITER_UNIT_PATH",
         writer_unit_path,
     )
@@ -555,6 +572,36 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
     )
     monkeypatch.setattr(
         recovery,
+        "DEFAULT_LIVE_DEPLOYMENT_MANIFEST_PATH",
+        live_deployment_manifest_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_TMPFILES_PATH",
+        live_tmpfiles_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_ROOT_RECEIPT_PATH",
+        live_root_receipt_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_LIVE_EXPORTER_UNIT_PATH",
+        live_exporter_unit_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_DATABASE_CA_PATH",
+        database_ca_path,
+    )
+    monkeypatch.setattr(
+        recovery,
+        "DEFAULT_PROJECTION_PATH",
+        projection_path,
+    )
+    monkeypatch.setattr(
+        recovery,
         "DEFAULT_STAGED_OWNER_APPROVAL_PATH",
         owner_approval_path,
     )
@@ -586,6 +633,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             external_iam_path,
             installed_native_plan_path,
             foreign_path,
+            installed_activation_plan_path,
             writer_unit_path,
             phase_b_unit_path,
             gateway_unit_path,
@@ -594,6 +642,8 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             live_gateway_unit_path,
             live_writer_config_path,
             live_gateway_config_path,
+            live_deployment_manifest_path,
+            live_tmpfiles_path,
         ),
     )
     monkeypatch.setattr(recovery, "_STOPPED_SERVICE_UNITS", (unit,))
@@ -615,10 +665,12 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
             "owner-approval.json",
             "external-iam-receipt.json",
         })
+        failed_activation = failed | frozenset({"activation-plan.json"})
         if not path.is_dir() or frozenset(os.listdir(path)) not in {
             pair,
             bundle,
             failed,
+            failed_activation,
         }:
             raise RuntimeError("test staging directory is not exact")
         return frozenset(os.listdir(path))
@@ -662,6 +714,7 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "gateway_raw": gateway_raw,
         "native_plan_path": native_plan_path,
         "installed_native_plan_path": installed_native_plan_path,
+        "installed_activation_plan_path": installed_activation_plan_path,
         "writer_unit_path": writer_unit_path,
         "phase_b_unit_path": phase_b_unit_path,
         "gateway_unit_path": gateway_unit_path,
@@ -670,6 +723,12 @@ def recovery_tree(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> dict[str, 
         "live_gateway_unit_path": live_gateway_unit_path,
         "live_writer_config_path": live_writer_config_path,
         "live_gateway_config_path": live_gateway_config_path,
+        "live_deployment_manifest_path": live_deployment_manifest_path,
+        "live_tmpfiles_path": live_tmpfiles_path,
+        "live_root_receipt_path": live_root_receipt_path,
+        "live_exporter_unit_path": live_exporter_unit_path,
+        "database_ca_path": database_ca_path,
+        "projection_path": projection_path,
         "owner_approval_path": owner_approval_path,
         "external_iam_path": external_iam_path,
         "quarantine_path": quarantine_path,
@@ -1138,6 +1197,454 @@ def _write_failed_native_bundle(
     recovery_tree["quarantine_path"].parent.mkdir(parents=True)
     recovery_tree["quarantine_path"].write_bytes(failure_raw)
     return extras, native_raw, failure_raw
+
+
+def _write_failed_final_activation_bundle(
+    recovery_tree: dict[str, Any],
+) -> tuple[bytes, bytes]:
+    extras, native_raw, _native_failure_raw = _write_failed_native_bundle(
+        recovery_tree,
+        install_failure=True,
+        post_install_failure_stage="start_writer",
+        installed_live_artifacts=True,
+        current_native_schema=True,
+    )
+    native = recovery.NativeObservationPlan.from_mapping(
+        json.loads(native_raw.decode())
+    )
+    preview_iam = recovery.ExternalIAMReceipt.from_mapping(
+        _external_iam_mapping(source_approval_sha256="0" * 64)
+    )
+    deployment_manifest = {
+        "schema": "test-deployment-manifest.v1",
+        "revision": SOURCE_REVISION,
+    }
+    deployment_raw = recovery._canonical_bytes(deployment_manifest)
+    tmpfiles_raw = b"d /run/muncho-canonical-writer 0750 root root -\n"
+    digests = {
+        "database_ca_sha256": "1" * 64,
+        "deployment_manifest_sha256": _sha256(deployment_raw),
+        "exporter_unit_sha256": "2" * 64,
+        "external_iam_policy_sha256": preview_iam.policy_sha256,
+        "gateway_config_sha256": _sha256(recovery_tree["gateway_raw"]),
+        "gateway_unit_sha256": _sha256(
+            extras[recovery_tree["gateway_unit_path"]]
+        ),
+        "native_observation_plan_sha256": native.sha256,
+        "native_observation_receipt_sha256": "3" * 64,
+        "phase_b_readiness_unit_sha256": _sha256(
+            extras[recovery_tree["phase_b_unit_path"]]
+        ),
+        "release_manifest_file_sha256": "4" * 64,
+        "tmpfiles_sha256": _sha256(tmpfiles_raw),
+        "writer_config_sha256": _sha256(recovery_tree["writer_raw"]),
+        "writer_unit_sha256": _sha256(
+            extras[recovery_tree["writer_unit_path"]]
+        ),
+    }
+
+    def artifact(
+        source: Path | None,
+        target: Path,
+        sha256: str,
+        mode: str,
+        uid: int,
+        gid: int,
+        maximum_bytes: int,
+    ) -> dict[str, Any]:
+        return {
+            "source_path": None if source is None else str(source),
+            "target_path": str(target),
+            "sha256": sha256,
+            "mode": mode,
+            "uid": uid,
+            "gid": gid,
+            "maximum_bytes": maximum_bytes,
+        }
+
+    install_artifacts = {
+        "manifest": artifact(
+            None,
+            recovery_tree["live_deployment_manifest_path"],
+            digests["deployment_manifest_sha256"],
+            "0400",
+            0,
+            0,
+            recovery._MAX_MANIFEST_BYTES,
+        ),
+        "writer_unit": artifact(
+            None,
+            recovery_tree["live_writer_unit_path"],
+            digests["writer_unit_sha256"],
+            "0644",
+            0,
+            0,
+            recovery._MAX_UNIT_BYTES,
+        ),
+        "phase_b_readiness_unit": artifact(
+            None,
+            recovery_tree["live_phase_b_unit_path"],
+            digests["phase_b_readiness_unit_sha256"],
+            "0644",
+            0,
+            0,
+            recovery._MAX_UNIT_BYTES,
+        ),
+        "gateway_unit": artifact(
+            None,
+            recovery_tree["live_gateway_unit_path"],
+            digests["gateway_unit_sha256"],
+            "0644",
+            0,
+            0,
+            recovery._MAX_UNIT_BYTES,
+        ),
+        "tmpfiles": artifact(
+            None,
+            recovery_tree["live_tmpfiles_path"],
+            digests["tmpfiles_sha256"],
+            "0644",
+            0,
+            0,
+            recovery._MAX_UNIT_BYTES,
+        ),
+        "writer_config": artifact(
+            recovery_tree["writer_path"],
+            recovery_tree["live_writer_config_path"],
+            digests["writer_config_sha256"],
+            "0440",
+            0,
+            recovery.CANARY_WRITER_GID,
+            recovery._MAX_CONFIG_BYTES,
+        ),
+        "gateway_config": artifact(
+            recovery_tree["gateway_path"],
+            recovery_tree["live_gateway_config_path"],
+            digests["gateway_config_sha256"],
+            "0444",
+            0,
+            0,
+            recovery._MAX_CONFIG_BYTES,
+        ),
+    }
+    activation_unsigned = {
+        "schema": recovery._ACTIVATION_PLAN_SCHEMA,
+        "revision": SOURCE_REVISION,
+        "identities": {"writer_gid": recovery.CANARY_WRITER_GID},
+        "paths": {
+            "plan_path": str(recovery_tree["installed_activation_plan_path"]),
+            "manifest_path": str(recovery_tree["live_deployment_manifest_path"]),
+            "root_receipt_path": str(recovery_tree["live_root_receipt_path"]),
+            "writer_unit_path": str(recovery_tree["live_writer_unit_path"]),
+            "phase_b_readiness_unit_path": str(
+                recovery_tree["live_phase_b_unit_path"]
+            ),
+            "gateway_unit_path": str(recovery_tree["live_gateway_unit_path"]),
+            "exporter_unit_path": str(recovery_tree["live_exporter_unit_path"]),
+            "tmpfiles_path": str(recovery_tree["live_tmpfiles_path"]),
+            "writer_config_source_path": str(recovery_tree["writer_path"]),
+            "gateway_config_source_path": str(recovery_tree["gateway_path"]),
+            "writer_config_path": str(recovery_tree["live_writer_config_path"]),
+            "gateway_config_path": str(recovery_tree["live_gateway_config_path"]),
+            "database_ca_path": str(recovery_tree["database_ca_path"]),
+            "external_iam_receipt_path": str(
+                recovery.DEFAULT_EXTERNAL_IAM_LIVE_PATH
+            ),
+            "evidence_root": str(recovery_tree["quarantine_path"].parent),
+            "quarantine_path": str(recovery_tree["quarantine_path"]),
+            "projection_export_path": str(recovery_tree["projection_path"]),
+        },
+        "digests": digests,
+        "deployment_manifest": deployment_manifest,
+        "native_observation_receipt": {"plan": native.to_mapping()},
+        "systemd_bundle": {"schema": "test-systemd-bundle.v1"},
+        "install_artifacts": install_artifacts,
+        "collector_argv": ["/usr/bin/python3", "collect"],
+        "validator_argv": ["/usr/bin/python3", "validate"],
+    }
+    activation = {
+        **activation_unsigned,
+        "activation_plan_sha256": recovery._sha256_json(activation_unsigned),
+    }
+    activation_raw = recovery._canonical_bytes(activation)
+    recovery_tree["foreign_path"].write_bytes(activation_raw)
+    recovery_tree["installed_activation_plan_path"].write_bytes(activation_raw)
+    recovery_tree["live_deployment_manifest_path"].write_bytes(deployment_raw)
+    recovery_tree["live_tmpfiles_path"].write_bytes(tmpfiles_raw)
+
+    owner = recovery.OwnerApprovalReceipt.from_mapping({
+        "schema": "muncho-writer-owner-approval.v1",
+        "scope": "activation",
+        "plan_sha256": activation["activation_plan_sha256"],
+        "authority_kind": "trusted_root_bootstrap_out_of_band_owner",
+        "cryptographic_owner_proof": False,
+        "owner_subject_sha256": "5" * 64,
+        "approval_source_sha256": "6" * 64,
+        "nonce_sha256": "7" * 64,
+        "approved_at_unix": 100,
+        "expires_at_unix": 400,
+    })
+    iam = recovery.ExternalIAMReceipt.from_mapping(
+        _external_iam_mapping(source_approval_sha256=owner.sha256)
+    )
+    evidence_root = (
+        recovery_tree["quarantine_path"].parent
+        / "plans"
+        / SOURCE_REVISION
+        / activation["activation_plan_sha256"]
+    )
+    iam_path = evidence_root / "external-iam" / f"{iam.sha256}.json"
+    iam_path.parent.mkdir(parents=True)
+    iam_path.write_bytes(recovery._canonical_bytes(iam.to_mapping()))
+    checks = [
+        {"name": name, "passed": True}
+        for name in (
+            "quarantine.absent",
+            "native_receipt.same_host_exact",
+            "release_config_ca_db.exact",
+            "services_discord_authority.stopped_exact",
+            "success_or_fresh_iam.exact",
+        )
+    ]
+    preflight_unsigned = {
+        "schema": recovery._ACTIVATION_PREFLIGHT_SCHEMA,
+        "ok": True,
+        "revision": SOURCE_REVISION,
+        "activation_plan_sha256": activation["activation_plan_sha256"],
+        "checks": checks,
+        "failed_checks": [],
+        "checked_at_unix": 150,
+    }
+    preflight_report = {
+        **preflight_unsigned,
+        "report_sha256": recovery._sha256_json(preflight_unsigned),
+    }
+    preflight_raw = recovery._canonical_bytes(preflight_report)
+    preflight_path = (
+        evidence_root
+        / "preflights"
+        / f"{preflight_report['report_sha256']}.json"
+    )
+    preflight_path.parent.mkdir(parents=True)
+    preflight_path.write_bytes(preflight_raw)
+    preflight = {
+        **preflight_report,
+        "evidence": {
+            "path": str(preflight_path),
+            "report_sha256": preflight_report["report_sha256"],
+            "file_sha256": _sha256(preflight_raw),
+            "mode": "0400",
+            "owner_uid": 0,
+            "group_gid": 0,
+        },
+    }
+    failure_path = evidence_root / "failures" / "failure-321-654.json"
+    failure_path.parent.mkdir(parents=True)
+    failure = {
+        "schema": recovery._NATIVE_FAILURE_SCHEMA,
+        "revision": SOURCE_REVISION,
+        "activation_plan_sha256": activation["activation_plan_sha256"],
+        "approved_plan_sha256": activation["activation_plan_sha256"],
+        "owner_approval_receipt_sha256": owner.sha256,
+        "owner_approval_receipt": owner.to_mapping(),
+        "external_iam_evidence": {
+            "path": str(iam_path),
+            "sha256": iam.sha256,
+            "policy_sha256": iam.policy_sha256,
+            "mode": "0400",
+            "owner_uid": 0,
+            "group_gid": 0,
+            "live_path": str(recovery.DEFAULT_EXTERNAL_IAM_LIVE_PATH),
+        },
+        "read_only_preflight": preflight,
+        "stage": "projection_export",
+        "error_type": "RuntimeError",
+        "error_sha256": "8" * 64,
+        "failed_at_unix": 200,
+        "quarantined": True,
+        "failure_receipt_path": str(failure_path),
+    }
+    failure_raw = recovery._canonical_bytes(failure)
+    failure_path.write_bytes(failure_raw)
+    recovery_tree["quarantine_path"].write_bytes(failure_raw)
+    return activation_raw, failure_raw
+
+
+def test_apply_archives_exact_final_activation_failure_chain(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    unit = recovery_tree["service_states"][0]["unit"]
+    before = [{
+        "unit": unit,
+        "state": "disabled_inactive",
+        "properties": {
+            "LoadState": "loaded",
+            "ActiveState": "inactive",
+            "SubState": "dead",
+            "UnitFileState": "disabled",
+            "MainPID": "0",
+            "FragmentPath": f"/etc/systemd/system/{unit}",
+            "DropInPaths": "",
+        },
+    }]
+    after = recovery._service_states_after_native_artifact_archive(before)
+    observed = {"value": before}
+    reloads: list[bool] = []
+
+    monkeypatch.setattr(
+        recovery,
+        "_collect_service_states",
+        lambda: observed["value"],
+    )
+
+    def read_exact(binding: Mapping[str, Any], path: Path) -> bytes:
+        raw = path.read_bytes()
+        assert len(raw) <= binding["maximum_bytes"]
+        assert _sha256(raw) == binding["sha256"]
+        return raw
+
+    def daemon_reload() -> None:
+        reloads.append(True)
+        observed["value"] = after
+
+    monkeypatch.setattr(recovery, "_read_exact_live_artifact", read_exact)
+    monkeypatch.setattr(recovery, "_daemon_reload", daemon_reload)
+    activation_raw, failure_raw = _write_failed_final_activation_bundle(
+        recovery_tree
+    )
+
+    plan = recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+    assert plan["schema"] == recovery.FAILED_ACTIVATION_PLAN_SCHEMA
+    assert set(plan["staged_artifacts"]) == {
+        "writer.json",
+        "gateway.yaml",
+        "native-observation-plan.json",
+        "activation-plan.json",
+        "muncho-canonical-writer.service",
+        "muncho-canonical-writer-phase-b-readiness.service",
+        "hermes-cloud-gateway.service",
+        "owner-approval.json",
+        "external-iam-receipt.json",
+    }
+    assert [item["name"] for item in plan["installed_activation_artifacts"]] == [
+        "activation_plan",
+        "deployment_manifest",
+        "writer_unit",
+        "phase_b_readiness_unit",
+        "gateway_unit",
+        "tmpfiles",
+        "writer_config",
+        "gateway_config",
+    ]
+    live_raw = {
+        item["name"]: Path(item["source_path"]).read_bytes()
+        for item in plan["installed_activation_artifacts"]
+    }
+    failed = plan["failed_activation_observation"]
+    activation = json.loads(activation_raw.decode())
+    assert failed["activation_plan_sha256"] == activation[
+        "activation_plan_sha256"
+    ]
+    assert failed["sha256"] == _sha256(failure_raw)
+
+    receipt = recovery.apply_stopped_writer_residue_recovery(
+        TARGET_REVISION,
+        plan["plan_sha256"],
+        clock=lambda: 895,
+        lifecycle_lock=contextlib.nullcontext,
+    )
+
+    assert reloads == [True]
+    assert not recovery_tree["staging_root"].exists()
+    assert not recovery_tree["installed_native_plan_path"].exists()
+    assert not recovery_tree["quarantine_path"].exists()
+    assert Path(failed["archive_path"]).read_bytes() == failure_raw
+    assert Path(failed["failure_receipt_path"]).read_bytes() == failure_raw
+    for item in plan["installed_activation_artifacts"]:
+        assert not Path(item["source_path"]).exists()
+        assert Path(item["archive_path"]).read_bytes() == live_raw[item["name"]]
+    assert receipt["schema"] == recovery.FAILED_ACTIVATION_RECEIPT_SCHEMA
+    assert receipt["failed_activation_observation"] == failed
+    assert receipt["installed_activation_artifacts"] == plan[
+        "installed_activation_artifacts"
+    ]
+    assert receipt["failure_quarantine_archived"] is True
+    assert receipt["failure_receipt_preserved"] is True
+    assert receipt["daemon_reloaded_after_installed_artifact_archive"] is True
+
+
+def test_final_activation_recovery_rejects_partial_live_residue(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    _write_failed_final_activation_bundle(recovery_tree)
+    recovery_tree["live_tmpfiles_path"].unlink()
+
+    with pytest.raises(
+        RuntimeError,
+        match="installed activation artifact residue is partial",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_final_activation_recovery_rejects_non_exact_activation_paths(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    activation_raw, _failure_raw = _write_failed_final_activation_bundle(
+        recovery_tree
+    )
+    activation = json.loads(activation_raw.decode())
+    activation["paths"]["unexpected_path"] = "/tmp/not-recoverable"
+    unsigned = {
+        name: item
+        for name, item in activation.items()
+        if name != "activation_plan_sha256"
+    }
+    activation["activation_plan_sha256"] = recovery._sha256_json(unsigned)
+    drifted = recovery._canonical_bytes(activation)
+    recovery_tree["foreign_path"].write_bytes(drifted)
+    recovery_tree["installed_activation_plan_path"].write_bytes(drifted)
+
+    with pytest.raises(ValueError, match="fixed paths drifted"):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
+
+
+def test_final_activation_recovery_rejects_quarantine_receipt_divergence(
+    recovery_tree: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        recovery,
+        "_read_exact_live_artifact",
+        lambda _binding, path: path.read_bytes(),
+    )
+    _activation_raw, failure_raw = _write_failed_final_activation_bundle(
+        recovery_tree
+    )
+    failure = json.loads(failure_raw.decode())
+    failure["error_sha256"] = "9" * 64
+    recovery_tree["quarantine_path"].write_bytes(
+        recovery._canonical_bytes(failure)
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="failure receipt differs from quarantine",
+    ):
+        recovery.plan_stopped_writer_residue_recovery(TARGET_REVISION)
 
 
 def test_apply_archives_identical_installed_native_plan_crash_safely(
