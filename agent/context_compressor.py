@@ -35,6 +35,7 @@ from agent.context_engine import ContextEngine, sanitize_memory_context
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.model_metadata import (
     MINIMUM_CONTEXT_LENGTH,
+    estimate_request_tokens_rough,
     get_model_context_length,
     estimate_messages_tokens_rough,
     estimate_tokens_rough,
@@ -3112,7 +3113,7 @@ class ContextCompressor(ContextEngine):
         # Nothing to reclaim until there are messages outside the protected tail.
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
             return messages, 0
-        before = sum(_estimate_msg_budget_tokens(m) for m in messages)
+        before = estimate_request_tokens_rough(messages, api_mode=self.api_mode)
         if before < self._proactive_prune_rearm_tokens:
             return messages, 0
         # Capability gate BEFORE the expensive 3-pass scan: a bound store that
@@ -3140,7 +3141,9 @@ class ContextCompressor(ContextEngine):
         # Measured-savings gate (prompt-cache hysteresis): only commit when
         # the prune reclaims a meaningful batch of tokens. Estimated on the
         # real before/after messages so dedup + arg truncation count too.
-        after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
+        after = estimate_request_tokens_rough(
+            pruned_msgs, api_mode=self.api_mode,
+        )
         reclaimed = max(0, before - after)
         if reclaimed < self.proactive_prune_min_reclaim_tokens:
             return messages, 0
