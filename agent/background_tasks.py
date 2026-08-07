@@ -100,7 +100,9 @@ __all__ = [
 ]
 
 
-def _sign(key: bytes, task_id: str, plugin_id: str, parent_session_id: str, created_at: float) -> str:
+def _sign(
+    key: bytes, task_id: str, plugin_id: str, parent_session_id: str, created_at: float
+) -> str:
     return _sign_handle(key, task_id, plugin_id, parent_session_id, created_at)
 
 
@@ -178,12 +180,19 @@ class ExternalBackgroundTasksService:
                     state, created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'registered', ?, ?)""",
                 (
-                    task_id, self.plugin_id, parent_session_id,
-                    routing["session_key"], routing["origin_ui_session_id"],
-                    routing["origin_session_id"], external_id, dedup_key, label,
+                    task_id,
+                    self.plugin_id,
+                    parent_session_id,
+                    routing["session_key"],
+                    routing["origin_ui_session_id"],
+                    routing["origin_session_id"],
+                    external_id,
+                    dedup_key,
+                    label,
                     payload_hash,
                     json.dumps(dict(payload)) if payload is not None else "{}",
-                    now, now,
+                    now,
+                    now,
                 ),
             )
             if cur.rowcount == 0:
@@ -206,16 +215,24 @@ class ExternalBackgroundTasksService:
                 logger.info(
                     "External background task %s re-registered idempotently "
                     "(plugin=%s, external_id=%s)",
-                    existing["task_id"][:12], self.plugin_id, external_id,
+                    existing["task_id"][:12],
+                    self.plugin_id,
+                    external_id,
                 )
                 return handle_from_row(key, existing)
         logger.info(
             "Registered external background task %s (plugin=%s, external_id=%s)",
-            task_id[:12], self.plugin_id, external_id,
+            task_id[:12],
+            self.plugin_id,
+            external_id,
         )
         return ExternalTaskHandle(
-            PUBLIC_CONTRACT_VERSION, task_id, self.plugin_id,
-            parent_session_id, now, signature,
+            PUBLIC_CONTRACT_VERSION,
+            task_id,
+            self.plugin_id,
+            parent_session_id,
+            now,
+            signature,
         )
 
     # -- terminal transitions -----------------------------------------------
@@ -235,7 +252,10 @@ class ExternalBackgroundTasksService:
         conflicts. Emits at most one parent completion.
         """
         self._validate_terminal_inputs(
-            event_id=event_id, summary=summary, error=None, result_payload=result_payload
+            event_id=event_id,
+            summary=summary,
+            error=None,
+            result_payload=result_payload,
         )
         resolved = self._resolve_handle(handle)
         if resolved is None:
@@ -245,8 +265,14 @@ class ExternalBackgroundTasksService:
             ExternalTaskState.COMPLETED.value, event_id, summary, None, result_payload
         )
         return self._transition_terminal(
-            row, coerced, ExternalTaskState.COMPLETED.value, event_id, payload_hash,
-            summary=summary, error=None, result_payload=result_payload,
+            row,
+            coerced,
+            ExternalTaskState.COMPLETED.value,
+            event_id,
+            payload_hash,
+            summary=summary,
+            error=None,
+            result_payload=result_payload,
         )
 
     def fail(
@@ -271,8 +297,14 @@ class ExternalBackgroundTasksService:
             ExternalTaskState.FAILED.value, event_id, None, error, None
         )
         return self._transition_terminal(
-            row, coerced, ExternalTaskState.FAILED.value, event_id, payload_hash,
-            summary=None, error=error, result_payload=None,
+            row,
+            coerced,
+            ExternalTaskState.FAILED.value,
+            event_id,
+            payload_hash,
+            summary=None,
+            error=error,
+            result_payload=None,
         )
 
     def request_cancel(self, handle: Any) -> ExternalTaskResult:
@@ -289,10 +321,13 @@ class ExternalBackgroundTasksService:
         row, coerced = resolved
         task_id = row["task_id"]
         if row["state"] in (
-            ExternalTaskState.COMPLETED.value, ExternalTaskState.FAILED.value,
+            ExternalTaskState.COMPLETED.value,
+            ExternalTaskState.FAILED.value,
         ):
             return ExternalTaskResult(
-                handle=coerced, accepted=False, already_terminal=True,
+                handle=coerced,
+                accepted=False,
+                already_terminal=True,
                 state=row["state"],
             )
         now = time.time()
@@ -308,14 +343,18 @@ class ExternalBackgroundTasksService:
         if already:
             fresh = self._read_row(task_id)
             if fresh is not None and fresh["state"] in (
-                ExternalTaskState.COMPLETED.value, ExternalTaskState.FAILED.value,
+                ExternalTaskState.COMPLETED.value,
+                ExternalTaskState.FAILED.value,
             ):
                 return ExternalTaskResult(
-                    handle=coerced, accepted=False, already_terminal=True,
+                    handle=coerced,
+                    accepted=False,
+                    already_terminal=True,
                     state=fresh["state"],
                 )
         return ExternalTaskResult(
-            handle=coerced, accepted=True,
+            handle=coerced,
+            accepted=True,
             state=ExternalTaskState.CANCEL_REQUESTED.value,
             cancel_already_requested=already,
         )
@@ -347,7 +386,8 @@ class ExternalBackgroundTasksService:
             ):
                 self._sync_delivery_state(row)
             if (
-                row["state"] in (
+                row["state"]
+                in (
                     ExternalTaskState.REGISTERED.value,
                     ExternalTaskState.CANCEL_REQUESTED.value,
                 )
@@ -368,7 +408,9 @@ class ExternalBackgroundTasksService:
 
     # -- internals ----------------------------------------------------------
 
-    def _resolve_handle(self, value: Any) -> Optional[Tuple[Dict[str, Any], ExternalTaskHandle]]:
+    def _resolve_handle(
+        self, value: Any
+    ) -> Optional[Tuple[Dict[str, Any], ExternalTaskHandle]]:
         """Verify handle shape, plugin ownership, signature, and row existence.
 
         Returns ``None`` for anything that does not positively resolve —
@@ -387,8 +429,11 @@ class ExternalBackgroundTasksService:
         if not hmac.compare_digest(
             handle.signature,
             _sign(
-                key, handle.task_id, handle.plugin_id,
-                handle.parent_session_id, handle.created_at,
+                key,
+                handle.task_id,
+                handle.plugin_id,
+                handle.parent_session_id,
+                handle.created_at,
             ),
         ):
             return None
@@ -451,9 +496,16 @@ class ExternalBackgroundTasksService:
                        delivery_delegation_id=?, delivery_state='pending'
                    WHERE task_id=? AND state IN ('registered','cancel_requested')""",
                 (
-                    status, now, now, event_id, payload_hash, summary, error,
+                    status,
+                    now,
+                    now,
+                    event_id,
+                    payload_hash,
+                    summary,
+                    error,
                     json.dumps(result_payload) if result_payload is not None else None,
-                    delegation_id, task_id,
+                    delegation_id,
+                    task_id,
                 ),
             )
             if cur.rowcount == 1:
@@ -471,17 +523,23 @@ class ExternalBackgroundTasksService:
         if fresh["terminal_event_id"] == event_id:
             if fresh["terminal_payload_hash"] == payload_hash:
                 return ExternalTaskResult(
-                    handle=handle, accepted=True, already_terminal=True,
+                    handle=handle,
+                    accepted=True,
+                    already_terminal=True,
                     state=fresh["state"],
                 )
             return ExternalTaskResult(
-                handle=handle, accepted=False, conflict=True,
+                handle=handle,
+                accepted=False,
+                conflict=True,
                 state=fresh["state"],
                 message="The same event id was already applied with a "
                 "different payload.",
             )
         return ExternalTaskResult(
-            handle=handle, accepted=False, already_terminal=True,
+            handle=handle,
+            accepted=False,
+            already_terminal=True,
             state=fresh["state"],
             message="Task already reached a terminal state.",
         )
@@ -544,8 +602,10 @@ class ExternalBackgroundTasksService:
 
     @staticmethod
     def _validate_register_inputs(
-        external_id: str, payload: Optional[Mapping[str, Any]],
-        idempotency_key: str, label: str,
+        external_id: str,
+        payload: Optional[Mapping[str, Any]],
+        idempotency_key: str,
+        label: str,
     ) -> None:
         if not isinstance(external_id, str) or not external_id.strip():
             raise BackgroundTaskError("external_id must be a non-empty string.")
@@ -567,17 +627,18 @@ class ExternalBackgroundTasksService:
             if not isinstance(payload, Mapping):
                 raise BackgroundTaskError("payload must be a JSON object (mapping).")
             try:
-                raw = json.dumps(dict(payload), sort_keys=True)
+                raw = json.dumps(dict(payload), sort_keys=True, allow_nan=False)
             except (TypeError, ValueError) as exc:
                 raise BackgroundTaskError("payload must be JSON-serializable.") from exc
             if len(raw.encode("utf-8")) > MAX_PAYLOAD_BYTES:
-                raise BackgroundTaskError(
-                    f"payload exceeds {MAX_PAYLOAD_BYTES} bytes."
-                )
+                raise BackgroundTaskError(f"payload exceeds {MAX_PAYLOAD_BYTES} bytes.")
 
     @staticmethod
     def _validate_terminal_inputs(
-        *, event_id: str, summary: Optional[str], error: Optional[str],
+        *,
+        event_id: str,
+        summary: Optional[str],
+        error: Optional[str],
         result_payload: Optional[Mapping[str, Any]],
     ) -> None:
         if not isinstance(event_id, str) or not event_id.strip():
@@ -606,7 +667,7 @@ class ExternalBackgroundTasksService:
                     "result_payload must be a JSON object (mapping)."
                 )
             try:
-                raw = json.dumps(dict(result_payload), sort_keys=True)
+                raw = json.dumps(dict(result_payload), sort_keys=True, allow_nan=False)
             except (TypeError, ValueError) as exc:
                 raise BackgroundTaskError(
                     "result_payload must be JSON-serializable."

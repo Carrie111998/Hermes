@@ -2339,11 +2339,12 @@ def _format_async_delegation(evt: dict) -> str:
     lines.append(f"Role: {role}   Model: {model}")
     lines.append(f"Status: {status}   API calls: {api_calls}   Duration: {duration}s")
     lines.append("--- RESULT ---")
+    task_subject = "background task" if evt.get("external_background_task") else "subagent"
     if status in ("completed", "success") and summary:
         lines.append(summary)
     elif status == "interrupted":
         lines.append(
-            "The subagent was interrupted before completing"
+            f"The {task_subject} was interrupted before completing"
             + (f": {error}" if error else ".")
         )
         if summary:
@@ -2352,7 +2353,7 @@ def _format_async_delegation(evt: dict) -> str:
     else:
         # error / timeout / failed
         lines.append(
-            f"The subagent did not complete successfully (status={status})."
+            f"The {task_subject} did not complete successfully (status={status})."
             + (f"\n{error}" if error else "")
         )
         if summary:

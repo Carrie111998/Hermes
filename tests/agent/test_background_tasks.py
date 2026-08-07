@@ -64,6 +64,7 @@ def _drain_one():
 # PluginContext exposure
 # ---------------------------------------------------------------------------
 
+
 def test_plugin_context_lazily_exposes_service_and_captures_identity():
     from hermes_cli.plugins import PluginContext, PluginManifest
 
@@ -97,6 +98,7 @@ def test_plugin_context_service_is_per_plugin_identity():
 # Parent binding
 # ---------------------------------------------------------------------------
 
+
 def test_register_outside_active_parent_fails():
     svc = _service()
     with pytest.raises(BackgroundTaskError):
@@ -116,6 +118,52 @@ def test_register_binds_only_the_active_host_parent():
     assert handle.plugin_id == "test-plugin"
 
 
+def test_public_contract_results_are_json_serializable_mappings():
+    svc = _service()
+    with bind_host_parent(_parent("parent-a")):
+        handle = svc.register_external(external_id="run-1")
+
+    status = svc.list_pending()[0]
+    completed = svc.complete(handle, event_id="event-1", summary="done")
+
+    assert json.loads(json.dumps(status.to_dict()))["state"] == "registered"
+    assert json.loads(json.dumps(completed.to_dict()))["state"] == "completed"
+
+
+def test_public_contract_rejects_non_finite_json_numbers():
+    svc = _service()
+    with bind_host_parent(_parent("parent-a")):
+        with pytest.raises(BackgroundTaskError):
+            svc.register_external(
+                external_id="run-nan", payload={"value": float("nan")}
+            )
+
+        handle = svc.register_external(external_id="run-1")
+
+    with pytest.raises(BackgroundTaskError):
+        svc.complete(
+            handle,
+            event_id="event-nan",
+            summary="done",
+            result_payload={"value": float("inf")},
+        )
+
+
+def test_external_failure_message_uses_generic_background_task_wording():
+    from tools.process_registry import _format_async_delegation
+
+    svc = _service()
+    with bind_host_parent(_parent("parent-a")):
+        handle = svc.register_external(external_id="run-1", label="code run")
+    assert svc.fail(handle, event_id="event-1", error="provider failed").accepted
+    event = _drain_one()
+    assert event is not None
+
+    rendered = _format_async_delegation(event)
+    assert "The background task did not complete successfully" in rendered
+    assert "The subagent did not complete successfully" not in rendered
+
+
 def test_register_cannot_be_forged_through_method_parameters():
     """The public surface has no parent/session parameters at all."""
     import inspect
@@ -123,7 +171,11 @@ def test_register_cannot_be_forged_through_method_parameters():
     sig = inspect.signature(ExternalBackgroundTasksService.register_external)
     params = set(sig.parameters)
     assert params == {
-        "self", "external_id", "payload", "idempotency_key", "label",
+        "self",
+        "external_id",
+        "payload",
+        "idempotency_key",
+        "label",
     }
     with bind_host_parent(_parent("parent-a")):
         handle = _service().register_external(external_id="run-1")
@@ -167,6 +219,7 @@ def test_register_captures_gateway_session_routing_from_parent_context():
 # ---------------------------------------------------------------------------
 # Plugin ownership / handle security
 # ---------------------------------------------------------------------------
+
 
 def test_cross_plugin_operations_rejected_without_existence_leak():
     owner = _service("owner-plugin")
@@ -242,6 +295,7 @@ def test_malformed_handle_is_unknown_not_crash():
 # Registration idempotency
 # ---------------------------------------------------------------------------
 
+
 def test_registration_replay_returns_same_handle():
     svc = _service()
     with bind_host_parent(_parent("parent-1")):
@@ -279,19 +333,24 @@ def test_distinct_external_ids_are_distinct_tasks():
 # Terminal transitions: idempotency + atomicity
 # ---------------------------------------------------------------------------
 
+
 def test_complete_event_replay_is_harmless():
     svc = _service()
     with bind_host_parent(_parent("parent-1")):
         handle = svc.register_external(external_id="run-1")
 
-    first = svc.complete(handle, event_id="e1", summary="done", result_payload={"k": "v"})
+    first = svc.complete(
+        handle, event_id="e1", summary="done", result_payload={"k": "v"}
+    )
     assert first.accepted is True
     assert first.state == ExternalTaskState.COMPLETED.value
     evt1 = _drain_one()
     assert evt1 is not None
     assert evt1["summary"] == "done"
 
-    replay = svc.complete(handle, event_id="e1", summary="done", result_payload={"k": "v"})
+    replay = svc.complete(
+        handle, event_id="e1", summary="done", result_payload={"k": "v"}
+    )
     assert replay.accepted is True
     assert replay.already_terminal is True
     assert replay.conflict is False
@@ -398,6 +457,7 @@ def test_concurrent_register_same_key_is_idempotent():
 # Size / schema limits
 # ---------------------------------------------------------------------------
 
+
 def test_oversized_payload_fails_before_persistence():
     svc = _service()
     with bind_host_parent(_parent("parent-1")):
@@ -437,7 +497,9 @@ def test_oversized_result_payload_fails_before_queue_side_effect():
 
     with pytest.raises(BackgroundTaskError):
         svc.complete(
-            handle, event_id="e1", summary="ok",
+            handle,
+            event_id="e1",
+            summary="ok",
             result_payload={"blob": "y" * 40_000},
         )
     assert _drain_one() is None
@@ -464,6 +526,7 @@ def test_missing_event_id_rejected():
 # Cancel intent
 # ---------------------------------------------------------------------------
 
+
 def test_cancel_intent_is_durable_but_distinct_from_cancel_success():
     svc = _service()
     with bind_host_parent(_parent("parent-1")):
@@ -485,7 +548,10 @@ def test_cancel_intent_is_durable_but_distinct_from_cancel_success():
     assert len(statuses) == 1
     assert statuses[0].state is ExternalTaskState.CANCEL_REQUESTED
 
-    assert svc.complete(handle, event_id="e1", summary="cancelled externally").accepted is True
+    assert (
+        svc.complete(handle, event_id="e1", summary="cancelled externally").accepted
+        is True
+    )
     evt = _drain_one()
     assert evt is not None and evt["summary"] == "cancelled externally"
 
@@ -505,9 +571,11 @@ def test_cancel_on_terminal_task_is_rejected():
 # list_pending
 # ---------------------------------------------------------------------------
 
+
 def test_list_pending_scope_and_lifecycle():
     from tools.async_delegation import (
-        claim_event_delivery, complete_event_delivery,
+        claim_event_delivery,
+        complete_event_delivery,
     )
 
     svc = _service("owner")
@@ -540,8 +608,10 @@ def test_list_pending_includes_undelivered_terminal_until_delivered():
 
     # Ack delivery the way a drain consumer does, then it drops off the list.
     from tools.async_delegation import (
-        claim_event_delivery, complete_event_delivery,
+        claim_event_delivery,
+        complete_event_delivery,
     )
+
     claim = claim_event_delivery(evt, "test-consumer")
     assert claim is not None
     complete_event_delivery(evt, claim)
@@ -571,12 +641,13 @@ def test_list_pending_returns_stable_handles_after_restart(tmp_path, monkeypatch
 # Restart restore (real subprocess)
 # ---------------------------------------------------------------------------
 
+
 def test_real_restart_restores_undelivered_completion_and_pending_state(tmp_path):
     """A fresh interpreter restores a pending external completion + handle."""
     repo = os.path.dirname(os.path.dirname(os.path.dirname(__file__)))
     env = {**os.environ, "HERMES_HOME": str(tmp_path), "PYTHONPATH": repo}
 
-    producer = r'''
+    producer = r"""
 import json
 from types import SimpleNamespace
 from agent.background_tasks import ExternalBackgroundTasksService
@@ -591,14 +662,20 @@ with bind_host_parent(SimpleNamespace(session_id="parent-1")):
     print(json.dumps(handle.to_dict()))
     res = svc.complete(handle, event_id="e1", summary="completed before restart")
     assert res.accepted is True
-'''
+"""
     first = subprocess.run(
-        [sys.executable, "-c", producer], cwd=repo, env=env,
-        text=True, capture_output=True, timeout=20, check=True,
+        [sys.executable, "-c", producer],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
     )
     handle_json = first.stdout.strip().splitlines()[-1]
 
-    consumer = r'''
+    consumer = (
+        r"""
 import json
 import sys
 from types import SimpleNamespace
@@ -634,10 +711,17 @@ assert evt["summary"] == "completed before restart"
 text = format_process_notification(evt)
 assert "durable run" in text
 print("OK")
-''' % handle_json
+"""
+        % handle_json
+    )
     second = subprocess.run(
-        [sys.executable, "-c", consumer], cwd=repo, env=env,
-        text=True, capture_output=True, timeout=20, check=True,
+        [sys.executable, "-c", consumer],
+        cwd=repo,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=True,
     )
     assert second.stdout.strip().splitlines()[-1] == "OK"
 
@@ -645,6 +729,7 @@ print("OK")
 # ---------------------------------------------------------------------------
 # HERMES_HOME isolation
 # ---------------------------------------------------------------------------
+
 
 def test_tests_never_touch_the_real_profile(tmp_path):
     from pathlib import Path

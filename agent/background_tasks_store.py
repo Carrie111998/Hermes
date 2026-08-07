@@ -64,12 +64,29 @@ CREATE INDEX IF NOT EXISTS idx_ext_tasks_plugin_state
 """
 
 _ROW_COLUMNS = (
-    "task_id", "plugin_id", "parent_session_id", "session_key",
-    "origin_ui_session_id", "origin_session_id", "external_id",
-    "idempotency_key", "label", "payload_hash", "payload_json", "state",
-    "created_at", "updated_at", "cancel_requested_at", "completed_at",
-    "terminal_event_id", "terminal_payload_hash", "summary", "error",
-    "result_json", "delivery_delegation_id", "delivery_state",
+    "task_id",
+    "plugin_id",
+    "parent_session_id",
+    "session_key",
+    "origin_ui_session_id",
+    "origin_session_id",
+    "external_id",
+    "idempotency_key",
+    "label",
+    "payload_hash",
+    "payload_json",
+    "state",
+    "created_at",
+    "updated_at",
+    "cancel_requested_at",
+    "completed_at",
+    "terminal_event_id",
+    "terminal_payload_hash",
+    "summary",
+    "error",
+    "result_json",
+    "delivery_delegation_id",
+    "delivery_state",
 )
 
 
@@ -138,7 +155,9 @@ def canonical_hash(payload: Any) -> str:
     ).hexdigest()
 
 
-def terminal_hash(status: str, event_id: str, summary: Any, error: Any, result_payload: Any) -> str:
+def terminal_hash(
+    status: str, event_id: str, summary: Any, error: Any, result_payload: Any
+) -> str:
     payload = {
         "status": status,
         "event_id": event_id,

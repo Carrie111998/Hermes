@@ -72,6 +72,9 @@ class ExternalTaskStatus:
     updated_at: float
     completed_at: Optional[float] = None
 
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
+
 
 @dataclasses.dataclass(frozen=True)
 class ExternalTaskResult:
@@ -85,6 +88,9 @@ class ExternalTaskResult:
     unknown_handle: bool = False
     cancel_already_requested: bool = False
     message: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return dataclasses.asdict(self)
 
 
 def sign(
@@ -101,7 +107,10 @@ def handle_from_row(key: bytes, row: Mapping[str, Any]) -> ExternalTaskHandle:
         parent_session_id=row["parent_session_id"],
         created_at=row["created_at"],
         signature=sign(
-            key, row["task_id"], row["plugin_id"], row["parent_session_id"],
+            key,
+            row["task_id"],
+            row["plugin_id"],
+            row["parent_session_id"],
             row["created_at"],
         ),
     )

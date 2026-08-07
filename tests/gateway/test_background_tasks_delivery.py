@@ -151,7 +151,9 @@ def test_gateway_delivery_is_delivered_once_for_duplicate_queue_replay(monkeypat
     isolated.put(dict(evt))
     import tools.process_registry as pr_module
 
-    monkeypatch.setattr(pr_module, "process_registry", type("R", (), {"completion_queue": isolated})())
+    monkeypatch.setattr(
+        pr_module, "process_registry", type("R", (), {"completion_queue": isolated})()
+    )
 
     runner = _runner(adapter, live_parent="parent-telegram")
     _stop_after_sleeps(monkeypatch, runner, count=2)
