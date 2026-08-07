@@ -65,7 +65,7 @@ export function MasterDetail({
 
 export function ListColumn({ children, header }: { children: ReactNode; header?: ReactNode }) {
   return (
-    <aside className="flex min-h-0 flex-col p-2">
+    <aside className="flex min-h-0 flex-col border-r border-(--ui-stroke-quaternary) bg-[color-mix(in_srgb,var(--ui-bg-tertiary)_26%,transparent)] p-3">
       {header}
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]">{children}</div>
     </aside>
@@ -87,7 +87,7 @@ export function DetailColumn({
   return (
     <main className="flex min-h-0 flex-col overflow-hidden">
       <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain [scrollbar-gutter:stable]">
-        <div className="mx-auto max-w-2xl space-y-5 px-5 py-4">{children}</div>
+        <div className="mx-auto max-w-3xl space-y-6 px-6 py-5">{children}</div>
       </div>
       {footer && (
         <div className="mx-auto w-full max-w-2xl shrink-0 px-5 pb-3 pt-1.5 text-right text-[0.65rem] text-muted-foreground/50">
@@ -225,10 +225,30 @@ export function DetailPane({
 
 // One-line control strip pinned above the list: sort/primary action on the
 // left, overflow kebab on the right.
-export function ListStrip({ left, right }: { left?: ReactNode; right?: ReactNode }) {
+export function ListStrip({
+  label,
+  left,
+  meta,
+  right
+}: {
+  label?: ReactNode
+  left?: ReactNode
+  meta?: ReactNode
+  right?: ReactNode
+}) {
   return (
-    <div className="mb-1 flex h-6 shrink-0 items-center justify-between gap-2 pl-2 pr-1">
-      <div className="flex min-w-0 items-center gap-1.5">{left}</div>
+    <div className="mb-2 flex h-7 shrink-0 items-center justify-between gap-2 px-1">
+      <div className="flex min-w-0 items-center gap-1.5">
+        {label && (
+          <span className="truncate text-[0.72rem] font-semibold tracking-[0.01em] text-foreground">{label}</span>
+        )}
+        {meta !== undefined && (
+          <span className="rounded-md bg-(--ui-bg-quinary) px-1.5 py-0.5 text-[0.62rem] tabular-nums text-(--ui-text-tertiary)">
+            {meta}
+          </span>
+        )}
+        {left}
+      </div>
       <div className="flex shrink-0 items-center gap-1.5">{right}</div>
     </div>
   )
@@ -317,7 +337,7 @@ export function ListStripButton({
   return (
     <button
       className={cn(
-        'cursor-pointer text-[0.68rem] font-medium transition-colors disabled:opacity-40',
+        'cursor-pointer text-[0.7rem] font-medium transition-colors disabled:opacity-40',
         active ? 'text-foreground' : 'text-muted-foreground/70 hover:text-foreground'
       )}
       disabled={disabled}
@@ -361,33 +381,35 @@ export function CapRow({
   return (
     <div
       className={cn(
-        'group/row row-hover flex w-full shrink-0 items-center rounded-md hover:text-foreground',
-        subtitle ? 'h-11' : 'h-8',
-        active ? 'bg-(--ui-row-active-background) text-foreground' : 'text-(--ui-text-secondary)'
+        'group/row row-hover mb-1 flex w-full shrink-0 items-center rounded-[var(--radius-sm)] border border-transparent transition-[background-color,border-color,box-shadow,color] duration-200 ease-out hover:border-(--ui-stroke-quaternary) hover:bg-(--chrome-action-hover) hover:text-foreground',
+        subtitle ? 'min-h-12' : 'h-9',
+        active
+          ? 'border-(--ui-stroke-secondary) bg-(--ui-row-active-background) text-foreground shadow-[0_1px_2px_rgb(0_0_0/0.04)]'
+          : 'text-(--ui-text-secondary)'
       )}
       id={rowId}
     >
       <RowButton
-        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-md pl-2 pr-1.5 text-left"
+        className="flex h-full min-w-0 flex-1 cursor-pointer items-center gap-2 rounded-[var(--radius-sm)] pl-2.5 pr-2 text-left"
         onClick={onSelect}
       >
         <span className="min-w-0 flex-1">
           <span
             className={cn(
-              'block truncate text-[0.78rem]',
+              'block truncate text-[0.8125rem]',
               enabled ? 'font-medium text-foreground/85' : 'font-normal text-muted-foreground/60'
             )}
           >
             {title}
           </span>
           {subtitle != null && (
-            <span className="flex min-w-0 items-center gap-1 text-[0.62rem] text-muted-foreground/50">
+            <span className="mt-0.5 flex min-w-0 items-center gap-1 text-[0.68rem] text-muted-foreground/65">
               {typeof subtitle === 'string' ? <span className="truncate">{subtitle}</span> : subtitle}
             </span>
           )}
         </span>
         {meta != null && (
-          <span className="shrink-0 rounded bg-(--ui-bg-quinary) px-1 py-px text-[0.6rem] tabular-nums leading-3.5 text-(--ui-text-tertiary)">
+          <span className="shrink-0 rounded-md bg-(--ui-bg-quinary) px-1.5 py-0.5 text-[0.62rem] tabular-nums leading-3.5 text-(--ui-text-tertiary)">
             {meta}
           </span>
         )}
@@ -395,7 +417,7 @@ export function CapRow({
       <Switch
         aria-label={toggleLabel}
         checked={enabled}
-        className={cn('mr-1.5 shrink-0 cursor-pointer', !enabled && 'opacity-60')}
+        className={cn('mr-2 shrink-0 cursor-pointer', !enabled && 'opacity-60')}
         disabled={busy}
         onCheckedChange={onToggle}
         size="xs"

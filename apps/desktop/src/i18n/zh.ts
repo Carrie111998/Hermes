@@ -1187,6 +1187,8 @@ export const zh: Translations = {
   },
 
   skills: {
+    title: '功能',
+    description: '技能、工具和 MCP 服务器',
     tabSkills: '技能',
     tabToolsets: '工具集',
     tabMcp: 'MCP',

@@ -11,7 +11,7 @@ import { triggerHaptic } from '@/lib/haptics'
 import { Package } from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
-import { EmptyState, ListRow, Pill, SectionHeading, SettingsContent } from './primitives'
+import { EmptyState, ListRow, Pill, SectionHeading, SettingsContent, SettingsGroup } from './primitives'
 
 const KIND_ORDER: Record<PluginRecord['kind'], number> = { disk: 0, runtime: 1, bundled: 2 }
 
@@ -121,11 +121,11 @@ export function PluginsSettings() {
       {rows.length === 0 ? (
         <EmptyState title={p.empty} />
       ) : (
-        <div className="divide-y divide-(--ui-stroke-tertiary)">
+        <SettingsGroup>
           {rows.map(record => (
             <PluginRow key={record.id} record={record} />
           ))}
-        </div>
+        </SettingsGroup>
       )}
     </SettingsContent>
   )

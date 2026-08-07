@@ -95,7 +95,7 @@ export function OverlayView({
     >
       <div
         className={cn(
-          'relative flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background) shadow-md',
+          'overlay-surface-enter relative flex h-full min-h-0 flex-col overflow-hidden rounded-xl border border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background) shadow-md',
           rootClassName
         )}
       >

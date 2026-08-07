@@ -855,6 +855,8 @@ export interface Translations {
   }
 
   skills: {
+    title: string
+    description: string
     tabSkills: string
     tabToolsets: string
     tabMcp: string

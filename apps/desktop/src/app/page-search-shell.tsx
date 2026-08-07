@@ -16,9 +16,12 @@ export interface PageShellTab {
 
 interface PageSearchShellProps extends React.ComponentProps<'section'> {
   children: ReactNode
+  /** Optional page identity above the search and tab controls. */
+  description?: ReactNode
   tabs?: PageShellTab[]
   activeTab?: string
   onTabChange?: (id: string) => void
+  title?: ReactNode
   /** Secondary filters shown full-width on their own row below (expands). */
   filters?: ReactNode
   onSearchChange: (value: string) => void
@@ -58,6 +61,8 @@ export function PageSearchShell({
   tabs,
   activeTab,
   onTabChange,
+  title,
+  description,
   filters,
   onSearchChange,
   searchPlaceholder,
@@ -89,9 +94,24 @@ export function PageSearchShell({
         draggable titlebar strip that is `calc()`'d around the icon clusters
         (see app-shell.tsx), so window dragging still works here.
       */}
-      <div className="shrink-0">
+      <div className="shrink-0 border-b border-(--ui-stroke-quaternary) bg-(--ui-chat-surface-background)">
+        {title && (
+          <div className="px-5 pb-2 pt-[calc(var(--titlebar-height)+0.625rem)]">
+            <h1 className="text-[0.9375rem] font-semibold tracking-tight text-foreground">{title}</h1>
+            {description && (
+              <p className="mt-0.5 text-[length:var(--conversation-caption-font-size)] leading-(--conversation-caption-line-height) text-(--ui-text-tertiary)">
+                {description}
+              </p>
+            )}
+          </div>
+        )}
         {(hasTabs || !searchHidden) && (
-          <div className="grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 px-3 pb-2 pt-[calc(var(--titlebar-height)+0.5rem)]">
+          <div
+            className={cn(
+              'grid grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center gap-3 px-4 pb-3',
+              title ? 'pt-1' : 'pt-[calc(var(--titlebar-height)+0.5rem)]'
+            )}
+          >
             <div className="flex min-w-0 items-center justify-start">
               {!searchHidden && (
                 <SearchField

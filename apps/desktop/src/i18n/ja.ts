@@ -1016,6 +1016,8 @@ export const ja = defineLocale({
   },
 
   skills: {
+    title: '機能',
+    description: 'スキル、ツール、MCP サーバー',
     tabSkills: 'スキル',
     tabToolsets: 'ツールセット',
     tabMcp: 'MCP',

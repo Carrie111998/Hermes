@@ -896,6 +896,8 @@ export const ar = defineLocale({
     }
   },
   skills: {
+    title: 'الإمكانات',
+    description: 'المهارات والأدوات وخوادم MCP',
     tabSkills: 'المهارات',
     tabToolsets: 'مجموعات الأدوات',
     all: 'الكل',

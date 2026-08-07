@@ -544,6 +544,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     <PageSearchShell
       {...props}
       activeTab={mode}
+      description={t.skills.description}
       onSearchChange={setQuery}
       onTabChange={id => setMode(id as (typeof SKILLS_MODES)[number])}
       // MCP manages a handful of entries with the editor right there —
@@ -564,6 +565,7 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
         { id: 'mcp', label: t.skills.tabMcp },
         { id: 'hub', label: t.skills.tabHub }
       ]}
+      title={t.skills.title}
     >
       {mode === 'hub' ? (
         <SkillsHub query={query} />
@@ -590,7 +592,9 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
             <ListColumn
               header={
                 <ListStrip
+                  label={t.skills.tabSkills}
                   left={sortButton(skillsSortDesc, () => $skillsSortDesc.set(!$skillsSortDesc.get()))}
+                  meta={visibleSkills.length}
                   right={
                     <ListStripMenu
                       items={[
@@ -636,7 +640,9 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
           <ListColumn
             header={
               <ListStrip
+                label={t.skills.tabToolsets}
                 left={sortButton(toolsetsSortDesc, () => $toolsetsSortDesc.set(!$toolsetsSortDesc.get()))}
+                meta={visibleToolsets.length}
                 right={<ListStripMenu label={t.skills.tabToolsets} toggle={bulkSwitch(allToolsetsEnabled)} />}
               />
             }
@@ -714,7 +720,7 @@ function DetailHeader({
   title: string
 }) {
   return (
-    <header>
+    <header className="rounded-xl border border-(--ui-stroke-quaternary) bg-[color-mix(in_srgb,var(--ui-bg-elevated)_72%,transparent)] p-4 shadow-[0_1px_2px_rgb(0_0_0/0.03)]">
       <div className="flex min-h-6 flex-wrap items-center gap-2">
         <h3 className="min-w-0 truncate text-[0.9375rem] font-semibold tracking-tight">{title}</h3>
         {pills}
@@ -785,7 +791,7 @@ function ToolsetDetail({
         title={label}
       />
       {tools.length > 0 && (
-        <div className="flex flex-wrap gap-1">
+        <div className="flex flex-wrap gap-1.5 rounded-lg bg-(--ui-bg-tertiary)/45 p-2">
           {tools.map(name => (
             <ToolChip key={name}>
               {name}

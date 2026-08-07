@@ -10,7 +10,7 @@ const TEXT_ACTION_ICON = '[&_.codicon]:no-underline [&_svg]:no-underline'
 // All button variants share the same softened corner treatment. Text actions
 // remain compact, but their hover surface now follows the system radius too.
 const buttonVariants = cva(
-  "inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-[var(--radius-sm)] text-xs leading-4 font-medium whitespace-nowrap shadow-none transition-all duration-100 outline-none focus-visible:border-ring focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-default disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
+  "inline-flex shrink-0 cursor-pointer items-center justify-center gap-1.5 rounded-[var(--radius-sm)] text-xs leading-4 font-medium whitespace-nowrap shadow-none transition-[transform,background-color,border-color,box-shadow,color,opacity] duration-200 ease-[cubic-bezier(0.2,0.8,0.2,1)] outline-none focus-visible:border-ring focus-visible:ring-[0.1875rem] focus-visible:ring-ring/50 disabled:pointer-events-none disabled:cursor-default disabled:opacity-50 aria-invalid:border-destructive aria-invalid:ring-destructive/20 dark:aria-invalid:ring-destructive/40 [&_svg]:pointer-events-none [&_svg]:shrink-0 [&_svg:not([class*='size-'])]:size-3.5",
   {
     variants: {
       variant: {
@@ -48,8 +48,7 @@ const buttonVariants = cva(
         'icon-xs': "size-6 [&_svg:not([class*='size-'])]:size-3",
         'icon-sm': 'size-8',
         'icon-lg': 'size-10',
-        'icon-titlebar':
-          'h-(--titlebar-control-height) w-(--titlebar-control-size) [&_.codicon]:text-[0.875rem]'
+        'icon-titlebar': 'h-(--titlebar-control-height) w-(--titlebar-control-size) [&_.codicon]:text-[0.875rem]'
       }
     },
     compoundVariants: [
@@ -58,6 +57,10 @@ const buttonVariants = cva(
       {
         variant: 'textStrong',
         class: 'px-0 has-[>svg]:px-0'
+      },
+      {
+        variant: ['default', 'destructive', 'outline', 'secondary', 'ghost'],
+        class: 'hover:-translate-y-px active:translate-y-0 active:scale-[0.98] active:duration-[90ms]'
       }
     ],
     defaultVariants: {

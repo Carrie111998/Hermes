@@ -1056,6 +1056,22 @@ button[class*='rounded-full'],
   border-radius: calc(var(--radius-scalar) * 9999rem);
 }
 
+@keyframes overlay-surface-in {
+  from {
+    opacity: 0;
+    transform: translateY(0.5rem) scale(0.992);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+.overlay-surface-enter {
+  animation: overlay-surface-in 280ms cubic-bezier(0.2, 0.8, 0.2, 1) both;
+}
+
 /* User bubbles are <button>s (click → edit), so the rule above would kill
    drag-to-select and leave ⌘C with nothing to grab. Message text stays
    selectable; chrome controls outside the bubble keep user-select: none. */

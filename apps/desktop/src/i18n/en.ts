@@ -987,6 +987,8 @@ export const en: Translations = {
   },
 
   skills: {
+    title: 'Capabilities',
+    description: 'Skills, tools, and MCP servers',
     tabSkills: 'Skills',
     tabToolsets: 'Tools',
     tabMcp: 'MCP',
