@@ -613,6 +613,9 @@ class AIAgent:
             from hermes_state import SessionDB
 
             self._session_db = SessionDB()
+            # The agent self-created this handle, so it owns it and must
+            # release the connection on close() (see AIAgent.close()).
+            self._owns_session_db = True
             return self._session_db
         except Exception:
             logger.debug("SessionDB unavailable for recall", exc_info=True)
@@ -4330,6 +4333,21 @@ class AIAgent:
                 session_id = getattr(self, "session_id", None)
                 if session_db and session_id:
                     session_db.end_session(session_id, "agent_close")
+        except Exception:
+            pass
+
+        # 8b. Release an OWNED session_db connection. The CLI/gateway pass a
+        # long-lived shared handle they keep for the process; the TUI/serve
+        # backend hands a fresh dedicated handle per profile-scoped agent
+        # build, and the recall fallback self-creates one. Only the owner
+        # closes it — closing a shared handle would break concurrent users
+        # and corrupt the tracked-connection ledger. Without this, long-lived
+        # serve backends leaked 2 fds per agent build and exhausted the fd
+        # table (OSError 24) after ~2 days.
+        try:
+            if getattr(self, "_owns_session_db", False) and self._session_db is not None:
+                self._session_db.close()
+                self._session_db = None
         except Exception:
             pass
 

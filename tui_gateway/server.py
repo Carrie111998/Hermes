@@ -6485,7 +6485,7 @@ def _make_agent(
                 raise RuntimeError("Auth fallback resolved without a model")
             model = resolution.selected_model
     _pr = _load_provider_routing()
-    return AIAgent(
+    agent = AIAgent(
         model=model,
         max_iterations=_cfg_max_turns(cfg, 500),
         provider=runtime.get("provider"),
@@ -6532,6 +6532,16 @@ def _make_agent(
         fallback_model=_load_fallback_model(),
         **_agent_cbs(sid),
     )
+
+    # A dedicated profile-scoped session_db handle is owned by this agent and
+    # must be closed on teardown (AIAgent.close()); the launch-profile shared
+    # handle (_get_db()) stays open for the whole process.
+    if session_db is not None and session_db is not _get_db():
+        try:
+            agent._owns_session_db = True
+        except Exception:
+            pass
+    return agent
 
 
 def _init_session(

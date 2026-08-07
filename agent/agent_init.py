@@ -1588,6 +1588,13 @@ def init_agent(
     # background skill/memory review fork so its harness turn can't leak into
     # the user's real session and hijack the next live turn. Default False.
     agent._persist_disabled = False
+    # Whether this agent OWNS its session_db handle and must close the SQLite
+    # connection on close(). The CLI/gateway pass a long-lived shared handle
+    # they keep open for the process; the TUI/serve backend hands a fresh
+    # dedicated handle per profile-scoped agent build, and the recall fallback
+    # self-creates one. Only the owner closes it — closing a shared handle
+    # would break concurrent users.
+    agent._owns_session_db = False
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
         "reasoning_config": reasoning_config,
