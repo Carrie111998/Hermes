@@ -1500,6 +1500,20 @@ display:
 #     base_url: "https://ollama.com/v1"
 
 # =============================================================================
+# Telegram static location pins (optional)
+# =============================================================================
+# Default behavior is "conversational": a static pin is its own agent turn.
+# Opt into "stage_next" to acknowledge the pin without an agent call and attach
+# it once to the next accepted text message from the same sender/chat/topic.
+#
+# gateway:
+#   platforms:
+#     telegram:
+#       extra:
+#         location_pin_mode: stage_next
+#         location_pin_ttl_seconds: 300  # 1–3600 seconds
+
+# =============================================================================
 # Privacy
 # =============================================================================
 # privacy:

@@ -8,6 +8,44 @@ from gateway.platforms.base import MessageType
 from gateway.session import SessionSource
 
 
+def test_ignore_trigger_bypasses_only_group_trigger_rules():
+    adapter = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+    )
+    message = _group_message(chat_id=-100)
+
+    assert adapter._should_process_message(message) is False
+    assert adapter._should_process_message(message, ignore_trigger=True) is True
+
+
+def test_ignore_trigger_preserves_chat_and_topic_access_gates():
+    wrong_chat = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-200"],
+    )
+    ignored_topic = _make_adapter(
+        require_mention=True,
+        allowed_chats=["-100"],
+        ignored_threads=[7],
+    )
+
+    assert (
+        wrong_chat._should_process_message(
+            _group_message(chat_id=-100),
+            ignore_trigger=True,
+        )
+        is False
+    )
+    assert (
+        ignored_topic._should_process_message(
+            _group_message(chat_id=-100, thread_id=7),
+            ignore_trigger=True,
+        )
+        is False
+    )
+
+
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,

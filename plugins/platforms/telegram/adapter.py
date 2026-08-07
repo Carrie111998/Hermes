@@ -666,6 +666,7 @@ class TelegramAdapter(BasePlatformAdapter):
     _TEXT_BATCH_FAST_DELAY_S = 0.18
     _TEXT_BATCH_SHORT_LEN = 1024
     _TEXT_BATCH_SHORT_DELAY_S = 0.24
+    _LOCATION_PIN_MAX_PENDING = 1024
 
     @staticmethod
     def _env_float_clamped(
@@ -767,6 +768,12 @@ class TelegramAdapter(BasePlatformAdapter):
         )
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
+        # One pending static pin per Telegram sender/session when the optional
+        # stage-next mode is enabled. Coordinates never cross sender, chat, or
+        # topic boundaries and are discarded on adapter shutdown.
+        self._pending_location_context: Dict[str, tuple[object, float, str]] = {}
+        self._pending_location_expiry_handles: Dict[str, asyncio.TimerHandle] = {}
+        self._pending_location_ack_intents: Dict[str, object] = {}
         self._drop_delayed_deliveries = False
         self._polling_error_task: Optional[asyncio.Task] = None
         self._polling_conflict_count: int = 0
@@ -4287,6 +4294,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._pending_photo_batches.clear()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        self._clear_pending_location_state()
         if getattr(self, "_polling_error_task", None) is not current_task:
             self._polling_error_task = None
         if getattr(self, "_polling_progress_verifier_task", None) is not current_task:
@@ -4403,6 +4411,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] Error during Telegram disconnect: %s",
                     self.name, _redact_telegram_error_text(e),
                 )
+        # Updater shutdown can race a final location handler after the first
+        # cleanup pass. This authoritative second pass prevents precise pins,
+        # acknowledgement intents, or timer handles from surviving teardown.
+        self._clear_pending_location_state()
         self._release_platform_lock()
 
         self._app = None
@@ -8651,7 +8663,13 @@ class TelegramAdapter(BasePlatformAdapter):
         user_id = getattr(from_user, "id", None)
         return bot_id is not None and user_id is not None and bot_id == user_id
 
-    def _should_process_message(self, message: Message, *, is_command: bool = False) -> bool:
+    def _should_process_message(
+        self,
+        message: Message,
+        *,
+        is_command: bool = False,
+        ignore_trigger: bool = False,
+    ) -> bool:
         """Apply Telegram group trigger rules.
 
         DMs remain unrestricted. Group/supergroup messages are accepted when:
@@ -8729,6 +8747,11 @@ class TelegramAdapter(BasePlatformAdapter):
         if allowed and chat_id_str not in allowed:
             return guest_mention
 
+        # Passive attachments may opt out of mention/reply/wake-word triggers
+        # after all authorization, chat, and topic gates above have passed.
+        if ignore_trigger:
+            return True
+
         if guest_mention:
             return True
         if chat_id_str in self._telegram_free_response_chats():
@@ -8780,6 +8803,125 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    def _location_stage_key(self, event: MessageEvent) -> str:
+        """Return a sender-scoped session key for a pending static pin."""
+        return f"{self._text_batch_key(event)}\x1f{event.source.user_id or ''}"
+
+    def _location_pin_staging_enabled(self) -> bool:
+        """Whether static location pins should attach to the next text turn."""
+        mode = str(
+            self.config.extra.get("location_pin_mode", "conversational")
+        ).strip().lower()
+        return mode == "stage_next"
+
+    def _location_pin_ttl_seconds(self) -> float:
+        """Return the bounded lifetime of an unconsumed static pin."""
+        raw = self.config.extra.get("location_pin_ttl_seconds", 300.0)
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            value = 300.0
+        return max(1.0, min(value, 3600.0))
+
+    @staticmethod
+    def _is_static_location_update(update: Update, location: Any) -> bool:
+        """Distinguish deliberate fixed pins from Telegram live telemetry."""
+        if getattr(location, "live_period", None) is not None:
+            return False
+        return not (
+            getattr(update, "edited_message", None)
+            or getattr(update, "edited_channel_post", None)
+        )
+
+    def _is_authorized_for_location_staging(self, event: MessageEvent) -> bool:
+        """Require the gateway's canonical authorization decision before staging."""
+        source = event.source
+        if not source.user_id:
+            logger.warning(
+                "[Telegram] Refusing location staging without stable sender identity"
+            )
+            return False
+        authorized = self._is_sender_authorized(
+            source.user_id,
+            source.chat_type,
+            source.chat_id,
+        )
+        if authorized is None:
+            logger.warning(
+                "[Telegram] Cannot verify canonical authorization for location staging"
+            )
+            return False
+        return authorized
+
+    def _remove_staged_location(self, key: str) -> None:
+        """Remove one staged pin and cancel its active expiry callback."""
+        self._pending_location_context.pop(key, None)
+        handle = self._pending_location_expiry_handles.pop(key, None)
+        if handle is not None:
+            handle.cancel()
+
+    def _clear_pending_location_state(self) -> None:
+        """Cancel and discard all staged pins and in-flight acknowledgements."""
+        for handle in getattr(
+            self, "_pending_location_expiry_handles", {}
+        ).values():
+            handle.cancel()
+        getattr(self, "_pending_location_expiry_handles", {}).clear()
+        getattr(self, "_pending_location_context", {}).clear()
+        getattr(self, "_pending_location_ack_intents", {}).clear()
+
+    def _expire_staged_location(self, key: str, token: object) -> None:
+        """Discard a pin at its deadline unless a newer pin replaced it."""
+        pending = self._pending_location_context.get(key)
+        if pending is not None and pending[0] is token:
+            self._pending_location_context.pop(key, None)
+            self._pending_location_expiry_handles.pop(key, None)
+            logger.info("[Telegram] Discarded expired staged location pin")
+
+    def _stage_location(self, key: str, location_text: str) -> None:
+        """Store a bounded, actively expiring static location attachment."""
+        if key not in self._pending_location_context and len(
+            self._pending_location_context
+        ) >= self._LOCATION_PIN_MAX_PENDING:
+            oldest_key = min(
+                self._pending_location_context,
+                key=lambda candidate: self._pending_location_context[candidate][1],
+            )
+            self._remove_staged_location(oldest_key)
+            logger.warning("[Telegram] Evicted oldest staged location pin at capacity")
+        self._remove_staged_location(key)
+        token = object()
+        staged_at = time.monotonic()
+        self._pending_location_context[key] = (token, staged_at, location_text)
+        self._pending_location_expiry_handles[key] = (
+            asyncio.get_running_loop().call_later(
+                self._location_pin_ttl_seconds(),
+                self._expire_staged_location,
+                key,
+                token,
+            )
+        )
+
+    def _attach_staged_location(self, event: MessageEvent) -> None:
+        """Consume a fresh staged pin and prepend it to this text request."""
+        if not self._location_pin_staging_enabled():
+            return
+        key = self._location_stage_key(event)
+        pending = self._pending_location_context.get(key)
+        if not pending:
+            return
+        _token, staged_at, location_text = pending
+        self._remove_staged_location(key)
+        if time.monotonic() - staged_at > self._location_pin_ttl_seconds():
+            logger.info("[Telegram] Discarded expired staged location pin")
+            return
+        request_text = event.text or ""
+        event.text = (
+            f"{location_text}\n\n"
+            "[The user's request follows.]\n"
+            f"{request_text}"
+        )
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -8809,9 +8951,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
         event = self._build_message_event(msg, MessageType.TEXT, update_id=update.update_id)
         event.text = self._clean_bot_trigger_text(event.text)
+        self._attach_staged_location(event)
         await self._cache_replied_media(msg, event)
+        # Group-observation attribution deliberately replaces the sender with
+        # a shared chat/topic source. In stage-next mode, preserve the
+        # sender-scoped key while the original source is still available so
+        # adjacent messages from different users cannot share a text batch.
+        batch_key = (
+            self._text_batch_key(event)
+            if self._location_pin_staging_enabled()
+            else None
+        )
         event = self._apply_telegram_group_observe_attribution(event)
-        self._enqueue_text_event(event)
+        self._enqueue_text_event(event, batch_key=batch_key)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
@@ -8852,6 +9004,8 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg:
             return
+        if self._should_drop_delayed_delivery():
+            return
         if not self._is_user_authorized_from_message(msg):
             logger.warning(
                 "[Telegram] Blocked unauthorized user %s in chat %s",
@@ -8859,7 +9013,28 @@ class TelegramAdapter(BasePlatformAdapter):
                 getattr(getattr(msg, "chat", None), "id", None),
             )
             return
-        if not self._should_process_message(msg):
+        stage_candidate = getattr(
+            getattr(msg, "venue", None), "location", None
+        ) or getattr(msg, "location", None)
+        location_event = None
+        stage_static_pin = False
+        if (
+            self._location_pin_staging_enabled()
+            and stage_candidate is not None
+            and self._is_static_location_update(update, stage_candidate)
+        ):
+            location_event = self._build_message_event(
+                msg,
+                MessageType.LOCATION,
+                update_id=update.update_id,
+            )
+            stage_static_pin = self._is_authorized_for_location_staging(
+                location_event
+            )
+        if not self._should_process_message(
+            msg,
+            ignore_trigger=stage_static_pin,
+        ):
             if self._should_observe_unmentioned_group_message(msg):
                 self._observe_unmentioned_group_message(msg, MessageType.LOCATION, update_id=update.update_id)
             return
@@ -8887,9 +9062,59 @@ class TelegramAdapter(BasePlatformAdapter):
         parts.append(f"latitude: {lat}")
         parts.append(f"longitude: {lon}")
         parts.append(f"Map: https://www.google.com/maps/search/?api=1&query={lat},{lon}")
-        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
 
-        event = self._build_message_event(msg, MessageType.LOCATION, update_id=update.update_id)
+        event = location_event or self._build_message_event(
+            msg,
+            MessageType.LOCATION,
+            update_id=update.update_id,
+        )
+        if stage_static_pin:
+            parts[0] = (
+                "[The user shared this location immediately before the current "
+                "request. Treat it as a location attachment; do not comment on "
+                "the pin itself.]"
+            )
+            location_key = self._location_stage_key(event)
+            ack_intent = object()
+            if (
+                location_key not in self._pending_location_ack_intents
+                and len(self._pending_location_ack_intents)
+                >= self._LOCATION_PIN_MAX_PENDING
+            ):
+                self._pending_location_ack_intents.pop(
+                    next(iter(self._pending_location_ack_intents)),
+                    None,
+                )
+            self._pending_location_ack_intents[location_key] = ack_intent
+            try:
+                await msg.reply_text(
+                    "Location will be attached to your next message."
+                )
+            except Exception as exc:
+                if self._pending_location_ack_intents.get(location_key) is ack_intent:
+                    self._pending_location_ack_intents.pop(location_key, None)
+                logger.warning(
+                    "[Telegram] Location pin acknowledgement failed; pin not staged: %s",
+                    _redact_telegram_error_text(exc),
+                )
+                return
+            if self._should_drop_delayed_delivery():
+                if self._pending_location_ack_intents.get(location_key) is ack_intent:
+                    self._pending_location_ack_intents.pop(location_key, None)
+                return
+            if self._pending_location_ack_intents.get(location_key) is not ack_intent:
+                logger.info(
+                    "[Telegram] Skipped superseded static location pin after acknowledgement"
+                )
+                return
+            self._pending_location_ack_intents.pop(location_key, None)
+            self._stage_location(location_key, "\n".join(parts))
+            logger.info(
+                "[Telegram] Staged authorized static location pin for next text request"
+            )
+            return
+
+        parts.append("Ask what they'd like to find nearby (restaurants, cafes, etc.) and any preferences.")
         event.text = "\n".join(parts)
         event = self._apply_telegram_group_observe_attribution(event)
         await self.handle_message(event)
@@ -8907,14 +9132,28 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         from gateway.session import build_session_key
         self._apply_topic_recovery(event)
+        sender_scoped = self._location_pin_staging_enabled()
         return build_session_key(
             event.source,
-            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
-            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+            group_sessions_per_user=(
+                True
+                if sender_scoped
+                else self.config.extra.get("group_sessions_per_user", True)
+            ),
+            thread_sessions_per_user=(
+                True
+                if sender_scoped
+                else self.config.extra.get("thread_sessions_per_user", False)
+            ),
             profile=event.source.profile,
         )
 
-    def _enqueue_text_event(self, event: MessageEvent) -> None:
+    def _enqueue_text_event(
+        self,
+        event: MessageEvent,
+        *,
+        batch_key: Optional[str] = None,
+    ) -> None:
         """Buffer a text event and reset the flush timer.
 
         When Telegram splits a long user message into multiple updates,
@@ -8926,7 +9165,7 @@ class TelegramAdapter(BasePlatformAdapter):
             logger.debug("[Telegram] Dropping text batch enqueue after disconnect started")
             return
 
-        key = self._text_batch_key(event)
+        key = batch_key if batch_key is not None else self._text_batch_key(event)
         existing = self._pending_text_batches.get(key)
         chunk_len = len(event.text or "")
         if existing is None:
