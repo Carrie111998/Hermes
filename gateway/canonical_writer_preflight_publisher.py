@@ -79,6 +79,10 @@ from gateway.canonical_writer_config_collector import (
     collect_and_stage,
     load_config_collector_receipt,
 )
+from gateway.production_access_policy import (
+    PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS,
+    PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS,
+)
 from gateway.canonical_writer_planner import (
     build_and_stage_native_observation_plan,
     load_release_manifest,
@@ -692,6 +696,12 @@ def _collect_or_resume_configs(
         release_manifest_file_sha256=str(plan["release_manifest_file_sha256"]),
         tls_server_name=DATABASE_TLS_SERVER_NAME,
         owner_discord_user_ids=(OWNER_DISCORD_USER_ID,),
+        plan_operator_discord_user_ids=tuple(
+            sorted(PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS)
+        ),
+        top_trusted_operator_discord_user_ids=tuple(
+            sorted(PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS)
+        ),
         _clock=clock,
     )
     receipt = load_config_collector_receipt(

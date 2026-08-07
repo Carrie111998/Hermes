@@ -89,6 +89,37 @@ def test_plan_capability_rejects_non_owner(monkeypatch):
         )
 
 
+def test_exact_plan_capability_accepts_configured_operator_without_owner_role(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "approvals": {
+                "plan_owner_user_ids": ["owner-1"],
+                "plan_operator_user_ids": ["operator-1"],
+            }
+        },
+    )
+    approval.clear_session("session-operator")
+    grant = approval.grant_plan_capability(
+        session_key="session-operator",
+        plan_id="plan-operator",
+        exact_commands=["git status --short"],
+        approved_by_user_id="operator-1",
+        max_uses_per_command=1,
+    )
+
+    assert grant["approved_by_user_id"] == "operator-1"
+    assert (
+        approval.consume_plan_capability(
+            "session-operator",
+            "git status --short",
+        )
+        == "plan-operator"
+    )
+
+
 def test_pending_model_plan_forces_tool_choice_required():
     class _Transport:
         def build_kwargs(self, **kwargs):
@@ -358,7 +389,7 @@ def test_explicit_canonical_config_fails_closed_when_helper_is_unavailable(monke
     ) is None
 
 
-def test_gateway_owner_is_discord_bound_and_requires_current_observed_message(monkeypatch):
+def test_gateway_operator_is_discord_bound_and_requires_current_observed_message(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["discord-owner"]}},
@@ -384,7 +415,7 @@ def test_gateway_owner_is_discord_bound_and_requires_current_observed_message(mo
 
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(approval, "_observed_session_message_id", lambda: "")
-    with pytest.raises(PermissionError, match="runtime-observed owner message_id"):
+    with pytest.raises(PermissionError, match="runtime-observed operator message_id"):
         approval.grant_plan_capability(
             session_key="session-platform-binding",
             plan_id="plan-platform-binding",
@@ -429,6 +460,64 @@ def test_gateway_owner_is_discord_bound_and_requires_current_observed_message(mo
     ]
     assert stored["source_refs"]["message_id"] == "current-discord-message"
     assert stored["source_refs"].get("message_id") != "model-supplied-old-message"
+
+
+def test_same_requester_message_authorizes_later_plan_revisions(monkeypatch):
+    operator = "trusted-plan-operator"
+    session = "session-plan-revision"
+    plan = "plan-long-running-task"
+    case = "case:long-running-task"
+    approval.clear_session(session)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"approvals": {"plan_operator_user_ids": [operator]}},
+    )
+    monkeypatch.setattr(approval, "_observed_session_user_id", lambda: operator)
+    monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
+    monkeypatch.setattr(
+        approval,
+        "_observed_session_message_id",
+        lambda: "original-task-message",
+    )
+    monkeypatch.setattr(
+        "tools.canonical_brain_tool.canonical_active_plan_matches",
+        lambda **_kwargs: True,
+    )
+    monkeypatch.setattr(
+        "tools.canonical_brain_tool.record_plan_approval_receipt",
+        lambda **_kwargs: _inserted_receipt(),
+    )
+
+    first = approval.grant_plan_capability(
+        session_key=session,
+        plan_id=plan,
+        plan_revision=1,
+        exact_commands=["git status --short"],
+        approved_by_user_id=operator,
+        canonical_case_id=case,
+    )
+    second = approval.grant_plan_capability(
+        session_key=session,
+        plan_id=plan,
+        plan_revision=2,
+        exact_commands=["git status --short", "python -m pytest -q"],
+        approved_by_user_id=operator,
+        canonical_case_id=case,
+    )
+
+    assert first["approval_source_sha256"] != second["approval_source_sha256"]
+    assert second["plan_revision"] == 2
+    assert second["command_count"] == 2
+
+    with pytest.raises(PermissionError, match="already used"):
+        approval.grant_plan_capability(
+            session_key=session,
+            plan_id=plan,
+            plan_revision=2,
+            exact_commands=["different command in the same revision"],
+            approved_by_user_id=operator,
+            canonical_case_id=case,
+        )
 
 
 def test_existing_capability_cannot_be_consumed_by_same_id_on_another_platform(
@@ -580,7 +669,7 @@ def test_observed_approval_message_cannot_mint_fresh_authority_after_restart_or_
     assert fresh["approval_id"] != first["approval_id"]
 
 
-def test_canonical_runtime_requires_observed_owner_case_and_active_exact_plan(monkeypatch):
+def test_canonical_runtime_requires_observed_operator_case_and_active_exact_plan(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
         lambda: {"approvals": {"plan_owner_user_ids": ["owner-1"]}},
@@ -589,7 +678,7 @@ def test_canonical_runtime_requires_observed_owner_case_and_active_exact_plan(mo
     monkeypatch.setattr(approval, "_observed_session_platform", lambda: "discord")
     monkeypatch.setattr(approval, "_observed_session_message_id", lambda: "msg-canonical")
 
-    with pytest.raises(PermissionError, match="runtime-observed owner"):
+    with pytest.raises(PermissionError, match="runtime-observed operator"):
         approval.grant_plan_capability(
             session_key="session-canonical",
             plan_id="plan-canonical",

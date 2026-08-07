@@ -1717,8 +1717,8 @@ TODO_SCHEMA = {
             "plan_approval": {
                 "type": "object",
                 "description": (
-                    "Use only after the authenticated owner explicitly approves this plan. "
-                    "Hermes decides approval meaning and authors the lease bounds; runtime grants "
+                    "Use only after the authenticated requester authorizes this operational plan. "
+                    "Hermes decides authorization meaning and authors the lease bounds; runtime grants "
                     "only exact expiring terminal or execute_code subjects. One grant remains valid "
                     "across monotonic progress revisions of the same active plan, but never "
                     "authorizes a newly added execution subject."
@@ -1729,7 +1729,7 @@ TODO_SCHEMA = {
                         "type": "integer",
                         "minimum": 1,
                         "description": (
-                            "Exact active Canonical Task Workspace revision approved by the owner."
+                            "Exact active Canonical Task Workspace revision authorized by the requester."
                         ),
                     },
                     "exact_commands": {

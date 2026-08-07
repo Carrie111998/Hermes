@@ -26,7 +26,11 @@ from typing import Any, Mapping, Sequence
 
 import yaml
 
-from gateway.production_access_policy import PRODUCTION_OWNER_DISCORD_USER_ID
+from gateway.production_access_policy import (
+    PRODUCTION_OWNER_DISCORD_USER_ID,
+    PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS,
+    PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS,
+)
 from gateway.support_ops_team_registry import (
     SKYVISION_CONTROL_TOWER_CHANNEL_ID,
     SKYVISION_GUILD_ID,
@@ -403,6 +407,12 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
         raise ConfigGateError("config_approvals_surface_drifted")
     approvals.pop("deny", None)
     approvals["plan_owner_user_ids"] = [PRODUCTION_OWNER_DISCORD_USER_ID]
+    approvals["plan_operator_user_ids"] = sorted(
+        PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS
+    )
+    approvals["top_trusted_operator_user_ids"] = sorted(
+        PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS
+    )
     approvals["gateway_authorized_user_ids"] = [
         PRODUCTION_OWNER_DISCORD_USER_ID
     ]

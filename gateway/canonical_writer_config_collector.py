@@ -865,6 +865,8 @@ def _writer_config_mapping(
     config: WriterDBConfig,
     policy: WriterPrivilegePolicy,
     owner_discord_user_ids: Sequence[str],
+    plan_operator_discord_user_ids: Sequence[str] = (),
+    top_trusted_operator_discord_user_ids: Sequence[str] = (),
 ) -> dict[str, Any]:
     receipt = policy.managed_cloudsqladmin_hba_rejection_receipt
     if receipt is None:
@@ -879,6 +881,12 @@ def _writer_config_mapping(
             "socket_gid": SOCKET_CLIENT_GID,
             "projector_gid": PROJECTOR_GID,
             "owner_discord_user_ids": list(owner_discord_user_ids),
+            "plan_operator_discord_user_ids": list(
+                plan_operator_discord_user_ids
+            ),
+            "top_trusted_operator_discord_user_ids": list(
+                top_trusted_operator_discord_user_ids
+            ),
             "connection_timeout_seconds": 30.0,
             "max_connections": 8,
         },
@@ -1194,11 +1202,17 @@ def _build_artifacts(
     attestation: PrivilegeAttestation,
     owner_discord_user_ids: Sequence[str],
     collected_at_unix: int,
+    plan_operator_discord_user_ids: Sequence[str] = (),
+    top_trusted_operator_discord_user_ids: Sequence[str] = (),
 ) -> CollectorArtifacts:
     writer_mapping = _writer_config_mapping(
         config=config,
         policy=policy,
         owner_discord_user_ids=owner_discord_user_ids,
+        plan_operator_discord_user_ids=plan_operator_discord_user_ids,
+        top_trusted_operator_discord_user_ids=(
+            top_trusted_operator_discord_user_ids
+        ),
     )
     writer = _canonical_bytes(writer_mapping)
     if len(writer) > _MAX_CONFIG_BYTES:
@@ -1438,6 +1452,8 @@ def collect_and_stage(
     release_manifest_file_sha256: str,
     tls_server_name: str,
     owner_discord_user_ids: Sequence[str],
+    plan_operator_discord_user_ids: Sequence[str] = (),
+    top_trusted_operator_discord_user_ids: Sequence[str] = (),
     _hba_collector: HBACollector = collect_managed_cloudsqladmin_hba_receipt,
     _session_factory: SessionFactory = _open_postgres_session,
     _clock: Callable[[], float] = time.time,
@@ -1446,6 +1462,12 @@ def collect_and_stage(
 
     _require_root_linux()
     owners = _owner_ids(owner_discord_user_ids)
+    operators = _owner_ids(plan_operator_discord_user_ids)
+    top_operators = _owner_ids(top_trusted_operator_discord_user_ids)
+    if set(owners) & set(operators):
+        raise ValueError("collector owner and plan operator IDs must be disjoint")
+    if not set(top_operators) <= set(operators):
+        raise ValueError("collector top-trusted IDs must be plan operators")
     _load_release_binding(
         revision=revision,
         expected_artifact_sha256=release_artifact_sha256,
@@ -1500,6 +1522,8 @@ def collect_and_stage(
         policy=policy,
         attestation=attestation,
         owner_discord_user_ids=owners,
+        plan_operator_discord_user_ids=operators,
+        top_trusted_operator_discord_user_ids=top_operators,
         collected_at_unix=collected_at,
     )
     _ensure_exact_directory(STAGING_ROOT)
@@ -1548,6 +1572,9 @@ def collect_and_stage(
             or loaded.socket_gid != SOCKET_CLIENT_GID
             or loaded.projector_gid != PROJECTOR_GID
             or loaded.owner_discord_user_ids != frozenset(owners)
+            or loaded.plan_operator_discord_user_ids != frozenset(operators)
+            or loaded.top_trusted_operator_discord_user_ids
+            != frozenset(top_operators)
             or loaded.discord_edge_authority.enabled is not False
         ):
             raise RuntimeError("collector staged writer config readback drifted")
@@ -1597,6 +1624,18 @@ def _parser() -> argparse.ArgumentParser:
         default=[],
         dest="owner_discord_user_ids",
     )
+    parser.add_argument(
+        "--plan-operator-discord-user-id",
+        action="append",
+        default=[],
+        dest="plan_operator_discord_user_ids",
+    )
+    parser.add_argument(
+        "--top-trusted-operator-discord-user-id",
+        action="append",
+        default=[],
+        dest="top_trusted_operator_discord_user_ids",
+    )
     return parser
 
 
@@ -1611,6 +1650,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ),
             tls_server_name=arguments.tls_server_name,
             owner_discord_user_ids=arguments.owner_discord_user_ids,
+            plan_operator_discord_user_ids=(
+                arguments.plan_operator_discord_user_ids
+            ),
+            top_trusted_operator_discord_user_ids=(
+                arguments.top_trusted_operator_discord_user_ids
+            ),
         )
     except Exception as exc:
         # Error messages and digests are deliberately excluded: an underlying

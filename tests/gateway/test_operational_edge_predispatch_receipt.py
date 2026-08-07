@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import os
 import time
@@ -230,6 +231,8 @@ def test_present_invalid_capability_has_distinct_signed_predispatch_truth(
         ("mutation_capability_required", True, False),
         ("mutation_capability_invalid", True, True),
         ("mutation_capability_invalid", False, False),
+        ("mutation_operator_tier_insufficient", True, True),
+        ("mutation_operator_tier_insufficient", False, False),
         ("some_other_blocker", False, False),
     ),
 )
@@ -262,7 +265,7 @@ def test_denials_do_not_consume_execution_idempotency_slot(
     )
     now_ms = int(time.time() * 1000)
     capability = OperationalCapability(
-        authority_kind="canonical_owner_plan",
+        authority_kind="canonical_plan",
         authority_ref="plan:capability-canary:1",
         operation_id=missing.intent.operation_id,
         arguments_sha256=missing.intent.arguments_sha256,
@@ -310,3 +313,73 @@ def test_denials_do_not_consume_execution_idempotency_slot(
     assert payload["outcome"] == "succeeded"
     assert payload["dispatched"] is True
     assert payload["mutation_performed"] is True
+
+
+def test_operator_tier_is_signed_and_enforced_before_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, receipt_key, writer_key, journal = _service()
+    service.operations = {
+        "bitrix.crm.lead_add": replace(
+            service.operations["bitrix.crm.lead_add"],
+            minimum_operator_tier="top",
+        )
+    }
+    peer = OperationalEdgePeer(pid=4321, uid=1001, gid=1002)
+    base = _request()
+    now_ms = int(time.time() * 1000)
+
+    def request_for_tier(tier: str, sequence: int) -> OperationalRequest:
+        capability = OperationalCapability(
+            authority_kind="canonical_plan",
+            authority_ref=f"plan:tier-canary:{tier}",
+            operation_id=base.intent.operation_id,
+            arguments_sha256=base.intent.arguments_sha256,
+            idempotency_key=base.intent.idempotency_key,
+            issued_at_unix_ms=now_ms - 1_000,
+            expires_at_unix_ms=now_ms + 60_000,
+            operator_tier=tier,
+        )
+        return OperationalRequest(
+            request_id=str(uuid.uuid4()),
+            sequence=sequence,
+            deadline_unix_ms=now_ms + 30_000,
+            intent=base.intent,
+            capability=sign_envelope(
+                capability.to_mapping(),
+                key_id="b" * 64,
+                private_key=writer_key,
+            ),
+        )
+
+    calls: list[list[str]] = []
+    service._argv = lambda _operation, _arguments: (["/sealed/helper"], "d" * 64)
+
+    def run(argv, **_kwargs):
+        calls.append(list(argv))
+        return SimpleNamespace(stdout=b'{"status":"OK"}', stderr=b"", returncode=0)
+
+    monkeypatch.setattr("gateway.operational_edge_service.subprocess.run", run)
+
+    denied = service.dispatch(request_for_tier("standard", 1), peer)
+    denial = verify_envelope(
+        decode_json_object(denied, maximum=2 * 1024 * 1024),
+        key_id="c" * 64,
+        public_key=receipt_key.public_key(),
+        code="test_signature_invalid",
+    )
+    assert denial["blocker_code"] == "mutation_operator_tier_insufficient"
+    assert denial["dispatched"] is False
+    assert calls == []
+
+    allowed = service.dispatch(request_for_tier("top", 2), peer)
+    success = verify_envelope(
+        decode_json_object(allowed, maximum=2 * 1024 * 1024),
+        key_id="c" * 64,
+        public_key=receipt_key.public_key(),
+        code="test_signature_invalid",
+    )
+    assert success["outcome"] == "succeeded"
+    assert calls == [["/sealed/helper"]]
+    assert journal.denial_store_calls == 1
+    assert journal.store_calls == 1

@@ -354,6 +354,8 @@ class RuntimeContext:
     thread_id: str = ""
     message_id: str = ""
     owner_authenticated: bool = False
+    plan_operator_authenticated: bool = False
+    top_trusted_operator_authenticated: bool = False
     service_internal: bool = False
 
     def __post_init__(self) -> None:
@@ -371,6 +373,16 @@ class RuntimeContext:
             raise CanonicalWriterError(
                 "invalid_runtime",
                 "runtime.owner_authenticated must be boolean",
+            )
+        if type(self.plan_operator_authenticated) is not bool:
+            raise CanonicalWriterError(
+                "invalid_runtime",
+                "runtime.plan_operator_authenticated must be boolean",
+            )
+        if type(self.top_trusted_operator_authenticated) is not bool:
+            raise CanonicalWriterError(
+                "invalid_runtime",
+                "runtime.top_trusted_operator_authenticated must be boolean",
             )
         if type(self.service_internal) is not bool:
             raise CanonicalWriterError(
@@ -1356,10 +1368,12 @@ class CanonicalWriterHandlers:
                 "invalid_runtime",
                 "capability grant requires exact observed user, session, and epoch bindings",
             )
-        if runtime.platform != "discord" or not runtime.owner_authenticated:
+        if runtime.platform != "discord" or not (
+            runtime.owner_authenticated or runtime.plan_operator_authenticated
+        ):
             raise CanonicalWriterError(
-                "owner_required",
-                "capability grant requires a configured authenticated Discord owner",
+                "operator_required",
+                "capability grant requires a configured authenticated Discord plan operator",
             )
         return self.backend.capability_grant(CapabilityGrantRequest(
             approval_id=_identifier(p["approval_id"], "payload.approval_id"),
@@ -1431,6 +1445,13 @@ class CanonicalWriterHandlers:
         if operational_intent is None:
             return result
         assert self.discord_edge_authority is not None
+        result["operator_tier"] = (
+            "owner"
+            if runtime.owner_authenticated
+            else "top"
+            if runtime.top_trusted_operator_authenticated
+            else "standard"
+        )
         try:
             capability = self.discord_edge_authority.issue_operational_edge_capability(
                 operational_intent,
@@ -1488,10 +1509,18 @@ class CanonicalWriterTypedDispatcher:
         handlers: CanonicalWriterHandlers,
         *,
         owner_user_ids: frozenset[str] = frozenset(),
+        plan_operator_user_ids: frozenset[str] = frozenset(),
+        top_trusted_operator_user_ids: frozenset[str] = frozenset(),
     ):
         self.handlers = handlers
         self.owner_user_ids = frozenset(
             str(value) for value in owner_user_ids if str(value)
+        )
+        self.plan_operator_user_ids = frozenset(
+            str(value) for value in plan_operator_user_ids if str(value)
+        )
+        self.top_trusted_operator_user_ids = frozenset(
+            str(value) for value in top_trusted_operator_user_ids if str(value)
         )
 
     def dispatch(self, operation: Any, payload: Mapping[str, Any], context: Any) -> Any:
@@ -1525,6 +1554,19 @@ class CanonicalWriterTypedDispatcher:
                     platform == "discord"
                     and user_id
                     and user_id in self.owner_user_ids
+                ),
+                plan_operator_authenticated=bool(
+                    platform == "discord"
+                    and user_id
+                    and (
+                        user_id in self.owner_user_ids
+                        or user_id in self.plan_operator_user_ids
+                    )
+                ),
+                top_trusted_operator_authenticated=bool(
+                    platform == "discord"
+                    and user_id
+                    and user_id in self.top_trusted_operator_user_ids
                 ),
                 # Wire/runtime payloads can never opt into service-internal
                 # authority. One-shot writer jobs construct it in-process.

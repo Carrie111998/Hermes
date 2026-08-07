@@ -533,7 +533,7 @@ _plan_capabilities: dict[str, dict[str, dict]] = {}
 _plan_capability_consume_locks: dict[tuple[str, str, str], threading.Lock] = {}
 # Process-lifetime replay ledger for runtime-observed approval messages.  It is
 # intentionally not cleared with a session: clearing/restarting an agent task
-# must not turn the same owner message into fresh authority.  Cross-process
+# must not turn the same requester task/revision into fresh authority. Cross-process
 # restoration remains deliberately unsupported until there is an atomic
 # durable lease/consume protocol.
 _plan_approval_source_states: dict[str, str] = {}
@@ -1356,7 +1356,7 @@ def _plan_approval_source_sha256(
     if require_runtime_observed:
         if not observed_message_id:
             raise PermissionError(
-                "plan capability requires the current runtime-observed owner message_id"
+                "plan capability requires the current runtime-observed operator message_id"
             )
         stable_ref = json.dumps(
             {
@@ -1477,11 +1477,11 @@ def _canonical_active_plan_continues_approved_revision(
 ) -> bool:
     """Verify that the same plan remains active at or after approval.
 
-    The owner approves an exact revision and an immutable set of command
-    hashes.  Model-authored progress checkpoints may advance that same plan's
-    revision without expanding those command hashes.  Supersession and
-    terminal states stop matching because the active-plan lookup is exact on
-    case and plan id.  Any malformed value or read failure remains fail-closed.
+    The requester authorizes a task and the model authors exact command hashes
+    for each active plan revision. Model-authored progress checkpoints may
+    advance that same plan. Supersession and terminal states stop matching
+    because the active-plan lookup is exact on case and plan id. Any malformed
+    value or read failure remains fail-closed.
     """
     try:
         from tools.canonical_brain_tool import canonical_active_plan_revision
@@ -1514,7 +1514,7 @@ def _canonical_receipt_committed(result: object) -> bool:
 
 
 def _reserve_plan_approval_source(approval_source_sha256: str) -> str:
-    """Reserve one observed owner message against concurrent/replayed grants."""
+    """Reserve one task/revision authorization against concurrent replays."""
     reservation = f"pending:{uuid.uuid4()}"
     with _lock:
         if approval_source_sha256 in _plan_approval_source_states:
@@ -1561,9 +1561,9 @@ def grant_plan_capability(
 ) -> dict:
     """Grant expiring exact terminal/code capabilities for an approved plan.
 
-    Hermes/GPT decides that the authenticated owner's current message approves
-    the plan. This function only verifies identity/config and hashes exact
-    terminal/code subjects; it performs no semantic approval classification.
+    Hermes/GPT decides that the authenticated plan operator's current message
+    authorizes the plan. This function only verifies identity/config and hashes
+    exact terminal/code subjects; it performs no semantic classification.
     """
     if is_delegated_exact_plan_consumer():
         raise PermissionError(
@@ -1579,6 +1579,12 @@ def grant_plan_capability(
         for value in (approvals.get("plan_owner_user_ids") or [])
         if str(value).strip()
     }
+    operators = {
+        str(value).strip()
+        for value in (approvals.get("plan_operator_user_ids") or [])
+        if str(value).strip()
+    }
+    plan_grant_users = owners | operators
     requested_approved_by_user_id = str(approved_by_user_id or "").strip()
     session_key = str(session_key or "").strip()
     plan_id = str(plan_id or "").strip()
@@ -1620,7 +1626,7 @@ def grant_plan_capability(
     )
     if runtime_scoped and not observed_user_id:
         raise PermissionError(
-            "plan capability requires a runtime-observed owner identity"
+            "plan capability requires a runtime-observed operator identity"
         )
     if (
         runtime_scoped
@@ -1628,15 +1634,15 @@ def grant_plan_capability(
         and observed_user_id != requested_approved_by_user_id
     ):
         raise PermissionError(
-            "plan capability owner does not match the runtime-observed user"
+            "plan capability operator does not match the runtime-observed user"
         )
     if runtime_scoped and observed_platform != "discord":
         raise PermissionError(
-            "configured plan owner IDs are bound to the observed Discord platform"
+            "configured plan grant IDs are bound to the observed Discord platform"
         )
     if runtime_scoped and not observed_message_id:
         raise PermissionError(
-            "plan capability requires the current runtime-observed owner message_id"
+            "plan capability requires the current runtime-observed operator message_id"
         )
     # Runtime identity is authoritative.  The model-tool dispatcher does not
     # pass user identity as a handler kwarg, and accepting a caller-supplied id
@@ -1645,9 +1651,9 @@ def grant_plan_capability(
     approved_by_user_id = (
         observed_user_id if runtime_scoped else requested_approved_by_user_id
     )
-    if not owners or approved_by_user_id not in owners:
+    if not plan_grant_users or approved_by_user_id not in plan_grant_users:
         raise PermissionError(
-            "plan capability requires an authenticated configured owner"
+            "plan capability requires an authenticated configured plan operator"
         )
     if canonical_required and not canonical_case_id:
         raise PermissionError(
@@ -1730,12 +1736,35 @@ def grant_plan_capability(
         if runtime_scoped
         else dict(source_refs or {})
     )
-    approval_source_sha256 = _plan_approval_source_sha256(
+    authorization_source_sha256 = _plan_approval_source_sha256(
         source_refs,
         require_runtime_observed=runtime_scoped,
         observed_platform=observed_platform,
         observed_user_id=observed_user_id,
         observed_message_id=observed_message_id,
+    )
+    # One requester message commissions the task, not only its first shell
+    # command. The model may advance the same active Canonical plan without a
+    # new human prompt. Each revision still receives a unique, replay-safe
+    # mechanical binding, and changing the exact subjects within an existing
+    # revision remains rejected by the durable writer.
+    approval_source_sha256 = (
+        hashlib.sha256(
+            json.dumps(
+                {
+                    "schema": "hermes-plan-revision-authorization.v1",
+                    "authorization_source_sha256": authorization_source_sha256,
+                    "canonical_case_id": canonical_case_id,
+                    "plan_id": plan_id,
+                    "plan_revision": effective_plan_revision,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("ascii")
+        ).hexdigest()
+        if runtime_scoped
+        else authorization_source_sha256
     )
     try:
         from gateway.canonical_writer_boundary import (
@@ -2122,13 +2151,13 @@ def _consume_plan_capability_digest(
     if canonical_required and use_privileged_writer:
         if observed_platform != "discord" or not observed_user_id:
             logger.warning(
-                "Privileged plan capability rejected: current Discord owner identity is missing"
+                "Privileged plan capability rejected: current Discord operator identity is missing"
             )
             return None
         runtime_envelope = trusted_runtime_envelope()
         if str(runtime_envelope.get("user_id") or "") != observed_user_id:
             logger.warning(
-                "Privileged plan capability rejected: runtime owner identity mismatch"
+                "Privileged plan capability rejected: runtime operator identity mismatch"
             )
             return None
         try:
@@ -2247,13 +2276,13 @@ def _consume_plan_capability_digest(
             )
             if runtime_scoped and observed_platform != "discord":
                 logger.warning(
-                    "Plan capability %s rejected: configured owner IDs require Discord",
+                    "Plan capability %s rejected: configured plan grant IDs require Discord",
                     plan_id,
                 )
                 continue
             if runtime_scoped and not observed_user_id:
                 logger.warning(
-                    "Plan capability %s rejected: runtime-observed owner is missing",
+                    "Plan capability %s rejected: runtime-observed operator is missing",
                     plan_id,
                 )
                 continue
@@ -2749,7 +2778,7 @@ def _delegated_exact_capability_required(execution_kind: str) -> dict:
         "message": (
             f"BLOCKED: delegated {execution_kind} execution outside a "
             "mechanically isolated backend requires an unexpired exact "
-            "owner-approved plan capability for this exact input."
+            "requester-authorized plan capability for this exact input."
         ),
         "status": "blocked",
         "outcome": "exact_plan_capability_required",
@@ -2767,8 +2796,8 @@ def _exact_plan_capability_required(execution_kind: str) -> dict:
         "approved": False,
         "message": (
             f"BLOCKED: {execution_kind} execution is outside the exact "
-            "subjects commissioned by the active owner-approved plan. Add "
-            "this exact input to a new owner-approved plan revision or use "
+            "subjects commissioned by the active requester-authorized plan. Add "
+            "this exact input to a new requester-authorized plan revision or use "
             "the exact one-operation approval prompt."
         ),
         "status": "blocked",
@@ -2794,7 +2823,7 @@ def _request_exact_execution_approval(
 
     if is_delegated_exact_plan_consumer():
         return _delegated_exact_capability_required(execution_kind)
-    # This exact owner surface is already identity-bound. Preserve the model's
+    # This exact operator surface is already identity-bound. Preserve the model's
     # bytes instead of applying a post-model keyword/regex rewrite. Exact-value
     # secret tainting belongs at the credential source boundary, not here.
     display_input = raw_input
@@ -3346,7 +3375,7 @@ def check_execute_code_guard(code: str, env_type: str,
     """Resolve opaque Python execution using exact structural authority only.
 
     The script bytes are never parsed or classified. Isolated backends,
-    exact owner-approved plan capabilities, process/session YOLO, cron's
+    exact requester-authorized plan capabilities, process/session YOLO, cron's
     whole-surface mode, and the profile's whole-surface approval mode are the
     only authority inputs. Manual mode can grant one exact operation only.
     """

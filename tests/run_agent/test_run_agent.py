@@ -3831,7 +3831,7 @@ class TestConcurrentToolExecution:
             approval.clear_session_local(routing_key)
             clear_session_vars(session_tokens)
 
-        assert "runtime-observed owner identity" in result["error"]
+        assert "runtime-observed operator identity" in result["error"]
 
     def test_non_gateway_plan_capability_cannot_self_assert_owner(self, agent):
         from gateway.session_context import clear_session_vars, set_session_vars
@@ -3865,7 +3865,7 @@ class TestConcurrentToolExecution:
             approval.reset_current_session_key(approval_token)
             clear_session_vars(session_tokens)
 
-        assert "authenticated configured owner" in result["error"]
+        assert "authenticated configured plan operator" in result["error"]
 
     def test_invoke_tool_middleware_cannot_originate_reasoning(self, agent, monkeypatch):
         """Plugin middleware is mechanical and cannot author model effort."""

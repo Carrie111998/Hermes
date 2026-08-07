@@ -1006,7 +1006,8 @@ def test_plan_and_capability_transactions_are_exact_and_non_replenishing():
             "approval_id,reason,revoked_by_session_sha256,revoked_at"
         )
 
-    assert "runtime->>'owner_authenticated' IS DISTINCT FROM 'true'" in grant
+    assert "runtime->>'plan_operator_authenticated' = 'true'" in grant
+    assert "runtime->>'owner_authenticated' = 'true'" in grant
     assert "INTERVAL '8 hours'" in grant
     assert "(head_plan->>'revision')::integer < grant_record.plan_revision" in consume
     assert "'active_plan_revision', (head_plan->>'revision')::integer" in consume

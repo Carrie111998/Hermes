@@ -2412,7 +2412,9 @@ AS $function$
                runtime,
                ARRAY['request_id','platform','session_key_sha256',
                      'capability_epoch_sha256','user_id','chat_id','thread_id',
-                     'message_id','owner_authenticated','service_internal'],
+                     'message_id','owner_authenticated',
+                     'plan_operator_authenticated',
+                     'top_trusted_operator_authenticated','service_internal'],
                ARRAY['request_id']
            )
        AND NOT EXISTS (
@@ -2443,6 +2445,14 @@ AS $function$
        AND (
             NOT (runtime ? 'owner_authenticated')
             OR pg_catalog.jsonb_typeof(runtime->'owner_authenticated') = 'boolean'
+       )
+       AND (
+            NOT (runtime ? 'plan_operator_authenticated')
+            OR pg_catalog.jsonb_typeof(runtime->'plan_operator_authenticated') = 'boolean'
+       )
+       AND (
+            NOT (runtime ? 'top_trusted_operator_authenticated')
+            OR pg_catalog.jsonb_typeof(runtime->'top_trusted_operator_authenticated') = 'boolean'
        )
        AND (
             NOT (runtime ? 'service_internal')
@@ -5179,11 +5189,15 @@ BEGIN
         RETURN canonical_brain._fail('invalid_request', 'capability grant is invalid');
     END IF;
     IF runtime->>'platform' IS DISTINCT FROM 'discord'
-       OR runtime->>'owner_authenticated' IS DISTINCT FROM 'true'
+       OR NOT COALESCE(
+            runtime->>'owner_authenticated' = 'true'
+            OR runtime->>'plan_operator_authenticated' = 'true',
+            false
+       )
        OR NOT canonical_brain._case_scope_authorized(case_value, runtime, false) THEN
         RETURN canonical_brain._fail(
-            'owner_required',
-            'capability grant requires the authenticated Discord owner and exact case scope'
+            'operator_required',
+            'capability grant requires an authenticated Discord plan operator and exact case scope'
         );
     END IF;
     max_uses_value := (request->>'max_uses')::integer;

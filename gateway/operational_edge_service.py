@@ -672,27 +672,38 @@ class OperationalEdgeService:
             if peer.uid != self.config.mutation_peer_uid:
                 raise OperationalEdgeServiceError("mutation_peer_unauthorized")
             capability_blocker: str | None = None
+            capability = None
             if request.capability is None:
                 capability_blocker = "mutation_capability_required"
             else:
                 try:
-                    verify_mutation_capability(
+                    capability = verify_mutation_capability(
                         request,
                         key_id=self.config.writer_key_id,
                         public_key=self.writer_public_key,
                     )
                 except OperationalProtocolError:
                     capability_blocker = "mutation_capability_invalid"
+            if (
+                capability is not None
+                and {"standard": 0, "top": 1, "owner": 2}[
+                    capability.operator_tier
+                ]
+                < {"standard": 0, "top": 1, "owner": 2}[
+                    operation.minimum_operator_tier
+                ]
+            ):
+                capability_blocker = "mutation_operator_tier_insufficient"
             if capability_blocker is not None:
                 if capability_blocker not in PREDISPATCH_MUTATION_BLOCKERS:
                     raise OperationalEdgeServiceError(
                         "mutation_capability_denial_invalid"
                     )
-                capability_state = (
-                    "absent"
-                    if capability_blocker == "mutation_capability_required"
-                    else "invalid"
-                )
+                capability_state = {
+                    "mutation_capability_required": "absent",
+                    "mutation_capability_invalid": "invalid",
+                    "mutation_operator_tier_insufficient": "insufficient_tier",
+                }[capability_blocker]
                 replay = self.journal.read_predispatch_denial(
                     request.intent.idempotency_key,
                     intent_sha256,

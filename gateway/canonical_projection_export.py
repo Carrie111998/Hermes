@@ -37,6 +37,8 @@ TRUSTED_RUNTIME_KEYS = frozenset(
         "thread_id",
         "message_id",
         "owner_authenticated",
+        "plan_operator_authenticated",
+        "top_trusted_operator_authenticated",
         "service_internal",
     }
 )
@@ -116,7 +118,12 @@ def _validate_trusted_runtime(value: Any) -> dict[str, Any]:
             raise ProjectionExportError(
                 "projection_export_provenance_runtime_invalid"
             )
-    for key in ("owner_authenticated", "service_internal"):
+    for key in (
+        "owner_authenticated",
+        "plan_operator_authenticated",
+        "top_trusted_operator_authenticated",
+        "service_internal",
+    ):
         if key in value and type(value[key]) is not bool:
             raise ProjectionExportError(
                 "projection_export_provenance_runtime_invalid"

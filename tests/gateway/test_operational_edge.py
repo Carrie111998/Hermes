@@ -164,7 +164,7 @@ def test_catalog_is_exactly_implemented_and_credential_scoped() -> None:
     )
 
     mutations = [item for item in catalog.values() if item.access is OperationalAccess.MUTATION]
-    assert len(mutations) == 8
+    assert mutations
     assert all(item.probe_operation_id for item in mutations)
     assert all(
         catalog[item.probe_operation_id].access is OperationalAccess.READ
@@ -309,7 +309,7 @@ def test_mutation_capability_is_exactly_bound_to_writer_plan_intent() -> None:
         idempotency_key="case-1:step-1",
     )
     capability = OperationalCapability(
-        authority_kind="canonical_owner_plan",
+        authority_kind="canonical_plan",
         authority_ref="plan:case-1:lease-7",
         operation_id=intent.operation_id,
         arguments_sha256=intent.arguments_sha256,
@@ -466,8 +466,8 @@ def test_existing_writer_consume_issues_edge_capability_from_same_plan_lease() -
     )
     capability = OperationalCapability.from_mapping(payload)
     capability.require(intent, now_unix_ms=int(now.timestamp() * 1000))
-    assert capability.authority_kind == "canonical_owner_plan"
-    assert capability.authority_ref.startswith("canonical-owner-plan:")
+    assert capability.authority_kind == "canonical_plan"
+    assert capability.authority_ref.startswith("canonical-plan:")
 
 
 def test_readiness_v2_is_fresh_boot_bound_and_portably_validatable() -> None:

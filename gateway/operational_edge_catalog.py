@@ -68,7 +68,8 @@ OPERATION_PURPOSES: Mapping[str, str] = MappingProxyType(
         "bitrix.voucher.request_extension": "Request approval for one exact voucher extension.",
         "bitrix.voucher.execute_extension": "Execute one previously approved voucher extension.",
         "skyvision.db.probe": "Run the fixed read-only SkyVision database readiness query.",
-        "skyvision.db.query": "Run one bounded read-only query against an allowed SkyVision database.",
+        "skyvision.db.query": "Run one model-designated non-sensitive bounded read-only query against an allowed SkyVision database.",
+        "skyvision.db.query_sensitive": "Run one model-designated sensitive bounded read-only query under an exact signed Canonical plan capability.",
         "skyvision.panel.status": "Check SkyVision panel read-only helper readiness.",
         "skyvision.panel.check_voucher_user": "Check the panel user linked to one voucher.",
         "skyvision.panel.invoice_lookup": "Look up an invoice by invoice ID or order ID.",
@@ -182,6 +183,7 @@ class OperationSpec:
     available: bool = True
     blocker_code: str = ""
     availability_requirement: str = ""
+    minimum_operator_tier: str = "standard"
 
 
 def _arg(
@@ -226,7 +228,7 @@ ASSETS: tuple[AssetSpec, ...] = (
     _asset("bitrix_skyvision_crm_report.py"),
     _asset("bitrix_voucher_ops.py"),
     _asset("skyvision_callcenter_api_tools.py"),
-    _asset("skyvision_db_readonly.py", relative="bin/skyvision_db_readonly"),
+    _asset("skyvision_db_readonly.py", root="release", relative="ops/muncho/runtime/skyvision_db_readonly.py"),
     _asset("skyvision_panel_ops_readonly.py"),
     _asset("skyvision_gitlab_prod_deploy.py"),
     _asset("skyvision_gitlab_readonly.py", root="release", relative="ops/muncho/runtime/skyvision_gitlab_readonly.py"),
@@ -295,6 +297,7 @@ def _op(
     available: bool = True,
     blocker_code: str = "",
     availability_requirement: str = "",
+    minimum_operator_tier: str = "standard",
 ) -> OperationSpec:
     return OperationSpec(
         operation_id=operation_id,
@@ -312,6 +315,7 @@ def _op(
         available=available,
         blocker_code=blocker_code,
         availability_requirement=availability_requirement,
+        minimum_operator_tier=minimum_operator_tier,
     )
 
 
@@ -406,15 +410,24 @@ OPERATIONS: tuple[OperationSpec, ...] = (
     ), access=OperationalAccess.MUTATION, probe="bitrix.voucher.status"),
 
     # Database and panel read boundaries.
-    _op("skyvision.db.probe", "skyvision_db", "skyvision_db_readonly.py", "--db", "skyvisio_fp", "--query", "SELECT 1 AS operational_edge_ready", "--case-id", "case:operational-edge-readiness", "--requester", "operational-edge-readiness", "--purpose", "Credential-scoped read-only operational edge readiness", "--max-rows", "1", "--timeout-seconds", "10", "--sensitivity", "normal", timeout=30),
-    _op("skyvision.db.query", "skyvision_db", "skyvision_db_readonly.py", arguments=(
+    _op("skyvision.db.probe", "skyvision_db", "skyvision_db_readonly.py", "--db", "skyvisio_fp", "--query", "SELECT 1 AS operational_edge_ready", "--case-id", "case:operational-edge-readiness", "--requester", "operational-edge-readiness", "--purpose", "Credential-scoped read-only operational edge readiness", "--max-rows", "1", "--timeout-seconds", "10", "--sensitivity", "normal", "--expected-result-shape", "scalar", timeout=30),
+    _op("skyvision.db.query", "skyvision_db", "skyvision_db_readonly.py", "--sensitivity", "normal", arguments=(
         _arg("db", required=True, kind=ArgumentKind.CHOICE, choices=("skyvisio_fp", "skyvisio_laravel", "skyvisio_wp64")), _arg("query", required=True, kind=ArgumentKind.SQL, maximum_chars=MAX_SQL_CHARS),
         _arg("case_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("requester", required=True, maximum_chars=240),
         _arg("requester_id", kind=ArgumentKind.IDENTIFIER), _arg("purpose", required=True, maximum_chars=2000),
-        _arg("max_rows", kind=ArgumentKind.INTEGER, minimum=1, maximum=1000), _arg("timeout_seconds", kind=ArgumentKind.INTEGER, minimum=1, maximum=30),
-        _arg("sensitivity", kind=ArgumentKind.CHOICE, choices=("auto", "normal", "sensitive")), _arg("step_up_scope", maximum_chars=120),
-        _arg("step_up_request_id", kind=ArgumentKind.IDENTIFIER),
+        _arg("max_rows", kind=ArgumentKind.INTEGER, minimum=1, maximum=500), _arg("timeout_seconds", kind=ArgumentKind.INTEGER, minimum=1, maximum=30),
+        _arg("expected_result_shape", kind=ArgumentKind.CHOICE, choices=("scalar", "single_row", "bounded_rows", "aggregate_report", "schema_metadata")),
+        _arg("redact_field", kind=ArgumentKind.IDENTIFIER, repeat=True),
     ), timeout=60, probe="skyvision.db.probe"),
+    _op("skyvision.db.query_sensitive", "skyvision_db", "skyvision_db_readonly.py", "--sensitivity", "sensitive", arguments=(
+        _arg("db", required=True, kind=ArgumentKind.CHOICE, choices=("skyvisio_fp", "skyvisio_laravel", "skyvisio_wp64")), _arg("query", required=True, kind=ArgumentKind.SQL, maximum_chars=MAX_SQL_CHARS),
+        _arg("case_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("requester", required=True, maximum_chars=240),
+        _arg("requester_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("purpose", required=True, maximum_chars=2000),
+        _arg("max_rows", kind=ArgumentKind.INTEGER, minimum=1, maximum=500), _arg("timeout_seconds", kind=ArgumentKind.INTEGER, minimum=1, maximum=30),
+        _arg("expected_result_shape", kind=ArgumentKind.CHOICE, choices=("scalar", "single_row", "bounded_rows", "aggregate_report", "schema_metadata")),
+        _arg("redact_field", kind=ArgumentKind.IDENTIFIER, repeat=True),
+    ), access=OperationalAccess.MUTATION, timeout=60, probe="skyvision.db.probe"),
+
     _op("skyvision.panel.status", "skyvision_panel", "skyvision_panel_ops_readonly.py", "status"),
     _op("skyvision.panel.check_voucher_user", "skyvision_panel", "skyvision_panel_ops_readonly.py", "check-voucher-user", arguments=(
         _arg("voucher", required=True, maximum_chars=80), _arg("case_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("requester", required=True, maximum_chars=240),
@@ -440,14 +453,16 @@ OPERATIONS: tuple[OperationSpec, ...] = (
         _arg("requester_discord_user_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("reason", required=True, maximum_chars=2000),
     ), access=OperationalAccess.MUTATION, timeout=120, probe="skyvision.deploy.status",
         available=False, blocker_code=WEBSITE_RELEASE_CONTRACT_BLOCKER,
-        availability_requirement=WEBSITE_RELEASE_CONTRACT_REQUIREMENT),
+        availability_requirement=WEBSITE_RELEASE_CONTRACT_REQUIREMENT,
+        minimum_operator_tier="top"),
     _op("skyvision.deploy.execute", "skyvision_gitlab", "skyvision_gitlab_prod_deploy.py", "execute-prod-deploy", arguments=(
         _arg("sha", required=True, kind=ArgumentKind.SHA), _arg("case_id", required=True, kind=ArgumentKind.IDENTIFIER),
         _arg("request_id", required=True, kind=ArgumentKind.IDENTIFIER), _arg("reason", required=True, maximum_chars=2000),
         _arg("monitor", kind=ArgumentKind.BOOLEAN), _arg("monitor_seconds", kind=ArgumentKind.INTEGER, minimum=60, maximum=3600),
     ), access=OperationalAccess.MUTATION, timeout=900, probe="skyvision.deploy.status",
         available=False, blocker_code=WEBSITE_RELEASE_CONTRACT_BLOCKER,
-        availability_requirement=WEBSITE_RELEASE_CONTRACT_REQUIREMENT),
+        availability_requirement=WEBSITE_RELEASE_CONTRACT_REQUIREMENT,
+        minimum_operator_tier="top"),
     _op("infra.contabo.observe", "infrastructure", "contabo_observer.py", "instances", timeout=120),
     _op("infra.alwyzon.observe", "infrastructure", "alwyzon_phoenix_observer.py", "status", timeout=120),
     _op("infra.watchtower.fast", "infrastructure", "devops_watchtower_phase1.py", "--mode", "fast", "--no-dispatch", timeout=240, probe="infra.contabo.observe", cron="7e4a90bdeff0"),
@@ -544,6 +559,8 @@ def operation_catalog() -> Mapping[str, OperationSpec]:
     for item in OPERATIONS:
         if item.asset_id not in assets or item.domain not in CREDENTIALS_BY_DOMAIN:
             raise OperationalCatalogError("operational catalog references an unknown asset/domain")
+        if item.minimum_operator_tier not in {"standard", "top", "owner"}:
+            raise OperationalCatalogError("operational operator tier is invalid")
         if (
             item.purpose != OPERATION_PURPOSES[item.operation_id]
             or item.purpose != item.purpose.strip()
@@ -684,6 +701,7 @@ def catalog_public_contract() -> Mapping[str, Any]:
                 "purpose": item.purpose,
                 "domain": item.domain,
                 "access": item.access.value,
+                "minimum_operator_tier": item.minimum_operator_tier,
                 "available": item.available,
                 "blocker_code": item.blocker_code or None,
                 "availability_requirement": item.availability_requirement or None,

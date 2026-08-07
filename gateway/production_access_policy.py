@@ -17,10 +17,28 @@ from dataclasses import dataclass
 from typing import Any, Iterable
 
 from gateway.production_capability_prerequisites import FIRST_WAVE_TOOLSETS
+from gateway.support_ops_team_registry import TEAM_MEMBERS
 
 
-PRODUCTION_ACCESS_SCHEMA = "muncho-production-owner-team-access.v1"
+PRODUCTION_ACCESS_SCHEMA = "muncho-production-owner-team-access.v2"
 PRODUCTION_OWNER_DISCORD_USER_ID = "1279454038731264061"
+PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS = frozenset(
+    member.discord_user_id
+    for member in TEAM_MEMBERS
+    if member.discord_user_id != PRODUCTION_OWNER_DISCORD_USER_ID
+)
+PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS = frozenset(
+    {
+        "1282938967888498720",  # Nassi
+        "1391703330711142472",  # Ivs
+        "1282940511962791959",  # Alex
+        "1282940574533423125",  # Plamenka
+    }
+)
+if not PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS <= (
+    PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS
+):
+    raise RuntimeError("top-trusted operators must be registered team operators")
 
 OWNER_ROLE = "owner"
 TEAM_ROLE = "team"
@@ -40,8 +58,8 @@ TEAM_SLASH_COMMANDS = frozenset(
     }
 )
 
-TEAM_REMOVED_TOOLSETS = frozenset({"memory", "session_search", "skills"})
-TEAM_READ_ONLY_SKILLS_TOOLSET = "skills_readonly"
+TEAM_REMOVED_TOOLSETS = frozenset({"skills"})
+TEAM_ADDED_TOOLSETS = frozenset({"skills_readonly"})
 
 # Interactive owner-only management surface.  These are added solely from the
 # connector-authenticated owner identity; they are never inherited by cron
@@ -109,14 +127,12 @@ def project_production_agent_access(
             skip_memory=False,
         )
 
-    had_skills = "skills" in normalized
     normalized.difference_update(TEAM_REMOVED_TOOLSETS)
-    if had_skills:
-        normalized.add(TEAM_READ_ONLY_SKILLS_TOOLSET)
+    normalized.update(TEAM_ADDED_TOOLSETS)
     return ProductionAgentAccess(
         role=role,
         enabled_toolsets=tuple(sorted(normalized)),
-        skip_memory=True,
+        skip_memory=False,
     )
 
 
@@ -144,11 +160,17 @@ def production_access_config() -> dict[str, Any]:
     return {
         "schema": PRODUCTION_ACCESS_SCHEMA,
         "owner_discord_user_id": PRODUCTION_OWNER_DISCORD_USER_ID,
+        "plan_operator_discord_user_ids": sorted(
+            PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS
+        ),
+        "top_trusted_operator_discord_user_ids": sorted(
+            PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS
+        ),
         "owner_added_toolsets": sorted(OWNER_ADDED_TOOLSETS),
         "team_agent": {
-            "skip_memory": True,
+            "skip_memory": False,
+            "added_toolsets": sorted(TEAM_ADDED_TOOLSETS),
             "removed_toolsets": sorted(TEAM_REMOVED_TOOLSETS),
-            "read_only_skills_toolset": TEAM_READ_ONLY_SKILLS_TOOLSET,
         },
         "team_slash_commands": sorted(TEAM_SLASH_COMMANDS),
     }
@@ -159,8 +181,9 @@ __all__ = [
     "OWNER_ADDED_TOOLSETS",
     "PRODUCTION_ACCESS_SCHEMA",
     "PRODUCTION_OWNER_DISCORD_USER_ID",
+    "PRODUCTION_PLAN_OPERATOR_DISCORD_USER_IDS",
+    "PRODUCTION_TOP_TRUSTED_OPERATOR_DISCORD_USER_IDS",
     "ProductionAgentAccess",
-    "TEAM_READ_ONLY_SKILLS_TOOLSET",
     "TEAM_REMOVED_TOOLSETS",
     "TEAM_ROLE",
     "TEAM_SLASH_COMMANDS",
