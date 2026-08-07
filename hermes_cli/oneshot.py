@@ -5,7 +5,8 @@ no stderr chatter.  Just the agent's final text to stdout.
 
 Toolsets = explicit --toolsets when provided, otherwise whatever the user has
 configured for "cli" in `hermes tools`.
-Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn.
+Rules / memory / AGENTS.md / preloaded skills = same as a normal chat turn,
+unless ignore_rules / HERMES_IGNORE_RULES isolates the run.
 Approvals = auto-bypassed (HERMES_YOLO_MODE=1 is set for the call).
 Working directory = the user's CWD (AGENTS.md etc. resolve from there as usual).
 
@@ -173,6 +174,7 @@ def run_oneshot(
     provider: Optional[str] = None,
     toolsets: object = None,
     usage_file: Optional[str] = None,
+    ignore_rules: bool = False,
 ) -> int:
     """Execute a single prompt and print only the final content block.
 
@@ -187,6 +189,8 @@ def run_oneshot(
             cost, token counts, model, api_calls) is written there after the
             run — even when the run fails — so pipelines can account for
             spend per invocation.
+        ignore_rules: Skip AGENTS.md/SOUL.md/.cursorrules, memory, and
+            preloaded skills for this one-shot run.
 
     Returns the exit code.  The caller owns process termination.
     """
@@ -248,6 +252,7 @@ def run_oneshot(
                     provider=provider,
                     toolsets=explicit_toolsets,
                     use_config_toolsets=use_config_toolsets,
+                    ignore_rules=ignore_rules,
                 )
             except BaseException as exc:  # noqa: BLE001
                 # Capture anything that escapes the agent (including OSError
@@ -316,6 +321,7 @@ def _run_agent(
     provider: Optional[str] = None,
     toolsets: object = None,
     use_config_toolsets: bool = True,
+    ignore_rules: bool = False,
 ) -> tuple[str, dict]:
     """Build an AIAgent exactly like a normal CLI chat turn would, then
     run a single conversation.  Returns ``(final_response, run_result)``."""
@@ -328,6 +334,7 @@ def _run_agent(
     from run_agent import AIAgent
 
     cfg = load_config()
+    skip_rules = ignore_rules or os.environ.get("HERMES_IGNORE_RULES") == "1"
 
     # Resolve effective model: explicit arg → env var → config.
     model_cfg = cfg.get("model") or {}
@@ -432,6 +439,8 @@ def _run_agent(
             quiet_mode=True,
             platform="cli",
             session_db=session_db,
+            skip_context_files=skip_rules,
+            skip_memory=skip_rules,
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             # Interactive callbacks are intentionally NOT wired beyond this

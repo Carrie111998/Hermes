@@ -180,6 +180,7 @@ def _run_and_exit_oneshot(
     provider: object = None,
     toolsets: object = None,
     usage_file: object = None,
+    ignore_rules: object = False,
 ) -> None:
     try:
         from hermes_cli.oneshot import run_oneshot
@@ -190,6 +191,7 @@ def _run_and_exit_oneshot(
             provider=provider,
             toolsets=toolsets,
             usage_file=usage_file,
+            ignore_rules=ignore_rules,
         )
     except KeyboardInterrupt:
         rc = 130
@@ -2529,9 +2531,8 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _apply_isolation_env(args)
     use_tui = _resolve_use_tui(args)
-
-    _apply_safe_mode(args)
 
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
@@ -2667,20 +2668,6 @@ def cmd_chat(args):
     # that invoke cmd_chat directly (e.g. subcommand dispatch).
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
-
-    # --ignore-user-config: make load_cli_config() / load_config() skip the
-    # user's ~/.hermes/config.yaml and return built-in defaults. Set BEFORE
-    # importing cli (which runs `CLI_CONFIG = load_cli_config()` at module
-    # import time). Credentials in .env are still loaded — this flag only
-    # ignores behavioral/config settings.
-    if getattr(args, "ignore_user_config", False):
-        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
-
-    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
-    # (rules), memory entries, and any preloaded skills coming from user config.
-    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
-    if getattr(args, "ignore_rules", False):
-        os.environ["HERMES_IGNORE_RULES"] = "1"
 
     # --source: tag session source for filtering (e.g. 'tool' for third-party integrations)
     if getattr(args, "source", None):
@@ -10784,7 +10771,7 @@ def _prepare_agent_startup(args) -> None:
     # (#60328).
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
-    _apply_safe_mode(args)
+    _apply_isolation_env(args)
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
@@ -10866,6 +10853,23 @@ def _apply_safe_mode(args) -> None:
     os.environ["HERMES_IGNORE_RULES"] = "1"
 
 
+def _apply_isolation_env(args) -> None:
+    _apply_safe_mode(args)
+
+    # --ignore-user-config: make load_cli_config() / load_config() skip the
+    # user's ~/.hermes/config.yaml and return built-in defaults. Credentials
+    # in .env are still loaded — this flag only ignores behavioral/config
+    # settings.
+    if getattr(args, "ignore_user_config", False):
+        os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
+
+    # --ignore-rules: skip auto-injection of AGENTS.md/SOUL.md/.cursorrules
+    # (rules), memory entries, and any preloaded skills coming from user config.
+    # Maps to AIAgent(skip_context_files=True, skip_memory=True).
+    if getattr(args, "ignore_rules", False):
+        os.environ["HERMES_IGNORE_RULES"] = "1"
+
+
 def _set_chat_arg_defaults(args) -> None:
     for attr, default in [
         ("query", None),
@@ -10927,6 +10931,10 @@ def _try_termux_fast_cli_launch() -> bool:
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=(
+                getattr(args, "ignore_rules", False)
+                or getattr(args, "safe_mode", False)
+            ),
         )
 
     if (args.resume or args.continue_last) and args.command is None:
@@ -10979,6 +10987,7 @@ def _try_termux_fast_tui_launch() -> bool:
     parser, _subparsers, chat_parser = build_top_level_parser()
     chat_parser.set_defaults(func=cmd_chat)
     args = parser.parse_args(_coalesce_session_name_args(sys.argv[1:]))
+    _apply_isolation_env(args)
 
     # Preserve top-level behaviours whose semantics are not "launch chat/TUI".
     if getattr(args, "version", False) or getattr(args, "oneshot", None):
@@ -12568,6 +12577,10 @@ def main():
             provider=getattr(args, "provider", None),
             toolsets=getattr(args, "toolsets", None),
             usage_file=getattr(args, "usage_file", None),
+            ignore_rules=(
+                getattr(args, "ignore_rules", False)
+                or getattr(args, "safe_mode", False)
+            ),
         )
 
     # Handle top-level --resume / --continue as shortcut to chat

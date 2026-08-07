@@ -146,6 +146,75 @@ def _stub_plugin_discovery(monkeypatch):
     )
 
 
+def _stub_main_boot(monkeypatch, main_mod):
+    monkeypatch.setattr(main_mod, "_set_process_title", lambda: None)
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_sweep_stale_bytecode_if_checkout_changed", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+
+
+def test_main_top_level_oneshot_accepts_toolsets(monkeypatch, main_mod):
+    captured = {}
+
+    _stub_main_boot(monkeypatch, main_mod)
+    monkeypatch.setattr(sys, "argv", ["hermes", "--toolsets", "web,terminal", "-z", "hello"])
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
+
+    def fake_run_and_exit(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        _raise_exit(0)
+
+    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", fake_run_and_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+
+    assert exc.value.code == 0
+    assert captured == {
+        "prompt": "hello",
+        "model": None,
+        "provider": None,
+        "toolsets": "web,terminal",
+        "usage_file": None,
+        "ignore_rules": False,
+    }
+
+
+def test_main_top_level_oneshot_safe_mode_sets_env_and_passes_ignore_rules(
+    monkeypatch,
+    main_mod,
+):
+    captured = {}
+    for var in ("HERMES_SAFE_MODE", "HERMES_IGNORE_USER_CONFIG", "HERMES_IGNORE_RULES"):
+        monkeypatch.delenv(var, raising=False)
+
+    _stub_main_boot(monkeypatch, main_mod)
+    monkeypatch.setattr(sys, "argv", ["hermes", "--safe-mode", "-z", "hello"])
+
+    def fake_prepare_agent_startup(args):
+        main_mod._apply_isolation_env(args)
+        assert os.environ["HERMES_SAFE_MODE"] == "1"
+        assert os.environ["HERMES_IGNORE_USER_CONFIG"] == "1"
+        assert os.environ["HERMES_IGNORE_RULES"] == "1"
+
+    def fake_run_and_exit(prompt, **kwargs):
+        captured["prompt"] = prompt
+        captured.update(kwargs)
+        _raise_exit(0)
+
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", fake_prepare_agent_startup)
+    monkeypatch.setattr(main_mod, "_run_and_exit_oneshot", fake_run_and_exit)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+
+    assert exc.value.code == 0
+    assert captured["ignore_rules"] is True
+
+
 
 
 def test_oneshot_wires_session_db_for_recall(monkeypatch):
@@ -216,6 +285,90 @@ def test_oneshot_wires_session_db_for_recall(monkeypatch):
     assert captured["prompt"] == "recall this"
 
 
+@pytest.mark.parametrize(("env_value", "arg_value"), [(None, True), ("1", False)])
+def test_oneshot_ignore_rules_skips_context_and_memory(
+    monkeypatch,
+    env_value,
+    arg_value,
+):
+    """Both the CLI arg and inherited env var must isolate one-shot context."""
+    from hermes_cli.oneshot import _run_agent
+
+    captured = {}
+
+    if env_value is None:
+        monkeypatch.delenv("HERMES_IGNORE_RULES", raising=False)
+    else:
+        monkeypatch.setenv("HERMES_IGNORE_RULES", env_value)
+
+    class FakeAgent:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+            self.suppress_status_output = False
+            self.stream_delta_callback = object()
+            self.tool_gen_callback = object()
+
+        def run_conversation(self, prompt, **_kwargs):
+            captured["prompt"] = prompt
+            return {"final_response": "ok", "failed": False, "partial": False}
+
+        def shutdown_memory_provider(self, *_args):
+            captured["shutdown_memory_provider"] = True
+
+        def close(self):
+            captured["agent_closed"] = True
+
+    class FakeSessionDB:
+        def close(self):
+            captured["session_db_closed"] = True
+
+    def mod(name, **attrs):
+        module = types.ModuleType(name)
+        for key, value in attrs.items():
+            setattr(module, key, value)
+        return module
+
+    monkeypatch.setitem(sys.modules, "run_agent", mod("run_agent", AIAgent=FakeAgent))
+    monkeypatch.setitem(sys.modules, "hermes_state", mod("hermes_state", SessionDB=FakeSessionDB))
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.config",
+        mod("hermes_cli.config", load_config=lambda: {"model": {"default": "m"}}),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.models",
+        mod("hermes_cli.models", detect_provider_for_model=lambda *_args, **_kwargs: None),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.runtime_provider",
+        mod(
+            "hermes_cli.runtime_provider",
+            resolve_runtime_provider=lambda **_kwargs: {
+                "api_key": "k",
+                "base_url": "u",
+                "provider": "p",
+                "api_mode": "chat_completions",
+                "credential_pool": None,
+            },
+        ),
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "hermes_cli.tools_config",
+        mod("hermes_cli.tools_config", _get_platform_tools=lambda *_args, **_kwargs: set()),
+    )
+
+    text, result = _run_agent("isolated", ignore_rules=arg_value)
+
+    assert text == "ok"
+    assert not result.get("failed")
+    assert captured["skip_context_files"] is True
+    assert captured["skip_memory"] is True
+    assert captured["prompt"] == "isolated"
+
+
 def test_launch_tui_exports_model_provider_and_toolsets(monkeypatch, main_mod):
     captured = {}
     active_path_during_call = None
@@ -282,7 +435,3 @@ def test_make_tui_argv_dev_prebuilds_hermes_ink(monkeypatch, main_mod, tmp_path)
     assert argv == [str(tsx), "src/entry.tsx"]
     assert cwd == tui_dir
     assert calls == [(["/usr/bin/npm", "run", "build"], str(ink_dir))]
-
-
-
-
