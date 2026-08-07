@@ -371,6 +371,8 @@ class WebhookAdapter(BasePlatformAdapter):
         if self._reconciliation_tasks:
             return
         for route_name, route_config in self._static_routes.items():
+            if route_config.get("reconcile") is not True:
+                continue
             raw_interval = route_config.get("reconcile_interval_seconds")
             if not isinstance(raw_interval, (int, float, str)):
                 continue
@@ -888,6 +890,9 @@ class WebhookAdapter(BasePlatformAdapter):
             logger.info(
                 "[webhook] Skipping duplicate delivery %s", delivery_id
             )
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
             return web.json_response(
                 {"status": "duplicate", "delivery_id": delivery_id},
                 status=200,
@@ -1229,6 +1234,9 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return False
         if not self._record_delivery_id(delivery_id, now):
+            await self._release_review_reservation(
+                route_name, payload, settlement_lease_token
+            )
             return False
 
         # Keep the lease capability outside the model-visible recovered payload.
@@ -1813,6 +1821,7 @@ class WebhookAdapter(BasePlatformAdapter):
         repo = extra.get("repo", "")
         pr_number = extra.get("pr_number", "")
         base_sha = extra.get("base_sha", "")
+        base_ref = extra.get("base_ref", "")
         head_sha = extra.get("head_sha", "")
         publisher_login = extra.get("publisher_login", "")
         requested_reviewer = extra.get("requested_reviewer", "")
@@ -1827,6 +1836,8 @@ class WebhookAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="Invalid repo format")
         if not re.fullmatch(r"[0-9a-f]{40}", str(base_sha)):
             return SendResult(success=False, error="Invalid base_sha")
+        if not re.fullmatch(r"[A-Za-z0-9._/-]{1,255}", str(base_ref)):
+            return SendResult(success=False, error="Invalid base_ref")
         if not re.fullmatch(r"[0-9a-f]{40}", str(head_sha)):
             return SendResult(success=False, error="Invalid head_sha")
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,38}", str(publisher_login)):
@@ -1854,6 +1865,13 @@ class WebhookAdapter(BasePlatformAdapter):
         if review_marker not in content:
             return SendResult(
                 success=False, error="Missing canonical review marker"
+            )
+        markers = re.findall(
+            r"<!-- newtonsapple-pr-review:v2\b[^>]*-->", content
+        )
+        if markers != [review_marker]:
+            return SendResult(
+                success=False, error="Conflicting canonical review marker"
             )
 
         run_kwargs: Dict[str, Any] = {
@@ -1886,8 +1904,7 @@ class WebhookAdapter(BasePlatformAdapter):
                 live_pr.get("state") != "open"
                 or live_pr.get("draft") is not False
                 or live_pr.get("base", {}).get("sha") != base_sha
-                or live_pr.get("base", {}).get("ref")
-                not in {"dev", "staging", "main"}
+                or live_pr.get("base", {}).get("ref") != base_ref
                 or live_pr.get("head", {}).get("sha") != head_sha
                 or requested_reviewer not in requested
             ):

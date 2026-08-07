@@ -243,6 +243,52 @@ class TestGitHubPREvidenceScope:
             },
         )
 
+    @pytest.mark.asyncio
+    async def test_duplicate_http_delivery_releases_newly_reclaimed_lease(self):
+        secret = "secret"
+        route = {
+            "evidence": "github_pr",
+            "secret": secret,
+            "events": ["pull_request"],
+            "script": "trusted-gate.py",
+            "prompt": "review",
+            "deliver_extra": {"contract_version": "v2"},
+            "execution_attestation_public_key": base64.b64encode(b"k" * 32).decode(),
+            "baseline_execution_gates": ["quality", "integration", "e2e"],
+            "execution_gate_policy_version": "newtonsapple-v1",
+            "execution_gate_policy_sha256": "f" * 64,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        delivery_id = "duplicate-http-delivery"
+        assert adapter._record_delivery_id(delivery_id, 10**12) is True
+        gated = {**self.payload, "lease_token": "l" * 43}
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[(True, gated), (True, {"settled": "release"})]
+        )
+        adapter.handle_message = AsyncMock()
+        body = json.dumps(GITHUB_PR_PAYLOAD).encode()
+
+        async with TestClient(TestServer(_create_app(adapter))) as client:
+            response = await client.post(
+                "/webhooks/github-pr",
+                data=body,
+                headers={
+                    "Content-Type": "application/json",
+                    "X-GitHub-Event": "pull_request",
+                    "X-Hub-Signature-256": _github_signature(body, secret),
+                    "X-GitHub-Delivery": delivery_id,
+                },
+            )
+            response_data = await response.json()
+
+        assert response.status == 200
+        assert response_data["status"] == "duplicate"
+        adapter.handle_message.assert_not_called()
+        assert adapter._route_processor.run_route_script.call_count == 2
+        assert adapter._route_processor.run_route_script.call_args_list[-1].args[1][
+            "lease_token"
+        ] == "l" * 43
+
     def test_execution_loader_uses_only_static_script_and_exact_tuple(self):
         route = {
             "evidence": "github_pr",
@@ -448,10 +494,28 @@ class TestStaticRouteRecovery:
         assert event.message_id == "recovery-v2-pr-185"
 
     @pytest.mark.asyncio
+    async def test_reconciliation_does_not_start_when_route_is_disabled(self):
+        route = {
+            "script": "trusted-gate.py",
+            "events": ["pull_request"],
+            "reconcile": False,
+            "reconcile_interval_seconds": 300,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        adapter._run_reconciliation_once = AsyncMock(return_value=0)
+
+        adapter._start_reconciliation_tasks()
+        await asyncio.sleep(0)
+
+        adapter._run_reconciliation_once.assert_not_awaited()
+        assert adapter._reconciliation_tasks == set()
+
+    @pytest.mark.asyncio
     async def test_reconciliation_task_runs_immediately_and_is_cancelled_on_disconnect(self):
         route = {
             "script": "trusted-gate.py",
             "events": ["pull_request"],
+            "reconcile": True,
             "reconcile_interval_seconds": 300,
         }
         adapter = _make_adapter({"github-pr": route})
@@ -602,6 +666,52 @@ class TestStaticRouteRecovery:
         assert accepted is False
         adapter.handle_message.assert_not_called()
         assert adapter._route_processor.run_route_script.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_duplicate_recovered_delivery_releases_newly_reclaimed_lease(self):
+        route = {
+            "evidence": "github_pr",
+            "script": "trusted-gate.py",
+            "events": ["pull_request"],
+            "prompt": "review",
+            "deliver_extra": {"contract_version": "v2"},
+            "execution_attestation_public_key": base64.b64encode(b"k" * 32).decode(),
+            "baseline_execution_gates": ["quality", "integration", "e2e"],
+            "execution_gate_policy_version": "newtonsapple-v1",
+            "execution_gate_policy_sha256": "f" * 64,
+        }
+        adapter = _make_adapter({"github-pr": route})
+        delivery_id = "recovery-v2-pr-185"
+        assert adapter._record_delivery_id(delivery_id, 10**12) is True
+        gated = {
+            "contract_version": "v2",
+            "repository": "org/repo",
+            "pr_number": 42,
+            "expected_base_sha": "a" * 40,
+            "expected_head_sha": "b" * 40,
+            "lease_token": "l" * 43,
+        }
+        adapter._route_processor.run_route_script = MagicMock(
+            side_effect=[(True, gated), (True, {"settled": "release"})]
+        )
+        adapter.handle_message = AsyncMock()
+
+        accepted = await adapter._dispatch_recovered_event(
+            "github-pr",
+            route,
+            {
+                "delivery_id": delivery_id,
+                "event_type": "pull_request",
+                "payload": {"action": "review_requested", "number": 185},
+            },
+        )
+
+        assert accepted is False
+        adapter.handle_message.assert_not_called()
+        assert adapter._route_processor.run_route_script.call_count == 2
+        assert adapter._route_processor.run_route_script.call_args_list[-1].args[1][
+            "lease_token"
+        ] == "l" * 43
 
 
 # ===================================================================
@@ -841,6 +951,7 @@ class TestGitHubReviewDelivery:
             "repo": "org/repo",
             "pr_number": "42",
             "base_sha": self.base_sha,
+            "base_ref": "dev",
             "head_sha": self.head_sha,
             "publisher_login": self.publisher,
             "requested_reviewer": self.publisher,
@@ -926,6 +1037,22 @@ class TestGitHubReviewDelivery:
         mock_run.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_rejects_any_additional_conflicting_review_marker(self):
+        adapter = _make_adapter({})
+        conflicting = (
+            "<!-- newtonsapple-pr-review:v2 repo=org/repo pr=99 "
+            f"base={self.base_sha} head={self.head_sha} -->"
+        )
+        content = f"No findings.\n\n{self._marker()}\n\n{conflicting}"
+
+        with patch("gateway.platforms.webhook.subprocess.run") as mock_run:
+            result = await adapter._deliver_github_review(content, self._delivery())
+
+        assert result.success is False
+        assert result.error == "Conflicting canonical review marker"
+        mock_run.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_rejects_incomplete_evidence_before_github_access(self):
         adapter = _make_adapter({})
         incomplete = EvidenceScope(
@@ -994,6 +1121,7 @@ class TestGitHubReviewDelivery:
             {"state": "closed"},
             {"draft": True},
             {"base": {"sha": "a" * 40, "ref": "feature"}},
+            {"base": {"sha": "a" * 40, "ref": "staging"}},
             {"base": {"sha": "c" * 40, "ref": "dev"}},
             {"head": {"sha": "c" * 40}},
             {"requested_reviewers": []},

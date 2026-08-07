@@ -1190,6 +1190,13 @@ def test_signed_local_worker_attestation_accepts_unavailable_gate_results():
 
     with evidence_scope(scope):
         assert record_execution_attestation(payload, signature) is True
+        assert execution_evidence_complete_for(
+            scope.contract_version,
+            scope.repository,
+            scope.pr_number,
+            scope.base_sha,
+            scope.head_sha,
+        ) is True
 
 
 def test_review_worker_gate_cannot_omit_disposable_worker_preflight():

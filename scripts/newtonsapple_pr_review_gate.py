@@ -48,12 +48,14 @@ EXECUTION_DISPATCH_RUN_NAME_PATTERN = re.compile(
 )
 LOGIN_PATTERN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$")
 LEASE_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
-ALLOWED_BASE_REFS = {"dev", "staging", "main"}
 LEASE_SECONDS = 2 * 60 * 60
 RETRY_DELAY_SECONDS = 5 * 60
 MAX_REVIEW_ATTEMPTS = 3
 BUZZ_CHANNEL = "b1cb95c9-6a36-4516-abdd-81d853a9412e"
 TRUSTED_EXECUTION_WORKFLOW_ID = -1  # Pin the assigned GitHub ID after bootstrap merge.
+TRUSTED_CAPTURE_WORKFLOW_SHA256 = (
+    "8b4182103f3b7ea04d473805e7296424a242097f2ccd0fc8ccb7c3c02a581ffd"
+)
 TRUSTED_EXECUTION_WORKFLOW_PATH = ".github/workflows/pr-review-execution.yml"
 TRUSTED_EXECUTION_WORKFLOW_SHA256 = (
     "4b3277b35071dc0b33055ec579f28d1dbe26a057fd37ef950d82f640d8f1de0f"
@@ -708,7 +710,7 @@ def select_authorized_tuple(
     bot_bodies: list[str],
     load_timeline: Optional[Callable[[int], list[dict]]] = None,
 ) -> Optional[ReviewTuple]:
-    """Select a current exact tuple backed by a trusted capture workflow run."""
+    """Select a current exact tuple from capture evidence or strict timeline proof."""
     try:
         base = live_pr["base"]
         head = live_pr["head"]
@@ -905,7 +907,7 @@ def _trusted_ci_evidence(review_tuple: ReviewTuple) -> tuple[dict, list[dict]]:
         or live_pr.get("draft") is not False
         or not isinstance(base, dict)
         or base.get("sha") != review_tuple.base_sha
-        or base.get("ref") not in ALLOWED_BASE_REFS
+        or base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
         or not isinstance(head, dict)
         or head.get("sha") != review_tuple.head_sha
         or not isinstance(reviewers, list)
@@ -968,7 +970,7 @@ def _trusted_ci_evidence(review_tuple: ReviewTuple) -> tuple[dict, list[dict]]:
             and run.get("path") == TRUSTED_EXECUTION_WORKFLOW_PATH
             and run.get("status") == "completed"
             and run.get("conclusion") in {"success", "failure"}
-            and run.get("head_branch") == "dev"
+            and run.get("head_branch") == TRUSTED_CAPTURE_WORKFLOW.branch
             and SHA_PATTERN.fullmatch(str(run.get("head_sha", ""))) is not None
             and (request_provenance or dispatch_provenance)
         ):
@@ -1103,10 +1105,10 @@ def _commit_tree_sha(commit_sha: str) -> str:
     return tree_sha
 
 
-def _trusted_execution_workflow_sha256(workflow_sha: str) -> str:
+def _workflow_source_sha256(commit_sha: str, path: str) -> str:
     value = gh_json(
         "api",
-        f"repos/{REPOSITORY}/contents/{TRUSTED_EXECUTION_WORKFLOW_PATH}?ref={workflow_sha}",
+        f"repos/{REPOSITORY}/contents/{path}?ref={commit_sha}",
     )
     if (
         not isinstance(value, dict)
@@ -1114,12 +1116,16 @@ def _trusted_execution_workflow_sha256(workflow_sha: str) -> str:
         or value.get("encoding") != "base64"
         or not isinstance(value.get("content"), str)
     ):
-        raise RuntimeError("GitHub returned malformed execution workflow content")
+        raise RuntimeError("GitHub returned malformed workflow content")
     try:
         content = base64.b64decode(value["content"], validate=True)
     except (binascii.Error, ValueError) as exc:
-        raise RuntimeError("GitHub returned malformed execution workflow content") from exc
+        raise RuntimeError("GitHub returned malformed workflow content") from exc
     return hashlib.sha256(content).hexdigest()
+
+
+def _trusted_execution_workflow_sha256(workflow_sha: str) -> str:
+    return _workflow_source_sha256(workflow_sha, TRUSTED_EXECUTION_WORKFLOW_PATH)
 
 
 def _job_log(job_id: int) -> bytes:
@@ -1202,6 +1208,32 @@ def _credential_free_environment(home: Path) -> dict[str, str]:
     return allowed
 
 
+def _local_docker_host() -> str:
+    """Resolve the active local Docker socket without allowing a remote daemon."""
+    result = subprocess.run(
+        ["docker", "context", "inspect", "--format", "{{.Endpoints.docker.Host}}"],
+        env={
+            "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            "HOME": os.environ.get("HOME", str(Path.home())),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=10,
+    )
+    host = result.stdout.strip()
+    socket_path = host.removeprefix("unix://")
+    if (
+        result.returncode != 0
+        or not host.startswith("unix:///")
+        or not Path(socket_path).is_absolute()
+    ):
+        raise RuntimeError("local Docker socket is unavailable")
+    return host
+
+
 def _run_command(
     command: list[str], *, cwd: Path, env: dict[str, str], timeout: int
 ) -> subprocess.CompletedProcess[str]:
@@ -1216,6 +1248,39 @@ def _run_command(
         errors="replace",
         timeout=timeout,
     )
+
+
+def _fetch_exact_commit(workspace: Path, commit_sha: str, *, home: Path) -> None:
+    """Fetch one trusted tuple commit without exposing credentials to PR code."""
+    gh_config_dir = os.environ.get("GH_CONFIG_DIR", "")
+    if not gh_config_dir or not Path(gh_config_dir).is_absolute():
+        raise RuntimeError("local worker GitHub credential source is unavailable")
+    env = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "HOME": str(home),
+        "GH_CONFIG_DIR": gh_config_dir,
+    }
+    result = _run_command(
+        [
+            "git",
+            "-c",
+            "credential.helper=",
+            "-c",
+            "credential.helper=!gh auth git-credential",
+            "fetch",
+            "-q",
+            "--depth=1",
+            "origin",
+            commit_sha,
+        ],
+        cwd=workspace,
+        env=env,
+        timeout=180,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("local worker could not materialize exact tuple")
 
 
 def _git_output(workspace: Path, *args: str) -> str:
@@ -1284,6 +1349,7 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
         },
         "mutations": [],
     }
+    gates: list[dict] = []
     with tempfile.TemporaryDirectory(prefix="newtonsapple-review-") as temp:
         root = Path(temp)
         workspace = root / "workspace"
@@ -1301,13 +1367,20 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
                     "origin",
                     f"https://github.com/{REPOSITORY}.git",
                 ],
-                ["git", "fetch", "-q", "--depth=1", "origin", review_tuple.head_sha],
-                ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
-                ["git", "fetch", "-q", "--depth=1", "origin", review_tuple.base_sha],
             ):
-                result = _run_command(command, cwd=workspace, env=env, timeout=180)
+                result = _run_command(command, cwd=workspace, env=env, timeout=60)
                 if result.returncode != 0:
-                    raise RuntimeError("local worker could not materialize exact tuple")
+                    raise RuntimeError("local worker could not initialize workspace")
+            _fetch_exact_commit(workspace, review_tuple.head_sha, home=home)
+            checkout = _run_command(
+                ["git", "checkout", "-q", "--detach", "FETCH_HEAD"],
+                cwd=workspace,
+                env=env,
+                timeout=60,
+            )
+            if checkout.returncode != 0:
+                raise RuntimeError("local worker could not materialize exact tuple")
+            _fetch_exact_commit(workspace, review_tuple.base_sha, home=home)
             if (
                 _git_output(workspace, "rev-parse", "HEAD") != review_tuple.head_sha
                 or _git_output(workspace, "rev-parse", "HEAD^{tree}") != head_tree_sha
@@ -1316,102 +1389,127 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
                 or _git_output(workspace, "status", "--porcelain")
             ):
                 raise RuntimeError("local worker exact-head preflight failed")
-            install = _run_command(
-                _docker_gate_command(
-                    workspace,
-                    [
-                        "npm",
-                        "ci",
-                        "--ignore-scripts",
-                        "--no-audit",
-                        "--no-fund",
-                    ],
-                    network="bridge",
-                ),
-                cwd=workspace,
-                env=env,
-                timeout=1200,
+
+            docker_env = {**env, "DOCKER_HOST": _local_docker_host()}
+            unavailable_pattern = re.compile(
+                r"(ECONNREFUSED|ENOTFOUND|Service Unavailable|docker: not found|"
+                r"Cannot connect to the Docker daemon|no such host|"
+                r"executable doesn't exist|browserType\.launch)",
+                re.IGNORECASE,
             )
-            install_log = (install.stdout + install.stderr)[-200_000:]
-            if install.returncode != 0 or _git_output(workspace, "status", "--porcelain"):
-                reason = "dependency installation unavailable: " + install_log[-500:]
-                gates = [
-                    _unavailable_local_gate(name, reason)
-                    for name in BASELINE_EXECUTION_GATES
-                ]
-            else:
-                gates = []
-                unavailable_pattern = re.compile(
-                    r"(ECONNREFUSED|ENOTFOUND|Service Unavailable|docker: not found|"
-                    r"Cannot connect to the Docker daemon|no such host)",
-                    re.IGNORECASE,
-                )
-                for name in BASELINE_EXECUTION_GATES:
-                    started = _utc_now()
-                    try:
-                        result = _run_command(
-                            _docker_gate_command(
-                                workspace,
-                                EXECUTION_GATE_COMMANDS[name],
-                                network="none",
-                            ),
-                            cwd=workspace,
-                            env=env,
-                            timeout=3600,
-                        )
-                        log = (result.stdout + result.stderr)[-1_000_000:]
-                        status = (
-                            "pass"
-                            if result.returncode == 0
-                            else "unavailable"
-                            if result.returncode in {125, 126, 127}
-                            or unavailable_pattern.search(log)
-                            else "pr-fail"
-                        )
-                        exit_code = max(0, min(result.returncode, 255))
-                        attempted = result.returncode not in {125, 126, 127}
-                    except subprocess.TimeoutExpired as exc:
-                        log = f"local gate timeout: {exc}"
-                        status = "unavailable"
-                        exit_code = 124
-                        attempted = True
-                    completed = _utc_now()
-                    duration_ms = _duration_ms(started, completed)
-                    tree_after = _git_output(workspace, "rev-parse", "HEAD^{tree}")
-                    dirty = _git_output(workspace, "status", "--porcelain")
-                    if tree_after != head_tree_sha or dirty:
-                        status = "unavailable"
-                        log += "\nsource tree mutated during local gate"
-                    gates.append(
-                        {
-                            "id": name,
-                            "executor": "review_worker",
-                            "runner": {
-                                "kind": "review_worker",
-                                "name": "docker-node22",
-                            },
-                            "status": status,
-                            "head_sha": review_tuple.head_sha,
-                            "attempted": attempted,
-                            "command": EXECUTION_GATE_COMMANDS[name],
-                            "exit_code": exit_code,
-                            "started_at": started,
-                            "completed_at": completed,
-                            "duration_ms": duration_ms,
-                            "tree_before": head_tree_sha,
-                            "tree_after": tree_after,
-                            "evidence": {
-                                "kind": "local_worker",
-                                "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
-                                "reason": log[-500:] if status == "unavailable" else "",
-                            },
-                        }
+            not_started_pattern = re.compile(
+                r"(docker: not found|Cannot connect to the Docker daemon|"
+                r"failed to connect to the docker API|no such host)",
+                re.IGNORECASE,
+            )
+            for name in BASELINE_EXECUTION_GATES:
+                for command in (
+                    ["git", "reset", "--hard", review_tuple.head_sha],
+                    ["git", "clean", "-fdx"],
+                ):
+                    cleaned = _run_command(
+                        command, cwd=workspace, env=env, timeout=120
                     )
+                    if cleaned.returncode != 0:
+                        raise RuntimeError("local worker could not reset exact-head source")
+
+                install_log = ""
+                install_returncode = 0
+                try:
+                    install = _run_command(
+                        _docker_gate_command(
+                            workspace,
+                            [
+                                "npm",
+                                "ci",
+                                "--ignore-scripts",
+                                "--no-audit",
+                                "--no-fund",
+                            ],
+                            network="bridge",
+                        ),
+                        cwd=workspace,
+                        env=docker_env,
+                        timeout=1200,
+                    )
+                    install_returncode = install.returncode
+                    install_log = (install.stdout + install.stderr)[-200_000:]
+                except subprocess.TimeoutExpired as exc:
+                    install_returncode = 124
+                    install_log = f"dependency installation timeout: {exc}"
+
+                started = _utc_now()
+                try:
+                    result = _run_command(
+                        _docker_gate_command(
+                            workspace,
+                            EXECUTION_GATE_COMMANDS[name],
+                            network="none",
+                        ),
+                        cwd=workspace,
+                        env=docker_env,
+                        timeout=3600,
+                    )
+                    log = (result.stdout + result.stderr)[-1_000_000:]
+                    attempted = (
+                        result.returncode not in {125, 126, 127}
+                        and not not_started_pattern.search(log)
+                    )
+                    if result.returncode == 0:
+                        status = "pass"
+                    elif (
+                        install_returncode != 0
+                        or result.returncode in {125, 126, 127}
+                        or unavailable_pattern.search(log)
+                    ):
+                        status = "unavailable"
+                    else:
+                        status = "pr-fail"
+                    exit_code = max(0, min(result.returncode, 255))
+                except subprocess.TimeoutExpired as exc:
+                    log = f"local gate timeout: {exc}"
+                    status = "unavailable"
+                    exit_code = 124
+                    attempted = True
+                completed = _utc_now()
+
+                dirty = _git_output(workspace, "status", "--porcelain")
+                if dirty:
+                    status = "unavailable"
+                    log += "\nsource tree mutated during local gate"
+                if install_returncode != 0:
+                    log += "\ndependency installation unavailable: " + install_log[-500:]
+                gates.append(
+                    {
+                        "id": name,
+                        "executor": "review_worker",
+                        "runner": {
+                            "kind": "review_worker",
+                            "name": "docker-node22",
+                        },
+                        "status": status,
+                        "head_sha": review_tuple.head_sha,
+                        "attempted": attempted,
+                        "command": EXECUTION_GATE_COMMANDS[name],
+                        "exit_code": exit_code,
+                        "started_at": started,
+                        "completed_at": completed,
+                        "duration_ms": _duration_ms(started, completed),
+                        "tree_before": head_tree_sha,
+                        "tree_after": head_tree_sha,
+                        "evidence": {
+                            "kind": "local_worker",
+                            "log_sha256": hashlib.sha256(log.encode()).hexdigest(),
+                            "reason": log[-500:] if status == "unavailable" else "",
+                        },
+                    }
+                )
         except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-            gates = [
-                _unavailable_local_gate(name, str(exc))
-                for name in BASELINE_EXECUTION_GATES
-            ]
+            reason = str(exc)
+            gates.extend(
+                _unavailable_local_gate(name, reason)
+                for name in BASELINE_EXECUTION_GATES[len(gates) :]
+            )
     for gate in gates:
         gate["head_sha"] = review_tuple.head_sha
         gate["tree_before"] = head_tree_sha
@@ -1422,7 +1520,6 @@ def _run_local_execution_worker(review_tuple: ReviewTuple) -> dict:
         "worker": worker,
         "gates": gates,
     }
-
 
 def execution_evidence(payload: dict) -> dict:
     review_tuple = _execution_tuple(payload)
@@ -1597,7 +1694,7 @@ def _summary_content(review_tuple: ReviewTuple, pr_url: str, review_body: str) -
         f"**PR review completed:** [#{review_tuple.pr_number}]({pr_url}) at "
         f"head `{review_tuple.head_sha}` (base `{review_tuple.base_sha}`).\n\n"
         f"{review_body}\n\n"
-        "**Verification:** trusted v2 capture provenance, live exact tuple, "
+        "**Verification:** verified v2 request provenance, live exact tuple, "
         "current reviewer request, formal bot review marker, and terminal status verified."
     )
 
@@ -1636,7 +1733,32 @@ def _post_error_status(review_tuple: ReviewTuple, pr_url: str) -> None:
     )
 
 
+def _buzz_own_pubkey() -> str:
+    result = subprocess.run(
+        ["buzz", "users", "get"],
+        check=False,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=20,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Buzz identity lookup unavailable")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Buzz identity lookup returned malformed JSON") from exc
+    if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
+        raise RuntimeError("Buzz identity lookup returned an ambiguous identity")
+    pubkey = data[0].get("pubkey")
+    if not isinstance(pubkey, str) or re.fullmatch(r"[0-9a-f]{64}", pubkey) is None:
+        raise RuntimeError("Buzz identity lookup returned an invalid identity")
+    return pubkey
+
+
 def _buzz_find(marker: str) -> Optional[str]:
+    own_pubkey = _buzz_own_pubkey()
     result = subprocess.run(
         ["buzz", "messages", "search", "--query", marker, "--limit", "10"],
         check=False,
@@ -1656,6 +1778,7 @@ def _buzz_find(marker: str) -> Optional[str]:
             continue
         content = item.get("content", "")
         event_id = item.get("event_id") or item.get("id")
+        author_pubkey = item.get("pubkey")
         tags = item.get("tags")
         in_channel = isinstance(tags, list) and any(
             isinstance(tag, list)
@@ -1666,8 +1789,9 @@ def _buzz_find(marker: str) -> Optional[str]:
         )
         if (
             in_channel
+            and author_pubkey == own_pubkey
             and isinstance(content, str)
-            and marker in content
+            and content.rstrip().endswith(marker)
             and isinstance(event_id, str)
         ):
             return event_id
@@ -1718,7 +1842,20 @@ def _live_review_state(pr_number: int, expected_login: str) -> tuple[dict, list[
 
 def _load_run(run_id: int) -> Optional[dict]:
     run = gh_json("api", f"repos/{REPOSITORY}/actions/runs/{run_id}")
-    return run if isinstance(run, dict) else None
+    if not isinstance(run, dict):
+        return None
+    head_sha = run.get("head_sha")
+    if not isinstance(head_sha, str) or SHA_PATTERN.fullmatch(head_sha) is None:
+        return None
+    try:
+        workflow_sha256 = _workflow_source_sha256(
+            head_sha, TRUSTED_CAPTURE_WORKFLOW.path
+        )
+    except RuntimeError:
+        return None
+    if workflow_sha256 != TRUSTED_CAPTURE_WORKFLOW_SHA256:
+        return None
+    return run
 
 
 def _load_timeline(pr_number: int) -> list[dict]:
@@ -1727,7 +1864,10 @@ def _load_timeline(pr_number: int) -> list[dict]:
     )
 
 
-def _authorized_live_tuple(pr_number: int, expected_login: str) -> tuple[dict, Optional[ReviewTuple], list[str]]:
+def _captured_live_tuple(
+    pr_number: int, expected_login: str
+) -> tuple[dict, Optional[ReviewTuple], list[str]]:
+    """Return a tuple backed by capture evidence or strict timeline recovery."""
     live_pr, statuses, bodies = _live_review_state(pr_number, expected_login)
     selected = select_authorized_tuple(
         live_pr,
@@ -1735,9 +1875,20 @@ def _authorized_live_tuple(pr_number: int, expected_login: str) -> tuple[dict, O
         load_run=_load_run,
         trusted_workflow=_workflow_from_environment(),
         reviewer_login=expected_login,
-        bot_bodies=bodies,
+        bot_bodies=[],
         load_timeline=_load_timeline,
     )
+    return live_pr, selected, bodies
+
+
+def _authorized_live_tuple(
+    pr_number: int, expected_login: str
+) -> tuple[dict, Optional[ReviewTuple], list[str]]:
+    live_pr, selected, bodies = _captured_live_tuple(pr_number, expected_login)
+    if selected is not None:
+        marker = review_marker(selected)
+        if any(marker in body for body in bodies if isinstance(body, str)):
+            selected = None
     return live_pr, selected, bodies
 
 
@@ -1750,8 +1901,65 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
         number = listed.get("number")
         if isinstance(number, bool) or not isinstance(number, int) or number <= 0:
             continue
-        live_pr, selected, bodies = _authorized_live_tuple(number, expected_login)
+        try:
+            live_pr, selected, bodies = _captured_live_tuple(
+                number, expected_login
+            )
+        except (RuntimeError, TypeError, ValueError, sqlite3.Error):
+            base = listed.get("base")
+            head = listed.get("head")
+            requested = listed.get("requested_reviewers")
+            if (
+                isinstance(base, dict)
+                and isinstance(head, dict)
+                and base.get("ref") == TRUSTED_CAPTURE_WORKFLOW.branch
+                and isinstance(base.get("sha"), str)
+                and SHA_PATTERN.fullmatch(base["sha"]) is not None
+                and isinstance(head.get("sha"), str)
+                and SHA_PATTERN.fullmatch(head["sha"]) is not None
+                and isinstance(requested, list)
+                and expected_login
+                in {
+                    item.get("login")
+                    for item in requested
+                    if isinstance(item, dict)
+                }
+            ):
+                blocked_tuple = ReviewTuple(
+                    repository=REPOSITORY,
+                    pr_number=number,
+                    base_sha=base["sha"],
+                    head_sha=head["sha"],
+                )
+                store.enqueue_blocker(
+                    blocked_tuple,
+                    marker=_blocker_marker(blocked_tuple),
+                    content=(
+                        f"**Operational blocker:** PR #{number} at head "
+                        f"`{blocked_tuple.head_sha}` could not safely verify current "
+                        "request provenance. The review was not started."
+                    ),
+                )
+            continue
         if selected is not None:
+            matching_body = next(
+                (
+                    body
+                    for body in bodies
+                    if review_marker(selected) in body
+                ),
+                None,
+            )
+            if matching_body is not None:
+                pr_url = str(live_pr.get("html_url", ""))
+                _post_terminal_status(selected, pr_url)
+                store.record_external_completion(
+                    selected,
+                    now=int(time.time()),
+                    marker=_summary_marker(selected),
+                    content=_summary_content(selected, pr_url, matching_body),
+                )
+                continue
             events.append(
                 {
                     "delivery_id": (
@@ -1783,18 +1991,6 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
             )
         except KeyError:
             continue
-        marker = review_marker(review_tuple)
-        matching_body = next((body for body in bodies if marker in body), None)
-        if matching_body is not None:
-            pr_url = str(live_pr.get("html_url", ""))
-            _post_terminal_status(review_tuple, pr_url)
-            store.record_external_completion(
-                review_tuple,
-                now=int(time.time()),
-                marker=_summary_marker(review_tuple),
-                content=_summary_content(review_tuple, pr_url, matching_body),
-            )
-            continue
         requested = live_pr.get("requested_reviewers")
         if (
             SHA_PATTERN.fullmatch(review_tuple.base_sha) is not None
@@ -1813,8 +2009,8 @@ def _reconcile(expected_login: str, store: ReviewStateStore) -> dict:
                 content=(
                     f"**Operational blocker:** PR #{number} at head "
                     f"`{review_tuple.head_sha}` still requests `{expected_login}`, "
-                    "but no matching trusted v2 capture workflow run/status could "
-                    "be verified. The review was not started."
+                    "but neither trusted capture evidence nor a strict current-request "
+                    "timeline proof could be verified. The review was not started."
                 ),
             )
     delivered = drain_summary_outbox(
@@ -1935,6 +2131,8 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         or not isinstance(payload_head, dict)
         or not isinstance(live_base, dict)
         or not isinstance(live_head, dict)
+        or payload_base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
+        or live_base.get("ref") != TRUSTED_CAPTURE_WORKFLOW.branch
         or payload_base.get("sha") != live_base.get("sha")
         or payload_head.get("sha") != live_head.get("sha")
     ):
@@ -1948,7 +2146,6 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
     if (
         live_pr.get("state") != "open"
         or live_pr.get("draft") is not False
-        or live_base.get("ref") not in ALLOWED_BASE_REFS
         or SHA_PATTERN.fullmatch(review_tuple.base_sha) is None
         or SHA_PATTERN.fullmatch(review_tuple.head_sha) is None
         or not isinstance(requested_reviewers, list)
@@ -1975,6 +2172,7 @@ def _gate_webhook(payload: dict, expected_login: str, store: ReviewStateStore) -
         "repository": REPOSITORY,
         "pr_number": number,
         "expected_base_sha": review_tuple.base_sha,
+        "expected_base_ref": TRUSTED_CAPTURE_WORKFLOW.branch,
         "expected_head_sha": review_tuple.head_sha,
         "action": "review_requested",
         "pr_url": str(live_pr.get("html_url", "")),

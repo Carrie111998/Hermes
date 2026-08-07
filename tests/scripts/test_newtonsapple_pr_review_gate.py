@@ -259,6 +259,26 @@ def test_trusted_execution_rejects_pull_request_merge_ref_run(monkeypatch):
             )
 
 
+def test_trusted_execution_rejects_a_different_base_branch(monkeypatch):
+    live_pr = _live_execution_pr()
+    live_pr["base"]["ref"] = "staging"
+    run, _ = _trusted_ci_fixture()
+    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
+    with (
+        patch.object(gate, "gh_json", return_value=live_pr),
+        patch.object(gate, "_collection", return_value=[run]),
+    ):
+        with pytest.raises(RuntimeError, match="not eligible"):
+            gate._trusted_ci_evidence(
+                ReviewTuple(
+                    repository=gate.REPOSITORY,
+                    pr_number=185,
+                    base_sha=BASE_SHA,
+                    head_sha=HEAD_SHA,
+                )
+            )
+
+
 def test_trusted_execution_accepts_only_pinned_dispatch_workflow(monkeypatch):
     run, jobs = _trusted_ci_fixture()
     monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
@@ -287,6 +307,38 @@ def test_trusted_execution_accepts_only_pinned_dispatch_workflow(monkeypatch):
     assert selected_run == run
     assert selected_jobs == jobs
     workflow_digest.assert_called_once_with(run["head_sha"])
+
+
+def test_trusted_execution_accepts_a_completed_pr_gate_failure(monkeypatch):
+    run, jobs = _trusted_ci_fixture()
+    run["conclusion"] = "failure"
+    jobs[0]["conclusion"] = "failure"
+    jobs[0]["steps"][1]["conclusion"] = "failure"
+    monkeypatch.setenv("NEWTONSAPPLE_REVIEW_BOT_LOGIN", "newtonsapple-bot")
+    with (
+        patch.object(
+            gate,
+            "gh_json",
+            side_effect=[_live_execution_pr(), {"jobs": jobs}],
+        ),
+        patch.object(gate, "_collection", return_value=[run]),
+        patch.object(
+            gate,
+            "_trusted_execution_workflow_sha256",
+            return_value=gate.TRUSTED_EXECUTION_WORKFLOW_SHA256,
+        ),
+    ):
+        selected_run, selected_jobs = gate._trusted_ci_evidence(
+            ReviewTuple(
+                repository=gate.REPOSITORY,
+                pr_number=185,
+                base_sha=BASE_SHA,
+                head_sha=HEAD_SHA,
+            )
+        )
+
+    assert selected_run == run
+    assert gate._gate_contract(selected_jobs[0])["status"] == "pr-fail"
 
 
 def test_trusted_execution_accepts_pinned_request_workflow_for_automatic_reviews(
@@ -485,6 +537,38 @@ def test_pending_status_is_authorized_only_by_matching_successful_allowlisted_ru
     assert review_tuple.head_sha == HEAD_SHA
 
 
+def test_capture_run_loader_requires_the_pinned_base_workflow_source(monkeypatch):
+    run = {
+        "id": 123,
+        "head_sha": BASE_SHA,
+        "path": ".github/workflows/pr-review-capture.yml",
+    }
+    monkeypatch.setattr(gate, "gh_json", lambda *args: run)
+    monkeypatch.setattr(
+        gate,
+        "_workflow_source_sha256",
+        lambda commit_sha, path: "0" * 64,
+    )
+
+    assert gate._load_run(123) is None
+
+
+def test_capture_run_loader_accepts_the_pinned_base_workflow_source(monkeypatch):
+    run = {
+        "id": 123,
+        "head_sha": BASE_SHA,
+        "path": ".github/workflows/pr-review-capture.yml",
+    }
+    monkeypatch.setattr(gate, "gh_json", lambda *args: run)
+    monkeypatch.setattr(
+        gate,
+        "_workflow_source_sha256",
+        lambda commit_sha, path: gate.TRUSTED_CAPTURE_WORKFLOW_SHA256,
+    )
+
+    assert gate._load_run(123) == run
+
+
 def test_dispatch_status_requires_canonical_run_name_and_allowlisted_actor():
     trusted = TrustedWorkflow(
         workflow_id=778899,
@@ -655,6 +739,7 @@ def test_webhook_gate_returns_the_opaque_lease_token(monkeypatch, tmp_path):
     )
 
     assert result["contract_version"] == "v2"
+    assert result["expected_base_ref"] == "dev"
     assert isinstance(result["lease_token"], str)
     assert len(result["lease_token"]) >= 32
 
@@ -702,30 +787,49 @@ def test_summary_outbox_is_tuple_unique_and_replay_checks_buzz_before_sending(tm
     assert store.sent_event_id(first_id) == "buzz-event-existing"
 
 
-def test_buzz_marker_reconciliation_requires_the_configured_channel(monkeypatch):
+def test_buzz_marker_reconciliation_requires_configured_channel_and_own_author(monkeypatch):
     marker = "<!-- tuple-marker -->"
+    own_pubkey = "b" * 64
+    responses = iter(
+        [
+            [{"display_name": "Hermany", "pubkey": own_pubkey}],
+            [
+                {
+                    "id": "wrong-channel",
+                    "pubkey": own_pubkey,
+                    "content": marker,
+                    "tags": [["h", "different-channel"]],
+                },
+                {
+                    "id": "forged-same-channel",
+                    "pubkey": "a" * 64,
+                    "content": marker,
+                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+                },
+                {
+                    "id": "quoted-by-own-author",
+                    "pubkey": own_pubkey,
+                    "content": f"quoted {marker} but not a settled outbox message",
+                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+                },
+                {
+                    "id": "expected-channel-and-author",
+                    "pubkey": own_pubkey,
+                    "content": marker,
+                    "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
+                },
+            ],
+        ]
+    )
     monkeypatch.setattr(
         "scripts.newtonsapple_pr_review_gate.subprocess.run",
         lambda *args, **kwargs: SimpleNamespace(
             returncode=0,
-            stdout=json.dumps(
-                [
-                    {
-                        "id": "wrong-channel",
-                        "content": marker,
-                        "tags": [["h", "different-channel"]],
-                    },
-                    {
-                        "id": "expected-channel",
-                        "content": marker,
-                        "tags": [["h", "b1cb95c9-6a36-4516-abdd-81d853a9412e"]],
-                    },
-                ]
-            ),
+            stdout=json.dumps(next(responses)),
         ),
     )
 
-    assert _buzz_find(marker) == "expected-channel"
+    assert _buzz_find(marker) == "expected-channel-and-author"
 
 
 def test_summary_outbox_remains_pending_when_buzz_delivery_fails(tmp_path):
@@ -841,7 +945,109 @@ def test_reconciliation_selects_only_live_exact_tuple_with_no_bot_marker():
     )
 
 
-def test_reconciliation_uses_latest_current_request_when_capture_status_is_missing():
+def test_reconcile_does_not_settle_an_untrusted_legacy_bot_marker(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    live_pr = _live_pr()
+    review_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    marker_body = f"legacy review\n\n{gate.review_marker(review_tuple)}"
+    state = (live_pr, None, [marker_body])
+    monkeypatch.setattr(gate, "_collection", lambda endpoint: [live_pr])
+    monkeypatch.setattr(gate, "_authorized_live_tuple", lambda *args: state)
+    monkeypatch.setattr(
+        gate, "_captured_live_tuple", lambda *args: state, raising=False
+    )
+    terminal_statuses = []
+    monkeypatch.setattr(
+        gate,
+        "_post_terminal_status",
+        lambda candidate, url: terminal_statuses.append((candidate, url)),
+    )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
+    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-blocker")
+
+    result = gate._reconcile("newtonsapple-bot", store)
+
+    assert result["events"] == []
+    assert terminal_statuses == []
+
+
+def test_reconcile_settles_existing_marker_only_with_trusted_capture(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    live_pr = _live_pr()
+    review_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    marker_body = f"verified review\n\n{gate.review_marker(review_tuple)}"
+    monkeypatch.setattr(gate, "_collection", lambda endpoint: [live_pr])
+    monkeypatch.setattr(
+        gate,
+        "_captured_live_tuple",
+        lambda *args: (live_pr, review_tuple, [marker_body]),
+    )
+    terminal_statuses = []
+    monkeypatch.setattr(
+        gate,
+        "_post_terminal_status",
+        lambda candidate, url: terminal_statuses.append((candidate, url)),
+    )
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
+    monkeypatch.setattr(gate, "_buzz_send", lambda content: "buzz-summary")
+
+    result = gate._reconcile("newtonsapple-bot", store)
+
+    assert result == {"events": [], "outbox_delivered": 1}
+    assert terminal_statuses == [(review_tuple, live_pr["html_url"])]
+    assert store.reserve(review_tuple, now=200, lease_seconds=30) is None
+
+
+def test_reconcile_isolates_a_malformed_candidate_and_continues(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    first = _live_pr()
+    second_head = "c" * 40
+    second = _live_pr(
+        number=186,
+        html_url="https://github.com/NewtonsAppleAI/newtonsapple-web/pull/186",
+        head={"ref": "feature", "sha": second_head},
+    )
+    second_tuple = ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=186,
+        base_sha=BASE_SHA,
+        head_sha=second_head,
+    )
+    monkeypatch.setattr(gate, "_collection", lambda endpoint: [first, second])
+
+    def captured(number, login):
+        if number == 185:
+            raise RuntimeError("malformed status provenance")
+        return second, second_tuple, []
+
+    monkeypatch.setattr(gate, "_captured_live_tuple", captured)
+    delivered = []
+    monkeypatch.setattr(gate, "_buzz_find", lambda marker: None)
+    monkeypatch.setattr(
+        gate,
+        "_buzz_send",
+        lambda content: delivered.append(content) or "buzz-blocker",
+    )
+
+    result = gate._reconcile("newtonsapple-bot", store)
+
+    assert len(result["events"]) == 1
+    assert result["events"][0]["payload"]["number"] == 186
+    assert result["outbox_delivered"] == 1
+    assert "could not safely verify current request provenance" in delivered[0]
+
+
+def test_reconciliation_accepts_latest_current_request_when_capture_status_is_missing():
     timeline = [
         {"id": 1, "event": "committed"},
         {
@@ -866,7 +1072,7 @@ def test_reconciliation_uses_latest_current_request_when_capture_status_is_missi
     )
 
     assert selected == ReviewTuple(
-        repository="NewtonsAppleAI/newtonsapple-web",
+        repository=gate.REPOSITORY,
         pr_number=185,
         base_sha=BASE_SHA,
         head_sha=HEAD_SHA,
@@ -916,7 +1122,7 @@ def test_reconciliation_without_capture_rejects_events_after_latest_request(late
     assert selected is None
 
 
-def test_reconciliation_without_capture_selects_only_the_latest_rerequest():
+def test_reconciliation_without_capture_accepts_the_latest_rerequest():
     timeline = [
         {
             "id": 2,
@@ -949,10 +1155,15 @@ def test_reconciliation_without_capture_selects_only_the_latest_rerequest():
         load_timeline=lambda pr_number: timeline,
     )
 
-    assert selected is not None
+    assert selected == ReviewTuple(
+        repository=gate.REPOSITORY,
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
 
 
-def test_webhook_binds_verified_payload_tuple_without_capture_status(monkeypatch, tmp_path):
+def test_webhook_accepts_verified_payload_tuple_without_capture_status(monkeypatch, tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     live_pr = _live_pr()
     monkeypatch.setattr(
@@ -1001,6 +1212,123 @@ def test_webhook_rejects_head_mutation_between_payload_and_live_state(monkeypatc
         )
 
 
+def test_local_execution_worker_attempts_every_gate_without_credentials(monkeypatch):
+    monkeypatch.setattr(
+        gate,
+        "_commit_tree_sha",
+        lambda sha: "c" * 40 if sha == BASE_SHA else "d" * 40,
+    )
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-propagate")
+    monkeypatch.setenv("GH_TOKEN", "must-not-propagate")
+    monkeypatch.setattr(gate, "_local_docker_host", lambda: "unix:///tmp/docker.sock")
+    fetched = []
+    monkeypatch.setattr(
+        gate,
+        "_fetch_exact_commit",
+        lambda workspace, sha, *, home: fetched.append((sha, home)),
+    )
+    monkeypatch.setattr(
+        gate,
+        "_git_output",
+        lambda workspace, *args: (
+            HEAD_SHA
+            if args == ("rev-parse", "HEAD")
+            else "d" * 40
+            if args == ("rev-parse", "HEAD^{tree}")
+            else "commit"
+            if args == ("cat-file", "-t", BASE_SHA)
+            else ""
+        ),
+    )
+    calls = []
+
+    def fake_run(command, *, cwd, env, timeout):
+        calls.append((command, env))
+        return SimpleNamespace(returncode=0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(gate, "_run_command", fake_run)
+
+    result = gate._run_local_execution_worker(
+        ReviewTuple(
+            repository=gate.REPOSITORY,
+            pr_number=185,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+        )
+    )
+
+    assert result["worker"]["required"] is True
+    assert result["worker"]["preflight"]["host_mounts_absent"] is True
+    assert [item["status"] for item in result["gates"]] == ["pass", "pass", "pass"]
+    assert all(item["attempted"] is True for item in result["gates"])
+    assert [sha for sha, _ in fetched] == [HEAD_SHA, BASE_SHA]
+    docker_calls = [(command, env) for command, env in calls if command[0] == "docker"]
+    assert len(docker_calls) == 6
+    assert [command[command.index("--network") + 1] for command, _ in docker_calls] == [
+        "bridge",
+        "none",
+        "bridge",
+        "none",
+        "bridge",
+        "none",
+    ]
+    assert all(env["DOCKER_HOST"] == "unix:///tmp/docker.sock" for _, env in docker_calls)
+    assert all("GITHUB_TOKEN" not in env and "GH_TOKEN" not in env for _, env in docker_calls)
+
+
+def test_local_execution_worker_reports_each_gate_when_docker_is_unavailable(monkeypatch):
+    monkeypatch.setattr(
+        gate,
+        "_commit_tree_sha",
+        lambda sha: "c" * 40 if sha == BASE_SHA else "d" * 40,
+    )
+    monkeypatch.setattr(gate, "_local_docker_host", lambda: "unix:///tmp/docker.sock")
+    monkeypatch.setattr(gate, "_fetch_exact_commit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        gate,
+        "_git_output",
+        lambda workspace, *args: (
+            HEAD_SHA
+            if args == ("rev-parse", "HEAD")
+            else "d" * 40
+            if args == ("rev-parse", "HEAD^{tree}")
+            else "commit"
+            if args == ("cat-file", "-t", BASE_SHA)
+            else ""
+        ),
+    )
+    docker_calls = []
+
+    def fake_run(command, *, cwd, env, timeout):
+        if command[0] == "docker":
+            docker_calls.append(command)
+            return SimpleNamespace(
+                returncode=1,
+                stdout="",
+                stderr="failed to connect to the docker API",
+            )
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate, "_run_command", fake_run)
+
+    result = gate._run_local_execution_worker(
+        ReviewTuple(
+            repository=gate.REPOSITORY,
+            pr_number=185,
+            base_sha=BASE_SHA,
+            head_sha=HEAD_SHA,
+        )
+    )
+
+    assert len(docker_calls) == 6
+    assert [item["status"] for item in result["gates"]] == [
+        "unavailable",
+        "unavailable",
+        "unavailable",
+    ]
+    assert all(item["attempted"] is False for item in result["gates"])
+
+
 def test_local_execution_reports_unavailable_gates_in_signed_evidence(monkeypatch):
     private_key = _install_attestation_key(monkeypatch)
     monkeypatch.setattr(
@@ -1034,6 +1362,85 @@ def test_local_execution_reports_unavailable_gates_in_signed_evidence(monkeypatc
         "unavailable",
         "unavailable",
     ]
+
+
+def test_exact_commit_fetch_uses_only_the_pinned_gh_credential_helper(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("GH_CONFIG_DIR", "/trusted/gh-config")
+    monkeypatch.setenv("GITHUB_TOKEN", "must-not-propagate")
+    calls = []
+
+    def fake_run(command, *, cwd, env, timeout):
+        calls.append((command, cwd, env, timeout))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(gate, "_run_command", fake_run)
+
+    gate._fetch_exact_commit(workspace, HEAD_SHA, home=home)
+
+    assert calls == [
+        (
+            [
+                "git",
+                "-c",
+                "credential.helper=",
+                "-c",
+                "credential.helper=!gh auth git-credential",
+                "fetch",
+                "-q",
+                "--depth=1",
+                "origin",
+                HEAD_SHA,
+            ],
+            workspace,
+            {
+                "PATH": gate.os.environ.get(
+                    "PATH", "/usr/bin:/bin:/usr/sbin:/sbin"
+                ),
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "HOME": str(home),
+                "GH_CONFIG_DIR": "/trusted/gh-config",
+            },
+            180,
+        )
+    ]
+
+
+def test_local_docker_host_resolves_only_a_unix_socket(monkeypatch):
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="unix:///Users/reviewer/.docker/run/docker.sock\n",
+            stderr="",
+        ),
+    )
+
+    assert gate._local_docker_host() == (
+        "unix:///Users/reviewer/.docker/run/docker.sock"
+    )
+
+
+def test_local_docker_host_rejects_remote_daemon(monkeypatch):
+    monkeypatch.setattr(
+        gate.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0,
+            stdout="tcp://docker.example:2375\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="local Docker socket"):
+        gate._local_docker_host()
 
 
 def test_gate_resolution_falls_back_to_status_agnostic_local_contracts(monkeypatch):
