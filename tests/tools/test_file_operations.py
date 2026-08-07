@@ -673,3 +673,25 @@ class TestReadNonUtf8IsBinary:
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
         assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+
+    def test_trailing_truncation_artifact_not_flagged(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # The binary-detection sample is taken with `head -c 1000` (byte-based).
+        # When byte 1000 splits a multi-byte UTF-8 char, the truncated tail
+        # decodes to up to 3 U+FFFD at the END of the sample only. That is a
+        # truncation artifact, not evidence of a binary file — legitimate
+        # UTF-8 text cut mid-character must still read as text.
+        sample = "网络" * 500 + "学"  # ends mid-UTF-8-char after byte cut
+        raw = sample.encode("utf-8")[:1000]
+        lossy_tail = raw.decode("utf-8", errors="replace")
+        assert lossy_tail.endswith("\ufffd")
+        assert ops._is_likely_binary("notes.txt", lossy_tail) is False
+
+    def test_replacement_char_in_body_still_binary(self, tmp_path):
+        ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
+        # U+FFFD inside the body (not just the trailing truncation artifact)
+        # must still be flagged binary — scattered replacement chars mean the
+        # file really is undecodable, and returning it as text could lead to a
+        # read→edit→write round-trip that overwrites the original bytes.
+        scattered = "前缀" + "\ufffd" * 10 + "后缀" + "\ufffd" * 5 + "尾部"
+        assert ops._is_likely_binary("notes.txt", scattered) is True
