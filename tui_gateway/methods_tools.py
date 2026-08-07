@@ -429,6 +429,45 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5012, str(e))
 
 
+@method("plugin.command.dispatch")
+def _(rid, params: dict) -> dict:
+    """Run one registered plugin command without creating an Agent session.
+
+    This deliberately has a smaller surface than ``command.dispatch``: it does
+    not resolve quick commands, bundles, skills, shell commands, or prompts.
+    The authenticated gateway transport remains responsible for caller access;
+    this handler only narrows what that caller can dispatch.
+    """
+    if frozenset(params) != frozenset({"name", "arg"}):
+        return _err(rid, -32602, "plugin.command.dispatch requires name and arg")
+    name, arg = params.get("name"), params.get("arg")
+    if (
+        not isinstance(name, str)
+        or not isinstance(arg, str)
+        or not (clean_name := name.strip().lstrip("/"))
+        or name != clean_name
+        or clean_name != clean_name.lower()
+    ):
+        return _err(rid, -32602, "plugin.command.dispatch requires a lowercase name and string arg")
+
+    try:
+        from hermes_cli.plugins import (
+            get_plugin_command_handler,
+            resolve_plugin_command_result,
+        )
+
+        handler = get_plugin_command_handler(clean_name)
+    except Exception:
+        return _err(rid, 5000, "plugin command registry unavailable")
+    if handler is None:
+        return _err(rid, 4011, f"unknown plugin command: {clean_name}")
+    try:
+        result = resolve_plugin_command_result(handler(arg))
+    except Exception:
+        return _err(rid, 5000, "plugin command failed")
+    return _ok(rid, {"type": "plugin", "output": str(result or "")})
+
+
 @method("command.dispatch")
 def _(rid, params: dict) -> dict:
     name, arg = params.get("name", "").lstrip("/"), params.get("arg", "")
