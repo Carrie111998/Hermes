@@ -58,6 +58,10 @@ _HERMES_CORE_TOOLS = [
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)
     "send_message",
+    # Memory-kernel approval requests — proposing and requesting operator approval for it
+    # are the same workflow step, so this belongs alongside send_message, not a toolset
+    # you'd need to separately enable.
+    "send_kernel_approval",
     # Home Assistant smart home control (gated on HASS_TOKEN via check_fn)
     "ha_list_entities", "ha_get_state", "ha_list_services", "ha_call_service",
     # Kanban multi-agent coordination — only in schema when the agent is

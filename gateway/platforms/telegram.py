@@ -2042,6 +2042,86 @@ class TelegramAdapter(BasePlatformAdapter):
                     logger.error("[%s] slash-confirm callback failed: %s", self.name, exc, exc_info=True)
             return
 
+        # --- Kernel proposal approval callbacks (kp:approve|reject:proposal_id) ---
+        # A binary approve/reject decision on a memory-kernel truth proposal — deliberately its
+        # own branch rather than reusing ea:/sc: above, since neither's button set (4-way / 3-way
+        # execution-permission semantics) maps cleanly onto "approve or reject this fact, once."
+        # This gateway is a pure relay: it verifies the tap is the authorized operator, then
+        # shells out to the memory-kernel's own decision script — it never decides anything
+        # itself, and never asserts kernel authority under this gateway's own identity.
+        if data.startswith("kp:"):
+            parts = data.split(":", 2)
+            if len(parts) == 3:
+                action = parts[1]  # approve, reject
+                proposal_id = parts[2]
+
+                caller_id = str(getattr(query.from_user, "id", ""))
+                if not self._is_callback_user_authorized(
+                    caller_id,
+                    chat_id=query_chat_id,
+                    chat_type=str(query_chat_type) if query_chat_type is not None else None,
+                    thread_id=str(query_thread_id) if query_thread_id is not None else None,
+                    user_name=query_user_name,
+                ):
+                    await query.answer(text="⛔ You are not authorized to decide kernel proposals.")
+                    return
+
+                if action not in ("approve", "reject"):
+                    await query.answer(text="Invalid decision data.")
+                    return
+
+                await query.answer(text="Processing...")
+                user_display = getattr(query.from_user, "first_name", "User")
+
+                import subprocess
+
+                script = (
+                    "/Users/MoltbotAgent/moltbot/workspace-dev/memory-kernel/scripts/"
+                    "apply_proposal_decision.py"
+                )
+                kind_labels = {
+                    "approved": "✅ Approved",
+                    "rejected": "❌ Rejected",
+                    "already_resolved": "ℹ️ Already resolved",
+                    "stale": "⚠️ Stale — kernel moved since this was proposed",
+                    "error": "⚠️ Error",
+                }
+                try:
+                    proc = subprocess.run(
+                        [
+                            "/Library/Developer/CommandLineTools/usr/bin/python3", script,
+                            "--proposal-id", proposal_id, "--action", action,
+                        ],
+                        capture_output=True, text=True, timeout=30,
+                    )
+                    if proc.returncode != 0:
+                        logger.error(
+                            "apply_proposal_decision.py failed (rc=%d) stderr=%s",
+                            proc.returncode, proc.stderr.strip(),
+                        )
+                        label = f"⚠️ Decision failed (see gateway log) — {proposal_id}"
+                    else:
+                        result = json.loads(proc.stdout.strip().splitlines()[-1])
+                        kind = result.get("kind", "error")
+                        label = (
+                            f"{kind_labels.get(kind, kind)} by {user_display}\n"
+                            f"`{result.get('field')}` — {result.get('detail')}"
+                        )
+                except subprocess.TimeoutExpired:
+                    logger.error("apply_proposal_decision.py timed out for proposal %s", proposal_id)
+                    label = f"⚠️ Decision timed out (see gateway log) — {proposal_id}"
+                except Exception as exc:
+                    logger.error("Failed to apply kernel proposal decision: %s", exc, exc_info=True)
+                    label = f"⚠️ Error applying decision (see gateway log) — {proposal_id}"
+
+                try:
+                    await query.edit_message_text(
+                        text=label, parse_mode=ParseMode.MARKDOWN, reply_markup=None,
+                    )
+                except Exception:
+                    pass  # non-fatal if edit fails
+            return
+
         # --- Update prompt callbacks ---
         if not data.startswith("update_prompt:"):
             return
