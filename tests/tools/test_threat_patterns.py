@@ -211,6 +211,39 @@ class TestNonEnglishInjection:
         for text in benign:
             assert scan_for_threats(text, scope="strict") == []
 
+    def test_descriptive_prose_sharing_vocabulary_not_flagged(self):
+        # Regression: the fr/es/de/ru "ignore"/"disregard" patterns
+        # originally used unbounded verb-stem wildcards (`ignor\w*`,
+        # `игнориру\w*`, etc.) instead of anchoring on the actual
+        # imperative/command forms the way the English "ignore" literal
+        # does. That let them match nominalizations ("ignorance"/
+        # "ignorancia"), gerunds ("игнорирование"), and reported-speech/
+        # passive-voice sentences ("a ignoré", "ignoriert hat", "ignoró")
+        # that share vocabulary with the attack phrase but describe past
+        # behavior rather than issuing a command. Checked at scope="strict"
+        # since that's what gates memory writes (memory_tool.py).
+        benign = [
+            # fr: nominalization + reported speech, not an imperative.
+            "Son ignorance des instructions précédentes a causé le problème.",
+            "Le rapport note que l'employé a ignoré les instructions "
+            "précédentes de son manager.",
+            # es: nominalization + reported speech.
+            "Su ignorancia de las instrucciones anteriores causó el problema.",
+            "El empleado, según el informe, ignoró las instrucciones "
+            "anteriores de su jefe.",
+            "El desarrollador hizo caso omiso de sus tareas pendientes.",
+            # de: compound-past reported speech ("... ignoriert hat").
+            "Der Bericht stellt fest, dass der Mitarbeiter die vorherigen "
+            "Anweisungen seines Vorgesetzten ignoriert hat.",
+            # ru: gerund/nominalization + adverbial participle, not
+            # imperative "игнорируй/игнорируйте".
+            "Игнорирование предыдущих инструкций привело к сбою в системе.",
+            "Не обращая особого внимания на правила компании, он всё же "
+            "успешно завершил проект.",
+        ]
+        for text in benign:
+            assert scan_for_threats(text, scope="strict") == [], text
+
 
 # =========================================================================
 # False-positive guards (THIS IS THE WHOLE POINT)
