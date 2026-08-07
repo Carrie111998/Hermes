@@ -1,8 +1,10 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { ArtifactDetection } from '@/lib/artifact-detect'
 
 import {
+  $artifactRecord,
+  $artifactSelectedVersion,
   $artifactVersionSelection,
   artifactsForSession,
   clearArtifactRegistry,
@@ -79,6 +81,51 @@ describe('artifacts store', () => {
     expect(artifactsForSession('session-2')).toHaveLength(1)
   })
 
+  it('does not notify one artifact preview when an unrelated artifact changes', () => {
+    const first = upsertArtifact('session-1', HTML_DETECTION, '<html>a</html>')!
+    const selected = $artifactRecord(first.artifactId)
+    const changes: unknown[] = []
+    const unsubscribe = selected.subscribe(value => changes.push(value))
+
+    upsertArtifact(
+      'session-2',
+      { ...HTML_DETECTION, title: 'Unrelated Dashboard' },
+      '<html>unrelated</html>'
+    )
+
+    expect(changes).toHaveLength(1)
+    expect(changes[0]).toBe(first.record)
+    unsubscribe()
+  })
+
+  it('evicts derived stores and version pins when bounded pruning removes an artifact', () => {
+    const now = vi.spyOn(Date, 'now')
+    let timestamp = 0
+    now.mockImplementation(() => ++timestamp)
+
+    const first = upsertArtifact('session-1', HTML_DETECTION, '<html>v1</html>')!
+    upsertArtifact('session-1', HTML_DETECTION, '<html>v2</html>')
+    selectArtifactVersion(first.artifactId, 0)
+
+    const recordStore = $artifactRecord(first.artifactId)
+    const selectionStore = $artifactSelectedVersion(first.artifactId)
+
+    for (let index = 0; index < 24; index += 1) {
+      upsertArtifact(
+        'session-1',
+        { ...HTML_DETECTION, title: `Newer artifact ${index}` },
+        `<html>${index}</html>`
+      )
+    }
+
+    expect(getArtifact(first.artifactId)).toBeNull()
+    expect(first.artifactId in $artifactVersionSelection.get()).toBe(false)
+    expect($artifactRecord(first.artifactId)).not.toBe(recordStore)
+    expect($artifactSelectedVersion(first.artifactId)).not.toBe(selectionStore)
+
+    now.mockRestore()
+  })
+
   it('rejects empty sessions and empty content', () => {
     expect(upsertArtifact('', HTML_DETECTION, '<html>x</html>')).toBeNull()
     expect(upsertArtifact('session-1', HTML_DETECTION, '   ')).toBeNull()
@@ -126,6 +173,7 @@ describe('artifacts store', () => {
     selectArtifactVersion(result.artifactId, 0)
 
     expect($artifactVersionSelection.get()[result.artifactId]).toBe(0)
+    expect($artifactSelectedVersion(result.artifactId).get()).toBe(0)
 
     // Selecting the newest version clears the pin (absent = newest).
     selectArtifactVersion(result.artifactId, 2)
@@ -154,11 +202,15 @@ describe('artifacts store', () => {
 
   it('clearing the registry closes the tabs pointing into it', () => {
     const result = upsertArtifact('session-1', HTML_DETECTION, '<html>v1</html>')!
+    const recordStore = $artifactRecord(result.artifactId)
+    const selectionStore = $artifactSelectedVersion(result.artifactId)
 
     openArtifact(result.artifactId)
     clearArtifactRegistry()
 
     expect($previewTabs.get()).toEqual([])
     expect(artifactsForSession('session-1')).toEqual([])
+    expect($artifactRecord(result.artifactId)).not.toBe(recordStore)
+    expect($artifactSelectedVersion(result.artifactId)).not.toBe(selectionStore)
   })
 })

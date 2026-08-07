@@ -1,6 +1,6 @@
 import { useStore } from '@nanostores/react'
 import DOMPurify from 'dompurify'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 
 import { CopyButton } from '@/components/ui/copy-button'
 import { Tip } from '@/components/ui/tooltip'
@@ -8,7 +8,7 @@ import { useI18n } from '@/i18n'
 import { artifactDownloadName, type ArtifactKind } from '@/lib/artifact-detect'
 import { downloadTextFile } from '@/lib/download-text'
 import { ChevronLeft, ChevronRight, Download, ExternalLink } from '@/lib/icons'
-import { $artifactRegistry, $artifactVersionSelection, findArtifact, selectArtifactVersion } from '@/store/artifacts'
+import { $artifactRecord, $artifactSelectedVersion, selectArtifactVersion } from '@/store/artifacts'
 import { notifyError } from '@/store/notifications'
 import type { PreviewTarget } from '@/store/preview'
 
@@ -43,6 +43,19 @@ function composeArtifactHtml(content: string): string {
   ].join('\n')
 }
 
+type ArtifactPreviewWebview = HTMLElement & {
+  src?: string
+}
+
+function artifactGuestUrl(content: string): string {
+  // A data: document has a unique opaque origin. That preserves the old
+  // srcDoc sandbox's local-file boundary while the <webview> adds the process
+  // boundary the iframe lacked. Percent encoding is Unicode-safe and avoids
+  // writing generated code to disk (and the cleanup/orphan lifecycle that
+  // would come with temporary file:// previews).
+  return `data:text/html;charset=utf-8,${encodeURIComponent(composeArtifactHtml(content))}`
+}
+
 /** Write the composed document to a real temp file through the existing
  *  buffer-save IPC, then hand it to the OS browser. A blob/data URL can't
  *  cross into the OS default browser, so a file on disk is the honest path. */
@@ -74,10 +87,12 @@ async function openHtmlInBrowser(content: string): Promise<void> {
 /**
  * Live view for renderable artifact content.
  *
- * HTML runs in an `<iframe sandbox="allow-scripts">` — scripts execute in an
- * opaque origin with no same-origin access, no top navigation, no popups, no
- * form submission out of the frame. The parent app is unreachable. SVG is
- * DOMPurify-sanitized with the same profile as the inline ```svg embed.
+ * HTML runs in an Electron `<webview>` guest process. This is a process
+ * boundary, not merely an origin boundary: a generated page with expensive JS
+ * or an accidental infinite loop can hang its own preview without taking the
+ * chat, composer, and pane layout down with it. Node stays disabled and the
+ * guest is sandboxed. SVG is DOMPurify-sanitized with the same profile as the
+ * inline ```svg embed.
  */
 function ArtifactLiveView({ content, kind, title }: { content: string; kind: ArtifactKind; title: string }) {
   const svgClean = useMemo(
@@ -93,18 +108,36 @@ function ArtifactLiveView({ content, kind, title }: { content: string; kind: Art
     )
   }
 
-  return (
-    <iframe
-      className="block size-full border-0 bg-white"
-      sandbox="allow-scripts"
-      srcDoc={composeArtifactHtml(content)}
-      // Deliberately raw white + forced light scheme: the frame hosts foreign
-      // generated HTML that assumes a light canvas, so it renders deterministically
-      // light in both app themes instead of inheriting theme tokens it can't see.
-      style={{ colorScheme: 'light' }}
-      title={title}
-    />
-  )
+  return <ArtifactHtmlGuestView content={content} title={title} />
+}
+
+function ArtifactHtmlGuestView({ content, title }: { content: string; title: string }) {
+  const hostRef = useRef<HTMLDivElement | null>(null)
+
+  useEffect(() => {
+    const host = hostRef.current
+
+    if (!host) {
+      return
+    }
+
+    const webview = document.createElement('webview') as ArtifactPreviewWebview
+
+    webview.className = 'block size-full border-0 bg-white'
+    webview.setAttribute('aria-label', title)
+    webview.setAttribute('partition', 'hermes-artifact-preview')
+    webview.setAttribute('title', title)
+    webview.setAttribute('webpreferences', 'contextIsolation=yes,nodeIntegration=no,sandbox=yes,webSecurity=yes')
+    webview.setAttribute('src', artifactGuestUrl(content))
+    webview.style.colorScheme = 'light'
+    host.replaceChildren(webview)
+
+    return () => {
+      webview.remove()
+    }
+  }, [content, title])
+
+  return <div className="size-full bg-white" ref={hostRef} />
 }
 
 function VersionStepper({
@@ -176,16 +209,14 @@ export function ArtifactPreview({ target }: { target: PreviewTarget }) {
   const { t } = useI18n()
   const copy = t.artifactPreview
   const artifactId = target.url
-  const registry = useStore($artifactRegistry)
-  const versionSelection = useStore($artifactVersionSelection)
+  const record = useStore(useMemo(() => $artifactRecord(artifactId), [artifactId]))
+  const selectedVersion = useStore(useMemo(() => $artifactSelectedVersion(artifactId), [artifactId]))
   const [userMode, setUserMode] = useState<PreviewViewMode | null>(null)
 
   // Reset the explicit mode when the pane is reused for another artifact.
   useEffect(() => {
     setUserMode(null)
   }, [artifactId])
-
-  const record = useMemo(() => findArtifact(registry, artifactId), [artifactId, registry])
 
   if (!record) {
     return <PreviewEmptyState body={copy.missingBody} title={copy.missingTitle} />
@@ -194,7 +225,7 @@ export function ArtifactPreview({ target }: { target: PreviewTarget }) {
   const renderable = record.kind === 'html' || record.kind === 'svg'
   const modes: PreviewViewMode[] = renderable ? ['rendered', 'source'] : ['source']
   const mode = userMode && modes.includes(userMode) ? userMode : modes[0]!
-  const versionIndex = Math.min(versionSelection[artifactId] ?? record.versions.length - 1, record.versions.length - 1)
+  const versionIndex = Math.min(selectedVersion ?? record.versions.length - 1, record.versions.length - 1)
   const version = record.versions[versionIndex]!
 
   return (

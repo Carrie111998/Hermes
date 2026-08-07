@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { installArtifactPreviewGuestIsolation } from './artifact-preview-guest'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -8695,6 +8696,7 @@ async function startHermes() {
 function wireCommonWindowHandlers(win, { zoom = true }: { zoom?: boolean } = {}) {
   installPreviewShortcut(win)
   installDevToolsShortcut(win)
+  installArtifactPreviewGuestIsolation(win.webContents)
 
   if (zoom) {
     installZoomShortcuts(win)
