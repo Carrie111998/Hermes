@@ -14,7 +14,13 @@ import pytest
 
 ROOT = Path(__file__).parents[3]
 RUNTIME = ROOT / "ops" / "muncho" / "runtime"
-RELEASE_ENTRYPOINTS = ("hermes", "hermes-acp", "hermes-agent", "muncho-ops")
+RELEASE_ENTRYPOINTS = (
+    "hermes",
+    "hermes-acp",
+    "hermes-agent",
+    "muncho-ops",
+    "muncho-release",
+)
 
 
 def _load_routine():
@@ -897,6 +903,45 @@ def test_deploy_marks_planned_stop_before_symlink_swap_and_restart():
     assert '"restored_source":' not in source
 
 
+def test_release_announcement_is_after_exact_post_restart_health_only():
+    source = (RUNTIME / "muncho-auto-deploy-release").read_text(encoding="utf-8")
+    run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
+
+    reserve = run_deploy.index('reserve_muncho_release_mapping "$new" "$sha"')
+    restart = run_deploy.index('systemctl restart "$SERVICE"')
+    active_health = run_deploy.index('systemctl is-active --quiet "$SERVICE"', restart)
+    exact_readback = run_deploy.index('deployed_head="$(')
+    exact_gate = run_deploy.index('if [ "$deployed_head" != "$sha" ]')
+    restart_prepare = run_deploy.index(
+        'prepare_muncho_restart_attestation',
+        reserve,
+    )
+    restart_complete = run_deploy.index(
+        'complete_muncho_restart_attestation',
+        exact_gate,
+    )
+    announce = run_deploy.index(
+        'release_announcement="$(announce_muncho_release_after_smoke'
+    )
+    cleanup = run_deploy.index('cleanup_output="$(cleanup_old_releases)"')
+    deploy_pass = run_deploy.rindex('write_status "deploy_pass"')
+
+    assert reserve < restart_prepare < restart < active_health < exact_readback
+    assert exact_readback < exact_gate < restart_complete < announce
+    assert announce < cleanup < deploy_pass
+    assert (
+        "announce_muncho_release_after_smoke"
+        not in source[
+            source.index("fail_after_activation() {") : source.index(
+                "record_release_packaging_failure() {"
+            )
+        ]
+    )
+    assert (
+        '\\"release_completion\\": \\"discord_announcement_unconfirmed\\"' in run_deploy
+    )
+
+
 def test_deploy_staging_dependency_package_is_final_address_bound():
     helper = RUNTIME / "muncho-auto-deploy-release"
     source = helper.read_text(encoding="utf-8")
@@ -1124,7 +1169,7 @@ def test_root_owned_release_parent_keeps_staging_and_publish_authority_at_root()
     assert 'sudo -n -u "$OWNER" mv -T "$tmp" "$new"' not in run_deploy
 
 
-def test_already_active_fast_path_is_read_only_and_fully_attested():
+def test_already_active_fast_path_requires_restart_receipt_before_announcement():
     helper = RUNTIME / "muncho-auto-deploy-release"
     source = helper.read_text(encoding="utf-8")
     run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
@@ -1147,15 +1192,20 @@ def test_already_active_fast_path_is_read_only_and_fully_attested():
     entrypoint = fast_path.index('attest_target_release_entrypoints "$active"')
     venv = fast_path.index('attest_target_release_venv "$active" "$active"')
     cutover = fast_path.index('cutover_artifacts_match "$active" "$sha"')
+    reserve = fast_path.index('reserve_muncho_release_mapping "$active" "$sha"')
+    restart_receipt = fast_path.index('complete_muncho_restart_attestation')
+    announce = fast_path.index('announce_muncho_release_after_smoke "$active" "$sha"')
     deploy_pass = fast_path.index('write_status "deploy_pass"')
     completed = fast_path.index("return 0", deploy_pass)
 
-    assert entrypoint < venv < cutover < deploy_pass < completed
+    assert entrypoint < venv < cutover < reserve < restart_receipt
+    assert restart_receipt < announce < deploy_pass < completed
     assert "install_target_release_wheel" not in fast_path
     assert " pip " not in fast_path
     assert "ln -sfn" not in fast_path
     assert "mv -T" not in fast_path
     assert "systemctl restart" not in fast_path
+    assert "qualifying_restart_unattested" in fast_path
     assert '"already_active\\": true' in fast_path
     assert '"$release/.venv/bin/python" -I -B -P -s -' in venv_attestation
     assert cutover_attestation.count('"$release/.venv/bin/python" -I -B') == 1
@@ -1647,6 +1697,7 @@ hermes = "entrypoint_probe:main"
 hermes-acp = "entrypoint_probe:main"
 hermes-agent = "entrypoint_probe:main"
 muncho-ops = "entrypoint_probe:main"
+muncho-release = "entrypoint_probe:main"
 
 [tool.setuptools]
 py-modules = ["entrypoint_probe"]
