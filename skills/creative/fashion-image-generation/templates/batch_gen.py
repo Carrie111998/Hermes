@@ -65,6 +65,14 @@ OUTFIT_GUARD = ("The model's surrounding outfit (base layers under/around the ga
     "to the ghost reference — do not add, remove or alter the garment, its shape, details, "
     "color or its relation to the body.")
 
+# Outfit consistency: for one colorway the SAME surrounding outfit must appear across all
+# three poses (front/bust34/editorial). Same top, same trousers, same shoes in every shot.
+OUTFIT_CONSISTENCY = ("For this colorway, keep the SAME surrounding outfit across all generated "
+    "poses (front, bust34 and editorial): the model wears the exact same top, same trousers "
+    "and same shoes in every shot. Do not change the base layers from one pose to the next. "
+    "The reference garment itself must remain exactly identical to the ghost reference in "
+    "every pose.")
+
 def data_url(path):
     b = open(path, "rb").read()
     ext = "png" if path.lower().endswith(".png") else "jpeg"
@@ -132,7 +140,7 @@ for capo, cfg in MANIFEST.items():
                     continue
                 pose_clause = POSES.get(posa, POSES["front"])
                 scene = STUDIO_SCENE  # all poses share the same studio background
-                prompt = f"{STEPB_PROMPT} {pose_clause}, {scene}. {OUTFIT_GUARD}."
+                prompt = f"{STEPB_PROMPT} {pose_clause}, {scene}. {OUTFIT_GUARD} {OUTFIT_CONSISTENCY}."
                 try:
                     n, c = gen(prompt, [data_url(modela), data_url(g_out)], w_out)
                     print(f"  STEP B {posa} ok ${c}", flush=True); summary.append(("B", capo, colore, posa, c))

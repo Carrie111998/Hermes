@@ -73,6 +73,10 @@ top, full-length tailored trousers or jeans). **Never shorts, never skirts.** Th
 garment itself must remain exactly identical to the ghost (shape, details, color, relation to
 body) — never add/remove/alter it.
 
+**Outfit-consistency guard (MANDATORY per colorway).** For each color the SAME surrounding
+outfit must appear across ALL three poses (front/bust34/editorial): same top, same trousers,
+same shoes in every shot. Do not change the base layers between poses.
+
 ## Workflow (end-to-end)
 1. **Enumerate the Drive source** — for each garment folder: identify the ghost mannequin (product photo on flat grey) vs. the color swatches (flat rectangle with a color name+code). Use vision to disambiguate and to map each swatch file → its color code (`NOCCIOLA-302`…). A single `seed` colorway may also come pre-generated.
 2. **Scaffold a manifest** of `{garment: {ghost: path, swatch: {COLOR: path}}}`.
