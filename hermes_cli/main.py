@@ -3258,10 +3258,10 @@ def select_provider_and_model(args=None):
     # Deduplicate: skip custom providers whose provider_key matches a
     # canonical slug — they are already shown in the built-in catalog.
     # Fixes #7524.
-    _canonical_slugs = {p.slug for p in CANONICAL_PROVIDERS}
+    _canonical_slugs = {p.slug.lower() for p in CANONICAL_PROVIDERS}
 
     for key, provider_info in _custom_provider_map.items():
-        provider_key = provider_info.get("provider_key", "")
+        provider_key = provider_info.get("provider_key", "").lower()
         if provider_key and provider_key in _canonical_slugs:
             continue
         name = provider_info["name"]
