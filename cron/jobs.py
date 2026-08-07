@@ -286,6 +286,11 @@ def _jobs_lock():
     Nested calls in the same thread reuse the held lock so legacy callers that
     invoke save_jobs() inside a broader mutation section don't deadlock or try
     to reacquire the advisory file lock.
+
+    Whenever the cross-process flock could not actually be acquired (timeout,
+    OSError, or neither fcntl/msvcrt available), ``_jobs_lock_state.degraded``
+    is set so ``_save_jobs_unlocked`` can detect and recover from a sibling
+    process writing jobs.json during the unprotected window (#80624).
     """
     depth = getattr(_jobs_lock_state, "depth", 0)
     if depth:
@@ -298,7 +303,11 @@ def _jobs_lock():
 
     with _jobs_file_lock:
         _jobs_lock_state.depth = 1
+        _jobs_lock_state.degraded = False
+        _jobs_lock_state.load_stamp = None
+        _jobs_lock_state.load_ids = None
         lock_fd = None
+        locked = False
         try:
             try:
                 ensure_dirs()
@@ -323,6 +332,7 @@ def _jobs_lock():
                     while True:
                         try:
                             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                            locked = True
                             break
                         except (OSError, IOError):
                             if time.monotonic() >= _deadline:
@@ -343,11 +353,13 @@ def _jobs_lock():
                             time.sleep(0.1)
                 elif msvcrt is not None:
                     getattr(msvcrt, "locking")(lock_fd.fileno(), getattr(msvcrt, "LK_LOCK"), 1)
+                    locked = True
             except (OSError, IOError) as e:
                 # Never let a locking failure take down cron writes — fall back to
                 # in-process-only protection (still held via _jobs_file_lock).
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
                                "proceeding with in-process lock only", e)
+            _jobs_lock_state.degraded = not locked
             try:
                 yield
             finally:
@@ -363,6 +375,9 @@ def _jobs_lock():
                         lock_fd.close()
         finally:
             _jobs_lock_state.depth = 0
+            _jobs_lock_state.degraded = False
+            _jobs_lock_state.load_stamp = None
+            _jobs_lock_state.load_ids = None
 
 # Fields on a cron job that must never change after creation. ``id`` is used
 # as a filesystem path component under ``OUTPUT_DIR``; allowing it to be
@@ -1010,11 +1025,31 @@ def get_ticker_last_error() -> Optional[str]:
 # Job CRUD Operations
 # =============================================================================
 
+def _record_load_stamp(jobs_file: Path, jobs: List[Dict[str, Any]]) -> None:
+    """Snapshot the file state + job IDs a load_jobs() call observed.
+
+    Only meaningful inside a _jobs_lock() critical section (depth > 0); lets
+    _save_jobs_unlocked() detect a sibling process writing jobs.json during a
+    degraded (unlocked) window and recover any job it added instead of
+    silently discarding it (#80624).
+    """
+    if not getattr(_jobs_lock_state, "depth", 0):
+        return
+    try:
+        st = jobs_file.stat()
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    _jobs_lock_state.load_stamp = stamp
+    _jobs_lock_state.load_ids = {j["id"] for j in jobs if isinstance(j, dict) and "id" in j}
+
+
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     if not jobs_file.exists():
+        _record_load_stamp(jobs_file, [])
         return []
 
     _strict_retry = False  # track whether we used the strict=False fallback
@@ -1048,6 +1083,7 @@ def load_jobs() -> List[Dict[str, Any]]:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
+        _record_load_stamp(jobs_file, jobs)
         return jobs
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
@@ -1055,6 +1091,7 @@ def load_jobs() -> List[Dict[str, Any]]:
         if data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
+        _record_load_stamp(jobs_file, data)
         return data
 
     raise RuntimeError(
@@ -1062,10 +1099,71 @@ def load_jobs() -> List[Dict[str, Any]]:
     )
 
 
+def _reconcile_degraded_write(
+    jobs_file: Path, jobs: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Recover jobs a sibling process wrote since this critical section loaded.
+
+    When the cross-process flock in _jobs_lock() times out or is unavailable
+    (#60703), two processes can run a load->modify->save cycle concurrently
+    with no mutual exclusion. If a sibling process created a job in that
+    window, this critical section never saw it, and a plain overwrite would
+    silently discard it — the exact symptom in #80624 (CLI-created jobs
+    vanishing from jobs.json while the gateway is running).
+
+    Runs on every save, not just ones this process saw as degraded: a
+    *healthy* lock holder can still clobber a sibling's degraded write if
+    that sibling raced in and out while this process's own (properly
+    exclusive) critical section was open — the flock only stops other
+    processes from *also* getting exclusive access, it does nothing to stop
+    a process that gave up on getting it. The stat check below is a single
+    cheap syscall that is always a no-op when nothing raced (the overwhelming
+    common case), so this costs nothing on the healthy path. Any job ID
+    present on disk right now but absent from both what we loaded and what
+    we're about to write is unioned back in — favoring a resurrected job over
+    a silently lost one, matching the liveness-over-strict-consistency
+    tradeoff #60703 already accepted for this lock.
+    """
+    load_stamp = getattr(_jobs_lock_state, "load_stamp", None)
+    load_ids = getattr(_jobs_lock_state, "load_ids", None)
+    if load_ids is None:
+        return jobs
+    try:
+        st = jobs_file.stat()
+        current_stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        current_stamp = None
+    if current_stamp == load_stamp:
+        return jobs
+    try:
+        current_jobs = load_jobs()
+    except RuntimeError:
+        return jobs
+    result_ids = {j["id"] for j in jobs if isinstance(j, dict) and "id" in j}
+    recovered = [
+        j
+        for j in current_jobs
+        if isinstance(j, dict)
+        and j.get("id") not in load_ids
+        and j.get("id") not in result_ids
+    ]
+    if recovered:
+        logger.error(
+            "jobs.json changed on disk since this process loaded it — "
+            "recovering %d job(s) a sibling process wrote that this write "
+            "would otherwise have discarded (#80624): %s",
+            len(recovered),
+            [j.get("id") for j in recovered],
+        )
+        jobs = jobs + recovered
+    return jobs
+
+
 def _save_jobs_unlocked(jobs: List[Dict[str, Any]]):
     """Save all jobs to storage. Caller must hold _jobs_lock()."""
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
+    jobs = _reconcile_degraded_write(jobs_file, jobs)
     # Snapshot the current owner BEFORE the atomic replace so a privileged
     # writer (root CLI in Docker) can hand ownership back to the gateway user
     # afterwards instead of locking its ticker out (#68483). When the file is

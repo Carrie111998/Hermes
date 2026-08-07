@@ -125,3 +125,117 @@ def test_jobs_lock_excludes_another_process(tmp_path, monkeypatch):
     # Once the child has released, the lock is freely acquirable again.
     with jobs._jobs_lock():
         pass
+
+
+def test_degraded_lock_recovers_concurrently_created_job(tmp_path, monkeypatch):
+    """#80624: a job a sibling process wrote during a degraded (unlocked)
+    window must not be silently discarded by this process's own save.
+
+    ``_jobs_lock()`` intentionally falls through to in-process-only locking
+    when the cross-process flock times out or is unavailable (#60703) — that
+    is a deliberate liveness tradeoff, not a bug. But before this fix, a save
+    made during that window would blindly overwrite jobs.json with whatever
+    stale list this process last loaded, discarding any job a sibling process
+    (e.g. the CLI) wrote in between. Reproduces that exact race in-process by
+    forcing ``_jobs_lock_state`` into the degraded state _jobs_lock() would
+    have left it in, without depending on OS-specific flock timing.
+    """
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+
+    job_a = {"id": "aaaaaaaaaaaa", "name": "existing"}
+    job_b = {"id": "bbbbbbbbbbbb", "name": "cli-created"}
+
+    try:
+        jobs.save_jobs([job_a])
+
+        # This process enters a degraded critical section (as _jobs_lock()
+        # does after a flock timeout) and loads the current, job_b-less state.
+        jobs._jobs_lock_state.depth = 1
+        jobs._jobs_lock_state.degraded = True
+        assert jobs.load_jobs() == [job_a]
+        stale_stamp = jobs._jobs_lock_state.load_stamp
+        stale_ids = jobs._jobs_lock_state.load_ids
+
+        # A sibling process (e.g. the CLI) creates job_b concurrently, via its
+        # own independent, fully-scoped _jobs_lock() cycle.
+        jobs._jobs_lock_state.depth = 0
+        jobs.save_jobs([job_a, job_b])
+
+        # This process resumes its degraded section with the stale view it
+        # actually observed (no job_b) and saves — pre-fix, this silently
+        # wiped job_b out of jobs.json.
+        jobs._jobs_lock_state.depth = 1
+        jobs._jobs_lock_state.degraded = True
+        jobs._jobs_lock_state.load_stamp = stale_stamp
+        jobs._jobs_lock_state.load_ids = stale_ids
+        jobs._save_jobs_unlocked([job_a])
+    finally:
+        jobs._jobs_lock_state.depth = 0
+        jobs._jobs_lock_state.degraded = False
+        jobs._jobs_lock_state.load_stamp = None
+        jobs._jobs_lock_state.load_ids = None
+
+    on_disk_ids = {j["id"] for j in jobs.load_jobs()}
+    assert on_disk_ids == {job_a["id"], job_b["id"]}, (
+        "sibling-created job was clobbered by a degraded-lock write (#80624)"
+    )
+
+
+def test_healthy_lock_write_recovers_sibling_degraded_create(tmp_path, monkeypatch):
+    """#80624 reverse direction: a *healthy* lock holder can still clobber a
+    sibling's degraded write if that sibling raced in and out while this
+    process's own critical section was open. flock only excludes other
+    processes that also hold it — it does nothing to stop a process that
+    gave up waiting for it. The reconcile check must not be gated on this
+    process's own ``degraded`` flag, or this direction of the race reopens
+    the exact #80624 symptom.
+    """
+    cron_dir = tmp_path / "cron"
+    monkeypatch.setattr(jobs, "CRON_DIR", cron_dir)
+    monkeypatch.setattr(jobs, "JOBS_FILE", cron_dir / "jobs.json")
+    monkeypatch.setattr(jobs, "OUTPUT_DIR", cron_dir / "output")
+
+    job_a = {"id": "aaaaaaaaaaaa", "name": "existing"}
+    job_b = {"id": "bbbbbbbbbbbb", "name": "cli-created"}
+
+    try:
+        jobs.save_jobs([job_a])
+
+        # This process opens a *healthy* critical section (real flock held)
+        # and loads the current, job_b-less state.
+        jobs._jobs_lock_state.depth = 1
+        jobs._jobs_lock_state.degraded = False
+        assert jobs.load_jobs() == [job_a]
+        stale_stamp = jobs._jobs_lock_state.load_stamp
+        stale_ids = jobs._jobs_lock_state.load_ids
+
+        # A sibling process couldn't get the flock, degraded, and created
+        # job_b anyway via its own independent _jobs_lock() cycle. (This
+        # nested call shares the same thread-local as the outer section only
+        # because the test simulates two processes in one thread — real
+        # processes each have their own _jobs_lock_state, so this reset
+        # doesn't happen in production; restored below to keep the test
+        # faithful to the real per-process state.)
+        jobs._jobs_lock_state.depth = 0
+        jobs.save_jobs([job_a, job_b])
+
+        # This process resumes its still-healthy section with the stale view
+        # it actually observed (no job_b) and saves.
+        jobs._jobs_lock_state.depth = 1
+        jobs._jobs_lock_state.degraded = False
+        jobs._jobs_lock_state.load_stamp = stale_stamp
+        jobs._jobs_lock_state.load_ids = stale_ids
+        jobs._save_jobs_unlocked([job_a])
+    finally:
+        jobs._jobs_lock_state.depth = 0
+        jobs._jobs_lock_state.degraded = False
+        jobs._jobs_lock_state.load_stamp = None
+        jobs._jobs_lock_state.load_ids = None
+
+    on_disk_ids = {j["id"] for j in jobs.load_jobs()}
+    assert on_disk_ids == {job_a["id"], job_b["id"]}, (
+        "sibling's degraded create was clobbered by a healthy-lock write (#80624)"
+    )
