@@ -20,7 +20,7 @@ import {
   generatedImageEchoSources,
   stripGeneratedImageEchoes
 } from '@/lib/generated-images'
-import { parseTodos } from '@/lib/todos'
+import { parsePersistedTodos, parseTodos } from '@/lib/todos'
 import { dispatchNativeNotification } from '@/store/native-notifications'
 import { isDiskFullErrorMessage, notifyError } from '@/store/notifications'
 import { broadcastSessionsChanged } from '@/store/session-sync'
@@ -38,7 +38,8 @@ interface MessageStreamOptions {
   hydrateFromStoredSession: (
     attempts?: number,
     storedSessionId?: string | null,
-    runtimeSessionId?: string | null
+    runtimeSessionId?: string | null,
+    options?: { preserveLocalScrollback?: boolean }
   ) => Promise<void>
   queryClient: QueryClient
   refreshHermesConfig: () => Promise<void>
@@ -62,6 +63,22 @@ interface QueuedStreamDeltas {
 let streamMessageSeq = 0
 
 const nextStreamMessageId = (prefix: string) => `${prefix}-${Date.now()}-${++streamMessageSeq}`
+
+function currentTurnHasCompletedTodoResult(messages: readonly ChatMessage[]): boolean {
+  const lastUserIndex = messages.findLastIndex(message => message.role === 'user' && !message.hidden)
+
+  return messages.slice(lastUserIndex + 1).some(
+    message =>
+      !message.hidden &&
+      message.parts.some(
+        part =>
+          part.type === 'tool-call' &&
+          part.toolName === 'todo' &&
+          'result' in part &&
+          parsePersistedTodos(part.result) !== null
+      )
+  )
+}
 
 export function useMessageStream({
   activeGatewayProfile = 'default',
@@ -192,7 +209,8 @@ export function useMessageStream({
   // can cancel it instead of letting parked callbacks pile up while hidden.
   const measureRafRef = useRef<number | null>(null)
   const nativeSubagentSessionsRef = useRef<Set<string>>(new Set())
-  // Turns that auto-compacted: skip post-turn hydrate so live scrollback survives.
+  // Turns that auto-compacted: avoid replacing live scrollback at turn end.
+  // A completed todo still fetches persisted provenance and merges only that metadata.
   const compactedTurnRef = useRef<Set<string>>(new Set())
   // Last session we applied a session.info cwd for — lets us tell an agent
   // relocating the SAME session (follow it) from a session switch (don't yank).
@@ -538,6 +556,8 @@ export function useMessageStream({
   const completeAssistantMessage = useCallback(
     (sessionId: string, text: string, responsePreviewed?: boolean, failure?: { error: string; partial: boolean }) => {
       let shouldHydrate = false
+      let requiresTodoHydration = false
+      let preserveLocalScrollback = false
 
       const completedState = updateSessionState(sessionId, state => {
         // Late completion from an already-cancelled turn: cancelRun has
@@ -545,6 +565,14 @@ export function useMessageStream({
         // empty). Re-running the dedupe below would replace the partial with
         // the just-cancelled full text, so we settle and bail instead.
         if (state.interrupted) {
+          // cancelRun can remove a tool-only pending bubble before this late
+          // terminal frame arrives, so absence from local messages is not proof
+          // that the persisted turn had no todo result. Probe persisted history
+          // while preserving the already-finalized local scrollback.
+          requiresTodoHydration = true
+          shouldHydrate = true
+          preserveLocalScrollback = true
+
           return {
             ...state,
             awaitingResponse: false,
@@ -653,11 +681,22 @@ export function useMessageStream({
           }
         }
 
-        const hasInlineError = nextMessages.some(m => m.role === 'assistant' && m.error && !m.hidden)
         const lastVisible = [...nextMessages].reverse().find(m => !m.hidden)
         const unresolvedUserTail = lastVisible?.role === 'user'
+        const lastUserIndex = nextMessages.findLastIndex(message => message.role === 'user' && !message.hidden)
+        const currentTurnMessages = nextMessages.slice(lastUserIndex + 1)
+
+        const hasInlineError = currentTurnMessages.some(
+          message => message.role === 'assistant' && message.error && !message.hidden
+        )
+
+        const hasCompletedTodoResult = currentTurnHasCompletedTodoResult(nextMessages)
+
+        requiresTodoHydration = hasCompletedTodoResult
         shouldHydrate =
-          !completionError && !hasInlineError && !unresolvedUserTail && (!state.sawAssistantPayload || !finalText)
+          !unresolvedUserTail &&
+          (hasCompletedTodoResult ||
+            (!completionError && !hasInlineError && (!state.sawAssistantPayload || !finalText)))
 
         return {
           ...state,
@@ -685,12 +724,20 @@ export function useMessageStream({
 
       scheduleSessionsRefresh()
 
-      if (compactedTurnRef.current.delete(sessionId)) {
+      const compactedTurn = compactedTurnRef.current.delete(sessionId)
+
+      if (compactedTurn && !requiresTodoHydration) {
         shouldHydrate = false
       }
 
       if (shouldHydrate) {
-        void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
+        if ((compactedTurn || preserveLocalScrollback) && requiresTodoHydration) {
+          void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId, {
+            preserveLocalScrollback: true
+          })
+        } else {
+          void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
+        }
       }
 
       dispatchNativeNotification({
@@ -705,6 +752,9 @@ export function useMessageStream({
 
   const failAssistantMessage = useCallback(
     (sessionId: string, errorMessage: string) => {
+      let shouldHydrateTodos = false
+      let storedSessionId: null | string = null
+
       updateSessionState(sessionId, state => {
         const streamId = state.streamId ?? `assistant-error-${Date.now()}`
         const groupId = state.pendingBranchGroup ?? undefined
@@ -733,6 +783,9 @@ export function useMessageStream({
               }
             ]
 
+        shouldHydrateTodos = currentTurnHasCompletedTodoResult(nextMessages)
+        storedSessionId = state.storedSessionId
+
         return {
           ...state,
           messages: nextMessages,
@@ -746,8 +799,12 @@ export function useMessageStream({
           turnStartedAt: null
         }
       })
+
+      if (shouldHydrateTodos && storedSessionId) {
+        void hydrateFromStoredSession(3, storedSessionId, sessionId)
+      }
     },
-    [updateSessionState]
+    [hydrateFromStoredSession, updateSessionState]
   )
 
   const handleGatewayEvent = useGatewayEventHandler({

@@ -2,10 +2,14 @@ import { cleanup } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
 import { createClientSessionState } from '@/lib/chat-runtime'
-import { $activeSessionId, $busy, $messages } from '@/store/session'
+import { $activeSessionId, $busy, $messages, $selectedStoredSessionId } from '@/store/session'
 import { $sessionStates, dropSessionState, publishSessionState } from '@/store/session-states'
 
-import { PRIMARY_SESSION_VIEW } from './session-view'
+import {
+  $primaryRuntimeStoredId,
+  PRIMARY_SESSION_VIEW,
+  routeSessionIdentityMismatch
+} from './session-view'
 
 const message = (id: string, text: string) => ({
   id,
@@ -34,6 +38,7 @@ describe('primary session view reads its own session slice', () => {
     $activeSessionId.set(null)
     $messages.set([])
     $busy.set(false)
+    $selectedStoredSessionId.set(null)
   })
 
   afterEach(cleanup)
@@ -46,6 +51,23 @@ describe('primary session view reads its own session slice', () => {
 
     expect(PRIMARY_SESSION_VIEW.$messages.get()).toEqual([message('runtime-foreground-msg', 'foreground turn')])
     expect(PRIMARY_SESSION_VIEW.$busy.get()).toBe(false)
+  })
+
+  it('detects warm route, selection, and runtime identity skew', () => {
+    publishSessionState('runtime-a', stateWith('runtime-a', 'session A turn', false))
+    $activeSessionId.set('runtime-a')
+
+    // Navigation selects B before the async resume switches the active runtime.
+    $selectedStoredSessionId.set('stored-runtime-b')
+
+    expect(PRIMARY_SESSION_VIEW.$runtimeId.get()).toBe('runtime-a')
+    expect(PRIMARY_SESSION_VIEW.$storedId.get()).toBe('stored-runtime-b')
+    expect($primaryRuntimeStoredId.get()).toBe('stored-runtime-a')
+    expect(routeSessionIdentityMismatch('stored-runtime-b', 'stored-runtime-b', $primaryRuntimeStoredId.get())).toBe(
+      true
+    )
+    expect(routeSessionIdentityMismatch('stored-runtime-a', 'stored-runtime-a', 'stored-runtime-a')).toBe(false)
+    expect(PRIMARY_SESSION_VIEW.$messages.get()).toEqual([message('runtime-a-msg', 'session A turn')])
   })
 
   it('ignores a background session that keeps streaming after the user switches away', () => {
