@@ -318,7 +318,7 @@ class TestShellFileOpsHelpers:
 
         assert result.error is None
         assert commands[0] == "wc -c < '/c/Users/alice/notes.txt' 2>/dev/null"
-        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null"
+        assert commands[1] == "head -c 1000 '/c/Users/alice/notes.txt' 2>/dev/null | base64"
         assert commands[2] == "sed -n '1,2000p' '/c/Users/alice/notes.txt'"
         assert commands[3] == "wc -l < '/c/Users/alice/notes.txt'"
 
@@ -665,11 +665,12 @@ class TestReadNonUtf8IsBinary:
 
     def test_replacement_char_sample_flagged_binary(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
-        # A latin-1 file decoded with errors="replace" yields U+FFFD chars.
-        lossy_sample = "caf\ufffd r\ufffdsum\ufffd\n"
-        assert ops._is_likely_binary("notes.txt", lossy_sample) is True
+        # A latin-1 file whose bytes are genuinely non-UTF-8.
+        raw_bytes = b"caf\xe9 r\xe9sum\xe9\n"
+        assert ops._is_likely_binary("notes.txt", raw_bytes) is True
 
     def test_plain_utf8_text_not_flagged(self, tmp_path):
         ops = ShellFileOperations(make_real_subprocess_env(str(tmp_path)))
         # Proper UTF-8 (including non-ASCII) must still read as text.
-        assert ops._is_likely_binary("notes.txt", "café résumé\nsecond\n") is False
+        raw_bytes = "café résumé\nsecond\n".encode("utf-8")
+        assert ops._is_likely_binary("notes.txt", raw_bytes) is False
