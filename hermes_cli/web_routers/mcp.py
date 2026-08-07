@@ -131,6 +131,24 @@ async def remove_mcp_server(name: str, profile: Optional[str] = None):
         removed = _remove_mcp_server(name)
     if not removed:
         raise HTTPException(status_code=404, detail=f"Server '{name}' not found")
+
+    # Also evict any cached OAuth provider and delete on-disk token state
+    # (.json, .client.json, .meta.json) so a server removed via the dashboard
+    # cannot be revived at the next gateway restart by leftover files in
+    # mcp-tokens/. The CLI `hermes mcp remove` path already routes through
+    # MCPOAuthManager.remove() to achieve this (#81050); the dashboard DELETE
+    # path must do the same.
+    try:
+        from tools.mcp_oauth_manager import get_manager
+
+        get_manager().remove(name)
+    except Exception:
+        # Token cleanup is best-effort: a missing tokens directory is fine,
+        # but the underlying HermesTokenStorage.remove() is the same call
+        # path the CLI uses, so failures here indicate a real disk problem
+        # and the next gateway start will surface it.
+        pass
+
     return {"ok": True}
 
 
