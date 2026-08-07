@@ -21,6 +21,16 @@ export const $sessionsChangeTick = atom(0)
 export const $platformsChangeTick = atom(0)
 export const $pairingChangeTick = atom(0)
 
+/** Payload carried on `memory.changed` — profile and target when a agent memory or user memory
+ * is updated. Source identifies the emitter (e.g. "memory_tool", "reset", or a custom provider). */
+export interface MemoryChangeMeta {
+  profile?: string
+  target?: string
+  source?: string
+}
+
+export const $memoryChange = atom<{ meta?: MemoryChangeMeta; tick: number }>({ tick: 0 })
+
 /** `pet.info.meta`-shaped payload carried on `pet.changed` — lets the pet skip
  *  the heavy sprite refetch when the broadcast already says enabled=false. */
 export interface PetChangeMeta {
@@ -55,6 +65,10 @@ export function notifyPlatformsChanged(): void {
 
 export function notifyPairingChanged(): void {
   $pairingChangeTick.set($pairingChangeTick.get() + 1)
+}
+
+export function notifyMemoryChanged(meta?: MemoryChangeMeta): void {
+  $memoryChange.set({ meta, tick: $memoryChange.get().tick + 1 })
 }
 
 /** Reset on gateway wipe/reconnect — a new backend re-advertises capability on

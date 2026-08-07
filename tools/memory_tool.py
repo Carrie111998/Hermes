@@ -364,6 +364,16 @@ class MemoryStore:
         """Persist entries to the appropriate file. Called after every mutation."""
         get_memory_dir().mkdir(parents=True, exist_ok=True)
         self._write_file(self._path_for(target), self._entries_for(target))
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            from tui_gateway.server import _broadcast_global_event
+
+            profile = get_active_profile_name()
+            payload = {"profile": profile, "target": target, "source": "default_memory_tool"}
+            _broadcast_global_event("memory.changed", payload)
+            logger.info("memory.changed emitted: %s", payload)
+        except Exception:
+            pass
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
