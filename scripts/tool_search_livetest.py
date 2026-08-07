@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Live test harness for Hermes Agent's Tool Search feature.
 
-Spins up a real AIAgent against a real model, registers ~20 fake "MCP" tools
-with realistic shapes (github-like, slack-like, calendar-like, search-like),
-runs a small set of scenarios, and records exactly what the model did.
+Runs selectable fake-MCP and built-in direct-vs-deferred scenarios against a
+real AIAgent and records exactly what the model did. Use ``--list`` or
+``--dry-run`` to inspect the suite without making model calls.
 
 For each scenario we record:
   - the full message transcript
@@ -12,15 +12,16 @@ For each scenario we record:
   - the final assistant response
   - timing and round-trip count
 
-Each scenario runs twice:
-  - tool_search ENABLED  (deferred behind bridges)
-  - tool_search DISABLED (all tools loaded directly)
+By default, MCP scenarios run enabled/disabled and built-in scenarios run
+deferred/direct. Built-in rollback mode (tool search fully off) is selectable.
 
-Output: ./out/<scenario_id>__<enabled|disabled>.json
+Output: ./out/<scenario_id>__<mode>.json
 """
 
 from __future__ import annotations
 
+import argparse
+import base64
 import json
 import os
 import re
@@ -243,6 +244,96 @@ SCENARIOS: List[Dict[str, Any]] = [
 ]
 
 
+BUILTIN_DEFER_GROUPS = [
+    "browser",
+    "session_search",
+    "delegation",
+    "code_execution",
+    "todo",
+    "vision",
+]
+
+BUILTIN_SCENARIOS: List[Dict[str, Any]] = [
+    {
+        "id": "builtin_tool_free",
+        "description": "Tool-free answer with the broad built-in catalog deferred",
+        "prompt": "What's 7 times 8? Answer with just the number.",
+        "expected_underlying_tools": [],
+        "builtin_defer_groups": BUILTIN_DEFER_GROUPS,
+    },
+    {
+        "id": "builtin_browser",
+        "description": "Navigate with a deferred browser tool",
+        "prompt": (
+            "Open https://example.com in the browser and report the page title. "
+            "Do not use web search."
+        ),
+        "expected_underlying_tools": ["browser_navigate"],
+        "builtin_defer_groups": ["browser"],
+    },
+    {
+        "id": "builtin_file_then_browser",
+        "description": "Use eager read_file followed by a deferred browser tool",
+        "prompt": (
+            "Read /tmp/livetest/notes.txt, then open https://example.com in the "
+            "browser. Report the file text and page title. Do not use web search."
+        ),
+        "expected_underlying_tools": ["read_file", "browser_navigate"],
+        "expected_eager_tools": ["read_file"],
+        "builtin_defer_groups": ["browser"],
+    },
+    {
+        "id": "builtin_session_search",
+        "description": "Search isolated session history through the deferred bridge",
+        "prompt": (
+            "Search prior sessions for the phrase 'livetest sentinel' and tell me "
+            "whether any match exists."
+        ),
+        "expected_underlying_tools": ["session_search"],
+        "builtin_defer_groups": ["session_search"],
+    },
+    {
+        "id": "builtin_delegation",
+        "description": "Delegate a tiny task through the deferred bridge",
+        "prompt": (
+            "Delegate this exact task to one leaf worker: calculate 19 + 23. "
+            "Return only the worker's answer."
+        ),
+        "expected_underlying_tools": ["delegate_task"],
+        "builtin_defer_groups": ["delegation"],
+    },
+    {
+        "id": "builtin_code_execution",
+        "description": "Execute a small calculation through the deferred bridge",
+        "prompt": "Use execute_code to calculate sum(range(10)); report the result.",
+        "expected_underlying_tools": ["execute_code"],
+        "builtin_defer_groups": ["code_execution"],
+    },
+    {
+        "id": "builtin_todo",
+        "description": "Create planning state through the deferred bridge",
+        "prompt": "Use the todo tool to add one item named 'livetest item', then stop.",
+        "expected_underlying_tools": ["todo"],
+        "builtin_defer_groups": ["todo"],
+    },
+    {
+        "id": "builtin_vision",
+        "description": "Analyze a local image through the deferred bridge",
+        "prompt": (
+            "Use vision_analyze on /tmp/livetest/pixel.png and briefly describe "
+            "the image."
+        ),
+        "expected_underlying_tools": ["vision_analyze"],
+        "builtin_defer_groups": ["vision"],
+    },
+]
+
+SCENARIO_SUITES = {
+    "mcp": SCENARIOS,
+    "builtins": BUILTIN_SCENARIOS,
+}
+
+
 # ---------------------------------------------------------------------------
 # Harness
 # ---------------------------------------------------------------------------
@@ -250,7 +341,10 @@ SCENARIOS: List[Dict[str, Any]] = [
 
 def setup_isolated_home(enabled: bool, listing: str = "off",
                         listing_max_tokens: int = 4000,
-                        model: str = "anthropic/claude-haiku-4.5") -> Path:
+                        model: str = "anthropic/claude-haiku-4.5",
+                        builtins_enabled: bool = False,
+                        builtin_defer_groups: List[str] | None = None,
+                        builtin_min_schema_tokens: int = 0) -> Path:
     """Create a fresh ~/.hermes/ for one test, copying minimal credentials.
 
     Also reads OPENROUTER_API_KEY from the user's real ``~/.hermes/.env`` so
@@ -290,6 +384,11 @@ def setup_isolated_home(enabled: bool, listing: str = "off",
                 "max_search_limit": 20,
                 "listing": listing,
                 "listing_max_tokens": listing_max_tokens,
+                "builtins": {
+                    "enabled": builtins_enabled,
+                    "defer": builtin_defer_groups or BUILTIN_DEFER_GROUPS,
+                    "min_schema_tokens": builtin_min_schema_tokens,
+                },
             },
         },
         "logging": {"level": "WARNING"},
@@ -353,17 +452,45 @@ def reset_module_state():
         del sys.modules[k]
 
 
-def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> Dict[str, Any]:
+def _prepare_fixtures() -> None:
+    fixture_dir = Path("/tmp/livetest")
+    fixture_dir.mkdir(exist_ok=True)
+    (fixture_dir / "notes.txt").write_text(
+        "Hello from the test fixture.\n", encoding="utf-8"
+    )
+    # One opaque white pixel. Keeping the fixture inline makes the harness
+    # portable without adding a binary test artifact.
+    (fixture_dir / "pixel.png").write_bytes(base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMA"
+        "ASsJTYQAAAAASUVORK5CYII="
+    ))
+
+
+def run_one_scenario(
+    scenario: Dict[str, Any],
+    enabled: bool,
+    out_dir: Path,
+    *,
+    suite: str = "mcp",
+    mode: str | None = None,
+) -> Dict[str, Any]:
     """Run one (scenario, enabled) combination. Returns the recorded transcript."""
     reset_module_state()
-    home = setup_isolated_home(enabled=enabled)
+    if mode is None:
+        mode = "enabled" if enabled else "disabled"
+    builtin_disclosure = suite == "builtins" and mode == "deferred"
+    tool_search_enabled = enabled and mode != "off"
+    home = setup_isolated_home(
+        enabled=tool_search_enabled,
+        builtins_enabled=builtin_disclosure,
+        builtin_defer_groups=scenario.get("builtin_defer_groups"),
+        builtin_min_schema_tokens=0,
+    )
     os.environ["HERMES_HOME"] = str(home)
 
-    # Pre-create the test file used by scenario D.
-    Path("/tmp/livetest").mkdir(exist_ok=True)
-    Path("/tmp/livetest/notes.txt").write_text("Hello from the test fixture.\n", encoding="utf-8")
+    _prepare_fixtures()
 
-    n_registered = register_fake_tools()
+    n_registered = register_fake_tools() if suite == "mcp" else 0
 
     # Capture tool calls via a hook on the registry dispatch path. We use the
     # registry hook (rather than the run_agent.handle_function_call binding,
@@ -426,7 +553,11 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
     record = {
         "scenario_id": scenario["id"],
         "scenario_description": scenario["description"],
+        "suite": suite,
+        "mode": mode,
         "tool_search_enabled": enabled,
+        "builtin_disclosure_enabled": builtin_disclosure,
+        "builtin_defer_groups": scenario.get("builtin_defer_groups", []),
         "model": "anthropic/claude-haiku-4.5 (via openrouter)",
         "prompt": scenario["prompt"],
         "expected_underlying_tools": scenario.get("expected_underlying_tools", []),
@@ -439,8 +570,7 @@ def run_one_scenario(scenario: Dict[str, Any], enabled: bool, out_dir: Path) -> 
         "error": _redact_secrets(error) if error else error,
     }
 
-    suffix = "enabled" if enabled else "disabled"
-    out_path = out_dir / f"{scenario['id']}__{suffix}.json"
+    out_path = out_dir / f"{scenario['id']}__{mode}.json"
     out_path.write_text(json.dumps(record, indent=2, default=str), encoding="utf-8")
 
     # Cleanup
@@ -509,17 +639,114 @@ def _extract_bridge_calls(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]
     return out
 
 
-def main():
-    out_dir = _THIS_DIR / "out"
+def build_run_matrix(
+    suite: str,
+    scenario_ids: List[str] | None = None,
+    modes: List[str] | None = None,
+) -> List[Dict[str, Any]]:
+    """Resolve CLI selection into deterministic live cases without running them."""
+    suite_names = list(SCENARIO_SUITES) if suite == "all" else [suite]
+    available = {
+        scenario["id"]
+        for suite_name in suite_names
+        for scenario in SCENARIO_SUITES[suite_name]
+    }
+    requested = set(scenario_ids or available)
+    unknown = sorted(requested - available)
+    if unknown:
+        raise ValueError(f"unknown scenario(s) for suite {suite}: {', '.join(unknown)}")
+
+    allowed_modes = {
+        "mcp": ["enabled", "disabled"],
+        "builtins": ["deferred", "direct", "off"],
+    }
+    default_modes = {
+        "mcp": ["enabled", "disabled"],
+        "builtins": ["deferred", "direct"],
+    }
+    cases: List[Dict[str, Any]] = []
+    for suite_name in suite_names:
+        selected_modes = modes or default_modes[suite_name]
+        selected_modes = [mode for mode in selected_modes if mode in allowed_modes[suite_name]]
+        for scenario in SCENARIO_SUITES[suite_name]:
+            if scenario["id"] not in requested:
+                continue
+            for mode in selected_modes:
+                cases.append({"suite": suite_name, "scenario": scenario, "mode": mode})
+    if not cases:
+        raise ValueError("selection produced no runnable cases")
+    return cases
+
+
+def _case_manifest(case: Dict[str, Any]) -> Dict[str, Any]:
+    scenario = case["scenario"]
+    return {
+        "suite": case["suite"],
+        "scenario_id": scenario["id"],
+        "description": scenario["description"],
+        "mode": case["mode"],
+        "expected_underlying_tools": scenario.get("expected_underlying_tools", []),
+        "expected_eager_tools": scenario.get("expected_eager_tools", []),
+        "builtin_defer_groups": scenario.get("builtin_defer_groups", []),
+    }
+
+
+def _parse_args(argv: List[str] | None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--suite", choices=("mcp", "builtins", "all"), default="mcp")
+    parser.add_argument("--scenario", action="append", dest="scenario_ids")
+    parser.add_argument(
+        "--mode",
+        action="append",
+        choices=("enabled", "disabled", "deferred", "direct", "off"),
+        dest="modes",
+    )
+    parser.add_argument("--list", action="store_true", help="List scenarios without running them")
+    parser.add_argument("--dry-run", action="store_true", help="Print selected cases as JSON")
+    parser.add_argument("--out-dir", type=Path, default=_THIS_DIR / "out")
+    return parser.parse_args(argv)
+
+
+def main(argv: List[str] | None = None) -> int:
+    args = _parse_args(argv)
+    try:
+        cases = build_run_matrix(args.suite, args.scenario_ids, args.modes)
+    except ValueError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
+
+    manifest = [_case_manifest(case) for case in cases]
+    if args.list:
+        seen = set()
+        for item in manifest:
+            key = (item["suite"], item["scenario_id"])
+            if key in seen:
+                continue
+            seen.add(key)
+            print(f"{item['suite']:8} {item['scenario_id']:28} {item['description']}")
+        return 0
+    if args.dry_run:
+        print(json.dumps(manifest, indent=2))
+        return 0
+
+    out_dir = args.out_dir
     out_dir.mkdir(exist_ok=True)
     print(f"Writing transcripts to: {out_dir}")
 
     summary = []
-    for scenario in SCENARIOS:
-        for enabled in (True, False):
-            label = "enabled" if enabled else "disabled"
-            print(f"\n{'='*72}\nScenario {scenario['id']} (tool_search={label})\n{'='*72}")
-            record = run_one_scenario(scenario, enabled, out_dir)
+    try:
+        for case in cases:
+            scenario = case["scenario"]
+            mode = case["mode"]
+            enabled = mode not in ("disabled", "off")
+            print(f"\n{'='*72}\nScenario {scenario['id']} ({case['suite']}={mode})\n{'='*72}")
+            record = run_one_scenario(
+                scenario,
+                enabled,
+                out_dir,
+                suite=case["suite"],
+                mode=mode,
+            )
             n_bridge = len(record["bridge_calls"])
             n_under = len(record["underlying_tool_calls"])
             err = record["error"]
@@ -529,6 +756,8 @@ def main():
                 print(f"  ERROR: {err[:300]}")
             summary.append({
                 "scenario": scenario["id"],
+                "suite": case["suite"],
+                "mode": mode,
                 "enabled": enabled,
                 "n_bridge": n_bridge,
                 "n_underlying": n_under,
@@ -538,16 +767,17 @@ def main():
                 "expected": scenario.get("expected_underlying_tools", []),
             })
 
-    summary_path = out_dir / "_summary.json"
-    summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
-    print(f"\nSummary saved to: {summary_path}")
-
-    # Restore original HERMES_HOME
-    if ORIGINAL_HOME is not None:
-        os.environ["HERMES_HOME"] = ORIGINAL_HOME
-    else:
-        os.environ.pop("HERMES_HOME", None)
+        summary_path = out_dir / "_summary.json"
+        summary_path.write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        print(f"\nSummary saved to: {summary_path}")
+    finally:
+        # Restore the caller's profile even when a live case fails.
+        if ORIGINAL_HOME is not None:
+            os.environ["HERMES_HOME"] = ORIGINAL_HOME
+        else:
+            os.environ.pop("HERMES_HOME", None)
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
