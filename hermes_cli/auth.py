@@ -532,12 +532,16 @@ try:
             continue
         _api_key_vars = tuple(v for v in _pp.env_vars if not v.endswith("_BASE_URL") and not v.endswith("_URL")) if _pp.env_vars else ()
         _base_url_var = next((v for v in _pp.env_vars if v.endswith("_BASE_URL") or v.endswith("_URL")), None) if _pp.env_vars else None
+        # auth_type="none": never surface env vars as key sources — the
+        # credential resolver forces api_key="" regardless, and the doctor
+        # would otherwise report an env-var key that is never sent.
+        _key_vars_for_registry = () if _pp.auth_type == "none" else (_api_key_vars or _pp.env_vars)
         PROVIDER_REGISTRY[_pp.name] = ProviderConfig(
             id=_pp.name,
             name=_pp.display_name or _pp.name,
             auth_type=_pp.auth_type,
             inference_base_url=_pp.base_url,
-            api_key_env_vars=_api_key_vars or (_pp.env_vars if _pp.auth_type == "api_key" else ()),
+            api_key_env_vars=_key_vars_for_registry,
             base_url_env_var=_base_url_var or "",
         )
         # Also register aliases so resolve_provider() resolves them

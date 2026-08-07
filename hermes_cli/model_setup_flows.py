@@ -2720,6 +2720,12 @@ def _model_flow_api_key_provider(config, provider_id, current_model=""):
     # Check / prompt for API key
     existing_key, existing_source = _existing_api_key_for_model_flow(provider_id, pconfig)
 
+    if is_noauth:
+        # auth_type="none": never send a credential even if a similarly-named
+        # env var exists — the endpoint rejects any Authorization header.
+        existing_key = ""
+        existing_source = ""
+
     if not is_noauth:
         existing_key, abort = _prompt_api_key(
             pconfig,
