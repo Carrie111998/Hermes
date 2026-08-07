@@ -14,7 +14,7 @@ _LEGACY_RESET_TARGETS = frozenset({"all", "memory", "user"})
 
 
 def _dispatch_memory_reset(args, *, legacy_handler: Callable):
-    """Route existing targets to the legacy handler and new targets safely."""
+    """Route existing targets to the legacy handler and conversation reset."""
     target = getattr(args, "target", "all")
     if target in _LEGACY_RESET_TARGETS:
         return legacy_handler(args)
@@ -53,7 +53,7 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     memory_sub.add_parser("off", help="Disable external provider (built-in only)")
     _reset_parser = memory_sub.add_parser(
         "reset",
-        help="Erase built-in memory and optional conversation history",
+        help="Erase built-in memory or persisted conversation history",
     )
     _reset_parser.add_argument(
         "--yes",
@@ -63,11 +63,11 @@ def build_memory_parser(subparsers, *, cmd_memory: Callable) -> None:
     )
     _reset_parser.add_argument(
         "--target",
-        choices=["all", "memory", "user", "conversations", "everything"],
+        choices=["all", "memory", "user", "conversations"],
         default="all",
         help=(
             "Which store to reset: 'all' (MEMORY.md + USER.md, default), "
-            "'memory', 'user', 'conversations', or 'everything'"
+            "'memory', 'user', or 'conversations'"
         ),
     )
     _reset_parser.set_defaults(
