@@ -11843,12 +11843,31 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             removed = old_servers - connected_servers
             reconnected = connected_servers & old_servers
 
+            # #80771: distinguish servers removed from config vs servers
+            # still in config that simply didn't reconnect (e.g. slow
+            # connect, disabled, or failed).
+            still_in_config: set = set()
+            truly_removed: set = set()
+            if removed:
+                try:
+                    from tools.mcp_tool import _load_mcp_config
+                    configured_names = set(_load_mcp_config().keys())
+                except Exception:
+                    configured_names = set()
+                still_in_config = removed & configured_names
+                truly_removed = removed - configured_names
+
             if reconnected:
                 print(f"  ♻️  Reconnected: {', '.join(sorted(reconnected))}")
             if added:
                 print(f"  ➕ Added: {', '.join(sorted(added))}")
-            if removed:
-                print(f"  ➖ Removed: {', '.join(sorted(removed))}")
+            if still_in_config:
+                print(
+                    f"  ⏳ Not connected (still in config): "
+                    f"{', '.join(sorted(still_in_config))}"
+                )
+            if truly_removed:
+                print(f"  ➖ Removed: {', '.join(sorted(truly_removed))}")
             if not connected_servers:
                 print("  No MCP servers connected.")
             else:
@@ -11890,8 +11909,13 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             change_parts = []
             if added:
                 change_parts.append(f"Added servers: {', '.join(sorted(added))}")
-            if removed:
-                change_parts.append(f"Removed servers: {', '.join(sorted(removed))}")
+            if truly_removed:
+                change_parts.append(f"Removed servers: {', '.join(sorted(truly_removed))}")
+            if still_in_config:
+                change_parts.append(
+                    f"Servers still in config but not connected: "
+                    f"{', '.join(sorted(still_in_config))}"
+                )
             if reconnected:
                 change_parts.append(f"Reconnected servers: {', '.join(sorted(reconnected))}")
             tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
