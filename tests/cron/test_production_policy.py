@@ -35,6 +35,17 @@ def _production_toolset_config():
     }
 
 
+def _patch_cron_tool_create(monkeypatch, replacement):
+    """Patch the create seam used by the model tool's runtime path."""
+    from cron import scheduler
+
+    monkeypatch.setattr(
+        scheduler,
+        "create_job_with_scheduler_registration",
+        replacement,
+    )
+
+
 def _mechanical_job(**overrides):
     value = {
         "id": "job-mechanical",
@@ -328,7 +339,7 @@ def test_cron_tool_pins_omitted_create_route_before_store_write(monkeypatch):
         "model": "gpt-5.6-sol",
     }
     create = Mock(return_value=stored)
-    monkeypatch.setattr(cronjob_tools, "create_job", create)
+    _patch_cron_tool_create(monkeypatch, create)
     monkeypatch.setattr(cronjob_tools, "_local_delivery_notice", lambda *_: None)
     result = json.loads(
         cronjob_tools.cronjob(
@@ -348,7 +359,7 @@ def test_cron_tool_rejects_explicit_alternate_create_route(monkeypatch):
     from tools import cronjob_tools
 
     create = Mock(side_effect=AssertionError("store write must not run"))
-    monkeypatch.setattr(cronjob_tools, "create_job", create)
+    _patch_cron_tool_create(monkeypatch, create)
     result = json.loads(
         cronjob_tools.cronjob(
             action="create",
@@ -380,7 +391,7 @@ def test_cron_tool_rejects_widening_or_bypass_delivery_before_store_write(
     from tools import cronjob_tools
 
     create = Mock(side_effect=AssertionError("store write must not run"))
-    monkeypatch.setattr(cronjob_tools, "create_job", create)
+    _patch_cron_tool_create(monkeypatch, create)
     result = json.loads(
         cronjob_tools.cronjob(
             action="create",
@@ -413,7 +424,7 @@ def test_cron_tool_empty_toolset_list_normalizes_to_exact_inheritance(
         "next_run_at": "2026-07-14T12:00:00+00:00",
     }
     create = Mock(return_value=stored)
-    monkeypatch.setattr(cronjob_tools, "create_job", create)
+    _patch_cron_tool_create(monkeypatch, create)
     monkeypatch.setattr(cronjob_tools, "_local_delivery_notice", lambda *_: None)
 
     result = json.loads(
@@ -455,7 +466,7 @@ def test_cron_tool_default_delivery_keeps_authenticated_public_origin(
         "next_run_at": "2026-07-14T12:00:00+00:00",
     }
     create = Mock(return_value=stored)
-    monkeypatch.setattr(cronjob_tools, "create_job", create)
+    _patch_cron_tool_create(monkeypatch, create)
     monkeypatch.setattr(cronjob_tools, "_origin_from_env", lambda: origin)
     monkeypatch.setattr(cronjob_tools, "_local_delivery_notice", lambda *_: None)
 
@@ -541,6 +552,37 @@ def test_store_boundary_rejects_raw_full_list_and_leaves_no_file(
             save_jobs([_agent_job(provider="openrouter", model="other")])
 
     assert not (tmp_path / "cron" / "jobs.json").exists()
+
+
+def test_store_boundary_validates_jobs_recovered_by_shrink_merge_before_staging(
+    monkeypatch,
+    tmp_path,
+):
+    import cron.jobs as jobs_module
+    from cron.jobs import save_jobs, use_cron_store
+
+    drifted = _agent_job(
+        id="job-drifted",
+        provider="openrouter",
+        model="other",
+    )
+    exact = _agent_job(id="job-exact")
+
+    with use_cron_store(tmp_path):
+        monkeypatch.setattr(production_policy, "_active", False)
+        save_jobs([drifted], replace=True)
+
+        monkeypatch.setattr(production_policy, "_active", True)
+        stage = Mock(side_effect=AssertionError("temp file must not be staged"))
+        monkeypatch.setattr(jobs_module.tempfile, "mkstemp", stage)
+
+        with pytest.raises(
+            production_policy.ProductionCronPolicyError,
+            match="production_cron_primary_route_not_exact",
+        ):
+            save_jobs([exact])
+
+        stage.assert_not_called()
 
 
 @pytest.mark.parametrize("operation", ["resume", "trigger"])
