@@ -495,3 +495,43 @@ class TestFeishuPortBindingConditional:
         assert connected == 0  # no error, just nothing connected
 
 
+
+
+class TestAdapterProfile:
+    """Slice 1.1R-B Task 10/11: adapters carry an immutable receiving-profile name."""
+
+    def test_adapter_stores_profile_immutably(self):
+        from gateway.config import PlatformConfig
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        cfg = PlatformConfig(enabled=True, token="123:abc")
+        adapter = TelegramAdapter(cfg, profile="default")
+        assert adapter.profile == "default"
+        with pytest.raises(AttributeError):
+            adapter.profile = "other"
+
+    def test_configure_profile_adapter_stamps_profile(self):
+        """gateway/run.py must stamp the profile onto every profile-scoped adapter."""
+        from gateway.config import Platform
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner.session_store = None
+        runner._busy_text_mode = "off"
+        runner._make_profile_message_handler = lambda p: None
+        runner._make_profile_fatal_error_handler = lambda p, pl: None
+        runner._handle_active_session_busy_message = None
+        runner._handle_reaction_event = None
+        runner._recover_telegram_topic_thread_id = None
+        runner._make_adapter_auth_check = lambda pl, profile_name=None: None
+
+        class _Adapter:
+            set_message_handler = lambda self, h: None
+            set_fatal_error_handler = lambda self, h: None
+            set_session_store = lambda self, s: None
+            set_busy_session_handler = lambda self, h: None
+            set_topic_recovery_fn = lambda self, f: None
+            set_authorization_check = lambda self, c: None
+
+        adapter = _Adapter()
+        runner._configure_profile_adapter(adapter, "reviewer", Platform.TELEGRAM)
+        assert adapter._profile == "reviewer"

@@ -614,6 +614,15 @@ class _PollingLifecycleAbort(RuntimeError):
     """Internal control flow for polling startup fenced by teardown."""
 
 
+def _active_profile_name() -> str:
+    """Process-active profile name, or "default" when profiles are unavailable."""
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+        return get_active_profile_name() or "default"
+    except Exception:
+        return "default"
+
+
 class TelegramAdapter(BasePlatformAdapter):
     """
     Telegram bot adapter.
@@ -700,8 +709,18 @@ class TelegramAdapter(BasePlatformAdapter):
         """Telegram measures message length in UTF-16 code units."""
         return utf16_len
 
-    def __init__(self, config: PlatformConfig):
+    @property
+    def profile(self) -> str:
+        """Receiving-profile name this adapter belongs to (read-only)."""
+        return self._profile
+
+    def __init__(self, config: PlatformConfig, *, profile: Optional[str] = None):
         super().__init__(config, Platform.TELEGRAM)
+        # Receiving-profile name. Stamped by gateway/run.py for secondary
+        # profiles; falls back to the process-active profile for the primary.
+        # Read-only via the `profile` property — capture event_ids are keyed on
+        # it, so it must not drift after construction.
+        self._profile: str = profile or _active_profile_name()
         self._app: Optional[Application] = None
         self._bot: Optional[Bot] = None
         self._webhook_mode: bool = False

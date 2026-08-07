@@ -13416,6 +13416,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             self._make_adapter_auth_check(platform, profile_name=profile_name)
         )
         adapter._busy_text_mode = self._busy_text_mode
+        # Receiving-profile stamp — capture ingress keys ledger event_ids on it.
+        adapter._profile = profile_name
 
     async def _run_secondary_profile_reconnect(
         self, profile_name: str, platform: Platform
