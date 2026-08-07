@@ -116,21 +116,15 @@ export function ApprovalModeMenuContent({ menu }: { menu: ApprovalModeMenuState 
     <>
       <DropdownMenuLabel>{menu.title}</DropdownMenuLabel>
       <DropdownMenuSeparator />
-      <DropdownMenuRadioGroup
-        onValueChange={value => menu.setMode(value as ApprovalMode)}
-        value={menu.mode}
-      >
+      <DropdownMenuRadioGroup onValueChange={value => menu.setMode(value as ApprovalMode)} value={menu.mode}>
         {APPROVAL_MODE_VALUES.map(value => (
-          <DropdownMenuRadioItem
-            className="items-start gap-2.5"
-            data-approval-mode={value}
-            key={value}
-            value={value}
-          >
+          <DropdownMenuRadioItem className="items-start gap-2.5" data-approval-mode={value} key={value} value={value}>
             <ApprovalModeGlyph className="mt-0.5 size-3.5" mode={value} />
             <span className="flex min-w-0 flex-col gap-0.5">
               <span className={cn('text-xs font-medium', approvalModeToneClass[value])}>{menu.labels[value]}</span>
-              <span className="text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{menu.descriptions[value]}</span>
+              <span className="text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">
+                {menu.descriptions[value]}
+              </span>
             </span>
           </DropdownMenuRadioItem>
         ))}
@@ -144,10 +138,7 @@ export function useApprovalModeStatusbarItem(profile: string, requestGateway: Ap
   const fullAccess = menu.mode === 'off'
 
   return {
-    className: cn(
-      approvalModeInteractiveToneClass[menu.mode],
-      fullAccess && 'bg-amber-500/10 hover:bg-amber-500/15'
-    ),
+    className: cn(approvalModeInteractiveToneClass[menu.mode], fullAccess && 'bg-amber-500/10 hover:bg-amber-500/15'),
     icon: <ApprovalModeGlyph className="size-3.5" mode={menu.mode} />,
     id: 'approval-mode',
     label: menu.labels[menu.mode],

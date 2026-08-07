@@ -123,7 +123,9 @@ export function formatModelStatusLabel(
 
   // Always surface the effort so the current reasoning level is visible at a
   // glance, not just when non-default.
-  sessionState.push(reasoningEffortLabel(options?.reasoningEffort || options?.defaultEffort || DEFAULT_REASONING_EFFORT))
+  sessionState.push(
+    reasoningEffortLabel(options?.reasoningEffort || options?.defaultEffort || DEFAULT_REASONING_EFFORT)
+  )
 
   return `${name} · ${[free ? 'Free' : '', sessionState.join(' ')].filter(Boolean).join(' · ')}`
 }

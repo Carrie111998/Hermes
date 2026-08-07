@@ -27,7 +27,13 @@ import {
 // it from here; the canonical definition lives in @/store/session.
 export { sessionMatchesStoredId }
 import { reportBackendContract, reportInstallMethodWarning } from '@/store/updates'
-import type { SessionCreateResponse, SessionInfo, SessionResumeResponse, SessionRuntimeInfo, UsageStats } from '@/types/hermes'
+import type {
+  SessionCreateResponse,
+  SessionInfo,
+  SessionResumeResponse,
+  SessionRuntimeInfo,
+  UsageStats
+} from '@/types/hermes'
 
 import type { ClientSessionState } from '../../../types'
 

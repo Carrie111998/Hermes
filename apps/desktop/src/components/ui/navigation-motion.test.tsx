@@ -43,9 +43,7 @@ describe('navigation motion boundaries', () => {
     render(
       <I18nProvider configClient={null}>
         <Sheet open>
-          <SheetContent showCloseButton={false}>
-            Sheet preview
-          </SheetContent>
+          <SheetContent showCloseButton={false}>Sheet preview</SheetContent>
         </Sheet>
       </I18nProvider>
     )
