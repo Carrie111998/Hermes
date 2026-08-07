@@ -96,6 +96,41 @@ class _CaptureTransport:
         return {"success": True, "message_id": "m1"}
 
 
+@pytest.mark.asyncio
+async def test_send_for_platform_preserves_uncertain_connector_result():
+    """Release reconciliation depends on the connector uncertainty signal."""
+    transport = _CaptureTransport()
+    transport._identities = [("discord", "release-edge")]
+
+    async def uncertain_send(action, *, platform=None):
+        transport.sent = action
+        transport.sent_platform = platform
+        return {
+            "success": False,
+            "error": "connector response lost",
+            "retryable": True,
+            "retry_after": 1.5,
+            "error_kind": "dispatch_uncertain",
+        }
+
+    transport.send_outbound = uncertain_send
+    adapter = RelayAdapter(
+        PlatformConfig(), make_desc(platform="discord"), transport=transport
+    )
+
+    result = await adapter.send_for_platform(
+        Platform.DISCORD,
+        "channel-1",
+        "release summary",
+        metadata={"scope_id": "guild-1"},
+    )
+
+    assert result.success is False
+    assert result.retryable is True
+    assert result.retry_after == 1.5
+    assert result.error_kind == "dispatch_uncertain"
+
+
 def _make_event(chat_id="chan-1", scope_id="scope-9"):
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource

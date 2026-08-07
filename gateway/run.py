@@ -14454,6 +14454,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 finally:
                     _clear_planned_restart_notification()
 
+        # Muncho release announcements are queued only after the external
+        # deploy coordinator has verified the exact active SHA and production
+        # smokes. Start this watcher after restart/startup lifecycle messages
+        # so a verified announcement is the next release lifecycle message.
+        # The watcher uses only the live Relay -> privileged Discord connector
+        # transport; it never loads a bot token or enables direct REST egress.
+        _muncho_release_state = (
+            Path(_hermes_home) / "state" / "private" / "muncho-release"
+        )
+        if _muncho_release_state.is_dir():
+            self._spawn_supervised(
+                self._muncho_release_announcement_watcher,
+                "muncho_release_announcement_watcher",
+            )
+
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
         # by the normal successful-turn path, so a failed auto-resume remains
@@ -26815,6 +26830,58 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except RuntimeError:
             logger.debug("Skipping update notification watcher: no running event loop")
+
+    async def _muncho_release_announcement_watcher(
+        self,
+        poll_interval: float = 1.0,
+    ) -> None:
+        """Deliver strict post-smoke release requests through the live relay."""
+
+        from hermes_cli.config import load_config_readonly
+        from ops.muncho.release.gateway_delivery import (
+            dispatch_pending_gateway_discord_deliveries,
+        )
+        from ops.muncho.release.metadata import resolve_exact_release_sha
+
+        state_dir = Path(_hermes_home) / "state" / "private" / "muncho-release"
+        previous_projection: tuple[tuple[str, str, str], ...] = ()
+        while self._running:
+            try:
+                deployed_sha = resolve_exact_release_sha()
+                if deployed_sha is not None:
+                    outcomes = await dispatch_pending_gateway_discord_deliveries(
+                        state_dir=state_dir,
+                        gateway_config=self.config,
+                        adapters=self.adapters,
+                        production_config=load_config_readonly() or {},
+                        deployed_release_sha=deployed_sha,
+                    )
+                    projection = tuple(
+                        (
+                            str(item.get("release_sha", ""))[:8],
+                            str(item.get("summary_sha256", "")),
+                            str(item.get("state", "")),
+                        )
+                        for item in outcomes
+                    )
+                    if projection and projection != previous_projection:
+                        logger.info(
+                            "Muncho release announcement edge: %s",
+                            ", ".join(
+                                f"{short}:{state}"
+                                for short, _digest, state in projection
+                            ),
+                        )
+                    previous_projection = projection
+            except Exception as exc:
+                projection = (("", "", f"error:{type(exc).__name__}"),)
+                if projection != previous_projection:
+                    logger.warning(
+                        "Muncho release announcement edge blocked: %s",
+                        type(exc).__name__,
+                    )
+                previous_projection = projection
+            await asyncio.sleep(poll_interval)
 
     async def _watch_update_progress(
         self,

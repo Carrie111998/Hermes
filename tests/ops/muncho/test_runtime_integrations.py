@@ -912,13 +912,22 @@ def test_release_announcement_is_after_exact_post_restart_health_only():
     active_health = run_deploy.index('systemctl is-active --quiet "$SERVICE"', restart)
     exact_readback = run_deploy.index('deployed_head="$(')
     exact_gate = run_deploy.index('if [ "$deployed_head" != "$sha" ]')
+    restart_prepare = run_deploy.index(
+        'prepare_muncho_restart_attestation',
+        reserve,
+    )
+    restart_complete = run_deploy.index(
+        'complete_muncho_restart_attestation',
+        exact_gate,
+    )
     announce = run_deploy.index(
         'release_announcement="$(announce_muncho_release_after_smoke'
     )
     cleanup = run_deploy.index('cleanup_output="$(cleanup_old_releases)"')
     deploy_pass = run_deploy.rindex('write_status "deploy_pass"')
 
-    assert reserve < restart < active_health < exact_readback < exact_gate < announce
+    assert reserve < restart_prepare < restart < active_health < exact_readback
+    assert exact_readback < exact_gate < restart_complete < announce
     assert announce < cleanup < deploy_pass
     assert (
         "announce_muncho_release_after_smoke"
@@ -1160,7 +1169,7 @@ def test_root_owned_release_parent_keeps_staging_and_publish_authority_at_root()
     assert 'sudo -n -u "$OWNER" mv -T "$tmp" "$new"' not in run_deploy
 
 
-def test_already_active_fast_path_only_reconciles_release_announcement():
+def test_already_active_fast_path_requires_restart_receipt_before_announcement():
     helper = RUNTIME / "muncho-auto-deploy-release"
     source = helper.read_text(encoding="utf-8")
     run_deploy = source[source.index("run_deploy() {") : source.index("main() {")]
@@ -1184,16 +1193,19 @@ def test_already_active_fast_path_only_reconciles_release_announcement():
     venv = fast_path.index('attest_target_release_venv "$active" "$active"')
     cutover = fast_path.index('cutover_artifacts_match "$active" "$sha"')
     reserve = fast_path.index('reserve_muncho_release_mapping "$active" "$sha"')
+    restart_receipt = fast_path.index('complete_muncho_restart_attestation')
     announce = fast_path.index('announce_muncho_release_after_smoke "$active" "$sha"')
     deploy_pass = fast_path.index('write_status "deploy_pass"')
     completed = fast_path.index("return 0", deploy_pass)
 
-    assert entrypoint < venv < cutover < reserve < announce < deploy_pass < completed
+    assert entrypoint < venv < cutover < reserve < restart_receipt
+    assert restart_receipt < announce < deploy_pass < completed
     assert "install_target_release_wheel" not in fast_path
     assert " pip " not in fast_path
     assert "ln -sfn" not in fast_path
     assert "mv -T" not in fast_path
     assert "systemctl restart" not in fast_path
+    assert "qualifying_restart_unattested" in fast_path
     assert '"already_active\\": true' in fast_path
     assert '"$release/.venv/bin/python" -I -B -P -s -' in venv_attestation
     assert cutover_attestation.count('"$release/.venv/bin/python" -I -B') == 1

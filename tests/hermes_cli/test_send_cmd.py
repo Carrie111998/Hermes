@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import io
 import json
+import sys
+import types
 
 import pytest
 
@@ -45,9 +47,6 @@ class _FakeTool:
 @pytest.fixture
 def fake_tool(monkeypatch):
     """Install a fake send_message_tool and return the stub for inspection."""
-    import sys
-    import types
-
     fake = _FakeTool({"success": True, "message_id": "m123"})
 
     mod = types.ModuleType("tools.send_message_tool")
@@ -62,6 +61,113 @@ def fake_tool(monkeypatch):
 # ---------------------------------------------------------------------------
 # Happy path
 # ---------------------------------------------------------------------------
+
+
+def test_real_discord_command_uses_discovered_standalone_sender_and_exact_id(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    """Exercise CLI -> tool -> discovered plugin -> Discord HTTP boundary.
+
+    This is the installed command contract that previously returned
+    ``No live adapter ... standalone_sender_fn`` when the sealed wheel omitted
+    Discord's plugin manifest.  The HTTP boundary is mocked; the registry and
+    command routing are real.
+    """
+    token = "test-discord-token-must-not-leak"
+    channel_id = "123456789012345678"
+    message_id = "987654321098765432"
+    requests = []
+
+    class _Response:
+        status = 200
+
+        async def json(self):
+            return {"id": message_id}
+
+        async def text(self):
+            return ""
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+    class _Session:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        def post(self, url, **kwargs):
+            requests.append((url, kwargs))
+            return _Response()
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setenv("DISCORD_BOT_TOKEN", token)
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+
+    # A production Muncho gateway must use its privileged relay.  This test is
+    # specifically the generic upstream standalone command contract.
+    from plugins.platforms.discord import adapter as discord_adapter
+    from tools import send_message_tool as send_tool_module
+
+    monkeypatch.setattr(
+        discord_adapter,
+        "_discord_public_only_policy_required",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        send_tool_module,
+        "_discord_privileged_connector_active",
+        lambda: False,
+    )
+    monkeypatch.setattr(
+        "gateway.channel_directory.is_discord_public_target",
+        lambda _target: True,
+    )
+    monkeypatch.setattr(
+        "gateway.channel_directory.lookup_channel_type",
+        lambda _platform, _target: "channel",
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "gateway.run",
+        types.SimpleNamespace(_gateway_runner_ref=lambda: None),
+    )
+    monkeypatch.setattr("aiohttp.ClientSession", _Session)
+
+    args = _parse(["--to", f"discord:{channel_id}", "--json", "release ready"])
+    with pytest.raises(SystemExit) as exc:
+        send_cmd.cmd_send(args)
+
+    captured = capsys.readouterr()
+    payload = json.loads(captured.out)
+    assert exc.value.code == 0
+    assert payload["success"] is True
+    assert payload["message_id"] == message_id
+    assert requests == [
+        (
+            f"https://discord.com/api/v10/channels/{channel_id}/messages",
+            {
+                "headers": {
+                    "Authorization": f"Bot {token}",
+                    "Content-Type": "application/json",
+                },
+                "json": {"content": "release ready"},
+            },
+        )
+    ]
+    assert token not in captured.out
+    assert token not in captured.err
 
 
 
@@ -232,5 +338,4 @@ def test_load_hermes_env_bridges_config_yaml_scalars(tmp_path, monkeypatch):
 
     assert os.environ.get("SOME_TOKEN") == "abc123"
     assert os.environ.get("TELEGRAM_HOME_CHANNEL") == "5550001111"
-
 

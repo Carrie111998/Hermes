@@ -8,14 +8,19 @@ from pathlib import Path
 from typing import Sequence
 
 from .completion import (
+    DELIVERY_SCHEMA,
     ReleaseCompletionError,
-    deliver_discord_once,
-    hermes_send_discord,
+    complete_restart_attestation,
+    deliver_discord_via_gateway_once,
     load_current_production_config,
     prepare_summary_draft,
+    prepare_restart_attestation,
+    record_codex_task_summary_and_finalize,
     record_production_smoke,
     release_health,
     release_status,
+    require_restart_attestation,
+    reserve_codex_task_summary,
     reserve_release_mapping,
 )
 from .metadata import (
@@ -45,12 +50,44 @@ def _parser() -> argparse.ArgumentParser:
     reserve.add_argument("--version")
     reserve.add_argument("--state-dir", type=Path, required=True)
 
+    restart_prepare = subparsers.add_parser("restart-prepare")
+    restart_prepare.add_argument("--release-root", type=Path)
+    restart_prepare.add_argument("--release-sha", required=True)
+    restart_prepare.add_argument("--state-dir", type=Path, required=True)
+    restart_prepare.add_argument("--service", required=True)
+    restart_prepare.add_argument("--before-invocation-id", required=True)
+
+    restart_complete = subparsers.add_parser("restart-complete")
+    restart_complete.add_argument("--release-root", type=Path)
+    restart_complete.add_argument("--release-sha", required=True)
+    restart_complete.add_argument("--state-dir", type=Path, required=True)
+    restart_complete.add_argument("--service", required=True)
+    restart_complete.add_argument("--after-invocation-id", required=True)
+
     announce = subparsers.add_parser("announce-after-smoke")
     announce.add_argument("--release-root", type=Path)
     announce.add_argument("--release-sha", required=True)
     announce.add_argument("--state-dir", type=Path, required=True)
     announce.add_argument("--production-config", type=Path, required=True)
     announce.add_argument("--check", action="append", required=True)
+
+    coordinator_prepare = subparsers.add_parser("coordinator-prepare")
+    coordinator_prepare.add_argument("--version", required=True)
+    coordinator_prepare.add_argument("--release-sha", required=True)
+    coordinator_prepare.add_argument("--state-dir", type=Path, required=True)
+    coordinator_prepare.add_argument("--task-id", required=True)
+
+    coordinator_complete = subparsers.add_parser("coordinator-complete")
+    coordinator_complete.add_argument("--version", required=True)
+    coordinator_complete.add_argument("--release-sha", required=True)
+    coordinator_complete.add_argument("--state-dir", type=Path, required=True)
+    coordinator_complete.add_argument("--task-id", required=True)
+    coordinator_complete.add_argument("--message-ref", required=True)
+    coordinator_complete.add_argument("--summary-sha256", required=True)
+    coordinator_complete.add_argument(
+        "--attempt-receipt-sha256",
+        required=True,
+    )
 
     for name in ("status", "health"):
         status = subparsers.add_parser(name)
@@ -92,6 +129,40 @@ def main(argv: Sequence[str] | None = None) -> int:
                 )
             )
             return 0
+        if arguments.command in {"restart-prepare", "restart-complete"}:
+            bundle = load_release_bundle(arguments.release_root)
+            version = str(bundle.metadata.version)
+            mapping = reserve_release_mapping(
+                arguments.state_dir,
+                bundle,
+                version=version,
+                release_sha=arguments.release_sha,
+            )
+            if arguments.command == "restart-prepare":
+                receipt = prepare_restart_attestation(
+                    arguments.state_dir,
+                    mapping,
+                    service_name=arguments.service,
+                    before_invocation_id=arguments.before_invocation_id,
+                )
+                receipt_kind = "attempt"
+            else:
+                receipt = complete_restart_attestation(
+                    arguments.state_dir,
+                    mapping,
+                    service_name=arguments.service,
+                    after_invocation_id=arguments.after_invocation_id,
+                )
+                receipt_kind = "attestation"
+            _emit({
+                "schema": "muncho-release-restart-receipt.v1",
+                "muncho_version": version,
+                "release_sha": mapping["release_sha"],
+                "release_sha_short": mapping["release_sha"][:8],
+                "receipt_kind": receipt_kind,
+                "restart_receipt_sha256": receipt["receipt_sha256"],
+            })
+            return 0
         if arguments.command == "announce-after-smoke":
             bundle = load_release_bundle(arguments.release_root)
             version = str(bundle.metadata.version)
@@ -106,9 +177,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 version=version,
                 release_sha=arguments.release_sha,
             )
+            restart = require_restart_attestation(arguments.state_dir, mapping)
             smoke = record_production_smoke(
                 arguments.state_dir,
                 mapping,
+                restart,
                 checks=arguments.check,
             )
             draft = prepare_summary_draft(
@@ -120,10 +193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                     arguments.production_config
                 ),
             )
-            delivery = deliver_discord_once(
+            delivery = deliver_discord_via_gateway_once(
                 arguments.state_dir,
                 draft,
-                sender=hermes_send_discord,
             )
             _emit({
                 "schema": "muncho-release-automatic-announcement.v1",
@@ -136,6 +208,66 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "discord_delivery_receipt_sha256": delivery["receipt_sha256"],
                 "summary": draft["summary"],
                 "release_completion": "codex_task_summary_pending",
+            })
+            return 0
+        if arguments.command == "coordinator-prepare":
+            draft, attempt, created = reserve_codex_task_summary(
+                arguments.state_dir,
+                version=arguments.version,
+                release_sha=arguments.release_sha,
+                task_id=arguments.task_id,
+            )
+            already_delivered = attempt.get("schema") == DELIVERY_SCHEMA
+            _emit({
+                "schema": "muncho-release-coordinator-summary.v1",
+                "muncho_version": draft["muncho_version"],
+                "release_sha": draft["release_sha"],
+                "release_sha_short": draft["release_sha"][:8],
+                "task_id": arguments.task_id,
+                "summary": draft["summary"],
+                "summary_sha256": draft["summary_sha256"],
+                "attempt_receipt_sha256": (
+                    attempt["attempt_receipt_sha256"]
+                    if already_delivered
+                    else attempt["receipt_sha256"]
+                ),
+                "delivery_state": (
+                    "delivered"
+                    if already_delivered
+                    else "reserved"
+                    if created
+                    else "reconciliation_required"
+                ),
+                "message_ref": (
+                    attempt["message_ref"] if already_delivered else None
+                ),
+                "release_completion": (
+                    "finalization_pending"
+                    if already_delivered
+                    else "codex_task_summary_pending"
+                ),
+            })
+            return 0
+        if arguments.command == "coordinator-complete":
+            codex, completion = record_codex_task_summary_and_finalize(
+                arguments.state_dir,
+                version=arguments.version,
+                release_sha=arguments.release_sha,
+                task_id=arguments.task_id,
+                message_ref=arguments.message_ref,
+                summary_sha256=arguments.summary_sha256,
+                attempt_receipt_sha256=arguments.attempt_receipt_sha256,
+            )
+            _emit({
+                "schema": "muncho-release-coordinator-completion.v1",
+                "muncho_version": completion["muncho_version"],
+                "release_sha": completion["release_sha"],
+                "release_sha_short": completion["release_sha"][:8],
+                "summary_sha256": completion["summary_sha256"],
+                "codex_task_delivery_receipt_sha256": codex["receipt_sha256"],
+                "completion_receipt_sha256": completion["receipt_sha256"],
+                "release_completion": "complete",
+                "healthy": True,
             })
             return 0
         projection = release_status if arguments.command == "status" else release_health
