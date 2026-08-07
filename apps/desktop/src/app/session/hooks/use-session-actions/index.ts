@@ -4,12 +4,14 @@ import type { NavigateFunction } from 'react-router'
 
 import { NO_PROJECT_ID } from '@/app/chat/sidebar/projects/workspace-groups'
 import { graftRefreshedTailOntoBackfill } from '@/app/chat/transcript-backfill'
+import { reconcileClientTurnState } from '@/app/session/turn-state'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { setWorkspaceScope } from '@/components/pane-shell/workspace-scope'
 import { deleteSession, getAllSessionMessages, getLatestSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
 import {
   type ChatMessage,
+  type GatewayEventPayload,
   preserveLocalAssistantErrors,
   restorePendingClarifyToolCall,
   settlePendingClarifyToolCall,
@@ -1509,6 +1511,24 @@ export function useSessionActions({
             ? resumed.turn_started_at * 1000
             : null
 
+        const turnSnapshot: GatewayEventPayload = { ...(resumed.info ?? {}) }
+
+        if (Object.hasOwn(resumed, 'running')) {
+          turnSnapshot.running = resumed.running
+        }
+
+        if (Object.hasOwn(resumed, 'turn_generation')) {
+          turnSnapshot.turn_generation = resumed.turn_generation
+        }
+
+        if (Object.hasOwn(resumed, 'turn_origin')) {
+          turnSnapshot.turn_origin = resumed.turn_origin
+        }
+
+        if (Object.hasOwn(resumed, 'turn_state_revision')) {
+          turnSnapshot.turn_state_revision = resumed.turn_state_revision
+        }
+
         const pendingClarifyProjection = pendingClarify
           ? restorePendingClarifyToolCall(messagesForView, pendingClarifyToolPayload(pendingClarify))
           : null
@@ -1524,45 +1544,54 @@ export function useSessionActions({
         const visibleMessagesForView =
           pendingClarifyProjection?.messages ?? clearedClarifyProjection?.messages ?? messagesForView
 
-        updateSessionState(
+        const resumedState = updateSessionState(
           resumed.session_id,
-          state => ({
-            ...state,
-            ...(runtimeInfo ?? {}),
-            messages: visibleMessagesForView,
-            busy: resumedRunning,
-            awaitingResponse: resumedRunning && !recoveredInFlightTail,
-            // Backend reported this turn running at resume time — live proof.
-            turnLive: state.turnLive || resumedRunning,
-            needsInput:
-              pendingApproval || Boolean(pendingClarify) || (clarifyAuthoritativelyAbsent ? false : state.needsInput),
-            adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
-            ...(inFlightRecovery.applied
-              ? {
-                  sawAssistantPayload: true,
-                  // Point live deltas at the recovered row when the backend is
-                  // still mid-turn; a settled recovery keeps the stream idle.
-                  streamId: resumedRunning ? inFlightRecovery.streamId : null,
-                  turnStartedAt: resumedRunning ? (inFlightRecovery.turnStartedAt ?? resumedTurnStartedAt) : null
-                }
-              : {
-                  turnStartedAt: resumedRunning && resumedTurnStartedAt !== null ? resumedTurnStartedAt : null
-                }),
-            ...(pendingClarifyProjection
-              ? {
-                  awaitingResponse: false,
-                  sawAssistantPayload: true,
-                  streamId: pendingClarifyProjection.streamId
-                }
-              : {}),
-            ...(clearedClarifyProjection
-              ? {
-                  streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
-                }
-              : {})
-          }),
+          state => {
+            const reconciled = reconcileClientTurnState(state, turnSnapshot, 'snapshot')
+            const turnState = reconciled.accepted ? reconciled.state : state
+
+            return {
+              ...turnState,
+              ...(runtimeInfo ?? {}),
+              messages: visibleMessagesForView,
+              busy: resumedRunning,
+              awaitingResponse: reconciled.accepted ? turnState.busy : resumedRunning && !recoveredInFlightTail,
+              // Backend reported this turn running at resume time — live proof.
+              turnLive: state.turnLive || resumedRunning,
+              needsInput:
+                pendingApproval ||
+                Boolean(pendingClarify) ||
+                (clarifyAuthoritativelyAbsent ? false : turnState.needsInput),
+              adoptedRunningTurn: state.adoptedRunningTurn || resumedRunning,
+              ...(inFlightRecovery.applied
+                ? {
+                    sawAssistantPayload: true,
+                    // Point live deltas at the recovered row when the backend is
+                    // still mid-turn; a settled recovery keeps the stream idle.
+                    streamId: resumedRunning ? inFlightRecovery.streamId : null,
+                    turnStartedAt: resumedRunning ? (inFlightRecovery.turnStartedAt ?? resumedTurnStartedAt) : null
+                  }
+                : {
+                    turnStartedAt: resumedRunning && resumedTurnStartedAt !== null ? resumedTurnStartedAt : null
+                  }),
+              ...(pendingClarifyProjection
+                ? {
+                    awaitingResponse: false,
+                    sawAssistantPayload: true,
+                    streamId: pendingClarifyProjection.streamId
+                  }
+                : {}),
+              ...(clearedClarifyProjection
+                ? {
+                    streamId: resumedRunning ? (clearedClarifyProjection.streamId ?? state.streamId) : null
+                  }
+                : {})
+            }
+          },
           storedSessionId
         )
+
+        resumedRunning = Boolean(resumedState.busy)
 
         // updateSessionState stages its view sync through requestAnimationFrame.
         // Commit the final, already-reconciled transcript now so resume has one

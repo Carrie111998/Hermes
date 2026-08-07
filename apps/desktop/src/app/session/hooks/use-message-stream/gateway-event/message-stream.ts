@@ -1,5 +1,6 @@
 import type { BillingBlock } from '@hermes/shared'
 
+import { reconcileClientTurnState } from '@/app/session/turn-state'
 import { burstVibeHearts } from '@/components/chat/vibe-hearts'
 import { translateNow } from '@/i18n'
 import { coerceGatewayText, coerceThinkingText } from '@/lib/chat-runtime'
@@ -14,7 +15,7 @@ import { flashPetActivity, markPetUnread, setPetActivity } from '@/store/pet'
 import { clearAllPrompts } from '@/store/prompts'
 import { providerWaitText, setSessionProviderWait } from '@/store/provider-wait'
 import { setCurrentUsage, setTurnStartedAt } from '@/store/session'
-import { pruneFinishedSessionSubagents } from '@/store/subagents'
+import { clearSessionSubagents } from '@/store/subagents'
 import { clearActiveSessionTodos } from '@/store/todos'
 
 import type { GatewayEventContext } from './types'
@@ -76,6 +77,7 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     finalizeInterimAssistantMessage,
     flushQueuedDeltas,
     nativeSubagentSessionsRef,
+    sessionInterrupted,
     sessionStateByRuntimeIdRef,
     updateSessionState
   } = deps
@@ -83,19 +85,6 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
   if (event.type === 'message.start') {
     if (!sessionId) {
       return true
-    }
-
-    flushQueuedDeltas(sessionId)
-    pruneFinishedSessionSubagents(sessionId)
-    setSessionCompacting(sessionId, false)
-    compactedTurnRef.current.delete(sessionId)
-    nativeSubagentSessionsRef.current.delete(sessionId)
-    // A fresh turn on this session optimistically clears its billing wall;
-    // if credits are still exhausted the next failure re-raises it.
-    clearBillingBlock(sessionId)
-
-    if (isActiveEvent) {
-      triggerHaptic('streamStart')
     }
 
     // Submit→accept latency: seedOptimistic armed the clock at Enter; this
@@ -107,6 +96,9 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
     if (typeof seededAt === 'number') {
       console.debug('[turn-accept-latency]', { sessionId, ms: Date.now() - seededAt })
     }
+
+    const startedAt = Date.now()
+    let accepted = false
 
     updateSessionState(sessionId, state => {
       // If the user clicked Stop (cancelRun set interrupted=true), don't
@@ -120,9 +112,16 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
         return state
       }
 
+      const reconciled = reconcileClientTurnState(state, payload, 'start')
+
+      if (!reconciled.accepted) {
+        return state
+      }
+
+      accepted = true
+
       return {
-        ...state,
-        busy: true,
+        ...reconciled.state,
         awaitingResponse: true,
         sawAssistantPayload: false,
         interrupted: false,
@@ -134,17 +133,31 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
         // here would hide the submit→accept round trip from the timer.
         // Backend-originated turns (queue drain elsewhere, goal follow-up)
         // have no seed and arm here.
-        turnStartedAt: state.turnStartedAt ?? Date.now()
+        turnStartedAt: state.turnStartedAt ?? startedAt
       }
     })
 
+    if (!accepted) {
+      return true
+    }
+
+    flushQueuedDeltas(sessionId)
+    clearSessionSubagents(sessionId)
+    setSessionCompacting(sessionId, false)
+    compactedTurnRef.current.delete(sessionId)
+    nativeSubagentSessionsRef.current.delete(sessionId)
+    // A fresh turn on this session optimistically clears its billing wall;
+    // if credits are still exhausted the next failure re-raises it.
+    clearBillingBlock(sessionId)
+
     if (isActiveEvent) {
+      triggerHaptic('streamStart')
       // Belt-and-suspenders mirror of the ACTIVE session's per-session
       // clock (the load-bearing mirror is the view-sync flush in
       // use-session-state-cache). Mirror the seeded value, not Date.now():
       // resetting to accept-time here would visibly snap the timer back
       // after the submit-time seed above already started it.
-      setTurnStartedAt(sessionStateByRuntimeIdRef.current.get(sessionId)?.turnStartedAt ?? Date.now())
+      setTurnStartedAt(sessionStateByRuntimeIdRef.current.get(sessionId)?.turnStartedAt ?? startedAt)
     }
 
     return true
@@ -316,6 +329,32 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       return true
     }
 
+    // A background internal completion (slash-command synthetic turn) carries
+    // its own turn_origin; its completion must not settle the foreground
+    // user turn's state — the revision/generation fence below rejects it.
+    const completedOrigin =
+      payload?.turn_origin === 'notification' || payload?.turn_origin === 'goal' || payload?.turn_origin === 'user'
+        ? payload.turn_origin
+        : null
+
+    let accepted = false
+
+    updateSessionState(sessionId, state => {
+      const reconciled = reconcileClientTurnState(state, payload, 'settle')
+
+      if (!reconciled.accepted) {
+        return state
+      }
+
+      accepted = true
+
+      return reconciled.state
+    })
+
+    if (!accepted) {
+      return true
+    }
+
     // Turn ended — drop any blocking prompt still open for THIS session
     // (e.g. interrupted, or the approval already resolved). Scoped to the
     // session so a background turn finishing can't wipe the active chat's
@@ -330,8 +369,14 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
 
     flushQueuedDeltas(sessionId)
 
-    // Keyed by session so only one window beeps when several are open.
-    playCompletionSound(sessionId)
+    // An interrupted foreground turn completed by a background notification
+    // turn must not replay the user-facing completion fanfare.
+    const suppressFeedback = sessionInterrupted(sessionId) && completedOrigin === 'notification'
+
+    if (!suppressFeedback) {
+      // Keyed by session so only one window beeps when several are open.
+      playCompletionSound(sessionId)
+    }
 
     const finalText = coerceGatewayText(payload?.text) || coerceGatewayText(payload?.rendered)
 
@@ -348,7 +393,16 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
           }
         : undefined
 
-    completeAssistantMessage(sessionId, finalText, payload?.response_previewed, failure, occurredAt)
+    completeAssistantMessage(
+      sessionId,
+      finalText,
+      {
+        responsePreviewed: payload?.response_previewed,
+        suppressFeedback,
+        failure
+      },
+      occurredAt
+    )
 
     // Structured billing wall forwarded by the gateway (out of credits /
     // payment required) — cache it + raise a billing-specific toast.
@@ -364,12 +418,14 @@ export function handleMessageStreamEvent(ctx: GatewayEventContext): boolean {
       // toolRunning/reasoning AND sets celebrate together) so no stray "run"
       // frame leaks to the sprite — including the popped-out overlay, which
       // mirrors each activity change. The jump runs ~2 loops, then settles.
-      flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      if (!suppressFeedback) {
+        flashPetActivity({ celebrate: true, reasoning: false, toolRunning: false }, 2200)
+      }
 
       // Light up the pet's mail icon if the user wasn't looking when the turn
       // finished — a glanceable "new message" hint on the popped-out overlay.
       // Cleared when they open the app via the mail icon or refocus the window.
-      if (typeof document !== 'undefined' && !document.hasFocus()) {
+      if (!suppressFeedback && typeof document !== 'undefined' && !document.hasFocus()) {
         markPetUnread()
       }
     }

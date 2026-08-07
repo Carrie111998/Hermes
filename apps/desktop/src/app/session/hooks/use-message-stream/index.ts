@@ -561,8 +561,15 @@ export function useMessageStream({
     (
       sessionId: string,
       text: string,
-      responsePreviewed?: boolean,
-      failure?: { error: string; partial: boolean; surface?: ErrorSurface | null },
+      {
+        responsePreviewed,
+        suppressFeedback,
+        failure
+      }: {
+        responsePreviewed?: boolean
+        suppressFeedback?: boolean
+        failure?: { error: string; partial: boolean; surface?: ErrorSurface | null }
+      } = {},
       occurredAt = Date.now() / 1000
     ) => {
       let shouldHydrate = false
@@ -772,12 +779,14 @@ export function useMessageStream({
         void hydrateFromStoredSession(3, completedState.storedSessionId, sessionId)
       }
 
-      dispatchNativeNotification({
-        body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
-        kind: 'turnDone',
-        sessionId,
-        title: translateNow('notifications.native.turnDoneTitle')
-      })
+      if (!suppressFeedback) {
+        dispatchNativeNotification({
+          body: text.slice(0, 140) || translateNow('notifications.native.turnDoneBody'),
+          kind: 'turnDone',
+          sessionId,
+          title: translateNow('notifications.native.turnDoneTitle')
+        })
+      }
     },
     [hydrateFromStoredSession, scheduleSessionsRefresh, updateSessionState]
   )
