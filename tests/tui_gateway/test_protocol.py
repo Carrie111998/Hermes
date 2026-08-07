@@ -349,6 +349,39 @@ def test_session_resume_returns_hydrated_messages(server, monkeypatch):
     ]
 
 
+def test_find_live_session_does_not_cross_profile_boundaries(server):
+    """A live session from one profile must not satisfy another profile lookup."""
+
+    shared_key = "shared-profile-session"
+
+    server._sessions["profile-a-live"] = {
+        "session_key": shared_key,
+        "profile_home": "/tmp/hermes/profile-a",
+        "agent": types.SimpleNamespace(model="test/model"),
+    }
+
+    server._sessions["profile-b-live"] = {
+        "session_key": shared_key,
+        "profile_home": "/tmp/hermes/profile-b",
+        "agent": types.SimpleNamespace(model="test/model"),
+    }
+
+    assert server._find_live_session_by_key(
+        shared_key,
+        "/tmp/hermes/profile-a",
+    ) == ("profile-a-live", server._sessions["profile-a-live"])
+
+    assert server._find_live_session_by_key(
+        shared_key,
+        "/tmp/hermes/profile-b",
+    ) == ("profile-b-live", server._sessions["profile-b-live"])
+
+    assert server._find_live_session_by_key(
+        shared_key,
+        "/tmp/hermes/profile-c",
+    ) is None
+
+
 def test_enforce_session_cap_evicts_oldest_detached_only(server, monkeypatch):
     """The LRU cap frees the least-recently-active DETACHED sessions when over
     the limit, and never a live-transport / running / mid-build one."""
