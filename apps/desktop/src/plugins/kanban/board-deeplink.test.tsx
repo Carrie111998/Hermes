@@ -144,6 +144,31 @@ describe('KanbanBoardPage deep link (?task=<id>)', () => {
     expect(fetchTask).not.toHaveBeenCalled()
   })
 
+  it('spends the param when the board fails to load, so a later board cannot be hit by it', async () => {
+    // First load blows up — the board never resolves, but the link must still
+    // be consumed. A stale ?task= left in the URL would fire against whatever
+    // board loads next in this same mounted page.
+    fetchBoard.mockRejectedValueOnce(new Error('board offline'))
+
+    renderPage('/kanban?task=t_abc123')
+
+    await waitFor(() => expect(fetchBoard).toHaveBeenCalled())
+    await act(async () => {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+    expect(fetchTask).not.toHaveBeenCalled()
+
+    // The board comes back (manual retry / board switch) — now containing the
+    // id. The consumed param must not resurrect the deep link: no drawer, no
+    // fetch, despite the id existing on the newly loaded board.
+    fetchBoard.mockResolvedValue(boardWith('t_abc123'))
+    await act(async () => {
+      queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
+      await new Promise(resolve => setTimeout(resolve, 50))
+    })
+    expect(fetchTask).not.toHaveBeenCalled()
+  })
+
   it('does not re-open a consumed deep link when the board refetches', async () => {
     fetchBoard.mockResolvedValue(boardWith('t_abc123'))
     fetchTask.mockResolvedValue(detailFor('t_abc123'))

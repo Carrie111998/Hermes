@@ -53,6 +53,7 @@ import {
   type CSSProperties,
   type DragEvent as ReactDragEvent,
   type ReactNode,
+  useCallback,
   useEffect,
   useMemo,
   useRef,
@@ -1107,13 +1108,38 @@ export function KanbanBoardPage() {
   // been handled, so a board refetch, a reload, or a board switch can never
   // re-open a drawer the user closed. A foreign id (other board, deleted,
   // archived) opens nothing — but the param is still dropped, so it can't
-  // leak onto a later board where the id happens to exist.
+  // leak onto a later board where the id happens to exist. A board that
+  // errors (or never resolves) also spends the param: otherwise a stale
+  // ?task= would survive the failed load and fire against the next board
+  // that loads in this same mounted page.
   const location = useLocation()
   const navigate = useNavigate()
   const deepLinkTask = useMemo(() => new URLSearchParams(location.search).get('task'), [location.search])
 
+  // Drop only `task`, preserving any other params the route may carry.
+  const stripTaskParam = useCallback(() => {
+    const params = new URLSearchParams(location.search)
+    params.delete('task')
+    const qs = params.toString()
+    navigate(qs ? `${location.pathname}?${qs}` : location.pathname, { replace: true })
+  }, [location.pathname, location.search, navigate])
+
   useEffect(() => {
-    if (!deepLinkTask || !board) {
+    if (!deepLinkTask) {
+      return
+    }
+
+    // Load failed: consume without opening — nothing to validate against,
+    // and the link is spent either way.
+    if (error) {
+      stripTaskParam()
+
+      return
+    }
+
+    // Still loading: keep the param so a slow board still opens the card
+    // when it resolves.
+    if (!board) {
       return
     }
 
@@ -1123,8 +1149,8 @@ export function KanbanBoardPage() {
       setOpenId(deepLinkTask)
     }
 
-    navigate(location.pathname, { replace: true })
-  }, [board, deepLinkTask, location.pathname, navigate])
+    stripTaskParam()
+  }, [board, deepLinkTask, error, stripTaskParam])
 
   // A new-task request raised from outside the page (⌘⌥N, the palette row).
   // The command navigates here and parks the lane; the page picks it up on
