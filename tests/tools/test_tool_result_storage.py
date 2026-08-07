@@ -18,6 +18,7 @@ from tools.tool_result_storage import (
     _resolve_storage_dir,
     _safe_result_filename,
     _write_to_sandbox,
+    enforce_recent_tool_tail_budget,
     enforce_turn_budget,
     generate_preview,
     maybe_persist_tool_result,
@@ -287,6 +288,108 @@ class TestEnforceTurnBudget:
     def test_empty_messages(self):
         result = enforce_turn_budget([], env=None, config=BudgetConfig(turn_budget=200_000))
         assert result == []
+
+
+class TestEnforceRecentToolTailBudget:
+    def test_spills_cumulative_tool_tail_since_latest_user(self):
+        """Many medium same-user-turn tool outputs must not stay inline forever.
+
+        Each result is below the normal per-result threshold, but together they
+        recreate the incident shape: a protected fresh tail dominated by tool
+        output that LCM cannot compact without losing the latest user anchor.
+        """
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "older task"},
+            {"role": "tool", "tool_call_id": "older", "content": "o" * 90_000},
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 70_000},
+            {"role": "assistant", "content": "thinking"},
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 65_000},
+            {"role": "tool", "tool_call_id": "t3", "content": "c" * 55_000},
+        ]
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=env,
+            config=BudgetConfig(turn_budget=120_000),
+        )
+
+        assert changed is True
+        # Older history is outside the latest-user protected tail and is left to
+        # the context engine rather than rewritten here.
+        assert messages[2]["content"] == "o" * 90_000
+        latest_tail_tool_chars = sum(
+            len(m["content"])
+            for m in messages[4:]
+            if m.get("role") == "tool"
+        )
+        assert latest_tail_tool_chars <= 120_000
+        assert sum(PERSISTED_OUTPUT_TAG in m.get("content", "") for m in messages[4:]) >= 1
+        env.execute.assert_called()
+
+    def test_returns_false_when_tail_under_budget(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 20_000},
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 20_000},
+        ]
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=None,
+            config=BudgetConfig(turn_budget=120_000),
+        )
+
+        assert changed is False
+        assert all(PERSISTED_OUTPUT_TAG not in m.get("content", "") for m in messages)
+
+    def test_ignores_synthetic_user_scaffolding_when_selecting_tail(self):
+        env = MagicMock()
+        env.execute.return_value = {"output": "", "returncode": 0}
+        messages = [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 70_000},
+            {
+                "role": "user",
+                "content": "[Your active task list was preserved across context compression]",
+                "_todo_snapshot_synthetic": True,
+            },
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 65_000},
+        ]
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=env,
+            config=BudgetConfig(turn_budget=120_000),
+        )
+
+        assert changed is True
+        assert sum(PERSISTED_OUTPUT_TAG in m.get("content", "") for m in messages) == 1
+
+    def test_does_not_accept_non_reducing_no_env_replacements(self):
+        messages = [
+            {"role": "user", "content": "current task"},
+            {"role": "tool", "tool_call_id": "t1", "content": "a" * 100},
+            {"role": "tool", "tool_call_id": "t2", "content": "b" * 100},
+            {"role": "tool", "tool_call_id": "t3", "content": "c" * 100},
+        ]
+        before = sum(len(m["content"]) for m in messages if m.get("role") == "tool")
+
+        changed = enforce_recent_tool_tail_budget(
+            messages,
+            env=None,
+            config=BudgetConfig(turn_budget=150),
+        )
+
+        after = sum(len(m["content"]) for m in messages if m.get("role") == "tool")
+        assert changed is False
+        assert after == before
+        assert all(PERSISTED_OUTPUT_TAG not in m.get("content", "") for m in messages)
 
 
 # ── Per-tool threshold integration ────────────────────────────────────

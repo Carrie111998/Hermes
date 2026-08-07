@@ -10,6 +10,7 @@ sys.modules.setdefault("firecrawl", types.SimpleNamespace(Firecrawl=object))
 sys.modules.setdefault("fal_client", types.SimpleNamespace())
 
 import run_agent
+from agent import conversation_loop as conversation_loop_module
 
 
 @pytest.fixture(autouse=True)
@@ -1321,6 +1322,11 @@ def test_run_conversation_compresses_mid_turn_before_output_budget_exhaustion(mo
     agent = _build_agent(monkeypatch)
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "enforce_recent_tool_tail_budget",
+        lambda *_args, **_kwargs: False,
+    )
 
     responses = [
         _codex_tool_call_response(),
@@ -1387,6 +1393,11 @@ def test_mid_turn_compaction_does_not_double_persist_in_place_rows(monkeypatch, 
 
     agent.context_compressor.context_length = 20_000
     agent.context_compressor.threshold_tokens = 20_000
+    monkeypatch.setattr(
+        conversation_loop_module,
+        "enforce_recent_tool_tail_budget",
+        lambda *_args, **_kwargs: False,
+    )
 
     agent._session_db = SessionDB()
     agent._ensure_db_session()

@@ -35,7 +35,7 @@ from agent.conversation_compression import (
     compression_skipped_due_to_lock,
     conversation_history_after_compression,
 )
-from agent.context_engine import automatic_compaction_status_message
+from agent.context_engine import ContextEngine, automatic_compaction_status_message
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
 from agent.turn_context import (
@@ -89,7 +89,9 @@ from agent.trajectory import has_incomplete_scratchpad
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from hermes_constants import PARTIAL_STREAM_STUB_ID
 from hermes_logging import set_session_context
+from tools.budget_config import DEFAULT_BUDGET, budget_for_context_window
 from tools.skill_provenance import set_current_write_origin
+from tools.tool_result_storage import enforce_recent_tool_tail_budget
 from utils import base_url_host_matches, env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -177,6 +179,15 @@ _LOCAL_PROCESSING_MODULES = frozenset({
 _API_CALL_MODULES = frozenset({
     "chat_completion_helpers",
 })
+
+
+def _budget_for_context_compressor(compressor: Any):
+    """Resolve tool-result budgets from a context compressor, with fallback."""
+    try:
+        context_length = getattr(compressor, "context_length", None)
+        return budget_for_context_window(int(context_length)) if context_length else DEFAULT_BUDGET
+    except Exception:
+        return DEFAULT_BUDGET
 
 
 def _apply_active_turn_redirect(agent: Any, messages: List[Dict[str, Any]], text: str) -> None:
@@ -1048,6 +1059,104 @@ def _compression_deferred_result(
         "compression_deferred": True,
         "session_id": agent.session_id,
     }
+
+
+def _fresh_tail_context_exhausted_result(
+    agent,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]],
+    api_call_count: int,
+    *,
+    attempted_tokens: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Return a terminal result when protected recent context cannot fit.
+
+    Context engines such as LCM may preserve a fresh tail verbatim.  When the
+    engine reports that even forced overflow recovery is still over its assembly
+    cap, retrying the same request only burns compression attempts and repeats
+    the provider overflow.  Stop immediately with a handoff/new-session hint.
+    """
+    try:
+        agent._flush_status_buffer()
+    except Exception:
+        pass
+    token_hint = f" (~{attempted_tokens:,} tokens)" if attempted_tokens else ""
+    agent._vprint(
+        f"{agent.log_prefix}❌ Protected recent context is still too large after forced compression{token_hint}.",
+        force=True,
+    )
+    agent._vprint(
+        f"{agent.log_prefix}   💡 Start a fresh session or create a concise handoff; older details remain recoverable through context tools.",
+        force=True,
+    )
+    logger.error(
+        "%sContext overflow recovery failed because the protected fresh tail still exceeds the safe assembly budget%s.",
+        agent.log_prefix,
+        token_hint,
+    )
+    agent._persist_session(messages, conversation_history)
+    _final = (
+        "Context recovery failed: the protected recent context/tool-output tail "
+        "is still too large to fit safely after compression. Start a fresh "
+        "session or ask for a concise handoff before continuing."
+    )
+    return {
+        "final_response": _final,
+        "messages": messages,
+        "completed": False,
+        "api_calls": api_call_count,
+        "error": _final,
+        "partial": True,
+        "failed": True,
+        "compression_exhausted": True,
+        "context_handoff_required": True,
+        "fresh_tail_exhausted": True,
+        "session_id": agent.session_id,
+    }
+
+
+def _context_engine_overflow_recovery_failed(agent) -> bool:
+    """Return whether the active context engine reports failed overflow recovery."""
+    _compressor = getattr(agent, "context_compressor", None)
+    _checker = getattr(_compressor, "overflow_recovery_failed", None)
+    if callable(_checker):
+        _class_checker = getattr(type(_compressor), "overflow_recovery_failed", None)
+        _instance_checker = getattr(_compressor, "__dict__", {}).get(
+            "overflow_recovery_failed"
+        )
+        if (
+            _instance_checker is not None
+            or (
+                _class_checker is not None
+                and _class_checker is not ContextEngine.overflow_recovery_failed
+            )
+        ):
+            try:
+                return bool(_checker())
+            except Exception:
+                logger.exception("context engine overflow_recovery_failed hook failed")
+                return False
+    # Compatibility for older plugin engines that predate the public hook.
+    return getattr(_compressor, "_last_overflow_recovery_failed", False) is True
+
+
+def _fresh_tail_context_exhausted_result_if_needed(
+    agent,
+    messages: List[Dict],
+    conversation_history: Optional[List[Dict]],
+    api_call_count: int,
+    *,
+    attempted_tokens: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    if not _context_engine_overflow_recovery_failed(agent):
+        return None
+    return _fresh_tail_context_exhausted_result(
+        agent,
+        messages,
+        conversation_history,
+        api_call_count,
+        attempted_tokens=attempted_tokens,
+    )
 
 
 def _rewrite_system_content_blocks(system_message: dict, effective: str) -> bool:
@@ -2076,14 +2185,53 @@ def run_conversation(
         # relative to a recent real provider prompt that fit under threshold
         # (schema overhead / post-compaction over-count, #36718); (2) skip
         # while a same-session compression-failure cooldown is active; (3) then
-        # should_compress() — reusing the canonical threshold_tokens (output
-        # room already reserved by _compute_threshold_tokens) and its summary-
-        # LLM cooldown + anti-thrash guards (#11529). compression_attempts is a
+        # should_compress_request_pressure() — reusing the canonical
+        # threshold_tokens (output room already reserved by
+        # _compute_threshold_tokens) and its summary-LLM cooldown + anti-thrash
+        # guards (#11529) via the default delegate.  The message-aware hook lets
+        # alternative engines combine host pressure with their own
+        # eligible-backlog/protected-tail rules, preventing no-op retries when
+        # the engine has no material it can compact. compression_attempts is a
         # hard per-turn backstop shared with the overflow error handlers.
         _compressor = agent.context_compressor
         _preflight_threshold = int(
             getattr(_compressor, "threshold_tokens", 0) or 0
         )
+        if (
+            len(messages) > 1
+            and _preflight_threshold > 0
+            and request_pressure_tokens >= _preflight_threshold
+        ):
+            _tail_budget_config = _budget_for_context_compressor(_compressor)
+            try:
+                from tools.terminal_tool import get_active_env
+                _tail_budget_env = get_active_env(effective_task_id)
+            except Exception:
+                _tail_budget_env = None
+            try:
+                _tool_tail_reduced = enforce_recent_tool_tail_budget(
+                    messages,
+                    env=_tail_budget_env,
+                    config=_tail_budget_config,
+                )
+            except Exception:
+                logger.exception("recent tool-tail budget enforcement failed")
+                _tool_tail_reduced = False
+            if _tool_tail_reduced:
+                logger.info(
+                    "Pre-API tool-tail budget enforcement reduced recent tool output before provider call: ~%s request tokens >= %s threshold",
+                    f"{request_pressure_tokens:,}",
+                    f"{_preflight_threshold:,}",
+                )
+                pending_moa_prepared_request = _moa_prepared_request
+                _last_preflight_pressure = None
+                api_call_count -= 1
+                agent._api_call_count = api_call_count
+                try:
+                    agent.iteration_budget.refund()
+                except Exception:
+                    pass
+                continue
         # A previous mid-turn preflight pass deliberately continued the loop so
         # API-only context and all sanitization could be rebuilt. Compare that
         # fully assembled request with the fully assembled request that caused
@@ -2112,21 +2260,47 @@ def run_conversation(
                 f"{_previous_preflight_pressure:,}",
                 f"{request_pressure_tokens:,}",
             )
-        _defer_preflight = getattr(
-            _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
-        )
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
-        if (
+        _preflight_deferred = False
+        _can_run_pre_api_compression = (
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
             and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
             and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
-        ):
+        )
+        if _can_run_pre_api_compression:
+            _defer_preflight = getattr(
+                _compressor, "should_defer_preflight_to_real_usage", lambda _t: False
+            )
+            _preflight_deferred = bool(_defer_preflight(request_pressure_tokens))
+            if _preflight_deferred:
+                _can_run_pre_api_compression = False
+        _request_pressure_eligible = False
+        if _can_run_pre_api_compression:
+            _request_pressure_hook = getattr(
+                _compressor, "should_compress_request_pressure", None
+            )
+            _request_pressure_decision = None
+            if callable(_request_pressure_hook):
+                try:
+                    _request_pressure_decision = _request_pressure_hook(
+                        messages,
+                        request_pressure_tokens,
+                    )
+                except Exception:
+                    logger.exception(
+                        "context engine should_compress_request_pressure failed; falling back to should_compress"
+                    )
+            if _request_pressure_decision is None:
+                _request_pressure_eligible = _compressor.should_compress(
+                    request_pressure_tokens
+                )
+            else:
+                _request_pressure_eligible = bool(_request_pressure_decision)
+        if _can_run_pre_api_compression and _request_pressure_eligible:
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
             compression_attempts += 1
@@ -2191,6 +2365,15 @@ def run_conversation(
                 if pending_moa_prepared_request is _moa_prepared_request:
                     pending_moa_prepared_request = None
             else:
+                _tail_exhausted = _fresh_tail_context_exhausted_result_if_needed(
+                    agent,
+                    messages,
+                    conversation_history,
+                    api_call_count,
+                    attempted_tokens=request_pressure_tokens,
+                )
+                if _tail_exhausted is not None:
+                    return _tail_exhausted
                 # Reset retry/empty-response state so the compacted request
                 # gets a fresh chance instead of inheriting stale recovery
                 # counters from the pre-compaction history.
@@ -2240,7 +2423,7 @@ def run_conversation(
             agent.compression_enabled
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
-            and not _defer_preflight(request_pressure_tokens)
+            and not _preflight_deferred
             and _compression_cooldown
         ):
             # Blocked by the summary-LLM cooldown. Surface a deduped warning
@@ -4837,6 +5020,17 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
+                    _tail_exhausted = _fresh_tail_context_exhausted_result_if_needed(
+                        agent,
+                        messages,
+                        conversation_history,
+                        api_call_count,
+                        attempted_tokens=estimate_request_tokens_rough(
+                            api_messages, tools=agent.tools or None
+                        ),
+                    )
+                    if _tail_exhausted is not None:
+                        return _tail_exhausted
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
@@ -5138,6 +5332,17 @@ def run_conversation(
                         return _compression_deferred_result(
                             agent, messages, api_call_count
                         )
+                    _tail_exhausted = _fresh_tail_context_exhausted_result_if_needed(
+                        agent,
+                        messages,
+                        conversation_history,
+                        api_call_count,
+                        attempted_tokens=estimate_request_tokens_rough(
+                            api_messages, tools=agent.tools or None
+                        ),
+                    )
+                    if _tail_exhausted is not None:
+                        return _tail_exhausted
                     conversation_history = conversation_history_after_compression(
                         agent, messages, conversation_history
                     )
