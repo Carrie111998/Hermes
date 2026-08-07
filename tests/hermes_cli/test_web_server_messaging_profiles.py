@@ -267,3 +267,40 @@ class TestMultiplexPortBindingGuard:
             )
             assert resp.status_code == 200
 
+
+
+class TestMessagingPlatformsThreadOffload:
+    """Regression (#77048): the per-platform liveness probes must be offloaded
+    from the FastAPI event-loop thread.
+
+    Each catalog entry's payload builder calls resolve_gateway_liveness()
+    (PID probing + file I/O); running ~32 of those synchronously on the
+    event-loop thread starved the loop for 6-12s and tripped Desktop's
+    15s readiness timeout. The endpoint must delegate the synchronous build
+    through run_in_threadpool — mirroring the /api/status topology pattern.
+    """
+
+    def test_payload_build_is_offloaded_via_threadpool(self, client, monkeypatch):
+        import threading
+
+        from starlette.concurrency import run_in_threadpool
+
+        from hermes_cli import web_server
+
+        captured = []
+
+        async def _spy_threadpool(fn, *a, **kw):
+            captured.append(threading.current_thread())
+            return fn(*a, **kw)
+
+        # The endpoint imports run_in_threadpool inside the function body, so
+        # patch at the source module the local import binds to.
+        import starlette.concurrency
+        monkeypatch.setattr(starlette.concurrency, "run_in_threadpool", _spy_threadpool)
+        # Real catalog + real payload builder: exercises the actual code path.
+        resp = client.get("/api/messaging/platforms")
+        assert resp.status_code == 200
+        platforms = resp.json()["platforms"]
+        assert platforms, "expected at least one platform payload"
+        # The endpoint must delegate through run_in_threadpool (spy captured it).
+        assert captured, "get_messaging_platforms did not delegate through run_in_threadpool"
