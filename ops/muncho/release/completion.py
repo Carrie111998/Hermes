@@ -1558,8 +1558,29 @@ def _load_release_completion_chain(
     discord = validate_delivery_receipt(
         _read(state / f"summary-discord-delivery-{suffix}.json")
     )
+    expected_identity = (
+        version,
+        release_sha,
+        release_idempotency_key(version, release_sha),
+    )
     if (
-        mapping["release_sha"] != release_sha
+        any(
+            (
+                record["muncho_version"],
+                record["release_sha"],
+                record["release_idempotency_key"],
+            )
+            != expected_identity
+            for record in (
+                mapping,
+                restart,
+                smoke,
+                draft,
+                gateway_request,
+                discord_attempt,
+                discord,
+            )
+        )
         or smoke["mapping_receipt_sha256"] != mapping["receipt_sha256"]
         or smoke["restart_attestation_receipt_sha256"]
         != restart["receipt_sha256"]

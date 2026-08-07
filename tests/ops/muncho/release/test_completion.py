@@ -808,6 +808,72 @@ def test_coordinator_cli_never_claims_delivery_before_explicit_ack(
     assert completed["healthy"] is True
 
 
+def test_coordinator_cli_rejects_release_records_copied_under_version_alias(
+    tmp_path: Path,
+    capsys,
+):
+    state, _mapping, _smoke, draft = _draft(tmp_path)
+    _record_gateway_delivery(state, draft)
+    source_version = "2.3.2"
+    alias_version = "9.9.9"
+    source_suffix = (
+        f"v{source_version}-"
+        f"{release_idempotency_key(source_version, RELEASE_SHA)[:20]}"
+    )
+    alias_suffix = (
+        f"v{alias_version}-"
+        f"{release_idempotency_key(alias_version, RELEASE_SHA)[:20]}"
+    )
+    alias_mapping = state / f"mapping-v{alias_version}.json"
+    alias_mapping.write_bytes(
+        (state / f"mapping-v{source_version}.json").read_bytes()
+    )
+    alias_mapping.chmod(0o600)
+    for source in state.glob(f"*{source_suffix}.json"):
+        alias = state / source.name.replace(source_suffix, alias_suffix)
+        alias.write_bytes(source.read_bytes())
+        alias.chmod(0o600)
+
+    task_id = "019fa801-52ca-7460-954d-30aee7053618"
+    common = [
+        "--version",
+        alias_version,
+        "--release-sha",
+        RELEASE_SHA,
+        "--state-dir",
+        str(state),
+        "--task-id",
+        task_id,
+    ]
+    assert cli.main(["coordinator-prepare", *common]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == (
+        "muncho_release_completion_binding_invalid"
+    )
+
+    _prepared, attempt, created = reserve_codex_task_summary(
+        state,
+        version=source_version,
+        release_sha=RELEASE_SHA,
+        task_id=task_id,
+        reserved_at=NOW,
+    )
+    assert created is True
+    assert cli.main([
+        "coordinator-complete",
+        *common,
+        "--message-ref",
+        "assistant-release-summary",
+        "--summary-sha256",
+        draft["summary_sha256"],
+        "--attempt-receipt-sha256",
+        attempt["receipt_sha256"],
+    ]) == 2
+    assert json.loads(capsys.readouterr().out)["error"] == (
+        "muncho_release_completion_binding_invalid"
+    )
+    assert not tuple(state.glob("completion-*.json"))
+
+
 def test_delivery_receipt_requires_a_persisted_matching_attempt(tmp_path: Path):
     state, _mapping, _smoke, draft = _draft(tmp_path)
     attempt, created = reserve_summary_delivery(
