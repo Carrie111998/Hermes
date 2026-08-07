@@ -173,3 +173,115 @@ def test_row_id_is_opt_in_and_never_reaches_the_provider(session, db):
     for message in db.get_messages_as_conversation(key, include_row_ids=True):
         assert "_row_id" in message
         assert all(not k.startswith("_") or k == "_row_id" for k in message)
+
+
+def test_react_tool_gate_requires_opt_in(monkeypatch, tmp_path):
+    """Off by default — even a desktop-spawned backend must not see the tool."""
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: False)
+    monkeypatch.setattr(mod, "_desktop_session_context", lambda: True)
+
+    assert mod.check_react_requirements() is False
+
+
+def test_react_tool_gate_local_desktop_env(monkeypatch):
+    """Local Electron child: HERMES_DESKTOP=1 + opt-in → tool available."""
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.setenv("HERMES_DESKTOP", "1")
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: True)
+
+    assert mod.check_react_requirements() is True
+
+
+def test_react_tool_gate_remote_desktop_session_source(monkeypatch, tmp_path):
+    """MBA → shared dashboard: no HERMES_DESKTOP, but session source=desktop."""
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: True)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = db.create_session("desktop-remote", "desktop")
+
+    monkeypatch.setattr(
+        mod,
+        "get_session_env",
+        lambda key, default="": sid if key in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY") else default,
+    )
+    monkeypatch.setattr(mod, "_open_session_db", lambda: db)
+
+    assert mod._desktop_session_context() is True
+    assert mod.check_react_requirements() is True
+
+
+def test_react_tool_gate_rejects_non_desktop_session(monkeypatch, tmp_path):
+    """Opt-in alone must not expose the tool on messaging/CLI sessions."""
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: True)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = db.create_session("imessage-chat", "bluebubbles")
+
+    monkeypatch.setattr(
+        mod,
+        "get_session_env",
+        lambda key, default="": sid if key in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY") else default,
+    )
+    monkeypatch.setattr(mod, "_open_session_db", lambda: db)
+
+    assert mod._desktop_session_context() is False
+    assert mod.check_react_requirements() is False
+
+
+def test_react_tool_gate_serve_backend_session_source_env(monkeypatch, tmp_path):
+    """Current desktop app (serve backend): no HERMES_DESKTOP and the DB row
+    carries the webui platform label — but the backend binds
+    HERMES_SESSION_SOURCE=desktop for the turn, so the tool must be available.
+    """
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: True)
+    monkeypatch.setattr(
+        mod,
+        "get_session_env",
+        lambda key, default="": "desktop" if key == "HERMES_SESSION_SOURCE" else default,
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session("serve-desktop", "webui")
+    monkeypatch.setattr(mod, "_open_session_db", lambda: db)
+
+    assert mod._desktop_session_context() is True
+    assert mod.check_react_requirements() is True
+
+
+def test_react_tool_gate_rejects_webui_session_without_desktop_marker(monkeypatch, tmp_path):
+    """Browser WebUI sessions are also source='webui' but get no desktop marker
+    — the tool must stay gated off there."""
+    from tools import react_to_message_tool as mod
+
+    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(mod, "_message_reactions_opted_in", lambda: True)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    sid = db.create_session("browser-webui", "webui")
+
+    monkeypatch.setattr(
+        mod,
+        "get_session_env",
+        lambda key, default="": sid if key in ("HERMES_SESSION_ID", "HERMES_SESSION_KEY") else default,
+    )
+    monkeypatch.setattr(mod, "_open_session_db", lambda: db)
+
+    assert mod._desktop_session_context() is False
+    assert mod.check_react_requirements() is False

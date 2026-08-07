@@ -89,15 +89,8 @@ def react_to_message_tool(emoji: str, message_row_id=None, messages_back=None) -
     )
 
 
-def check_react_requirements() -> bool:
-    """Desktop GUI only, and opt-in.
-
-    HERMES_DESKTOP is set on the gateway the app spawns; the feature itself is
-    off by default and enabled from Settings → Appearance (the desktop mirrors
-    the toggle into ``display.message_reactions``).
-    """
-    if not env_var_enabled("HERMES_DESKTOP"):
-        return False
+def _message_reactions_opted_in() -> bool:
+    """True when Settings → Appearance reactions (or config) is on."""
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -105,6 +98,57 @@ def check_react_requirements() -> bool:
     except Exception:
         return False
     return isinstance(display, dict) and bool(display.get("message_reactions", False))
+
+
+def _desktop_session_context() -> bool:
+    """True when this turn is a Desktop chat (local child or remote client).
+
+    Local Electron sets ``HERMES_DESKTOP=1`` on the backend it spawns. Remote
+    Desktop (e.g. MBA → mini dashboard :9120) does **not** — the shared
+    launchd dashboard has no that env — but sessions are still recorded with
+    ``source='desktop'``. Without this branch the react tool stays gated off
+    for the remote-gateway layout even when the user opted in.
+
+    One more shape (2026-08): the current desktop app spawns ``hermes serve``
+    for its chat backend, which — unlike the legacy dashboard spawn and the
+    remote-SSH spawn — sets neither ``HERMES_DESKTOP`` nor records
+    ``source='desktop'`` (sessions carry the ``webui`` platform label). What
+    it *does* bind for every desktop turn is ``HERMES_SESSION_SOURCE=desktop``
+    (see gateway/session_context.py — the same marker CLI/TUI sessions use).
+    Check that before falling back to the DB.
+    """
+    if env_var_enabled("HERMES_DESKTOP"):
+        return True
+    if get_session_env("HERMES_SESSION_SOURCE", "").lower() == "desktop":
+        return True
+    try:
+        sid = get_session_env("HERMES_SESSION_ID", "") or get_session_env(
+            "HERMES_SESSION_KEY", ""
+        )
+        if not sid:
+            return False
+        db = _open_session_db()
+        if db is None:
+            return False
+        sess = db.get_session(sid) if hasattr(db, "get_session") else None
+        if isinstance(sess, dict):
+            return (sess.get("source") or "").lower() == "desktop"
+        # Some SessionDB builds expose attribute access / row mapping
+        source = getattr(sess, "source", None) if sess is not None else None
+        return str(source or "").lower() == "desktop"
+    except Exception:
+        return False
+
+
+def check_react_requirements() -> bool:
+    """Desktop chat only, and opt-in.
+
+    Feature is off by default; Settings → Appearance mirrors the toggle into
+    ``display.message_reactions``. Surface gate: local Desktop backend
+    (``HERMES_DESKTOP``) **or** a session with ``source=desktop`` (remote
+    Desktop clients on a shared dashboard).
+    """
+    return _message_reactions_opted_in() and _desktop_session_context()
 
 
 REACT_TO_MESSAGE_SCHEMA = {
