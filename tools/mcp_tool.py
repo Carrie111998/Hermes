@@ -135,9 +135,137 @@ def _canonical_profile_home() -> str:
     return str(Path(get_hermes_home()).expanduser().resolve())
 
 
+def _active_profile_home_or_none() -> Optional[str]:
+    """Return the active owner, or None for an unscoped multiplex caller."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            from hermes_constants import get_hermes_home_override
+
+            override = get_hermes_home_override()
+            if not override:
+                return None
+            return _normalize_profile_home(override)
+        return _canonical_profile_home()
+    except Exception:
+        # An unresolved owner must never fall back to another profile's
+        # process-default MCP runtime.
+        return None
+
+
 def _normalize_profile_home(profile_home: str) -> str:
     """Normalize a captured profile-home value without consulting context."""
     return str(Path(profile_home).expanduser().resolve())
+
+
+MCPServerKey = Tuple[str, str]
+
+
+def _server_key(
+    server_name: str,
+    profile_home: Optional[str] = None,
+) -> MCPServerKey:
+    """Return the canonical runtime owner for one profile's named server."""
+    owner = (
+        _normalize_profile_home(profile_home)
+        if profile_home is not None
+        else _canonical_profile_home()
+    )
+    return owner, server_name
+
+
+class _ProfileServerDict(dict):
+    """Tuple-keyed runtime map with an active-profile string convenience API."""
+
+    @staticmethod
+    def _key(key):
+        return _server_key(key) if isinstance(key, str) else key
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __setitem__(self, key, value):
+        return super().__setitem__(self._key(key), value)
+
+    def get(self, key, default=None):
+        return super().get(self._key(key), default)
+
+    def pop(self, key, *args):
+        return super().pop(self._key(key), *args)
+
+    def setdefault(self, key, default=None):
+        return super().setdefault(self._key(key), default)
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        return super().update({self._key(k): v for k, v in incoming.items()})
+
+
+class _ProfileServerSet(set):
+    """Tuple-keyed runtime set with active-profile string membership helpers."""
+
+    @staticmethod
+    def _key(key):
+        return _server_key(key) if isinstance(key, str) else key
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+    def add(self, key):
+        return super().add(self._key(key))
+
+    def discard(self, key):
+        return super().discard(self._key(key))
+
+    def update(self, *iterables):
+        for iterable in iterables:
+            super().update(self._key(item) for item in iterable)
+
+    def difference_update(self, *iterables):
+        for iterable in iterables:
+            super().difference_update(self._key(item) for item in iterable)
+
+
+class _ProfileToolServerDict(dict):
+    """Profile-keyed MCP tool provenance with active-profile string helpers."""
+
+    @staticmethod
+    def _key(key):
+        if isinstance(key, str):
+            return _canonical_profile_home(), key
+        return key
+
+    @staticmethod
+    def _value(value):
+        if isinstance(value, str):
+            return _server_key(value)
+        return value
+
+    def __contains__(self, key):
+        return super().__contains__(self._key(key))
+
+    def __getitem__(self, key):
+        return super().__getitem__(self._key(key))
+
+    def __setitem__(self, key, value):
+        return super().__setitem__(self._key(key), self._value(value))
+
+    def get(self, key, default=None):
+        return super().get(self._key(key), default)
+
+    def pop(self, key, *args):
+        return super().pop(self._key(key), *args)
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        return super().update({
+            self._key(k): self._value(v)
+            for k, v in incoming.items()
+        })
 
 
 def _server_profile_home(server: "MCPServerTask") -> str:
@@ -2229,6 +2357,7 @@ class MCPServerTask:
             # notifications. Tools absent from the fresh list are no longer
             # callable, so remove only those stale registry entries first.
             toolset_name = f"mcp-{self.name}"
+            profile_home = _server_profile_home(self)
             stale_tool_names = old_tool_names - {
                 mcp_prefixed_tool_name(self.name, tool.name)
                 for tool in new_mcp_tools
@@ -2236,10 +2365,13 @@ class MCPServerTask:
             for tool_name in stale_tool_names:
                 # Never let one server's refresh remove a colliding name that
                 # is currently owned by another server.
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                if registry.get_toolset_for_tool(
+                    tool_name,
+                    profile_home=profile_home,
+                ) != toolset_name:
                     continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+                registry.deregister(tool_name, profile_home=profile_home)
+                _forget_mcp_tool_server(tool_name, profile_home)
 
             # 3. Re-register with the fresh list. The helper may skip names that
             # are ambiguous after normalization.
@@ -2254,10 +2386,13 @@ class MCPServerTask:
             # collision-checked registration set no longer owns.
             registered_name_set = set(registered_names)
             for tool_name in old_tool_names - registered_name_set:
-                if registry.get_toolset_for_tool(tool_name) != toolset_name:
+                if registry.get_toolset_for_tool(
+                    tool_name,
+                    profile_home=profile_home,
+                ) != toolset_name:
                     continue
-                registry.deregister(tool_name)
-                _forget_mcp_tool_server(tool_name)
+                registry.deregister(tool_name, profile_home=profile_home)
+                _forget_mcp_tool_server(tool_name, profile_home)
             self._registered_tool_names = registered_names
 
             # 4. Log what changed (user-visible notification)
@@ -2655,7 +2790,7 @@ class MCPServerTask:
                     # Session is live again: clear any breaker state from a
                     # prior outage so the first call after recovery isn't
                     # gated on a stale consecutive-failure count (#16788).
-                    _reset_server_error(self.name)
+                    _reset_server_error(_server_key(self.name, _server_profile_home(self)))
                     # A completed handshake alone is NOT proof of health: a
                     # flapping transport can handshake fine and drop moments
                     # later, forever (#62212). The session must prove itself
@@ -3000,7 +3135,7 @@ class MCPServerTask:
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
+                        _reset_server_error(_server_key(self.name, _server_profile_home(self)))
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
@@ -3063,7 +3198,7 @@ class MCPServerTask:
                             # Session is live again: clear any breaker state from
                             # a prior outage so the first call after recovery
                             # isn't gated on a stale failure count (#16788).
-                            _reset_server_error(self.name)
+                            _reset_server_error(_server_key(self.name, _server_profile_home(self)))
                             # Unproven until keepalive/tool-call success (#62212).
                             self._session_proven = False
                             reason = await self._wait_for_lifecycle_event()
@@ -3101,7 +3236,7 @@ class MCPServerTask:
                         # Session is live again: clear any breaker state from a
                         # prior outage so the first call after recovery isn't
                         # gated on a stale consecutive-failure count (#16788).
-                        _reset_server_error(self.name)
+                        _reset_server_error(_server_key(self.name, _server_profile_home(self)))
                         # Unproven until keepalive/tool-call success (#62212).
                         self._session_proven = False
                         reason = await self._wait_for_lifecycle_event()
@@ -3162,9 +3297,10 @@ class MCPServerTask:
         """
         if self._registered_tool_names:
             return
+        server_key = _server_key(self.name, _server_profile_home(self))
         if not self._ready.is_set():
             with _lock:
-                if _servers.get(self.name) is not self:
+                if _servers.get(server_key) is not self:
                     return
         self._registered_tool_names = _register_server_tools(
             self.name, self, self._config
@@ -3173,8 +3309,8 @@ class MCPServerTask:
         # recovered: drop its stale connect error so status surfaces stop
         # reporting it as failed.
         with _lock:
-            if _servers.get(self.name) is self:
-                _server_connect_errors.pop(self.name, None)
+            if _servers.get(server_key) is self:
+                _server_connect_errors.pop(server_key, None)
 
     async def run(self, config: dict):
         """Long-lived coroutine: connect, discover tools, wait, disconnect.
@@ -3628,9 +3764,10 @@ class MCPServerTask:
         """
         from tools.registry import registry
 
+        profile_home = _server_profile_home(self)
         for tool_name in list(getattr(self, "_registered_tool_names", [])):
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
+            registry.deregister(tool_name, profile_home=profile_home)
+            _forget_mcp_tool_server(tool_name, profile_home)
         self._registered_tool_names = []
 
     async def _wait_for_lazy_reconnect(self) -> None:
@@ -3656,23 +3793,15 @@ class MCPServerTask:
 # Module-level state
 # ---------------------------------------------------------------------------
 
-_servers: Dict[str, MCPServerTask] = {}
-_server_connecting: set[str] = set()
-_server_connect_errors: Dict[str, str] = {}
+_servers: Dict[MCPServerKey, MCPServerTask] = _ProfileServerDict()
+_server_connecting: set[MCPServerKey] = _ProfileServerSet()
+_server_connect_errors: Dict[MCPServerKey, str] = _ProfileServerDict()
 # Lazy MCP startup (#56832): servers whose tools were registered from the
 # on-disk schema cache without spawning/connecting. Keyed by server name;
 # entries are popped once a real connection is established on first use.
-_lazy_server_configs: Dict[str, dict] = {}
-_lazy_server_fingerprints: Dict[str, str] = {}
-_lazy_server_tool_names: Dict[str, List[str]] = {}
-# Profile provenance captured when a lazy manifest is registered. This is
-# separate from the config snapshot because the same server name may be
-# explicitly re-registered under another profile in this name-keyed runtime.
-_lazy_server_profile_homes: Dict[str, str] = {}
-# Owner for connecting/failed servers that do not yet have an MCPServerTask.
-# Connected ownership lives on MCPServerTask itself; this map is status
-# bookkeeping for the pre-task lifecycle states.
-_server_profile_homes: Dict[str, str] = {}
+_lazy_server_configs: Dict[MCPServerKey, dict] = _ProfileServerDict()
+_lazy_server_fingerprints: Dict[MCPServerKey, str] = _ProfileServerDict()
+_lazy_server_tool_names: Dict[MCPServerKey, List[str]] = _ProfileServerDict()
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -3700,13 +3829,13 @@ _connect_server_claim: contextvars.ContextVar[
 # server is retried on a backoff schedule instead of on every worker
 # session -- isolating it from the rest of the bridge. A successful
 # connection clears the state.
-_server_connect_retry_after: Dict[str, float] = {}   # name -> monotonic deadline
-_server_connect_failures: Dict[str, int] = {}        # name -> consecutive failures
+_server_connect_retry_after: Dict[MCPServerKey, float] = _ProfileServerDict()
+_server_connect_failures: Dict[MCPServerKey, int] = _ProfileServerDict()
 _CONNECT_RETRY_BASE_BACKOFF_SEC = 30.0
 _CONNECT_RETRY_MAX_BACKOFF_SEC = 600.0
 
 
-def _record_connect_failure(server_name: str) -> None:
+def _record_connect_failure(server_key: MCPServerKey) -> None:
     """Stamp an exponential-backoff cooldown after a failed connect.
 
     Called (under ``_lock``) when a server fails its discovery/connect
@@ -3715,24 +3844,24 @@ def _record_connect_failure(server_name: str) -> None:
     so a permanently-broken server settles into infrequent retries
     rather than a tight respawn loop.
     """
-    n = _server_connect_failures.get(server_name, 0) + 1
-    _server_connect_failures[server_name] = n
+    n = _server_connect_failures.get(server_key, 0) + 1
+    _server_connect_failures[server_key] = n
     backoff = min(
         _CONNECT_RETRY_BASE_BACKOFF_SEC * (2 ** (n - 1)),
         _CONNECT_RETRY_MAX_BACKOFF_SEC,
     )
-    _server_connect_retry_after[server_name] = time.monotonic() + backoff
+    _server_connect_retry_after[server_key] = time.monotonic() + backoff
 
 
-def _clear_connect_failure(server_name: str) -> None:
+def _clear_connect_failure(server_key: MCPServerKey) -> None:
     """Clear the connect-cooldown state after a successful connection."""
-    _server_connect_failures.pop(server_name, None)
-    _server_connect_retry_after.pop(server_name, None)
+    _server_connect_failures.pop(server_key, None)
+    _server_connect_retry_after.pop(server_key, None)
 
 
-def _connect_cooldown_active(server_name: str) -> bool:
+def _connect_cooldown_active(server_key: MCPServerKey) -> bool:
     """Return True if ``server_name`` is still within its retry cooldown."""
-    deadline = _server_connect_retry_after.get(server_name)
+    deadline = _server_connect_retry_after.get(server_key)
     return deadline is not None and time.monotonic() < deadline
 
 # Circuit breaker: consecutive error counts per server.  After
@@ -3752,8 +3881,8 @@ def _connect_cooldown_active(server_name: str) -> bool:
 # the breaker most recently transitioned into the open state. Use the
 # ``_bump_server_error`` / ``_reset_server_error`` helpers to mutate
 # this state — they keep the count and timestamp in sync.
-_server_error_counts: Dict[str, int] = {}
-_server_breaker_opened_at: Dict[str, float] = {}
+_server_error_counts: Dict[MCPServerKey, int] = _ProfileServerDict()
+_server_breaker_opened_at: Dict[MCPServerKey, float] = _ProfileServerDict()
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
 
@@ -3902,28 +4031,28 @@ def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
     )
 
 
-def _bump_server_error(server_name: str) -> None:
-    """Increment the consecutive-failure count for ``server_name``.
+def _bump_server_error(server_key: MCPServerKey) -> None:
+    """Increment the consecutive-failure count for ``server_key``.
 
     When the count crosses :data:`_CIRCUIT_BREAKER_THRESHOLD`, stamp the
     breaker-open timestamp so the cooldown clock starts (or re-starts,
     for probe failures in the half-open state).
     """
-    n = _server_error_counts.get(server_name, 0) + 1
-    _server_error_counts[server_name] = n
+    n = _server_error_counts.get(server_key, 0) + 1
+    _server_error_counts[server_key] = n
     if n >= _CIRCUIT_BREAKER_THRESHOLD:
-        _server_breaker_opened_at[server_name] = time.monotonic()
+        _server_breaker_opened_at[server_key] = time.monotonic()
 
 
-def _reset_server_error(server_name: str) -> None:
-    """Fully close the breaker for ``server_name``.
+def _reset_server_error(server_key: MCPServerKey) -> None:
+    """Fully close the breaker for ``server_key``.
 
     Clears both the failure count and the breaker-open timestamp. Call
     this on any unambiguous success signal (successful tool call,
     successful reconnect, manual /mcp refresh).
     """
-    _server_error_counts[server_name] = 0
-    _server_breaker_opened_at.pop(server_name, None)
+    _server_error_counts[server_key] = 0
+    _server_breaker_opened_at.pop(server_key, None)
 
 
 def _signal_reconnect(server: Any) -> bool:
@@ -3955,8 +4084,12 @@ def _signal_reconnect(server: Any) -> bool:
 
 def reconnect_mcp_server(server_name: str) -> bool:
     """Ask a currently-live MCP server to rebuild after external re-auth."""
+    profile_home = _active_profile_home_or_none()
+    if profile_home is None:
+        return False
+    server_key = _server_key(server_name, profile_home)
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(server_key)
     if server is None:
         return False
     return _signal_reconnect(server)
@@ -4116,7 +4249,7 @@ def _is_auth_error(exc: BaseException) -> bool:
 
 
 def _handle_auth_error_and_retry(
-    server_name: str,
+    server_key: MCPServerKey | str,
     exc: BaseException,
     retry_call,
     op_description: str,
@@ -4151,6 +4284,9 @@ def _handle_auth_error_and_retry(
     """
     if not _is_auth_error(exc):
         return None
+    if isinstance(server_key, str):
+        server_key = _server_key(server_key)
+    _profile_home, server_name = server_key
 
     from tools.mcp_oauth_manager import get_manager
     manager = get_manager()
@@ -4169,7 +4305,7 @@ def _handle_auth_error_and_retry(
 
     if recovered:
         with _lock:
-            srv = _servers.get(server_name)
+            srv = _servers.get(server_key)
         reconnected = False
         if srv is not None and hasattr(srv, "_reconnect_event"):
             reconnected = _signal_reconnect_and_wait(
@@ -4187,17 +4323,17 @@ def _handle_auth_error_and_retry(
         # _bump_server_error on failure, so a genuinely broken server will
         # re-trip the breaker as normal.
         if reconnected:
-            _reset_server_error(server_name)
+            _reset_server_error(server_key)
 
         try:
             result = retry_call()
             try:
                 parsed = json.loads(result)
                 if "error" not in parsed:
-                    _reset_server_error(server_name)
+                    _reset_server_error(server_key)
                     return result
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)
+                _reset_server_error(server_key)
                 return result
         except Exception as retry_exc:
             logger.warning(
@@ -4208,7 +4344,7 @@ def _handle_auth_error_and_retry(
     # No recovery available, or retry also failed: surface a structured
     # needs_reauth error. Bumps the circuit breaker so the model stops
     # retrying the tool.
-    _bump_server_error(server_name)
+    _bump_server_error(server_key)
     return tool_error(
         f"MCP server '{server_name}' requires re-authentication. "
         f"Run `hermes mcp login {server_name}` (or delete the tokens "
@@ -4322,7 +4458,7 @@ def _is_session_expired_error(exc: BaseException) -> bool:
 
 
 def _handle_session_expired_and_retry(
-    server_name: str,
+    server_key: MCPServerKey | str,
     exc: BaseException,
     retry_call,
     op_description: str,
@@ -4352,9 +4488,12 @@ def _handle_session_expired_and_retry(
     """
     if not _is_session_expired_error(exc):
         return None
+    if isinstance(server_key, str):
+        server_key = _server_key(server_key)
+    _profile_home, server_name = server_key
 
     with _lock:
-        srv = _servers.get(server_name)
+        srv = _servers.get(server_key)
     if srv is None or not hasattr(srv, "_reconnect_event"):
         return None
 
@@ -4388,10 +4527,10 @@ def _handle_session_expired_and_retry(
         try:
             parsed = json.loads(result)
             if "error" not in parsed:
-                _reset_server_error(server_name)
+                _reset_server_error(server_key)
                 return result
         except (json.JSONDecodeError, TypeError):
-            _reset_server_error(server_name)
+            _reset_server_error(server_key)
             return result
     except Exception as retry_exc:
         logger.warning(
@@ -4404,13 +4543,13 @@ def _handle_session_expired_and_retry(
 # Exact raw server names whose ``supports_parallel_tool_calls`` config is True.
 # Raw identity matters: distinct names such as ``foo-bar`` and ``foo_bar`` both
 # sanitize to ``foo_bar`` but must not share policy.
-_parallel_safe_servers: set = set()
+_parallel_safe_servers: set[MCPServerKey] = _ProfileServerSet()
 
 # Exact MCP tool-name provenance. The generated registry name is lossy because
 # provider-safe normalization maps punctuation to ``_``. Keep the raw server
 # name captured at registration time so policy and capability checks never rely
 # on parsing or re-sanitizing the generated name.
-_mcp_tool_server_names: Dict[str, str] = {}
+_mcp_tool_server_names: Dict[Tuple[str, str], MCPServerKey] = _ProfileToolServerDict()
 
 # Dedicated event loop running in a background daemon thread.
 _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
@@ -4990,7 +5129,9 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
     # task may later reconnect on a shared event loop after the caller's
     # context-local home has changed, so deriving ownership during refresh
     # would be incorrect.
-    server = MCPServerTask(name, profile_home=_canonical_profile_home())
+    profile_home = _canonical_profile_home()
+    server = MCPServerTask(name)
+    server.profile_home = profile_home
     claim = _connect_server_claim.get()
     claim_token = None
     if claim is not None:
@@ -5073,7 +5214,7 @@ def _resolve_server_lazy(name: str, config: dict) -> bool:
     return _parse_boolish(config.get("lazy", False), default=False)
 
 
-def _ensure_lazy_server_connected(server_name: str) -> bool:
+def _ensure_lazy_server_connected(server_key: MCPServerKey | str) -> bool:
     """Connect a lazily-registered MCP server on demand (sync, blocks caller).
 
     Composes with the existing connect machinery: respects the per-server
@@ -5082,26 +5223,22 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     cooldown bookkeeping stays in one place. Returns True when a live
     session is available afterwards.
     """
+    if isinstance(server_key, str):
+        server_key = _server_key(server_key)
+    profile_home, server_name = server_key
     with _lock:
-        server = _servers.get(server_name)
+        server = _servers.get(server_key)
         if server is not None and server.session is not None:
             return True
-        config = _lazy_server_configs.get(server_name)
+        config = _lazy_server_configs.get(server_key)
         if not config:
             return False
-        if _connect_cooldown_active(server_name):
+        if _connect_cooldown_active(server_key):
             return False
-        if server_name in _server_connecting:
+        if server_key in _server_connecting:
             return False
-        profile_home = _lazy_server_profile_homes.get(server_name)
-        if profile_home is None:
-            # Defensive fallback for old in-memory state created before this
-            # provenance map existed. Capture it once and retain it for the
-            # lifetime of this lazy registration.
-            profile_home = _canonical_profile_home()
-            _lazy_server_profile_homes[server_name] = profile_home
-        _server_connecting.add(server_name)
-        _server_connect_errors.pop(server_name, None)
+        _server_connecting.add(server_key)
+        _server_connect_errors.pop(server_key, None)
 
     logger.info("MCP server '%s': lazy start on first use", server_name)
     _ensure_mcp_loop()
@@ -5125,9 +5262,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     except BaseException as exc:
         message = _format_connect_error(exc)
         with _lock:
-            _server_connecting.discard(server_name)
-            _server_connect_errors[server_name] = message
-            _record_connect_failure(server_name)
+            _server_connecting.discard(server_key)
+            _server_connect_errors[server_key] = message
+            _record_connect_failure(server_key)
         logger.warning(
             "Lazy MCP connect failed for '%s': %s", server_name, message,
         )
@@ -5137,12 +5274,12 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             reset_home_override(override_token)
 
     with _lock:
-        _server_connecting.discard(server_name)
-        _clear_connect_failure(server_name)
-        _lazy_server_configs.pop(server_name, None)
-        stale_fingerprint = _lazy_server_fingerprints.pop(server_name, None)
-        cached_names = _lazy_server_tool_names.pop(server_name, None) or []
-        server = _servers.get(server_name)
+        _server_connecting.discard(server_key)
+        _clear_connect_failure(server_key)
+        _lazy_server_configs.pop(server_key, None)
+        stale_fingerprint = _lazy_server_fingerprints.pop(server_key, None)
+        cached_names = _lazy_server_tool_names.pop(server_key, None) or []
+        server = _servers.get(server_key)
         live_names = set(
             getattr(server, "_registered_tool_names", []) or []
         )
@@ -5154,8 +5291,8 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
         from tools.registry import registry
 
         for tool_name in phantom_names:
-            registry.deregister(tool_name)
-            _forget_mcp_tool_server(tool_name)
+            registry.deregister(tool_name, profile_home=profile_home)
+            _forget_mcp_tool_server(tool_name, profile_home)
         logger.info(
             "MCP server '%s': deregistered %d phantom cached tool(s) not "
             "served live (stale schema-cache fingerprint %s): %s",
@@ -5165,25 +5302,26 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     return server is not None and server.session is not None
 
 
-def _get_connected_server_for_call(server_name: str) -> Optional[MCPServerTask]:
+def _get_connected_server_for_call(server_key: MCPServerKey) -> Optional[MCPServerTask]:
     """Return a connected server, lazily reconnecting recycled stdio state.
 
     Also the single first-use connect point for lazy (schema-cache
     registered) servers, so raw tool calls AND the resource/prompt utility
     handlers all trigger the deferred spawn (#56832).
     """
+    profile_home, server_name = server_key
     with _lock:
-        server = _servers.get(server_name)
-        is_lazy = server_name in _lazy_server_configs
+        server = _servers.get(server_key)
+        is_lazy = server_key in _lazy_server_configs
     if is_lazy and (server is None or server.session is None):
-        _ensure_lazy_server_connected(server_name)
+        _ensure_lazy_server_connected(server_key)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(server_key)
         return server
     if server is not None and server.session is None and server._is_recycled_stdio():
         _request_lazy_reconnect(server_name, server)
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(server_key)
     return server
 
 
@@ -5194,12 +5332,19 @@ def _mark_server_call_started(server: Any) -> None:
         mark_tool_call()
 
 
-def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
+def _make_tool_handler(
+    server_name: str,
+    tool_name: str,
+    tool_timeout: float,
+    profile_home: Optional[str] = None,
+):
     """Return a sync handler that calls an MCP tool via the background loop.
 
     The handler conforms to the registry's dispatch interface:
     ``handler(args_dict, **kwargs) -> str``
     """
+
+    server_key = _server_key(server_name, profile_home)
 
     def _handler(args: dict, **kwargs) -> str:
         # Trust-tier gate (security boundary): write-capable tools on
@@ -5220,23 +5365,23 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
         # failure the error paths below bump the count again, which
         # re-stamps the open-time via _bump_server_error (re-arming
         # the cooldown).
-        if _server_error_counts.get(server_name, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
-            opened_at = _server_breaker_opened_at.get(server_name, 0.0)
+        if _server_error_counts.get(server_key, 0) >= _CIRCUIT_BREAKER_THRESHOLD:
+            opened_at = _server_breaker_opened_at.get(server_key, 0.0)
             age = time.monotonic() - opened_at
             if age < _CIRCUIT_BREAKER_COOLDOWN_SEC:
                 remaining = max(1, int(_CIRCUIT_BREAKER_COOLDOWN_SEC - age))
                 return tool_error(
                     f"MCP server '{server_name}' is unreachable after "
-                    f"{_server_error_counts[server_name]} consecutive "
+                    f"{_server_error_counts[server_key]} consecutive "
                     f"failures. Auto-retry available in ~{remaining}s. "
                     f"Do NOT retry this tool yet — use alternative "
                     f"approaches or ask the user to check the MCP server."
                 )
             # Cooldown elapsed → fall through as a half-open probe.
 
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_key)
         if not server:
-            _bump_server_error(server_name)
+            _bump_server_error(server_key)
             return tool_error(f"MCP server '{server_name}' is not connected")
 
         if not server.session:
@@ -5260,7 +5405,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
                 # without burning iterations. The breaker resets once the
                 # fresh session initializes (_run_stdio/_run_http call
                 # _reset_server_error).
-                _bump_server_error(server_name)
+                _bump_server_error(server_key)
                 if _signal_reconnect(server):
                     return tool_error(
                         f"MCP server '{server_name}' transport is down; "
@@ -5376,11 +5521,11 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             try:
                 parsed = json.loads(result)
                 if "error" in parsed:
-                    _bump_server_error(server_name)
+                    _bump_server_error(server_key)
                 else:
-                    _reset_server_error(server_name)  # success — reset
+                    _reset_server_error(server_key)  # success — reset
             except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+                _reset_server_error(server_key)  # non-JSON = success
             return result
         except InterruptedError:
             return _interrupted_call_result()
@@ -5389,7 +5534,7 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # reconnect if viable, retry once. Returns None to fall
             # through for non-auth exceptions.
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once,
+                server_key, exc, _call_once,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
@@ -5399,13 +5544,13 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             # but skips OAuth recovery because the access token is
             # still valid — only the server-side session is stale.
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once,
+                server_key, exc, _call_once,
                 f"tools/call {tool_name}",
             )
             if recovered is not None:
                 return recovered
 
-            _bump_server_error(server_name)
+            _bump_server_error(server_key)
             logger.error(
                 "MCP tool %s/%s call failed: %s",
                 server_name, tool_name, exc,
@@ -5417,11 +5562,16 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_list_resources_handler(server_name: str, tool_timeout: float):
+def _make_list_resources_handler(
+    server_name: str,
+    tool_timeout: float,
+    profile_home: Optional[str] = None,
+):
     """Return a sync handler that lists resources from an MCP server."""
+    server_key = _server_key(server_name, profile_home)
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_key)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5454,12 +5604,12 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "resources/list",
+                server_key, exc, _call_once, "resources/list",
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once, "resources/list",
+                server_key, exc, _call_once, "resources/list",
             )
             if recovered is not None:
                 return recovered
@@ -5473,11 +5623,16 @@ def _make_list_resources_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_read_resource_handler(server_name: str, tool_timeout: float):
+def _make_read_resource_handler(
+    server_name: str,
+    tool_timeout: float,
+    profile_home: Optional[str] = None,
+):
     """Return a sync handler that reads a resource by URI from an MCP server."""
+    server_key = _server_key(server_name, profile_home)
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_key)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5515,12 +5670,12 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "resources/read",
+                server_key, exc, _call_once, "resources/read",
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once, "resources/read",
+                server_key, exc, _call_once, "resources/read",
             )
             if recovered is not None:
                 return recovered
@@ -5534,11 +5689,16 @@ def _make_read_resource_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_list_prompts_handler(server_name: str, tool_timeout: float):
+def _make_list_prompts_handler(
+    server_name: str,
+    tool_timeout: float,
+    profile_home: Optional[str] = None,
+):
     """Return a sync handler that lists prompts from an MCP server."""
+    server_key = _server_key(server_name, profile_home)
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_key)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5576,12 +5736,12 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "prompts/list",
+                server_key, exc, _call_once, "prompts/list",
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once, "prompts/list",
+                server_key, exc, _call_once, "prompts/list",
             )
             if recovered is not None:
                 return recovered
@@ -5595,11 +5755,16 @@ def _make_list_prompts_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_get_prompt_handler(server_name: str, tool_timeout: float):
+def _make_get_prompt_handler(
+    server_name: str,
+    tool_timeout: float,
+    profile_home: Optional[str] = None,
+):
     """Return a sync handler that gets a prompt by name from an MCP server."""
+    server_key = _server_key(server_name, profile_home)
 
     def _handler(args: dict, **kwargs) -> str:
-        server = _get_connected_server_for_call(server_name)
+        server = _get_connected_server_for_call(server_key)
         if not server or not server.session:
             return tool_error(f"MCP server '{server_name}' is not connected")
 
@@ -5641,12 +5806,12 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
             return _interrupted_call_result()
         except Exception as exc:
             recovered = _handle_auth_error_and_retry(
-                server_name, exc, _call_once, "prompts/get",
+                server_key, exc, _call_once, "prompts/get",
             )
             if recovered is not None:
                 return recovered
             recovered = _handle_session_expired_and_retry(
-                server_name, exc, _call_once, "prompts/get",
+                server_key, exc, _call_once, "prompts/get",
             )
             if recovered is not None:
                 return recovered
@@ -5660,19 +5825,20 @@ def _make_get_prompt_handler(server_name: str, tool_timeout: float):
     return _handler
 
 
-def _make_check_fn(server_name: str):
+def _make_check_fn(server_name: str, profile_home: Optional[str] = None):
     """Return a check function that verifies the MCP connection is alive."""
+    server_key = _server_key(server_name, profile_home)
 
     def _check() -> bool:
         with _lock:
-            server = _servers.get(server_name)
+            server = _servers.get(server_key)
             if server is not None and (
                 server.session is not None or server._is_recycled_stdio()
             ):
                 return True
             # Lazy (schema-cache registered) servers are available: the
             # first real call spawns/connects them (#56832).
-            return server_name in _lazy_server_configs
+            return server_key in _lazy_server_configs
 
     return _check
 
@@ -6056,16 +6222,27 @@ _UTILITY_CAPABILITY_ATTRS = {
 }
 
 
-def _track_mcp_tool_server(tool_name: str, server_name: str) -> None:
+def _track_mcp_tool_server(
+    tool_name: str,
+    server_name: str,
+    profile_home: Optional[str] = None,
+) -> None:
     """Remember the exact raw MCP server that registered *tool_name*."""
+    server_key = _server_key(server_name, profile_home)
     with _lock:
-        _mcp_tool_server_names[tool_name] = server_name
+        _mcp_tool_server_names[(server_key[0], tool_name)] = server_key
 
 
-def _forget_mcp_tool_server(tool_name: str) -> None:
+def _forget_mcp_tool_server(
+    tool_name: str,
+    profile_home: Optional[str] = None,
+) -> None:
     """Forget MCP server provenance for a deregistered tool."""
     with _lock:
-        _mcp_tool_server_names.pop(tool_name, None)
+        _mcp_tool_server_names.pop(
+            (_server_key("", profile_home)[0], tool_name),
+            None,
+        )
 
 
 def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dict) -> List[dict]:
@@ -6126,9 +6303,14 @@ def _select_utility_schemas(server_name: str, server: MCPServerTask, config: dic
 
 
 def _existing_tool_names() -> List[str]:
-    """Return tool names for all currently connected servers."""
+    """Return tool names owned by the active profile's MCP runtime."""
+    profile_home = _active_profile_home_or_none()
+    if profile_home is None:
+        return []
     names: List[str] = []
-    for _sname, server in _servers.items():
+    for (owner_home, _sname), server in _servers.items():
+        if owner_home != profile_home:
+            continue
         if hasattr(server, "_registered_tool_names"):
             names.extend(server._registered_tool_names)
             continue
@@ -6140,8 +6322,8 @@ def _existing_tool_names() -> List[str]:
     with _lock:
         lazy_names = [
             n
-            for sname, tool_names in _lazy_server_tool_names.items()
-            if sname not in _servers
+            for server_key, tool_names in _lazy_server_tool_names.items()
+            if server_key[0] == profile_home and server_key not in _servers
             for n in tool_names
         ]
     names.extend(lazy_names)
@@ -6170,11 +6352,6 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
     profile_home = _server_profile_home(server)
-    with _lock:
-        _server_profile_homes[name] = profile_home
-        # A live/eager publication supersedes any stale lazy-manifest owner
-        # for this name. The server task now carries the authoritative owner.
-        _lazy_server_profile_homes.pop(name, None)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -6198,7 +6375,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             return not matches_name_filter(tool_name, exclude_set)
         return True
 
-    check_fn = _make_check_fn(name)
+    check_fn = _make_check_fn(name, profile_home)
     candidates: List[dict] = []
 
     # Trust-tier metadata (security boundary): capture the server's
@@ -6224,7 +6401,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"tool {mcp_tool.name!r}",
                 "schema": schema,
                 "handler": _make_tool_handler(
-                    name, mcp_tool.name, server.tool_timeout
+                    name, mcp_tool.name, server.tool_timeout, profile_home
                 ),
                 "check_fn": check_fn,
             }
@@ -6247,7 +6424,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                 "origin": f"generated utility {handler_key!r}",
                 "schema": schema,
                 "handler": handler_factories[handler_key](
-                    name, server.tool_timeout
+                    name, server.tool_timeout, profile_home
                 ),
                 "check_fn": check_fn,
             }
@@ -6295,7 +6472,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
         if registry_name in ambiguous_names:
             continue
 
-        existing_toolset = registry.get_toolset_for_tool(registry_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            registry_name,
+            profile_home=profile_home,
+        )
         if existing_toolset and existing_toolset != toolset_name:
             if existing_toolset.startswith("mcp-"):
                 logger.error(
@@ -6330,7 +6510,10 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
         # The pre-check above is advisory only. Multiple servers connect in
         # parallel, so ToolRegistry.register() is the atomic ownership gate.
-        if registry.get_toolset_for_tool(registry_name) != toolset_name:
+        if registry.get_toolset_for_tool(
+            registry_name,
+            profile_home=profile_home,
+        ) != toolset_name:
             logger.error(
                 "MCP server '%s': registration of %s as '%s' was rejected by "
                 "the registry; skipping provenance/count updates",
@@ -6340,11 +6523,15 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, profile_home)
         registered_names.append(registry_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(
+            name,
+            toolset_name,
+            profile_home=profile_home,
+        )
         # Write-through (#56832): refresh the on-disk schema cache after a
         # live connect so the next startup can lazily register this server
         # without spawning it. Cache failures never break registration.
@@ -6428,7 +6615,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             return not matches_name_filter(tool_name, exclude_set)
         return True
 
-    check_fn = _make_check_fn(name)
+    check_fn = _make_check_fn(name, profile_home)
     # Trust-tier metadata for the lazy path: the cached manifest carries
     # each tool's readOnlyHint (written by the live discovery path), and
     # trust comes from operator config. Recording it before registration
@@ -6462,7 +6649,10 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         registry_name = schema["name"]
-        existing_toolset = registry.get_toolset_for_tool(registry_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            registry_name,
+            profile_home=profile_home,
+        )
         if existing_toolset and existing_toolset != toolset_name:
             logger.warning(
                 "MCP server '%s' (lazy): cached tool '%s' collides with "
@@ -6474,15 +6664,23 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             name=registry_name,
             toolset=toolset_name,
             schema=schema,
-            handler=_make_tool_handler(name, raw_name, tool_timeout),
+            handler=_make_tool_handler(
+                name,
+                raw_name,
+                tool_timeout,
+                profile_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
             profile_home=profile_home,
         )
-        if registry.get_toolset_for_tool(registry_name) != toolset_name:
+        if registry.get_toolset_for_tool(
+            registry_name,
+            profile_home=profile_home,
+        ) != toolset_name:
             continue
-        _track_mcp_tool_server(registry_name, name)
+        _track_mcp_tool_server(registry_name, name, profile_home)
         registered_names.append(registry_name)
 
     handler_factories = {
@@ -6501,32 +6699,45 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         util_name = schema.get("name") or ""
         if not util_name:
             continue
-        existing_toolset = registry.get_toolset_for_tool(util_name)
+        existing_toolset = registry.get_toolset_for_tool(
+            util_name,
+            profile_home=profile_home,
+        )
         if existing_toolset and existing_toolset != toolset_name:
             continue
         registry.register(
             name=util_name,
             toolset=toolset_name,
             schema=schema,
-            handler=handler_factories[handler_key](name, tool_timeout),
+            handler=handler_factories[handler_key](
+                name,
+                tool_timeout,
+                profile_home,
+            ),
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
             profile_home=profile_home,
         )
-        if registry.get_toolset_for_tool(util_name) != toolset_name:
+        if registry.get_toolset_for_tool(
+            util_name,
+            profile_home=profile_home,
+        ) != toolset_name:
             continue
-        _track_mcp_tool_server(util_name, name)
+        _track_mcp_tool_server(util_name, name, profile_home)
         registered_names.append(util_name)
 
     if registered_names:
-        registry.register_toolset_alias(name, toolset_name)
+        registry.register_toolset_alias(
+            name,
+            toolset_name,
+            profile_home=profile_home,
+        )
+        server_key = _server_key(name, profile_home)
         with _lock:
-            _lazy_server_configs[name] = dict(config)
-            _lazy_server_fingerprints[name] = fingerprint
-            _lazy_server_tool_names[name] = list(registered_names)
-            _lazy_server_profile_homes[name] = profile_home
-            _server_profile_homes[name] = profile_home
+            _lazy_server_configs[server_key] = dict(config)
+            _lazy_server_fingerprints[server_key] = fingerprint
+            _lazy_server_tool_names[server_key] = list(registered_names)
         logger.info(
             "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
             name, len(registered_names),
@@ -6540,8 +6751,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
     discovery_profile_home = _canonical_profile_home()
-    with _lock:
-        _server_profile_homes[name] = discovery_profile_home
+    server_key = _server_key(name, discovery_profile_home)
     # List-based claim (not a ``nonlocal`` rebind): the claim callback runs
     # inside ``_connect_server`` while this frame is suspended, and appending
     # keeps type narrowing intact for the module's other ``server`` locals.
@@ -6574,7 +6784,7 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
             # Recoverable park: the run task deliberately stays alive to
             # self-probe, so adopt it into the registry for shutdown/revival.
             with _lock:
-                _servers[name] = server
+                _servers[server_key] = server
         elif server is not None:
             await server.shutdown()
         raise
@@ -6582,14 +6792,14 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
         _connect_server_claim.reset(claim_token)
 
     with _lock:
-        _server_connecting.discard(name)
-        _server_connect_errors.pop(name, None)
+        _server_connecting.discard(server_key)
+        _server_connect_errors.pop(server_key, None)
         # Test/probe adapters may return a task constructed without the
         # production connection helper. Preserve an existing owner, otherwise
         # bind this server before any registry publication.
         if not getattr(server, "profile_home", None):
             server.profile_home = discovery_profile_home
-        _servers[name] = server
+        _servers[server_key] = server
 
     registered_names = _register_server_tools(name, server, config)
     server._registered_tool_names = list(registered_names)
@@ -6626,7 +6836,16 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     # Capture the request's profile once. This owner is used for connecting
     # and failed status rows even if the caller's context changes while the
     # background discovery batch is in flight.
-    registration_profile_home = _canonical_profile_home()
+    registration_profile_home = _active_profile_home_or_none()
+    if registration_profile_home is None:
+        logger.error(
+            "MCP registration skipped: multiplex profile owner is unresolved"
+        )
+        return []
+    registration_keys = {
+        name: _server_key(name, registration_profile_home)
+        for name in servers
+    }
     servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
@@ -6641,11 +6860,11 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         new_servers = {
             k: v
             for k, v in servers.items()
-            if k not in _servers
-            and k not in connecting
+            if registration_keys[k] not in _servers
+            and registration_keys[k] not in connecting
             # Servers already lazily registered from the schema cache are
             # not re-registered; they connect on first tool use (#56832).
-            and k not in _lazy_server_configs
+            and registration_keys[k] not in _lazy_server_configs
             and _parse_boolish(v.get("enabled", True), default=True)
             # Skip a server still serving its post-failure backoff. Without
             # this, a server that fails to connect (and is therefore never
@@ -6653,7 +6872,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             # session's discovery pass -- the #50394 restart storm. The
             # cooldown is cleared automatically on the next successful
             # connect or by a manual /mcp refresh.
-            and not _connect_cooldown_active(k)
+            and not _connect_cooldown_active(registration_keys[k])
         }
         # Cached entries with no live session are parked or mid-reconnect.
         # Their tools are deregistered, so nothing else can reach
@@ -6661,20 +6880,20 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # waits up to _PARKED_RETRY_INTERVAL for the next self-probe
         # (#50170). Wake them now so their tools come back promptly.
         stale_cached = [
-            _servers[k]
+            _servers[registration_keys[k]]
             for k in servers
-            if k in _servers and getattr(_servers[k], "session", None) is None
+            if registration_keys[k] in _servers
+            and getattr(_servers[registration_keys[k]], "session", None) is None
         ]
-        _server_connecting.update(new_servers)
+        _server_connecting.update(registration_keys[name] for name in new_servers)
         for srv_name in new_servers:
-            _server_connect_errors.pop(srv_name, None)
-            _server_profile_homes[srv_name] = registration_profile_home
+            _server_connect_errors.pop(registration_keys[srv_name], None)
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
-                _parallel_safe_servers.add(srv_name)
+                _parallel_safe_servers.add(registration_keys[srv_name])
             else:
-                _parallel_safe_servers.discard(srv_name)
+                _parallel_safe_servers.discard(registration_keys[srv_name])
 
     for srv in stale_cached:
         _signal_reconnect(srv)
@@ -6703,7 +6922,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
             if not entry:
                 continue
             with _lock:
-                _server_connecting.discard(name)
+                _server_connecting.discard(registration_keys[name])
             try:
                 names = _register_from_cache_sync(name, cfg, entry)
             except Exception as exc:
@@ -6711,7 +6930,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     "Failed lazy MCP registration for '%s': %s", name, exc,
                 )
                 with _lock:
-                    _server_connecting.add(name)
+                    _server_connecting.add(registration_keys[name])
                 continue
             eager_servers.pop(name, None)
             lazy_registered += len(names)
@@ -6746,13 +6965,14 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 command = new_servers.get(name, {}).get("command")
                 message = _format_connect_error(result)
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors[name] = message
+                    server_key = registration_keys[name]
+                    _server_connecting.discard(server_key)
+                    _server_connect_errors[server_key] = message
                     # Arm the per-server backoff so the next discovery pass
                     # doesn't immediately re-spawn this failing server
                     # (#50394). Isolated to this server -- healthy servers
                     # in the same batch are unaffected.
-                    _record_connect_failure(name)
+                    _record_connect_failure(server_key)
                 logger.warning(
                     "Failed to connect to MCP server '%s'%s: %s",
                     name,
@@ -6761,9 +6981,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                 )
             else:
                 with _lock:
-                    _server_connecting.discard(name)
-                    _server_connect_errors.pop(name, None)
-                    _clear_connect_failure(name)
+                    server_key = registration_keys[name]
+                    _server_connecting.discard(server_key)
+                    _server_connect_errors.pop(server_key, None)
+                    _clear_connect_failure(server_key)
 
     # Per-server timeouts are handled inside _discover_and_register_server.
     # The outer timeout is generous: 120s total for parallel discovery.
@@ -6783,7 +7004,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         # entries stranded in _server_connecting.  Those stale
         # entries would block future reconnection attempts (#58862).
         with _lock:
-            stale = [n for n in new_servers if n in _server_connecting]
+            stale = [
+                n for n in new_servers
+                if registration_keys[n] in _server_connecting
+            ]
             if stale:
                 logger.warning(
                     "MCP discovery %s while %d server(s) were still "
@@ -6792,10 +7016,12 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
                     len(stale),
                     ", ".join(stale),
                 )
-                _server_connecting.difference_update(stale)
+                _server_connecting.difference_update(
+                    registration_keys[n] for n in stale
+                )
                 for _sn in stale:
                     _server_connect_errors.setdefault(
-                        _sn,
+                        registration_keys[_sn],
                         f"Connection attempt {'timed out' if isinstance(_e, TimeoutError) else 'interrupted'} during discovery",
                     )
         raise
@@ -6808,10 +7034,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         connected = [
             n
             for n in new_servers
-            if n in _servers and n not in _server_connect_errors
+            if registration_keys[n] in _servers
+            and registration_keys[n] not in _server_connect_errors
         ]
         new_tool_count = sum(
-            len(getattr(_servers[n], "_registered_tool_names", []))
+            len(getattr(
+                _servers[registration_keys[n]],
+                "_registered_tool_names",
+                [],
+            ))
             for n in connected
         )
     failed = len(new_servers) - len(connected)
@@ -6841,11 +7072,21 @@ def discover_mcp_tools() -> List[str]:
     if not _MCP_AVAILABLE:
         logger.debug("MCP SDK not available -- skipping MCP tool discovery")
         return []
+    if _active_profile_home_or_none() is None:
+        logger.error(
+            "MCP discovery skipped: multiplex profile owner is unresolved"
+        )
+        return []
 
     servers = _load_mcp_config()
     if not servers:
         logger.debug("No MCP servers configured")
         return []
+    discovery_profile_home = _canonical_profile_home()
+    discovery_keys = {
+        name: _server_key(name, discovery_profile_home)
+        for name in servers
+    }
 
     # Cross-process discovery guard (#62771). A lock loser waits for
     # the holder, then performs its own process-local discovery. If locking is
@@ -6877,8 +7118,8 @@ def discover_mcp_tools() -> List[str]:
             new_server_names = [
                 name
                 for name, cfg in servers.items()
-                if name not in _servers
-                and name not in connecting
+                if discovery_keys[name] not in _servers
+                and discovery_keys[name] not in connecting
                 and _parse_boolish(cfg.get("enabled", True), default=True)
             ]
 
@@ -6890,10 +7131,15 @@ def discover_mcp_tools() -> List[str]:
             connected_server_names = [
                 name
                 for name in new_server_names
-                if name in _servers and name not in _server_connect_errors
+                if discovery_keys[name] in _servers
+                and discovery_keys[name] not in _server_connect_errors
             ]
             new_tool_count = sum(
-                len(getattr(_servers[name], "_registered_tool_names", []))
+                len(getattr(
+                    _servers[discovery_keys[name]],
+                    "_registered_tool_names",
+                    [],
+                ))
                 for name in connected_server_names
             )
 
@@ -6923,9 +7169,12 @@ def is_mcp_tool_parallel_safe(tool_name: str) -> bool:
     """
     if not tool_name.startswith(MCP_TOOL_NAME_PREFIX):
         return False
+    profile_home = _active_profile_home_or_none()
+    if profile_home is None:
+        return False
     with _lock:
-        server_name = _mcp_tool_server_names.get(tool_name)
-        return bool(server_name and server_name in _parallel_safe_servers)
+        server_key = _mcp_tool_server_names.get((profile_home, tool_name))
+        return bool(server_key and server_key in _parallel_safe_servers)
 
 
 def get_mcp_status() -> List[dict]:
@@ -6937,24 +7186,36 @@ def get_mcp_status() -> List[dict]:
     that are configured but have not been started in this process yet.
     """
     result: List[dict] = []
+    status_profile_home = _active_profile_home_or_none()
+    if status_profile_home is None:
+        return result
 
     # Get configured servers from config
     configured = _load_mcp_config()
     if not configured:
         return result
-    status_profile_home = _canonical_profile_home()
 
     with _lock:
-        active_servers = dict(_servers)
-        connecting = set(_server_connecting)
-        connect_errors = dict(_server_connect_errors)
-        profile_homes = dict(_server_profile_homes)
-        lazy_profile_homes = dict(_lazy_server_profile_homes)
+        active_servers = {
+            key: server
+            for key, server in _servers.items()
+            if key[0] == status_profile_home
+        }
+        connecting = {
+            key for key in _server_connecting
+            if key[0] == status_profile_home
+        }
+        connect_errors = {
+            key: error
+            for key, error in _server_connect_errors.items()
+            if key[0] == status_profile_home
+        }
 
     for name, cfg in configured.items():
+        server_key = _server_key(name, status_profile_home)
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
         enabled = _parse_boolish(cfg.get("enabled", True), default=True)
-        server = active_servers.get(name)
+        server = active_servers.get(server_key)
         if server and server.session is not None:
             entry = {
                 "name": name,
@@ -6981,7 +7242,7 @@ def get_mcp_status() -> List[dict]:
                 "status": "disabled",
                 "profile_home": status_profile_home,
             })
-        elif name in connecting:
+        elif server_key in connecting:
             result.append({
                 "name": name,
                 "transport": transport,
@@ -6989,9 +7250,9 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "connecting",
-                "profile_home": profile_homes.get(name, status_profile_home),
+                "profile_home": status_profile_home,
             })
-        elif name in connect_errors:
+        elif server_key in connect_errors:
             result.append({
                 "name": name,
                 "transport": transport,
@@ -6999,8 +7260,8 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "failed",
-                "error": connect_errors[name],
-                "profile_home": profile_homes.get(name, status_profile_home),
+                "error": connect_errors[server_key],
+                "profile_home": status_profile_home,
             })
         else:
             result.append({
@@ -7010,13 +7271,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "configured",
-                "profile_home": (
-                    lazy_profile_homes.get(name, status_profile_home)
-                    if name in lazy_profile_homes
-                    else profile_homes.get(name, status_profile_home)
-                    if name in active_servers
-                    else status_profile_home
-                ),
+                "profile_home": status_profile_home,
             })
 
     return result
@@ -7106,8 +7361,14 @@ def has_registered_mcp_tools() -> bool:
     registered TOOLS, not connected servers, so a server that registers no tools
     doesn't keep the hook firing every turn.
     """
+    profile_home = _active_profile_home_or_none()
+    if profile_home is None:
+        return False
     with _lock:
-        return bool(_mcp_tool_server_names)
+        return any(
+            owner_home == profile_home
+            for owner_home, _tool_name in _mcp_tool_server_names
+        )
 
 
 def get_registered_mcp_server_names() -> set:
@@ -7120,8 +7381,16 @@ def get_registered_mcp_server_names() -> set:
     Slack platform note) to detect an MCP server that provides a given
     platform's capability regardless of what its config key is named.
     """
+    profile_home = _active_profile_home_or_none()
+    if profile_home is None:
+        return set()
     with _lock:
-        return set(_mcp_tool_server_names.values())
+        return {
+            server_key[1]
+            for (owner_home, _tool_name), server_key
+            in _mcp_tool_server_names.items()
+            if owner_home == profile_home
+        }
 
 
 
@@ -7336,8 +7605,6 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
-            _server_profile_homes.clear()
-            _lazy_server_profile_homes.clear()
         _stop_mcp_loop()
         return
 
@@ -7358,8 +7625,6 @@ def shutdown_mcp_servers():
             # stale per-server backoff from before the restart (#50394).
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
-            _server_profile_homes.clear()
-            _lazy_server_profile_homes.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -7383,8 +7648,6 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
-        _server_profile_homes.clear()
-        _lazy_server_profile_homes.clear()
 
     _stop_mcp_loop()
 
