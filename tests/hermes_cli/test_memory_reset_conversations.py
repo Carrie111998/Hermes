@@ -101,7 +101,6 @@ def _assert_conversations_cleared_and_state_preserved(home, fts_objects):
         assert db.is_telegram_topic_mode_enabled(
             chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID
         )
-        # This row is session-owned and has ON DELETE CASCADE by design.
         assert db.get_telegram_topic_binding(
             chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
         ) is None
@@ -121,17 +120,17 @@ def test_memory_reset_parser_invokes_exactly_one_handler(monkeypatch):
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command")
     legacy_calls: list[str] = []
-    safe_calls: list[str] = []
+    conversation_calls: list[str] = []
 
     def legacy_handler(args):
         legacy_calls.append(args.target)
         return 0
 
-    def safe_handler(args):
-        safe_calls.append(args.target)
+    def conversation_handler(args):
+        conversation_calls.append(args.target)
         return 0
 
-    monkeypatch.setattr(memory_reset_module, "cmd_memory_reset", safe_handler)
+    monkeypatch.setattr(memory_reset_module, "cmd_memory_reset", conversation_handler)
     build_memory_parser(subparsers, cmd_memory=legacy_handler)
 
     legacy_args = parser.parse_args(["memory", "reset", "--target", "all"])
@@ -141,13 +140,13 @@ def test_memory_reset_parser_invokes_exactly_one_handler(monkeypatch):
 
     assert legacy_args.func(legacy_args) == 0
     assert legacy_calls == ["all"]
-    assert safe_calls == []
+    assert conversation_calls == []
     assert conversation_args.func(conversation_args) == 0
     assert legacy_calls == ["all"]
-    assert safe_calls == ["conversations"]
+    assert conversation_calls == ["conversations"]
 
 
-def test_conversations_target_preserves_files_and_unrelated_state(
+def test_conversations_target_clears_history_and_preserves_other_state(
     tmp_path, monkeypatch
 ):
     home, fts_objects = _seed_home(tmp_path, monkeypatch)
@@ -159,17 +158,7 @@ def test_conversations_target_preserves_files_and_unrelated_state(
     _assert_conversations_cleared_and_state_preserved(home, fts_objects)
 
 
-def test_everything_target_clears_files_and_conversations(tmp_path, monkeypatch):
-    home, fts_objects = _seed_home(tmp_path, monkeypatch)
-
-    assert cmd_memory_reset(Namespace(target="everything", yes=True)) == 0
-
-    assert not (home / "memories" / "MEMORY.md").exists()
-    assert not (home / "memories" / "USER.md").exists()
-    _assert_conversations_cleared_and_state_preserved(home, fts_objects)
-
-
-def test_reset_spans_multiple_pages_and_delete_batches(tmp_path, monkeypatch):
+def test_conversation_reset_uses_bounded_delete_batches(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -216,49 +205,22 @@ def test_gateway_probe_checks_profile_and_root(tmp_path, monkeypatch):
 
 def test_running_gateway_blocks_reset_without_touching_state(tmp_path, monkeypatch):
     home, _fts_objects = _seed_home(tmp_path, monkeypatch)
-    probed_homes = []
-
-    def fake_gateway_probe(hermes_home):
-        probed_homes.append(hermes_home)
-        return 4242
 
     monkeypatch.setattr(
-        memory_reset_module, "_get_running_gateway_pid", fake_gateway_probe
+        memory_reset_module, "_get_running_gateway_pid", lambda _home: 4242
     )
 
-    assert cmd_memory_reset(Namespace(target="everything", yes=True)) == 1
-
-    assert probed_homes == [home]
+    assert cmd_memory_reset(Namespace(target="conversations", yes=True)) == 1
     assert (home / "memories" / "MEMORY.md").is_file()
     assert (home / "memories" / "USER.md").is_file()
     _assert_seed_still_present(home)
 
 
-def test_file_preflight_fails_before_database_mutation(tmp_path, monkeypatch):
-    home, _fts_objects = _seed_home(tmp_path, monkeypatch)
-
-    def deny_file_reset(_memories_dir, _existing_files):
-        raise PermissionError("read-only memory directory")
-
-    monkeypatch.setattr(
-        memory_reset_module, "_preflight_memory_file_deletion", deny_file_reset
-    )
-
-    assert cmd_memory_reset(Namespace(target="everything", yes=True)) == 1
-
-    assert (home / "memories" / "MEMORY.md").is_file()
-    assert (home / "memories" / "USER.md").is_file()
-    _assert_seed_still_present(home)
-
-
-def test_confirmation_denied_leaves_everything_untouched(tmp_path, monkeypatch):
+def test_confirmation_denied_leaves_state_untouched(tmp_path, monkeypatch):
     home, _fts_objects = _seed_home(tmp_path, monkeypatch)
     monkeypatch.setattr("builtins.input", lambda _prompt: "no")
 
-    assert cmd_memory_reset(Namespace(target="everything", yes=False)) == 0
-
-    assert (home / "memories" / "MEMORY.md").is_file()
-    assert (home / "memories" / "USER.md").is_file()
+    assert cmd_memory_reset(Namespace(target="conversations", yes=False)) == 0
     _assert_seed_still_present(home)
 
 
@@ -269,12 +231,3 @@ def test_conversations_target_does_not_create_empty_database(tmp_path, monkeypat
 
     assert cmd_memory_reset(Namespace(target="conversations", yes=True)) == 0
     assert not (home / "state.db").exists()
-
-
-def test_direct_handler_rejects_legacy_target(tmp_path, monkeypatch):
-    home, _fts_objects = _seed_home(tmp_path, monkeypatch)
-
-    assert cmd_memory_reset(Namespace(target="all", yes=True)) == 2
-
-    assert (home / "memories" / "MEMORY.md").is_file()
-    _assert_seed_still_present(home)
