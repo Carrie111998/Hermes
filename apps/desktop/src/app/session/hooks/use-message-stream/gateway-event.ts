@@ -55,7 +55,6 @@ import {
   setCurrentReasoningEffort,
   setCurrentServiceTier,
   setCurrentUsage,
-  setMessages,
   setSessions,
   setTurnStartedAt,
   setYoloActive
@@ -1050,11 +1049,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
         // keyed by ChatMessage identity.
         const reactedRowId = payload?.row_id
 
-        if (typeof reactedRowId === 'number') {
+        if (typeof reactedRowId === 'number' && sessionId) {
           const nextReactions = Array.isArray(payload?.reactions) ? payload.reactions : []
           const reactedRole = payload?.role === 'assistant' ? 'assistant' : 'user'
 
-          setMessages(messages => {
+          updateSessionState(sessionId, state => {
+            const messages = state.messages
             // Preferred leg: the message already knows its durable row id
             // (rehydrated transcript, or a live row that has round-tripped).
             const byRowId = messages.find(message => message.rowId === reactedRowId)
@@ -1064,9 +1064,12 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
               // in-memory history that doesn't carry this mid-turn DB write.
               recordAgentReaction(reactedRowId, nextReactions)
 
-              return messages.map(message =>
-                message.rowId === reactedRowId ? { ...message, reactions: nextReactions } : message
-              )
+              return {
+                ...state,
+                messages: messages.map(message =>
+                  message.rowId === reactedRowId ? { ...message, reactions: nextReactions } : message
+                )
+              }
             }
 
             // Live leg: the targeted message is still optimistic (no rowId —
@@ -1079,14 +1082,17 @@ export function useGatewayEventHandler(deps: GatewayEventDeps) {
             )
 
             if (lastIndex === -1) {
-              return messages
+              return state
             }
 
             recordAgentReaction(reactedRowId, nextReactions)
 
-            return messages.map((message, index) =>
-              index === lastIndex ? { ...message, rowId: reactedRowId, reactions: nextReactions } : message
-            )
+            return {
+              ...state,
+              messages: messages.map((message, index) =>
+                index === lastIndex ? { ...message, rowId: reactedRowId, reactions: nextReactions } : message
+              )
+            }
           })
         }
       } else if (event.type === 'status.update') {
