@@ -49,9 +49,7 @@ def _seed_home(tmp_path, monkeypatch):
     db.save_gateway_routing_entry(
         "route-1", '{"session_id":"session-1"}', scope="test-scope"
     )
-    db.enable_telegram_topic_mode(
-        chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID
-    )
+    db.enable_telegram_topic_mode(chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID)
     db.bind_telegram_topic(
         chat_id=_TELEGRAM_CHAT_ID,
         thread_id=_TELEGRAM_THREAD_ID,
@@ -78,12 +76,12 @@ def _assert_seed_still_present(home):
         assert db.message_count() == 3
         assert db.get_meta("memory-reset-preservation") == "keep"
         assert db.search_messages(_SEARCH_NEEDLE)
-        assert db.is_telegram_topic_mode_enabled(
-            chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID
+        assert (
+            db.get_telegram_topic_binding(
+                chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
+            )
+            is not None
         )
-        assert db.get_telegram_topic_binding(
-            chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
-        ) is not None
     finally:
         db.close()
 
@@ -101,9 +99,12 @@ def _assert_conversations_cleared_and_state_preserved(home, fts_objects):
         assert db.is_telegram_topic_mode_enabled(
             chat_id=_TELEGRAM_CHAT_ID, user_id=_TELEGRAM_USER_ID
         )
-        assert db.get_telegram_topic_binding(
-            chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
-        ) is None
+        assert (
+            db.get_telegram_topic_binding(
+                chat_id=_TELEGRAM_CHAT_ID, thread_id=_TELEGRAM_THREAD_ID
+            )
+            is None
+        )
     finally:
         db.close()
 
@@ -111,9 +112,7 @@ def _assert_conversations_cleared_and_state_preserved(home, fts_objects):
     assert not (home / "sessions" / "session-1.jsonl").exists()
     assert not (home / "sessions" / "session-child.json").exists()
     assert not (home / "sessions" / "request_dump_session-2_001.json").exists()
-    assert (home / "sessions" / "unrelated.jsonl").read_text(
-        encoding="utf-8"
-    ) == "keep"
+    assert (home / "sessions" / "unrelated.jsonl").read_text(encoding="utf-8") == "keep"
 
 
 def test_memory_reset_parser_invokes_exactly_one_handler(monkeypatch):
