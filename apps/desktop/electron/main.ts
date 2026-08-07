@@ -10477,7 +10477,7 @@ ipcMain.handle('hermes:readFileText', async (_event, filePath) => {
 
       return {
         binary: false,
-        byteSize: stat.size,
+        byteSize: truncated ? TEXT_PREVIEW_MAX_BYTES : officeText.length,
         language: 'text',
         mimeType: mimeTypeForPath(resolvedPath),
         path: resolvedPath,
