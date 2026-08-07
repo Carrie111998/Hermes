@@ -714,22 +714,26 @@ def _install_startup_entry(script_path: Path) -> Path:
     return entry
 
 
-def _remove_startup_entries() -> list[Path]:
+def _remove_startup_entries() -> tuple[list[Path], list[Path]]:
     """Remove both Startup-folder gateway entries (.vbs fallback + legacy .cmd).
 
     The Scheduled Task and the Startup entry are alternatives — the fallback
     is only installed when schtasks is unavailable (see ``install``). If both
     persist, logon fires the same launcher twice and spawns duplicate
-    gateways (#80569). Best-effort per path; returns the paths removed.
+    gateways (#80569). Returns (removed, failed); failures (locked or access
+    denied) are surfaced so callers warn instead of claiming convergence.
     """
     removed: list[Path] = []
+    failed: list[Path] = []
     for path in (get_startup_entry_path(), _legacy_startup_entry_path()):
         try:
             path.unlink()
             removed.append(path)
-        except OSError:
+        except FileNotFoundError:
             pass
-    return removed
+        except OSError:
+            failed.append(path)
+    return removed, failed
 
 
 def reconcile_autostart_launchers() -> list[str]:
@@ -756,8 +760,14 @@ def reconcile_autostart_launchers() -> list[str]:
     except Exception:
         return actions
     if task_registered:
-        for path in _remove_startup_entries():
+        removed, failed = _remove_startup_entries()
+        for path in removed:
             actions.append(f"Removed redundant Windows login item: {path}")
+        for path in failed:
+            actions.append(
+                f"⚠ Could not remove redundant Windows login item: {path} "
+                "(locked or access denied — duplicate autostart may persist)"
+            )
         return actions
     if _legacy_startup_entry_path().exists():
         script_path = _write_task_script()
@@ -1063,8 +1073,19 @@ def _prompt_install_choices(
 def _install_startup_fallback(script_path: Path, start_now: bool, detail: str) -> None:
     """Install the Startup-folder fallback and optionally start once."""
     print(f"↻ Scheduled Task install blocked ({detail.splitlines()[0]}) — using Startup folder fallback")
-    entry = _install_startup_entry(script_path)
-    print(f"✓ Installed Windows login item: {entry}")
+    try:
+        task_still_registered = is_task_registered()
+    except Exception:
+        task_still_registered = False
+    if task_still_registered:
+        # The task still exists (schtasks delete failed with access denied, or
+        # UAC was declined on a machine that already has a task). Installing
+        # the fallback too would fire the same launcher twice at logon and
+        # spawn duplicate gateways (#80569).
+        print("⚠ Scheduled Task is still registered — skipped Startup fallback to avoid duplicate autostart entries.")
+    else:
+        entry = _install_startup_entry(script_path)
+        print(f"✓ Installed Windows login item: {entry}")
     print(f"  Task script: {script_path}")
 
     # Re-running `hermes -p <profile> gateway install` must be safe.
@@ -1152,8 +1173,11 @@ def install(
         # Startup fallback or a legacy pre-#45610 .cmd entry still exists,
         # logon would fire the same launcher twice and spawn duplicate
         # gateways (#80569). Converge to the task only.
-        for entry in _remove_startup_entries():
+        removed, failed = _remove_startup_entries()
+        for entry in removed:
             print(f"✓ Removed redundant Windows login item: {entry}")
+        for entry in failed:
+            print(f"⚠ Could not remove redundant Windows login item: {entry} (locked or access denied — it will still fire at logon)")
         if start_now:
             running_pids = _gateway_pids()
             if running_pids:

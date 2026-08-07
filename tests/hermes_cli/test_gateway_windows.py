@@ -288,7 +288,7 @@ def test_install_success_removes_redundant_startup_entries(monkeypatch, tmp_path
 
     def fake_remove_startup_entries():
         removed_calls.append(True)
-        return [tmp_path / "Startup" / "Hermes_Gateway_alice.vbs"]
+        return ([tmp_path / "Startup" / "Hermes_Gateway_alice.vbs"], [])
 
     monkeypatch.setattr(gateway_windows, "_remove_startup_entries", fake_remove_startup_entries)
     monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: None)
@@ -296,6 +296,65 @@ def test_install_success_removes_redundant_startup_entries(monkeypatch, tmp_path
     gateway_windows.install()
 
     assert removed_calls == [True]
+
+
+def test_reconcile_reports_unlink_failure(monkeypatch, tmp_path):
+    """A locked Startup entry must be reported, not silently claimed removed."""
+    vbs, cmd = _arrange_startup_files(monkeypatch, tmp_path)
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+
+    real_unlink = Path.unlink
+
+    def flaky_unlink(self):
+        if self.name.endswith(".vbs"):
+            raise PermissionError("file is locked")
+        return real_unlink(self)
+
+    monkeypatch.setattr(Path, "unlink", flaky_unlink)
+
+    actions = gateway_windows.reconcile_autostart_launchers()
+
+    assert vbs.exists()
+    assert not cmd.exists()
+    assert any("Removed redundant Windows login item" in a for a in actions)
+    assert any("Could not remove redundant Windows login item" in a for a in actions)
+
+
+def test_reconcile_noop_when_schtasks_wedges(monkeypatch, tmp_path):
+    """A schtasks query failure must not crash or remove anything."""
+    vbs, cmd = _arrange_startup_files(monkeypatch, tmp_path)
+
+    def raise_wedge():
+        raise RuntimeError("schtasks timed out")
+
+    monkeypatch.setattr(gateway_windows, "is_task_registered", raise_wedge)
+
+    assert gateway_windows.reconcile_autostart_launchers() == []
+    assert vbs.exists()
+    assert cmd.exists()
+
+
+def test_install_fallback_skips_entry_when_task_still_registered(monkeypatch, tmp_path):
+    """Startup fallback must not be installed while the Scheduled Task exists."""
+    script_path = tmp_path / "Hermes_Gateway_alice.cmd"
+    calls = []
+    monkeypatch.setattr(gateway_windows, "_assert_windows", lambda: None)
+    monkeypatch.setattr(gateway_windows, "is_task_registered", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows, "_install_startup_entry", lambda p: calls.append(("entry", p)) or p
+    )
+    monkeypatch.setattr(
+        gateway_windows, "_spawn_detached", lambda: calls.append(("spawn", None)) or 12345
+    )
+    monkeypatch.setattr(gateway_windows, "_report_gateway_start", lambda via: calls.append(("report", via)))
+    monkeypatch.setattr(gateway_windows, "_print_next_steps", lambda: calls.append(("next", None)))
+    monkeypatch.setattr(gateway, "find_gateway_pids", lambda: [])
+    monkeypatch.setattr(gateway, "_profile_arg", lambda: "--profile alice")
+
+    gateway_windows._install_startup_fallback(script_path, start_now=True, detail="blocked")
+
+    assert not any(c[0] == "entry" for c in calls)
+    assert any(c[0] == "spawn" for c in calls)
 
 
 def test_gateway_vbs_script_is_console_less(monkeypatch):

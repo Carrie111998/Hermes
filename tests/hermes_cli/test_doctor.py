@@ -1453,3 +1453,23 @@ def test_windows_gateway_launcher_check_skips_when_not_installed(monkeypatch, ca
     doctor._check_windows_gateway_launcher([])
 
     assert "Windows Gateway Autostart" not in capsys.readouterr().out
+
+
+def test_windows_gateway_launcher_check_warns_on_incomplete_reconcile(monkeypatch, capsys):
+    """A failed removal must surface as a warning, not a clean ok."""
+    import hermes_cli.gateway_windows as gateway_windows
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(gateway_windows, "is_installed", lambda: True)
+    monkeypatch.setattr(
+        gateway_windows,
+        "reconcile_autostart_launchers",
+        lambda: ["⚠ Could not remove redundant Windows login item: C:\\Startup\\Hermes_Gateway.cmd"],
+    )
+
+    doctor._check_windows_gateway_launcher([])
+
+    out = capsys.readouterr().out
+    assert "Could not remove redundant Windows login item" in out
+    assert "reconcile incomplete" in out
+    assert "reconciled to a single mechanism" not in out

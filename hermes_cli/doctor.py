@@ -612,7 +612,10 @@ def _check_windows_gateway_launcher(issues: list[str]) -> None:
     if actions:
         for action in actions:
             check_info(action)
-        check_ok("Gateway autostart reconciled to a single mechanism")
+        if any(a.startswith("⚠") for a in actions):
+            check_warn("Gateway autostart reconcile incomplete — remove the listed Startup entries manually")
+        else:
+            check_ok("Gateway autostart reconciled to a single mechanism")
     else:
         check_ok("Gateway autostart uses a single mechanism")
 
