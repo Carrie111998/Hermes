@@ -37,6 +37,7 @@ import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
 import { buildDesktopBackendEnv, hermesManagedNodePathEntries, normalizeHermesHomeRoot } from './backend-env'
 import { isReauthRequiredError, waitForHermesReady } from './backend-health'
+import { cleanupFailedBackendPoolEntry, deleteBackendPoolEntryIfCurrent } from './backend-pool-state'
 import {
   canImportHermesCli,
   execProbeSync,
@@ -8050,7 +8051,7 @@ async function ensureBackend(profile) {
   }
 
   entry.connectionPromise = spawnPoolBackend(key, entry).catch(error => {
-    backendPool.delete(key)
+    cleanupFailedBackendPoolEntry(backendPool, key, entry, stopBackendChild)
     throw error
   })
   backendPool.set(key, entry)
@@ -8232,12 +8233,12 @@ async function spawnPoolBackend(profile, entry) {
 
   child.once('error', error => {
     rememberLog(`Hermes backend for profile "${profile}" failed to start: ${error.message}`)
-    backendPool.delete(profile)
+    deleteBackendPoolEntryIfCurrent(backendPool, profile, entry)
     rejectStart?.(error)
   })
   child.once('exit', (code, signal) => {
     rememberLog(`Hermes backend for profile "${profile}" exited (${signal || code})`)
-    backendPool.delete(profile)
+    deleteBackendPoolEntryIfCurrent(backendPool, profile, entry)
 
     if (!ready) {
       rejectStart?.(
