@@ -12,6 +12,7 @@ import {
   sessionMatchesStoredId,
   setCurrentBranch,
   setCurrentCwd,
+  setCurrentCwdTransient,
   setCurrentFastMode,
   setCurrentModel,
   setCurrentPersonality,
@@ -1017,7 +1018,10 @@ export function applyRuntimeInfo(
     sessionState.provider = info.provider
   }
 
-  if (info.cwd) {
+  // Empty string is authoritative: a detached/bare session must clear the
+  // previous project's Files pane root. Truthy-only used to leave `$currentCwd`
+  // stuck on the last project after switching away.
+  if (typeof info.cwd === 'string') {
     sessionState.cwd = info.cwd
   }
 
@@ -1056,7 +1060,9 @@ export function applyRuntimeInfo(
   return sessionState
 }
 
-export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | string } | undefined) {
+export function applyStoredSessionPreviewRuntimeInfo(
+  stored: { cwd?: null | string; git_repo_root?: null | string; model?: null | string } | undefined
+) {
   setCurrentModel(stored?.model || '')
   setCurrentProvider('')
   setCurrentReasoningEffort('')
@@ -1064,6 +1070,13 @@ export function applyStoredSessionPreviewRuntimeInfo(stored: { model?: null | st
   setCurrentFastMode(false)
   setYoloActive(false)
   setCurrentPersonality('')
+
+  // Cold resume paints the transcript before `session.resume` returns. Mirror
+  // the selected row's workspace into `$currentCwd` on the same tick so the
+  // Files pane doesn't keep showing the previous project's tree. Transient —
+  // persistence waits for `applyRuntimeInfo` after the runtime binds.
+  const previewCwd = (stored?.cwd ?? stored?.git_repo_root ?? '').trim()
+  setCurrentCwdTransient(previewCwd)
 }
 
 // A "session genuinely doesn't exist" failure (deleted, or an id from a wiped /
