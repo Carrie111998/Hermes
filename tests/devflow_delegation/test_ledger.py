@@ -13,7 +13,7 @@ from devflow_delegation.ledger import (
 
 
 def make_request(key="critic:gw-timeout:v1", title="Restore bounded gateway health query",
-                 state_seed="REQUESTED", agent="critic"):
+                 agent="critic"):
     payload = {
         "schema_version": "3.0",
         "type": "DEVFLOW_WORK_REQUEST",
@@ -136,3 +136,26 @@ def test_adopt_envelope_preserves_request_id(ledger):
     row = ledger.get_request(req.request_id)
     assert row is not None
     assert row["state"] == "REQUESTED"
+
+
+def test_adopt_envelope_preserves_created_at(ledger):
+    # Reconciler path: adopting an aged envelope (e.g. crash recovery from the
+    # mailbox hours later) must NOT re-date the request to "now" — count_since /
+    # count_critical_since rate windows and created_at ordering depend on the
+    # original creation time. Use an explicit past timestamp so the assertion is
+    # deterministic (not dependent on two now() calls landing in different ticks).
+    req = make_request()
+    env = req.to_envelope()
+    env["created_at"] = "2020-01-01T00:00:00+00:00"
+    ledger.adopt_envelope(env)
+    row = ledger.get_request(env["request_id"])
+    assert row["created_at"] == "2020-01-01T00:00:00+00:00"
+    assert json.loads(row["envelope_json"])["created_at"] == "2020-01-01T00:00:00+00:00"
+
+
+def test_find_by_idempotency_key(ledger):
+    req = make_request()
+    ledger.insert_request(req)
+    found = ledger.find_by_idempotency_key("critic:gw-timeout:v1")
+    assert found["request_id"] == req.request_id
+    assert ledger.find_by_idempotency_key("nonexistent:key") is None

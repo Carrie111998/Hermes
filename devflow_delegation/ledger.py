@@ -133,9 +133,12 @@ class DelegationLedger:
         """Reconciler path: adopt an envelope dict (v3) already carrying its
         request_id, without minting a new identity."""
         req = parse_request(env)
+        # parse_request re-mints identity/timestamp; pin the envelope's own so an
+        # aged envelope (crash recovery) keeps its original creation time and id.
         if req.request_id != env.get("request_id"):
-            # parse_request mints a fresh id; pin the envelope's own id.
             req.request_id = env["request_id"]
+        if env.get("created_at"):
+            req.created_at = env["created_at"]
         self.insert_request(req)
 
     def append_evidence(self, request_id: str, evidence: Dict[str, Any]) -> None:
