@@ -26,7 +26,12 @@ from ops.muncho.release.completion import (
     reserve_summary_delivery,
     resolve_discord_destination,
 )
-from ops.muncho.release.metadata import load_release_bundle, resolve_exact_release_sha
+from ops.muncho.release.metadata import (
+    canonical_bytes,
+    load_release_bundle,
+    resolve_exact_release_sha,
+    sha256_bytes,
+)
 
 
 ROOT = Path(__file__).parents[4]
@@ -130,6 +135,14 @@ def _record_gateway_delivery(
         message_id="423456789012345678",
         published_at=NOW,
     )
+
+
+def _tamper_and_reseal(path: Path, field: str, value: str) -> None:
+    record = json.loads(path.read_text(encoding="ascii"))
+    record[field] = value
+    record.pop("receipt_sha256")
+    record["receipt_sha256"] = sha256_bytes(canonical_bytes(record))
+    path.write_bytes(canonical_bytes(record) + b"\n")
 
 
 def test_retrospective_r1_mapping_is_append_only_without_source_metadata(
@@ -408,6 +421,61 @@ def test_gateway_request_is_mandatory_for_terminal_completion_and_health(
             match="muncho_release_status_chain_invalid",
         ):
             projection(state, version="2.3.2", release_sha=RELEASE_SHA)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("after_invocation_id", "3" * 32),
+        ("channel_id", "333456789012345678"),
+    ],
+)
+def test_coordinator_complete_rejects_tampered_gateway_request_chain(
+    tmp_path: Path,
+    capsys,
+    field: str,
+    value: str,
+):
+    state, _mapping, _smoke, draft = _draft(tmp_path)
+    _record_gateway_delivery(state, draft)
+    task_id = "019fa801-52ca-7460-954d-30aee7053618"
+    _prepared, attempt, created = reserve_codex_task_summary(
+        state,
+        version="2.3.2",
+        release_sha=RELEASE_SHA,
+        task_id=task_id,
+        reserved_at=NOW,
+    )
+    assert created is True
+    _tamper_and_reseal(
+        next(state.glob("gateway-discord-request-*.json")),
+        field,
+        value,
+    )
+
+    result = cli.main([
+        "coordinator-complete",
+        "--version",
+        "2.3.2",
+        "--release-sha",
+        RELEASE_SHA,
+        "--state-dir",
+        str(state),
+        "--task-id",
+        task_id,
+        "--message-ref",
+        "assistant-release-summary",
+        "--summary-sha256",
+        draft["summary_sha256"],
+        "--attempt-receipt-sha256",
+        attempt["receipt_sha256"],
+    ])
+
+    assert result == 2
+    assert json.loads(capsys.readouterr().out)["error"] == (
+        "muncho_release_completion_binding_invalid"
+    )
+    assert not tuple(state.glob("completion-*.json"))
 
 
 def test_status_and_health_reject_wrong_sha_receipt_under_expected_filename(

@@ -1115,6 +1115,32 @@ def validate_gateway_discord_request(value: Any) -> dict[str, Any]:
     return raw
 
 
+def _gateway_discord_request_binds(
+    request: Mapping[str, Any],
+    *,
+    restart: Mapping[str, Any],
+    smoke: Mapping[str, Any],
+    draft: Mapping[str, Any],
+    discord_attempt: Mapping[str, Any],
+) -> bool:
+    """Return whether one validated request belongs to the full release chain."""
+
+    destination = draft["discord_destination"]
+    return (
+        request["attempt_receipt_sha256"] == discord_attempt["receipt_sha256"]
+        and request["draft_receipt_sha256"] == draft["receipt_sha256"]
+        and request["restart_attestation_receipt_sha256"]
+        == restart["receipt_sha256"]
+        and request["smoke_receipt_sha256"] == smoke["receipt_sha256"]
+        and request["summary_sha256"] == draft["summary_sha256"]
+        and request["summary"] == draft["summary"]
+        and request["guild_id"] == destination["guild_id"]
+        and request["channel_id"] == destination["channel_id"]
+        and request["target_type"] == destination["target_type"]
+        and request["after_invocation_id"] == restart["after_invocation_id"]
+    )
+
+
 def _gateway_discord_request_path(
     state: Path,
     *,
@@ -1426,20 +1452,23 @@ def finalize_release_completion(
             validate_delivery_receipt(discord_delivery),
         )
     }
+    discord_attempt = validate_delivery_attempt(
+        _read(state / f"summary-discord-attempt-{suffix}.json")
+    )
     if set(deliveries) != {"codex_task", "discord"} or (
         bound_mapping["receipt_sha256"] != bound_smoke["mapping_receipt_sha256"]
         or bound_smoke["restart_attestation_receipt_sha256"]
         != restart["receipt_sha256"]
         or bound_smoke["receipt_sha256"] != bound_draft["smoke_receipt_sha256"]
-        or gateway_request["attempt_receipt_sha256"]
-        != deliveries["discord"]["attempt_receipt_sha256"]
-        or gateway_request["draft_receipt_sha256"]
-        != bound_draft["receipt_sha256"]
-        or gateway_request["restart_attestation_receipt_sha256"]
-        != restart["receipt_sha256"]
-        or gateway_request["smoke_receipt_sha256"]
-        != bound_smoke["receipt_sha256"]
-        or gateway_request["summary_sha256"] != bound_draft["summary_sha256"]
+        or not _gateway_discord_request_binds(
+            gateway_request,
+            restart=restart,
+            smoke=bound_smoke,
+            draft=bound_draft,
+            discord_attempt=discord_attempt,
+        )
+        or deliveries["discord"]["attempt_receipt_sha256"]
+        != discord_attempt["receipt_sha256"]
         or any(
             item["draft_receipt_sha256"] != bound_draft["receipt_sha256"]
             or item["summary_sha256"] != bound_draft["summary_sha256"]
@@ -1508,6 +1537,9 @@ def _load_release_completion_chain(
     gateway_request = validate_gateway_discord_request(
         _read(state / f"gateway-discord-request-{suffix}.json")
     )
+    discord_attempt = validate_delivery_attempt(
+        _read(state / f"summary-discord-attempt-{suffix}.json")
+    )
     discord = validate_delivery_receipt(
         _read(state / f"summary-discord-delivery-{suffix}.json")
     )
@@ -1517,13 +1549,15 @@ def _load_release_completion_chain(
         or smoke["restart_attestation_receipt_sha256"]
         != restart["receipt_sha256"]
         or draft["smoke_receipt_sha256"] != smoke["receipt_sha256"]
-        or gateway_request["attempt_receipt_sha256"]
-        != discord["attempt_receipt_sha256"]
-        or gateway_request["draft_receipt_sha256"] != draft["receipt_sha256"]
-        or gateway_request["restart_attestation_receipt_sha256"]
-        != restart["receipt_sha256"]
-        or gateway_request["smoke_receipt_sha256"] != smoke["receipt_sha256"]
-        or gateway_request["summary_sha256"] != draft["summary_sha256"]
+        or not _gateway_discord_request_binds(
+            gateway_request,
+            restart=restart,
+            smoke=smoke,
+            draft=draft,
+            discord_attempt=discord_attempt,
+        )
+        or discord["attempt_receipt_sha256"]
+        != discord_attempt["receipt_sha256"]
         or discord["destination_kind"] != "discord"
         or discord["draft_receipt_sha256"] != draft["receipt_sha256"]
         or discord["summary_sha256"] != draft["summary_sha256"]
@@ -1766,21 +1800,13 @@ def release_status(
         or restart is None
         or smoke is None
         or discord_attempt is None
-        or gateway_request["attempt_receipt_sha256"]
-        != discord_attempt["receipt_sha256"]
-        or gateway_request["draft_receipt_sha256"] != draft["receipt_sha256"]
-        or gateway_request["restart_attestation_receipt_sha256"]
-        != restart["receipt_sha256"]
-        or gateway_request["smoke_receipt_sha256"] != smoke["receipt_sha256"]
-        or gateway_request["summary_sha256"] != draft["summary_sha256"]
-        or gateway_request["guild_id"]
-        != draft["discord_destination"]["guild_id"]
-        or gateway_request["channel_id"]
-        != draft["discord_destination"]["channel_id"]
-        or gateway_request["target_type"]
-        != draft["discord_destination"]["target_type"]
-        or gateway_request["after_invocation_id"]
-        != restart["after_invocation_id"]
+        or not _gateway_discord_request_binds(
+            gateway_request,
+            restart=restart,
+            smoke=smoke,
+            draft=draft,
+            discord_attempt=discord_attempt,
+        )
     ):
         raise ReleaseCompletionError("muncho_release_status_chain_invalid")
     if completion is not None and (
