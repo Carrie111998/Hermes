@@ -171,7 +171,8 @@ test('getVenvSitePackagesEntries: reads pyvenv.cfg version on POSIX and resolves
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
     directoryExists: p => p === '/venv/lib/python3.12/site-packages',
-    readFile: () => 'version_info = 3.12.1\n'
+    readFile: () => 'version_info = 3.12.1\n',
+    join: path.posix.join
   })
 
   assert.deepEqual(result, ['/venv/lib/python3.12/site-packages'])
@@ -181,7 +182,8 @@ test('getVenvSitePackagesEntries: returns empty on POSIX when pyvenv.cfg is miss
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
     directoryExists: () => true,
-    readFile: () => undefined
+    readFile: () => undefined,
+    join: path.posix.join
   })
 
   assert.deepEqual(result, [])
@@ -191,7 +193,8 @@ test('getVenvSitePackagesEntries: returns empty on POSIX when pyvenv.cfg has no 
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
     directoryExists: () => true,
-    readFile: () => 'home = /usr/bin\n'
+    readFile: () => 'home = /usr/bin\n',
+    join: path.posix.join
   })
 
   assert.deepEqual(result, [])
@@ -201,7 +204,8 @@ test('getVenvSitePackagesEntries: returns empty on POSIX when version is present
   const result = getVenvSitePackagesEntries('/venv', {
     isWindows: false,
     directoryExists: () => false,
-    readFile: () => 'version_info = 3.11\n'
+    readFile: () => 'version_info = 3.11\n',
+    join: path.posix.join
   })
 
   assert.deepEqual(result, [])

@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict'
+import path from 'node:path'
 
 import { test } from 'vitest'
 
 import { collectSshConfigHosts, parseSshConfigHosts, parseSshConfigIncludes, parseSshGOutput } from './ssh-config'
+
+const posixPath = { join: path.posix.join, isAbsolute: path.posix.isAbsolute.bind(path.posix) }
 
 test('parseSshConfigHosts keeps literal aliases and drops wildcard/negated patterns', () => {
   const cfg = [
@@ -36,14 +39,15 @@ test('collectSshConfigHosts follows Include directives (read-only)', () => {
 
   const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
     homeDir: '/home/u',
-    readFile: p => files[p] ?? null
+    readFile: p => files[p] ?? null,
+    ...posixPath
   })
 
   assert.deepEqual(hosts.sort(), ['deep', 'home-abs', 'main', 'work-box'].sort())
 })
 
 test('collectSshConfigHosts tolerates a missing config file', () => {
-  assert.deepEqual(collectSshConfigHosts('/nope/config', { homeDir: '/home/u', readFile: () => null }), [])
+  assert.deepEqual(collectSshConfigHosts('/nope/config', { homeDir: '/home/u', readFile: () => null, ...posixPath }), [])
 })
 
 test('collectSshConfigHosts does not loop on a self-include cycle', () => {
@@ -54,7 +58,8 @@ test('collectSshConfigHosts does not loop on a self-include cycle', () => {
 
   const hosts = collectSshConfigHosts('/home/u/.ssh/config', {
     homeDir: '/home/u',
-    readFile: p => files[p] ?? null
+    readFile: p => files[p] ?? null,
+    ...posixPath
   })
 
   assert.deepEqual(hosts.sort(), ['a', 'b'])
@@ -71,7 +76,8 @@ test('collectSshConfigHosts expands globbed includes via injected globSync', () 
     homeDir: '/home/u',
     readFile: p => files[p] ?? null,
     globSync: pattern =>
-      pattern.endsWith('config.d/*') ? ['/home/u/.ssh/config.d/10-work', '/home/u/.ssh/config.d/20-home'] : [pattern]
+      pattern.endsWith('config.d/*') ? ['/home/u/.ssh/config.d/10-work', '/home/u/.ssh/config.d/20-home'] : [pattern],
+    ...posixPath
   })
 
   assert.deepEqual(hosts.sort(), ['home', 'root', 'work'].sort())

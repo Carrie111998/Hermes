@@ -68,10 +68,13 @@ function die(message) {
 }
 
 function run(command, args, options = {}) {
-  const result = spawnSync(command, args, {
+  const usesNpmCli = PLATFORM === 'win32' && command === 'npm' && process.env.npm_execpath
+  const executable = usesNpmCli ? process.execPath : command
+  const executableArgs = usesNpmCli ? [process.env.npm_execpath, ...args] : args
+  const result = spawnSync(executable, executableArgs, {
     cwd: options.cwd || DESKTOP_ROOT,
     env: options.env || process.env,
-    shell: Boolean(options.shell) || PLATFORM === 'win32',
+    shell: Boolean(options.shell),
     stdio: 'inherit'
   })
 

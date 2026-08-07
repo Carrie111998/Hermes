@@ -117,8 +117,11 @@ describe('sessionBucketLabel', () => {
   })
 
   it('formats month (same year) and month + year (prior year) via Intl', () => {
-    // en-US default in the test env: month name, plus year for the prior year.
-    expect(labelAt(2026, 2, 3)).toBe('March')
-    expect(labelAt(2025, 11, 3)).toBe('December 2025')
+    expect(labelAt(2026, 2, 3)).toBe(
+      new Intl.DateTimeFormat(undefined, { month: 'long' }).format(new Date(2026, 2, 3))
+    )
+    expect(labelAt(2025, 11, 3)).toBe(
+      new Intl.DateTimeFormat(undefined, { month: 'long', year: 'numeric' }).format(new Date(2025, 11, 3))
+    )
   })
 })

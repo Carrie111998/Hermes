@@ -59,16 +59,18 @@ function unpackedDirName(platform) {
  * Match is a path-segment-aware prefix check (not a bare string startsWith) so
  * `.../release/linux-unpacked-evil` can't masquerade as `.../release/linux-unpacked`.
  */
-function resolveUnpackedRelease(execPath, updateRoot, platform) {
+function resolveUnpackedRelease(execPath, updateRoot, platform, deps: any = {}) {
   if (!execPath || !updateRoot) {
     return null
   }
 
-  const releaseDir = path.join(updateRoot, 'apps', 'desktop', 'release')
-  const unpacked = path.join(releaseDir, unpackedDirName(platform))
-  const normalizedExec = path.resolve(String(execPath))
+  const p = deps.path || path
+
+  const releaseDir = p.join(updateRoot, 'apps', 'desktop', 'release')
+  const unpacked = p.join(releaseDir, unpackedDirName(platform))
+  const normalizedExec = p.resolve(String(execPath))
   // execPath must be the unpacked dir itself or a descendant of it.
-  const withSep = unpacked.endsWith(path.sep) ? unpacked : unpacked + path.sep
+  const withSep = unpacked.endsWith(p.sep) ? unpacked : unpacked + p.sep
 
   if (normalizedExec === unpacked || normalizedExec.startsWith(withSep)) {
     return unpacked

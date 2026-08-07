@@ -81,8 +81,10 @@ function collectSshConfigHosts(rootPath = '', deps: any = {}) {
     })
 
   const homeDir = deps.homeDir || os.homedir()
-  const root = rootPath || path.join(homeDir, '.ssh', 'config')
-  const sshDir = path.join(homeDir, '.ssh')
+  const join = deps.join || path.join
+  const isAbsolute = deps.isAbsolute || path.isAbsolute.bind(path)
+  const root = rootPath || join(homeDir, '.ssh', 'config')
+  const sshDir = join(homeDir, '.ssh')
 
   const out: string[] = []
   const seen = new Set()
@@ -90,14 +92,14 @@ function collectSshConfigHosts(rootPath = '', deps: any = {}) {
 
   const resolveIncludePath = token => {
     if (token.startsWith('~/')) {
-      return path.join(homeDir, token.slice(2))
+      return join(homeDir, token.slice(2))
     }
 
-    if (path.isAbsolute(token)) {
+    if (isAbsolute(token)) {
       return token
     }
 
-    return path.join(sshDir, token)
+    return join(sshDir, token)
   }
 
   const walk = (filePath, depth) => {
