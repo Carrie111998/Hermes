@@ -3,7 +3,8 @@
 Release coordination writes a strict request into the gateway's private state
 directory.  This module dispatches those exact bytes through either the
 privileged Relay connector or the already-connected native Discord adapter.
-Both paths are explicitly idempotent and read back an exact public receipt.
+Both paths are explicitly idempotent and read back an exact bot-authored guild
+receipt.
 This module never reads a bot token and never falls back to standalone Discord
 REST.
 """
@@ -42,13 +43,13 @@ def _native_discord_nonce(release_idempotency_key: str) -> int:
 
 
 def _supports_verified_native_discord_delivery(adapter: Any) -> bool:
-    """Require the live adapter's explicit idempotent public-receipt contract."""
+    """Require the live adapter's explicit idempotent guild-receipt contract."""
 
     return (
-        getattr(adapter, "supports_verified_idempotent_public_delivery", False)
+        getattr(adapter, "supports_verified_idempotent_guild_delivery", False)
         is True
-        and callable(getattr(adapter, "find_public_message_ids_by_exact_nonce", None))
-        and callable(getattr(adapter, "verify_public_message_receipt", None))
+        and callable(getattr(adapter, "find_guild_message_ids_by_exact_nonce", None))
+        and callable(getattr(adapter, "verify_guild_message_receipt", None))
     )
 
 
@@ -73,7 +74,7 @@ async def dispatch_pending_gateway_discord_deliveries(
     Relay replays carry the same connector idempotency key.  Native Discord
     replays carry a deterministic 64-bit nonce which discord.py sends with
     ``enforce_nonce``.  The native adapter is admitted only when it explicitly
-    implements the verified, idempotent public-delivery contract; standalone
+    implements the verified, idempotent guild-delivery contract; standalone
     senders and token access are never consulted.
     """
 
@@ -147,7 +148,7 @@ async def dispatch_pending_gateway_discord_deliveries(
                     str(request["queued_at_utc"]).replace("Z", "+00:00")
                 )
                 existing_ids = (
-                    await transport.adapter.find_public_message_ids_by_exact_nonce(
+                    await transport.adapter.find_guild_message_ids_by_exact_nonce(
                         expected_guild_id=request["guild_id"],
                         channel_id=request["channel_id"],
                         nonce=native_nonce,
@@ -189,8 +190,8 @@ async def dispatch_pending_gateway_discord_deliveries(
         if success and _SNOWFLAKE.fullmatch(message_id) is not None:
             if is_native:
                 try:
-                    public_receipt = (
-                        await transport.adapter.verify_public_message_receipt(
+                    guild_receipt = (
+                        await transport.adapter.verify_guild_message_receipt(
                             expected_guild_id=request["guild_id"],
                             channel_id=request["channel_id"],
                             message_id=message_id,
@@ -198,14 +199,14 @@ async def dispatch_pending_gateway_discord_deliveries(
                         )
                     )
                     if (
-                        public_receipt.get("verified") is not True
-                        or public_receipt.get("platform") != "discord"
-                        or str(public_receipt.get("guild_id", ""))
+                        guild_receipt.get("verified") is not True
+                        or guild_receipt.get("platform") != "discord"
+                        or str(guild_receipt.get("guild_id", ""))
                         != request["guild_id"]
-                        or str(public_receipt.get("channel_id", ""))
+                        or str(guild_receipt.get("channel_id", ""))
                         != request["channel_id"]
-                        or str(public_receipt.get("message_id", "")) != message_id
-                        or public_receipt.get("content_sha256")
+                        or str(guild_receipt.get("message_id", "")) != message_id
+                        or guild_receipt.get("content_sha256")
                         != request["summary_sha256"]
                     ):
                         raise RuntimeError("native Discord receipt identity mismatch")

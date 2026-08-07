@@ -1297,6 +1297,10 @@ class DiscordAdapter(BasePlatformAdapter):
     # read back an exact bot-authored public receipt.  This does not authorize
     # the standalone/token sender.
     supports_verified_idempotent_public_delivery = True
+    # Release delivery follows the same public-or-explicitly-approved-private
+    # guild policy as ``send``.  Its exact nonce and receipt readbacks use the
+    # guild methods below so they cannot be stricter than the mutation gate.
+    supports_verified_idempotent_guild_delivery = True
 
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
@@ -3644,27 +3648,83 @@ class DiscordAdapter(BasePlatformAdapter):
         message or choose a target. DMs/group DMs and non-bot-authored messages
         fail closed.
         """
+        return await self._verify_exact_message_receipt(
+            expected_guild_id=expected_guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            expected_content_sha256=expected_content_sha256,
+            require_public=True,
+        )
+
+    async def verify_guild_message_receipt(
+        self,
+        *,
+        expected_guild_id: str,
+        channel_id: str,
+        message_id: str,
+        expected_content_sha256: str,
+    ) -> Dict[str, Any]:
+        """Read back one exact bot-authored approved guild delivery."""
+
+        return await self._verify_exact_message_receipt(
+            expected_guild_id=expected_guild_id,
+            channel_id=channel_id,
+            message_id=message_id,
+            expected_content_sha256=expected_content_sha256,
+            require_public=False,
+        )
+
+    async def _verify_exact_message_receipt(
+        self,
+        *,
+        expected_guild_id: Optional[str],
+        channel_id: str,
+        message_id: str,
+        expected_content_sha256: Optional[str],
+        require_public: bool,
+    ) -> Dict[str, Any]:
+        """Shared receipt verifier with an explicit audience policy."""
+
         if not self._client or not getattr(self._client, "user", None):
             raise RuntimeError("Discord client is not connected")
         channel = self._client.get_channel(int(channel_id))
         if channel is None:
             channel = await self._client.fetch_channel(int(channel_id))
-        if _discord_public_target_error(channel):
+        target_error = (
+            _discord_public_target_error
+            if require_public
+            else _discord_delivery_target_error
+        )
+        if target_error(channel):
+            if require_public:
+                raise RuntimeError(
+                    "Discord receipt target is not a public guild channel/thread "
+                    "visible to @everyone/default role"
+                )
             raise RuntimeError(
-                "Discord receipt target is not a public guild channel/thread "
-                "visible to @everyone/default role"
+                "Discord receipt target is not an approved guild delivery target"
             )
         actual_guild_id = str(
             getattr(getattr(channel, "guild", None), "id", "") or ""
         )
         if expected_guild_id and actual_guild_id != str(expected_guild_id):
             raise RuntimeError("Discord receipt guild identity mismatch")
+        actual_channel_id = str(getattr(channel, "id", "") or "")
+        if actual_channel_id != str(channel_id):
+            raise RuntimeError("Discord receipt channel identity mismatch")
         message = await channel.fetch_message(int(message_id))
-        if _discord_public_target_error(channel):
+        if target_error(channel):
+            if require_public:
+                raise RuntimeError(
+                    "Discord receipt target lost public @everyone visibility "
+                    "during readback"
+                )
             raise RuntimeError(
-                "Discord receipt target lost public @everyone visibility "
-                "during readback"
+                "Discord receipt target lost approved guild delivery authorization"
             )
+        actual_message_id = str(getattr(message, "id", "") or "")
+        if actual_message_id != str(message_id):
+            raise RuntimeError("Discord receipt message identity mismatch")
         author_id = str(getattr(getattr(message, "author", None), "id", "") or "")
         bot_id = str(getattr(self._client.user, "id", "") or "")
         if not author_id or author_id != bot_id:
@@ -3678,8 +3738,8 @@ class DiscordAdapter(BasePlatformAdapter):
             "verified": True,
             "platform": "discord",
             "guild_id": actual_guild_id,
-            "channel_id": str(getattr(channel, "id", channel_id)),
-            "message_id": str(getattr(message, "id", message_id)),
+            "channel_id": actual_channel_id,
+            "message_id": actual_message_id,
             "content_sha256": actual_sha256,
             "bot_user_id": bot_id,
         }
@@ -3701,6 +3761,46 @@ class DiscordAdapter(BasePlatformAdapter):
         request timestamp.  Only the exact nonce, bot author, and content hash
         are retained; unrelated message content is not interpreted.
         """
+        return await self._find_message_ids_by_exact_nonce(
+            expected_guild_id=expected_guild_id,
+            channel_id=channel_id,
+            nonce=nonce,
+            expected_content_sha256=expected_content_sha256,
+            after_utc=after_utc,
+            require_public=True,
+        )
+
+    async def find_guild_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id: str,
+        channel_id: str,
+        nonce: int,
+        expected_content_sha256: str,
+        after_utc: dt.datetime,
+    ) -> Tuple[str, ...]:
+        """Reconcile an exact nonce in one approved guild delivery target."""
+
+        return await self._find_message_ids_by_exact_nonce(
+            expected_guild_id=expected_guild_id,
+            channel_id=channel_id,
+            nonce=nonce,
+            expected_content_sha256=expected_content_sha256,
+            after_utc=after_utc,
+            require_public=False,
+        )
+
+    async def _find_message_ids_by_exact_nonce(
+        self,
+        *,
+        expected_guild_id: str,
+        channel_id: str,
+        nonce: int,
+        expected_content_sha256: str,
+        after_utc: dt.datetime,
+        require_public: bool,
+    ) -> Tuple[str, ...]:
+        """Shared exact-nonce reconciliation with an explicit audience policy."""
 
         if not self._client or not getattr(self._client, "user", None):
             raise RuntimeError("Discord client is not connected")
@@ -3719,16 +3819,28 @@ class DiscordAdapter(BasePlatformAdapter):
         channel = self._client.get_channel(int(channel_id))
         if channel is None:
             channel = await self._client.fetch_channel(int(channel_id))
-        if _discord_public_target_error(channel):
+        target_error = (
+            _discord_public_target_error
+            if require_public
+            else _discord_delivery_target_error
+        )
+        if target_error(channel):
+            if require_public:
+                raise RuntimeError(
+                    "Discord reconciliation target is not a public guild "
+                    "channel/thread visible to @everyone/default role"
+                )
             raise RuntimeError(
-                "Discord reconciliation target is not a public guild "
-                "channel/thread visible to @everyone/default role"
+                "Discord reconciliation target is not an approved guild "
+                "delivery target"
             )
         actual_guild_id = str(
             getattr(getattr(channel, "guild", None), "id", "") or ""
         )
         if actual_guild_id != str(expected_guild_id):
             raise RuntimeError("Discord reconciliation guild identity mismatch")
+        if str(getattr(channel, "id", "") or "") != str(channel_id):
+            raise RuntimeError("Discord reconciliation channel identity mismatch")
         history = getattr(channel, "history", None)
         if not callable(history):
             raise RuntimeError("Discord reconciliation history is unavailable")
@@ -3767,9 +3879,14 @@ class DiscordAdapter(BasePlatformAdapter):
             if len(matches) > 1:
                 raise RuntimeError("Discord reconciliation nonce is ambiguous")
 
-        if _discord_public_target_error(channel):
+        if target_error(channel):
+            if require_public:
+                raise RuntimeError(
+                    "Discord reconciliation target lost public @everyone visibility"
+                )
             raise RuntimeError(
-                "Discord reconciliation target lost public @everyone visibility"
+                "Discord reconciliation target lost approved guild delivery "
+                "authorization"
             )
         return tuple(matches)
 

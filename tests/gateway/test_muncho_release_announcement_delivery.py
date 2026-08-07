@@ -157,7 +157,7 @@ class _Relay:
 class _NativeDiscord:
     """Live-adapter double with Discord's enforce-nonce replay semantics."""
 
-    supports_verified_idempotent_public_delivery = True
+    supports_verified_idempotent_guild_delivery = True
 
     def __init__(self) -> None:
         self.calls = []
@@ -178,7 +178,7 @@ class _NativeDiscord:
             raise RuntimeError("nonce reused with different exact content")
         return SimpleNamespace(success=True, message_id=accepted[0])
 
-    async def find_public_message_ids_by_exact_nonce(
+    async def find_guild_message_ids_by_exact_nonce(
         self,
         *,
         expected_guild_id,
@@ -198,7 +198,7 @@ class _NativeDiscord:
             raise RuntimeError("stored nonce content mismatch")
         return (accepted[0],)
 
-    async def verify_public_message_receipt(
+    async def verify_guild_message_receipt(
         self,
         *,
         expected_guild_id,
@@ -586,11 +586,16 @@ async def test_real_live_discord_adapter_path_sends_and_reads_exact_receipt(
     monkeypatch,
 ):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    monkeypatch.setenv("DISCORD_ALLOWED_CHANNELS", CHANNEL_ID)
     state, draft = _queued(tmp_path)
     adapter = DiscordAdapter(PlatformConfig(enabled=True, token="unused"))
     bot_user = SimpleNamespace(id=323456789012345679)
     default_role = object()
-    guild = SimpleNamespace(id=int(GUILD_ID), default_role=default_role)
+    guild = SimpleNamespace(
+        id=int(GUILD_ID),
+        default_role=default_role,
+        me=bot_user,
+    )
     sent_message = SimpleNamespace(
         id=423456789012345678,
         author=bot_user,
@@ -611,7 +616,9 @@ async def test_real_live_discord_adapter_path_sends_and_reads_exact_receipt(
         type=0,
         guild=guild,
         permissions_for=lambda role: SimpleNamespace(
-            view_channel=role is default_role
+            view_channel=role is bot_user,
+            read_message_history=role is bot_user,
+            send_messages=role is bot_user,
         ),
         history=history,
         send=send,
@@ -827,13 +834,13 @@ async def test_native_readback_mismatch_stays_pending_and_replays_without_duplic
     direct_config = GatewayConfig(
         platforms={Platform.DISCORD: PlatformConfig(enabled=True)},
     )
-    real_verify = direct.verify_public_message_receipt
+    real_verify = direct.verify_guild_message_receipt
 
     async def mismatched_receipt(**kwargs):
         receipt = await real_verify(**kwargs)
         return {**receipt, "content_sha256": "f" * 64}
 
-    monkeypatch.setattr(direct, "verify_public_message_receipt", mismatched_receipt)
+    monkeypatch.setattr(direct, "verify_guild_message_receipt", mismatched_receipt)
     kwargs = {
         "state_dir": state,
         "gateway_config": direct_config,
@@ -850,7 +857,7 @@ async def test_native_readback_mismatch_stays_pending_and_replays_without_duplic
         release_sha=RELEASE_SHA,
     )["discord_summary_published"] is False
 
-    monkeypatch.setattr(direct, "verify_public_message_receipt", real_verify)
+    monkeypatch.setattr(direct, "verify_guild_message_receipt", real_verify)
     delivered = await dispatch_pending_gateway_discord_deliveries(**kwargs)
     assert delivered[0]["state"] == "delivered"
     assert delivered[0]["discord_enforced_nonce"] == uncertain[0][
