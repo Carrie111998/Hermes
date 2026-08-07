@@ -26,13 +26,31 @@ def kanban_stop_nudge_enabled() -> bool:
     """Return whether the kanban stop-guard is active for this process.
 
     On when ``HERMES_KANBAN_TASK`` is set (dispatcher-spawned worker), unless
-    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it.
+    ``HERMES_KANBAN_STOP_NUDGE`` explicitly disables it or the current
+    execution is not the lifecycle-owning worker.
     """
     env = os.environ.get("HERMES_KANBAN_STOP_NUDGE")
     if env is not None and env.strip().lower() in {"0", "false", "no", "off"}:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
-    return bool(task)
+    if not task:
+        return False
+    # #80507: delegated children (and cron jobs fired in-process from a
+    # worker) inherit HERMES_KANBAN_TASK but are denied the terminal kanban
+    # tools (#69837), so the stop-guard nudge would be unsatisfiable for them
+    # and would burn the parent's turn budget. The guard applies only to the
+    # dispatcher-owned worker context; subprocesses of a delegated child carry
+    # the HERMES_DELEGATED_CHILD_CONTEXT lineage marker.
+    child_marker = (os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT") or "").strip().lower()
+    if child_marker not in {"", "0", "false", "no", "off"}:
+        return False
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        return is_dispatcher_owned_worker_context()
+    except ImportError:
+        # Unknown context — keep the pre-existing behavior (guard on).
+        return True
 
 
 def _tool_call_name(tc: Any) -> str:
