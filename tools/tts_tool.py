@@ -706,6 +706,91 @@ def _resolve_command_provider_config(
     return None
 
 
+_TTS_LOCALE_RE = re.compile(
+    r"^[A-Za-z]{2,3}(?:[-_][A-Za-z0-9]{2,8})*$"
+)
+_VOICE_LOCALE_RE = re.compile(
+    r"(?:^|[/\\])([A-Za-z]{2,3})[-_]([A-Za-z]{2})(?=[-_])"
+)
+
+
+def _canonicalize_tts_locale(value: object) -> Optional[str]:
+    """Return a conservative BCP-47-like locale, or ``None`` if absent."""
+    if not isinstance(value, str):
+        return None
+    locale = value.strip()
+    if not locale:
+        return None
+    if locale.lower() in {"auto", "und"}:
+        return "und"
+    if not _TTS_LOCALE_RE.fullmatch(locale):
+        return None
+    parts = locale.replace("_", "-").split("-")
+    normalized = [parts[0].lower()]
+    for part in parts[1:]:
+        normalized.append(part.upper() if len(part) == 2 else part)
+    return "-".join(normalized)
+
+
+def _infer_tts_locale_from_voice(provider_config: Dict[str, Any]) -> Optional[str]:
+    """Infer locales embedded in Edge/Piper-style voice identifiers."""
+    for key in ("voice", "voice_id"):
+        value = provider_config.get(key)
+        if not isinstance(value, str):
+            continue
+        match = _VOICE_LOCALE_RE.search(value.strip())
+        if match:
+            return _canonicalize_tts_locale(
+                f"{match.group(1)}-{match.group(2)}"
+            )
+    return None
+
+
+def _resolve_tts_locale(
+    provider: Optional[str],
+    tts_config: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Resolve the language used by Hermes' spoken-text normalizer.
+
+    Resolution order is provider-specific ``language``/``locale``, global
+    ``tts.language``, then a locale embedded in Edge/Piper-style voice names.
+    English remains the compatibility fallback. An explicit ``auto``/``und``
+    returns ``und`` so the normalizer leaves semantic symbols to the provider.
+    """
+    config = tts_config if isinstance(tts_config, dict) else _load_tts_config()
+    provider_key = (provider or _get_provider(config)).lower().strip()
+    if provider_key in BUILTIN_TTS_PROVIDERS:
+        provider_config = _get_provider_section(config, provider_key)
+    else:
+        provider_config = _get_named_provider_config(config, provider_key)
+
+    for candidate in (
+        provider_config.get("language"),
+        provider_config.get("locale"),
+        config.get("language"),
+    ):
+        locale = _canonicalize_tts_locale(candidate)
+        if locale is not None:
+            return locale
+
+    return _infer_tts_locale_from_voice(provider_config) or "en"
+
+
+def _prepare_spoken_text_for_tts(
+    text: str,
+    *,
+    max_chars: Optional[int] = None,
+    tts_config: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+) -> str:
+    """Apply shared cleanup using the configured provider's language."""
+    config = tts_config if isinstance(tts_config, dict) else _load_tts_config()
+    locale = _resolve_tts_locale(provider, config)
+    from tools.tts_text_normalize import prepare_spoken_text
+
+    return prepare_spoken_text(text, max_chars=max_chars, locale=locale)
+
+
 def _dispatch_to_plugin_provider(
     text: str,
     output_path: str,
@@ -2819,15 +2904,26 @@ def text_to_speech_tool(
     if not text or not text.strip():
         return tool_error("Text is required", success=False)
 
+    tts_config = _load_tts_config()
+
+    # Resolve the provider before cleanup so symbol/unit expansion follows the
+    # configured voice language instead of always injecting English.
+    if provider:
+        provider = provider.lower().strip()
+    else:
+        provider = _get_provider(tts_config)
+
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        text = prepare_spoken_text(text, max_chars=None)
+        text = _prepare_spoken_text_for_tts(
+            text,
+            max_chars=None,
+            tts_config=tts_config,
+            provider=provider,
+        )
     except Exception:
         text = text.strip()
     if not text:
         return tool_error("Text is empty after TTS cleanup", success=False)
-
-    tts_config = _load_tts_config()
 
     # When the model supplies a speed parameter, inject it into the config
     # so all downstream provider functions pick it up uniformly.
@@ -2835,12 +2931,6 @@ def text_to_speech_tool(
         clamped = max(0.25, min(4.0, float(speed)))
         tts_config = dict(tts_config)  # shallow copy to avoid mutating the cache
         tts_config["speed"] = clamped
-
-    # Allow per-call provider override; fall back to the configured default.
-    if provider:
-        provider = provider.lower().strip()
-    else:
-        provider = _get_provider(tts_config)
 
     # User-declared command provider (type: command under tts.providers.<name>)
     # resolves BEFORE the built-in dispatch. Built-in names short-circuit here
@@ -3319,19 +3409,29 @@ _EMOJI = re.compile(
 _THINK_BLOCK = re.compile(r'<think[\s>].*?</think>', flags=re.DOTALL)
 
 
-def _strip_markdown_for_tts(text: str) -> str:
+def _strip_markdown_for_tts(
+    text: str,
+    *,
+    tts_config: Optional[Dict[str, Any]] = None,
+    provider: Optional[str] = None,
+) -> str:
     """Prepare text for speech via the shared cleaner in tts_text_normalize.
 
     One cleaner for every TTS path (tool, gateway auto-TTS, voice-mode
     streaming, web dashboard): strips <think> reasoning blocks, the
     file-mutation verifier footer, markdown, and emoji; expands units and
     symbols; and flattens newlines to sentence breaks so newline-sensitive
-    providers (Kokoro) speak the whole script.  Falls back to the legacy
-    regex pipeline if the normalizer ever fails.
+    providers (Kokoro) speak the whole script. Symbol and unit expansions use
+    the resolved provider language. Falls back to the legacy regex pipeline if
+    the normalizer ever fails.
     """
     try:
-        from tools.tts_text_normalize import prepare_spoken_text
-        return prepare_spoken_text(text, max_chars=None)
+        return _prepare_spoken_text_for_tts(
+            text,
+            max_chars=None,
+            tts_config=tts_config,
+            provider=provider,
+        )
     except Exception:
         pass
     text = _THINK_BLOCK.sub(' ', text)
@@ -3479,6 +3579,11 @@ def stream_tts_to_speaker(
         # per-sentence sync synthesis (universal — edge + every non-streamer).
         from tools.tts_streaming import SentenceChunker, resolve_streaming_provider
         streamer = resolve_streaming_provider(tts_config, preferred=provider)
+        spoken_provider = (
+            getattr(streamer, "provider_name", "")
+            or provider
+            or _get_provider(tts_config)
+        )
 
         # No chunked streamer: per-sentence sync synthesis, pipelined so the
         # next sentence synthesizes while the current one plays (closed in the
@@ -3727,7 +3832,11 @@ def stream_tts_to_speaker(
             """Display sentence and route to the appropriate audio path."""
             if stop_event.is_set():
                 return
-            cleaned = _strip_markdown_for_tts(sentence).strip()
+            cleaned = _strip_markdown_for_tts(
+                sentence,
+                tts_config=tts_config,
+                provider=spoken_provider,
+            ).strip()
             if not cleaned:
                 return
             # Skip duplicate/near-duplicate sentences (LLM repetition)

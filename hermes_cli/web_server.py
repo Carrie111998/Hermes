@@ -4659,14 +4659,20 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
         with _config_profile_scope(profile):
             cfg = _load_tts_config()
             streamer = resolve_streaming_provider(cfg)
-            cap = _resolve_max_text_length(_get_provider(cfg), cfg) if streamer else 0
-        return streamer, cap
+            configured_provider = _get_provider(cfg)
+            spoken_provider = (
+                getattr(streamer, "provider_name", "") or configured_provider
+            )
+            cap = _resolve_max_text_length(configured_provider, cfg) if streamer else 0
+        return streamer, cap, cfg, spoken_provider
 
     try:
-        streamer, cap = await loop.run_in_executor(None, _resolve)
+        streamer, cap, tts_config, spoken_provider = await loop.run_in_executor(
+            None, _resolve
+        )
     except Exception:
         _log.exception("speak-stream provider resolution failed")
-        streamer, cap = None, 0
+        streamer, cap, tts_config, spoken_provider = None, 0, {}, None
     if streamer is None:
         with contextlib.suppress(Exception):
             await ws.send_json({"type": "fallback"})
@@ -4719,7 +4725,11 @@ async def speak_stream_ws(ws: "WebSocket") -> None:
 
         try:
             for sentence in _sentences():
-                cleaned = _strip_markdown_for_tts(sentence)
+                cleaned = _strip_markdown_for_tts(
+                    sentence,
+                    tts_config=tts_config,
+                    provider=spoken_provider,
+                )
                 if not cleaned:
                     continue
                 for piece in _split_text_for_speak_stream(cleaned, cap):

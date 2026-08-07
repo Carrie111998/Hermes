@@ -351,6 +351,31 @@ class TestStreamerFormatAndLooping:
             tts_streaming.resolve_streaming_provider = original_resolve
             loop.close()
 
+    def test_consumer_normalizes_with_streaming_provider_locale(self, monkeypatch):
+        streamer = FakeStreamer(chunks_per_clause=1)
+        streamer.provider_name = "edge"
+        monkeypatch.setattr(
+            "tools.tts_streaming.resolve_streaming_provider",
+            lambda *_args, **_kwargs: streamer,
+        )
+        loop = asyncio.new_event_loop()
+        try:
+            consumer = StreamingTTSConsumer(
+                FakeVoiceAdapter(),
+                "chat1",
+                {
+                    "provider": "edge",
+                    "edge": {"voice": "fr-FR-HenriNeural"},
+                },
+                loop,
+            )
+
+            assert consumer._strip_markdown_for_tts("44 % à 28 °C") == (
+                "44 pour cent à 28 degrés Celsius"
+            )
+        finally:
+            loop.close()
+
 
 class TestGatewayIntegrationSeam:
     """The actual adapter seam is per-turn, not chat-only."""

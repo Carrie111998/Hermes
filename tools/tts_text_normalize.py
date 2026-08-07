@@ -84,24 +84,94 @@ def strip_markdown_for_tts(text: str) -> str:
     return text
 
 
-def _normalize_temperature_ranges(text: str) -> str:
-    # 11-17 degrees C -> "11 to 17 degrees Celsius" (en/em dash or hyphen).
+_NUMBER_RE = r"[-+\u2212]?\d+(?:[.,]\d+)?"
+
+_EN_SYMBOL_FORMS = {
+    "range_to": "to",
+    "degrees_celsius": "degrees Celsius",
+    "degrees_fahrenheit": "degrees Fahrenheit",
+    "degrees": "degrees",
+    "km_per_hour": "kilometres per hour",
+    "millimetres": "millimetres",
+    "centimetres": "centimetres",
+    "metres": "metres",
+    "per": "per",
+    "nzd": "New Zealand dollars",
+    "aud": "Australian dollars",
+    "usd": "US dollars",
+    "eur": "euros",
+    "gbp": "pounds",
+    "dollars": "dollars",
+    "percent": "percent",
+    "and": "and",
+    "to": "to",
+    "about": "about",
+}
+
+_FR_SYMBOL_FORMS = {
+    "range_to": "à",
+    "degrees_celsius": "degrés Celsius",
+    "degrees_fahrenheit": "degrés Fahrenheit",
+    "degrees": "degrés",
+    "km_per_hour": "kilomètres par heure",
+    "millimetres": "millimètres",
+    "centimetres": "centimètres",
+    "metres": "mètres",
+    "per": "par",
+    "nzd": "dollars néo-zélandais",
+    "aud": "dollars australiens",
+    "usd": "dollars américains",
+    "eur": "euros",
+    "gbp": "livres sterling",
+    "dollars": "dollars",
+    "percent": "pour cent",
+    "and": "et",
+    "to": "à",
+    "about": "environ",
+}
+
+
+def _symbol_forms_for_locale(locale: str | None) -> dict[str, str] | None:
+    """Return spoken forms for *locale*.
+
+    ``None`` preserves the historical English behavior. For a known
+    non-English locale without a bundled table, leave semantic symbols intact
+    so the selected voice can pronounce them instead of injecting English.
+    """
+    if locale is None:
+        return _EN_SYMBOL_FORMS
+    language = str(locale).strip().lower().replace("_", "-").split("-", 1)[0]
+    if not language or language == "en":
+        return _EN_SYMBOL_FORMS
+    if language == "fr":
+        return _FR_SYMBOL_FORMS
+    return None
+
+
+def _normalize_temperature_ranges(text: str, forms: dict[str, str]) -> str:
+    # 11-17 degrees C -> a locale-appropriate spoken range.
     text = re.sub(
-        r"(?<!\w)([-+\u2212]?\d+(?:\.\d+)?)\s*[\u2013\u2014-]\s*([-+\u2212]?\d+(?:\.\d+)?)\s*°\s*C\b",
-        lambda m: f"{m.group(1).replace(chr(0x2212), '-')} to {m.group(2).replace(chr(0x2212), '-')} degrees Celsius",
+        rf"(?<!\w)({_NUMBER_RE})\s*[\u2013\u2014-]\s*({_NUMBER_RE})\s*°\s*C\b",
+        lambda m: (
+            f"{m.group(1).replace(chr(0x2212), '-')} {forms['range_to']} "
+            f"{m.group(2).replace(chr(0x2212), '-')} {forms['degrees_celsius']}"
+        ),
         text,
         flags=re.IGNORECASE,
     )
     text = re.sub(
-        r"(?<!\w)([-+\u2212]?\d+(?:\.\d+)?)\s*[\u2013\u2014-]\s*([-+\u2212]?\d+(?:\.\d+)?)\s*°\s*F\b",
-        lambda m: f"{m.group(1).replace(chr(0x2212), '-')} to {m.group(2).replace(chr(0x2212), '-')} degrees Fahrenheit",
+        rf"(?<!\w)({_NUMBER_RE})\s*[\u2013\u2014-]\s*({_NUMBER_RE})\s*°\s*F\b",
+        lambda m: (
+            f"{m.group(1).replace(chr(0x2212), '-')} {forms['range_to']} "
+            f"{m.group(2).replace(chr(0x2212), '-')} {forms['degrees_fahrenheit']}"
+        ),
         text,
         flags=re.IGNORECASE,
     )
     return text
 
 
-def normalize_symbols_for_tts(text: str) -> str:
+def normalize_symbols_for_tts(text: str, locale: str | None = None) -> str:
     """Expand common symbols/shorthand into words a TTS engine reads well."""
     if not text:
         return ""
@@ -110,46 +180,70 @@ def normalize_symbols_for_tts(text: str) -> str:
     text = re.sub("[   ]", " ", text)  # non-breaking / thin spaces
     text = text.replace("\u2212", "-")  # minus sign
     text = text.replace("…", "...")  # ellipsis
-    text = _normalize_temperature_ranges(text)
+    forms = _symbol_forms_for_locale(locale)
+
+    # Do not inject English into known non-English languages for which Hermes
+    # has no table. Their TTS provider gets the original semantic symbols.
+    if forms is None:
+        text = re.sub("[•◦▪▫]", " ", text)
+        text = _VARIATION_SELECTOR_RE.sub("", text)
+        return _EMOJI_RE.sub("", text)
+
+    text = _normalize_temperature_ranges(text, forms)
 
     # Temperatures with a number.  Do this before generic degree handling.
-    text = re.sub(r"(?<!\w)([-+]?\d+(?:\.\d+)?)\s*°\s*C\b", r"\1 degrees Celsius", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<!\w)([-+]?\d+(?:\.\d+)?)\s*°\s*F\b", r"\1 degrees Fahrenheit", text, flags=re.IGNORECASE)
+    text = re.sub(
+        rf"(?<!\w)({_NUMBER_RE})\s*°\s*C\b",
+        lambda m: f"{m.group(1)} {forms['degrees_celsius']}",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(
+        rf"(?<!\w)({_NUMBER_RE})\s*°\s*F\b",
+        lambda m: f"{m.group(1)} {forms['degrees_fahrenheit']}",
+        text,
+        flags=re.IGNORECASE,
+    )
     # Bare units with no leading number ("measured in degrees C").
-    text = re.sub(r"°\s*C\b", "degrees Celsius", text, flags=re.IGNORECASE)
-    text = re.sub(r"°\s*F\b", "degrees Fahrenheit", text, flags=re.IGNORECASE)
+    text = re.sub(r"°\s*C\b", forms["degrees_celsius"], text, flags=re.IGNORECASE)
+    text = re.sub(r"°\s*F\b", forms["degrees_fahrenheit"], text, flags=re.IGNORECASE)
     # Any remaining degree symbol (angles, stray cases).
-    text = re.sub(r"(?<!\w)([-+]?\d+(?:\.\d+)?)\s*°", r"\1 degrees", text)
-    text = text.replace("°", " degrees")
+    text = re.sub(
+        rf"(?<!\w)({_NUMBER_RE})\s*°",
+        lambda m: f"{m.group(1)} {forms['degrees']}",
+        text,
+    )
+    text = text.replace("°", f" {forms['degrees']}")
 
     # Common weather/travel units.
-    text = re.sub(r"(?<=\d)\s*km\s*/\s*h\b", " kilometres per hour", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<=\d)\s*km/h\b", " kilometres per hour", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<=\d)\s*mm\b", " millimetres", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<=\d)\s*cm\b", " centimetres", text, flags=re.IGNORECASE)
-    text = re.sub(r"(?<=\d)\s*m\b", " metres", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*km\s*/\s*h\b", f" {forms['km_per_hour']}", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*km/h\b", f" {forms['km_per_hour']}", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*mm\b", f" {forms['millimetres']}", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*cm\b", f" {forms['centimetres']}", text, flags=re.IGNORECASE)
+    text = re.sub(r"(?<=\d)\s*m\b", f" {forms['metres']}", text, flags=re.IGNORECASE)
 
     # Numeric rates only ("5/month" -> "5 per month").  Requiring digit-then-letter
     # keeps "and/or", "N/A", "TCP/IP" and dates like "2026/06" intact.
-    text = re.sub(r"(?<=\d)\s*/\s*(?=[A-Za-z])", " per ", text)
+    text = re.sub(r"(?<=\d)\s*/\s*(?=[A-Za-zÀ-ÖØ-öø-ÿ])", f" {forms['per']} ", text)
 
     # Money and percentages.  The integer part must END in a digit so a trailing
     # comma ("A$50, ...") is not swallowed into the spoken amount.
-    text = re.sub(r"NZ\$\s*([\d,]*\d(?:\.\d+)?)", r"\1 New Zealand dollars", text, flags=re.IGNORECASE)
-    text = re.sub(r"A\$\s*([\d,]*\d(?:\.\d+)?)", r"\1 Australian dollars", text, flags=re.IGNORECASE)
-    text = re.sub(r"US\$\s*([\d,]*\d(?:\.\d+)?)", r"\1 US dollars", text, flags=re.IGNORECASE)
-    text = re.sub(r"€\s*([\d,]*\d(?:\.\d+)?)", r"\1 euros", text)
-    text = re.sub(r"£\s*([\d,]*\d(?:\.\d+)?)", r"\1 pounds", text)
-    text = re.sub(r"\$\s*([\d,]*\d(?:\.\d+)?)", r"\1 dollars", text)
-    text = re.sub(r"(?<=\d)\s*%", " percent", text)
+    amount = r"([\d,]*\d(?:\.\d+)?)"
+    text = re.sub(rf"NZ\$\s*{amount}", lambda m: f"{m.group(1)} {forms['nzd']}", text, flags=re.IGNORECASE)
+    text = re.sub(rf"A\$\s*{amount}", lambda m: f"{m.group(1)} {forms['aud']}", text, flags=re.IGNORECASE)
+    text = re.sub(rf"US\$\s*{amount}", lambda m: f"{m.group(1)} {forms['usd']}", text, flags=re.IGNORECASE)
+    text = re.sub(rf"€\s*{amount}", lambda m: f"{m.group(1)} {forms['eur']}", text)
+    text = re.sub(rf"£\s*{amount}", lambda m: f"{m.group(1)} {forms['gbp']}", text)
+    text = re.sub(rf"\$\s*{amount}", lambda m: f"{m.group(1)} {forms['dollars']}", text)
+    text = re.sub(r"(?<=\d)\s*%", f" {forms['percent']}", text)
 
     # Operators and separators that commonly leak from formatted answers.
-    text = text.replace("&", " and ")
+    text = text.replace("&", f" {forms['and']} ")
     text = re.sub("[•◦▪▫]", " ", text)  # bullet glyphs
-    text = text.replace("→", " to ")  # ->
-    text = text.replace("⇒", " to ")  # =>
-    text = text.replace("≈", " about ")  # almost equal
-    text = text.replace("~", " about ")
+    text = text.replace("→", f" {forms['to']} ")  # ->
+    text = text.replace("⇒", f" {forms['to']} ")  # =>
+    text = text.replace("≈", f" {forms['about']} ")  # almost equal
+    text = text.replace("~", f" {forms['about']} ")
 
     text = _VARIATION_SELECTOR_RE.sub("", text)
     text = _EMOJI_RE.sub("", text)
@@ -258,7 +352,11 @@ def flatten_newlines_for_payload(text: str) -> str:
     return text.strip()
 
 
-def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
+def prepare_spoken_text(
+    text: str,
+    max_chars: int | None = 4000,
+    locale: str | None = None,
+) -> str:
     """Return a TTS-friendly script from assistant text.
 
     Deterministic cleanup, not a semantic rewrite: it removes ``<think>``
@@ -270,7 +368,7 @@ def prepare_spoken_text(text: str, max_chars: int | None = 4000) -> str:
     """
     spoken = strip_nonspoken_blocks(text)
     spoken = strip_markdown_for_tts(spoken)
-    spoken = normalize_symbols_for_tts(spoken)
+    spoken = normalize_symbols_for_tts(spoken, locale=locale)
     spoken = smooth_whitespace_for_tts(spoken)
     spoken = flatten_newlines_for_payload(spoken)
     if max_chars is not None and max_chars > 0 and len(spoken) > max_chars:

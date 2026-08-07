@@ -131,6 +131,7 @@ class SentenceChunker:
 class StreamingTTSProvider(ABC):
     """Yields raw int16, little-endian, mono PCM chunks at ``sample_rate``."""
 
+    provider_name: str = ""
     sample_rate: int = 24000
     channels: int = 1
     sample_width: int = 2  # bytes/sample (int16)
@@ -154,6 +155,7 @@ _REGISTRY: Dict[str, type[StreamingTTSProvider]] = {}
 
 def register(name: str) -> Callable[[type[StreamingTTSProvider]], type[StreamingTTSProvider]]:
     def _wrap(cls: type[StreamingTTSProvider]) -> type[StreamingTTSProvider]:
+        cls.provider_name = name
         _REGISTRY[name] = cls
         return cls
 

@@ -49,9 +49,10 @@ class _FakeStreamer:
         yield from self.chunks
 
 
-def _patch_provider(monkeypatch, streamer, cap=4000):
+def _patch_provider(monkeypatch, streamer, cap=4000, config=None):
+    config = config or {}
     monkeypatch.setattr("tools.tts_streaming.resolve_streaming_provider", lambda cfg: streamer)
-    monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: {})
+    monkeypatch.setattr("tools.tts_tool._load_tts_config", lambda: config)
     monkeypatch.setattr("tools.tts_tool._get_provider", lambda cfg: "fake")
     monkeypatch.setattr("tools.tts_tool._resolve_max_text_length", lambda provider, cfg: cap)
 
@@ -74,6 +75,27 @@ def test_streams_pcm_frames_then_end(stream_client, monkeypatch):
         assert conn.receive_json() == {"type": "end"}
 
     assert streamer.requests == ["Hello there."]
+
+
+def test_stream_uses_configured_voice_locale(stream_client, monkeypatch):
+    streamer = _FakeStreamer([b"\x00\x00"])
+    streamer.provider_name = "edge"
+    _patch_provider(
+        monkeypatch,
+        streamer,
+        config={
+            "provider": "edge",
+            "edge": {"voice": "fr-FR-HenriNeural"},
+        },
+    )
+
+    with stream_client.websocket_connect(_url()) as conn:
+        assert conn.receive_json()["type"] == "start"
+        conn.send_text(json.dumps({"text": "44 % à 28 °C", "done": True}))
+        assert conn.receive_bytes() == b"\x00\x00"
+        assert conn.receive_json() == {"type": "end"}
+
+    assert streamer.requests == ["44 pour cent à 28 degrés Celsius"]
 
 
 
@@ -119,5 +141,4 @@ def test_split_text_respects_cap_and_preserves_content():
     joined = " ".join(pieces)
     for word in text.replace(".", "").split():
         assert word in joined
-
 

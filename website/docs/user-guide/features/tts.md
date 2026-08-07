@@ -45,6 +45,7 @@ Convert text to speech with eleven providers:
 # In ~/.hermes/config.yaml
 tts:
   provider: "edge"              # "edge" | "elevenlabs" | "openai" | "minimax" | "mistral" | "gemini" | "xai" | "deepinfra" | "neutts" | "kittentts" | "piper"
+  language: ""                  # Optional BCP-47 override; blank infers from provider/voice
   speed: 1.0                    # Global speed multiplier (provider-specific settings override this)
   edge:
     voice: "en-US-AriaNeural"   # 322 voices, 74 languages
@@ -104,6 +105,15 @@ tts:
     # volume: 1.0                               # 0.5 = half as loud
     # normalize_audio: true
 ```
+
+Hermes uses the resolved TTS language when expanding symbols and units before
+synthesis. Provider-specific `language` or `locale` settings take priority,
+then `tts.language`; when both are blank, locale-bearing Edge and Piper voice
+names such as `fr-FR-HenriNeural` and `fr_FR-siwis-medium` are detected
+automatically. English remains the compatibility fallback. For other
+explicitly configured languages without a bundled expansion table, Hermes
+leaves semantic symbols for the selected voice to pronounce instead of
+inserting English words.
 
 MiniMax TTS selects its region, endpoint, and credential together:
 

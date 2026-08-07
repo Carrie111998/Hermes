@@ -76,6 +76,10 @@ class StreamingTTSConsumer:
         # Resolve the streaming provider once. If unavailable, the consumer is
         # inactive and the gateway falls back to whole-file TTS.
         self._streamer = resolve_streaming_provider(tts_config)
+        self._spoken_provider = (
+            getattr(self._streamer, "provider_name", "")
+            or str(tts_config.get("provider") or "edge").lower().strip()
+        )
         self._chunker = SentenceChunker()
 
         if self._streamer is not None:
@@ -360,7 +364,11 @@ class StreamingTTSConsumer:
         if self._strip_markdown is None:
             try:
                 from tools.tts_tool import _strip_markdown_for_tts as _strip
-                self._strip_markdown = _strip
+                self._strip_markdown = lambda value: _strip(
+                    value,
+                    tts_config=getattr(self, "_tts_config", None),
+                    provider=getattr(self, "_spoken_provider", None),
+                )
             except ImportError:
                 self._strip_markdown = lambda t: t  # noqa: E731
         return self._strip_markdown(text).strip()
