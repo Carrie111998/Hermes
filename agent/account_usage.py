@@ -54,10 +54,16 @@ def _title_case_slug(value: Optional[str]) -> Optional[str]:
 
 
 def _parse_dt(value: Any) -> Optional[datetime]:
-    if value in {None, ""}:
+    if value is None or value == "" or isinstance(value, bool):
         return None
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        timestamp = float(value)
+        if not math.isfinite(timestamp):
+            return None
+        try:
+            return datetime.fromtimestamp(timestamp, tz=timezone.utc)
+        except (OSError, OverflowError, ValueError):
+            return None
     if isinstance(value, str):
         text = value.strip()
         if not text:
@@ -73,24 +79,23 @@ def _parse_dt(value: Any) -> Optional[datetime]:
 
 
 def _coerce_percent_value(value: Any) -> Optional[float]:
-    """Return an already-scaled percent value when numeric and finite."""
+    """Return a validated already-scaled percentage in ``[0, 100]``."""
 
-    if value is None:
+    if value is None or isinstance(value, bool):
         return None
     try:
         percent = float(value)
     except (TypeError, ValueError):
         return None
-    return percent if math.isfinite(percent) else None
+    return percent if math.isfinite(percent) and 0 <= percent <= 100 else None
 
 
 def _coerce_usage_percent(value: Any) -> Optional[float]:
-    """Return a percent value for legacy Anthropic utilization fields.
+    """Return a percent value for pre-``limits`` Anthropic payloads.
 
-    Anthropic's OAuth usage endpoint has emitted both fractional utilization
-    values (``0.41``) and already-scaled percentage values (``41``). Treat
-    utilization values in ``[0, 1]`` as fractions and larger values as
-    percentages. Do not use this for fields literally named ``percent``.
+    Older payloads used fractional ``utilization`` values, while newer payloads
+    pair percentage-style top-level values with canonical ``limits[].percent``
+    records. This heuristic is therefore only safe when ``limits`` is absent.
     """
 
     percent = _coerce_percent_value(value)
@@ -116,13 +121,48 @@ def _anthropic_scoped_limit_label(limit: dict[str, Any]) -> Optional[str]:
         return "Scoped week"
     model = scope.get("model")
     if isinstance(model, dict):
-        display = str(model.get("display_name") or model.get("id") or "").strip()
+        display = str(
+            model.get("display_name") or model.get("name") or model.get("id") or ""
+        ).strip()
         if display:
             return f"{display} week"
     surface = scope.get("surface")
     if isinstance(surface, str) and surface.strip():
         return f"{_title_case_slug(surface)} week"
     return "Scoped week"
+
+
+def _anthropic_scoped_limit_identity(limit: dict[str, Any]) -> tuple[str, ...]:
+    """Stable identity for first-valid-wins scoped-limit deduplication."""
+
+    scope = limit.get("scope")
+    if not isinstance(scope, dict):
+        return ("unscoped",)
+    model = scope.get("model")
+    model_id = ""
+    model_name = ""
+    if isinstance(model, dict):
+        raw_id = model.get("id")
+        if isinstance(raw_id, str):
+            model_id = raw_id.strip().casefold()
+        for key in ("display_name", "name"):
+            raw_name = model.get(key)
+            if isinstance(raw_name, str) and raw_name.strip():
+                model_name = raw_name.strip().casefold()
+                break
+    raw_surface = scope.get("surface")
+    surface = (
+        raw_surface.strip().casefold()
+        if isinstance(raw_surface, str) and raw_surface.strip()
+        else ""
+    )
+    if model_id:
+        return ("model-id", model_id, surface)
+    if model_name:
+        return ("model-name", model_name, surface)
+    if surface:
+        return ("surface", surface)
+    return ("unscoped",)
 
 
 def _format_reset(dt: Optional[datetime]) -> str:
@@ -824,16 +864,120 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
         response.raise_for_status()
     payload = response.json() or {}
     windows: list[AccountUsageWindow] = []
-    mapping = (
-        ("five_hour", "Current session"),
-        ("seven_day", "Current week"),
-        ("seven_day_opus", "Opus week"),
-        ("seven_day_sonnet", "Sonnet week"),
+    raw_limits = payload.get("limits")
+    limits = (
+        [item for item in raw_limits if isinstance(item, dict)]
+        if isinstance(raw_limits, list)
+        else []
     )
-    seen_labels: set[str] = set()
-    for key, label in mapping:
-        window = payload.get(key) or {}
-        used = _coerce_usage_percent(window.get("utilization"))
+    standard_limits: dict[str, dict[str, Any]] = {}
+    for item in limits:
+        kind = item.get("kind")
+        if (
+            isinstance(kind, str)
+            and kind in {"session", "weekly_all"}
+            and _coerce_percent_value(item.get("percent")) is not None
+        ):
+            standard_limits.setdefault(kind, item)
+    top_level_keys = (
+        "five_hour",
+        "seven_day",
+        "seven_day_opus",
+        "seven_day_sonnet",
+        "seven_day_overage_included",
+    )
+    top_level_values: list[float] = []
+    for key in top_level_keys:
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        value = _coerce_percent_value(window.get("utilization"))
+        if value is not None:
+            top_level_values.append(value)
+    # A validated canonical limit identifies the percentage-style response. For
+    # a top-level-only response, one value above 1 proves that sibling values
+    # use the same percentage scale; an all-<=1 response retains the legacy
+    # fractional interpretation for backward compatibility. Empty or malformed
+    # ``limits`` arrays do not change the scale.
+    canonical_kinds = {"session", "weekly_all", "weekly_scoped"}
+    has_valid_canonical_limit = any(
+        isinstance(item.get("kind"), str)
+        and item.get("kind") in canonical_kinds
+        and _coerce_percent_value(item.get("percent")) is not None
+        for item in limits
+    )
+    uses_percent_scale = has_valid_canonical_limit or any(
+        value > 1 for value in top_level_values
+    )
+    top_level_percent = (
+        _coerce_percent_value if uses_percent_scale else _coerce_usage_percent
+    )
+
+    # Canonical limits win for standard windows. In current payloads a value of
+    # ``percent=1`` means 1%, whereas the old utilization heuristic interprets
+    # ``1`` as a complete 0-1 fraction.
+    standard_mapping = (
+        ("five_hour", "Current session", "session"),
+        ("seven_day", "Current week", "weekly_all"),
+    )
+    for key, label, canonical_kind in standard_mapping:
+        canonical = standard_limits.get(canonical_kind)
+        if canonical is not None:
+            used = _coerce_percent_value(canonical.get("percent"))
+            reset_at = canonical.get("resets_at")
+        else:
+            window = payload.get(key)
+            if not isinstance(window, dict):
+                continue
+            used = top_level_percent(window.get("utilization"))
+            reset_at = window.get("resets_at")
+        if used is None:
+            continue
+        windows.append(
+            AccountUsageWindow(
+                label=label,
+                used_percent=used,
+                reset_at=_parse_dt(reset_at),
+            )
+        )
+
+    scoped_windows: list[AccountUsageWindow] = []
+    scoped_identities: set[tuple[str, ...]] = set()
+    scoped_labels: set[str] = set()
+    for limit in limits:
+        label = _anthropic_scoped_limit_label(limit)
+        identity = _anthropic_scoped_limit_identity(limit)
+        if not label or identity in scoped_identities:
+            continue
+        used = _coerce_percent_value(limit.get("percent"))
+        if used is None:
+            continue
+        scoped_windows.append(
+            AccountUsageWindow(
+                label=label,
+                used_percent=used,
+                reset_at=_parse_dt(limit.get("resets_at")),
+            )
+        )
+        scoped_identities.add(identity)
+        scoped_labels.add(label)
+
+    # Retain older model-specific fields only when no canonical scoped window
+    # represents that model family. ``seven_day_overage_included`` is the
+    # legacy Fable allowance observed in earlier Claude Code payloads.
+    scoped_text = " ".join(scoped_labels).casefold()
+    legacy_scoped_mapping = (
+        ("seven_day_opus", "Opus week", "opus"),
+        ("seven_day_sonnet", "Sonnet week", "sonnet"),
+        ("seven_day_overage_included", "Fable week", "fable"),
+    )
+    for key, label, model_family in legacy_scoped_mapping:
+        if model_family in scoped_text:
+            continue
+        window = payload.get(key)
+        if not isinstance(window, dict):
+            continue
+        used = top_level_percent(window.get("utilization"))
         if used is None:
             continue
         windows.append(
@@ -843,31 +987,11 @@ def _fetch_anthropic_account_usage() -> Optional[AccountUsageSnapshot]:
                 reset_at=_parse_dt(window.get("resets_at")),
             )
         )
-        seen_labels.add(label)
 
-    # Claude Code's newer /api/oauth/usage payload can carry scoped weekly
-    # buckets in a generic limits[] array while the older top-level fields (for
-    # example seven_day_sonnet) are null. This is how model-specific buckets
-    # like the Fable weekly allowance currently appear.
-    for limit in payload.get("limits") or []:
-        if not isinstance(limit, dict):
-            continue
-        label = _anthropic_scoped_limit_label(limit)
-        if not label or label in seen_labels:
-            continue
-        used = _coerce_percent_value(limit.get("percent"))
-        if used is None:
-            continue
-        windows.append(
-            AccountUsageWindow(
-                label=label,
-                used_percent=used,
-                reset_at=_parse_dt(limit.get("resets_at")),
-            )
-        )
-        seen_labels.add(label)
+    windows.extend(scoped_windows)
     details: list[str] = []
-    extra = payload.get("extra_usage") or {}
+    raw_extra = payload.get("extra_usage")
+    extra = raw_extra if isinstance(raw_extra, dict) else {}
     if extra.get("is_enabled"):
         used_credits = extra.get("used_credits")
         monthly_limit = extra.get("monthly_limit")
