@@ -30,6 +30,13 @@ class TestRewrites:
         cmd = "A && B &\nfalse || C &"
         assert rewrite(cmd) == "A && { B & }\nfalse || { C & }"
 
+    def test_multiple_rewrites_on_one_line(self):
+        # Two mid-command rewrites in a single line, applied back-to-front,
+        # must both stay bash-valid ('A && B & C && D & E' backgrounds two
+        # compounds and runs E in the foreground).
+        cmd = "A && B & C && D & E"
+        assert rewrite(cmd) == "A && { B & }; C && { D & }; E"
+
 
 class TestMidCommandBackground:
     """``A && B & C``: the backgrounded compound is followed by another

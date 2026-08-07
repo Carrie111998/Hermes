@@ -971,6 +971,11 @@ def _rewrite_compound_background(command: str) -> str:
         head = suffix.lstrip()
         prefix_ws = suffix[: len(suffix) - len(head)]
         if head and "\n" not in prefix_ws and head[0] not in (";", "&", "#"):
+            # Note: the re-joined form normalizes the inter-token whitespace
+            # ('; ' replaces the original spacing) — only tail/newline cases
+            # are byte-identical. Malformed inputs like `A && B &; C` are
+            # silently repaired into valid output; that is fine — the input
+            # was already a syntax error to bash.
             result = prefix + "{ " + middle + "& }; " + head
         else:
             result = prefix + "{ " + middle + "& }" + suffix
