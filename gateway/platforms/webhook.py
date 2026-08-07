@@ -426,7 +426,17 @@ class WebhookAdapter(BasePlatformAdapter):
             )
             return SendResult(success=True)
 
-        delivery = self._delivery_info.get(chat_id, {})
+        delivery = self._delivery_info.get(chat_id)
+        if delivery is None:
+            if chat_id.startswith("webhook:"):
+                logger.error(
+                    "[webhook] Missing delivery authority for active session %s", chat_id
+                )
+                return SendResult(
+                    success=False,
+                    error="Webhook delivery authority is missing or expired",
+                )
+            delivery = {}
         deliver_type = delivery.get("deliver", "log")
 
         if deliver_type == "log":
@@ -437,6 +447,11 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "github_review":
+            if not await self._claim_review_publication(delivery):
+                return SendResult(
+                    success=False,
+                    error="GitHub review publication lease is missing or stale",
+                )
             result = await self._deliver_github_review(content, delivery)
             if result.success:
                 self._successful_github_reviews.add(chat_id)
@@ -475,7 +490,9 @@ class WebhookAdapter(BasePlatformAdapter):
                     self._delivery_info_created.items(), key=lambda item: item[1]
                 )
             )
-        cutoff = now - self._idempotency_ttl
+        # Route processing may legally take up to four hours. Preserve the
+        # authority envelope through that bound plus settlement headroom.
+        cutoff = now - max(self._idempotency_ttl, 5 * 60 * 60)
         while self._delivery_info_order and self._delivery_info_order[0][0] < cutoff:
             created_at, key = self._delivery_info_order.popleft()
             if self._delivery_info_created.get(key) != created_at:
@@ -1156,6 +1173,57 @@ class WebhookAdapter(BasePlatformAdapter):
         )
         return keep
 
+    async def _claim_review_publication(self, delivery: dict) -> bool:
+        """Atomically fence the exact lease token before GitHub publication."""
+        route_name = delivery.get("_trusted_evidence_route")
+        lease_token = delivery.get("_settlement_lease_token")
+        review_tuple = delivery.get("_evidence_tuple")
+        static_route = (
+            self._static_routes.get(route_name)
+            if isinstance(route_name, str)
+            else None
+        )
+        extra = delivery.get("deliver_extra")
+        if (
+            not isinstance(route_name, str)
+            or not isinstance(static_route, dict)
+            or static_route.get("evidence") != "github_pr"
+            or not isinstance(static_route.get("script"), str)
+            or not isinstance(lease_token, str)
+            or re.fullmatch(r"[A-Za-z0-9_-]{32,128}", lease_token) is None
+            or not isinstance(review_tuple, dict)
+            or not isinstance(extra, dict)
+            or str(extra.get("repo")) != str(review_tuple.get("repository"))
+            or str(extra.get("pr_number")) != str(review_tuple.get("pr_number"))
+            or str(extra.get("base_sha")) != str(review_tuple.get("base_sha"))
+            or str(extra.get("head_sha")) != str(review_tuple.get("head_sha"))
+        ):
+            return False
+        settlement = {
+            "operation": "claim_publish",
+            "contract_version": review_tuple.get("contract_version"),
+            "repository": review_tuple.get("repository"),
+            "pr_number": str(review_tuple.get("pr_number", "")),
+            "base_sha": review_tuple.get("base_sha"),
+            "head_sha": review_tuple.get("head_sha"),
+            "lease_token": lease_token,
+        }
+        try:
+            keep, result = await asyncio.to_thread(
+                self._route_processor.run_route_script,
+                static_route["script"],
+                settlement,
+                trusted_github_pr_environment=True,
+            )
+        except Exception:
+            logger.exception("[webhook] GitHub review publication claim failed")
+            return False
+        return bool(
+            keep
+            and isinstance(result, dict)
+            and result.get("settled") == "claim_publish"
+        )
+
     async def _dispatch_recovered_event(
         self, route_name: str, route_config: dict, recovered: dict
     ) -> bool:
@@ -1825,6 +1893,11 @@ class WebhookAdapter(BasePlatformAdapter):
             return await self._deliver_github_comment(content, delivery)
 
         if deliver_type == "github_review":
+            if not await self._claim_review_publication(delivery):
+                return SendResult(
+                    success=False,
+                    error="GitHub review publication lease is missing or stale",
+                )
             return await self._deliver_github_review(content, delivery)
 
         # Fall through to the cross-platform dispatcher, which validates the
@@ -1930,45 +2003,49 @@ class WebhookAdapter(BasePlatformAdapter):
             ):
                 return SendResult(success=False, error="PR state changed before publish")
 
-            existing_bodies = []
-            for endpoint in (
-                f"repos/{repo}/issues/{pr_int}/comments",
-                f"repos/{repo}/pulls/{pr_int}/reviews",
-            ):
-                existing_result = subprocess.run(
-                    ["gh", "api", "--paginate", "--slurp", endpoint],
-                    **run_kwargs,
+            existing_result = subprocess.run(
+                [
+                    "gh", "api", "--paginate", "--slurp",
+                    f"repos/{repo}/pulls/{pr_int}/reviews",
+                ],
+                **run_kwargs,
+            )
+            if existing_result.returncode != 0:
+                return SendResult(success=False, error=existing_result.stderr)
+            pages = json.loads(existing_result.stdout)
+            if not isinstance(pages, list):
+                return SendResult(
+                    success=False, error="Invalid GitHub marker response"
                 )
-                if existing_result.returncode != 0:
-                    return SendResult(
-                        success=False, error=existing_result.stderr
+            pending = list(pages)
+            existing_reviews: list[dict[str, Any]] = []
+            while pending:
+                item = pending.pop()
+                if isinstance(item, list):
+                    pending.extend(item)
+                elif isinstance(item, dict):
+                    existing_reviews.append(item)
+            for review in existing_reviews:
+                review_id = review.get("id")
+                author = review.get("user")
+                body = review.get("body")
+                if (
+                    isinstance(review_id, int)
+                    and not isinstance(review_id, bool)
+                    and review_id > 0
+                    and isinstance(author, dict)
+                    and author.get("login") == publisher_login
+                    and isinstance(body, str)
+                    and review_marker in body
+                    and review.get("state") == "COMMENTED"
+                    and review.get("commit_id") == head_sha
+                ):
+                    logger.info(
+                        "[webhook] COMMENT review already exists on %s#%s",
+                        repo,
+                        pr_int,
                     )
-                pages = json.loads(existing_result.stdout)
-                if not isinstance(pages, list):
-                    return SendResult(
-                        success=False, error="Invalid GitHub marker response"
-                    )
-                pending = list(pages)
-                while pending:
-                    item = pending.pop()
-                    if isinstance(item, list):
-                        pending.extend(item)
-                    elif isinstance(item, dict):
-                        author = item.get("user")
-                        body = item.get("body")
-                        if (
-                            isinstance(author, dict)
-                            and author.get("login") == publisher_login
-                            and isinstance(body, str)
-                        ):
-                            existing_bodies.append(body)
-            if any(review_marker in body for body in existing_bodies):
-                logger.info(
-                    "[webhook] COMMENT review already exists on %s#%s",
-                    repo,
-                    pr_int,
-                )
-                return SendResult(success=True)
+                    return SendResult(success=True)
 
             result = subprocess.run(
                 [

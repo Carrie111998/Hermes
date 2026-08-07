@@ -1119,7 +1119,7 @@ class TestGitHubReviewDelivery:
         with patch(
             "gateway.platforms.webhook.subprocess.run",
             side_effect=[
-                self._actor(), self._live_pr(), self._page(), self._page(), posted,
+                self._actor(), self._live_pr(), self._page(), posted,
             ],
         ) as mock_run:
             result = await adapter._deliver_github_review(content, self._delivery())
@@ -1259,22 +1259,56 @@ class TestGitHubReviewDelivery:
         assert mock_run.call_count == 2
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("endpoint", ["comments", "reviews"])
-    async def test_existing_bot_marker_is_successful_noop(self, endpoint):
+    async def test_only_structured_exact_head_formal_review_is_successful_noop(self):
         adapter = _make_adapter({})
-        marked = {"user": {"login": self.publisher}, "body": self._marker()}
-        comments = self._page([marked] if endpoint == "comments" else [])
-        reviews = self._page([marked] if endpoint == "reviews" else [])
+        marked_review = {
+            "id": 456,
+            "user": {"login": self.publisher},
+            "body": self._marker(),
+            "state": "COMMENTED",
+            "commit_id": self.head_sha,
+        }
         with patch(
             "gateway.platforms.webhook.subprocess.run",
-            side_effect=[self._actor(), self._live_pr(), comments, reviews],
+            side_effect=[self._actor(), self._live_pr(), self._page([marked_review])],
         ) as mock_run:
             result = await adapter._deliver_github_review(
                 self._marker(), self._delivery()
             )
         assert result.success is True
-        assert mock_run.call_count == 4
+        assert mock_run.call_count == 3
         assert all("--method" not in call.args[0] for call in mock_run.call_args_list)
+
+    @pytest.mark.asyncio
+    async def test_bot_issue_comment_marker_does_not_suppress_formal_review(self):
+        adapter = _make_adapter({})
+        marked_comment = {"user": {"login": self.publisher}, "body": self._marker()}
+
+        def run(command, **kwargs):
+            joined = " ".join(command)
+            if command == ["gh", "api", "user"]:
+                return self._actor()
+            if joined.endswith("repos/org/repo/pulls/42"):
+                return self._live_pr()
+            if "repos/org/repo/issues/42/comments" in joined:
+                return self._page([marked_comment])
+            if "--method POST" in joined:
+                return self._accepted_review()
+            if "repos/org/repo/pulls/42/reviews" in joined:
+                return self._page()
+            raise AssertionError(f"unexpected command: {command}")
+
+        with patch("gateway.platforms.webhook.subprocess.run", side_effect=run) as mock_run:
+            result = await adapter._deliver_github_review(
+                self._marker(), self._delivery()
+            )
+
+        assert result.success is True
+        assert "--method" in mock_run.call_args_list[-1].args[0]
+        assert all(
+            "repos/org/repo/issues/42/comments" not in " ".join(call.args[0])
+            for call in mock_run.call_args_list
+        )
 
     @pytest.mark.asyncio
     async def test_human_marker_does_not_suppress_publication(self):
@@ -1284,8 +1318,7 @@ class TestGitHubReviewDelivery:
         with patch(
             "gateway.platforms.webhook.subprocess.run",
             side_effect=[
-                self._actor(), self._live_pr(), self._page([human_marker]),
-                self._page(), posted,
+                self._actor(), self._live_pr(), self._page([human_marker]), posted,
             ],
         ) as mock_run:
             result = await adapter._deliver_github_review(
@@ -1301,7 +1334,7 @@ class TestGitHubReviewDelivery:
         with patch(
             "gateway.platforms.webhook.subprocess.run",
             side_effect=[
-                self._actor(), self._live_pr(), self._page(), self._page(), posted,
+                self._actor(), self._live_pr(), self._page(), posted,
             ],
         ):
             result = await adapter._deliver_github_review(
@@ -1310,6 +1343,128 @@ class TestGitHubReviewDelivery:
 
         assert result.success is False
         assert result.error == "GitHub did not confirm the expected formal review"
+
+    @pytest.mark.asyncio
+    async def test_github_review_send_claims_publication_with_opaque_lease_first(self):
+        adapter = _make_adapter(
+            {
+                "pr-review": {
+                    "evidence": "github_pr",
+                    "script": "newtonsapple-pr-review-gate.py",
+                }
+            }
+        )
+        chat_id = "webhook:pr-review:delivery-1"
+        delivery = {
+            "deliver": "github_review",
+            "deliver_extra": self._delivery()["deliver_extra"],
+            "_trusted_evidence_route": "pr-review",
+            "_settlement_lease_token": "l" * 43,
+            "_evidence_tuple": {
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": 42,
+                "base_sha": self.base_sha,
+                "head_sha": self.head_sha,
+            },
+        }
+        adapter._delivery_info[chat_id] = delivery
+
+        with patch.object(
+            adapter._route_processor,
+            "run_route_script",
+            return_value=(True, {"settled": "claim_publish"}),
+        ) as claim, patch.object(
+            adapter,
+            "_deliver_github_review",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as publish:
+            result = await adapter.send(chat_id, self._marker())
+
+        assert result.success is True
+        claim.assert_called_once_with(
+            "newtonsapple-pr-review-gate.py",
+            {
+                "operation": "claim_publish",
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": "42",
+                "base_sha": self.base_sha,
+                "head_sha": self.head_sha,
+                "lease_token": "l" * 43,
+            },
+            trusted_github_pr_environment=True,
+        )
+        publish.assert_awaited_once_with(self._marker(), delivery)
+
+    @pytest.mark.asyncio
+    async def test_github_review_send_fails_closed_when_publication_claim_is_rejected(self):
+        adapter = _make_adapter(
+            {
+                "pr-review": {
+                    "evidence": "github_pr",
+                    "script": "newtonsapple-pr-review-gate.py",
+                }
+            }
+        )
+        chat_id = "webhook:pr-review:delivery-1"
+        adapter._delivery_info[chat_id] = {
+            "deliver": "github_review",
+            "deliver_extra": self._delivery()["deliver_extra"],
+            "_trusted_evidence_route": "pr-review",
+            "_settlement_lease_token": "l" * 43,
+            "_evidence_tuple": {
+                "contract_version": "v2",
+                "repository": "org/repo",
+                "pr_number": 42,
+                "base_sha": self.base_sha,
+                "head_sha": self.head_sha,
+            },
+        }
+
+        with patch.object(
+            adapter._route_processor,
+            "run_route_script",
+            return_value=(False, {"settled": "claim_publish"}),
+        ), patch.object(
+            adapter,
+            "_deliver_github_review",
+            new=AsyncMock(return_value=SendResult(success=True)),
+        ) as publish:
+            result = await adapter.send(chat_id, self._marker())
+
+        assert result.success is False
+        assert result.error == "GitHub review publication lease is missing or stale"
+        publish.assert_not_awaited()
+        assert chat_id not in adapter._successful_github_reviews
+
+    @pytest.mark.asyncio
+    async def test_webhook_response_without_delivery_authority_fails_closed(self):
+        adapter = _make_adapter({})
+
+        result = await adapter.send(
+            "webhook:pr-review:expired-delivery", self._marker()
+        )
+
+        assert result.success is False
+        assert result.error == "Webhook delivery authority is missing or expired"
+
+    def test_delivery_authority_survives_the_maximum_review_window(self):
+        adapter = _make_adapter({})
+        adapter._idempotency_ttl = 60
+        now = 20_000.0
+        retained = "webhook:pr-review:retained"
+        expired = "webhook:pr-review:expired"
+        adapter._delivery_info = {retained: {}, expired: {}}
+        adapter._delivery_info_created = {
+            retained: now - (5 * 60 * 60) + 1,
+            expired: now - (5 * 60 * 60) - 1,
+        }
+
+        adapter._prune_delivery_info(now)
+
+        assert retained in adapter._delivery_info
+        assert expired not in adapter._delivery_info
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -1362,6 +1517,10 @@ class TestGitHubReviewDelivery:
 
         if send_result is not None:
             with patch.object(
+                adapter,
+                "_claim_review_publication",
+                new=AsyncMock(return_value=True),
+            ), patch.object(
                 adapter,
                 "_deliver_github_review",
                 new=AsyncMock(return_value=send_result),
