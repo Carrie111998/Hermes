@@ -37,6 +37,11 @@ Example config::
         url: "https://my-mcp-server.example.com/mcp"
         headers:
           Authorization: "Bearer sk-..."
+        identity_header:       # optional per-user identity header attached
+          name: "X-User-Id"    # to this server's HTTP/SSE requests
+          value_from: "static" # "static" (default) or "profile"
+          value: "alice"       # required for static; profile mode uses the
+                               # active Hermes profile name
         timeout: 180
         skip_preflight: true  # bypass the content-type probe for a valid
                               # Streamable HTTP endpoint that answers HEAD/GET
@@ -50,7 +55,7 @@ Example config::
         command: "npx"
         args: ["-y", "analysis-server"]
         sampling:                    # server-initiated LLM requests
-          enabled: true              # explicit opt-in; default: false
+          enabled: true              # default: true
           model: "gemini-3-flash"    # override model (optional)
           max_tokens_cap: 4096       # max tokens per request
           timeout: 30                # LLM call timeout (seconds)
@@ -105,7 +110,6 @@ import shutil
 import sys
 import threading
 import time
-from collections.abc import Mapping
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -115,6 +119,17 @@ from urllib.parse import urlparse
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+# Upper bound for the OSV malware preflight during stdio MCP startup. The
+# check makes a blocking urllib HTTPS call whose own timeout can fail to
+# interrupt a stalled SSL handshake, which froze the asyncio event loop and
+# blew past the gateway's 15s startup budget (#29184). We run it off the loop
+# AND bound it here; the check is fail-open, so a timeout lets startup proceed.
+# Set just ABOVE osv_check._TIMEOUT (10s) so the inner socket timeout fires
+# first in the normal case; this outer bound only bites when a stalled SSL
+# handshake defeats the inner timeout (the #29184 failure mode).
+_OSV_MALWARE_CHECK_TIMEOUT_S = 12.0
+
 
 # ---------------------------------------------------------------------------
 # Stdio subprocess stderr redirection
@@ -353,23 +368,6 @@ def _jittered(seconds: float) -> float:
 _DEFAULT_KEEPALIVE_INTERVAL = 180  # seconds between liveness pings
 _MIN_KEEPALIVE_INTERVAL = 5        # clamp floor for configured intervals
 
-def _enabled_sampling_config(config: Any) -> Optional[Dict[str, Any]]:
-    """Return sampling config only after an exact per-server boolean opt-in.
-
-    Missing/malformed sections and truthy non-booleans fail off. Sampling gives
-    an MCP server model access, so schema ambiguity must never enable it or
-    prevent the rest of the server from starting.
-    """
-    if not isinstance(config, Mapping):
-        return None
-    sampling = config.get("sampling")
-    if not isinstance(sampling, Mapping):
-        return None
-    if sampling.get("enabled") is not True:
-        return None
-    return dict(sampling)
-
-
 # Final shutdown gives pending MCP-loop tasks one bounded cancellation cycle
 # before closing their owning loop. Cooperative parked/reconnect waiters finish
 # immediately; cancellation-resistant tasks must not hang process exit.
@@ -544,6 +542,58 @@ def _is_method_not_found_error(exc: BaseException) -> bool:
         or "unknown method" in msg
         or "not found: ping" in msg
     )
+
+
+# ---------------------------------------------------------------------------
+# MCP tool description content scanning
+# ---------------------------------------------------------------------------
+
+# Patterns that indicate potential prompt injection in MCP tool descriptions.
+# These are WARNING-level — we log but don't block, since false positives
+# would break legitimate MCP servers.
+_MCP_INJECTION_PATTERNS = [
+    (re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I),
+     "prompt override attempt ('ignore previous instructions')"),
+    (re.compile(r"you\s+are\s+now\s+a", re.I),
+     "identity override attempt ('you are now a...')"),
+    (re.compile(r"your\s+new\s+(task|role|instructions?)\s+(is|are)", re.I),
+     "task override attempt"),
+    (re.compile(r"system\s*:\s*", re.I),
+     "system prompt injection attempt"),
+    (re.compile(r"<\s*(system|human|assistant)\s*>", re.I),
+     "role tag injection attempt"),
+    (re.compile(r"do\s+not\s+(tell|inform|mention|reveal)", re.I),
+     "concealment instruction"),
+    (re.compile(r"(curl|wget|fetch)\s+https?://", re.I),
+     "network command in description"),
+    (re.compile(r"base64\.(b64decode|decodebytes)", re.I),
+     "base64 decode reference"),
+    (re.compile(r"exec\s*\(|eval\s*\(", re.I),
+     "code execution reference"),
+    (re.compile(r"import\s+(subprocess|os|shutil|socket)", re.I),
+     "dangerous import reference"),
+]
+
+
+def _scan_mcp_description(server_name: str, tool_name: str, description: str) -> List[str]:
+    """Scan an MCP tool description for prompt injection patterns.
+
+    Returns a list of finding strings (empty = clean).
+    """
+    findings = []
+    if not description:
+        return findings
+    for pattern, reason in _MCP_INJECTION_PATTERNS:
+        if pattern.search(description):
+            findings.append(reason)
+    if findings:
+        logger.warning(
+            "MCP server '%s' tool '%s': suspicious description content — %s. "
+            "Description: %.200s",
+            server_name, tool_name, "; ".join(findings),
+            description,
+        )
+    return findings
 
 
 def _prepend_path(env: dict, directory: str) -> dict:
@@ -1134,6 +1184,81 @@ def _resolve_client_cert(server_name: str, config: dict):
         return (cert_path, key_path)
     # Single combined PEM file (cert + key in one file).
     return cert_path
+
+
+def _resolve_identity_header(server_name: str, config: dict):
+    """Resolve the optional per-server ``identity_header`` config.
+
+    Config shape (in the server's ``mcp_servers`` entry)::
+
+        identity_header:
+          name: "X-User-Id"
+          value_from: "static"   # or "profile"; default: static
+          value: "alice"         # required when value_from is static
+
+    Returns a ``(header_name, header_value)`` tuple, or ``None`` when the
+    key is unset or invalid. Invalid configs warn and are ignored — an
+    identity header must never break the server connection. ``profile``
+    mode resolves the value to the active Hermes profile name once at
+    connect time; there is no per-call mutation.
+    """
+    raw = config.get("identity_header")
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        logger.warning(
+            "MCP server '%s': identity_header must be a mapping with "
+            "'name' and 'value'/'value_from' keys (got %s) — ignoring",
+            server_name, type(raw).__name__,
+        )
+        return None
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        logger.warning(
+            "MCP server '%s': identity_header requires a non-empty "
+            "'name' — ignoring", server_name,
+        )
+        return None
+    value_from = (raw.get("value_from") or "static").strip().lower()
+    if value_from == "static":
+        value = raw.get("value")
+        if not isinstance(value, str) or not value.strip():
+            logger.warning(
+                "MCP server '%s': identity_header with value_from: static "
+                "requires a non-empty string 'value' — ignoring",
+                server_name,
+            )
+            return None
+        return (name.strip(), value)
+    if value_from == "profile":
+        from hermes_cli.profiles import get_active_profile_name
+        return (name.strip(), get_active_profile_name())
+    logger.warning(
+        "MCP server '%s': identity_header value_from must be 'static' or "
+        "'profile' (got %r) — ignoring", server_name, value_from,
+    )
+    return None
+
+
+def _apply_identity_header(server_name: str, config: dict, headers: dict) -> dict:
+    """Merge the resolved identity header into ``headers`` (in place).
+
+    An explicit per-server ``headers`` entry with the same name (any
+    casing) wins — the identity header never silently overrides user
+    config.
+    """
+    resolved = _resolve_identity_header(server_name, config)
+    if resolved is None:
+        return headers
+    name, value = resolved
+    if any(key.lower() == name.lower() for key in headers):
+        logger.debug(
+            "MCP server '%s': identity_header '%s' already set via explicit "
+            "headers config — keeping the explicit value", server_name, name,
+        )
+        return headers
+    headers[name] = value
+    return headers
 
 
 def _format_connect_error(exc: BaseException) -> str:
@@ -2331,6 +2456,13 @@ class MCPServerTask:
 
     async def _run_stdio(self, config: dict):
         """Run the server using stdio transport."""
+        if config.get("identity_header") is not None:
+            # Headers don't exist on stdio transports — warn and ignore so a
+            # copy-pasted HTTP config block doesn't silently mislead.
+            logger.warning(
+                "MCP server '%s': identity_header is only supported on "
+                "HTTP/SSE transports — ignored for stdio servers", self.name,
+            )
         if not _MCP_AVAILABLE:
             raise ImportError(
                 f"MCP server '{self.name}' requires the 'mcp' Python SDK, but "
@@ -2350,6 +2482,32 @@ class MCPServerTask:
         safe_env = _build_safe_env(user_env)
         command, safe_env = _resolve_stdio_command(command, safe_env)
 
+        # Check package against OSV malware database before spawning.
+        # Run off the event loop (the urllib HTTPS call is blocking) and bound
+        # it with a wall-clock timeout so a stalled SSL handshake can't freeze
+        # MCP discovery / gateway startup (#29184). The check is fail-open, so
+        # on timeout we log and proceed rather than blocking indefinitely.
+        # NOTE: must run against the REAL command/args — the watchdog wrap
+        # below rewrites argv to `python -m tools.mcp_stdio_watchdog …`,
+        # which would silently turn the preflight into a no-op.
+        from tools.osv_check import check_package_for_malware
+        try:
+            malware_error = await asyncio.wait_for(
+                asyncio.to_thread(check_package_for_malware, command, args),
+                timeout=_OSV_MALWARE_CHECK_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "MCP server '%s': OSV malware preflight timed out after %.0fs "
+                "(network slow/unreachable) — proceeding without the check.",
+                self.name, _OSV_MALWARE_CHECK_TIMEOUT_S,
+            )
+            malware_error = None
+        if malware_error:
+            raise ValueError(
+                f"MCP server '{self.name}': {malware_error}"
+            )
+
         # Wrap the real command in a parent-death watchdog supervisor so an
         # ungraceful exit of this Hermes process (kill -9, crash, force-quit)
         # can't leave the stdio MCP child (and its own descendants, e.g.
@@ -2358,12 +2516,15 @@ class MCPServerTask:
         # the reaping as before -- this only covers the case where that code
         # never gets to run. POSIX-only (relies on process groups); no-op
         # elsewhere, matching existing killpg-based cleanup's platform scope.
+        # Applied AFTER the OSV preflight so the check inspects the real
+        # package, not the watchdog wrapper.
         command, args = _wrap_command_with_watchdog(command, args)
 
         server_params = StdioServerParameters(
             command=command,
             args=args,
             env=safe_env if safe_env else None,
+            cwd=config.get("cwd"),
             # On Windows, pipe I/O can deliver non-UTF-8 bytes at chunk
             # boundaries.  Use "replace" to substitute undecodable bytes
             # with U+FFFD instead of crashing with UnicodeDecodeError.
@@ -2687,6 +2848,9 @@ class MCPServerTask:
 
         url = config["url"]
         headers = dict(config.get("headers") or {})
+        # Optional per-user identity header (config-gated; static or
+        # profile-derived). Explicit headers of the same name win.
+        headers = _apply_identity_header(self.name, config, headers)
         # Some MCP servers require MCP-Protocol-Version on the initial
         # initialize request and reject session-less POSTs otherwise.
         # Seed it as a client-level default, but treat user overrides as
@@ -2989,8 +3153,8 @@ class MCPServerTask:
         self._max_lifetime_seconds = _get_lifecycle_seconds(config, "max_lifetime_seconds")
 
         # Set up sampling handler if enabled and SDK types are available
-        sampling_config = _enabled_sampling_config(config)
-        if sampling_config is not None and _MCP_SAMPLING_TYPES:
+        sampling_config = config.get("sampling", {})
+        if sampling_config.get("enabled", True) and _MCP_SAMPLING_TYPES:
             self._sampling = SamplingHandler(self.name, sampling_config)
         else:
             self._sampling = None
@@ -3548,6 +3712,150 @@ _server_error_counts: Dict[str, int] = {}
 _server_breaker_opened_at: Dict[str, float] = {}
 _CIRCUIT_BREAKER_THRESHOLD = 3
 _CIRCUIT_BREAKER_COOLDOWN_SEC = 60.0
+
+# ---------------------------------------------------------------------------
+# Trust-tier gating state (per-server trust + per-tool readOnlyHint).
+#
+# ``trust: full | untrusted`` is a per-server key in the MCP server config
+# (config.yaml → mcp_servers.<name>.trust). On an ``untrusted`` server,
+# every WRITE-CAPABLE tool call routes through the existing dangerous-
+# approval surface before the RPC fires. A tool is write-capable unless its
+# discovery-time ``annotations.readOnlyHint`` is exactly ``True``
+# (missing/malformed annotations fail closed to write-capable).
+#
+# Security model (read this before changing defaults):
+# - ``readOnlyHint`` is a HINT supplied by the server itself. A hostile
+#   server can lie. That is precisely why the gate is tiered per-server by
+#   OPERATOR config: on an untrusted server the hint can only ever exempt
+#   tools the server claims are read-only — the worst a lie buys is
+#   skipping approval for calls the operator was already warned about when
+#   they marked the server untrusted. It can never widen access on top of
+#   the approval a write-capable tool would otherwise need.
+# - Default trust for servers with NO ``trust`` key is ``full`` (gate off)
+#   for backward compatibility — existing configs keep working unchanged.
+#   Operators opt servers into gating explicitly with ``trust: untrusted``.
+# - Any unrecognized ``trust`` value normalizes to ``untrusted``
+#   (fail closed): a typo must never silently disable the gate.
+#
+# Classification happens at CALL TIME from data captured at DISCOVERY —
+# no toolset or schema mutation, so the conversation's toolset stays
+# byte-stable and prompt caching is preserved.
+_server_trust_levels: Dict[str, str] = {}
+_tool_read_only_hints: Dict[str, Dict[str, bool]] = {}
+
+_TRUST_FULL = "full"
+_TRUST_UNTRUSTED = "untrusted"
+
+
+def _normalize_server_trust(value: Any) -> str:
+    """Normalize a config ``trust`` value to ``full`` or ``untrusted``.
+
+    Missing (None) → ``full`` (backward-compatible default, documented
+    above). Any string other than the two known tiers → ``untrusted``:
+    a misspelled tier must fail closed, never silently disable gating.
+    """
+    if value is None:
+        return _TRUST_FULL
+    text = str(value).strip().lower()
+    if text == _TRUST_FULL:
+        return _TRUST_FULL
+    if text == _TRUST_UNTRUSTED:
+        return _TRUST_UNTRUSTED
+    logger.warning(
+        "MCP trust: unrecognized trust value %r — treating as 'untrusted' "
+        "(valid values: full, untrusted)", value,
+    )
+    return _TRUST_UNTRUSTED
+
+
+def _annotation_read_only_hint(mcp_tool: Any) -> bool:
+    """Return True only when the tool's annotations carry readOnlyHint=True.
+
+    Accepts both SDK annotation objects (attribute access) and plain dicts
+    (schema-cache JSON). Anything else — missing annotations, missing key,
+    non-bool truthy values — is False: unknown metadata means the tool must
+    be treated as write-capable.
+    """
+    annotations = getattr(mcp_tool, "annotations", None)
+    if annotations is None:
+        return False
+    if isinstance(annotations, dict):
+        hint = annotations.get("readOnlyHint")
+    else:
+        hint = getattr(annotations, "readOnlyHint", None)
+    return hint is True
+
+
+def _record_tool_trust_metadata(
+    server_name: str, config: dict, tools: List[Any]
+) -> None:
+    """Capture per-server trust and per-tool readOnlyHint at discovery."""
+    with _lock:
+        _server_trust_levels[server_name] = _normalize_server_trust(
+            (config or {}).get("trust")
+        )
+        hints = _tool_read_only_hints.setdefault(server_name, {})
+        for tool in tools:
+            name = getattr(tool, "name", None)
+            if name:
+                hints[name] = _annotation_read_only_hint(tool)
+
+
+def _trust_gate_check(server_name: str, tool_name: str) -> Optional[str]:
+    """Consult the approval path for write-capable tools on untrusted servers.
+
+    Returns None when the call may proceed, or an error string (already
+    formatted via ``tool_error``) when the call is blocked. Fail-closed:
+    approval-system errors block the call.
+    """
+    trust = _server_trust_levels.get(server_name, _TRUST_FULL)
+    if trust != _TRUST_UNTRUSTED:
+        return None
+    if _tool_read_only_hints.get(server_name, {}).get(tool_name) is True:
+        return None
+
+    # Lazy import mirrors the elicitation handler's pattern: tools.approval
+    # routes the prompt to whichever surface owns the session (CLI, TUI,
+    # Telegram, Slack, ...) and normalizes the answer.
+    try:
+        from tools.approval import request_elicitation_consent
+
+        answer = request_elicitation_consent(
+            (
+                f"MCP tool '{tool_name}' on UNTRUSTED server "
+                f"'{server_name}' wants to run. This tool is write-capable "
+                f"(no readOnlyHint=true annotation) and may modify external "
+                f"state."
+            ),
+            (
+                f"Server '{server_name}' is configured 'trust: untrusted'. "
+                f"Approve to run '{tool_name}' once, or deny to block it."
+            ),
+            surface=f"mcp-trust/{server_name}",
+        )
+    except Exception as exc:
+        logger.error(
+            "MCP trust gate: approval check failed for %s.%s: %s",
+            server_name, tool_name, exc, exc_info=True,
+        )
+        return tool_error(
+            f"MCP tool '{tool_name}' on untrusted server '{server_name}' "
+            f"was blocked: the approval system was unavailable "
+            f"(fail-closed)."
+        )
+
+    if answer == "accept":
+        return None
+    logger.info(
+        "MCP trust gate: user %s '%s' on untrusted server '%s'",
+        "cancelled" if answer == "cancel" else "denied",
+        tool_name, server_name,
+    )
+    return tool_error(
+        f"The user did not approve running write-capable MCP tool "
+        f"'{tool_name}' on untrusted server '{server_name}'. The command "
+        f"was NOT run. Do not retry without explicit user direction."
+    )
 
 
 def _bump_server_error(server_name: str) -> None:
@@ -4537,22 +4845,31 @@ def _warn_hidden_whitespace(server_name: str, config: dict) -> List[str]:
     return flagged
 
 
-def _filter_invalid_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
-    """Drop entries that violate the exact MCP transport/schema contract."""
-    from hermes_cli.mcp_validation import validate_mcp_server_entry
+def _filter_suspicious_mcp_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
+    """Drop exfiltration-shaped MCP configs before any stdio spawn path."""
+    try:
+        from hermes_cli.mcp_security import validate_mcp_server_entry as _validate_mcp_server_entry
+    except Exception:
+        _validate_mcp_server_entry: Callable[[str, dict[str, Any]], list[str]] | None = None
 
-    valid_servers = {}
+    if _validate_mcp_server_entry is None:
+        return servers
+
+    safe_servers = {}
     for name, cfg in servers.items():
-        issues = validate_mcp_server_entry(name, cfg)
+        if not isinstance(cfg, dict):
+            safe_servers[name] = cfg
+            continue
+        issues = _validate_mcp_server_entry(name, cfg)
         if issues:
             logger.warning(
-                "Skipping invalid MCP server '%s': %s",
+                "Skipping suspicious MCP server '%s': %s",
                 name,
                 "; ".join(issues),
             )
             continue
-        valid_servers[name] = cfg
-    return valid_servers
+        safe_servers[name] = cfg
+    return safe_servers
 
 
 def _load_mcp_config() -> Dict[str, dict]:
@@ -4574,21 +4891,36 @@ def _load_mcp_config() -> Dict[str, dict]:
             return {}
         config = load_config()
         servers = config.get("mcp_servers")
-        if not servers or not isinstance(servers, dict):
-            return {}
+        if not isinstance(servers, dict):
+            servers = {}
         # Ensure .env vars are available for interpolation
         try:
             from hermes_cli.env_loader import load_hermes_dotenv
             load_hermes_dotenv()
         except Exception:
             pass
-        valid_servers: Dict[str, dict] = {}
-        for name, cfg in _filter_invalid_mcp_servers(servers).items():
+        safe_servers: Dict[str, dict] = {}
+        for name, cfg in _filter_suspicious_mcp_servers(servers).items():
             interpolated = _interpolate_env_vars(cfg)
             if isinstance(interpolated, dict):
                 _warn_hidden_whitespace(name, interpolated)
-                valid_servers[name] = interpolated
-        return valid_servers
+                safe_servers[name] = interpolated
+        try:
+            from hermes_cli.plugins import discover_plugins, get_plugin_manager
+
+            discover_plugins()
+            portable = get_plugin_manager().get_portable_mcp_servers()
+            for name, cfg in _filter_suspicious_mcp_servers(portable).items():
+                if name in safe_servers:
+                    logger.warning(
+                        "Portable MCP server '%s' conflicts with native config; skipping",
+                        name,
+                    )
+                    continue
+                safe_servers[name] = dict(cfg)
+        except Exception:
+            logger.debug("Failed to load portable MCP servers", exc_info=True)
+        return safe_servers
     except Exception as exc:
         logger.debug("Failed to load MCP config: %s", exc)
         return {}
@@ -4801,6 +5133,14 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
     """
 
     def _handler(args: dict, **kwargs) -> str:
+        # Trust-tier gate (security boundary): write-capable tools on
+        # servers configured ``trust: untrusted`` must be approved by the
+        # user before ANY transport work happens — including the lazy
+        # first-use spawn below. A denied call never touches the server.
+        gate_error = _trust_gate_check(server_name, tool_name)
+        if gate_error is not None:
+            return gate_error
+
         # Circuit breaker: if this server has failed too many times
         # consecutively, short-circuit with a clear message so the model
         # stops retrying and uses alternative approaches (#10447).
@@ -5361,6 +5701,19 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
         return strip_nullable_unions(node, keep_nullable_hint=True)
 
+    def _collapse_const_unions(node):
+        """Collapse anyOf/oneOf unions of same-typed consts to property enums.
+
+        Delegates to ``tools.schema_sanitizer.collapse_const_unions``. Runs
+        AFTER the nullable strip: single-non-null unions are already collapsed
+        by then, and unions of several const branches plus a null branch are
+        handled here (consts -> enum, null -> ``nullable: true`` hint).
+        Ported from block/goose tool_schema_normalize.rs (Apache-2.0).
+        """
+        from tools.schema_sanitizer import collapse_const_unions
+
+        return collapse_const_unions(node)
+
     def _repair_object_shape(node):
         """Recursively repair object-shaped nodes: fill type, prune required."""
         if isinstance(node, list):
@@ -5401,6 +5754,7 @@ def _normalize_mcp_input_schema(schema: dict | None) -> dict:
 
     normalized = _rewrite_local_refs(schema)
     normalized = _strip_nullable_union(normalized)
+    normalized = _collapse_const_unions(normalized)
     normalized = _repair_object_shape(normalized)
 
     # Ensure top-level is a well-formed object schema
@@ -5556,9 +5910,9 @@ def matches_name_filter(tool_name: str, patterns: set[str]) -> bool:
     """True if ``tool_name`` matches any entry in ``patterns``.
 
     Exact names match literally; entries containing fnmatch metacharacters
-    (``*``, ``?``, ``[``) match as case-sensitive globs. This is a configured
-    MCP tool-name visibility filter, not terminal-command authorization.
-    Exact membership is checked first so large literal lists stay O(1).
+    (``*``, ``?``, ``[``) match as case-sensitive globs — the same pattern
+    semantics as ``approvals.deny``. Exact membership is checked first so
+    large literal lists stay O(1).
     """
     if not patterns:
         return False
@@ -5772,6 +6126,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
     check_fn = _make_check_fn(name)
     candidates: List[dict] = []
 
+    # Trust-tier metadata (security boundary): capture the server's
+    # configured trust tier and each tool's readOnlyHint annotation NOW,
+    # at discovery, so the call-time gate in _make_tool_handler classifies
+    # from data we control rather than re-reading server-supplied state.
+    _record_tool_trust_metadata(name, config, server._tools)
+
     for mcp_tool in server._tools:
         if not _should_register(mcp_tool.name):
             logger.debug(
@@ -5781,6 +6141,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             )
             continue
 
+        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         candidates.append(
             {
@@ -5923,6 +6284,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
                     "name": mcp_tool.name,
                     "description": mcp_tool.description or "",
                     "inputSchema": schema_obj if isinstance(schema_obj, dict) else {},
+                    # Persist the trust-relevant annotation so the lazy
+                    # (cache-registered) path gates identically on next
+                    # startup without spawning the server.
+                    "annotations": {
+                        "readOnlyHint": _annotation_read_only_hint(mcp_tool),
+                    },
                 })
             utility_payload = [
                 {"schema": entry["schema"], "handler_key": entry["handler_key"]}
@@ -5985,6 +6352,22 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
         return True
 
     check_fn = _make_check_fn(name)
+    # Trust-tier metadata for the lazy path: the cached manifest carries
+    # each tool's readOnlyHint (written by the live discovery path), and
+    # trust comes from operator config. Recording it before registration
+    # keeps the call-time gate identical whether the server was spawned
+    # live or registered from cache. Missing "annotations" in older cache
+    # files fails closed to write-capable.
+    cached_tool_objs = [
+        SimpleNamespace(
+            name=raw.get("name"),
+            annotations=raw.get("annotations")
+            if isinstance(raw.get("annotations"), dict) else None,
+        )
+        for raw in tools_from_cache_entry(entry)
+        if isinstance(raw, dict) and raw.get("name")
+    ]
+    _record_tool_trust_metadata(name, config, cached_tool_objs)
     for raw in tools_from_cache_entry(entry):
         if not isinstance(raw, dict):
             continue
@@ -5997,6 +6380,9 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             raw.get("description") or "",
             raw_schema if isinstance(raw_schema, dict) else {},
         )
+        # Defense-in-depth: the cache file is user-writable JSON, so run the
+        # same injection scan the eager discovery path applies.
+        _scan_mcp_description(name, mcp_tool.name, mcp_tool.description or "")
         schema = _convert_mcp_schema(name, mcp_tool)
         registry_name = schema["name"]
         existing_toolset = registry.get_toolset_for_tool(registry_name)
@@ -6148,7 +6534,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
-    servers = _filter_invalid_mcp_servers(servers)
+    servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []

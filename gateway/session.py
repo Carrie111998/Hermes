@@ -13,68 +13,14 @@ import hashlib
 import logging
 import os
 import json
-import secrets
 import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, replace
-from dataclasses import field as dataclass_field, replace as dataclass_replace
-from typing import Any, Awaitable, Callable, Dict, List, Optional
+from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
-
-_CAPABILITY_EPOCH_PREFIX = "cap_epoch_v1_"
-_RESUME_MARK_EXPECTATION_UNSET = object()
-
-
-class CapabilityEpochRotationBlocked(RuntimeError):
-    """A routing boundary could not revoke the exact old authority epoch."""
-
-    def __init__(
-        self,
-        message: str,
-        *,
-        authority_rotated: bool = False,
-    ) -> None:
-        super().__init__(message)
-        # True means the old epoch was already durably tombstoned and any
-        # surviving same-epoch routing entry was replaced with fresh authority,
-        # even though the requested routing transition lost its CAS.
-        self.authority_rotated = bool(authority_rotated)
-
-
-CapabilityEpochRotationCallback = Callable[["SessionEntry", str], None]
-
-
-def _new_capability_epoch() -> str:
-    """Return a new opaque routing-boundary capability epoch.
-
-    The raw value exists only in the live gateway process. Model tools and the
-    privileged writer receive only its SHA-256 digest. A gateway restart thus
-    expires durable mutation authority even if model-controlled code rolls
-    routing storage back to an older snapshot.
-    """
-
-    return _CAPABILITY_EPOCH_PREFIX + secrets.token_hex(32)
-
-
-def _load_capability_epoch(value: Any) -> str:
-    """Canonicalize an explicitly supplied in-process epoch.
-
-    Epochs are never loaded from routing persistence.  This helper is only for
-    constructing and mechanically validating live ``SessionEntry`` objects.
-    """
-
-    epoch = str(value or "").strip()
-    body = epoch.removeprefix(_CAPABILITY_EPOCH_PREFIX)
-    if (
-        epoch.startswith(_CAPABILITY_EPOCH_PREFIX)
-        and len(body) == 64
-        and all(char in "0123456789abcdef" for char in body)
-    ):
-        return epoch
-    return _new_capability_epoch()
 
 
 def _now() -> datetime:
@@ -382,9 +328,6 @@ class SessionContext:
     # Session metadata
     session_key: str = ""
     session_id: str = ""
-    # Writer-only authority binding. Omitted from to_dict() and therefore from
-    # every model-facing session-context prompt.
-    capability_epoch_sha256: str = ""
     created_at: Optional[datetime] = None
     updated_at: Optional[datetime] = None
     
@@ -729,16 +672,6 @@ def build_session_context_prompt(
             "Voice-channel state, when relevant, appears in the current "
             "message as a `[Voice channel now: ...]` note."
         )
-        lines.append("")
-        lines.append(
-            "**Operational evidence note:** For source/code/runtime support work, "
-            "judge source-of-truth by evidence sufficiency, not keyword rules. "
-            "If a final answer depends on current/live source but the available "
-            "snapshot is stale, incomplete, or missing the requested files/symbols, "
-            "use an available bounded read-only worker/tool before finalizing. "
-            "If that evidence path is unavailable, say PARTIAL/BLOCKED, name the "
-            "missing evidence, and preserve the exact continuation context."
-        )
     elif context.source.platform == Platform.BLUEBUBBLES:
         lines.append("")
         lines.append(
@@ -820,52 +753,20 @@ def build_session_context_prompt(
 PERSISTABLE_MODEL_OVERRIDE_KEYS = ("model", "provider", "base_url")
 
 
-def sanitize_model_override(
-    override: Optional[Dict[str, Any]],
-    *,
-    reject_unsafe: bool = True,
-) -> Optional[Dict[str, str]]:
+def sanitize_model_override(override: Optional[Dict[str, Any]]) -> Optional[Dict[str, str]]:
     """Return a copy of *override* containing only persistable, non-secret keys.
 
     Returns ``None`` when the input is empty/not a dict or no persistable
     values remain, so callers can store the result directly on
-    ``SessionEntry.model_override``. New writes reject unsafe runtime
-    identifiers. Legacy routing rows are loaded with ``reject_unsafe=False``:
-    one poisoned override is discarded as a unit instead of being replayed.
+    ``SessionEntry.model_override``.
     """
     if not isinstance(override, dict):
         return None
-    from gateway.api_execution_context import (
-        canonicalize_session_endpoint,
-        normalize_model_identifier,
-        normalize_session_provider_identifier,
-    )
-
-    try:
-        cleaned: Dict[str, str] = {}
-        if override.get("model") not in (None, ""):
-            cleaned["model"] = normalize_model_identifier(
-                override["model"],
-                field="session model override.model",
-                allow_empty=False,
-            )
-        if override.get("provider") not in (None, ""):
-            cleaned["provider"] = normalize_session_provider_identifier(
-                override["provider"],
-                field="session model override.provider",
-                allow_empty=False,
-            )
-        if override.get("base_url") not in (None, ""):
-            cleaned["base_url"] = canonicalize_session_endpoint(
-                override["base_url"]
-            )
-    except ValueError:
-        if reject_unsafe:
-            raise
-        logger.warning(
-            "Discarding unsafe persisted session model override"
-        )
-        return None
+    cleaned = {
+        k: str(v)
+        for k, v in override.items()
+        if k in PERSISTABLE_MODEL_OVERRIDE_KEYS and v not in (None, "")
+    }
     return cleaned or None
 
 
@@ -880,18 +781,6 @@ class SessionEntry:
     session_id: str
     created_at: datetime
     updated_at: datetime
-
-    # Process-memory-only authority generation for the current routing
-    # boundary. It is intentionally never serialized. It is
-    # deliberately independent from the deterministic session_key and from a
-    # resumable transcript session_id: /new, /resume, /branch, and other
-    # routing switches must invalidate prior durable mutation capabilities
-    # even when best-effort revocation cannot reach the privileged writer.
-    capability_epoch: str = dataclass_field(default_factory=_new_capability_epoch, repr=False)
-    # An automatic reset whose durable old-epoch tombstone could not be written
-    # stays on the old entry and retries the boundary on every later access.
-    # Process-memory-only: restart already mints an unrelated fresh epoch.
-    capability_rotation_deferred: bool = dataclass_field(default=False, repr=False)
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
@@ -936,15 +825,9 @@ class SessionEntry:
     # skill re-injection on the first message of the new session.  We can't
     # reuse was_auto_reset for this because that flag fires the "session
     # expired due to inactivity" user-facing notice and a misleading
-    # context-note prepend — both wrong for an explicit manual reset. The
-    # exact cause below keeps that manual boundary distinct from involuntary
-    # compression exhaustion.
+    # context-note prepend — both wrong for an explicit manual reset.
     # See issue #6508.
     is_fresh_reset: bool = False
-    # Exact mechanical cause for ``is_fresh_reset``. Persist this so a
-    # gateway restart between reset and the next real user turn cannot
-    # confuse an explicit /new with compression-exhaustion recovery.
-    fresh_reset_reason: Optional[str] = None
     
     # Set by the background expiry watcher after it finalizes an expired
     # session (invoking on_session_finalize hooks and evicting the cached
@@ -969,6 +852,13 @@ class SessionEntry:
     resume_reason: Optional[str] = None  # e.g. "restart_timeout"
     last_resume_marked_at: Optional[datetime] = None
 
+    # Durable ownership marker for the agent turn currently executing on this
+    # routing entry.  A normal unwind clears it with compare-and-swap semantics;
+    # SIGKILL/OOM leaves it behind so the next unclean startup can recover the
+    # exact interrupted session instead of guessing from ``updated_at``.
+    active_turn_token: Optional[str] = None
+    active_turn_started_at: Optional[datetime] = None
+
     # Session-scoped /model override (model/provider/base_url ONLY — never
     # credentials).  ``_session_model_overrides`` in the gateway runner is
     # in-memory, so before this field a gateway restart silently reverted
@@ -977,12 +867,6 @@ class SessionEntry:
     # override is rehydrated after a restart and are never written to disk
     # (see sanitize_model_override / SessionStore.set_model_override).
     model_override: Optional[Dict[str, str]] = None
-
-    def __post_init__(self) -> None:
-        # The distinctive prefix lets the mandatory output redactor mask an
-        # epoch if it is ever included in diagnostics.  The value itself is
-        # process-memory-only and is deliberately absent from routing storage.
-        self.capability_epoch = _load_capability_epoch(self.capability_epoch)
 
     def to_dict(self) -> Dict[str, Any]:
         result = {
@@ -1011,8 +895,13 @@ class SessionEntry:
                 if self.last_resume_marked_at
                 else None
             ),
+            "active_turn_token": self.active_turn_token,
+            "active_turn_started_at": (
+                self.active_turn_started_at.isoformat()
+                if self.active_turn_started_at
+                else None
+            ),
             "is_fresh_reset": self.is_fresh_reset,
-            "fresh_reset_reason": self.fresh_reset_reason,
             "was_auto_reset": self.was_auto_reset,
             "auto_reset_reason": self.auto_reset_reason,
             "reset_had_activity": self.reset_had_activity,
@@ -1021,12 +910,7 @@ class SessionEntry:
         if self.model_override:
             # Defence-in-depth: strip credentials even if a caller stored an
             # unsanitized dict directly on the entry.
-            safe_override = sanitize_model_override(
-                self.model_override,
-                reject_unsafe=False,
-            )
-            if safe_override:
-                result["model_override"] = safe_override
+            result["model_override"] = sanitize_model_override(self.model_override)
         if self.origin:
             result["origin"] = self.origin.to_dict()
         return result
@@ -1051,6 +935,20 @@ class SessionEntry:
                 last_resume_marked_at = datetime.fromisoformat(_lrma)
             except (TypeError, ValueError):
                 last_resume_marked_at = None
+
+        active_turn_started_at = None
+        _atsa = data.get("active_turn_started_at")
+        if _atsa:
+            try:
+                active_turn_started_at = datetime.fromisoformat(_atsa)
+            except (TypeError, ValueError):
+                active_turn_started_at = None
+        active_turn_token = data.get("active_turn_token")
+        if not isinstance(active_turn_token, str) or not active_turn_token:
+            # The token/timestamp pair is written atomically.  A partial or
+            # malformed pair is not trustworthy enough to auto-resume.
+            active_turn_token = None
+            active_turn_started_at = None
 
         session_key = data["session_key"]
         session_id = data["session_id"]
@@ -1094,16 +992,14 @@ class SessionEntry:
             resume_pending=data.get("resume_pending", False),
             resume_reason=data.get("resume_reason"),
             last_resume_marked_at=last_resume_marked_at,
+            active_turn_token=active_turn_token,
+            active_turn_started_at=active_turn_started_at,
             is_fresh_reset=data.get("is_fresh_reset", False),
-            fresh_reset_reason=data.get("fresh_reset_reason"),
             was_auto_reset=data.get("was_auto_reset", False),
             auto_reset_reason=data.get("auto_reset_reason"),
             reset_had_activity=data.get("reset_had_activity", False),
             prev_session_id=data.get("prev_session_id"),
-            model_override=sanitize_model_override(
-                data.get("model_override"),
-                reject_unsafe=False,
-            ),
+            model_override=sanitize_model_override(data.get("model_override")),
         )
 
 
@@ -1319,28 +1215,11 @@ class _SessionFlight:
         self.error: Optional[BaseException] = None
 
 
-@dataclass(frozen=True)
-class ConsumedResetMarkers:
-    """Immutable one-turn reset facts claimed from durable routing state."""
-
-    was_auto_reset: bool
-    auto_reset_reason: Optional[str]
-    reset_had_activity: bool
-    was_fresh_reset: bool
-    fresh_reset_reason: Optional[str]
-
-
 class AsyncSessionStore:
     """Async boundary for the synchronous, thread-safe SessionStore."""
 
-    def __init__(
-        self,
-        store: "SessionStore",
-        *,
-        offload: Callable[..., Awaitable[Any]] | None = None,
-    ) -> None:
+    def __init__(self, store: "SessionStore") -> None:
         self._store = store
-        self._offload = offload
 
     def __getattr__(self, name: str):
         attr = getattr(self._store, name)
@@ -1348,12 +1227,6 @@ class AsyncSessionStore:
             return attr
 
         async def _offloaded(*args, **kwargs) -> Any:
-            if self._offload is not None:
-                if kwargs:
-                    from functools import partial
-
-                    return await self._offload(partial(attr, *args, **kwargs))
-                return await self._offload(attr, *args)
             return await asyncio.to_thread(attr, *args, **kwargs)
 
         return _offloaded
@@ -1367,19 +1240,8 @@ class SessionStore:
     Falls back to legacy JSONL files if SQLite is unavailable.
     """
     
-    def __init__(
-        self,
-        sessions_dir: Path,
-        config: GatewayConfig,
-        has_active_processes_fn=None,
-        has_active_turn_fn=None,
-        before_capability_epoch_rotation_fn: (
-            CapabilityEpochRotationCallback | None
-        ) = None,
-        db_path: Path | None = None,
-        primary_profile_name: str | None = None,
-        served_profile_names: Optional[set[str]] = None,
-    ):
+    def __init__(self, sessions_dir: Path, config: GatewayConfig,
+                 has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
         self._entries: Dict[str, SessionEntry] = {}
@@ -1413,35 +1275,6 @@ class SessionStore:
         self._transcript_append_failures: Dict[str, int] = {}
         self._fts_rebuild_attempted = False
         self._has_active_processes_fn = has_active_processes_fn
-        self._has_active_turn_fn = has_active_turn_fn
-        self._before_capability_epoch_rotation_fn = (
-            before_capability_epoch_rotation_fn
-        )
-        if primary_profile_name is None:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-
-                primary_profile_name = (
-                    get_active_profile_name() or "default"
-                )
-            except Exception:
-                primary_profile_name = "default"
-        self._primary_profile_name = str(
-            primary_profile_name or "default"
-        )
-        self._served_profile_names = frozenset(
-            str(name)
-            for name in (
-                served_profile_names
-                if served_profile_names is not None
-                else {self._primary_profile_name}
-            )
-            if str(name)
-        )
-        if self._primary_profile_name not in self._served_profile_names:
-            raise ValueError(
-                "primary SessionStore profile is not in its frozen served set"
-            )
         # Whether to keep writing the legacy sessions.json mirror alongside
         # the primary gateway_routing table in state.db. Default True for
         # backward compatibility; disable via gateway.write_sessions_json.
@@ -1453,11 +1286,7 @@ class SessionStore:
         self._db = None
         try:
             from hermes_state import SessionDB
-            self._db = (
-                SessionDB(Path(db_path))
-                if db_path is not None
-                else SessionDB()
-            )
+            self._db = SessionDB()
         except RuntimeError as e:
             if "live-system guard" in str(e):
                 # Test-isolation guard fired: a pytest-context process
@@ -1468,31 +1297,6 @@ class SessionStore:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
         except Exception as e:
             print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
-
-    def _before_capability_epoch_rotation(
-        self,
-        old_entry: SessionEntry,
-        reason: str,
-    ) -> None:
-        """Revoke one exact old epoch before a replacement can be published.
-
-        The callback performs privileged I/O and therefore must only run while
-        no SessionStore lock is held. A failure is a hard boundary for explicit
-        and stale transitions; automatic policy resets may catch this exception
-        and defer without changing the current entry.
-        """
-
-        callback = self._before_capability_epoch_rotation_fn
-        if callback is None:
-            return
-        try:
-            callback(old_entry, str(reason or "session_boundary")[:240])
-        except CapabilityEpochRotationBlocked:
-            raise
-        except Exception as exc:
-            raise CapabilityEpochRotationBlocked(
-                "durable old-epoch revocation failed before session rotation"
-            ) from exc
 
     def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
         """Return whether a session has active work, failing closed on registry errors."""
@@ -1681,10 +1485,6 @@ class SessionStore:
                             row["end_reason"],
                             recovered_entry.session_id,
                         )
-                        # Never carry process-memory authority across a recovery
-                        # inferred from state.db/routing data. Both are writable
-                        # by same-UID model children. The recovered entry keeps
-                        # the fresh epoch minted when it was constructed.
                         self._entries[key] = recovered_entry
                         recovered_keys += 1
                         continue
@@ -1732,20 +1532,8 @@ class SessionStore:
             self._next_routing_generation_locked(),
         )
 
-    def _persist_routing_data(
-        self,
-        data: Dict[str, Any],
-        generation: int,
-        *,
-        require_primary: bool = False,
-    ) -> None:
-        """Serialize all whole-index writers through one durable write lock.
-
-        ``require_primary`` is reserved for claims that guard an external side
-        effect. When the canonical SQLite writer exists, its failure must be
-        reported to the caller instead of silently succeeding through the
-        legacy JSON mirror.
-        """
+    def _persist_routing_data(self, data: Dict[str, Any], generation: int) -> None:
+        """Serialize all whole-index writers through one durable write lock."""
         save_lock = getattr(self, "_save_lock", None)
         if save_lock is None:
             save_lock = threading.Lock()
@@ -1775,24 +1563,21 @@ class SessionStore:
                         )
                         db_saved = True
                     except Exception as exc:
-                        if require_primary:
-                            raise RuntimeError(
-                                "gateway routing primary save failed"
-                            ) from None
                         logger.warning(
                             "gateway.session: state.db routing save failed: %s", exc
                         )
             if getattr(self, "_write_sessions_json", True) or not db_saved:
                 try:
                     self._save_sessions_json(data)
-                except Exception:
-                    if not (require_primary and db_saved):
+                except Exception as exc:
+                    if not db_saved:
                         raise
-                    # The authoritative DB claim is already durable. A legacy
-                    # mirror failure must not replay the external side effect.
+                    # state.db is authoritative. A failed legacy mirror must not
+                    # report the already-committed primary write as failed.
                     logger.warning(
                         "gateway.session: sessions.json mirror save failed "
-                        "after primary routing claim"
+                        "after state.db commit: %s",
+                        exc,
                     )
             self._persisted_routing_generation = generation
             # This rewrite supersedes fast records at or below its
@@ -1850,7 +1635,13 @@ class SessionStore:
             data, generation = self._snapshot_routing_locked()
         self._persist_routing_data(data, generation)
 
-    def _save_entry(self, session_key: str) -> None:
+    def _save_entry(
+        self,
+        session_key: str,
+        *,
+        entry_data: Optional[Dict[str, Any]] = None,
+        lock_held: bool = False,
+    ) -> None:
         """Persist ONE routing entry via UPSERT — the per-turn fast path.
 
         The steady-state turn only bumps ``updated_at`` /
@@ -1891,13 +1682,34 @@ class SessionStore:
         - No DB, or a failed upsert, falls back to the full rewrite so
           DB-less installs keep sessions.json — their primary store —
           durable every turn.
+
+        ``entry_data`` lets a failure-atomic metadata transition persist a
+        candidate before publishing it to the live entry.  Its full-save
+        fallback carries the same candidate instead of re-snapshotting the
+        unchanged live value.
         """
-        with self._lock:
+        def _capture() -> Optional[tuple[str, int, Optional[Dict[str, Any]]]]:
             entry = self._entries.get(session_key)
             if entry is None:
-                return
-            entry_json = json.dumps(entry.to_dict())
+                return None
+            serialized_entry = (
+                dict(entry_data) if entry_data is not None else entry.to_dict()
+            )
+            entry_json = json.dumps(serialized_entry)
             revision = self._next_routing_generation_locked()
+            # Don't eagerly build the O(n) full snapshot — only the candidate
+            # is needed for the DB upsert.  The fallback is deferred to the
+            # except branch below where it's actually used.
+            return entry_json, revision, serialized_entry if entry_data is not None else None
+
+        if lock_held:
+            captured = _capture()
+        else:
+            with self._lock:
+                captured = _capture()
+        if captured is None:
+            return
+        entry_json, revision, candidate_entry = captured
         _db = getattr(self, "_db", None)
         saver = getattr(_db, "save_gateway_routing_entry", None) if _db else None
         if callable(saver):
@@ -1925,7 +1737,26 @@ class SessionStore:
                     "(%s); falling back to full index rewrite",
                     session_key, exc,
                 )
-        self._save_entries()
+        if candidate_entry is not None:
+            # DB upsert failed (or no DB): build the full snapshot now, carrying
+            # the candidate entry so the fallback persists the intended
+            # transition rather than re-snapshotting the unchanged live value.
+            if lock_held:
+                # Caller already holds _lock — build snapshot in-place.
+                fallback_data: Dict[str, Any] = {
+                    key: current.to_dict()
+                    for key, current in self._entries.items()
+                }
+            else:
+                with self._lock:
+                    fallback_data = {
+                        key: current.to_dict()
+                        for key, current in self._entries.items()
+                    }
+            fallback_data[session_key] = candidate_entry
+            self._persist_routing_data(fallback_data, revision)
+        else:
+            self._save_entries()
 
     def _resolve_profile_for_key(self, source: Optional[SessionSource] = None) -> Optional[str]:
         """Return the profile namespace for session keys, or None when off.
@@ -1939,13 +1770,12 @@ class SessionStore:
         if not getattr(self.config, "multiplex_profiles", False):
             return None
         if source is not None and source.profile:
-            profile = str(source.profile)
-            if profile not in self._served_profile_names:
-                raise ValueError(
-                    f"Profile {profile!r} is not served by this SessionStore"
-                )
-            return profile
-        return self._primary_profile_name
+            return source.profile
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return None
 
     @staticmethod
     def _profile_from_session_key(session_key: Optional[str]) -> Optional[str]:
@@ -1958,8 +1788,13 @@ class SessionStore:
         namespace = parts[1] or "main"
         return "default" if namespace == "main" else namespace
 
-    def _active_profile_name(self) -> str:
-        return self._primary_profile_name
+    @staticmethod
+    def _active_profile_name() -> str:
+        try:
+            from hermes_cli.profiles import get_active_profile_name
+            return get_active_profile_name() or "default"
+        except Exception:
+            return "default"
 
     def _recovered_row_allowed_for_active_profile(
         self,
@@ -2675,7 +2510,6 @@ class SessionStore:
 
         # ---- Phase 1: lock read -- get entry snapshot for stale/reset checks ----
         _stale_session_id = None
-        _stale_updated_at = None
         _entry_for_checks = None
         with self._lock:
             self._ensure_loaded_locked()
@@ -2684,16 +2518,13 @@ class SessionStore:
             if session_key in self._entries and not force_new:
                 _entry_for_checks = self._entries[session_key]
                 _stale_session_id = _entry_for_checks.session_id
-                _stale_updated_at = _entry_for_checks.updated_at
 
         # ---- Phase 1b: no-lock I/O -- stale check + reset policy ----
         _is_stale = False
         _reset_reason = None
         if _entry_for_checks is not None and _stale_session_id is not None:
             _is_stale = self._is_session_ended_in_db(_stale_session_id)
-            if _entry_for_checks.capability_rotation_deferred:
-                _reset_reason = "capability_rotation_deferred"
-            elif _entry_for_checks.suspended:
+            if _entry_for_checks.suspended:
                 _reset_reason = "suspended"
             elif _entry_for_checks.resume_pending:
                 _reset_reason = self._should_reset(_entry_for_checks, source)
@@ -2719,63 +2550,6 @@ class SessionStore:
             else:
                 _reset_reason = self._should_reset(_entry_for_checks, source)
 
-        # Revoke the exact old authority epoch before any replacement entry is
-        # visible. This callback performs writer I/O, so it deliberately runs
-        # outside ``self._lock``. DB-reported compression lineage is not an
-        # authority proof: state.db is writable by same-UID model children, so
-        # recovering to its reported tip is an ordinary rotation boundary.
-        _rotation_deferred = False
-        _compression_continuation = bool(
-            existing_session_id
-            and canonical_existing_session_id
-            and canonical_existing_session_id != existing_session_id
-        )
-        _rotation_entry: Optional[SessionEntry] = None
-        _rotation_epoch = ""
-        _rotation_reason = ""
-        _rotation_callback_succeeded = False
-        if force_new and force_new_observed_entry is not None:
-            _rotation_entry = force_new_observed_entry
-            _rotation_reason = "force_new"
-        elif _entry_for_checks is not None and _compression_continuation:
-            _rotation_entry = _entry_for_checks
-            _rotation_reason = "compression_tip_recovery"
-        elif (
-            _entry_for_checks is not None
-            and _is_stale
-        ):
-            _rotation_entry = _entry_for_checks
-            _rotation_reason = "stale_session_recovery"
-        elif (
-            _entry_for_checks is not None
-            and _reset_reason
-        ):
-            _rotation_entry = _entry_for_checks
-            _rotation_reason = f"automatic_reset:{_reset_reason}"
-
-        if _rotation_entry is not None:
-            _rotation_epoch = _rotation_entry.capability_epoch
-            try:
-                self._before_capability_epoch_rotation(
-                    _rotation_entry,
-                    _rotation_reason,
-                )
-                _rotation_callback_succeeded = True
-            except CapabilityEpochRotationBlocked:
-                if _rotation_reason.startswith("automatic_reset:"):
-                    # An idle/daily/suspended policy reset is optional. Keep the
-                    # exact old entry and epoch published until the privileged
-                    # writer can durably tombstone it; never rotate locally and
-                    # hope a best-effort revoke catches up later.
-                    logger.warning(
-                        "Deferring automatic session reset for %s because exact "
-                        "old-epoch revocation is unavailable",
-                        session_key,
-                    )
-                    _rotation_deferred = True
-                else:
-                    raise
-
         # ---- Phase 2: lock write -- apply decisions to _entries ----
         _needs_save = False
         # Healthy-path saves only bump updated_at on one entry; they take
@@ -2795,83 +2569,14 @@ class SessionStore:
 
             if session_key in self._entries and not force_new:
                 entry = self._entries[session_key]
-                # Compression-tip recovery on this fork is an authority
-                # rotation boundary, not an in-place metadata heal.  The
-                # branch below publishes a replacement entry and deliberately
-                # keeps the full-rewrite save path.  Ordinary healthy turns
-                # remain eligible for upstream's single-entry UPSERT path.
-                _healed = False
-                # If trusted live work changed the routing entry while writer
-                # I/O was in flight, the stale policy decision must not be
-                # applied. After a successful callback, a same-epoch survivor
-                # must also be rotated because that epoch is now tombstoned. A
-                # failed automatic-reset callback preserves the old epoch and
-                # merely defers the policy boundary.
-                _rotation_cas_lost = bool(
-                    _rotation_epoch
-                    and (
-                        entry is not _rotation_entry
-                        or entry.session_id != _stale_session_id
-                        or entry.updated_at != _stale_updated_at
-                    )
+                # A heal rewrites entry.session_id, so it must reach the
+                # sessions.json mirror too: force the full-rewrite save
+                # below (the fast path persists state.db only).
+                _healed = self._heal_compression_tip_locked(
+                    entry, existing_session_id, canonical_existing_session_id
                 )
 
-                if _rotation_cas_lost:
-                    if (
-                        _rotation_callback_succeeded
-                        and entry.capability_epoch == _rotation_epoch
-                    ):
-                        logger.warning(
-                            "SessionStore authority rotation raced a live routing "
-                            "change for %s; preserving %s with fresh authority",
-                            session_key,
-                            entry.session_id,
-                        )
-                        entry = dataclass_replace(
-                            entry,
-                            updated_at=now,
-                            capability_epoch=_new_capability_epoch(),
-                            capability_rotation_deferred=False,
-                        )
-                        self._entries[session_key] = entry
-                    elif _rotation_deferred and entry is _rotation_entry:
-                        entry.capability_rotation_deferred = True
-                        entry.updated_at = now
-                    _needs_save = True
-                elif (
-                    _compression_continuation
-                    and entry is _entry_for_checks
-                    and entry.session_id == existing_session_id
-                ):
-                    logger.info(
-                        "SessionStore rotated authority while healing compressed "
-                        "session mapping: %s -> %s",
-                        entry.session_id,
-                        canonical_existing_session_id,
-                    )
-                    entry = dataclass_replace(
-                        entry,
-                        session_id=canonical_existing_session_id,
-                        updated_at=now,
-                        capability_epoch=_new_capability_epoch(),
-                        capability_rotation_deferred=False,
-                    )
-                    self._entries[session_key] = entry
-                    # A compression continuation changes the durable routing
-                    # identity.  The state.db UPSERT fast path intentionally
-                    # skips sessions.json, so force the structural full save.
-                    _healed = True
-                    _needs_save = True
-                if _rotation_cas_lost:
-                    # Concurrent trusted activity wins over the stale reset or
-                    # DB-selected target. The replacement above is the complete
-                    # mechanical outcome for this access.
-                    pass
-                elif _rotation_deferred and entry is _entry_for_checks:
-                    entry.capability_rotation_deferred = True
-                    entry.updated_at = now
-                    _needs_save = True
-                elif _is_stale and entry.session_id == _stale_session_id:
+                if _is_stale and entry.session_id == _stale_session_id:
                     # Stale routing self-heal (#54878): the in-memory entry
                     # points at a session that has ALREADY been ended in
                     # state.db.  Drop it and fall through to recovery/create.
@@ -2968,24 +2673,6 @@ class SessionStore:
                     self._entries[session_key] = candidate
                     published = candidate
                 else:
-                    if (
-                        force_new
-                        and current is not None
-                        and _rotation_epoch
-                        and _rotation_callback_succeeded
-                        and current.capability_epoch == _rotation_epoch
-                    ):
-                        # The force-new callback revoked an entry that was
-                        # concurrently replaced without rotating its epoch.
-                        # Preserve the winner, but never expose the tombstoned
-                        # generation.
-                        current = dataclass_replace(
-                            current,
-                            updated_at=now,
-                            capability_epoch=_new_capability_epoch(),
-                            capability_rotation_deferred=False,
-                        )
-                        self._entries[session_key] = current
                     published = current
             assert published is not None
             entry = published
@@ -3073,79 +2760,6 @@ class SessionStore:
             display_name=peer_display_name,
         )
 
-    def consume_reset_markers(
-        self,
-        session_key: str,
-        expected_session_id: str,
-        expected_capability_epoch: str,
-    ) -> ConsumedResetMarkers:
-        """Durably claim one-shot reset facts for one exact live session.
-
-        The gateway must call this before emitting a reset notice, hook, or
-        model turn.  Persisting the cleared flags before returning prevents a
-        process restart from replaying the same reset boundary and user-facing
-        notice.  The session-id comparison is a CAS guard: a concurrent
-        ``/new`` or ``/resume`` must not let an older handler consume markers
-        from the replacement route, including an away-and-back switch that
-        returns to the same transcript id with fresh mutation authority.
-        """
-
-        with self._lock:
-            self._ensure_loaded_locked()
-            entry = self._entries.get(session_key)
-            if (
-                entry is None
-                or entry.session_id != expected_session_id
-                or entry.capability_epoch != expected_capability_epoch
-            ):
-                raise RuntimeError(
-                    "session changed before reset markers could be consumed"
-                )
-
-            consumed = ConsumedResetMarkers(
-                was_auto_reset=bool(entry.was_auto_reset),
-                auto_reset_reason=entry.auto_reset_reason,
-                reset_had_activity=bool(entry.reset_had_activity),
-                was_fresh_reset=bool(entry.is_fresh_reset),
-                fresh_reset_reason=entry.fresh_reset_reason,
-            )
-            if (
-                entry.was_auto_reset
-                or entry.auto_reset_reason is not None
-                or entry.is_fresh_reset
-                or entry.fresh_reset_reason is not None
-            ):
-                previous_markers = (
-                    entry.was_auto_reset,
-                    entry.auto_reset_reason,
-                    entry.is_fresh_reset,
-                    entry.fresh_reset_reason,
-                )
-                entry.was_auto_reset = False
-                entry.auto_reset_reason = None
-                entry.is_fresh_reset = False
-                entry.fresh_reset_reason = None
-                routing_data, routing_generation = self._snapshot_routing_locked()
-                try:
-                    # Hold the routing lock until the canonical claim is
-                    # acknowledged. Otherwise a second handler could observe
-                    # the in-memory clear and emit side effects before a failed
-                    # primary write is rolled back.
-                    self._persist_routing_data(
-                        routing_data,
-                        routing_generation,
-                        require_primary=True,
-                    )
-                except Exception:
-                    (
-                        entry.was_auto_reset,
-                        entry.auto_reset_reason,
-                        entry.is_fresh_reset,
-                        entry.fresh_reset_reason,
-                    ) = previous_markers
-                    raise
-        return consumed
-
     def get_session_metadata(
         self,
         session_key: str,
@@ -3228,12 +2842,146 @@ class SessionStore:
                 return True
         return False
 
+    def mark_turn_active(self, session_key: str) -> Optional[str]:
+        """Persist exact ownership of the agent turn running for *session_key*.
+
+        The opaque token is returned to the caller and must be supplied to
+        :meth:`clear_turn_active`.  Re-marking replaces the previous token so
+        a stale asynchronous unwind cannot clear a newer turn.
+        """
+        token = uuid.uuid4().hex
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None:
+                return None
+            now = _now()
+            candidate = entry.to_dict()
+            candidate["active_turn_token"] = token
+            candidate["active_turn_started_at"] = now.isoformat()
+            # Keep the legacy 120-second startup heuristic effective during a
+            # rolling downgrade/upgrade window where an older binary cannot
+            # understand the exact marker fields.
+            candidate["updated_at"] = now.isoformat()
+
+            # Persist before publishing the marker in memory.  If the durable
+            # write raises, a later unrelated save cannot leak an unowned token.
+            self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+            entry.active_turn_token = token
+            entry.active_turn_started_at = now
+            entry.updated_at = now
+        return token
+
+    def clear_turn_active(self, session_key: str, token: str) -> bool:
+        """Compare-and-swap clear an active-turn marker.
+
+        Returns ``False`` when the entry disappeared or a newer turn owns it.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            entry = self._entries.get(session_key)
+            if entry is None or entry.active_turn_token != token:
+                return False
+            candidate = entry.to_dict()
+            candidate["active_turn_token"] = None
+            candidate["active_turn_started_at"] = None
+
+            # Keep the live token until the clear is durable.  A failed write
+            # therefore remains retryable instead of becoming a false mismatch.
+            self._save_entry(
+                session_key,
+                entry_data=candidate,
+                lock_held=True,
+            )
+            entry.active_turn_token = None
+            entry.active_turn_started_at = None
+        return True
+
+    def recover_interrupted_turns(
+        self,
+        max_age_seconds: int = 60 * 60,
+    ) -> int:
+        """Promote exact crash-left turn markers into ``resume_pending``.
+
+        This must only be called by the unclean-startup path.  Old or invalid
+        markers are cleared without resuming so a downgrade/re-upgrade cycle
+        cannot revive arbitrarily stale work.  Explicitly suspended sessions
+        are likewise never re-armed.
+
+        Returns the number of newly promoted sessions.
+        """
+        from datetime import timedelta
+
+        now = _now()
+        max_age = timedelta(seconds=max(0, max_age_seconds))
+        promoted = 0
+        changed = False
+
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if not entry.active_turn_token:
+                    continue
+
+                started_at = entry.active_turn_started_at
+                try:
+                    marker_is_stale = (
+                        started_at is None
+                        or (max_age_seconds > 0 and now - started_at > max_age)
+                    )
+                except TypeError:
+                    # Mixed aware/naive timestamps are invalid for this local
+                    # marker.  Clear rather than risking an unsafe old resume.
+                    marker_is_stale = True
+
+                if not marker_is_stale and not entry.suspended:
+                    if entry.resume_pending:
+                        # A drain-timeout marker is more specific than the
+                        # generic crash reason; preserve it and its freshness.
+                        if entry.last_resume_marked_at is None:
+                            entry.last_resume_marked_at = now
+                    else:
+                        entry.resume_pending = True
+                        entry.resume_reason = "restart_interrupted"
+                        # Freshness starts when recovery is discovered, not
+                        # when a potentially hours-long turn began.
+                        entry.last_resume_marked_at = now
+                        promoted += 1
+
+                entry.active_turn_token = None
+                entry.active_turn_started_at = None
+                changed = True
+
+            if changed:
+                # Cold-start batch: one durable rewrite is clearer and cheaper
+                # than an upsert per interrupted routing entry.
+                self._save()
+
+        return promoted
+
+    def discard_active_turn_markers(self) -> int:
+        """Clear orphan turn markers after a verified clean shutdown."""
+        cleared = 0
+        with self._lock:
+            self._ensure_loaded_locked()
+            for entry in self._entries.values():
+                if not entry.active_turn_token and entry.active_turn_started_at is None:
+                    continue
+                entry.active_turn_token = None
+                entry.active_turn_started_at = None
+                cleared += 1
+            if cleared:
+                self._save()
+        return cleared
+
     def mark_resume_pending(
         self,
         session_key: str,
         reason: str = "restart_timeout",
-        *,
-        require_primary: bool = False,
     ) -> bool:
         """Mark a session as resumable after a restart interruption.
 
@@ -3241,12 +2989,6 @@ class SessionStore:
         ``session_id`` and the transcript.  The next call to
         ``get_or_create_session()`` for this key returns the same entry
         so the user auto-resumes on the same conversation lane.
-
-        When ``require_primary`` is true, success means the canonical
-        ``state.db`` routing writer durably accepted the marker.  A failed
-        primary write is surfaced even when the legacy ``sessions.json``
-        recovery mirror succeeds, allowing shutdown callers to retry instead
-        of treating JSON-only persistence as an authoritative receipt.
 
         Returns True if the session existed and was marked.
         """
@@ -3258,74 +3000,19 @@ class SessionStore:
                 # forced-wipe signal (from /stop or stuck-loop escalation).
                 if entry.suspended:
                     return False
-                previous_marker = (
-                    entry.resume_pending,
-                    entry.resume_reason,
-                    entry.last_resume_marked_at,
-                )
                 entry.resume_pending = True
                 entry.resume_reason = reason
                 entry.last_resume_marked_at = _now()
-                if not require_primary:
-                    self._save()
-                    return True
-
-                routing_data, routing_generation = self._snapshot_routing_locked()
-                try:
-                    db = getattr(self, "_db", None)
-                    primary_writer = getattr(
-                        db,
-                        "replace_gateway_routing_entries",
-                        None,
-                    )
-                    if not callable(primary_writer):
-                        raise RuntimeError(
-                            "gateway routing primary save unavailable"
-                        )
-                    self._persist_routing_data(
-                        routing_data,
-                        routing_generation,
-                        require_primary=True,
-                    )
-                except Exception:
-                    # Keep a conservative emergency mirror even though it is
-                    # not an authoritative shutdown receipt.  state.db wins
-                    # when both copies are available on restart.
-                    try:
-                        self._save_sessions_json(routing_data)
-                    except Exception as mirror_exc:
-                        logger.warning(
-                            "gateway.session: sessions.json recovery mirror "
-                            "save failed after resume marker primary failure: %s",
-                            mirror_exc,
-                        )
-                    (
-                        entry.resume_pending,
-                        entry.resume_reason,
-                        entry.last_resume_marked_at,
-                    ) = previous_marker
-                    raise
+                self._save()
                 return True
         return False
 
-    def clear_resume_pending(
-        self,
-        session_key: str,
-        *,
-        expected_session_id: Optional[str] = None,
-        expected_last_resume_marked_at: Any = _RESUME_MARK_EXPECTATION_UNSET,
-    ) -> bool:
+    def clear_resume_pending(self, session_key: str) -> bool:
         """Clear the resume-pending flag after a successful resumed turn.
 
         Called from the gateway after ``run_conversation()`` returns a
         final response for a session that had ``resume_pending=True``,
         signalling that recovery succeeded.
-
-        The optional expectations make post-turn acknowledgement ABA-safe:
-        an older turn must not erase a newer restart marker or a marker on a
-        replacement session. Callers that deliberately perform operator or
-        delivery-ledger cleanup may omit them to retain the historical
-        unconditional behaviour.
 
         Returns True if a flag was cleared.
         """
@@ -3333,18 +3020,6 @@ class SessionStore:
             self._ensure_loaded_locked()
             entry = self._entries.get(session_key)
             if entry is None or not entry.resume_pending:
-                return False
-            if (
-                expected_session_id is not None
-                and entry.session_id != expected_session_id
-            ):
-                return False
-            if (
-                expected_last_resume_marked_at
-                is not _RESUME_MARK_EXPECTATION_UNSET
-                and entry.last_resume_marked_at
-                != expected_last_resume_marked_at
-            ):
                 return False
             entry.resume_pending = False
             entry.resume_reason = None
@@ -3376,114 +3051,24 @@ class SessionStore:
         cutoff = _now() - timedelta(days=max_age_days)
         removed_keys: list[str] = []
 
-        # Snapshot immutable CAS fields under the routing lock. Privileged
-        # writer I/O and activity callbacks must never run while it is held.
         with self._lock:
             self._ensure_loaded_locked()
-            candidates = [
-                (
-                    key,
-                    entry,
-                    entry.session_id,
-                    entry.updated_at,
-                    entry.capability_epoch,
-                )
-                for key, entry in self._entries.items()
-                if not entry.suspended and entry.updated_at < cutoff
-            ]
-
-        def _has_live_work(entry: SessionEntry) -> bool:
-            callbacks = (
-                ("has_active_turn_fn", getattr(self, "_has_active_turn_fn", None)),
-                (
-                    "has_active_processes_fn",
-                    getattr(self, "_has_active_processes_fn", None),
-                ),
-            )
-            for label, callback in callbacks:
-                if callback is None:
+            for key, entry in list(self._entries.items()):
+                if entry.suspended:
                     continue
-                try:
-                    if callback(entry.session_key):
-                        return True
-                except Exception as exc:
-                    # A maintenance sweep cannot prove inactivity when its
-                    # observer fails. Retain the entry rather than splitting a
-                    # live task from its authority epoch.
-                    logger.warning(
-                        "%s raised during prune for %s; retaining entry: %s",
-                        label,
-                        entry.session_key,
-                        exc,
-                    )
-                    return True
-            return False
-
-        for (
-            key,
-            entry,
-            observed_session_id,
-            observed_updated_at,
-            observed_epoch,
-        ) in candidates:
-            if _has_live_work(entry):
-                continue
-
-            # Revalidate immediately before the durable boundary. This avoids
-            # needless revocation when activity changed after the snapshot;
-            # the post-I/O CAS below still remains authoritative.
-            with self._lock:
-                current = self._entries.get(key)
-                candidate_still_current = bool(
-                    current is entry
-                    and current.session_id == observed_session_id
-                    and current.updated_at == observed_updated_at
-                    and current.capability_epoch == observed_epoch
-                    and not current.suspended
-                    and current.updated_at < cutoff
-                )
-            if not candidate_still_current or _has_live_work(entry):
-                continue
-
-            try:
-                self._before_capability_epoch_rotation(
-                    entry,
-                    "maintenance_prune",
-                )
-            except CapabilityEpochRotationBlocked:
-                logger.warning(
-                    "Deferring prune for %s because exact old-epoch "
-                    "revocation is unavailable",
-                    key,
-                )
-                continue
-
-            # A foreground turn may have started while writer I/O was in
-            # flight. Never remove it. Since the old epoch is already durably
-            # tombstoned, mark an exact same-epoch survivor for mandatory
-            # rotation on its next routing access.
-            live_after_revoke = _has_live_work(entry)
-            with self._lock:
-                current = self._entries.get(key)
-                cas_matches = bool(
-                    current is entry
-                    and current.session_id == observed_session_id
-                    and current.updated_at == observed_updated_at
-                    and current.capability_epoch == observed_epoch
-                    and not current.suspended
-                    and current.updated_at < cutoff
-                )
-                if cas_matches and not live_after_revoke:
-                    self._entries.pop(key, None)
+                # Never prune sessions with an active background process
+                # attached — the user may still be waiting on output.
+                # The callback is keyed by session_key (see process_registry.
+                # has_active_for_session); passing session_id here used to
+                # never match, so active sessions got pruned anyway.
+                if self._has_active_processes_safe(entry.session_key, context="prune"):
+                    continue
+                if entry.updated_at < cutoff:
                     removed_keys.append(key)
-                elif (
-                    current is not None
-                    and current.capability_epoch == observed_epoch
-                ):
-                    current.capability_rotation_deferred = True
-
-        if removed_keys:
-            self._save_entries()
+            for key in removed_keys:
+                self._entries.pop(key, None)
+            if removed_keys:
+                self._save()
 
         if removed_keys:
             logger.info(
@@ -3528,27 +3113,8 @@ class SessionStore:
                 self._save()
         return count
 
-    def reset_session(
-        self,
-        session_key: str,
-        display_name: Optional[str] = None,
-        *,
-        source: Optional[SessionSource] = None,
-        create_if_missing: bool = False,
-        fresh_reset_reason: str = "explicit_new",
-    ) -> Optional[SessionEntry]:
-        """Force reset a session, creating a new session ID.
-
-        ``create_if_missing`` is used by the gateway's first-ever ``/new``
-        boundary. Creating that initial route inside this method closes the gap
-        where the reset handler previously exposed its running slot and only
-        later called ``get_or_create_session(force_new=True)``.
-
-        ``fresh_reset_reason`` is persisted exact lifecycle metadata. Unknown
-        values are intentionally treated as manual choice boundaries by the
-        Canonical Task Workspace resolver, so only a recognized involuntary
-        cause can auto-recover an active plan.
-        """
+    def reset_session(self, session_key: str, display_name: Optional[str] = None) -> Optional[SessionEntry]:
+        """Force reset a session, creating a new session ID."""
         db_end_session_id = None
         db_create_kwargs = None
         new_entry = None
@@ -3557,68 +3123,9 @@ class SessionStore:
             self._ensure_loaded_locked()
 
             if session_key not in self._entries:
-                if not create_if_missing or source is None:
-                    return None
+                return None
 
-                now = _now()
-                session_id = (
-                    f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-                )
-                new_entry = SessionEntry(
-                    session_key=session_key,
-                    session_id=session_id,
-                    created_at=now,
-                    updated_at=now,
-                    origin=source,
-                    display_name=(
-                        display_name
-                        if display_name is not None
-                        else source.chat_name
-                    ),
-                    platform=source.platform,
-                    chat_type=source.chat_type,
-                    is_fresh_reset=True,
-                    fresh_reset_reason=fresh_reset_reason,
-                )
-                self._entries[session_key] = new_entry
-                self._save()
-                db_create_kwargs = {
-                    "session_id": session_id,
-                    "source": (
-                        source.platform.value if source.platform else "unknown"
-                    ),
-                    "user_id": source.user_id,
-                    "session_key": session_key,
-                    "chat_id": source.chat_id,
-                    "chat_type": source.chat_type,
-                    "thread_id": source.thread_id,
-                }
-                old_entry = None
-            else:
-                old_entry = self._entries[session_key]
-
-        if old_entry is None:
-            if self._db and db_create_kwargs:
-                try:
-                    self._db.create_session(**db_create_kwargs)
-                    self._record_gateway_session_peer(
-                        new_entry.session_id,
-                        session_key,
-                        source,
-                        display_name=new_entry.display_name,
-                    )
-                except Exception as e:
-                    logger.debug("Session DB operation failed: %s", e)
-            return new_entry
-
-        self._before_capability_epoch_rotation(old_entry, "explicit_reset")
-
-        with self._lock:
-            self._ensure_loaded_locked()
-            if self._entries.get(session_key) is not old_entry:
-                raise CapabilityEpochRotationBlocked(
-                    "session changed while exact old-epoch reset was being revoked"
-                )
+            old_entry = self._entries[session_key]
             db_end_session_id = old_entry.session_id
 
             now = _now()
@@ -3634,7 +3141,6 @@ class SessionStore:
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
                 is_fresh_reset=True,
-                fresh_reset_reason=fresh_reset_reason,
             )
 
             self._entries[session_key] = new_entry
@@ -3722,11 +3228,6 @@ class SessionStore:
         generating a fresh session ID, re-uses ``target_session_id`` so the
         old transcript is loaded on the next message. If the target session was
         previously ended, re-open it so gateway resume semantics match the CLI.
-
-        Every switch rotates mutation authority. Compression that completes
-        in the live gateway preserves continuity by updating the trusted
-        in-memory ``SessionEntry`` directly; a later switch inferred from
-        writable routing/SQLite state is never authority-preserving.
         """
         db_end_session_id = None
         new_entry = None
@@ -3738,45 +3239,12 @@ class SessionStore:
                 return None
 
             old_entry = self._entries[session_key]
-            old_session_id = old_entry.session_id
-            old_updated_at = old_entry.updated_at
-            old_epoch = old_entry.capability_epoch
 
             # Don't switch if already on that session
-            if old_session_id == target_session_id:
+            if old_entry.session_id == target_session_id:
                 return old_entry
 
-        # DB/routing ancestry is writable by the same-UID model child, so it
-        # cannot prove authority continuity. Revoke the exact process-memory
-        # epoch before publishing every switch, including recovery to a
-        # database-reported compression descendant.
-        self._before_capability_epoch_rotation(old_entry, "explicit_switch")
-
-        with self._lock:
-            self._ensure_loaded_locked()
-            current = self._entries.get(session_key)
-            if (
-                current is not old_entry
-                or old_entry.session_id != old_session_id
-                or old_entry.updated_at != old_updated_at
-            ):
-                if (
-                    current is not None
-                    and current.capability_epoch == old_epoch
-                ):
-                    current = dataclass_replace(
-                        current,
-                        updated_at=_now(),
-                        capability_epoch=_new_capability_epoch(),
-                        capability_rotation_deferred=False,
-                    )
-                    self._entries[session_key] = current
-                    self._save()
-                raise CapabilityEpochRotationBlocked(
-                    "session changed while exact old-epoch switch was being resolved",
-                    authority_rotated=True,
-                )
-            db_end_session_id = old_session_id
+            db_end_session_id = old_entry.session_id
 
             now = _now()
             new_entry = SessionEntry(
@@ -3788,7 +3256,6 @@ class SessionStore:
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
                 chat_type=old_entry.chat_type,
-                capability_epoch=_new_capability_epoch(),
             )
 
             self._entries[session_key] = new_entry
@@ -4260,9 +3727,6 @@ def build_session_context(
     if session_entry:
         context.session_key = session_entry.session_key
         context.session_id = session_entry.session_id
-        context.capability_epoch_sha256 = hashlib.sha256(
-            session_entry.capability_epoch.encode("ascii")
-        ).hexdigest()
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
     

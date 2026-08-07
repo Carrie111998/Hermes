@@ -81,8 +81,8 @@ def finalize_turn(
     original_user_message,
     _should_review_memory,
     _turn_exit_reason,
-    _pending_continuation_response=None,
-    _pending_continuation_response_previewed=False,
+    _pending_verification_response=None,
+    _pending_verification_response_previewed=False,
 ):
     """Run the post-loop finalization and return the turn ``result`` dict.
 
@@ -91,42 +91,10 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
-    execution_lease_exhausted = (
-        str(_turn_exit_reason) == "execution_lease_exhausted"
+    budget_exhausted = (
+        api_call_count >= agent.max_iterations
+        or agent.iteration_budget.remaining <= 0
     )
-    if execution_lease_exhausted and final_response is None:
-        lease = getattr(agent, "execution_lease", None)
-        lease_used = getattr(lease, "used", 0)
-        lease_max = getattr(lease, "max_total", 0)
-        final_response = (
-            "[RUNTIME EXECUTION LEASE RECEIPT — NOT MODEL-AUTHORED]\n"
-            f"Aggregate provider-call safety lease reached ({lease_used}/{lease_max}). "
-            "No model-authored final completion was produced. Existing Todo "
-            "and Canonical Task Workspace state was preserved unchanged; this "
-            "run is partial and resumable when the caller begins a fresh "
-            "authorized execution run."
-        )
-        failed = True
-
-    _iteration_budget = getattr(agent, "iteration_budget", None)
-    _budget_used = getattr(_iteration_budget, "used", 0)
-    _budget_max = getattr(_iteration_budget, "max_total", 0)
-    _budget_remaining = getattr(_iteration_budget, "remaining", 0)
-    _budget_renewals = getattr(agent, "_budget_renewal_count", 0)
-    _budget_stalled_boundaries = getattr(
-        agent,
-        "_budget_stagnant_boundary_count",
-        0,
-    )
-    _execution_lease = getattr(agent, "execution_lease", None)
-    _lease_used = getattr(_execution_lease, "used", 0)
-    _lease_max = getattr(_execution_lease, "max_total", 0)
-
-    # api_call_count is cumulative across renewable slices; max_iterations is
-    # only the size of the current slice. Comparing them after a renewal turns
-    # healthy values such as 176 total calls with an 86/90 current slice into a
-    # false budget exhaustion. The slice object is the sole local boundary.
-    budget_exhausted = _budget_remaining <= 0
     budget_fallback_eligible = (
         budget_exhausted
         and not interrupted
@@ -135,61 +103,49 @@ def finalize_turn(
     )
     continuation_budget_exhausted = (
         final_response is None
-        and bool(_pending_continuation_response)
+        and bool(_pending_verification_response)
         and budget_fallback_eligible
     )
 
     iteration_limit_fallback = False
-    preserved_continuation_fallback = False
+    preserved_verification_fallback = False
     if continuation_budget_exhausted:
-        # A model-visible protocol continuation deliberately withheld a composed
+        # A verification/continuation gate deliberately withheld a composed
         # answer, then consumed the remaining budget before producing a newer
         # one. Preserve that exact answer instead of replacing it with another
         # fallible model call. The explicit pending value is the provenance
         # guard: unrelated error/recovery exits can never enter this branch.
-        final_response = _pending_continuation_response
+        final_response = _pending_verification_response
         # Mark the turn as previewed only when the reused candidate was
         # actually streamed to the user as interim content. (#65919 review:
         # response-loss blocker)
-        if _pending_continuation_response_previewed:
+        if _pending_verification_response_previewed:
             agent._response_was_previewed = True
-        _turn_exit_reason = (
-            f"max_iterations_reached({_budget_used}/{_budget_max})"
-        )
+        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         iteration_limit_fallback = True
-        preserved_continuation_fallback = True
+        preserved_verification_fallback = True
     elif final_response is None and budget_fallback_eligible:
-        # The in-loop continuation rail could not obtain a model-authored
-        # closing response. Report the mechanical boundary truthfully. This
-        # compatibility helper performs no provider dispatch, does not remove
-        # tools, and never injects a synthetic user turn.
-        _turn_exit_reason = (
-            f"max_iterations_reached({_budget_used}/{_budget_max})"
-        )
+        # Budget exhausted — ask the model for a summary via one extra
+        # API call with tools stripped.  _handle_max_iterations injects a
+        # user message and makes a single toolless request.
+        _turn_exit_reason = f"max_iterations_reached({api_call_count}/{agent.max_iterations})"
         agent._emit_status(
-            f"⚠️ Iteration budget exhausted ({_budget_used}/{_budget_max}) "
-            "— task remains open and resumable"
+            f"⚠️ Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+            "— asking model to summarise"
         )
         if not agent.quiet_mode:
             agent._safe_print(
-                f"\n⚠️  Iteration budget exhausted ({_budget_used}/{_budget_max}) "
-                "— task remains open and resumable."
+                f"\n⚠️  Iteration budget exhausted ({api_call_count}/{agent.max_iterations}) "
+                "— requesting summary..."
             )
         final_response = agent._handle_max_iterations(messages, api_call_count)
-        failed = True
-        iteration_limit_fallback = True
-
-    if (
-        str(_turn_exit_reason)
-        == "budget_exhausted_after_grace_tool_request"
-    ):
         iteration_limit_fallback = True
 
     if iteration_limit_fallback:
         # If running as a kanban worker, signal the dispatcher that the
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
-        # came from the mechanical boundary receipt or an explicitly pending continuation;
+        # came from the summary call or an explicitly pending continuation;
         # both exhausted the task budget and must advance the failure circuit.
         #
         # We route through ``_record_task_failure(outcome="timed_out")``
@@ -206,7 +162,7 @@ def finalize_turn(
                         _kanban_task,
                         error=(
                             f"Iteration budget exhausted "
-                            f"({_budget_used}/{_budget_max}) — "
+                            f"({api_call_count}/{agent.max_iterations}) — "
                             "task could not complete within the allowed "
                             "iterations"
                         ),
@@ -214,13 +170,13 @@ def finalize_turn(
                         release_claim=True,
                         end_run=True,
                         event_payload_extra={
-                            "budget_used": _budget_used,
-                            "budget_max": _budget_max,
+                            "budget_used": api_call_count,
+                            "budget_max": agent.max_iterations,
                         },
                     )
                     logger.info(
                         "recorded budget-exhausted failure for task %s (%d/%d)",
-                        _kanban_task, _budget_used, _budget_max,
+                        _kanban_task, api_call_count, agent.max_iterations,
                     )
                 finally:
                     try:
@@ -234,24 +190,13 @@ def finalize_turn(
                     exc_info=True,
                 )
 
-    _runtime_boundary_receipt = (
-        execution_lease_exhausted
-        or (
-            not preserved_continuation_fallback
-            and str(_turn_exit_reason).startswith("max_iterations_reached(")
-        )
-    ) or (
-        str(_turn_exit_reason)
-        == "budget_exhausted_after_grace_tool_request"
-    )
-
     # Determine if conversation completed successfully
     normal_text_response = str(_turn_exit_reason).startswith("text_response(")
     completed = (
         final_response is not None
         and not failed
         and (
-            not budget_exhausted
+            api_call_count < agent.max_iterations
             or normal_text_response
         )
     )
@@ -400,26 +345,6 @@ def finalize_turn(
                 # this pop is the one place that does. Invalidate it so the
                 # filled row is re-examined instead of skipped.
                 agent._db_flush_scan_prefix = None
-            if _runtime_boundary_receipt:
-                _receipt_message = messages[-1] if messages else None
-                if (
-                    isinstance(_receipt_message, dict)
-                    and _receipt_message.get("role") == "assistant"
-                    and _receipt_message.get("content") == final_response
-                ):
-                    from agent.message_provenance import (
-                        MESSAGE_PROVENANCE_KEY,
-                        RUNTIME_BOUNDARY_RECEIPT_KIND,
-                        bind_message_fragment,
-                    )
-
-                    _receipt_message[MESSAGE_PROVENANCE_KEY] = (
-                        bind_message_fragment(
-                            _receipt_message.get(MESSAGE_PROVENANCE_KEY),
-                            kind=RUNTIME_BOUNDARY_RECEIPT_KIND,
-                            exact_text=final_response,
-                        )
-                    )
 
         # The model has completed its request, so replace API-local
         # voice/model/skill guidance with the clean user input before writing the
@@ -515,18 +440,16 @@ def finalize_turn(
         if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls")
     )
     _resp_len = len(final_response) if final_response else 0
+    _budget_used = agent.iteration_budget.used if agent.iteration_budget else 0
+    _budget_max = agent.iteration_budget.max_total if agent.iteration_budget else 0
 
     _diag_msg = (
-        "Turn ended: reason=%s model=%s api_calls=%d slice=%d/%d renewals=%d "
-        "stalled_boundaries=%d "
-        "execution_lease=%d/%d "
+        "Turn ended: reason=%s model=%s api_calls=%d/%d budget=%d/%d "
         "tool_turns=%d last_msg_role=%s response_len=%d session=%s"
     )
     _diag_args = (
-        _turn_exit_reason, agent.model, api_call_count,
-        _budget_used, _budget_max, _budget_renewals,
-        _budget_stalled_boundaries,
-        _lease_used, _lease_max,
+        _turn_exit_reason, agent.model, api_call_count, agent.max_iterations,
+        _budget_used, _budget_max,
         _turn_tool_count, _last_msg_role, _resp_len,
         agent.session_id or "none",
     )
@@ -592,7 +515,7 @@ def finalize_turn(
                 # truncated partial (the "The" case from #34452).
                 _is_partial_fragment = (
                     not _is_empty_terminal
-                    and not preserved_continuation_fallback
+                    and not preserved_verification_fallback
                     and not str(_turn_exit_reason).startswith("text_response")
                     and len(_stripped) <= 24
                     and _stripped[-1:] not in {".", "!", "?", "。", "！", "？", "`", ")"}
@@ -714,27 +637,15 @@ def finalize_turn(
             break
 
     # Build result with interrupt info if applicable
-    from agent.delivery_outcome import get_delivery_outcome
-
     result = {
         "final_response": final_response,
         "last_reasoning": last_reasoning,
         "messages": messages,
         "api_calls": api_call_count,
-        "iteration_budget_used": _budget_used,
-        "iteration_budget_max": _budget_max,
-        "iteration_budget_renewals": _budget_renewals,
-        "iteration_budget_stalled_boundaries": (
-            _budget_stalled_boundaries
-        ),
-        "execution_lease_used": _lease_used,
-        "execution_lease_max": _lease_max,
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "turn_id": turn_id,
-        "delivery_outcome": get_delivery_outcome(agent, turn_id),
-        "partial": _runtime_boundary_receipt,
+        "partial": False,  # True only when stopped due to invalid tool calls
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
@@ -760,10 +671,6 @@ def finalize_turn(
         ).get("service_tier"),
         "session_id": agent.session_id,
     }
-    if execution_lease_exhausted:
-        result["error"] = "execution_lease_exhausted"
-    elif _runtime_boundary_receipt:
-        result["error"] = "iteration_budget_exhausted"
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
     # Persistence failures already set failed=True + an explanation in
@@ -814,10 +721,13 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
+    # Suppressed when skip_background_review=True (e.g. cron) — review forks
+    # spawn another AIAgent (~30K tokens / event) and cron sessions have no
+    # human-in-the-loop benefit from the review.
     if (
-        getattr(agent, "_background_review_enabled", True)
-        and final_response
+        final_response
         and not interrupted
+        and not getattr(agent, "skip_background_review", False)
         and (_should_review_memory or _should_review_skills)
     ):
         try:

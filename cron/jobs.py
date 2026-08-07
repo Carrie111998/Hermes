@@ -1217,13 +1217,6 @@ def _save_jobs_unlocked(
     ``replace=True`` skips the shrink-merge guard (tests / disaster recovery
     that mean to rewrite the store wholesale).
     """
-    # This is the common persistence choke point for the model tool, CLI,
-    # dashboard/API, scheduler state changes, and future direct callers. Once
-    # the production latch is active, validate the complete post-mutation set
-    # while the jobs lock is still held and before a temporary file exists.
-    # Per-caller prechecks remain useful UX, but are not the security boundary.
-    from cron.production_policy import enforce_production_cron_jobs
-
     jobs_file = _current_cron_store().jobs_file
     ensure_dirs()
     # Snapshot the current owner BEFORE the atomic replace so a privileged
@@ -1251,7 +1244,6 @@ def _save_jobs_unlocked(
         for _attempt in range(5):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            enforce_production_cron_jobs(jobs)
             fd, tmp_path = tempfile.mkstemp(
                 dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
             )
@@ -1321,7 +1313,6 @@ def _save_jobs_unlocked(
         # Exhausted retries — last merge + write without another re-peek.
         if not replace:
             jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-        enforce_production_cron_jobs(jobs)
         fd, tmp_path = tempfile.mkstemp(
             dir=str(jobs_file.parent), suffix=".tmp", prefix=".jobs_"
         )
@@ -1520,6 +1511,8 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    monitor_script: Optional[str] = None,
+    monitor_url: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1564,6 +1557,19 @@ def create_job(
                 and deliver its stdout directly. Empty stdout = silent (no
                 delivery). Requires ``script`` to be set. Ideal for classic
                 watchdogs and periodic alerts that don't need LLM reasoning.
+        monitor_script: Optional path to a cheap monitor source script (same
+                resolution/containment rules as ``script``: relative to
+                ~/.hermes/scripts/, .sh/.bash via bash, else Python). Each
+                tick the script runs FIRST and its output is hashed as exact
+                bytes: unchanged output suppresses the agent run entirely
+                (recorded as a silent 'no_change' tick); changed output
+                injects a MONITOR CHANGE DETECTED block (unified diff + new
+                output) into the prompt before a normal agent run. Scripts
+                should emit stable output (no timestamps). Mutually exclusive
+                with ``monitor_url``; incompatible with ``no_agent=True``.
+        monitor_url: Optional http(s) URL used as the monitor source instead
+                of a script — fetched with a bounded GET each tick. Same
+                hash-suppression semantics as ``monitor_script``.
 
     Returns:
         The created job dict
@@ -1586,17 +1592,8 @@ def create_job(
     now = _hermes_now().isoformat()
 
     normalized_skills = _normalize_skill_list(skill, skills)
-    # Production create remains ergonomic for callers that omit the inference
-    # axes, while preserving the exact sealed route. Explicit alternatives are
-    # rejected by the policy helper; they are never silently overwritten.
-    from cron.production_policy import pin_production_cron_create_route
-
-    routed_provider, routed_model = pin_production_cron_create_route(
-        provider,
-        model,
-    )
-    normalized_model = _normalize_job_optional_text(routed_model)
-    normalized_provider = _normalize_job_optional_text(routed_provider)
+    normalized_model = _normalize_job_optional_text(model)
+    normalized_provider = _normalize_job_optional_text(provider)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -1605,6 +1602,24 @@ def create_job(
     normalized_workdir = _normalize_workdir(workdir)
     normalized_no_agent = bool(no_agent)
     normalized_attach = attach_to_session if isinstance(attach_to_session, bool) else None
+    normalized_monitor_script = str(monitor_script).strip() if isinstance(monitor_script, str) else None
+    normalized_monitor_script = normalized_monitor_script or None
+    normalized_monitor_url = str(monitor_url).strip() if isinstance(monitor_url, str) else None
+    normalized_monitor_url = normalized_monitor_url or None
+
+    # Monitor-mode validation: exactly one source, and monitor mode only
+    # makes sense when there IS an agent to suppress/wake.
+    if normalized_monitor_script and normalized_monitor_url:
+        raise ValueError(
+            "monitor_script and monitor_url are mutually exclusive — a job "
+            "can only have one monitor source."
+        )
+    if (normalized_monitor_script or normalized_monitor_url) and normalized_no_agent:
+        raise ValueError(
+            "monitor_script/monitor_url cannot be combined with no_agent=True — "
+            "the whole point of a monitor job is to suppress or wake the AGENT "
+            "based on source changes. Use a plain no_agent script job instead."
+        )
 
     # no_agent jobs are meaningless without a script — the script IS the job.
     # Surface this as a clear ValueError at create time so bad configs never
@@ -1624,6 +1639,14 @@ def create_job(
         context_from = None
 
     prompt_text = _coerce_job_text(prompt)
+
+    # Reject cron jobs that schedule gateway-lifecycle commands. Prevents
+    # agent-driven SIGTERM-respawn loops under launchd/systemd KeepAlive
+    # (#30719). Enforced here (not only in the CLI layer) so the agent's
+    # `cronjob` model tool — which calls create_job directly — is also
+    # covered, not just `hermes cron create`.
+    from cron.lifecycle_guard import check_gateway_lifecycle
+    check_gateway_lifecycle(prompt_text, normalized_script)
 
     label_source = (prompt_text or (normalized_skills[0] if normalized_skills else None) or (normalized_script if normalized_no_agent else None)) or "cron job"
 
@@ -1664,6 +1687,11 @@ def create_job(
         "base_url": normalized_base_url,
         "script": normalized_script,
         "no_agent": normalized_no_agent,
+        "monitor_script": normalized_monitor_script,
+        "monitor_url": normalized_monitor_url,
+        # Hash-suppression state for monitor jobs: {"last_output_hash": ...,
+        # "last_changed_at": ...}. None until the first monitor tick.
+        "monitor_state": None,
         "context_from": context_from,
         "schedule": parsed_schedule,
         "schedule_display": parsed_schedule.get("display", schedule),
@@ -1681,8 +1709,6 @@ def create_job(
         "last_status": None,
         "last_error": None,
         "last_delivery_error": None,
-        "last_delivery_status": "none",
-        "last_delivery_confirmed_at": None,
         # Delivery configuration
         "deliver": deliver,
         "origin": origin,  # Tracks where job was created for "origin" delivery
@@ -1948,13 +1974,44 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(
-    job_id: str,
-    success: bool,
-    error: Optional[str] = None,
-    delivery_error: Optional[str] = None,
-    delivery_status: Optional[str] = None,
-):
+def _set_preflight_alerted(job_id: str, value: bool) -> bool:
+    """Set/clear the preflight alert-dedup marker; return the PRIOR value.
+
+    The marker records that the operator was already alerted about this
+    job's blocked configuration, so the scheduler alerts exactly once and
+    stays silent on subsequent ticks until the config heals (same
+    alert-once shape as the dead-pin auto-pause in #73506). Persisted on
+    the job record so the dedup survives gateway restarts.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for i, job in enumerate(jobs):
+            if job["id"] == job_id:
+                prior = bool(job.get("preflight_alerted"))
+                if value:
+                    job["preflight_alerted"] = True
+                else:
+                    job.pop("preflight_alerted", None)
+                if prior != value:
+                    jobs[i] = job
+                    save_jobs(jobs)
+                return prior
+    return False
+
+
+def mark_preflight_alerted(job_id: str) -> bool:
+    """Mark the job as preflight-alerted; return True if it already was."""
+    return _set_preflight_alerted(job_id, True)
+
+
+def clear_preflight_alerted(job_id: str) -> None:
+    """Clear the preflight alert-dedup marker (config validates again)."""
+    _set_preflight_alerted(job_id, False)
+
+
+def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
+                 delivery_error: Optional[str] = None,
+                 status: Optional[str] = None):
     """
     Mark a job as having been run.
     
@@ -1963,33 +2020,28 @@ def mark_job_run(
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
-    ``delivery_status`` is an exact mechanical observation. A missing status
-    never becomes a receipt merely because ``delivery_error`` is absent.
+
+    ``status`` overrides the derived ``last_status`` ("ok"/"error") with a
+    specific terminal status for this run — e.g. ``"blocked_config"`` when
+    the pre-dispatch configuration validation refused to run the agent
+    (T1-26), so `cronjob list` distinguishes "your config is broken" from
+    "the run itself failed".
     """
-    normalized_delivery_status = delivery_status or (
-        "failed" if delivery_error else "none"
-    )
-    if normalized_delivery_status not in {
-        "none",
-        "confirmed",
-        "failed",
-        "unconfirmed",
-    }:
-        raise ValueError("invalid delivery_status")
     with _jobs_lock():
         jobs = load_jobs()
         for i, job in enumerate(jobs):
             if job["id"] == job_id:
                 now = _hermes_now().isoformat()
                 job["last_run_at"] = now
-                job["last_status"] = "ok" if success else "error"
+                job["last_status"] = status or ("ok" if success else "error")
                 job["last_error"] = error if not success else None
+                # A healthy run means the configuration validates again — drop
+                # the preflight alert-dedup marker so a FUTURE config break
+                # re-alerts instead of being silently swallowed.
+                if success:
+                    job.pop("preflight_alerted", None)
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
-                job["last_delivery_status"] = normalized_delivery_status
-                job["last_delivery_confirmed_at"] = (
-                    now if normalized_delivery_status == "confirmed" else None
-                )
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
