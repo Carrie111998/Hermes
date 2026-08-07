@@ -4911,12 +4911,13 @@ async def _standalone_send(
     media_files=None,
     force_document=False,
 ):
-    """Out-of-process Slack delivery via the Web API ``chat.postMessage``.
+    """Out-of-process Slack delivery via the Web API.
 
     Implements the ``standalone_sender_fn`` contract so ``deliver=slack`` cron
-    jobs succeed when the cron process is not co-located with the gateway (the
-    in-process adapter weakref is ``None`` in that case). Replaces the legacy
-    ``_send_slack`` helper that used to live in ``tools/send_message_tool.py``.
+    jobs and ``hermes send`` work when the process is not co-located with the
+    gateway. Text uses ``chat.postMessage``; ``MEDIA:<path>`` files use the
+    Slack SDK's ``files_upload_v2`` endpoint. This keeps standalone delivery
+    feature-parity with the live ``SlackAdapter`` attachment methods.
 
     mrkdwn formatting is applied exactly as the legacy core path did — via a
     throwaway ``SlackAdapter`` instance's ``format_message`` — so cron-delivered
@@ -4947,6 +4948,52 @@ async def _standalone_send(
 
         _proxy = resolve_proxy_url()
         _sess_kw, _req_kw = proxy_kwargs_for_aiohttp(_proxy)
+
+        # ``hermes send`` and cron delivery run outside the gateway process, so
+        # there is no live SlackAdapter instance whose ``send_document`` method
+        # can be called. Use the same Slack Web API endpoint directly through
+        # the SDK. Attach the accompanying text as the first file's comment;
+        # earlier text chunks are sent separately by the caller when needed.
+        if media_files:
+            try:
+                from slack_sdk.web.async_client import AsyncWebClient
+
+                client = AsyncWebClient(token=token)
+                _apply_slack_proxy(client, _proxy)
+                uploaded = 0
+                for index, media in enumerate(media_files):
+                    try:
+                        file_path, _is_voice = media
+                    except (TypeError, ValueError):
+                        return {"error": "Slack media send failed: invalid media descriptor"}
+
+                    file_name = os.path.basename(str(file_path))
+                    if not os.path.isfile(file_path):
+                        return {"error": f"Slack media file not found: {file_name}"}
+
+                    result = await client.files_upload_v2(
+                        channel=chat_id,
+                        file=file_path,
+                        filename=file_name,
+                        initial_comment=formatted if index == 0 else "",
+                        thread_ts=thread_id,
+                    )
+                    if not result.get("ok"):
+                        return {
+                            "error": f"Slack API error: {result.get('error', 'file upload failed')}"
+                        }
+                    uploaded += 1
+
+                return {
+                    "success": True,
+                    "platform": "slack",
+                    "chat_id": chat_id,
+                    "file_count": uploaded,
+                }
+            except Exception:
+                logger.error("[Slack] Standalone file upload failed", exc_info=True)
+                return {"error": "Slack file upload failed; check gateway logs"}
+
         url = "https://slack.com/api/chat.postMessage"
         headers = {
             "Authorization": f"Bearer {token}",
@@ -4970,8 +5017,9 @@ async def _standalone_send(
                         "message_id": data.get("ts"),
                     }
                 return {"error": f"Slack API error: {data.get('error', 'unknown')}"}
-    except Exception as e:
-        return {"error": f"Slack send failed: {e}"}
+    except Exception:
+        logger.error("[Slack] Standalone text send failed", exc_info=True)
+        return {"error": "Slack send failed; check gateway logs"}
 
 
 def interactive_setup() -> None:
