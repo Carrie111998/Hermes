@@ -28,8 +28,11 @@ Nothing in this module touches the agent's system prompt or toolset.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
+import subprocess
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -43,6 +46,9 @@ logger = logging.getLogger(__name__)
 # ──────────────────────────────────────────────────────────────────────
 
 DEFAULT_MAX_TURNS = 20
+DEFAULT_GATE_TIMEOUT_SECONDS = 300
+DEFAULT_GATE_MAX_RETRIES = 3
+_GATE_OUTPUT_TAIL_CHARS = 3000
 
 
 CONTINUATION_PROMPT_TEMPLATE = (
@@ -86,6 +92,19 @@ CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE = (
     "this turn, call the todo tool with goal_outcome: continue unless verified, "
     "complete only with concrete evidence, or blocked only after every safe "
     "available approach is exhausted."
+)
+
+
+CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE = (
+    "[Continuing toward your standing goal — a quality gate failed]\n"
+    "Goal: {goal}\n\n"
+    "The exact verification command below must pass before completion, and "
+    "it failed (attempt {attempt}/{max_retries}):\n"
+    "  $ {command}\n"
+    "Exit code: {exit_code}\n"
+    "Output (tail):\n```\n{output}\n```\n\n"
+    "Fix the verified failure and run the gate again. Do not claim completion "
+    "while it remains red."
 )
 
 
@@ -268,6 +287,81 @@ def parse_contract(text: str) -> Tuple[str, GoalContract]:
     return headline, contract
 
 
+@dataclass
+class GoalGate:
+    """An exact user-specified command that verifies model-authored completion."""
+
+    command: str
+    timeout_seconds: int = DEFAULT_GATE_TIMEOUT_SECONDS
+    max_retries: int = DEFAULT_GATE_MAX_RETRIES
+    attempts: int = 0
+    last_exit_code: Optional[int] = None
+    last_output_tail: str = ""
+    last_failed_fingerprint: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "GoalGate":
+        if not isinstance(data, dict):
+            return cls(command="")
+        return cls(
+            command=str(data.get("command") or ""),
+            timeout_seconds=int(data.get("timeout_seconds", DEFAULT_GATE_TIMEOUT_SECONDS) or DEFAULT_GATE_TIMEOUT_SECONDS),
+            max_retries=int(data.get("max_retries", DEFAULT_GATE_MAX_RETRIES) or DEFAULT_GATE_MAX_RETRIES),
+            attempts=int(data.get("attempts", 0) or 0),
+            last_exit_code=(int(data["last_exit_code"]) if data.get("last_exit_code") is not None else None),
+            last_output_tail=str(data.get("last_output_tail") or ""),
+            last_failed_fingerprint=str(data.get("last_failed_fingerprint") or ""),
+        )
+
+
+def workspace_fingerprint(cwd: Optional[str] = None) -> str:
+    """Return a mechanical git-tree fingerprint, or empty outside git."""
+
+    workdir = cwd or os.getcwd()
+    try:
+        head = subprocess.run(
+            ["git", "rev-parse", "HEAD"], capture_output=True, text=True,
+            timeout=10, cwd=workdir,
+        )
+        if head.returncode != 0:
+            return ""
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], capture_output=True, text=True,
+            timeout=30, cwd=workdir,
+        )
+        if status.returncode != 0:
+            return ""
+        payload = head.stdout.strip() + "\n" + status.stdout
+        return hashlib.sha256(payload.encode("utf-8", "replace")).hexdigest()
+    except Exception:
+        return ""
+
+
+def run_gate(gate: GoalGate, *, cwd: Optional[str] = None) -> Tuple[bool, int, str]:
+    """Run one exact verification command with bounded time and output."""
+
+    try:
+        proc = subprocess.run(
+            gate.command, shell=True, capture_output=True, text=True,
+            timeout=max(1, int(gate.timeout_seconds)), cwd=cwd or None,
+        )
+        combined = (proc.stdout or "") + (("\n" + proc.stderr) if proc.stderr else "")
+        tail = combined[-_GATE_OUTPUT_TAIL_CHARS:]
+        return proc.returncode == 0, proc.returncode, tail
+    except subprocess.TimeoutExpired as exc:
+        output = ""
+        for chunk in (exc.stdout, exc.stderr):
+            if chunk:
+                output += chunk if isinstance(chunk, str) else chunk.decode("utf-8", "replace")
+        tail = (output + f"\n[gate timed out after {gate.timeout_seconds}s]")[-_GATE_OUTPUT_TAIL_CHARS:]
+        return False, -1, tail
+    except Exception as exc:
+        return False, -1, f"[gate could not run: {type(exc).__name__}: {exc}]"[-_GATE_OUTPUT_TAIL_CHARS:]
+
+
 # ──────────────────────────────────────────────────────────────────────
 # Dataclass
 # ──────────────────────────────────────────────────────────────────────
@@ -323,6 +417,9 @@ class GoalState:
     # constraints / boundaries / stop_when). Empty by default; a goal with
     # no contract behaves exactly like the original free-form goal.
     contract: GoalContract = field(default_factory=GoalContract)
+    # Exact verification commands run only when the primary model records a
+    # completion outcome. They verify evidence; they never infer intent.
+    gates: List[GoalGate] = field(default_factory=list)
 
     def to_json(self) -> str:
         data = asdict(self)
@@ -367,6 +464,12 @@ class GoalState:
             waiting_reason=data.get("waiting_reason"),
             waiting_since=float(data.get("waiting_since", 0.0) or 0.0),
             contract=GoalContract.from_dict(data.get("contract")),
+            gates=[
+                GoalGate.from_dict(gate)
+                for gate in (data.get("gates") or [])
+                if isinstance(gate, dict)
+                and str(gate.get("command") or "").strip()
+            ],
         )
 
     # --- contract helpers -------------------------------------------------
@@ -752,7 +855,8 @@ class GoalManager:
         )
         sub = f", {len(s.subgoals)} subgoal{'s' if len(s.subgoals) != 1 else ''}" if s.subgoals else ""
         con = ", contract" if self.has_contract() else ""
-        meta = f"{turns}{sub}{con}"
+        gat = f", {len(s.gates)} gate{'s' if len(s.gates) != 1 else ''}" if s.gates else ""
+        meta = f"{turns}{sub}{con}{gat}"
         if s.status == "active":
             if s.waiting_on_session and _session_waiting(s.waiting_on_session):
                 wr = s.waiting_reason or f"session {s.waiting_on_session}"
@@ -1058,6 +1162,154 @@ class GoalManager:
             return "(no subgoals — use /subgoal <text> to add criteria)"
         return self._state.render_subgoals_block()
 
+    # --- exact quality gates ------------------------------------------
+
+    def add_gate(
+        self,
+        command: str,
+        *,
+        timeout_seconds: Optional[int] = None,
+        max_retries: Optional[int] = None,
+    ) -> GoalGate:
+        command = (command or "").strip()
+        if not command:
+            raise ValueError("gate command is empty")
+        gate = GoalGate(
+            command=command,
+            timeout_seconds=(
+                int(timeout_seconds)
+                if timeout_seconds is not None
+                else DEFAULT_GATE_TIMEOUT_SECONDS
+            ),
+            max_retries=(
+                int(max_retries)
+                if max_retries is not None
+                else DEFAULT_GATE_MAX_RETRIES
+            ),
+        )
+        if gate.timeout_seconds <= 0 or gate.max_retries < 0:
+            raise ValueError("gate bounds must be positive")
+
+        def _mutate(state):
+            if state is None or state.status not in {"active", "paused"}:
+                raise RuntimeError("no active goal")
+            state.gates.append(gate)
+            return state, gate, True
+
+        return self._mutate_durable(_mutate)
+
+    def remove_gate(self, index_1based: int) -> str:
+        index = int(index_1based) - 1
+
+        def _mutate(state):
+            if state is None or state.status not in {"active", "paused"}:
+                raise RuntimeError("no active goal")
+            if index < 0 or index >= len(state.gates):
+                raise IndexError(f"index out of range (1..{len(state.gates)})")
+            removed = state.gates.pop(index)
+            return state, removed.command, True
+
+        return str(self._mutate_durable(_mutate))
+
+    def clear_gates(self) -> int:
+        def _mutate(state):
+            if state is None or state.status not in {"active", "paused"}:
+                raise RuntimeError("no active goal")
+            previous = len(state.gates)
+            state.gates = []
+            return state, previous, True
+
+        return int(self._mutate_durable(_mutate))
+
+    def render_gates(self) -> str:
+        state = self._state
+        if state is None:
+            return "(no active goal)"
+        if not state.gates:
+            return "(no quality gates — use /goal gate add <command> to require one)"
+        lines = []
+        for index, gate in enumerate(state.gates, start=1):
+            status = ""
+            if gate.last_exit_code is not None:
+                status = (
+                    " ✓ passing"
+                    if gate.last_exit_code == 0
+                    else f" ✗ failing (exit {gate.last_exit_code}, attempt {gate.attempts}/{gate.max_retries})"
+                )
+            lines.append(f"- {index}. $ {gate.command}{status}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _verify_completion_gates(state: GoalState) -> Optional[Dict[str, Any]]:
+        """Verify exact gates after the model authors ``complete``."""
+
+        if not state.gates:
+            return None
+        fingerprint = workspace_fingerprint()
+        for gate in state.gates:
+            unchanged = (
+                bool(fingerprint)
+                and gate.last_exit_code not in (None, 0)
+                and gate.last_failed_fingerprint == fingerprint
+            )
+            if unchanged:
+                passed = False
+                exit_code = int(gate.last_exit_code or -1)
+                output = gate.last_output_tail
+            else:
+                passed, exit_code, output = run_gate(gate)
+            gate.last_exit_code = exit_code
+            gate.last_output_tail = output
+            if passed:
+                gate.attempts = 0
+                gate.last_failed_fingerprint = ""
+                continue
+
+            gate.attempts += 1
+            gate.last_failed_fingerprint = fingerprint
+            if gate.attempts > gate.max_retries:
+                state.status = "paused"
+                state.paused_reason = (
+                    f"quality gate exhausted {gate.max_retries} retries: $ {gate.command}"
+                )
+                return {
+                    "status": "paused",
+                    "should_continue": False,
+                    "continuation_prompt": None,
+                    "verdict": "gate_failed",
+                    "reason": f"gate exhausted retries: $ {gate.command}",
+                    "message": (
+                        f"⏸ Goal paused — quality gate still failing after "
+                        f"{gate.max_retries} retries: $ {gate.command} "
+                        f"(exit {exit_code})."
+                    ),
+                }
+
+            skipped = (
+                " (workspace unchanged since last failure — not re-run)"
+                if unchanged
+                else ""
+            )
+            return {
+                "status": "active",
+                "should_continue": True,
+                "continuation_prompt": CONTINUATION_PROMPT_GATE_FAILED_TEMPLATE.format(
+                    goal=state.goal,
+                    command=gate.command,
+                    exit_code=exit_code,
+                    attempt=gate.attempts,
+                    max_retries=gate.max_retries,
+                    output=output or "(no output)",
+                ),
+                "verdict": "gate_failed",
+                "reason": f"gate failed (exit {exit_code}): $ {gate.command}",
+                "message": (
+                    f"✗ Quality gate failed (attempt {gate.attempts}/{gate.max_retries})"
+                    f"{skipped}: $ {gate.command}"
+                ),
+            }
+        return None
+
     # --- /goal wait barrier -------------------------------------------
 
     def wait_on(self, pid: int, reason: str = "") -> GoalState:
@@ -1305,6 +1557,34 @@ class GoalManager:
             state.last_verdict = verdict
             state.last_reason = reason
 
+            # The primary model is the sole semantic completion authority.
+            # Exact user-specified commands only verify that completion claim;
+            # they never classify response prose or infer lifecycle state.
+            if verdict == "done":
+                gate_decision = self._verify_completion_gates(state)
+                if gate_decision is not None:
+                    if (
+                        gate_decision.get("should_continue")
+                        and state.max_turns > 0
+                        and state.turns_used >= state.max_turns
+                    ):
+                        state.status = "paused"
+                        state.paused_reason = (
+                            f"turn budget exhausted ({state.turns_used}/{state.max_turns})"
+                        )
+                        gate_decision = {
+                            "status": "paused",
+                            "should_continue": False,
+                            "continuation_prompt": None,
+                            "verdict": "gate_failed",
+                            "reason": gate_decision.get("reason", ""),
+                            "message": (
+                                f"⏸ Goal paused — {state.turns_used}/{state.max_turns} "
+                                "turns used while a quality gate remains red."
+                            ),
+                        }
+                    return state, gate_decision, True
+
             if verdict == "done":
                 state.status = "done"
                 return state, {
@@ -1362,7 +1642,9 @@ class GoalManager:
             }, True
 
         decision = self._mutate_durable(_mutate)
-        if decision.get("should_continue"):
+        if decision.get("should_continue") and not decision.get(
+            "continuation_prompt"
+        ):
             decision["continuation_prompt"] = self.next_continuation_prompt()
         return decision
 
@@ -1542,8 +1824,11 @@ def run_kanban_goal_loop(
 __all__ = [
     "GoalState",
     "GoalContract",
+    "GoalGate",
     "GoalManager",
     "parse_contract",
+    "run_gate",
+    "workspace_fingerprint",
     "PRIMARY_MODEL_GOAL_KICKOFF_PROMPT_TEMPLATE",
     "PRIMARY_MODEL_GOAL_KICKOFF_WITH_CONTRACT_TEMPLATE",
     "PRIMARY_MODEL_DRAFT_PROMPT_TEMPLATE",

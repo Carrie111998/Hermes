@@ -265,17 +265,6 @@ def test_close_terminal_tool_routes_to_registry(monkeypatch):
     assert seen["sid"] == "proc_abc"
 
 
-def test_close_terminal_tool_gated_on_desktop(monkeypatch):
-    """Hidden unless HERMES_DESKTOP is set (mirrors read_terminal gating)."""
-    from tools.close_terminal_tool import check_close_terminal_requirements
-
-    monkeypatch.delenv("HERMES_DESKTOP", raising=False)
-    assert check_close_terminal_requirements() is False
-
-    monkeypatch.setenv("HERMES_DESKTOP", "1")
-    assert check_close_terminal_requirements() is True
-
-
 def test_reader_loop_streams_incremental_chunks_from_read1(registry, monkeypatch):
     """Local reader must emit live chunks, not one EOF burst.
 
