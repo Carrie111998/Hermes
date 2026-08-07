@@ -206,6 +206,20 @@ class DelegationEmitter:
             return DelegationResult("queued", fingerprint=fingerprint, reason="dry_run")
 
         req = contract.parse_request(payload)
+        # A prior TERMINAL attempt of this fingerprint may already hold the auto
+        # idempotency key: 4b lets terminal rows through so a fingerprint can
+        # re-open once its cooldown expires (policy: "DECLINED rows gate
+        # re-opens"). The auto key is derived from the fingerprint, so a naive
+        # re-open would collide on the UNIQUE idempotency_key and raise
+        # sqlite3.IntegrityError out of delegate() — violating "never raise for
+        # policy outcomes". Give the re-opened request a per-attempt key so it
+        # inserts cleanly; active dedup is fingerprint-based (4b), never idem-key
+        # based, so uniqueness of the auto key is not relied on for dedup. Any
+        # row found here is necessarily terminal (a non-terminal one would have
+        # deduped at 4b), so this only fires on a legitimate post-cooldown reopen.
+        if req.idempotency_key.startswith("auto:") and \
+                self.ledger.find_by_idempotency_key(req.idempotency_key) is not None:
+            req.idempotency_key = f"{req.idempotency_key}:{req.request_id}"
         self.ledger.insert_request(req)
         try:
             self.write_envelope(req)

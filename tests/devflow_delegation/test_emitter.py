@@ -87,14 +87,46 @@ def test_rate_limit_suppresses_with_one_summarized_alert(emitter, hermes_root):
 
 
 def test_cooldown_suppresses_reopen_of_declined_fingerprint(emitter, hermes_root):
+    # The min_confidence floor makes the first (low-confidence) call terminalize
+    # as DECLINED with a REAL fingerprint (a resolved on-allowlist target),
+    # exercising the below_confidence decline path. A re-open of that SAME
+    # fingerprint inside the declined-cooldown window must then be suppressed
+    # with reason "cooldown_declined" (single-sourced at emitter.py:174 — the
+    # only path that yields it, so it is a positive control for the 4c gate).
+    # NOTE: an off-allowlist target short-circuits at target resolution (step 2)
+    # and never reaches the cooldown gate — that was the prior false-green here.
     (hermes_root / "devflow").mkdir(parents=True, exist_ok=True)
     (hermes_root / "devflow" / "policy.json").write_text(
-        json.dumps({"critic": {"mode": "queue", "cooldown_declined_hours": 24}}), encoding="utf-8")
+        json.dumps({"critic": {"mode": "queue", "min_confidence": 0.9,
+                               "cooldown_declined_hours": 24}}), encoding="utf-8")
     em = DelegationEmitter()
-    r1 = em.delegate(**make_delegate_kwargs(target={"repo": "rogue", "subsystem": "x"}))
-    assert r1.status == "declined"
-    r2 = em.delegate(**make_delegate_kwargs(target={"repo": "rogue", "subsystem": "x"}))
-    assert r2.status == "declined"
+    r1 = em.delegate(**make_delegate_kwargs(confidence=0.5))
+    assert r1.status == "declined" and r1.reason == "below_confidence"
+    r2 = em.delegate(**make_delegate_kwargs(confidence=0.95))
+    assert r2.status == "suppressed" and r2.reason == "cooldown_declined"
+    assert r2.fingerprint
+
+
+def test_declined_fingerprint_reopens_after_cooldown_without_raising(emitter, hermes_root):
+    # Regression: the auto idempotency key is auto:{fingerprint}, so it is stored
+    # on the terminal DECLINED row. Dedup at 4b lets terminal rows through so a
+    # fingerprint may re-open once its cooldown expires (policy: "DECLINED rows
+    # gate re-opens"). With the cooldown elapsed, the re-open reaches the queue
+    # insert and MUST NOT collide on the UNIQUE idempotency_key — a raised
+    # sqlite3.IntegrityError would escape delegate(), violating "never raise for
+    # policy outcomes". cooldown_declined_hours=0 => the window is already past.
+    (hermes_root / "devflow").mkdir(parents=True, exist_ok=True)
+    (hermes_root / "devflow" / "policy.json").write_text(
+        json.dumps({"critic": {"mode": "queue", "min_confidence": 0.9,
+                               "cooldown_declined_hours": 0}}), encoding="utf-8")
+    em = DelegationEmitter()
+    r1 = em.delegate(**make_delegate_kwargs(confidence=0.5))
+    assert r1.status == "declined" and r1.reason == "below_confidence"
+    r2 = em.delegate(**make_delegate_kwargs(confidence=0.95))
+    assert r2.status == "queued" and r2.reason == "queued"
+    assert r2.request_id and r2.request_id != r1.request_id
+    # exactly one active REQUESTED row for the re-opened fingerprint
+    assert em.ledger.summary_counts()["by_state"].get("REQUESTED") == 1
 
 
 def test_explicit_idempotency_key_dedups(emitter):
