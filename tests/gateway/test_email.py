@@ -958,6 +958,17 @@ class TestUidCursorFile(unittest.TestCase):
             self._path(tmp).write_text("{not json", encoding="utf-8")
             self.assertIsNone(self._cursor(tmp).resume_from("42"))
 
+    def test_baseline_at_zero_is_a_resume_point(self):
+        """An empty mailbox baselines at UID 0; that cursor must still resume.
+
+        Treating a stored 0 as "no cursor" would re-baseline past mail that
+        arrived during the next outage — the #80925 hole again.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            self._cursor(tmp).baseline("42", 0)
+            self.assertEqual(self._cursor(tmp).resume_from("42"), 0)
+
     def test_unwritable_path_does_not_raise(self):
         """Persistence is best-effort: polling must not break on a bad path."""
         import tempfile
@@ -1046,10 +1057,18 @@ class TestResumeAfterDowntime(unittest.TestCase):
         return mock_imap
 
     def _connect(self, adapter, mock_imap):
-        """Run connect() against a mocked IMAP/SMTP and stop the poll task."""
+        """Run connect() against a mocked IMAP/SMTP, with the poll loop stubbed.
+
+        connect() starts the poll task, and asyncio.run() gives it one step
+        during shutdown cancellation — enough for run_in_executor to submit a
+        real _fetch_new_messages to a thread. That thread outlives the patch
+        context (racing the assertions, or worse, dialing the real IMAP host),
+        so the loop itself is stubbed out instead of cancelled after the fact.
+        """
         import asyncio
         with patch("imaplib.IMAP4_SSL", return_value=mock_imap), \
-             patch("smtplib.SMTP", return_value=MagicMock()):
+             patch("smtplib.SMTP", return_value=MagicMock()), \
+             patch.object(type(adapter), "_poll_loop", new=AsyncMock()):
             result = asyncio.run(adapter.connect())
         adapter._running = False
         if adapter._poll_task:
@@ -1126,6 +1145,35 @@ class TestResumeAfterDowntime(unittest.TestCase):
 
             self.assertEqual(results, [])
             self.assertEqual(adapter._uid_cursor.uid, 5)
+
+    def test_empty_mailbox_baseline_still_resumes(self):
+        """A stored cursor of UID 0 must resume, not trigger a re-baseline.
+
+        The baseline of a mailbox that was empty when the option kicked in is
+        0. Re-baselining on the next start would set the cursor past mail that
+        arrived during the outage — the #80925 hole again.
+        """
+        import tempfile
+        with tempfile.TemporaryDirectory() as home:
+            self._seed_cursor(home, "42", 0)
+            adapter = self._make_adapter(home)
+            mock_imap = self._mock_imap(
+                search=b"1 2",
+                messages={b"1": self._email("Outage one"),
+                          b"2": self._email("Outage two")},
+            )
+
+            self.assertTrue(self._connect(adapter, mock_imap))
+            # Resumed at 0; a re-baseline here would move the cursor to 2 and
+            # swallow both waiting messages.
+            self.assertEqual(adapter._uid_cursor.uid, 0)
+
+            with patch("imaplib.IMAP4_SSL", return_value=mock_imap):
+                results = adapter._fetch_new_messages()
+
+            self.assertEqual(len(results), 2)
+            self.assertEqual(self._search_args(mock_imap),
+                             ("search", None, "UID", "1:*"))
 
     def test_mail_a_human_already_read_is_still_answered(self):
         """The server-side \\Seen flag must not act as the queue.

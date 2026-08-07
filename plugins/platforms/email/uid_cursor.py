@@ -79,8 +79,12 @@ class EmailUidCursor:
         A cursor is only meaningful inside the UIDVALIDITY generation it was
         measured in.  A different (or unreadable) generation returns None so the
         caller re-baselines instead of comparing UIDs across namespaces.
+
+        A stored 0 is a real resume point — the mailbox was empty when the
+        baseline was taken — not "no cursor": treating it as absent would
+        re-baseline past mail that arrived during the outage.
         """
-        if uidvalidity and self.uidvalidity == uidvalidity and self.uid > 0:
+        if uidvalidity and self.uidvalidity == uidvalidity:
             return self.uid
         return None
 
