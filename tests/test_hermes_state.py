@@ -6723,3 +6723,77 @@ class TestLoneSurrogatePersistence:
         assert db.set_session_title("s1", "title \ud835 bad") is True
         assert db.get_session("s1")["title"] == "title \ufffd bad"
 
+
+class TestExecuteReadRetry:
+    """`_execute_read` must wait out transient WAL lock bursts like writes do.
+
+    Reads on the session-bridge continuation ("resume") path hit the same
+    shared state.db as the gateway and the bridge poller. With the deliberate
+    short (1s) connection timeout, a concurrent checkpoint or a writer holding
+    the DB lock during commit surfaces ``database is locked`` on a bare SELECT.
+    ``_execute_write`` already retries with jitter; the read path must too, or
+    resume errors on the first collision instead of waiting out the burst.
+    """
+
+    def test_retries_lock_error_then_succeeds(self, db, monkeypatch):
+        monkeypatch.setattr(hermes_state.time, "sleep", lambda *_a, **_k: None)
+        calls = {"n": 0}
+
+        def _fn(_conn):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                raise sqlite3.OperationalError("database is locked")
+            return "ok"
+
+        assert db._execute_read(_fn) == "ok"
+        assert calls["n"] == 3  # two lock failures, third attempt succeeds
+
+    def test_busy_error_is_also_retried(self, db, monkeypatch):
+        monkeypatch.setattr(hermes_state.time, "sleep", lambda *_a, **_k: None)
+        calls = {"n": 0}
+
+        def _fn(_conn):
+            calls["n"] += 1
+            if calls["n"] < 2:
+                raise sqlite3.OperationalError("database is busy")
+            return 42
+
+        assert db._execute_read(_fn) == 42
+        assert calls["n"] == 2
+
+    def test_non_lock_operational_error_propagates_without_retry(self, db):
+        calls = {"n": 0}
+
+        def _fn(_conn):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("no such table: nope")
+
+        with pytest.raises(sqlite3.OperationalError, match="no such table"):
+            db._execute_read(_fn)
+        assert calls["n"] == 1  # no retry on a non-contention error
+
+    def test_persistent_lock_raises_after_max_retries(self, db, monkeypatch):
+        monkeypatch.setattr(hermes_state.time, "sleep", lambda *_a, **_k: None)
+        calls = {"n": 0}
+
+        def _fn(_conn):
+            calls["n"] += 1
+            raise sqlite3.OperationalError("database is locked")
+
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db._execute_read(_fn)
+        assert calls["n"] == db._WRITE_MAX_RETRIES
+
+    def test_read_serializes_under_the_same_lock(self, db):
+        """The helper holds ``self._lock`` while running fn (parity with
+        the bare ``with self._lock`` reads it replaces)."""
+        db.create_session("s1", source="cli")
+
+        def _fn(conn):
+            assert not db._lock.acquire(blocking=False)  # already held by helper
+            return conn.execute(
+                "SELECT id FROM sessions WHERE id = ?", ("s1",)
+            ).fetchone()["id"]
+
+        assert db._execute_read(_fn) == "s1"
+

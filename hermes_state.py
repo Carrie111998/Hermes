@@ -2415,6 +2415,50 @@ class SessionDB:
             "database is locked after max retries"
         )
 
+    def _execute_read(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+        """Execute a read query with the same jitter retry writes get.
+
+        Reads under WAL don't take a write lock, but they still surface
+        ``database is locked``/``busy`` when a concurrent checkpoint holds the
+        DB lock (or a writer is mid-commit) and our deliberately short 1s
+        connection timeout expires first. The session-bridge continuation
+        ("resume") read hits the shared state.db alongside the live gateway
+        and the ~3s bridge poller, so on a large WAL it can lose that race on
+        the first attempt and error out — even though ``_execute_write`` never
+        does, because it retries.
+
+        Mirror that behaviour here: hold ``self._lock`` (parity with the bare
+        ``with self._lock`` reads this replaces), run *fn*, and on a
+        contention error release the lock, sleep a random 20-150ms, and retry
+        — waiting out the burst instead of raising on the first collision.
+
+        *fn* receives the connection and should perform SELECT statements only
+        (it must not open a transaction or mutate rows). Returns whatever *fn*
+        returns.
+        """
+        last_err: Optional[Exception] = None
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            try:
+                with self._lock:
+                    return fn(self._conn)
+            except sqlite3.OperationalError as exc:
+                err_msg = str(exc).lower()
+                if "locked" in err_msg or "busy" in err_msg:
+                    last_err = exc
+                    if attempt < self._WRITE_MAX_RETRIES - 1:
+                        jitter = random.uniform(
+                            self._WRITE_RETRY_MIN_S,
+                            self._WRITE_RETRY_MAX_S,
+                        )
+                        time.sleep(jitter)
+                        continue
+                # Non-lock error or retries exhausted — propagate.
+                raise
+        # Retries exhausted (shouldn't normally reach here).
+        raise last_err or sqlite3.OperationalError(
+            "database is locked after max retries"
+        )
+
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:
         """True for the error class a corrupt FTS index raises on writes.

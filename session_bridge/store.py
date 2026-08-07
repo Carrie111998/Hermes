@@ -4859,10 +4859,12 @@ class SessionBridgeStore:
     ) -> dict[str, Any] | None:
         normalized_bridge_id = _nonempty_text(bridge_id, "bridge ID")
         normalized_provider = _external_provider(provider)
-        with self.db._lock:
-            conn = self.db._conn
+
+        # _execute_read: resume path (continue_session) — retry transient WAL
+        # locks instead of erroring the continuation.
+        def _read(conn):
             assert conn is not None
-            rows = conn.execute(
+            return conn.execute(
                 """SELECT * FROM external_sessions
                    WHERE origin_bridge_id = ? AND provider = ?
                      AND origin_kind IN (?, ?)
@@ -4875,6 +4877,8 @@ class SessionBridgeStore:
                     OriginKind.BRIDGE_CONTINUATION.value,
                 ),
             ).fetchall()
+
+        rows = self.db._execute_read(_read)
         if len(rows) > 1:
             raise ValueError(
                 "duplicate bridge provenance for provider and origin bridge ID"
@@ -10593,15 +10597,19 @@ class SessionBridgeStore:
     def get_context_pack(
         self, bridge_id: str, *, budget_chars: int
     ) -> dict[str, Any] | None:
-        with self.db._lock:
-            conn = self.db._conn
+        # _execute_read: this is on the resume path (continue_session), so a
+        # transient WAL lock must be retried, not surfaced as "database is
+        # locked".
+        def _read(conn):
             assert conn is not None
-            row = conn.execute(
+            return conn.execute(
                 """SELECT * FROM session_context_packs
                    WHERE bridge_id = ? AND budget_chars = ?
                    ORDER BY created_at DESC, id DESC LIMIT 1""",
                 (bridge_id, budget_chars),
             ).fetchone()
+
+        row = self.db._execute_read(_read)
         return dict(row) if row else None
 
     def set_state(self, key: str, value: Mapping[str, Any]) -> None:
@@ -10648,8 +10656,10 @@ class SessionBridgeStore:
     def get_continuation_snapshot(self, bridge_id: str) -> dict[str, Any] | None:
         normalized_bridge_id = _nonempty_text(bridge_id, "bridge ID")
         state_key = _continuation_snapshot_state_key(normalized_bridge_id)
-        with self.db._lock:
-            conn = self.db._conn
+
+        # _execute_read: resume path — retry transient WAL locks. Identity
+        # validation reads the same conn, so it stays inside the retried fn.
+        def _read(conn):
             assert conn is not None
             state_row = conn.execute(
                 "SELECT value_json FROM session_bridge_state WHERE key = ?",
@@ -10661,7 +10671,9 @@ class SessionBridgeStore:
             _validate_continuation_snapshot_identity(
                 conn, normalized_bridge_id, snapshot
             )
-        return snapshot
+            return snapshot
+
+        return self.db._execute_read(_read)
 
     def list_continuation_snapshots(
         self,

@@ -329,10 +329,14 @@ class UnifiedCatalog:
             where.append("target.provider = ?")
             params.append(normalized_target.value)
 
-        with self.db._lock:
-            conn = self.db._conn
+        # Route through _execute_read so a transient WAL lock (concurrent
+        # checkpoint / gateway commit racing this resume read on the shared
+        # state.db) is retried with jitter instead of surfacing as the desktop
+        # "Resume failed: handler error: database is locked". This is the read
+        # counterpart to the write path's BEGIN IMMEDIATE + retry.
+        def _read(conn: Any) -> list[Any]:
             assert conn is not None
-            rows = conn.execute(
+            return conn.execute(
                 f"""SELECT link.bridge_id, link.from_session_id, link.to_session_id,
                            target.provider AS target_provider
                       FROM session_links AS link
@@ -348,6 +352,8 @@ class UnifiedCatalog:
                               link.created_at DESC, link.id""",
                 params,
             ).fetchall()
+
+        rows = self.db._execute_read(_read)
         identities = {
             (
                 row["bridge_id"],

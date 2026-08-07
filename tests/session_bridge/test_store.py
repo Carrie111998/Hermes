@@ -2274,6 +2274,71 @@ def test_indexed_claude_visibility_target_creates_unified_catalog_lineage(db) ->
     }
 
 
+def test_resolve_continuation_retries_transient_lock(db, monkeypatch) -> None:
+    """The resume read must wait out a transient WAL lock, not error on it.
+
+    Regression for the desktop "Resume failed: handler error: database is
+    locked". ``resolve_continuation`` previously ran a bare unwrapped SELECT,
+    so a single ``database is locked`` from a concurrent checkpoint bubbled
+    straight up. It now routes through ``SessionDB._execute_read``, which
+    retries with jitter like the write path.
+    """
+    import hermes_state
+
+    monkeypatch.setattr(hermes_state.time, "sleep", lambda *_a, **_k: None)
+
+    store = SessionBridgeStore(db, clock=lambda: 100.0, local_timezone=timezone.utc)
+    candidate, identity = _claude_visibility_identity("transient-lock")
+    store.upsert_projection(
+        _projection(
+            _message("source-user", "meaningful request"),
+            provider=Provider.CODEX,
+            native_id="source-transient-lock",
+        )
+    )
+    _enqueue_claude_visibility_job(store, candidate, identity)
+    claim = store.claim_claude_visibility_job(100.0, 60, 25, "0.50", "0.02")
+    store.commit_claude_visibility_job(
+        identity.job_id, claim.lease_digest, "a" * 64, 100.0
+    )
+    store.upsert_projection(
+        _projection(
+            _message("target-user", "signed registration"),
+            native_id=identity.claude_uuid,
+            origin_kind=OriginKind.BRIDGE_PLACEHOLDER,
+            origin_bridge_id=identity.bridge_id,
+        )
+    )
+
+    # Inject exactly one transient lock error on the continuation SELECT.
+    # sqlite3.Connection.execute is read-only, so wrap the connection in a
+    # thin proxy that trips once, then delegates everything to the real one.
+    class _FlakyConn:
+        def __init__(self, real):
+            self._real = real
+            self.failed = False
+
+        def execute(self, sql, *args, **kwargs):
+            if "FROM session_links AS link" in sql and not self.failed:
+                self.failed = True
+                raise sqlite3.OperationalError("database is locked")
+            return self._real.execute(sql, *args, **kwargs)
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+    flaky = _FlakyConn(db._conn)
+    monkeypatch.setattr(db, "_conn", flaky)
+
+    resolved = UnifiedCatalog(db, store).resolve_continuation(
+        session_id=candidate.source_session_id,
+        bridge_id=None,
+        target_provider="claude",
+    )
+    assert flaky.failed is True  # the lock actually fired
+    assert resolved["target_session_id"] == f"claude:{identity.claude_uuid}"
+
+
 def test_claude_visibility_commit_finalizes_preindexed_target_lineage_atomically(
     db,
 ) -> None:
