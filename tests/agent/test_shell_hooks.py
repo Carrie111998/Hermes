@@ -394,9 +394,6 @@ class TestAllowlistConcurrency:
             "on_session_start", "/bin/x.sh",
         )
 
-
-
-
     def test_save_allowlist_uses_unique_tmp_paths(self, tmp_path, monkeypatch):
         """Two save_allowlist calls in flight must use distinct tmp files
         so the loser's os.replace does not ENOENT on the winner's sweep."""
@@ -419,3 +416,43 @@ class TestAllowlistConcurrency:
 
         assert len(tmp_paths_seen) == 2
         assert tmp_paths_seen[0] != tmp_paths_seen[1]
+
+
+# ── Windows command tokenization ───────────────────────────────────────────
+
+
+class TestWindowsCommandSplit:
+    """Windows ``_split_command`` must preserve backslashes and drop
+    grouping quotes that MS-mode ``shlex`` otherwise leaves literal."""
+
+    def test_split_command_preserves_windows_backslashes(self, monkeypatch):
+        """Unquoted Windows paths must survive tokenization."""
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        cmd = r"C:\Users\foo\hook.py"
+        assert shell_hooks._split_command(cmd) == [cmd]
+
+    def test_split_command_strips_quoted_windows_path(self, monkeypatch):
+        """Quoted paths with spaces must become clean argv elements."""
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        cmd = r'python.exe "C:\Program Files\foo\hook.py"'
+        assert shell_hooks._split_command(cmd) == [
+            "python.exe",
+            r"C:\Program Files\foo\hook.py",
+        ]
+
+    def test_split_command_strips_bare_quoted_windows_path(self, monkeypatch):
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        cmd = r'"C:\Program Files\foo\hook.py"'
+        assert shell_hooks._split_command(cmd) == [r"C:\Program Files\foo\hook.py"]
+
+    def test_command_script_path_windows_backslash(self, monkeypatch):
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        cmd = r"python.exe C:\Users\foo\hook.py"
+        assert shell_hooks._command_script_path(cmd) == r"C:\Users\foo\hook.py"
+
+    def test_command_script_path_quoted_windows_path(self, monkeypatch):
+        monkeypatch.setattr(shell_hooks, "IS_WINDOWS", True)
+        cmd = r'python.exe "C:\Program Files\foo\hook.py"'
+        assert shell_hooks._command_script_path(cmd) == (
+            r"C:\Program Files\foo\hook.py"
+        )
