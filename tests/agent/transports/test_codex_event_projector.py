@@ -109,7 +109,7 @@ class TestAgentMessageProjection:
         r = p.project({
             "method": "item/completed",
             "params": {"item": {"type": "agentMessage", "id": "x",
-                                "text": "hi there"}},
+                                "phase": "final_answer", "text": "hi there"}},
         })
         assert r.final_text == "hi there"
         assert r.messages == [{"role": "assistant", "content": "hi there"}]
@@ -129,7 +129,7 @@ class TestAgentMessageProjection:
         r2 = p.project({
             "method": "item/completed",
             "params": {"item": {"type": "agentMessage", "id": "a1",
-                                "text": "ok"}},
+                                "phase": "final_answer", "text": "ok"}},
         })
         assistant = r2.messages[0]
         assert "reasoning" in assistant
@@ -141,11 +141,144 @@ class TestAgentMessageProjection:
         p.project({"method": "item/completed", "params": {"item": {
             "type": "reasoning", "id": "r1", "summary": ["once"], "content": []}}})
         first = p.project({"method": "item/completed", "params": {"item": {
-            "type": "agentMessage", "id": "a", "text": "first"}}}).messages[0]
+            "type": "agentMessage", "id": "a", "phase": "final_answer",
+            "text": "first"}}}).messages[0]
         second = p.project({"method": "item/completed", "params": {"item": {
-            "type": "agentMessage", "id": "b", "text": "second"}}}).messages[0]
+            "type": "agentMessage", "id": "b", "phase": "final_answer",
+            "text": "second"}}}).messages[0]
         assert "reasoning" in first
         assert "reasoning" not in second
+
+    @pytest.mark.parametrize("phase", ["commentary", "analysis", None, "future"])
+    def test_non_final_present_phase_never_enters_history_or_final(
+        self, phase
+    ) -> None:
+        p = CodexEventProjector()
+        r = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage",
+                "id": "hidden",
+                "phase": phase,
+                "text": "not replayable",
+            }},
+        })
+        assert r.messages == []
+        assert r.final_text is None
+
+    @pytest.mark.parametrize("phase", ["commentary", "analysis", None, "future"])
+    def test_non_final_started_phase_controls_completion_when_omitted(
+        self, phase
+    ) -> None:
+        p = CodexEventProjector()
+        p.project({
+            "method": "item/started",
+            "params": {"item": {
+                "type": "agentMessage", "id": "phase-on-start", "phase": phase,
+            }},
+        })
+        completed = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage", "id": "phase-on-start",
+                "text": "not replayable",
+            }},
+        })
+        terminal = p.project({"method": "turn/completed", "params": {}})
+
+        assert completed.messages == []
+        assert completed.final_text is None
+        assert terminal.messages == []
+        assert terminal.final_text is None
+
+    def test_final_started_phase_controls_completion_when_omitted(self) -> None:
+        p = CodexEventProjector()
+        p.project({
+            "method": "item/started",
+            "params": {"item": {
+                "type": "agentMessage", "id": "final-on-start",
+                "phase": "final_answer",
+            }},
+        })
+        completed = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage", "id": "final-on-start", "text": "Done.",
+            }},
+        })
+
+        assert completed.messages == [
+            {"role": "assistant", "content": "Done."}
+        ]
+        assert completed.final_text == "Done."
+
+    def test_phase_less_legacy_final_waits_for_turn_boundary(self) -> None:
+        p = CodexEventProjector()
+        pending = p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage", "id": "legacy", "text": "done",
+            }},
+        })
+        assert pending.messages == []
+        assert pending.final_text is None
+
+        final = p.project({"method": "turn/completed", "params": {}})
+        assert final.messages == [{"role": "assistant", "content": "done"}]
+        assert final.final_text == "done"
+
+    def test_phase_less_message_before_tool_is_not_persisted(self) -> None:
+        p = CodexEventProjector()
+        p.project({
+            "method": "item/completed",
+            "params": {"item": {
+                "type": "agentMessage", "id": "legacy-progress",
+                "text": "I will inspect it.",
+            }},
+        })
+        tool = p.project(COMMAND_EXEC_COMPLETED)
+        final = p.project({"method": "turn/completed", "params": {}})
+
+        assert [message["role"] for message in tool.messages] == [
+            "assistant", "tool"
+        ]
+        assert final.messages == []
+        assert final.final_text is None
+
+    def test_commentary_tool_final_sequence_preserves_role_alternation(self) -> None:
+        p = CodexEventProjector()
+        results = [
+            p.project({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "agentMessage", "id": "c1",
+                    "phase": "commentary", "text": "First update.",
+                }},
+            }),
+            p.project({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "agentMessage", "id": "c2",
+                    "phase": "commentary", "text": "Second update.",
+                }},
+            }),
+            p.project(COMMAND_EXEC_COMPLETED),
+            p.project({
+                "method": "item/completed",
+                "params": {"item": {
+                    "type": "agentMessage", "id": "f1",
+                    "phase": "final_answer", "text": "Done.",
+                }},
+            }),
+        ]
+        messages = [message for result in results for message in result.messages]
+
+        assert [message["role"] for message in messages] == [
+            "assistant", "tool", "assistant"
+        ]
+        assert results[0].final_text is None
+        assert results[1].final_text is None
+        assert results[-1].final_text == "Done."
 
 
 class TestFileChangeProjection:

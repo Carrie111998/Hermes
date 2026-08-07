@@ -455,14 +455,18 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
       * ``item/completed`` for tool-shaped items → ``tool_progress_callback(
         "tool.completed", name, None, None, duration=..., is_error=...,
         result=...)``
-      * ``item/agentMessage/delta`` → ``_fire_stream_delta(text)`` so chat
-        adapters can render the assistant's reply as it streams.
+      * ``item/agentMessage/delta`` for final/legacy messages →
+        ``_fire_stream_delta(text)`` so chat adapters can render the final
+        reply as it streams. Commentary deltas wait for their completed item,
+        which keeps messaging platforms on concise model-authored updates
+        instead of raw token relays.
       * ``item/reasoning/delta`` → ``_fire_reasoning_delta(text)``
-      * ``item/completed`` for ``agentMessage`` →
+      * ``item/completed`` for commentary-phase ``agentMessage`` →
         ``_emit_interim_assistant_message({"role": "assistant",
-        "content": text})``. The gateway's ``already_streamed`` check
-        dedupes against any text the stream-delta callback already
-        rendered for the same message.
+        "content": text})``. Final-answer items stay on the normal final
+        delivery path. For older Codex versions without ``phase``, a message
+        is emitted as commentary only after a following tool start proves
+        structurally that it was not the terminal answer.
 
     All callback invocations are guarded — a buggy display callback must
     not tear down the codex turn loop. Errors are logged at DEBUG so the
@@ -472,6 +476,35 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     # item/started and consumed on item/completed so duration is correct
     # even when codex doesn't report durationMs.
     started: dict[str, tuple[str, dict, float]] = {}
+    # Codex 0.145+ identifies assistant-message purpose structurally on
+    # item/started and item/completed. Delta notifications only carry itemId,
+    # so retain the declared phase until completion. This is protocol state,
+    # not semantic routing: authored text is never inspected or classified.
+    # Value is (field_was_present, normalized_value). Presence matters:
+    # ``phase: null`` and future/unknown phases are explicit protocol states
+    # and must fail closed, while only a truly absent field may use legacy
+    # structural fallback.
+    message_phases: dict[str, tuple[bool, str | None]] = {}
+    # Older app-server versions omit ``phase``. Hold their completed message
+    # until a later tool start proves it was mid-turn. A turn terminal event
+    # instead discards it here because normal final delivery owns that text.
+    pending_unphased_messages: list[dict] = []
+
+    def _message_phase(
+        item: dict, *, consume: bool = False
+    ) -> tuple[bool, str | None]:
+        item_id = str(item.get("id") or "")
+        if "phase" in item:
+            raw = item.get("phase")
+            normalized = str(raw).strip().casefold() if raw is not None else ""
+            state = (True, normalized or None)
+        elif item_id and item_id in message_phases:
+            state = message_phases[item_id]
+        else:
+            state = (False, None)
+        if consume and item_id:
+            message_phases.pop(item_id, None)
+        return state
 
     def _stable_call_id(item: dict, name: str) -> str:
         """Deterministic tool_call id mirroring CodexEventProjector, so a
@@ -495,6 +528,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         return _deterministic_call_id(name, item_id)
 
     def _fire_tool_started(item: dict) -> None:
+        # On a phase-less legacy protocol, a completed assistant message
+        # followed by a tool is structurally commentary. Deliver it before the
+        # tool notification so the user sees the same order the model authored.
+        while pending_unphased_messages:
+            _fire_agent_message_completed(pending_unphased_messages.pop(0))
         item_id = item.get("id") or ""
         name = _codex_item_to_tool_name(item)
         args = _codex_item_to_args(item)
@@ -590,14 +628,20 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         # codex_responses commentary channel).
         if not getattr(agent, "show_commentary", True):
             return
-        emit = getattr(agent, "_emit_interim_assistant_message", None)
+        # This is the same centrally redacted/deduplicated path used by
+        # completed structured Codex commentary in the standard Responses
+        # runtime. Do not fall back to the generic interim-message helper: its
+        # plain-text
+        # compatibility branch is not the structured commentary redaction
+        # boundary.
+        emit = getattr(agent, "_fire_streamed_codex_commentary", None)
         if emit is None:
             return
         try:
-            emit({"role": "assistant", "content": text})
+            emit(text)
         except Exception:
             logger.debug(
-                "_emit_interim_assistant_message raised", exc_info=True,
+                "_fire_streamed_codex_commentary raised", exc_info=True,
             )
 
     def on_event(note: dict) -> None:
@@ -608,15 +652,36 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
         if not isinstance(params, dict):
             params = {}
         if method == "item/agentMessage/delta":
-            _fire_text_delta(params)
+            # Commentary is delivered once, as a complete useful update. Raw
+            # commentary tokens are intentionally not relayed to messaging
+            # platforms. Present-but-unknown phases fail closed; only a truly
+            # absent phase preserves legacy streaming compatibility.
+            item_id = str(params.get("itemId") or "")
+            phase_present, phase = message_phases.get(item_id, (False, None))
+            if not phase_present or phase in {"final_answer", "final"}:
+                _fire_text_delta(params)
             return
         if method in {"item/reasoning/delta", "item/reasoning/summaryDelta"}:
             _fire_reasoning_delta(params)
             return
         item = params.get("item")
         if not isinstance(item, dict):
+            if method in {
+                "turn/completed",
+                "turn/cancelled",
+                "turn/failed",
+                "turn/interrupted",
+            }:
+                pending_unphased_messages.clear()
+                message_phases.clear()
             return
         item_type = item.get("type") or ""
+        if method == "item/started" and item_type == "agentMessage":
+            item_id = str(item.get("id") or "")
+            phase_state = _message_phase(item)
+            if item_id and phase_state[0]:
+                message_phases[item_id] = phase_state
+            return
         if method == "item/started" and item_type in _CODEX_TOOL_ITEM_TYPES:
             _fire_tool_started(item)
             return
@@ -624,7 +689,11 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
             if item_type in _CODEX_TOOL_ITEM_TYPES:
                 _fire_tool_completed(item)
             elif item_type == "agentMessage":
-                _fire_agent_message_completed(item)
+                phase_present, phase = _message_phase(item, consume=True)
+                if phase_present and phase == "commentary":
+                    _fire_agent_message_completed(item)
+                elif not phase_present:
+                    pending_unphased_messages.append(item)
 
     return on_event
 
