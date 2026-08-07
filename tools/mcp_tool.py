@@ -110,6 +110,7 @@ import shutil
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Callable
 from datetime import datetime
@@ -119,6 +120,37 @@ from urllib.parse import urlparse
 from tools.registry import tool_error
 
 logger = logging.getLogger(__name__)
+
+
+def _canonical_profile_home() -> str:
+    """Return the active profile home as a normalized absolute path.
+
+    MCP discovery can run on a shared background loop while callers switch
+    the context-local Hermes home between turns. Callers must capture this
+    value at discovery/registration time and retain it as provenance rather
+    than resolving it again from a later mutable context.
+    """
+    from hermes_constants import get_hermes_home
+
+    return str(Path(get_hermes_home()).expanduser().resolve())
+
+
+def _normalize_profile_home(profile_home: str) -> str:
+    """Normalize a captured profile-home value without consulting context."""
+    return str(Path(profile_home).expanduser().resolve())
+
+
+def _server_profile_home(server: "MCPServerTask") -> str:
+    """Return and, when needed, capture a server's stable profile owner."""
+    profile_home = getattr(server, "profile_home", None)
+    if profile_home:
+        normalized = _normalize_profile_home(profile_home)
+        if normalized != profile_home:
+            server.profile_home = normalized
+        return normalized
+    profile_home = _canonical_profile_home()
+    server.profile_home = profile_home
+    return profile_home
 
 # Upper bound for the OSV malware preflight during stdio MCP startup. The
 # check makes a blocking urllib HTTPS call whose own timeout can fail to
@@ -1910,6 +1942,7 @@ class MCPServerTask:
 
     __slots__ = (
         "name", "session", "tool_timeout",
+        "profile_home",
         "_task", "_ready", "_shutdown_event", "_reconnect_event",
         "_tools", "_error", "_config",
         "_sampling", "_elicitation",
@@ -1922,10 +1955,13 @@ class MCPServerTask:
         "_reconnect_retries", "_session_proven", "_was_parked",
     )
 
-    def __init__(self, name: str):
+    def __init__(self, name: str, profile_home: Optional[str] = None):
         self.name = name
         self.session: Optional[Any] = None
         self.tool_timeout: float = _DEFAULT_TOOL_TIMEOUT
+        self.profile_home: Optional[str] = (
+            _normalize_profile_home(profile_home) if profile_home else None
+        )
         self._task: Optional[asyncio.Task] = None
         self._ready = asyncio.Event()
         self._shutdown_event = asyncio.Event()
@@ -3629,6 +3665,14 @@ _server_connect_errors: Dict[str, str] = {}
 _lazy_server_configs: Dict[str, dict] = {}
 _lazy_server_fingerprints: Dict[str, str] = {}
 _lazy_server_tool_names: Dict[str, List[str]] = {}
+# Profile provenance captured when a lazy manifest is registered. This is
+# separate from the config snapshot because the same server name may be
+# explicitly re-registered under another profile in this name-keyed runtime.
+_lazy_server_profile_homes: Dict[str, str] = {}
+# Owner for connecting/failed servers that do not yet have an MCPServerTask.
+# Connected ownership lives on MCPServerTask itself; this map is status
+# bookkeeping for the pre-task lifecycle states.
+_server_profile_homes: Dict[str, str] = {}
 # Discovery installs a task-local claim before calling ``_connect_server`` so
 # it can retain a recoverable parked task without making standalone probe calls
 # publish failed servers into module-global ownership.
@@ -4373,7 +4417,8 @@ _mcp_loop: Optional[asyncio.AbstractEventLoop] = None
 _mcp_thread: Optional[threading.Thread] = None
 
 # Protects _mcp_loop, _mcp_thread, _servers, MCP connection status maps,
-# _parallel_safe_servers, _mcp_tool_server_names, and _stdio_pids.
+# profile-owner maps, _parallel_safe_servers, _mcp_tool_server_names, and
+# _stdio_pids.
 _lock = threading.Lock()
 
 # ---------------------------------------------------------------------------
@@ -4941,7 +4986,11 @@ async def _connect_server(name: str, config: dict) -> MCPServerTask:
         ImportError: if HTTP transport is needed but not available.
         Exception: on connection or initialization failure.
     """
-    server = MCPServerTask(name)
+    # Capture the active profile before the long-lived task is started. The
+    # task may later reconnect on a shared event loop after the caller's
+    # context-local home has changed, so deriving ownership during refresh
+    # would be incorrect.
+    server = MCPServerTask(name, profile_home=_canonical_profile_home())
     claim = _connect_server_claim.get()
     claim_token = None
     if claim is not None:
@@ -5044,6 +5093,13 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             return False
         if server_name in _server_connecting:
             return False
+        profile_home = _lazy_server_profile_homes.get(server_name)
+        if profile_home is None:
+            # Defensive fallback for old in-memory state created before this
+            # provenance map existed. Capture it once and retain it for the
+            # lifetime of this lazy registration.
+            profile_home = _canonical_profile_home()
+            _lazy_server_profile_homes[server_name] = profile_home
         _server_connecting.add(server_name)
         _server_connect_errors.pop(server_name, None)
 
@@ -5054,7 +5110,17 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
     async def _connect():
         return await _discover_and_register_server(server_name, config)
 
+    override_token = None
+    reset_home_override = None
     try:
+        # A lazy manifest may have been registered under profile A while the
+        # first tool call arrives under profile B. Re-establish A around the
+        # shared-loop scheduling boundary so discovery and the new task retain
+        # the manifest's original owner.
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        reset_home_override = reset_hermes_home_override
+        override_token = set_hermes_home_override(profile_home)
         _run_on_mcp_loop(_connect, timeout=float(connect_timeout) + 30.0)
     except BaseException as exc:
         message = _format_connect_error(exc)
@@ -5066,6 +5132,9 @@ def _ensure_lazy_server_connected(server_name: str) -> bool:
             "Lazy MCP connect failed for '%s': %s", server_name, message,
         )
         return False
+    finally:
+        if override_token is not None and reset_home_override is not None:
+            reset_home_override(override_token)
 
     with _lock:
         _server_connecting.discard(server_name)
@@ -6100,6 +6169,12 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    profile_home = _server_profile_home(server)
+    with _lock:
+        _server_profile_homes[name] = profile_home
+        # A live/eager publication supersedes any stale lazy-manifest owner
+        # for this name. The server task now carries the authoritative owner.
+        _lazy_server_profile_homes.pop(name, None)
 
     # Selective tool loading: honour include/exclude lists from config.
     # Rules (matching issue #690 spec, extended with glob support):
@@ -6250,6 +6325,7 @@ def _register_server_tools(name: str, server: MCPServerTask, config: dict) -> Li
             check_fn=candidate["check_fn"],
             is_async=False,
             description=candidate["schema"]["description"],
+            profile_home=profile_home,
         )
 
         # The pre-check above is advisory only. Multiple servers connect in
@@ -6334,6 +6410,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
 
     registered_names: List[str] = []
     toolset_name = f"mcp-{name}"
+    profile_home = _canonical_profile_home()
     fingerprint = config_fingerprint(config)
     tool_timeout = config.get("timeout", _DEFAULT_TOOL_TIMEOUT)
     tools_filter = config.get("tools") or {}
@@ -6401,6 +6478,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema["description"],
+            profile_home=profile_home,
         )
         if registry.get_toolset_for_tool(registry_name) != toolset_name:
             continue
@@ -6434,6 +6512,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             check_fn=check_fn,
             is_async=False,
             description=schema.get("description") or "",
+            profile_home=profile_home,
         )
         if registry.get_toolset_for_tool(util_name) != toolset_name:
             continue
@@ -6446,6 +6525,8 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
             _lazy_server_configs[name] = dict(config)
             _lazy_server_fingerprints[name] = fingerprint
             _lazy_server_tool_names[name] = list(registered_names)
+            _lazy_server_profile_homes[name] = profile_home
+            _server_profile_homes[name] = profile_home
         logger.info(
             "MCP server '%s' (lazy): registered %d tool(s) from schema cache",
             name, len(registered_names),
@@ -6458,6 +6539,9 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     Returns list of registered tool names.
     """
     connect_timeout = config.get("connect_timeout", _DEFAULT_CONNECT_TIMEOUT)
+    discovery_profile_home = _canonical_profile_home()
+    with _lock:
+        _server_profile_homes[name] = discovery_profile_home
     # List-based claim (not a ``nonlocal`` rebind): the claim callback runs
     # inside ``_connect_server`` while this frame is suspended, and appending
     # keeps type narrowing intact for the module's other ``server`` locals.
@@ -6500,6 +6584,11 @@ async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     with _lock:
         _server_connecting.discard(name)
         _server_connect_errors.pop(name, None)
+        # Test/probe adapters may return a task constructed without the
+        # production connection helper. Preserve an existing owner, otherwise
+        # bind this server before any registry publication.
+        if not getattr(server, "profile_home", None):
+            server.profile_home = discovery_profile_home
         _servers[name] = server
 
     registered_names = _register_server_tools(name, server, config)
@@ -6534,6 +6623,10 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         logger.debug("MCP SDK not available -- skipping explicit MCP registration")
         return []
 
+    # Capture the request's profile once. This owner is used for connecting
+    # and failed status rows even if the caller's context changes while the
+    # background discovery batch is in flight.
+    registration_profile_home = _canonical_profile_home()
     servers = _filter_suspicious_mcp_servers(servers)
     if not servers:
         logger.debug("No explicit MCP servers provided")
@@ -6575,6 +6668,7 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
         _server_connecting.update(new_servers)
         for srv_name in new_servers:
             _server_connect_errors.pop(srv_name, None)
+            _server_profile_homes[srv_name] = registration_profile_home
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
@@ -6838,9 +6932,9 @@ def get_mcp_status() -> List[dict]:
     """Return status of all configured MCP servers for banner display.
 
     Returns a list of dicts with keys: name, transport, tools, connected,
-    disabled, and status. Includes connected servers, disabled servers,
-    in-flight connection attempts, recorded failures, and servers that are
-    configured but have not been started in this process yet.
+    disabled, status, and profile_home. Includes connected servers, disabled
+    servers, in-flight connection attempts, recorded failures, and servers
+    that are configured but have not been started in this process yet.
     """
     result: List[dict] = []
 
@@ -6848,11 +6942,14 @@ def get_mcp_status() -> List[dict]:
     configured = _load_mcp_config()
     if not configured:
         return result
+    status_profile_home = _canonical_profile_home()
 
     with _lock:
         active_servers = dict(_servers)
         connecting = set(_server_connecting)
         connect_errors = dict(_server_connect_errors)
+        profile_homes = dict(_server_profile_homes)
+        lazy_profile_homes = dict(_lazy_server_profile_homes)
 
     for name, cfg in configured.items():
         transport = cfg.get("transport", "http") if "url" in cfg else "stdio"
@@ -6866,6 +6963,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": True,
                 "disabled": False,
                 "status": "connected",
+                "profile_home": _server_profile_home(server),
             }
             if server._sampling:
                 entry["sampling"] = dict(server._sampling.metrics)
@@ -6881,6 +6979,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": True,
                 "status": "disabled",
+                "profile_home": status_profile_home,
             })
         elif name in connecting:
             result.append({
@@ -6890,6 +6989,7 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "connecting",
+                "profile_home": profile_homes.get(name, status_profile_home),
             })
         elif name in connect_errors:
             result.append({
@@ -6900,6 +7000,7 @@ def get_mcp_status() -> List[dict]:
                 "disabled": False,
                 "status": "failed",
                 "error": connect_errors[name],
+                "profile_home": profile_homes.get(name, status_profile_home),
             })
         else:
             result.append({
@@ -6909,6 +7010,13 @@ def get_mcp_status() -> List[dict]:
                 "connected": False,
                 "disabled": False,
                 "status": "configured",
+                "profile_home": (
+                    lazy_profile_homes.get(name, status_profile_home)
+                    if name in lazy_profile_homes
+                    else profile_homes.get(name, status_profile_home)
+                    if name in active_servers
+                    else status_profile_home
+                ),
             })
 
     return result
@@ -7228,6 +7336,8 @@ def shutdown_mcp_servers():
         with _lock:
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _server_profile_homes.clear()
+            _lazy_server_profile_homes.clear()
         _stop_mcp_loop()
         return
 
@@ -7248,6 +7358,8 @@ def shutdown_mcp_servers():
             # stale per-server backoff from before the restart (#50394).
             _server_connect_retry_after.clear()
             _server_connect_failures.clear()
+            _server_profile_homes.clear()
+            _lazy_server_profile_homes.clear()
 
     with _lock:
         loop = _mcp_loop
@@ -7271,6 +7383,8 @@ def shutdown_mcp_servers():
     with _lock:
         _server_connect_retry_after.clear()
         _server_connect_failures.clear()
+        _server_profile_homes.clear()
+        _lazy_server_profile_homes.clear()
 
     _stop_mcp_loop()
 

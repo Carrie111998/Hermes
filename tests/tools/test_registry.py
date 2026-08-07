@@ -33,6 +33,39 @@ class TestRegisterAndDispatch:
         result = json.loads(reg.dispatch("alpha", {}))
         assert result == {"ok": True}
 
+    def test_builtin_registration_has_no_profile_home_provenance(self):
+        reg = ToolRegistry()
+        reg.register(
+            name="alpha", toolset="core", schema=_make_schema("alpha"),
+            handler=_dummy_handler,
+        )
+
+        assert reg.get_profile_home_for_tool("alpha") is None
+
+    def test_reregister_updates_profile_home_provenance(self, tmp_path):
+        reg = ToolRegistry()
+        first_home = str((tmp_path / "first").resolve())
+        second_home = str((tmp_path / "second").resolve())
+
+        reg.register(
+            name="mcp__shared__search",
+            toolset="mcp-shared",
+            schema=_make_schema("mcp__shared__search"),
+            handler=_dummy_handler,
+            profile_home=first_home,
+        )
+        assert reg.get_profile_home_for_tool("mcp__shared__search") == first_home
+
+        reg.register(
+            name="mcp__shared__search",
+            toolset="mcp-shared",
+            schema=_make_schema("mcp__shared__search"),
+            handler=_dummy_handler,
+            profile_home=second_home,
+        )
+
+        assert reg.get_profile_home_for_tool("mcp__shared__search") == second_home
+
 
     def test_cross_mcp_toolsets_do_not_overwrite_atomically(self, caplog):
         """Parallel MCP registrations with one name leave exactly one owner."""

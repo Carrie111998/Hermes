@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -299,6 +300,52 @@ class TestMCPStatus:
         assert statuses["failed"]["error"] == "Connection closed"
         assert statuses["disabled"]["status"] == "disabled"
         assert statuses["disabled"]["disabled"] is True
+        from hermes_constants import get_hermes_home
+
+        assert {
+            entry["profile_home"]
+            for entry in statuses.values()
+        } == {str(Path(get_hermes_home()).expanduser().resolve())}
+
+    def test_connected_owner_survives_home_override_switch(self, tmp_path, monkeypatch):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        first_home = (tmp_path / "first").resolve()
+        second_home = (tmp_path / "second").resolve()
+        server = mcp_tool.MCPServerTask("connected")
+        server.profile_home = str(first_home)
+        server.session = object()
+        server._tools = []
+
+        monkeypatch.setattr(
+            mcp_tool,
+            "_load_mcp_config",
+            lambda: {"connected": {"command": "mock"}},
+        )
+        with mcp_tool._lock:
+            saved_servers = dict(mcp_tool._servers)
+            mcp_tool._servers.clear()
+            mcp_tool._servers["connected"] = server
+        try:
+            first_token = set_hermes_home_override(first_home)
+            try:
+                first_status = mcp_tool.get_mcp_status()
+            finally:
+                reset_hermes_home_override(first_token)
+
+            second_token = set_hermes_home_override(second_home)
+            try:
+                second_status = mcp_tool.get_mcp_status()
+            finally:
+                reset_hermes_home_override(second_token)
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._servers.clear()
+                mcp_tool._servers.update(saved_servers)
+
+        assert first_status[0]["profile_home"] == str(first_home)
+        assert second_status[0]["profile_home"] == str(first_home)
 
 
 class TestLifecycleConfig:
@@ -735,6 +782,134 @@ class TestDiscoverAndRegister:
         assert "mcp__fs__write_file" in mock_registry.get_all_tool_names()
 
         _servers.pop("fs", None)
+
+    def test_eager_registration_captures_profile_home(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.registry import ToolRegistry
+        import tools.mcp_tool as mcp_tool
+        from tools.mcp_tool import _discover_and_register_server, _servers, MCPServerTask
+
+        mock_registry = ToolRegistry()
+        mock_tools = [_make_mcp_tool("read_file", "Read a file")]
+        mock_session = MagicMock()
+        profile_home = (tmp_path / "eager").resolve()
+
+        async def fake_connect(name, config):
+            server = MCPServerTask(name)
+            server.session = mock_session
+            server._tools = mock_tools
+            return server
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            with patch("tools.mcp_tool._connect_server", side_effect=fake_connect), \
+                 patch("tools.registry.registry", mock_registry):
+                registered = asyncio.run(
+                    _discover_and_register_server(
+                        "eager",
+                        {
+                            "command": "mock",
+                            "tools": {"resources": False, "prompts": False},
+                        },
+                    )
+                )
+        finally:
+            reset_hermes_home_override(token)
+
+        try:
+            assert registered == ["mcp__eager__read_file"]
+            assert mock_registry.get_profile_home_for_tool(registered[0]) == str(profile_home)
+        finally:
+            _servers.pop("eager", None)
+            with mcp_tool._lock:
+                mcp_tool._server_profile_homes.pop("eager", None)
+
+    def test_dynamic_refresh_keeps_original_profile_home(self, tmp_path):
+        import tools.mcp_tool as mcp_tool
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.registry import ToolRegistry
+
+        first_home = (tmp_path / "first").resolve()
+        second_home = (tmp_path / "second").resolve()
+        config = {"tools": {"resources": False, "prompts": False}}
+        mock_registry = ToolRegistry()
+
+        first_token = set_hermes_home_override(first_home)
+        try:
+            # The server is created in profile A; registration happens after
+            # switching to profile B, like a list_changed refresh on the
+            # shared MCP loop.
+            server = mcp_tool.MCPServerTask(
+                "refresh", profile_home=mcp_tool._canonical_profile_home()
+            )
+            server.session = MagicMock()
+            server._tools = [_make_mcp_tool("read_file", "Read a file")]
+        finally:
+            reset_hermes_home_override(first_token)
+
+        second_token = set_hermes_home_override(second_home)
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                registered = mcp_tool._register_server_tools("refresh", server, config)
+        finally:
+            reset_hermes_home_override(second_token)
+
+        assert registered == ["mcp__refresh__read_file"]
+        assert mock_registry.get_profile_home_for_tool(registered[0]) == str(first_home)
+        with mcp_tool._lock:
+            mcp_tool._server_profile_homes.pop("refresh", None)
+
+    def test_lazy_registration_captures_profile_home(self, tmp_path):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from tools.registry import ToolRegistry
+        import tools.mcp_tool as mcp_tool
+
+        mock_registry = ToolRegistry()
+        profile_home = (tmp_path / "lazy").resolve()
+        config = {"command": "mock", "args": [], "lazy": True}
+        entry = {
+            "fingerprint": "unused",
+            "tools": [{
+                "name": "read_file",
+                "description": "Read a file",
+                "inputSchema": {"type": "object", "properties": {}},
+            }],
+            "utility_tools": [],
+        }
+        with mcp_tool._lock:
+            saved_configs = dict(mcp_tool._lazy_server_configs)
+            saved_fingerprints = dict(mcp_tool._lazy_server_fingerprints)
+            saved_names = dict(mcp_tool._lazy_server_tool_names)
+            saved_profile_homes = dict(mcp_tool._lazy_server_profile_homes)
+            saved_server_profile_homes = dict(mcp_tool._server_profile_homes)
+            mcp_tool._lazy_server_configs.clear()
+            mcp_tool._lazy_server_fingerprints.clear()
+            mcp_tool._lazy_server_tool_names.clear()
+            mcp_tool._lazy_server_profile_homes.clear()
+            mcp_tool._server_profile_homes.clear()
+
+        token = set_hermes_home_override(profile_home)
+        try:
+            with patch("tools.registry.registry", mock_registry):
+                registered = mcp_tool._register_from_cache_sync("lazy", config, entry)
+        finally:
+            reset_hermes_home_override(token)
+
+        try:
+            assert registered == ["mcp__lazy__read_file"]
+            assert mock_registry.get_profile_home_for_tool(registered[0]) == str(profile_home)
+        finally:
+            with mcp_tool._lock:
+                mcp_tool._lazy_server_configs.clear()
+                mcp_tool._lazy_server_configs.update(saved_configs)
+                mcp_tool._lazy_server_fingerprints.clear()
+                mcp_tool._lazy_server_fingerprints.update(saved_fingerprints)
+                mcp_tool._lazy_server_tool_names.clear()
+                mcp_tool._lazy_server_tool_names.update(saved_names)
+                mcp_tool._lazy_server_profile_homes.clear()
+                mcp_tool._lazy_server_profile_homes.update(saved_profile_homes)
+                mcp_tool._server_profile_homes.clear()
+                mcp_tool._server_profile_homes.update(saved_server_profile_homes)
 
 
     def test_same_server_normalization_collision_skips_all_ambiguous_tools(self, caplog):
