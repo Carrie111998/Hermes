@@ -909,6 +909,38 @@ def test_large_coverage_archive_inventory_is_optional_and_bounded():
     assert result["coverage"]["optional_available"] == 157
 
 
+def test_required_evidence_can_expand_past_bounded_optional_archive_inventory():
+    scope = _scope()
+    with evidence_scope(scope):
+        for index in range(200):
+            _new_cursor(
+                scope,
+                _Cursor(
+                    kind="archive_entry",
+                    data={"path": f"coverage/{index}.json", "content": b"{}"},
+                    required=False,
+                ),
+            )
+        required = {
+            _new_cursor(scope, _Cursor(kind="data", data={"index": index}))
+            for index in range(100)
+        }
+
+    assert len(scope.cursors) == 300
+    assert scope.required_cursors == required
+
+
+def test_cursor_registry_still_fails_closed_at_configured_scope_limit():
+    scope = _scope()
+    with evidence_scope(scope), patch(
+        "tools.github_pr_evidence._MAX_ACTIVE_CURSORS", 2
+    ):
+        _new_cursor(scope, _Cursor(kind="data"))
+        _new_cursor(scope, _Cursor(kind="data"))
+        with pytest.raises(RuntimeError, match="cursor limit exceeded"):
+            _new_cursor(scope, _Cursor(kind="data"))
+
+
 def test_large_archive_entry_creates_only_one_lazy_continuation_cursor():
     archive_bytes = io.BytesIO()
     with zipfile.ZipFile(archive_bytes, "w", zipfile.ZIP_DEFLATED) as archive:

@@ -54,7 +54,11 @@ _MAX_COMPRESSION_RATIO = 100
 _MAX_RESULT_CHARS = 90_000
 _MAX_INLINE_STRING_CHARS = 20_000
 _MAX_PAGE_CHARS = 60_000
-_MAX_ACTIVE_CURSORS = 200
+# A pull request can expose up to 3,000 changed files. Exact-head review may
+# materialize both base and head blobs plus the bounded 200-entry artifact
+# inventory, so the old 200-cursor ceiling rejected legitimate large reviews.
+# Keep a hard per-scope ceiling, but size it for the API's bounded inventory.
+_MAX_ACTIVE_CURSORS = 10_000
 _CANONICAL_REVIEW_PATHS = {
     "AGENTS.md",
     "CLAUDE.md",
