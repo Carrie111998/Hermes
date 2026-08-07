@@ -40,7 +40,7 @@ const DEFAULT_CONNECT_TIMEOUT_MS = 15_000
 const DEFAULT_EXEC_TIMEOUT_MS = 20_000
 const DEFAULT_FORWARD_TIMEOUT_MS = 15_000
 const CONTROL_PERSIST_SECONDS = 300
-const DEFAULT_CONTROL_KEEPALIVE_MS = 60_000
+const CONTROL_FORWARD_KEEPALIVE_MS = Math.min(60_000, Math.floor((CONTROL_PERSIST_SECONDS * 1_000) / 2))
 
 // eslint-disable-next-line no-control-regex -- deliberately reject control chars in ssh targets
 const _CONTROL_CHAR_RE = /[\x00-\x1f\x7f]/
@@ -471,7 +471,6 @@ class SshConnection {
   _mux: boolean
   _tunnels: Map<string, any>
   _forwardedSpecs: Set<string>
-  _controlKeepaliveMs: number
   _controlKeepaliveTimer: ReturnType<typeof setInterval> | null
 
   constructor(cfg, opts: any = {}) {
@@ -512,7 +511,6 @@ class SshConnection {
     this._connectTimeoutMs = opts.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
     this._execTimeoutMs = opts.execTimeoutMs ?? DEFAULT_EXEC_TIMEOUT_MS
     this._forwardTimeoutMs = opts.forwardTimeoutMs ?? DEFAULT_FORWARD_TIMEOUT_MS
-    this._controlKeepaliveMs = opts.controlKeepaliveMs ?? DEFAULT_CONTROL_KEEPALIVE_MS
     this._controlKeepaliveTimer = null
     this._opened = false
   }
@@ -656,8 +654,10 @@ class SshConnection {
     }
 
     this._controlKeepaliveTimer = setInterval(() => {
+      // Remote liveness owns reconnect/teardown. Keep refreshing through a
+      // transient failed check rather than turning one timeout into expiry.
       void this.isAlive()
-    }, this._controlKeepaliveMs)
+    }, CONTROL_FORWARD_KEEPALIVE_MS)
     this._controlKeepaliveTimer.unref?.()
   }
 
@@ -943,6 +943,7 @@ export {
   buildInteractiveSshArgs,
   buildMasterArgs,
   classifySshError,
+  CONTROL_FORWARD_KEEPALIVE_MS,
   CONTROL_PERSIST_SECONDS,
   controlSocketPath,
   createSshProbeConnection,
