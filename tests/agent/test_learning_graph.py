@@ -86,17 +86,18 @@ def test_full_payload_shape_and_edge_integrity(tmp_path):
 
 def test_externally_installed_skill_not_learned(tmp_path):
     """Skills installed externally (e.g. ``npx skills add``) land in
-    ``~/.hermes/skills/`` with ``source="profile"`` and ``created_by=None``.
+    ``~/.hermes/skills/`` with ``source="profile"`` and ``provenance=None``.
 
     They must NOT appear as "learned" in the graph even when ``use_count > 0``
-    from telemetry tracking — only agent-created skills should.
+    from telemetry tracking — only agent-created skills (``provenance == "agent"``)
+    should.
     """
     home = tmp_path / ".hermes"
     skills_dir = home / "skills"
     ext_category = skills_dir / "tools"
     ext_category.mkdir(parents=True)
 
-    # Externally installed skill — created_by=None, use_count > 0
+    # Externally installed skill — provenance=None, use_count > 0
     ext_skill = ext_category / "external-tool"
     ext_skill.mkdir()
     (ext_skill / "SKILL.md").write_text(
@@ -104,17 +105,28 @@ def test_externally_installed_skill_not_learned(tmp_path):
         encoding="utf-8",
     )
 
-    # Agent-created skill — created_by="agent"
-    agent_skill = ext_category / "agent-created"
-    agent_skill.mkdir()
-    (agent_skill / "SKILL.md").write_text(
-        "---\nname: agent-created\ncategory: tools\n---\nAgent skill body.\n",
+    # Foreground agent-created skill — provenance="agent", created_by=None
+    # (user-directed skill_manage(create): curator policy not set)
+    fg_skill = ext_category / "fg-agent-skill"
+    fg_skill.mkdir()
+    (fg_skill / "SKILL.md").write_text(
+        "---\nname: fg-agent-skill\ncategory: tools\n---\nForeground agent skill.\n",
+        encoding="utf-8",
+    )
+
+    # Background-review agent-created skill — provenance="agent", created_by="agent"
+    # (background review fork: curator policy also set)
+    bg_skill = ext_category / "bg-agent-skill"
+    bg_skill.mkdir()
+    (bg_skill / "SKILL.md").write_text(
+        "---\nname: bg-agent-skill\ncategory: tools\n---\nBackground agent skill.\n",
         encoding="utf-8",
     )
 
     usage = {
-        "external-tool": {"use_count": 15, "created_by": None, "state": "active"},
-        "agent-created": {"use_count": 3, "created_by": "agent", "state": "active"},
+        "external-tool": {"use_count": 15, "created_by": None, "provenance": None, "state": "active"},
+        "fg-agent-skill": {"use_count": 2, "created_by": None, "provenance": "agent", "state": "active"},
+        "bg-agent-skill": {"use_count": 5, "created_by": "agent", "provenance": "agent", "state": "active"},
     }
     (skills_dir / ".usage.json").write_text(json.dumps(usage), encoding="utf-8")
 
@@ -127,8 +139,9 @@ def test_externally_installed_skill_not_learned(tmp_path):
     skill_names = {
         n["id"] for n in graph["nodes"] if n["kind"] == "skill"
     }
-    # Agent-created skill IS in the learned graph
-    assert "agent-created" in skill_names
+    # Both agent-created skills (foreground and background) ARE in the learned graph
+    assert "fg-agent-skill" in skill_names
+    assert "bg-agent-skill" in skill_names
     # Externally installed skill is NOT in the learned graph
     assert "external-tool" not in skill_names
 
