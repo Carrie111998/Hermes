@@ -78,6 +78,41 @@ class TestCronCommandLifecycle:
         out = capsys.readouterr().out
         assert "Updated job" in out
 
+    def test_edit_sets_profile_field(self, tmp_cron_dir, capsys):
+        """cron edit --profile <name> pins the job to a profile (#32045).
+
+        The job record must gain a 'profile' field; subsequent get_job must
+        return it. Regression for the CLI path that previously never passed
+        profile through (and the --profile flag was consumed by
+        _apply_profile_override as a context switch).
+        """
+        job = create_job(prompt="Profile pin", schedule="every 1h")
+        assert job.get("profile") is None
+
+        cron_command(
+            Namespace(
+                cron_command="edit",
+                job_id=job["id"],
+                schedule=None,
+                prompt=None,
+                name=None,
+                deliver=None,
+                repeat=None,
+                skill=None,
+                skills=None,
+                clear_skills=False,
+                add_skills=None,
+                remove_skills=None,
+                script=None,
+                workdir=None,
+                no_agent=None,
+                profile="trading",
+            )
+        )
+        updated = get_job(job["id"])
+        assert updated is not None
+        assert updated["profile"] == "trading"
+
     def test_create_with_multiple_skills(self, tmp_cron_dir, capsys):
         cron_command(
             Namespace(

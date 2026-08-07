@@ -1527,6 +1527,7 @@ class CLICommandsMixin:
                 "all": False,
                 "prompt": None,
                 "schedule": None,
+                "profile": None,
                 "positionals": [],
             }
             i = 0
@@ -1565,6 +1566,9 @@ class CLICommandsMixin:
                     i += 2
                 elif token == "--schedule" and i + 1 < len(tokens):
                     opts["schedule"] = tokens[i + 1]
+                    i += 2
+                elif token == "--profile" and i + 1 < len(tokens):
+                    opts["profile"] = tokens[i + 1]
                     i += 2
                 else:
                     opts["positionals"].append(token)
@@ -1658,6 +1662,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=skills or None,
+                profile=opts["profile"],
             )
             if result.get("success"):
                 print(f"(^_^)b Created job: {result['job_id']}")
@@ -1704,6 +1709,7 @@ class CLICommandsMixin:
                 deliver=opts["deliver"],
                 repeat=opts["repeat"],
                 skills=final_skills,
+                profile=opts["profile"],
             )
             if result.get("success"):
                 job = result["job"]
