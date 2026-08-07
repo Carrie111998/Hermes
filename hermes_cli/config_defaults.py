@@ -1725,6 +1725,12 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Retained-subagent registry (delegate_task follow_up mode). Completed
+        # children stay addressable for follow-up messaging until tombstoned,
+        # TTL-expired, or pushed out by the cap. Tombstoning only removes
+        # addressability — transcripts/artifacts are never erased.
+        "max_retained": 10,        # max follow-up-addressable completed children
+        "retained_ttl_hours": 72,  # hours a completed child stays addressable
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

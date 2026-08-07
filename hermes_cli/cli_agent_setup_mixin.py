@@ -642,6 +642,25 @@ class CLIAgentSetupMixin:
             )
             self._restore_session_cwd(session_meta)
             self._restore_session_yolo(session_meta)
+            # Reapply persisted subagent-usage attribution (#79686 P1): the
+            # in-memory child cost rollup died with the previous process, so
+            # re-seed this session's aggregate from the durable ledger.
+            try:
+                from tools.async_delegation import load_child_usage_totals
+
+                _child_totals = load_child_usage_totals(self.session_id)
+                _child_cost = float(_child_totals.get("cost_usd") or 0.0)
+                if _child_cost > 0.0:
+                    self.session_estimated_cost_usd = (
+                        float(getattr(self, "session_estimated_cost_usd", 0.0) or 0.0)
+                        + _child_cost
+                    )
+                    if getattr(self, "session_cost_source", "none") in {None, "", "none"}:
+                        self.session_cost_source = "subagent"
+                    if getattr(self, "session_cost_status", "unknown") in {None, "", "unknown"}:
+                        self.session_cost_status = "estimated"
+            except Exception:
+                pass
         else:
             accent_color = _accent_hex()
             self._console_print(

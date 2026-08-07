@@ -7663,6 +7663,7 @@ class AIAgent:
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
             background=(not _is_subagent),
+            follow_up=function_args.get("follow_up"),
             parent_agent=self,
         )
 

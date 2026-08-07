@@ -1324,6 +1324,10 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Retained-subagent follow-up (#79686 P1): reuse a completed child's
+    # durable session id so the follow-up turn appends to ITS OWN session,
+    # preserving the transcript (and the provider prompt-cache prefix).
+    resume_session_id: Optional[str] = None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1622,6 +1626,7 @@ def _build_child_agent(
             acp_command=effective_acp_command,
             acp_args=effective_acp_args,
             max_iterations=max_iterations,
+            session_id=resume_session_id,
 
             reasoning_config=child_reasoning,
             prefill_messages=getattr(parent_agent, "prefill_messages", None),
@@ -2323,11 +2328,23 @@ def _run_single_child(
             _worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
 
+            # Retained-child follow-up (#79686 P1): the resumed transcript is
+            # stashed on the child at build time. Passing it as
+            # conversation_history appends the follow-up as the NEXT user
+            # turn of the child's own session — alternation stays legal and
+            # the cached prefix is preserved verbatim.
+            _resume_history = getattr(child, "_delegate_resume_history", None)
+            _extra_kwargs = (
+                {"conversation_history": _resume_history}
+                if isinstance(_resume_history, list) and _resume_history
+                else {}
+            )
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
                 return child.run_conversation(
                     user_message=goal,
                     task_id=child_task_id,
                     stream_callback=_relay_child_text,
+                    **_extra_kwargs,
                 )
 
         _child_context = contextvars.copy_context()
@@ -2562,6 +2579,10 @@ def _run_single_child(
             "duration_seconds": duration,
             "model": _model if isinstance(_model, str) else None,
             "exit_reason": exit_reason,
+            # Durable child identity (#79686 P1): lets the parent address this
+            # child later via delegate_task(follow_up=...) once retained.
+            "child_session_id": str(getattr(child, "session_id", "") or "") or None,
+            "subagent_id": _subagent_id,
             "tokens": {
                 "input": (
                     _input_tokens if isinstance(_input_tokens, (int, float)) else 0
@@ -2881,12 +2902,34 @@ def _finalize_child_results(
             invoke_hook = None
 
         children_cost_total = 0.0
+        _usage_records: List[tuple] = []
         for entry in results:
             child_role = entry.pop("_child_role", None)
             child_cost = entry.pop("_child_cost_usd", 0.0)
             try:
                 if child_cost:
                     children_cost_total += float(child_cost)
+            except (TypeError, ValueError):
+                pass
+            # Capture per-child usage for the durable attribution ledger
+            # (#79686 P1) — persisted below once the aggregate is known.
+            try:
+                _entry_child = child_by_index.get(entry.get("task_index", -1))
+                _usage_records.append(
+                    (
+                        str(getattr(_entry_child, "session_id", "") or ""),
+                        {
+                            "cost_usd": float(child_cost or 0.0),
+                            "tokens": (
+                                entry.get("tokens")
+                                if isinstance(entry.get("tokens"), dict)
+                                else {}
+                            ),
+                            "api_calls": entry.get("api_calls", 0),
+                            "status": entry.get("status"),
+                        },
+                    )
+                )
             except (TypeError, ValueError):
                 pass
             if invoke_hook is None:
@@ -2931,6 +2974,39 @@ def _finalize_child_results(
             except Exception:
                 logger.debug("Subagent cost rollup failed", exc_info=True)
 
+        # Persist the child-usage attribution ledger (#79686 P1): the
+        # in-memory rollup above dies with the process, so each child's usage
+        # plus the resulting aggregate is written durably keyed on the parent
+        # session + turn. Session-load paths reapply via
+        # async_delegation.load_child_usage_totals so parent aggregates
+        # survive reload (the reapply-on-load design; #62206's one-shot
+        # additive write was lost in production).
+        _parent_sid_raw = getattr(parent_agent, "session_id", None)
+        if isinstance(_parent_sid_raw, str) and _parent_sid_raw and _usage_records:
+            try:
+                from tools.async_delegation import record_child_usage_attribution
+
+                _aggregate = {
+                    "session_estimated_cost_usd": float(
+                        getattr(parent_agent, "session_estimated_cost_usd", 0.0)
+                        or 0.0
+                    ),
+                    "children_cost_total": children_cost_total,
+                }
+                _turn_id = getattr(parent_agent, "_current_turn_id", "") or ""
+                for _child_sid, _usage in _usage_records:
+                    record_child_usage_attribution(
+                        parent_session_id=_parent_sid_raw,
+                        parent_turn_id=_turn_id if isinstance(_turn_id, str) else "",
+                        child_session_id=_child_sid,
+                        usage=_usage,
+                        aggregate=_aggregate,
+                    )
+            except Exception:
+                logger.debug(
+                    "Persisting child usage attribution failed", exc_info=True
+                )
+
 
 def _run_child_lifecycle(
     task_index: int,
@@ -2974,6 +3050,185 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _resolve_running_child_for_follow_up(child_id: str) -> Optional[str]:
+    """Map a follow_up target onto a LIVE registered subagent id, if any.
+
+    Accepts either the public subagent id (``sa-...``) or the child's durable
+    session id; returns the registry subagent_id to steer, or None.
+    """
+    if not child_id:
+        return None
+    with _active_subagents_lock:
+        for sid, record in _active_subagents.items():
+            if sid == child_id:
+                return sid
+            agent = record.get("agent")
+            if agent is not None and str(
+                getattr(agent, "session_id", "") or ""
+            ) == child_id:
+                return sid
+    return None
+
+
+def _handle_follow_up(
+    follow_up: str,
+    goal: Optional[str],
+    context: Optional[str],
+    parent_agent,
+) -> str:
+    """delegate_task(follow_up=...): message a running or retained child.
+
+    Budget-exempt by design (#79686 P1): a follow-up is NOT a spawn, so it
+    consumes neither max_spawn_depth nor the async concurrency budget.
+
+    - RUNNING child → deliver via the steer primitive; receipt is
+      'delivered'/'queued' (the child folds the text in at its next
+      iteration boundary).
+    - COMPLETED retained child → re-open its persisted transcript as a
+      continued conversation (same lineage resolution as gateway /resume),
+      run the follow-up as the child's next user turn — a NEW user turn in
+      ITS OWN session, so alternation and the cached prefix stay intact —
+      and return the child's new summary.
+    """
+    text = (goal or "").strip()
+    if context and str(context).strip():
+        text = f"{text}\n\nContext: {str(context).strip()}" if text else str(context).strip()
+    if not text:
+        return tool_error(
+            "follow_up requires 'goal' (the message to deliver to the child)."
+        )
+
+    # 1) Running child → steer receipt.
+    live_sid = _resolve_running_child_for_follow_up(follow_up)
+    if live_sid is not None:
+        queued = steer_subagent(live_sid, text)
+        if queued:
+            return json.dumps(
+                {
+                    "status": "queued",
+                    "mode": "follow_up",
+                    "child_id": live_sid,
+                    "receipt": (
+                        "Message queued for the running subagent; it folds in "
+                        "at the child's next iteration boundary (the current "
+                        "tool call is never cut)."
+                    ),
+                },
+                ensure_ascii=False,
+            )
+        # Fall through: the child may have just completed and been retained.
+
+    # 2) Completed retained child → resume its transcript.
+    from tools.async_delegation import (
+        check_follow_up_authority,
+        find_retained_child,
+    )
+
+    entry = find_retained_child(follow_up)
+    if entry is None:
+        return tool_error(
+            f"follow_up target '{follow_up}' is not a running subagent or a "
+            "retained completed child. It may have been tombstoned (removed "
+            "from follow-up messaging), pruned by delegation.retained_ttl_hours, "
+            "or never retained. Its transcript, if any, is still in state.db."
+        )
+
+    requester_sid = getattr(parent_agent, "session_id", None)
+    auth_error = check_follow_up_authority(
+        entry, requester_sid if isinstance(requester_sid, str) else None
+    )
+    if auth_error:
+        return tool_error(auth_error)
+
+    child_session_id = str(entry.get("child_session_id") or "")
+    if not child_session_id:
+        return tool_error(
+            "Retained record has no child session id; cannot resume the "
+            "child's transcript."
+        )
+
+    session_db = getattr(parent_agent, "_session_db", None)
+    if session_db is None:
+        return tool_error(
+            "follow_up on a completed child requires a session database "
+            "(parent agent has none in this runtime)."
+        )
+
+    # Same lineage walk gateway /resume uses: if the child's own session was
+    # compression-rotated, follow the chain to the tip that holds messages.
+    try:
+        resume_sid = session_db.resolve_resume_session_id(child_session_id)
+    except Exception:
+        resume_sid = child_session_id
+    try:
+        history = session_db.get_messages_as_conversation(
+            resume_sid, repair_alternation=True
+        )
+    except Exception as exc:
+        return tool_error(
+            f"Could not load the retained child's transcript ({resume_sid}): {exc}"
+        )
+    if not history:
+        return tool_error(
+            f"Retained child transcript ({resume_sid}) is empty; nothing to resume."
+        )
+    # The stored system prompt is restored from the session row by
+    # run_conversation; keep only the dialogue so it isn't double-injected.
+    history = [m for m in history if m.get("role") != "system"]
+
+    cfg = _load_config()
+    try:
+        creds = _resolve_delegation_credentials(cfg, parent_agent)
+    except ValueError as exc:
+        return tool_error(str(exc))
+
+    overall_start = time.monotonic()
+    child = _build_child_preserving_parent_tools(
+        task_index=0,
+        goal=text,
+        context=None,
+        toolsets=None,
+        model=entry.get("model") or creds["model"],
+        max_iterations=cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS),
+        task_count=1,
+        parent_agent=parent_agent,
+        override_provider=creds["provider"],
+        override_base_url=creds["base_url"],
+        override_api_key=creds["api_key"],
+        override_api_mode=creds["api_mode"],
+        override_request_overrides=creds.get("request_overrides"),
+        override_max_tokens=creds.get("max_output_tokens"),
+        override_acp_command=creds.get("command"),
+        override_acp_args=creds.get("args"),
+        role="leaf",
+        resume_session_id=resume_sid,
+    )
+    # Hand the persisted transcript to the run wrapper: run_conversation
+    # receives it as conversation_history, and the follow-up lands as the
+    # session's next user turn.
+    setattr(child, "_delegate_resume_history", history)
+
+    result = _run_single_child(0, text, child, parent_agent)
+    result.setdefault("task_index", 0)
+    _finalize_child_results(
+        [result], [{"goal": text}], [(0, {"goal": text}, child)], parent_agent
+    )
+    payload = {
+        "mode": "follow_up",
+        "child_id": entry.get("child_id") or child_session_id,
+        "child_session_id": str(getattr(child, "session_id", "") or resume_sid),
+        "delegation_id": entry.get("delegation_id"),
+        "results": [result],
+        "total_duration_seconds": round(time.monotonic() - overall_start, 2),
+        "note": (
+            "Follow-up ran as the retained child's next user turn on its own "
+            "persisted session (budget-exempt: no spawn depth or concurrency "
+            "consumed)."
+        ),
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2981,6 +3236,7 @@ def delegate_task(
     max_iterations: Optional[int] = None,
     role: Optional[str] = None,
     background: Optional[bool] = None,
+    follow_up: Optional[str] = None,
     parent_agent=None,
 ) -> str:
     """
@@ -2995,10 +3251,22 @@ def delegate_task(
     toolset and can spawn its own workers, bounded by
     delegation.max_spawn_depth.  Per-task role beats the top-level one.
 
+    ``follow_up=<child_id>`` switches to follow-up mode (#79686 P1): deliver
+    'goal' to a RUNNING child via steering, or resume a COMPLETED retained
+    child's transcript as its next user turn. Follow-ups are budget-exempt —
+    they are messages, not spawns — so neither the depth limit nor the
+    concurrency budget applies.
+
     Returns JSON with results array, one entry per task.
     """
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
+
+    # Follow-up mode short-circuits BEFORE the spawn-pause kill switch, the
+    # depth limit, and capacity checks: messaging an existing child must
+    # never be blocked by spawn budgets (it is not a spawn).
+    if follow_up is not None and str(follow_up).strip():
+        return _handle_follow_up(str(follow_up).strip(), goal, context, parent_agent)
 
     # Operator-controlled kill switch — lets the TUI freeze new fan-out
     # when a runaway tree is detected, without interrupting already-running
@@ -3559,6 +3827,39 @@ def delegate_task(
 
         if dispatch.get("status") == "dispatched":
             n = len(_goals)
+            # Admission-handle info (#79686 P1): child ids, durable session
+            # ids (transcript paths), and model in the IMMEDIATE return so
+            # the parent can address each child (steer/follow_up) without
+            # waiting for completion.
+            _children_manifest = [
+                {
+                    "subagent_id": (
+                        getattr(c, "_subagent_id", None)
+                        if isinstance(getattr(c, "_subagent_id", None), str)
+                        else None
+                    ),
+                    "session_id": (
+                        getattr(c, "session_id", "")
+                        if isinstance(getattr(c, "session_id", ""), str)
+                        else ""
+                    ),
+                    "model": (
+                        getattr(c, "model", None)
+                        if isinstance(getattr(c, "model", None), str)
+                        else None
+                    ),
+                    "goal": t["goal"][:200],
+                }
+                for (_i, t, c) in children
+            ]
+            try:
+                from tools.async_delegation import record_dispatched_children
+
+                record_dispatched_children(
+                    dispatch["delegation_id"], _children_manifest
+                )
+            except Exception:
+                logger.debug("record_dispatched_children failed", exc_info=True)
             note = (
                 "Subagent is running in the background. You and the user can "
                 "keep working; its full result re-enters the conversation as a "
@@ -3577,6 +3878,7 @@ def delegate_task(
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
+                "children": _children_manifest,
                 "note": note,
             }
             if live_paths:
@@ -4065,6 +4367,22 @@ DELEGATE_TASK_SCHEMA = {
                     "backward compatibility."
                 ),
             },
+            "follow_up": {
+                "type": "string",
+                "description": (
+                    "Follow-up mode: the id of an existing subagent to message "
+                    "instead of spawning a new one. Pass the subagent_id or "
+                    "child session_id from a previous delegate_task dispatch or "
+                    "result, with 'goal' as the message. A RUNNING child "
+                    "receives it as steering at its next iteration boundary "
+                    "(receipt: queued); a COMPLETED retained child is resumed — "
+                    "its saved conversation continues with your message as the "
+                    "next turn and its new summary is returned. Follow-ups are "
+                    "not spawns: they never consume the delegation depth or "
+                    "concurrency budget. When follow_up is set, tasks/role are "
+                    "ignored."
+                ),
+            },
         },
         "required": [],
     },
@@ -4125,6 +4443,7 @@ registry.register(
         max_iterations=args.get("max_iterations"),
         role=args.get("role"),
         background=_model_background_value(args, kw.get("parent_agent")),
+        follow_up=args.get("follow_up"),
         parent_agent=kw.get("parent_agent"),
     ),
     check_fn=check_delegate_requirements,

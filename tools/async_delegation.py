@@ -173,9 +173,46 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         # completions recovered after a process restart are unroutable on
         # api_server (the in-memory record that carried it is gone).
         ("origin_session_id", "TEXT"),
+        # ── Durable retained-subagent registry (tracker #79686 P1) ──
+        # child_session_id: durable state.db session id of a SINGLE child
+        # (nullable; batches use children_json). children_json: JSON list of
+        # {subagent_id, session_id, model, goal} for every child in the unit.
+        # retained/retained_at: the completed child is addressable for
+        # delegate_task(follow_up=...) resume. tombstoned_at: de-registered
+        # from follow-up messaging (transcript/artifacts are NEVER erased).
+        # owner_profile: profile key that dispatched the unit — foreign-
+        # profile follow-ups are rejected. usage_json: last known child usage
+        # rollup for observability.
+        ("child_session_id", "TEXT"),
+        ("children_json", "TEXT"),
+        ("retained", "INTEGER"),
+        ("retained_at", "REAL"),
+        ("tombstoned_at", "REAL"),
+        ("owner_profile", "TEXT"),
+        ("usage_json", "TEXT"),
     ):
         if name not in columns:
             conn.execute(f"ALTER TABLE async_delegations ADD COLUMN {name} {sql_type}")
+    # Persisted child-usage attribution (tracker #79686 P1): each row records
+    # one child's usage rolled into a parent session's aggregate so the
+    # parent's subagent cost rollup survives process restarts and session
+    # reloads (reapply-on-load — see load_child_usage_totals). PR #62206
+    # attempted a one-shot additive write; this is the durable reapply design.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS delegation_child_usage (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            parent_session_id TEXT NOT NULL,
+            parent_turn_id TEXT NOT NULL DEFAULT '',
+            child_session_id TEXT NOT NULL DEFAULT '',
+            usage_json TEXT NOT NULL,
+            aggregate_json TEXT,
+            created_at REAL NOT NULL
+        )"""
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delegation_child_usage_parent "
+        "ON delegation_child_usage(parent_session_id)"
+    )
 
 
 @contextmanager
@@ -280,6 +317,16 @@ def _persist_completion(event: Dict[str, Any], result: Dict[str, Any]) -> None:
             (event.get("status", "completed"), event.get("completed_at", now), now,
              json.dumps(event), json.dumps(result), event["delegation_id"]),
         )
+    # Retained-subagent registry (#79686 P1): a successfully completed unit's
+    # children stay follow-up addressable until tombstoned or TTL-pruned.
+    if event.get("status") == "completed":
+        try:
+            retain_completed_delegation(
+                str(event["delegation_id"]),
+                usage=result.get("usage") if isinstance(result, dict) else None,
+            )
+        except Exception:
+            logger.debug("retain_completed_delegation failed", exc_info=True)
 
 
 def _note_delivery_attempt(delegation_id: str) -> None:
@@ -338,6 +385,12 @@ def recover_abandoned_delegations() -> int:
                 (now, now, json.dumps(event), json.dumps(result), delegation_id),
             )
             recovered += 1
+    # Retained children survive restarts by construction (durable rows);
+    # validate + TTL-prune the reconnectable set as part of recovery.
+    try:
+        rehydrate_retained_children()
+    except Exception:
+        logger.debug("retained-children rehydration failed", exc_info=True)
     return recovered
 
 
@@ -1495,6 +1548,382 @@ def interrupt_for_session(
             count, reason,
         )
     return count
+
+
+# ---------------------------------------------------------------------------
+# Durable retained-subagent registry (tracker #79686 P1)
+# ---------------------------------------------------------------------------
+# A completed child whose delegation unit is RETAINED stays addressable for
+# delegate_task(follow_up=<child_id>): its persisted transcript can be
+# re-opened as a continued conversation. Rows live in the same durable
+# async_delegations table (retained/retained_at/tombstoned_at/children_json
+# columns), so restart rehydration is inherent — recover_abandoned_delegations
+# proves the restart path and rehydrate_retained_children() reports the
+# reconnectable set after boot. Tombstoning de-registers a child from
+# follow-up messaging but NEVER erases its transcript or artifacts.
+
+_DEFAULT_MAX_RETAINED = 10
+_DEFAULT_RETAINED_TTL_HOURS = 72.0
+
+
+def _retention_limits() -> tuple[int, float]:
+    """(max_retained, ttl_hours) from delegation config, with safe floors."""
+    max_retained = _DEFAULT_MAX_RETAINED
+    ttl_hours = _DEFAULT_RETAINED_TTL_HOURS
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        cfg = (load_config_readonly().get("delegation") or {})
+        if isinstance(cfg, dict):
+            max_retained = max(1, int(cfg.get("max_retained", max_retained)))
+            ttl_hours = max(1.0, float(cfg.get("retained_ttl_hours", ttl_hours)))
+    except Exception:
+        pass
+    return max_retained, ttl_hours
+
+
+def _current_owner_profile() -> str:
+    try:
+        from agent.relay_runtime import current_profile_key
+
+        profile = current_profile_key()
+        return profile.strip() if isinstance(profile, str) else ""
+    except Exception:
+        return ""
+
+
+def _open_session_db_readonly():
+    from hermes_state import SessionDB
+
+    return SessionDB(get_hermes_home() / "state.db", read_only=True)
+
+
+def _lineage_root(session_id: Optional[str]) -> Optional[str]:
+    """Compression-only ownership root for ``session_id``, or None on doubt.
+
+    Authority model from #76512 (@0xbWy): only the compression-continuation
+    lineage of the spawning session owns a retained child. Branch, delegate,
+    and tool sessions resolve to None so sibling/cycle/foreign follow-ups
+    fail closed.
+    """
+    if not isinstance(session_id, str) or not session_id.strip():
+        return None
+    try:
+        db = _open_session_db_readonly()
+        try:
+            return db.get_compression_lineage_root(session_id.strip())
+        finally:
+            db.close()
+    except Exception:
+        return None
+
+
+def record_dispatched_children(
+    delegation_id: str, children: List[Dict[str, Any]]
+) -> None:
+    """Persist the child identity manifest for a dispatched unit.
+
+    ``children``: list of {subagent_id, session_id, model, goal} dicts,
+    captured at spawn so the immediate delegate_task return payload and the
+    durable registry agree on child identities.
+    """
+    if not delegation_id:
+        return
+    single_sid = (
+        str(children[0].get("session_id") or "") if len(children) == 1 else None
+    )
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET children_json=?, child_session_id=?, owner_profile=?,
+                   updated_at=?
+               WHERE delegation_id=?""",
+            (
+                json.dumps(children, ensure_ascii=False),
+                single_sid,
+                _current_owner_profile(),
+                time.time(),
+                delegation_id,
+            ),
+        )
+
+
+def retain_completed_delegation(
+    delegation_id: str, usage: Optional[Dict[str, Any]] = None
+) -> None:
+    """Mark a completed unit's children as retained (follow-up addressable)."""
+    if not delegation_id:
+        return
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE async_delegations
+               SET retained=1, retained_at=?, usage_json=?, updated_at=?
+               WHERE delegation_id=? AND tombstoned_at IS NULL""",
+            (
+                now,
+                json.dumps(usage, ensure_ascii=False) if usage else None,
+                now,
+                delegation_id,
+            ),
+        )
+    prune_retained_children()
+
+
+def _retained_rows(conn) -> List[Any]:
+    return conn.execute(
+        """SELECT delegation_id, parent_session_id, owner_profile, state,
+                  retained_at, children_json, child_session_id, usage_json,
+                  task_json, completed_at
+           FROM async_delegations
+           WHERE retained=1 AND tombstoned_at IS NULL
+           ORDER BY retained_at DESC"""
+    ).fetchall()
+
+
+def _row_children(row) -> List[Dict[str, Any]]:
+    try:
+        children = json.loads(row[5] or "[]")
+    except (TypeError, ValueError):
+        children = []
+    if not children and row[6]:
+        children = [{"session_id": row[6]}]
+    return [c for c in children if isinstance(c, dict)]
+
+
+def list_retained_children() -> List[Dict[str, Any]]:
+    """Snapshot of every follow-up-addressable retained child."""
+    prune_retained_children()
+    out: List[Dict[str, Any]] = []
+    with _DB_LOCK, _transaction() as conn:
+        rows = _retained_rows(conn)
+    for row in rows:
+        for child in _row_children(row):
+            out.append(
+                {
+                    "delegation_id": row[0],
+                    "parent_session_id": row[1],
+                    "owner_profile": row[2] or "",
+                    "state": row[3],
+                    "retained_at": row[4],
+                    "completed_at": row[9],
+                    "child_id": child.get("subagent_id")
+                    or child.get("session_id") or "",
+                    "child_session_id": child.get("session_id") or "",
+                    "model": child.get("model"),
+                    "goal": child.get("goal"),
+                }
+            )
+    return out
+
+
+def find_retained_child(child_id: str) -> Optional[Dict[str, Any]]:
+    """Resolve a retained child by subagent id, session id, or delegation id."""
+    if not child_id or not isinstance(child_id, str):
+        return None
+    child_id = child_id.strip()
+    for entry in list_retained_children():
+        if child_id in (
+            entry.get("child_id"),
+            entry.get("child_session_id"),
+            entry.get("delegation_id"),
+        ):
+            return entry
+    return None
+
+
+def tombstone_retained_child(child_id: str) -> bool:
+    """De-register a retained child from follow-up messaging.
+
+    The tombstone removes ADDRESSABILITY only: the child's transcript rows in
+    state.db and any files it produced are never touched. Returns True when a
+    matching retained row was tombstoned.
+    """
+    entry = find_retained_child(child_id)
+    if entry is None:
+        return False
+    now = time.time()
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE delegation_id=? AND retained=1 AND tombstoned_at IS NULL""",
+            (now, now, entry["delegation_id"]),
+        )
+        return cur.rowcount == 1
+
+
+def prune_retained_children(
+    max_retained: Optional[int] = None, ttl_hours: Optional[float] = None
+) -> int:
+    """TTL + cap pruning: tombstone (never delete) expired/excess retained rows."""
+    cfg_max, cfg_ttl = _retention_limits()
+    max_retained = cfg_max if max_retained is None else max(1, int(max_retained))
+    ttl_hours = cfg_ttl if ttl_hours is None else max(0.0, float(ttl_hours))
+    now = time.time()
+    cutoff = now - ttl_hours * 3600.0
+    pruned = 0
+    with _DB_LOCK, _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+               WHERE retained=1 AND tombstoned_at IS NULL AND retained_at < ?""",
+            (now, now, cutoff),
+        )
+        pruned += cur.rowcount
+        live = conn.execute(
+            """SELECT delegation_id FROM async_delegations
+               WHERE retained=1 AND tombstoned_at IS NULL
+               ORDER BY retained_at DESC"""
+        ).fetchall()
+        for (stale_id,) in live[max_retained:]:
+            cur = conn.execute(
+                """UPDATE async_delegations SET tombstoned_at=?, updated_at=?
+                   WHERE delegation_id=? AND tombstoned_at IS NULL""",
+                (now, now, stale_id),
+            )
+            pruned += cur.rowcount
+    return pruned
+
+
+def rehydrate_retained_children() -> int:
+    """Restart-rehydration hook: prune expired rows, count reconnectables.
+
+    Called from recover_abandoned_delegations() so a process restart proves
+    the retained registry is still addressable (rows are durable; nothing to
+    rebuild in memory — this validates and reports the reconnectable set).
+    """
+    prune_retained_children()
+    count = len(list_retained_children())
+    if count:
+        logger.info("Rehydrated %d retained subagent record(s) after restart", count)
+    return count
+
+
+def check_follow_up_authority(
+    entry: Dict[str, Any], requester_session_id: Optional[str]
+) -> Optional[str]:
+    """Return an error string when the requester may NOT follow up, else None.
+
+    Ownership model (design credit @0xbWy, #76512): the requester must be in
+    the same profile AND share the retained delegation's compression-only
+    lineage root with the spawning session. Branch/delegate/tool sessions
+    have no lineage root, so sibling children, cycles (a child following up
+    itself or its parent chain), and foreign sessions all fail closed.
+    """
+    owner_profile = str(entry.get("owner_profile") or "")
+    profile = _current_owner_profile()
+    if owner_profile and profile and owner_profile != profile:
+        return (
+            "follow_up rejected: retained subagent belongs to profile "
+            f"'{owner_profile}', not '{profile}'."
+        )
+    child_session_id = str(entry.get("child_session_id") or "")
+    if (
+        requester_session_id
+        and child_session_id
+        and requester_session_id.strip() == child_session_id
+    ):
+        return "follow_up rejected: a subagent cannot follow up on itself."
+    owner_root = _lineage_root(entry.get("parent_session_id"))
+    requester_root = _lineage_root(requester_session_id)
+    if owner_root is None or requester_root is None or owner_root != requester_root:
+        return (
+            "follow_up rejected: only the session lineage that spawned this "
+            "subagent may message it (compression-rotation continuations "
+            "included; branches, siblings, and foreign sessions are not owners)."
+        )
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Persisted child-usage attribution (tracker #79686 P1)
+# ---------------------------------------------------------------------------
+
+
+def record_child_usage_attribution(
+    *,
+    parent_session_id: str,
+    parent_turn_id: str = "",
+    child_session_id: str = "",
+    usage: Dict[str, Any],
+    aggregate: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Persist one child's usage rollup into the parent's durable ledger."""
+    if not parent_session_id:
+        return
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """INSERT INTO delegation_child_usage
+               (parent_session_id, parent_turn_id, child_session_id,
+                usage_json, aggregate_json, created_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (
+                parent_session_id,
+                parent_turn_id or "",
+                child_session_id or "",
+                json.dumps(usage, ensure_ascii=False),
+                json.dumps(aggregate, ensure_ascii=False) if aggregate else None,
+                time.time(),
+            ),
+        )
+
+
+def load_child_usage_attributions(
+    parent_session_id: str,
+) -> List[Dict[str, Any]]:
+    """All persisted child-usage records for one parent session, oldest first."""
+    if not parent_session_id:
+        return []
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT parent_turn_id, child_session_id, usage_json,
+                      aggregate_json, created_at
+               FROM delegation_child_usage
+               WHERE parent_session_id=? ORDER BY id""",
+            (parent_session_id,),
+        ).fetchall()
+    out = []
+    for turn_id, child_sid, usage_json, aggregate_json, created_at in rows:
+        try:
+            usage = json.loads(usage_json)
+        except (TypeError, ValueError):
+            usage = {}
+        try:
+            aggregate = json.loads(aggregate_json) if aggregate_json else None
+        except (TypeError, ValueError):
+            aggregate = None
+        out.append(
+            {
+                "parent_turn_id": turn_id,
+                "child_session_id": child_sid,
+                "usage": usage,
+                "aggregate": aggregate,
+                "created_at": created_at,
+            }
+        )
+    return out
+
+
+def load_child_usage_totals(parent_session_id: str) -> Dict[str, float]:
+    """Summed child usage for reapply-on-load (cost/tokens attribution).
+
+    Session-load paths call this to re-seed the parent agent's in-memory
+    subagent cost aggregate so it survives process restarts — the reapply
+    design that replaces #62206's lost one-shot additive write.
+    """
+    totals = {"cost_usd": 0.0, "input_tokens": 0.0, "output_tokens": 0.0}
+    for rec in load_child_usage_attributions(parent_session_id):
+        usage = rec.get("usage") or {}
+        try:
+            totals["cost_usd"] += float(usage.get("cost_usd") or 0.0)
+        except (TypeError, ValueError):
+            pass
+        tokens = usage.get("tokens") or {}
+        for src, dst in (("input", "input_tokens"), ("output", "output_tokens")):
+            try:
+                totals[dst] += float(tokens.get(src) or 0.0)
+            except (TypeError, ValueError):
+                pass
+    return totals
 
 
 def _reset_for_tests() -> None:
