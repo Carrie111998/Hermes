@@ -21,7 +21,7 @@ import pytest
 
 from agent.background_tasks import (
     BackgroundTaskError,
-    ExternalBackgroundTasksService,
+    _ExternalBackgroundTasksService,
     _create_external_background_tasks_service,
     ExternalTaskHandle,
     ExternalTaskResult,
@@ -88,7 +88,7 @@ def test_plugin_context_lazily_exposes_service_and_captures_identity():
 
     assert ctx._background_tasks is None
     svc = ctx.background_tasks
-    assert isinstance(svc, ExternalBackgroundTasksService)
+    assert isinstance(svc, _ExternalBackgroundTasksService)
     assert svc is ctx.background_tasks  # cached, built once
     assert svc.plugin_id == "ext-tasks-plugin"
 
@@ -119,10 +119,17 @@ def test_plugin_context_snapshots_identity_before_lazy_service_access():
 
 def test_direct_service_construction_is_host_only():
     with pytest.raises(BackgroundTaskError, match="host-owned"):
-        ExternalBackgroundTasksService(
+        _ExternalBackgroundTasksService(
             plugin_id="plugin-b",
             parent_agent_resolver=get_active_host_parent,
         )
+
+
+def test_service_implementation_is_not_a_public_module_export():
+    import agent.background_tasks as background_tasks
+
+    assert "ExternalBackgroundTasksService" not in background_tasks.__all__
+    assert not hasattr(background_tasks, "ExternalBackgroundTasksService")
 
 
 def test_plugin_service_identity_is_read_only():
@@ -217,7 +224,7 @@ def test_register_cannot_be_forged_through_method_parameters():
     """The public surface has no parent/session parameters at all."""
     import inspect
 
-    sig = inspect.signature(ExternalBackgroundTasksService.register_external)
+    sig = inspect.signature(_ExternalBackgroundTasksService.register_external)
     params = set(sig.parameters)
     assert params == {
         "self",

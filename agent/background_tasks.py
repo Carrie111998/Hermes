@@ -92,7 +92,6 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "PUBLIC_CONTRACT_VERSION",
     "BackgroundTaskError",
-    "ExternalBackgroundTasksService",
     "ExternalTaskHandle",
     "ExternalTaskResult",
     "ExternalTaskState",
@@ -111,17 +110,17 @@ _HOST_SERVICE_CAPABILITY = object()
 
 def _create_external_background_tasks_service(
     *, plugin_id: str, parent_agent_resolver: Callable[[], Any]
-) -> "ExternalBackgroundTasksService":
+) -> "_ExternalBackgroundTasksService":
     """Host-private constructor used by :class:`PluginContext` and core tests."""
 
-    return ExternalBackgroundTasksService(
+    return _ExternalBackgroundTasksService(
         plugin_id=plugin_id,
         parent_agent_resolver=parent_agent_resolver,
         _host_capability=_HOST_SERVICE_CAPABILITY,
     )
 
 
-class ExternalBackgroundTasksService:
+class _ExternalBackgroundTasksService:
     """Stable public service returned by :attr:`PluginContext.background_tasks`.
 
     ``plugin_id`` is captured from the ``PluginContext`` manifest (never passed
