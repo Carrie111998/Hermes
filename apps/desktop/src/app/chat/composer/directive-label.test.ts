@@ -116,6 +116,27 @@ describe('one label per reference, on every surface', () => {
     expect(composerPlainText(editor)).toBe('@folder:apps/desktop/')
   })
 
+  it('picking the @blame: starter inserts once, not @blame:@blame:', () => {
+    // Gateway returns text="@blame:"; classify must treat it as a typed starter
+    // with an empty value. If the whole string is mistaken for insertId,
+    // serialize rebuilds `@blame:` + `@blame:` -> `@blame:@blame:`.
+    const item = backendRow('@blame:', '@blame:', 'git blame')
+
+    expect(classify({ text: '@blame:', display: '@blame:', meta: 'git blame' })).toEqual({
+      type: 'blame',
+      insertId: '',
+      display: '@blame:',
+      meta: 'git blame'
+    })
+    expect(hermesDirectiveFormatter.serialize(item)).toBe('@blame:')
+
+    const { editor, result } = typed('@blame')
+
+    act(() => result.current.replaceTriggerWithChip(item))
+
+    expect(composerPlainText(editor)).toBe('@blame:')
+  })
+
   it('a url still reads host + path on every surface', () => {
     const item = backendRow('@url:https://github.com/NousResearch/hermes-agent/pull/74533', '', '')
     const { editor, result } = typed('@gith')

@@ -89,8 +89,20 @@ def test_bare_at_still_shows_static_refs(tmp_path, monkeypatch):
 
     texts = [t for t, _, _ in _items("@")]
 
-    for expected in ("@diff", "@staged", "@file:", "@folder:", "@url:", "@git:"):
+    for expected in ("@diff", "@staged", "@file:", "@folder:", "@url:", "@git:", "@blame:"):
         assert expected in texts, f"missing static ref {expected!r} in {texts!r}"
+
+
+def test_at_blame_colon_only_files(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    _fixture(tmp_path)
+
+    texts = [t for t, _, _ in _items("@blame:")]
+
+    assert all(t.startswith("@blame:") for t in texts), texts
+    assert any(t == "@blame:readme.md" for t in texts)
+    assert not any(t == "@blame:src/" for t in texts)
+    assert not any(t == "@blame:docs/" for t in texts)
 
 
 # ── Fuzzy basename matching ──────────────────────────────────────────────

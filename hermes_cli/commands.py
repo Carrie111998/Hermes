@@ -1676,6 +1676,7 @@ class SlashCommandCompleter(Completer):
             ("@file:", "Attach a file"),
             ("@folder:", "Attach a folder"),
             ("@git:", "Git log with diffs (e.g. @git:5)"),
+            ("@blame:", "Git blame for a file (e.g. @blame:main.py:10-20)"),
             ("@url:", "Fetch web content"),
         )
         for candidate, meta in _STATIC_REFS:
@@ -1687,12 +1688,12 @@ class SlashCommandCompleter(Completer):
                     display_meta=meta,
                 )
 
-        # If the user typed @file: / @folder: (or just @file / @folder with
+        # If the user typed @file: / @folder: / @blame: (or the bare keyword with
         # no colon yet), delegate to path completions.  Accepting the bare
         # form lets the picker surface directories as soon as the user has
         # typed `@folder`, without requiring them to first accept the static
         # `@folder:` hint and re-trigger completion.
-        for prefix in ("@file:", "@folder:"):
+        for prefix in ("@file:", "@folder:", "@blame:"):
             bare = prefix[:-1]
 
             if word == bare or word.startswith(prefix):
@@ -1720,8 +1721,8 @@ class SlashCommandCompleter(Completer):
                         continue
                     full_path = os.path.join(search_dir, entry)
                     is_dir = os.path.isdir(full_path)
-                    # `@folder:` must only surface directories; `@file:` only
-                    # regular files.  Without this filter `@folder:` listed
+                    # `@folder:` must only surface directories; `@file:` / `@blame:`
+                    # only regular files.  Without this filter `@folder:` listed
                     # every .env / .gitignore in the cwd, defeating the
                     # explicit prefix and confusing users expecting a
                     # directory picker.

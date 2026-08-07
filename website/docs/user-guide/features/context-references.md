@@ -19,6 +19,8 @@ Type `@` followed by a reference to inject content directly into your message. H
 | `@diff` | Inject `git diff` (unstaged working tree changes) |
 | `@staged` | Inject `git diff --staged` (staged changes) |
 | `@git:5` | Inject last N commits with patches (max 10) |
+| `@blame:path/to/file.py` | Inject `git blame` for a file |
+| `@blame:path/to/file.py:10-25` | Inject `git blame` for a line range |
 | `@url:https://example.com` | Fetch and inject web page content |
 
 ## Usage Examples
@@ -47,20 +49,21 @@ Trailing punctuation (`,`, `.`, `;`, `!`, `?`) is automatically stripped from re
 
 In the interactive CLI, typing `@` triggers autocomplete:
 
-- `@` shows all reference types (`@diff`, `@staged`, `@file:`, `@folder:`, `@git:`, `@url:`)
-- `@file:` and `@folder:` trigger filesystem path completion with file size metadata
+- `@` shows all reference types (`@diff`, `@staged`, `@file:`, `@folder:`, `@git:`, `@blame:`, `@url:`)
+- `@file:`, `@folder:`, and `@blame:` trigger filesystem path completion with file size metadata
 - Bare `@` followed by partial text shows matching files and folders from the current directory
 
 ## Line Ranges
 
-The `@file:` reference supports line ranges for precise content injection:
+The `@file:` and `@blame:` references support line ranges for precise content injection:
 
 ```text
 @file:src/main.py:42        # Single line 42
 @file:src/main.py:10-25     # Lines 10 through 25 (inclusive)
+@blame:src/main.py:10-25    # git blame for lines 10 through 25
 ```
 
-Lines are 1-indexed. Invalid ranges are silently ignored (full file is returned).
+Lines are 1-indexed. For `@file:`, invalid ranges are silently ignored (full file is returned).
 
 ## Size Limits
 

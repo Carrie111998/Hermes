@@ -118,6 +118,13 @@ describe('detectTrigger', () => {
     // A scope with nothing typed after it is the empty-browse state the
     // popover renders a header for.
     expect(detectTrigger('@url:')).toEqual({ kind: '@', query: 'url:', scope: 'url', tokenLength: 5, value: '' })
+    expect(detectTrigger('@blame:src/main.py')).toEqual({
+      kind: '@',
+      query: 'blame:src/main.py',
+      scope: 'blame',
+      tokenLength: 18,
+      value: 'src/main.py'
+    })
   })
 
   it('only treats a KNOWN kind as a scope', () => {

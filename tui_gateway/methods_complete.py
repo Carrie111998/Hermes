@@ -58,15 +58,16 @@ def _(rid, params: dict) -> dict:
                 {"text": "@folder:", "display": "@folder:", "meta": "attach folder"},
                 {"text": "@url:", "display": "@url:", "meta": "fetch url"},
                 {"text": "@git:", "display": "@git:", "meta": "git log"},
+                {"text": "@blame:", "display": "@blame:", "meta": "git blame"},
             ]
             return _ok(rid, {"items": items})
 
         # Accept both `@folder:path` and the bare `@folder` form so the user
         # sees directory listings as soon as they finish typing the keyword,
         # without first accepting the static `@folder:` hint.
-        if is_context and query in {"file", "folder"}:
+        if is_context and query in {"file", "folder", "blame"}:
             prefix_tag, path_part = query, ""
-        elif is_context and query.startswith(("file:", "folder:")):
+        elif is_context and query.startswith(("file:", "folder:", "blame:")):
             prefix_tag, _, tail = query.partition(":")
             path_part = tail
         else:

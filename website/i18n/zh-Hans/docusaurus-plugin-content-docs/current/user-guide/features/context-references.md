@@ -19,6 +19,8 @@ description: "用于将文件、文件夹、git diff 及 URL 直接附加到消�
 | `@diff` | 注入 `git diff`（未暂存的工作区变更） |
 | `@staged` | 注入 `git diff --staged`（已暂存的变更） |
 | `@git:5` | 注入最近 N 次提交及补丁（最多 10 次） |
+| `@blame:path/to/file.py` | 注入文件的 `git blame` |
+| `@blame:path/to/file.py:10-25` | 注入指定行范围的 `git blame` |
 | `@url:https://example.com` | 抓取并注入网页内容 |
 
 ## 使用示例
@@ -47,20 +49,21 @@ Check @file:main.py, and also @file:test.py.
 
 在交互式 CLI 中，输入 `@` 会触发自动补全：
 
-- `@` 显示所有引用类型（`@diff`、`@staged`、`@file:`、`@folder:`、`@git:`、`@url:`）
-- `@file:` 和 `@folder:` 触发文件系统路径补全，并显示文件大小元数据
+- `@` 显示所有引用类型（`@diff`、`@staged`、`@file:`、`@folder:`、`@git:`、`@blame:`、`@url:`）
+- `@file:`、`@folder:` 和 `@blame:` 触发文件系统路径补全，并显示文件大小元数据
 - 裸 `@` 后跟部分文本时，显示当前目录中匹配的文件和文件夹
 
 ## 行范围
 
-`@file:` 引用支持行范围，用于精确注入内容：
+`@file:` 和 `@blame:` 引用支持行范围，用于精确注入内容：
 
 ```text
 @file:src/main.py:42        # 单行第 42 行
 @file:src/main.py:10-25     # 第 10 至 25 行（含首尾）
+@blame:src/main.py:10-25    # 第 10 至 25 行的 git blame
 ```
 
-行号从 1 开始。无效范围会被静默忽略（返回完整文件）。
+行号从 1 开始。对 `@file:`，无效范围会被静默忽略（返回完整文件）。
 
 ## 大小限制
 

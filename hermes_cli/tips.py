@@ -49,6 +49,8 @@ TIPS = [
     "@diff injects your unstaged git changes into the message.",
     "@staged injects your staged git changes (git diff --staged).",
     "@git:5 injects the last 5 commits with full patches.",
+    "@blame:main.py injects git blame for a file (who last touched each line).",
+    "@blame:main.py:10-20 injects git blame for only those lines.",
     "@url:https://example.com fetches and injects a web page's content.",
     "Typing @ triggers filesystem path completion — navigate to any file interactively.",
     "Combine multiple references: \"Review @file:main.py and @file:test.py for consistency.\"",
