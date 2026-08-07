@@ -768,6 +768,20 @@ button,
   user-select: none;
 }
 
+/* Button chrome uses one generous system radius so borders, hover fills, and
+   inset outlines read as a single, polished shape. This intentionally reaches
+   native buttons too: a number of lightweight controls render without the
+   shared Button primitive. Explicit pill controls keep their full radius. */
+button,
+[role='button'] {
+  border-radius: var(--radius-sm);
+}
+
+button[class*='rounded-full'],
+[role='button'][class*='rounded-full'] {
+  border-radius: calc(var(--radius-scalar) * 9999rem);
+}
+
 img,
 picture,
 video,
@@ -1412,7 +1426,7 @@ text-* variant utilities. */ .btn-arc {
 /* Message action bars — flat icon hits with default dim; only the hovered/focused control is full-strength. */
 [data-slot='aui_msg-actions'] button {
   border: 0;
-  border-radius: 0;
+  border-radius: var(--radius-sm);
   background: transparent;
   box-shadow: none;
   padding: 0;
