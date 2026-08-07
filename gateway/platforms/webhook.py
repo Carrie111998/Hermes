@@ -27,6 +27,9 @@ Security:
     binds a timestamp into the signed data for replay protection; the
     legacy body-only V1 (X-Webhook-Signature) is deprecated but still
     accepted with a warning, since it has no replay protection
+  - X-Webhook-Secret plain shared-secret header (PostHog, n8n, Zapier,
+    Make.com): bearer-token pattern — the header value IS the secret,
+    TLS provides confidentiality in transit (same model as X-Gitlab-Token)
   - Set secret to "INSECURE_NO_AUTH" to skip validation (testing only)
 """
 
