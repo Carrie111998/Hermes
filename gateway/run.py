@@ -4762,6 +4762,7 @@ class TurnRunner:
             if _peek_entry and len(_peek_entry) > 3:
                 _peek_cached_sid = _peek_entry[3]
         _cached_sid_is_dead = False
+        _peek_cached_cua_generation = None
         if (
             _peek_cached_sid is not None
             and ctx.session_id is not None
@@ -4773,6 +4774,19 @@ class TurnRunner:
                 )
             except Exception:
                 _cached_sid_is_dead = False
+            if _cached_sid_is_dead and _peek_cached_sid:
+                try:
+                    from tools.computer_use import get_computer_use_session_generation
+
+                    _peek_cached_cua_generation = get_computer_use_session_generation(
+                        _peek_cached_sid
+                    )
+                except Exception:
+                    logger.debug(
+                        "Could not snapshot computer_use generation for dead session %s",
+                        _peek_cached_sid,
+                        exc_info=True,
+                    )
 
         # Detect cross-process writes: when another process (e.g. hermes
         # dashboard) appends to the same session in the shared SessionDB,
@@ -4791,6 +4805,7 @@ class TurnRunner:
                 pass
 
         _xproc_evicted_agent = None
+        _xproc_evicted_cua_release = None
         if _cache_lock and _cache is not None:
             with _cache_lock:
                 cached = _cache.get(ctx.session_key)
@@ -4856,6 +4871,15 @@ class TurnRunner:
                             # block the event loop / cache lock on
                             # memory-provider shutdown or socket teardown.
                             _xproc_evicted_agent = _ev_agent
+                            if (
+                                isinstance(_cached_sid, str)
+                                and _cached_sid.strip()
+                                and _peek_cached_cua_generation is not None
+                            ):
+                                _xproc_evicted_cua_release = (
+                                    _cached_sid,
+                                    _peek_cached_cua_generation,
+                                )
                     elif (
                         not _session_id_mismatch
                         and _cached_mc is not None
@@ -4915,25 +4939,22 @@ class TurnRunner:
                 agent, self._runner._refresh_fallback_model(),
             )
 
-        # Lock released — now schedule cleanup of any cross-process-evicted
-        # agent on a daemon thread so memory-provider shutdown / socket
-        # teardown never blocks the gateway event loop or the cache lock
-        # the session-expiry watcher needs (#52197).
+        # Lock released — perform cleanup in this tracked turn worker. The
+        # helper itself uses bounded computer_use quiescence and an exact
+        # (session_id, generation) token for hard dead-session boundaries.
+        # Generic same-session transcript refresh remains soft.
         if _xproc_evicted_agent is not None:
             try:
-                threading.Thread(
-                    target=self._runner._release_evicted_agent_soft,
-                    args=(_xproc_evicted_agent,),
-                    daemon=True,
-                    name=f"agent-xproc-evict-{str(ctx.session_key)[:24]}",
-                ).start()
+                self._runner._release_evicted_agent_soft(
+                    _xproc_evicted_agent,
+                    computer_use_release=_xproc_evicted_cua_release,
+                )
             except Exception:
-                # Interpreter shutdown or thread-spawn failure — release
-                # inline as a best-effort fallback.
-                try:
-                    self._runner._release_evicted_agent_soft(_xproc_evicted_agent)
-                except Exception:
-                    pass
+                logger.warning(
+                    "Tracked cross-process agent cleanup failed for %s",
+                    ctx.session_key,
+                    exc_info=True,
+                )
 
         if agent is None:
             # Config changed or first message — create fresh agent
@@ -13285,6 +13306,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(self, '_busy_ack_ts'):
                 self._busy_ack_ts.clear()
             self._shutdown_event.set()
+
+            # Drain exact-generation CUA cleanup submitted by dead-cache
+            # invalidation. Keep the event loop responsive and bound the wait;
+            # the final process sweep below remains the last-resort containment.
+            try:
+                from tools.computer_use import (
+                    computer_use_cleanup_snapshot,
+                    drain_computer_use_cleanup,
+                )
+
+                _cua_drained = await asyncio.to_thread(
+                    drain_computer_use_cleanup,
+                    10.0,
+                )
+                if not _cua_drained:
+                    logger.warning(
+                        "Timed out draining computer_use cleanup supervisor: %s",
+                        computer_use_cleanup_snapshot(),
+                    )
+            except Exception as _e:
+                logger.debug("computer_use cleanup drain error: %s", _e)
 
             # Global cleanup: kill any remaining tool subprocesses not tied
             # to a specific agent (catch-all for zombie prevention). On the
@@ -24105,18 +24147,75 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._commit_memory_before_soft_evict(agent, key)
         self._release_evicted_agent_soft(agent)
 
-    def _release_evicted_agent_soft(self, agent: Any) -> None:
-        """Soft cleanup for cache-evicted agents — preserves session tool state.
-
-        Called from _enforce_agent_cache_cap and _sweep_idle_cached_agents.
-        Distinct from _cleanup_agent_resources (full teardown) because a
-        cache-evicted session may resume at any time — its terminal
-        sandbox, browser daemon, and tracked bg processes must outlive
-        the Python AIAgent instance so the next agent built for the
-        same task_id inherits them.
-        """
+    def _release_evicted_agent_soft(
+        self,
+        agent: Any,
+        *,
+        computer_use_release: Optional[tuple[str, int]] = None,
+    ) -> Any:
+        """Release agent clients; optionally close one exact dead-session CUA generation."""
         if agent is None:
-            return
+            return None
+        release_result = None
+        if computer_use_release is not None:
+            sid, generation = computer_use_release
+            agent_sid = str(getattr(agent, "session_id", "") or "")
+            if (
+                not sid
+                or not isinstance(generation, int)
+                or isinstance(generation, bool)
+                or generation <= 0
+                or agent_sid != sid
+            ):
+                logger.error(
+                    "Rejected computer_use hard release: agent_sid=%s request_sid=%s "
+                    "generation=%r",
+                    agent_sid,
+                    sid,
+                    generation,
+                )
+            else:
+                try:
+                    from tools.computer_use import submit_computer_use_session_release
+
+                    release_result = submit_computer_use_session_release(
+                        sid,
+                        expected_generation=generation,
+                        timeout=5.0,
+                        reason="dead_cached_session",
+                        max_attempts=3,
+                        retry_delay=0.25,
+                    )
+
+                    def _log_cua_release(done: Any) -> None:
+                        try:
+                            result = done.result()
+                        except Exception:
+                            logger.exception(
+                                "computer_use hard release future raised: "
+                                "session=%s generation=%s",
+                                sid,
+                                generation,
+                            )
+                            return
+                        if result.status not in {"released", "already_absent"}:
+                            logger.error(
+                                "computer_use hard release did not complete: "
+                                "session=%s generation=%s status=%s error=%s",
+                                sid,
+                                generation,
+                                result.status,
+                                result.error,
+                            )
+
+                    release_result.add_done_callback(_log_cua_release)
+                except Exception:
+                    logger.exception(
+                        "computer_use hard release submission raised: "
+                        "session=%s generation=%s",
+                        sid,
+                        generation,
+                    )
         try:
             if hasattr(agent, "release_clients"):
                 agent.release_clients()
@@ -24125,7 +24224,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # fall back to the legacy full-close path.
                 self._cleanup_agent_resources(agent)
         except Exception:
-            pass
+            logger.debug("Soft agent client release failed", exc_info=True)
         # Free conversation history memory — can be tens of MB with tool
         # outputs (file reads, terminal output, search results) on heavy
         # 100+-tool-call sessions. release_clients() deliberately preserves
@@ -24141,6 +24240,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # agents the memory valve targets.
         if hasattr(agent, "_db_flush_scan_prefix"):
             agent._db_flush_scan_prefix = None
+        return release_result
 
     def _agent_cache_bounds(self):
         """Operator-configured agent-cache bounds, resolved once per process.

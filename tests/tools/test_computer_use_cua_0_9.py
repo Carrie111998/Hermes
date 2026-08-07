@@ -276,7 +276,7 @@ def test_release_seam_stops_exact_backend_and_clears_session_state():
     assert computer_use._backends["conversation-b"] is second
 
 
-def test_release_seam_evicts_state_even_when_backend_stop_fails():
+def test_release_seam_retains_failed_generation_when_backend_stop_fails():
     from tools.computer_use import tool as computer_use
 
     backend = MagicMock()
@@ -285,10 +285,11 @@ def test_release_seam_evicts_state_even_when_backend_stop_fails():
     computer_use._backend_call_locks["failed-run"] = computer_use.threading.RLock()
     computer_use._session_auto_approve["failed-run"] = True
 
-    assert computer_use.release_computer_use_session("failed-run") is True
-    assert "failed-run" not in computer_use._backends
-    assert "failed-run" not in computer_use._backend_call_locks
+    assert computer_use.release_computer_use_session("failed-run") is False
+    assert computer_use._backends["failed-run"] is backend
+    assert "failed-run" in computer_use._backend_call_locks
     assert "failed-run" not in computer_use._session_auto_approve
+    assert computer_use.computer_use_lifecycle_snapshot()["failed-run"]["state"] == "FAILED"
 
 
 def test_release_seam_waits_for_in_flight_action_before_stopping_backend():

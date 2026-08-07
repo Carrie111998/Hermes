@@ -6,7 +6,6 @@ gateway deployments.
 """
 
 import os
-import signal
 import subprocess
 import sys
 import threading
@@ -36,30 +35,32 @@ class TestZombieReproduction:
         """REPRODUCTION: processes spawned directly survive if no one kills
         them — this models the gap that causes zombie accumulation when
         the gateway drops agent references without calling close()."""
-        pids = []
+        procs = []
 
         try:
             for _ in range(3):
-                proc = _spawn_sleep(60)
-                pids.append(proc.pid)
+                procs.append(_spawn_sleep(60))
+            pids = [proc.pid for proc in procs]
 
             for pid in pids:
                 assert _pid_alive(pid), f"PID {pid} should be alive after spawn"
 
-            # Simulate "session end" by just dropping the reference
-            del proc  # noqa: F821
+            # Dropping an unrelated local reference does not close the handles
+            # retained in procs; the children remain alive until explicit cleanup.
+            proc = procs[-1]
+            del proc
 
-            # BUG: processes are still alive after reference is dropped
             for pid in pids:
                 assert _pid_alive(pid), (
                     f"PID {pid} died after ref drop — "
                     f"expected it to survive (demonstrating the bug)"
                 )
         finally:
-            for pid in pids:
+            for proc in procs:
                 try:
-                    os.kill(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
+                    proc.kill()
+                    proc.wait(timeout=2)
+                except Exception:
                     pass
 
     def test_explicit_terminate_reaps_processes(self):

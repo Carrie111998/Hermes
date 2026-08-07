@@ -40,13 +40,19 @@ from __future__ import annotations
 
 import atexit
 import base64
+import concurrent.futures
 import json
 import logging
 import os
+import queue
 import re
 import struct
 import sys
 import threading
+import time
+from collections import OrderedDict
+from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
 
 from tools.computer_use.backend import (
@@ -168,6 +174,398 @@ _session_auto_approve: Dict[str, bool] = {}
 _always_allow: Dict[str, set] = {}
 
 
+class BackendLifecycleState(str, Enum):
+    STARTING = "STARTING"
+    ACTIVE = "ACTIVE"
+    CLOSING = "CLOSING"
+    CLOSED = "CLOSED"
+    FAILED = "FAILED"
+
+
+@dataclass
+class ComputerUseReleaseResult:
+    session_id: str
+    generation: Optional[int]
+    status: str
+    reason: str
+    elapsed_ms: float = 0.0
+    error: Optional[str] = None
+
+    @property
+    def released(self) -> bool:
+        return self.status == "released"
+
+    def __bool__(self) -> bool:
+        return self.released
+
+
+@dataclass
+class _BackendRecord:
+    session_id: str
+    generation: int
+    permission_mode: str
+    backend: ComputerUseBackend
+    call_lock: threading.RLock
+    state: BackendLifecycleState = BackendLifecycleState.STARTING
+    close_requested_at: Optional[float] = None
+    close_reason: Optional[str] = None
+    last_error: Optional[str] = None
+    close_attempts: int = 0
+
+
+_backend_records: Dict[str, _BackendRecord] = {}
+_backend_generation_counters: OrderedDict[str, int] = OrderedDict()
+_backend_generation_sequence = 0
+_BACKEND_GENERATION_TOMBSTONE_CAP = 4096
+_DEFAULT_RELEASE_TIMEOUT = 5.0
+
+
+def _next_backend_generation_locked(sid: str) -> int:
+    global _backend_generation_sequence
+    _backend_generation_sequence += 1
+    generation = _backend_generation_sequence
+    _backend_generation_counters[sid] = generation
+    _backend_generation_counters.move_to_end(sid)
+    while len(_backend_generation_counters) > _BACKEND_GENERATION_TOMBSTONE_CAP:
+        for oldest_sid in tuple(_backend_generation_counters):
+            if oldest_sid != sid and oldest_sid not in _backend_records:
+                _backend_generation_counters.pop(oldest_sid, None)
+                break
+        else:
+            # More active sessions than the tombstone cap: keep their exact
+            # generations rather than corrupting ownership or looping forever.
+            break
+    return generation
+
+
+def _record_from_legacy_cache_locked(sid: str) -> Optional[_BackendRecord]:
+    """Normalize direct test/integration cache injection into lifecycle state."""
+    record = _backend_records.get(sid)
+    if record is not None:
+        return record
+    backend = _backends.get(sid)
+    if backend is None and sid == "":
+        backend = _backend
+    if backend is None:
+        return None
+    call_lock = _backend_call_locks.setdefault(sid, threading.RLock())
+    record = _BackendRecord(
+        session_id=sid,
+        generation=_next_backend_generation_locked(sid),
+        permission_mode=_backend_permission_modes.get(sid, "standard"),
+        backend=backend,
+        call_lock=call_lock,
+        state=BackendLifecycleState.ACTIVE,
+    )
+    _backend_records[sid] = record
+    return record
+
+
+def get_computer_use_session_generation(session_id: str) -> Optional[int]:
+    sid = str(session_id or "")
+    if not sid:
+        return None
+    with _backend_lock:
+        record = _record_from_legacy_cache_locked(sid)
+        return record.generation if record is not None else None
+
+
+def computer_use_lifecycle_snapshot() -> Dict[str, Dict[str, Any]]:
+    """Return a secret-free, operator-facing lifecycle snapshot."""
+    with _backend_lock:
+        return {
+            sid: {
+                "generation": record.generation,
+                "state": record.state.value,
+                "permission_mode": record.permission_mode,
+                "close_reason": record.close_reason,
+                "close_attempts": record.close_attempts,
+                "last_error": record.last_error,
+            }
+            for sid, record in _backend_records.items()
+        }
+
+
+class _CleanupSupervisor:
+    """Bounded, tracked executor with deduplicated deferred admission."""
+
+    def __init__(
+        self,
+        *,
+        max_workers: int = 2,
+        max_pending: int = 64,
+        max_deferred: int = 256,
+    ) -> None:
+        self._max_pending = max_pending
+        self._max_deferred = max_deferred
+        self._slots = threading.BoundedSemaphore(max_pending)
+        self._lock = threading.Lock()
+        self._work_queue: queue.Queue[
+            Optional[tuple[tuple[str, Optional[int]], str, Dict[str, Any]]]
+        ] = queue.Queue(maxsize=max_pending)
+        self._workers: list[threading.Thread] = []
+        for index in range(max_workers):
+            worker = threading.Thread(
+                target=self._worker_loop,
+                name=f"computer-use-cleanup-{index}",
+                daemon=True,
+            )
+            worker.start()
+            self._workers.append(worker)
+        self._active_keys: set[tuple[str, Optional[int]]] = set()
+        self._deferred: OrderedDict[
+            tuple[str, Optional[int]], tuple[str, Dict[str, Any]]
+        ] = OrderedDict()
+        self._inflight: Dict[
+            tuple[str, Optional[int]], concurrent.futures.Future
+        ] = {}
+        self._closed = False
+
+    @staticmethod
+    def _rejected_result(
+        sid: str,
+        kwargs: Dict[str, Any],
+        error: str,
+    ) -> ComputerUseReleaseResult:
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=kwargs.get("expected_generation"),
+            status="queue_rejected",
+            reason=str(kwargs.get("reason") or "unspecified"),
+            error=error,
+        )
+
+    def _launch_locked(
+        self,
+        key: tuple[str, Optional[int]],
+        sid: str,
+        kwargs: Dict[str, Any],
+    ) -> Optional[str]:
+        """Launch after one slot was acquired; caller holds ``_lock``."""
+        self._active_keys.add(key)
+        try:
+            self._work_queue.put_nowait((key, sid, kwargs))
+        except queue.Full:
+            self._active_keys.discard(key)
+            self._slots.release()
+            return "cleanup worker queue unexpectedly full"
+        return None
+
+    def _worker_loop(self) -> None:
+        while True:
+            item = self._work_queue.get()
+            try:
+                if item is None:
+                    return
+                key, sid, kwargs = item
+                self._run_release(key, sid, kwargs)
+            finally:
+                self._work_queue.task_done()
+
+    def _run_release(
+        self,
+        key: tuple[str, Optional[int]],
+        sid: str,
+        kwargs: Dict[str, Any],
+    ) -> None:
+        try:
+            result = _release_computer_use_session_with_retries(sid, **kwargs)
+        except Exception as exc:
+            result = ComputerUseReleaseResult(
+                session_id=sid,
+                generation=kwargs.get("expected_generation"),
+                status="failed",
+                reason=str(kwargs.get("reason") or "unspecified"),
+                error=f"cleanup worker raised: {exc!r}",
+            )
+        self._complete(key, result)
+
+    def _complete(
+        self,
+        key: tuple[str, Optional[int]],
+        result: ComputerUseReleaseResult,
+    ) -> None:
+        completions: list[
+            tuple[concurrent.futures.Future, ComputerUseReleaseResult]
+        ] = []
+        with self._lock:
+            external = self._inflight.pop(key, None)
+            self._active_keys.discard(key)
+            self._slots.release()
+            if external is not None:
+                completions.append((external, result))
+
+            # A completion admits the oldest deferred exact owner. If executor
+            # shutdown races admission, reject it truthfully and continue so no
+            # deferred future is left pending forever.
+            while self._deferred and self._slots.acquire(blocking=False):
+                deferred_key, (sid, kwargs) = self._deferred.popitem(last=False)
+                launch_error = self._launch_locked(deferred_key, sid, kwargs)
+                if launch_error is None:
+                    break
+                deferred_future = self._inflight.pop(deferred_key, None)
+                if deferred_future is not None:
+                    completions.append(
+                        (
+                            deferred_future,
+                            self._rejected_result(sid, kwargs, launch_error),
+                        )
+                    )
+        for future, completion in completions:
+            if not future.done():
+                future.set_result(completion)
+
+    def submit(self, session_id: str, **kwargs: Any) -> concurrent.futures.Future:
+        sid = str(session_id or "")
+        key = (sid, kwargs.get("expected_generation"))
+        rejected: Optional[ComputerUseReleaseResult] = None
+        with self._lock:
+            duplicate = self._inflight.get(key)
+            if duplicate is not None:
+                return duplicate
+            external: concurrent.futures.Future = concurrent.futures.Future()
+            if self._closed:
+                rejected = self._rejected_result(
+                    sid, kwargs, "cleanup supervisor closed"
+                )
+            else:
+                self._inflight[key] = external
+                if self._slots.acquire(blocking=False):
+                    launch_error = self._launch_locked(key, sid, dict(kwargs))
+                    if launch_error is not None:
+                        self._inflight.pop(key, None)
+                        rejected = self._rejected_result(
+                            sid, kwargs, launch_error
+                        )
+                elif len(self._deferred) < self._max_deferred:
+                    self._deferred[key] = (sid, dict(kwargs))
+                else:
+                    self._inflight.pop(key, None)
+                    rejected = self._rejected_result(
+                        sid,
+                        kwargs,
+                        "cleanup deferred-admission queue full; exact owner retained",
+                    )
+        if rejected is not None:
+            if "exact owner retained" in str(rejected.error or ""):
+                _mark_cleanup_admission_failure(
+                    sid,
+                    kwargs.get("expected_generation"),
+                    str(rejected.error),
+                )
+            external.set_result(rejected)
+            logger.error(
+                "computer_use cleanup rejected session=%s generation=%s reason=%s error=%s",
+                sid,
+                kwargs.get("expected_generation"),
+                kwargs.get("reason"),
+                rejected.error,
+            )
+        return external
+
+    def drain(self, timeout: float) -> bool:
+        deadline = time.monotonic() + max(0.0, timeout)
+        while True:
+            with self._lock:
+                if not self._active_keys and not self._deferred:
+                    return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.01)
+
+    def snapshot(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "pending": len(self._active_keys),
+                "deferred": len(self._deferred),
+                "capacity": self._max_pending,
+                "deferred_capacity": self._max_deferred,
+                "closed": self._closed,
+            }
+
+    def shutdown(self, timeout: float) -> bool:
+        with self._lock:
+            self._closed = True
+        deadline = time.monotonic() + max(0.0, timeout)
+        drained = self.drain(timeout)
+        if not drained:
+            # Do not enqueue stop sentinels ahead of deferred work. Workers are
+            # daemonized, so a wedged backend cannot block interpreter exit;
+            # a later shutdown/drain call can still reap them if work unwinds.
+            return False
+        for _ in self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            try:
+                self._work_queue.put(None, timeout=remaining)
+            except queue.Full:
+                break
+        for worker in self._workers:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            worker.join(timeout=remaining)
+        # Workers are daemonized deliberately: a backend violating its bounded
+        # stop contract cannot hold interpreter shutdown hostage. Active exact
+        # ownership remains visible in lifecycle state until process exit.
+        return drained and not any(worker.is_alive() for worker in self._workers)
+
+
+def _mark_cleanup_admission_failure(
+    sid: str,
+    expected_generation: Any,
+    error: str,
+) -> None:
+    """Fail closed if even the bounded deferred queue cannot admit ownership."""
+    if not isinstance(expected_generation, int) or isinstance(
+        expected_generation, bool
+    ):
+        return
+    with _backend_lock:
+        record = _backend_records.get(sid)
+        if record is None or record.generation != expected_generation:
+            return
+        record.state = BackendLifecycleState.FAILED
+        record.close_reason = "cleanup_admission_failure"
+        record.last_error = error
+
+
+_cleanup_supervisor = _CleanupSupervisor()
+
+
+def computer_use_cleanup_snapshot() -> Dict[str, Any]:
+    """Return bounded-supervisor queue depth without exposing session content."""
+    return _cleanup_supervisor.snapshot()
+
+
+def computer_use_process_snapshot() -> List[Dict[str, Any]]:
+    """Return direct/recursive cua-driver descendants for operator diagnostics."""
+    try:
+        import psutil
+
+        parent = psutil.Process()
+        rows = []
+        for child in parent.children(recursive=True):
+            try:
+                name = child.name()
+                if "cua-driver" not in name.lower():
+                    continue
+                rows.append({
+                    "pid": child.pid,
+                    "ppid": child.ppid(),
+                    "name": name,
+                    "create_time": child.create_time(),
+                    "status": child.status(),
+                })
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                continue
+        return sorted(rows, key=lambda row: (row["create_time"], row["pid"]))
+    except Exception:
+        logger.debug("computer_use process snapshot failed", exc_info=True)
+        return []
+
+
 def _cua_permission_mode(session_id: str) -> str:
     """Map Hermes's explicit approval bypass onto Cua's immutable mode.
 
@@ -202,31 +600,33 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
     global _backend
     sid = str(session_id or "")
     while True:
-        stale_backend: Optional[ComputerUseBackend] = None
-        stale_lock: Optional[threading.RLock] = None
+        release_generation: Optional[int] = None
         with _backend_lock:
-            # Resolve the mode while holding the cache lock. Session YOLO
-            # mutation never holds the approval lock while releasing this
-            # cache, so the lock order cannot cycle.
             permission_mode = _cua_permission_mode(sid)
             if sid == "" and _backend is not None and sid not in _backends:
-                # Preserve the long-standing empty-session injection hook used
-                # by integrations and tests while normalizing it into the
-                # session-owned cache/lifecycle path.
                 _backends[sid] = _backend
                 _backend_call_locks[sid] = threading.RLock()
                 _backend_permission_modes[sid] = permission_mode
-            cached = _backends.get(sid)
-            if cached is not None:
-                if _backend_permission_modes.get(sid, "standard") == permission_mode:
-                    return cached
-                # Cua's permission mode cannot change after daemon startup. A
-                # /yolo toggle replaces only this session's backend.
-                stale_backend = _backends.pop(sid)
-                stale_lock = _backend_call_locks.pop(sid, None)
-                _backend_permission_modes.pop(sid, None)
-                if sid == "":
-                    _backend = None
+            record = _record_from_legacy_cache_locked(sid)
+            if record is not None:
+                if record.state == BackendLifecycleState.ACTIVE:
+                    if record.permission_mode == permission_mode:
+                        return record.backend
+                    release_generation = record.generation
+                elif record.state == BackendLifecycleState.CLOSING:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} is closing"
+                    )
+                elif record.state == BackendLifecycleState.FAILED:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} cleanup failed; "
+                        "retry release before recreating it"
+                    )
+                else:
+                    raise RuntimeError(
+                        f"computer_use backend for session {sid!r} is "
+                        f"{record.state.value.lower()}"
+                    )
             else:
                 backend_name = os.environ.get(
                     "HERMES_COMPUTER_USE_BACKEND", "cua"
@@ -241,133 +641,399 @@ def _get_backend(session_id: str = "") -> ComputerUseBackend:
                     raise RuntimeError(
                         f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}"
                     )
-                # Starting under the cache lock preserves the existing
-                # one-backend-per-session invariant. A concurrent mode toggle
-                # releases this backend before returning to its caller.
-                backend.start()
+                call_lock = threading.RLock()
+                record = _BackendRecord(
+                    session_id=sid,
+                    generation=_next_backend_generation_locked(sid),
+                    permission_mode=permission_mode,
+                    backend=backend,
+                    call_lock=call_lock,
+                )
+                _backend_records[sid] = record
                 _backends[sid] = backend
-                _backend_call_locks[sid] = threading.RLock()
+                _backend_call_locks[sid] = call_lock
                 _backend_permission_modes[sid] = permission_mode
                 if sid == "":
                     _backend = backend
+                try:
+                    backend.start()
+                except Exception as exc:
+                    record.state = BackendLifecycleState.FAILED
+                    record.last_error = repr(exc)
+                    try:
+                        backend.stop()
+                    except Exception as cleanup_exc:
+                        record.last_error = (
+                            f"start={exc!r}; cleanup={cleanup_exc!r}"
+                        )
+                        logger.error(
+                            "computer_use startup cleanup failed session=%s "
+                            "generation=%s error=%s",
+                            sid,
+                            record.generation,
+                            cleanup_exc,
+                        )
+                    else:
+                        _backend_records.pop(sid, None)
+                        _backends.pop(sid, None)
+                        _backend_call_locks.pop(sid, None)
+                        _backend_permission_modes.pop(sid, None)
+                        if sid == "" and _backend is backend:
+                            _backend = None
+                    raise
+                record.state = BackendLifecycleState.ACTIVE
+                logger.info(
+                    "computer_use lifecycle session=%s generation=%s state=ACTIVE",
+                    sid,
+                    record.generation,
+                )
                 return backend
 
-        # Stop a mismatched backend outside the global cache lock. Another
-        # session can continue creating or releasing its own backend, and the
-        # loop re-reads the authoritative mode before installing a replacement.
-        try:
-            if stale_lock is not None:
-                with stale_lock:
-                    stale_backend.stop()
-            elif stale_backend is not None:
-                stale_backend.stop()
-        except Exception:
-            pass
+        # Permission-mode changes are hard lifecycle boundaries. The exact
+        # generation stays installed while it closes, so no same-SID backend can
+        # be recreated until stop has succeeded.
+        result = release_computer_use_session_result(
+            sid,
+            expected_generation=release_generation,
+            timeout=_DEFAULT_RELEASE_TIMEOUT,
+            reason="permission_mode_change",
+            allow_empty_session=(sid == ""),
+        )
+        if not result.released:
+            raise RuntimeError(
+                f"computer_use permission-mode transition failed for {sid!r}: "
+                f"{result.status}: {result.error or ''}"
+            )
 
 
-def release_computer_use_session(session_id: str) -> bool:
-    """Release one session-owned computer-use backend.
-
-    This is the production lifecycle seam for hosts and policy plugins. It
-    removes the exact session backend, its call lock, and its recorded
-    permission mode before stopping the backend, so new lookups cannot retain
-    the stale target/ref namespace — and stops a private embedded daemon when
-    Hermes YOLO selected unrestricted mode. Approval state is cleared even
-    when no backend was started.
-
-    Returns ``True`` when a backend was found and released, ``False`` when the
-    session was already absent. Safe to call repeatedly.
-    """
+def _acquire_backend_for_call(
+    session_id: str,
+) -> tuple[ComputerUseBackend, threading.RLock]:
+    """Acquire an action lease that cannot outlive its exact active backend."""
     global _backend
     sid = str(session_id or "")
+    for _ in range(3):
+        backend = _get_backend(session_id=sid)
+        with _backend_lock:
+            record = _record_from_legacy_cache_locked(sid)
+            if record is None and sid == "":
+                # Preserve the long-standing test/plugin seam where _get_backend
+                # itself is replaced and returns a pre-started backend. Restrict
+                # this normalization to the legacy empty-session namespace so
+                # hard session cleanup still requires authoritative ownership.
+                call_lock = threading.RLock()
+                record = _BackendRecord(
+                    session_id=sid,
+                    generation=_next_backend_generation_locked(sid),
+                    permission_mode=_cua_permission_mode(sid),
+                    backend=backend,
+                    call_lock=call_lock,
+                    state=BackendLifecycleState.ACTIVE,
+                )
+                _backend_records[sid] = record
+                _backends[sid] = backend
+                _backend_call_locks[sid] = call_lock
+                _backend_permission_modes[sid] = record.permission_mode
+                _backend = backend
+            if record is None or record.backend is not backend:
+                continue
+            call_lock = record.call_lock
+        call_lock.acquire()
+        with _backend_lock:
+            current = _backend_records.get(sid)
+            if (
+                current is record
+                and current.backend is backend
+                and current.state == BackendLifecycleState.ACTIVE
+            ):
+                return backend, call_lock
+        call_lock.release()
+    raise RuntimeError(
+        f"computer_use backend for session {sid!r} changed while acquiring action lease"
+    )
+
+
+def release_computer_use_session_result(
+    session_id: str,
+    *,
+    expected_generation: Optional[int] = None,
+    timeout: float = _DEFAULT_RELEASE_TIMEOUT,
+    reason: str = "explicit",
+    allow_empty_session: bool = False,
+) -> ComputerUseReleaseResult:
+    """Close one exact backend generation with bounded, truthful lifecycle state."""
+    global _backend
+    sid = str(session_id or "")
+    started = time.monotonic()
+    if not sid and not allow_empty_session:
+        return ComputerUseReleaseResult(
+            session_id=sid,
+            generation=expected_generation,
+            status="mismatch",
+            reason=reason,
+            error="empty session id rejected",
+        )
+
     with _backend_lock:
-        backend = _backends.pop(sid, None)
-        call_lock = _backend_call_locks.pop(sid, None)
-        _backend_permission_modes.pop(sid, None)
-        # Preserve the backward-compatible empty-session injection hook:
-        # older callers/tests may populate only `_backend`.
-        if sid == "" and backend is None:
-            backend = _backend
-        if sid == "" and _backend is backend:
-            _backend = None
+        record = _record_from_legacy_cache_locked(sid)
+        if record is None:
+            last_generation = _backend_generation_counters.get(sid)
+            idempotent_absence = (
+                expected_generation is None
+                or (
+                    last_generation is not None
+                    and expected_generation == last_generation
+                )
+            )
+            status = "already_absent" if idempotent_absence else "mismatch"
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=expected_generation,
+                status=status,
+                reason=reason,
+                error=None if status == "already_absent" else "generation absent",
+            )
+        if expected_generation is not None and record.generation != expected_generation:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="mismatch",
+                reason=reason,
+                error=f"expected generation {expected_generation}",
+            )
+        if record.state == BackendLifecycleState.CLOSING:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="already_closing",
+                reason=reason,
+            )
+        if record.state == BackendLifecycleState.CLOSED:
+            return ComputerUseReleaseResult(
+                session_id=sid,
+                generation=record.generation,
+                status="already_absent",
+                reason=reason,
+            )
+        record.state = BackendLifecycleState.CLOSING
+        record.close_requested_at = time.monotonic()
+        record.close_reason = reason
+        record.close_attempts += 1
+        record.last_error = None
+        generation = record.generation
+        backend = record.backend
+        call_lock = record.call_lock
 
     with _approval_lock:
         _session_auto_approve.pop(sid, None)
         _always_allow.pop(sid, None)
 
-    if backend is None:
-        return False
+    logger.info(
+        "computer_use lifecycle session=%s generation=%s state=CLOSING reason=%s",
+        sid,
+        generation,
+        reason,
+    )
+    acquired = False
     try:
-        # Let an in-flight action finish before ending the driver session and
-        # dropping its target/ref state. Do not hold the global cache lock
-        # while waiting: unrelated Hermes sessions remain independent.
-        if call_lock is not None:
-            with call_lock:
-                backend.stop()
+        acquired = call_lock.acquire(timeout=max(0.0, timeout))
+        if not acquired:
+            error = f"in-flight call did not quiesce within {timeout:.3f}s"
+            with _backend_lock:
+                current = _backend_records.get(sid)
+                if current is record:
+                    record.state = BackendLifecycleState.FAILED
+                    record.last_error = error
+            status = "timed_out"
         else:
-            backend.stop()
-    except Exception:
-        logger.debug(
-            "computer_use backend release failed for session %s",
-            sid,
-            exc_info=True,
+            try:
+                backend.stop()
+            except Exception as exc:
+                error = repr(exc)
+                with _backend_lock:
+                    current = _backend_records.get(sid)
+                    if current is record:
+                        record.state = BackendLifecycleState.FAILED
+                        record.last_error = error
+                status = "failed"
+            else:
+                error = None
+                with _backend_lock:
+                    current = _backend_records.get(sid)
+                    if current is not record:
+                        status = "mismatch"
+                        error = "lifecycle record changed during close"
+                    else:
+                        record.state = BackendLifecycleState.CLOSED
+                        _backend_records.pop(sid, None)
+                        _backends.pop(sid, None)
+                        _backend_call_locks.pop(sid, None)
+                        _backend_permission_modes.pop(sid, None)
+                        if sid == "" and _backend is backend:
+                            _backend = None
+                        status = "released"
+    finally:
+        if acquired:
+            call_lock.release()
+
+    elapsed_ms = (time.monotonic() - started) * 1000.0
+    log = logger.info if status == "released" else logger.error
+    log(
+        "computer_use lifecycle session=%s generation=%s status=%s "
+        "reason=%s elapsed_ms=%.1f error=%s",
+        sid,
+        generation,
+        status,
+        reason,
+        elapsed_ms,
+        error,
+    )
+    return ComputerUseReleaseResult(
+        session_id=sid,
+        generation=generation,
+        status=status,
+        reason=reason,
+        elapsed_ms=elapsed_ms,
+        error=error,
+    )
+
+
+def _release_computer_use_session_with_retries(
+    session_id: str,
+    *,
+    expected_generation: Optional[int],
+    timeout: float,
+    reason: str,
+    allow_empty_session: bool,
+    max_attempts: int = 3,
+    retry_delay: float = 0.1,
+) -> ComputerUseReleaseResult:
+    """Run bounded retries for transient quiescence/stop failures."""
+    result: Optional[ComputerUseReleaseResult] = None
+    for attempt in range(1, max(1, max_attempts) + 1):
+        result = release_computer_use_session_result(
+            session_id,
+            expected_generation=expected_generation,
+            timeout=timeout,
+            reason=f"{reason}:attempt-{attempt}",
+            allow_empty_session=allow_empty_session,
         )
-    return True
+        if result.status not in {"timed_out", "failed"}:
+            return result
+        if attempt < max_attempts:
+            time.sleep(max(0.0, retry_delay) * attempt)
+    assert result is not None
+    return result
+
+
+def release_computer_use_session(session_id: str) -> bool:
+    """Backward-compatible bool adapter for explicit session teardown."""
+    result = release_computer_use_session_result(
+        session_id,
+        timeout=_DEFAULT_RELEASE_TIMEOUT,
+        reason="explicit",
+        allow_empty_session=True,
+    )
+    return result.released
+
+
+def submit_computer_use_session_release(
+    session_id: str,
+    *,
+    expected_generation: Optional[int],
+    timeout: float = _DEFAULT_RELEASE_TIMEOUT,
+    reason: str,
+    max_attempts: int = 3,
+    retry_delay: float = 0.1,
+) -> concurrent.futures.Future:
+    """Submit one exact generation close to the bounded cleanup supervisor."""
+    return _cleanup_supervisor.submit(
+        session_id,
+        expected_generation=expected_generation,
+        timeout=timeout,
+        reason=reason,
+        allow_empty_session=False,
+        max_attempts=max_attempts,
+        retry_delay=retry_delay,
+    )
+
+
+def drain_computer_use_cleanup(timeout: float = _DEFAULT_RELEASE_TIMEOUT) -> bool:
+    return _cleanup_supervisor.drain(timeout)
 
 
 def _shutdown_backend_atexit() -> None:
-    """Stop all cached backends so cua-driver children don't outlive us.
+    """Boundedly drain tracked cleanup, then close every remaining generation."""
+    try:
+        drain_computer_use_cleanup(timeout=_DEFAULT_RELEASE_TIMEOUT)
+    except Exception:
+        logger.debug("computer_use cleanup drain failed during shutdown", exc_info=True)
 
-    Each session backend holds a long-lived ``cua-driver`` subprocess, so
-    without this a driver can survive the Hermes process that spawned it
-    (#28152 item 3). #69903 kept the orphan from burning a core by disabling
-    the cursor overlay; the process itself still lingered.
-
-    Mirrors ``browser_tool``'s ``atexit.register(_emergency_cleanup_all_sessions)``
-    — same spawn-and-drive-a-subprocess shape. atexit only, no signal handlers:
-    a ``SystemExit`` raised from a prompt_toolkit key binding corrupts its
-    coroutine state and makes the process unkillable. Never raises, since an
-    exception escaping atexit prints a traceback on every exit.
-    """
-    global _backend
-    # Drop the global lock before stop() — teardown budgets 5s and shouldn't
-    # block an unrelated caller waiting to spawn.
     with _backend_lock:
-        unique = {
-            id(backend): (backend, _backend_call_locks.get(sid))
-            for sid, backend in _backends.items()
-        }
-        if _backend is not None:
-            unique.setdefault(
-                id(_backend),
-                (_backend, _backend_call_locks.get("")),
+        records = [
+            (sid, record.generation)
+            for sid, record in _backend_records.items()
+        ]
+        # Preserve direct legacy injection even if it has not been normalized.
+        for sid in tuple(_backends):
+            record = _record_from_legacy_cache_locked(sid)
+            if record is not None and (sid, record.generation) not in records:
+                records.append((sid, record.generation))
+        if _backend is not None and "" not in _backends:
+            record = _record_from_legacy_cache_locked("")
+            if record is not None and ("", record.generation) not in records:
+                records.append(("", record.generation))
+
+    for sid, generation in records:
+        try:
+            release_computer_use_session_result(
+                sid,
+                expected_generation=generation,
+                timeout=_DEFAULT_RELEASE_TIMEOUT,
+                reason="process_shutdown",
+                allow_empty_session=True,
             )
-        _backend = None
-        _backends.clear()
-        _backend_call_locks.clear()
-        _backend_permission_modes.clear()
+        except Exception:
+            logger.debug(
+                "computer_use shutdown release failed session=%s generation=%s",
+                sid,
+                generation,
+                exc_info=True,
+            )
 
     with _approval_lock:
         _session_auto_approve.clear()
         _always_allow.clear()
 
-    for backend, call_lock in unique.values():
+
+def _finalize_computer_use_atexit() -> None:
+    try:
+        _shutdown_backend_atexit()
+    finally:
         try:
-            if call_lock is not None:
-                with call_lock:
-                    backend.stop()
-            else:
-                backend.stop()
-        except Exception as e:
-            logger.debug("cua-driver atexit teardown failed: %s", e)
+            _cleanup_supervisor.shutdown(timeout=_DEFAULT_RELEASE_TIMEOUT)
+        except Exception:
+            pass
 
 
-atexit.register(_shutdown_backend_atexit)
+atexit.register(_finalize_computer_use_atexit)
 
 
 def reset_backend_for_tests() -> None:  # pragma: no cover
-    """Test helper — tear down the cached backend and per-session state."""
+    """Test helper — tear down cached backends and reset lifecycle state."""
+    global _backend, _backend_generation_sequence
     _shutdown_backend_atexit()
+    with _backend_lock:
+        _backend = None
+        _backends.clear()
+        _backend_call_locks.clear()
+        _backend_permission_modes.clear()
+        _backend_records.clear()
+        _backend_generation_counters.clear()
+        _backend_generation_sequence = 0
+    with _approval_lock:
+        _session_auto_approve.clear()
+        _always_allow.clear()
     _AUX_VISION_ROUTE_CACHE.clear()
 
 
@@ -491,24 +1157,26 @@ def handle_computer_use(args: Dict[str, Any], **kwargs) -> Any:
         if err is not None:
             return err
 
-    # Dispatch to backend.
+    # Dispatch through an exact-generation action lease. Teardown can mark the
+    # record CLOSING concurrently, but cannot stop the backend until this lease
+    # releases its per-session call lock.
+    call_lock = None
     try:
-        backend = _get_backend(session_id=session_id)
+        backend, call_lock = _acquire_backend_for_call(session_id)
     except Exception as e:
         return json.dumps({
             "error": f"computer_use backend unavailable: {e}",
             "hint": "If the cua-driver binary is missing, run `hermes computer-use install`. "
                     "If a Python dependency is missing, the error above shows the exact install command.",
         })
-
     try:
-        with _backend_lock:
-            call_lock = _backend_call_locks.setdefault(session_id, threading.RLock())
-        with call_lock:
-            return _dispatch(backend, action, args)
+        return _dispatch(backend, action, args)
     except Exception as e:
         logger.exception("computer_use %s failed", action)
         return json.dumps({"error": f"{action} failed: {e}"})
+    finally:
+        if call_lock is not None:
+            call_lock.release()
 
 
 def _request_approval(action: str, args: Dict[str, Any],
