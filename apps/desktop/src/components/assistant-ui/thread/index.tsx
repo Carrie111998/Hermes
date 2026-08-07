@@ -1,3 +1,4 @@
+import { useStore } from '@nanostores/react'
 import { memo, useCallback, useMemo, useRef, useState } from 'react'
 
 import { AssistantMessage } from '@/components/assistant-ui/thread/assistant-message'
@@ -8,10 +9,12 @@ import { ThreadTimeline } from '@/components/assistant-ui/thread/timeline'
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { UserEditComposer } from '@/components/assistant-ui/thread/user-edit-composer'
 import { UserMessage } from '@/components/assistant-ui/thread/user-message'
+import { AvatarEditorDialog } from '@/components/chat/avatar-editor-dialog'
 import { Intro, type IntroProps } from '@/components/chat/intro'
 import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import type { HermesGateway } from '@/hermes'
 import { useI18n } from '@/i18n'
+import { $avatarEditorOpen, closeAvatarEditor } from '@/store/avatar'
 import { notifyError } from '@/store/notifications'
 
 type ThreadLoadingState = 'response' | 'session'
@@ -56,6 +59,8 @@ export const Thread = memo(function Thread({
   const [restoreConfirmTarget, setRestoreConfirmTarget] = useState<
     (RestoreMessageTarget & { messageId: string }) | null
   >(null)
+
+  const avatarEditorOpen = useStore($avatarEditorOpen)
 
   const closeRestoreConfirm = useCallback(() => setRestoreConfirmTarget(null), [])
 
@@ -165,6 +170,7 @@ export const Thread = memo(function Thread({
         open={Boolean(restoreConfirmTarget)}
         title={copy.restoreTitle}
       />
+      <AvatarEditorDialog onClose={closeAvatarEditor} open={avatarEditorOpen} />
     </div>
   )
 })
