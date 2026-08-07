@@ -174,6 +174,50 @@ class TestExtractCacheBustingConfig:
 
         assert out["tools.registry_generation"] == 12345
 
+    @pytest.mark.parametrize(
+        ("before", "after"),
+        [
+            ({"enabled": "auto"}, {"enabled": "off"}),
+            ({"threshold_pct": 5}, {"threshold_pct": 8}),
+            ({"search_default_limit": 5}, {"search_default_limit": 9}),
+            ({"max_search_limit": 20}, {"max_search_limit": 30}),
+            ({"listing": "auto"}, {"listing": "off"}),
+            ({"listing_max_tokens": 4000}, {"listing_max_tokens": 2500}),
+            (
+                {"builtins": {"enabled": False}},
+                {"builtins": {"enabled": True}},
+            ),
+            (
+                {"builtins": {"defer": ["browser"]}},
+                {"builtins": {"defer": ["todo"]}},
+            ),
+            (
+                {"builtins": {"min_schema_tokens": 1500}},
+                {"builtins": {"min_schema_tokens": 2500}},
+            ),
+        ],
+    )
+    def test_every_tool_search_setting_busts_cached_agent(self, before, after):
+        """Tool schemas are frozen on AIAgent, including nested policy."""
+        from gateway.run import GatewayRunner
+
+        runtime = {"api_key": "k", "base_url": "u", "provider": "p"}
+        first_keys = GatewayRunner._extract_cache_busting_config(
+            {"tools": {"tool_search": before}}
+        )
+        second_keys = GatewayRunner._extract_cache_busting_config(
+            {"tools": {"tool_search": after}}
+        )
+
+        first = GatewayRunner._agent_config_signature(
+            "m", runtime, ["hermes-telegram"], "", cache_keys=first_keys
+        )
+        second = GatewayRunner._agent_config_signature(
+            "m", runtime, ["hermes-telegram"], "", cache_keys=second_keys
+        )
+
+        assert first != second
+
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
@@ -1061,4 +1105,3 @@ class TestCrossProcessInvalidationDefersCleanup:
         # Stale entry was popped, hard-teardown path never used.
         assert "telegram:s1" not in runner._agent_cache
         runner._cleanup_agent_resources.assert_not_called()
-

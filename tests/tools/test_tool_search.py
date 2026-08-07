@@ -336,6 +336,59 @@ class TestAssembly:
             "terminal",
         }
 
+    @pytest.mark.parametrize(
+        ("scope", "tool_names"),
+        [
+            ("hermes-cron narrow job", ["execute_code"]),
+            (
+                "webhook-safe",
+                ["web_search", "web_extract", "vision_analyze", "clarify"],
+            ),
+            (
+                "kanban worker",
+                ["kanban_show", "kanban_complete", "kanban_heartbeat"],
+            ),
+            (
+                "delegated leaf",
+                ["terminal", "process", "read_file", "patch", "execute_code"],
+            ),
+        ],
+    )
+    def test_narrow_scoped_jobs_stay_direct_below_builtin_minimum(
+        self, scope, tool_names
+    ):
+        """Restricted background agents must not pay for an empty bridge."""
+        from tools.tool_search import (
+            BRIDGE_TOOL_NAMES,
+            ToolSearchConfig,
+            assemble_tool_defs,
+        )
+
+        raw_scoped_defs = [_td(name, f"{scope} action") for name in tool_names]
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": [
+                    "browser",
+                    "session_search",
+                    "delegation",
+                    "code_execution",
+                    "todo",
+                    "vision",
+                ],
+                "min_schema_tokens": 1500,
+            },
+        })
+
+        result = assemble_tool_defs(raw_scoped_defs, context_length=200_000, config=cfg)
+
+        assert not result.activated, scope
+        assert result.tool_defs == raw_scoped_defs
+        assert not (BRIDGE_TOOL_NAMES & {
+            td["function"]["name"] for td in result.tool_defs
+        })
+
     def test_builtin_above_threshold_defers_and_catalog_marks_builtin(self):
         from tools.tool_search import assemble_tool_defs, build_catalog, ToolSearchConfig
 
@@ -363,6 +416,7 @@ class TestAssembly:
     def test_tool_search_off_keeps_selected_builtins_eager(self):
         from tools.tool_search import assemble_tool_defs, ToolSearchConfig
 
+        self._register_mcp("mcp_rollback_probe")
         cfg = ToolSearchConfig.from_raw({
             "enabled": "off",
             "builtins": {
@@ -371,14 +425,15 @@ class TestAssembly:
                 "min_schema_tokens": 0,
             },
         })
-        defs = [_td("browser_navigate"), _td("terminal")]
+        defs = [
+            _td("browser_navigate"),
+            _td("terminal"),
+            _td("mcp_rollback_probe"),
+        ]
 
         result = assemble_tool_defs(defs, context_length=200_000, config=cfg)
         assert not result.activated
-        assert {td["function"]["name"] for td in result.tool_defs} == {
-            "browser_navigate",
-            "terminal",
-        }
+        assert result.tool_defs == defs
 
 
 # ---------------------------------------------------------------------------
@@ -469,6 +524,38 @@ class TestBridgeDispatch:
             [_td("browser_navigate", "Small browser schema")],
             config=cfg,
         ) == frozenset()
+
+    def test_disabled_or_out_of_scope_builtin_is_unsearchable(self):
+        from tools.tool_search import (
+            ToolSearchConfig,
+            dispatch_tool_describe,
+            dispatch_tool_search,
+        )
+
+        cfg = ToolSearchConfig.from_raw({
+            "enabled": "on",
+            "builtins": {
+                "enabled": True,
+                "defer": ["browser"],
+                "min_schema_tokens": 0,
+            },
+        })
+        raw_scoped_defs = [_td("terminal", "Only tool granted to this session")]
+
+        searched = json.loads(dispatch_tool_search(
+            {"query": "navigate browser"},
+            current_tool_defs=raw_scoped_defs,
+            config=cfg,
+        ))
+        described = json.loads(dispatch_tool_describe(
+            {"name": "browser_navigate"},
+            current_tool_defs=raw_scoped_defs,
+            config=cfg,
+        ))
+
+        assert searched["total_available"] == 0
+        assert searched["matches"] == []
+        assert "not currently available" in described["error"]
 
     def test_resolve_underlying_call_accepts_configured_builtin_only(self):
         from tools.tool_search import ToolSearchConfig, resolve_underlying_call

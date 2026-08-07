@@ -22587,6 +22587,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 out[f"{section}.{key}"] = section_val.get(key)
             else:
                 out[f"{section}.{key}"] = None
+
+        # Tool definitions are frozen when the cached AIAgent is constructed.
+        # Keep the whole tool-search subtree in the signature instead of
+        # enumerating leaves: listing controls and nested built-in disclosure
+        # policy all change the model-visible schema, and future settings must
+        # be cache-safe by default.
+        tools_cfg = cfg.get("tools")
+        out["tools.tool_search"] = (
+            tools_cfg.get("tool_search") if isinstance(tools_cfg, dict) else None
+        )
         try:
             from tools.registry import registry
 
