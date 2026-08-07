@@ -2,8 +2,8 @@
 
 Evidence-bound product and opportunity intelligence for Hermes. **Advisory only.**
 
-**Upstream / latest packaging:** https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes  
-**Community install:** `hermes skills install scrimshawlife-ctrl/Neon-Genie-Hermes/skills/neon-genie`  
+**Upstream / latest packaging:** https://github.com/scrimshawlife-ctrl/NeonGenie  
+**Community install:** `hermes skills install scrimshawlife-ctrl/NeonGenie/skills/neon-genie`  
 **After this PR merges:** `hermes skills install official/productivity/neon-genie`
 
 ```bash

@@ -13,13 +13,13 @@ Governed Hermes skill for opportunity and product intelligence. **Advisory only.
 **Hermes Skills Hub**
 
 ```bash
-hermes skills install scrimshawlife-ctrl/Neon-Genie-Hermes/skills/neon-genie
+hermes skills install scrimshawlife-ctrl/NeonGenie/skills/neon-genie
 ```
 
 **Clone**
 
 ```bash
-git clone https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes.git
+git clone https://github.com/scrimshawlife-ctrl/NeonGenie.git
 cd Neon-Genie-Hermes
 ./install.sh
 # → ~/.hermes/skills/neon-genie

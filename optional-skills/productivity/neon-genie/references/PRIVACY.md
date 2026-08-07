@@ -203,7 +203,7 @@ When evidence is missing: use `NOT_COMPUTABLE`, `privacy_warnings[]`, and/or `UN
 
 Questions, corrections, and privacy incidents related to this skill:
 
-- **Issues:** https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes/issues  
+- **Issues:** https://github.com/scrimshawlife-ctrl/NeonGenie/issues  
 - Prefer labeling privacy contract gaps clearly so `privacy_contract_version` can bump when semantics change.
 
 Related docs: ADR [0006 — Privacy by construction](docs/adr/0006-privacy-by-construction.md), ADR [0004 — Wayfinder boundary](docs/adr/0004-neon-genie-wayfinder-boundary.md), design spec `docs/superpowers/specs/2026-08-06-neon-genie-privacy-spine-design.md`.

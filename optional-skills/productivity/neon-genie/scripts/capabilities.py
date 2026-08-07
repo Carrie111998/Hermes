@@ -131,7 +131,7 @@ def build_capabilities() -> dict[str, Any]:
             "governance": "docs/GOVERNANCE.md",
         },
         "install": {
-            "hub": "hermes skills install scrimshawlife-ctrl/Neon-Genie-Hermes/skills/neon-genie",
+            "hub": "hermes skills install scrimshawlife-ctrl/NeonGenie/skills/neon-genie",
             "local": "./install.sh",
         },
     }

@@ -24,7 +24,7 @@ triggers:
 
 # Neon Genie Skill
 
-Neon Genie turns weak signals and blocked transitions into evidence-bound product and opportunity packets. It is **advisory only**: draft and recommend; never spend, publish, contact, or mutate repositories. Full releases and packaging live upstream: https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes
+Neon Genie turns weak signals and blocked transitions into evidence-bound product and opportunity packets. It is **advisory only**: draft and recommend; never spend, publish, contact, or mutate repositories. Full releases and packaging live upstream: https://github.com/scrimshawlife-ctrl/NeonGenie
 
 ## When to Use
 
@@ -124,4 +124,4 @@ python scripts/neon_genie.py do validate --packet out/neon-genie/verify-zero/run
 
 Expect: doctor green; zero-option path does not invent resources; every envelope has `authority: advisory_only` and `grants_execution: false`.
 
-Upstream monorepo and releases: https://github.com/scrimshawlife-ctrl/Neon-Genie-Hermes
+Upstream monorepo and releases: https://github.com/scrimshawlife-ctrl/NeonGenie
