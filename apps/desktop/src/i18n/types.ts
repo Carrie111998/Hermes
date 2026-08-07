@@ -316,6 +316,31 @@ export interface Translations {
       failed: string
       empty: string
       kinds: { bundled: string; disk: string; runtime: string }
+      integrationsTitle: string
+      integrationsDescription: string
+      integrationsCount: (n: number) => string
+      integrationsLoading: string
+      integrationsLoadFailed: string
+      integrationsRetry: string
+      integrationsEmpty: string
+      integrationsInstall: string
+      integrationsInstalling: string
+      integrationsInstallFailed: (name: string) => string
+      integrationsReady: string
+      integrationsDisabled: string
+      integrationsActivate: string
+      integrationsNeedsSignIn: string
+      integrationsSignIn: string
+      integrationsOAuth: string
+      integrationsApiKey: string
+      integrationsNeedsBuild: string
+      integrationsCredentialsTitle: (name: string) => string
+      integrationsCredentialsDescription: string
+      integrationsCredentialsRequired: string
+      integrationsBrowserUnavailable: string
+      integrationReady: (name: string) => string
+      integrationReadyMessage: string
+      integrationReadyNextLaunch: string
     }
     notifications: {
       title: string
@@ -908,11 +933,24 @@ export interface Translations {
     skillArchivedTitle: string
     skillArchivedMessage: string
     hub: {
+      title: string
+      description: string
       searchPlaceholder: string
       search: string
       searching: string
       connectingHubs: string
       connectedHubs: string
+      sources: string
+      filterAll: string
+      filterSkills: string
+      filterIntegrations: string
+      installedTitle: string
+      installedCount: (count: number) => string
+      skill: string
+      integration: string
+      results: string
+      integrationsTitle: string
+      integrationsDescription: string
       featured: string
       landingHint: string
       noResults: string
@@ -2312,6 +2350,8 @@ export interface Translations {
   assistant: {
     thread: {
       loadingSession: string
+      conversationHistory: string
+      browseConversationHistory: string
       showEarlier: string
       loadingResponse: string
       resumeWhenBackgroundDone: (count: number) => string

@@ -99,6 +99,56 @@ class TestProfileScopedEnv:
 
 class TestProfileScopedMcp:
 
+    def test_catalog_marks_oauth_setup_once_per_profile(
+        self, client, isolated_profiles, monkeypatch, tmp_path
+    ):
+        """The integrations page can distinguish a saved OAuth token from an
+        initial setup without exposing the token itself or prompting again."""
+        catalog_root = tmp_path / "optional-mcps"
+        manifest_dir = catalog_root / "oauth-demo"
+        manifest_dir.mkdir(parents=True)
+        (manifest_dir / "manifest.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "manifest_version": 1,
+                    "name": "oauth-demo",
+                    "description": "OAuth demo MCP",
+                    "source": "https://example.com/oauth-demo",
+                    "transport": {"type": "http", "url": "https://example.com/mcp"},
+                    "auth": {"type": "oauth"},
+                }
+            ),
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_OPTIONAL_MCPS", str(catalog_root))
+        (isolated_profiles["worker_beta"] / "config.yaml").write_text(
+            "mcp_servers:\n  oauth-demo:\n    url: https://example.com/mcp\n    auth: oauth\n    enabled: true\n",
+            encoding="utf-8",
+        )
+
+        import hermes_cli.mcp_config as mcp_config
+
+        monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: name == "oauth-demo")
+
+        worker = client.get("/api/mcp/catalog", params={"profile": "worker_beta"})
+        default = client.get("/api/mcp/catalog")
+
+        assert worker.status_code == 200
+        assert default.status_code == 200
+        worker_entry = worker.json()["entries"][0]
+        default_entry = default.json()["entries"][0]
+        assert worker_entry["name"] == "oauth-demo"
+        assert worker_entry["installed"] is True
+        assert worker_entry["enabled"] is True
+        assert worker_entry["authenticated"] is True
+        assert default_entry["installed"] is False
+        assert default_entry["authenticated"] is None
+
+        monkeypatch.setattr(mcp_config, "_oauth_tokens_present", lambda name: False)
+        needs_sign_in = client.get("/api/mcp/catalog", params={"profile": "worker_beta"})
+
+        assert needs_sign_in.json()["entries"][0]["authenticated"] is False
+
     def test_mcp_bearer_secret_is_profile_scoped(self, client, isolated_profiles):
         secret = "worker-only-secret"
         response = client.post(

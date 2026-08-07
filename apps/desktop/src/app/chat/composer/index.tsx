@@ -285,13 +285,18 @@ export function ChatBar({
     return onCancel()
   }, [activeQueueSessionKeyRef, onCancel])
 
-  const { compactPill, stacked } = useComposerMetrics({
+  const { compactPill, stacked: metricsStacked } = useComposerMetrics({
     composerDockRef,
     composerRef,
     composerSurfaceRef,
     editorRef,
     poppedOut
   })
+
+  // The main chat gets the roomy, two-row input treatment: text has its own
+  // line and the attachment/actions sit below it. Embedded pane composers keep
+  // the metrics-driven compact layout until content or width requires stacking.
+  const stacked = scope.target === 'main' || metricsStacked
 
   const hasComposerPayload = hasText || attachments.length > 0
   const canSubmit = busy || hasComposerPayload
@@ -947,7 +952,6 @@ export function ChatBar({
         className={cn(
           'min-h-[1.625rem] min-h-(--composer-input-min-height) max-h-(--composer-input-max-height) cursor-text overflow-y-auto whitespace-pre-wrap break-words [overflow-wrap:anywhere] bg-transparent pb-1 pr-1 pt-1 leading-normal text-foreground outline-none disabled:cursor-not-allowed',
           '**:data-ref-text:cursor-default',
-          stacked && 'pl-3',
           stacked ? 'w-full' : 'min-w-(--composer-input-inline-min-width) flex-1'
         )}
         contentEditable={!inputDisabled}
@@ -1114,13 +1118,14 @@ export function ChatBar({
           />
           <ComposerPrimitive.Root
             className={cn(
-              'group/composer relative w-full overflow-visible rounded-2xl',
+              'group/composer relative w-full overflow-visible rounded-[var(--composer-surface-radius)]',
               poppedOut && 'bg-transparent',
               dragging && 'cursor-grabbing select-none touch-none'
             )}
             data-drag-active={dragActive ? '' : undefined}
             data-popped-out={poppedOut ? '' : undefined}
             data-slot="composer-root"
+            data-spacious={scope.target === 'main' ? '' : undefined}
             data-status-stack={statusStackVisible ? '' : undefined}
             data-thread-scrolled-up={scrolledUp ? '' : undefined}
             onDragEnter={handleDragEnter}
@@ -1290,7 +1295,7 @@ export function ChatBarFallback() {
   return (
     <div
       className={cn(
-        'group/composer absolute bottom-0 left-1/2 z-30 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 rounded-2xl pt-2 pb-[var(--composer-shell-pad-block-end)]',
+        'group/composer absolute bottom-0 left-1/2 z-30 w-[min(var(--composer-width),calc(100%-2rem))] max-w-full -translate-x-1/2 rounded-[var(--composer-surface-radius)] pt-2 pb-[var(--composer-shell-pad-block-end)]',
         'bg-linear-to-b from-transparent to-background/55'
       )}
       data-slot="composer-root"

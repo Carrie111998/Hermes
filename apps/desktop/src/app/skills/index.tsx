@@ -2,7 +2,7 @@ import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import { useNavigate } from 'react-router'
+import { useLocation, useNavigate } from 'react-router'
 
 import { ArchiveSkillConfirmDialog } from '@/app/learning/archive-skill-confirm-dialog'
 import { CodeEditor } from '@/components/chat/code-editor'
@@ -25,8 +25,6 @@ import { compactNumber } from '@/lib/format'
 import { queryClient, writeCache } from '@/lib/query-client'
 import { invalidateSlashCompletions } from '@/lib/slash-completion-cache'
 import { normalize } from '@/lib/text'
-import { useStoreSelector } from '@/lib/use-session-slice'
-import { $gateway } from '@/store/gateway'
 import { notify, notifyError } from '@/store/notifications'
 import { $activeGatewayProfile, normalizeProfileKey } from '@/store/profile'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
@@ -48,7 +46,7 @@ import {
 } from '../master-detail'
 import { PanelEmpty, PanelPill } from '../overlays/panel'
 import { PageSearchShell } from '../page-search-shell'
-import { SETTINGS_ROUTE } from '../routes'
+import { SETTINGS_ROUTE, SKILLS_ROUTE } from '../routes'
 import { ComputerUsePanel } from '../settings/computer-use-panel'
 import { asText, includesQuery, prettyName, toolNames, toolsetDisplayLabel } from '../settings/helpers'
 import { TerminalBackendPanel } from '../settings/terminal-backend-panel'
@@ -56,10 +54,9 @@ import { ToolsetConfigPanel } from '../settings/toolset-config-panel'
 import type { SetStatusbarItemGroup } from '../shell/statusbar-controls'
 
 import { SkillsHub } from './hub'
-import { McpTab } from './mcp-tab'
 import { $skillsSortDesc, $toolsetsSortDesc } from './store'
 
-const SKILLS_MODES = ['skills', 'toolsets', 'mcp', 'hub'] as const
+const SKILLS_MODES = ['skills', 'toolsets', 'hub'] as const
 
 // Skills + toolsets live in the RQ cache so switching tabs/pages paints the
 // cached lists instantly (no reload flash) and mount only fires a deduped
@@ -184,11 +181,16 @@ interface SkillsViewProps extends React.ComponentProps<'section'> {
 
 export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...props }: SkillsViewProps) {
   const { t } = useI18n()
+  const navigate = useNavigate()
+  const { search } = useLocation()
   const [mode, setMode] = useRouteEnumParam('tab', SKILLS_MODES, 'skills')
-  // $gateway only feeds the MCP tab — gate the subscription so Skills/Toolsets/Hub
-  // tabs don't re-render on connect/disconnect/reconnect.
-  const gateway = useStoreSelector($gateway, g => (mode === 'mcp' ? g : null))
 
+  useEffect(() => {
+    if (new URLSearchParams(search).get('tab') === 'mcp') {
+      navigate(SKILLS_ROUTE + '?tab=hub', { replace: true })
+    }
+  }, [navigate, search])
+  // $gateway only feeds the MCP tab — gate the subscription so Skills/Toolsets/Hub
   const [query, setQuery] = useState('')
 
   const {
@@ -544,12 +546,13 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
     <PageSearchShell
       {...props}
       activeTab={mode}
-      description={t.skills.description}
+      contentWidth={mode === 'hub' ? 'reading' : 'wide'}
+      description={mode === 'hub' ? t.skills.hub.description : t.skills.description}
       onSearchChange={setQuery}
       onTabChange={id => setMode(id as (typeof SKILLS_MODES)[number])}
+      searchBelowTitle={mode === 'hub'}
       // MCP manages a handful of entries with the editor right there —
       // searching it is noise.
-      searchHidden={mode === 'mcp'}
       searchHints={searchHints}
       searchPlaceholder={
         mode === 'skills'
@@ -562,15 +565,12 @@ export function SkillsView({ setStatusbarItemGroup: _setStatusbarItemGroup, ...p
       tabs={[
         { id: 'skills', label: t.skills.tabSkills, meta: skills?.length ?? null },
         { id: 'toolsets', label: t.skills.tabToolsets, meta: toolsets ? visibleToolsetCount(toolsets) : null },
-        { id: 'mcp', label: t.skills.tabMcp },
         { id: 'hub', label: t.skills.tabHub }
       ]}
-      title={t.skills.title}
+      title={mode === 'hub' ? t.skills.hub.title : t.skills.title}
     >
       {mode === 'hub' ? (
         <SkillsHub query={query} />
-      ) : mode === 'mcp' ? (
-        <McpTab gateway={gateway} />
       ) : (skillsFailed || toolsetsFailed) && (!skills || !toolsets) ? (
         <PanelEmpty
           action={

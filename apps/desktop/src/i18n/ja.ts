@@ -1017,7 +1017,7 @@ export const ja = defineLocale({
 
   skills: {
     title: '機能',
-    description: 'スキル、ツール、MCP サーバー',
+    description: 'スキルとツール',
     tabSkills: 'スキル',
     tabToolsets: 'ツールセット',
     tabMcp: 'MCP',
@@ -2538,6 +2538,8 @@ export const ja = defineLocale({
   assistant: {
     thread: {
       loadingSession: 'セッションを読み込み中',
+      conversationHistory: '会話履歴',
+      browseConversationHistory: '会話履歴を表示',
       showEarlier: '以前のメッセージを表示',
       loadingResponse: 'Hermes が応答を読み込み中',
       resumeWhenBackgroundDone: count =>

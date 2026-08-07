@@ -58,14 +58,14 @@ function toolset(overrides: Record<string, unknown> = {}) {
   }
 }
 
-async function renderSkills() {
+async function renderSkills(initialRoute = '/skills?tab=toolsets') {
   const { SkillsView } = await import('./index')
   let result: ReturnType<typeof render>
   await act(async () => {
     result = render(
       // SkillsView reads skills/toolsets via useQuery, so it needs a provider.
       <QueryClientProvider client={queryClient}>
-        <MemoryRouter initialEntries={['/skills?tab=toolsets']}>
+        <MemoryRouter initialEntries={[initialRoute]}>
           <SkillsView />
         </MemoryRouter>
       </QueryClientProvider>
@@ -91,6 +91,12 @@ afterEach(() => {
 })
 
 describe('SkillsView toolset management', () => {
+  it('redirects a retired MCP deep link to the unified Hub', async () => {
+    await renderSkills('/skills?tab=mcp&server=linear')
+
+    await waitFor(() => expect(navigateSpy).toHaveBeenCalledWith('/skills?tab=hub', { replace: true }))
+  })
+
   it('renders a switch for each toolset and toggles it off', async () => {
     await renderSkills()
 

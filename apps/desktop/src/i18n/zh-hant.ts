@@ -983,7 +983,7 @@ export const zhHant = defineLocale({
 
   skills: {
     title: '功能',
-    description: '技能、工具和 MCP 伺服器',
+    description: '技能與工具',
     tabSkills: '技能',
     tabToolsets: '工具集',
     tabMcp: 'MCP',
@@ -2458,6 +2458,8 @@ export const zhHant = defineLocale({
   assistant: {
     thread: {
       loadingSession: '正在載入工作階段',
+      conversationHistory: '對話記錄',
+      browseConversationHistory: '瀏覽對話記錄',
       showEarlier: '顯示較早的訊息',
       loadingResponse: 'Hermes 正在載入回覆',
       resumeWhenBackgroundDone: count =>
