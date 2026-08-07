@@ -1815,7 +1815,14 @@ class AIAgent:
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
         """
-        from agent.background_review import spawn_background_review_thread
+        from agent.background_review import (
+            background_review_allowed,
+            spawn_background_review_thread,
+        )
+
+        if not background_review_allowed(getattr(self, "_chat_type", False)):
+            return
+
         from tools.thread_context import propagate_context_to_thread
         target, _prompt = spawn_background_review_thread(
             self,
