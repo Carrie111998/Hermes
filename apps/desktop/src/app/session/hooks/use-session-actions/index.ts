@@ -2,7 +2,6 @@ import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 import type { NavigateFunction } from 'react-router'
 
-import { setTerminalTakeover } from '@/app/right-sidebar/store'
 import { revealTreePane } from '@/components/pane-shell/tree/store'
 import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { useI18n } from '@/i18n'
@@ -298,12 +297,15 @@ export function useSessionActions({
       setAwaitingResponse(false)
       clearNotifications()
       setIntroSeed(seed => seed + 1)
-      // A fresh chat takes the screen: the terminal's persisted takeover flag
-      // (⌃` / the statusbar toggle) must not keep the pane fronted over the
-      // new session — otherwise New Session / ⌘N bounces straight back to the
-      // terminal. The terminal itself stays alive (tool panels collapse to a
-      // rail, PTYs are never torn down); only the fronting flag is cleared.
-      setTerminalTakeover(false)
+      // A fresh chat takes the screen. Front the workspace — and ONLY that:
+      // `$terminalTakeover` is the terminal's open/closed state in every
+      // layout, not a Focus-only overlay flag, so clearing it here would close
+      // a terminal sitting harmlessly in its own zone (Default, Terminal deck,
+      // Quad) and would persist a `false` that leaves the Focus tab unable to
+      // mount its workspace on the next boot. Behind another tab the terminal
+      // is hidden, not closed: it keeps its PTYs and the overlay stops
+      // painting on the pane-hidden marker, which is what actually cleared the
+      // chat.
       revealTreePane('workspace')
       // Clear the durable route intent synchronously, before React Router
       // publishes /new. Submit uses that intent to heal an existing-session

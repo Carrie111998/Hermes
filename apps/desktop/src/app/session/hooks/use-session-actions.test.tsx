@@ -434,11 +434,14 @@ describe('startFreshSessionDraft', () => {
     expect($newChatWorkspaceTarget.get()).toBeNull()
   })
 
-  it('clears the terminal takeover so the fresh chat takes the screen', async () => {
-    // Regression: a persisted terminal takeover (⌃` / statusbar toggle) kept
-    // the terminal pane fronted after New Session / ⌘N, bouncing the user
-    // straight back to the terminal. A fresh chat must collapse the pane to
-    // its rail (PTYs stay alive) and surface the new session.
+  it('fronts the workspace without closing a terminal that is merely behind a tab', async () => {
+    // Regression: a persisted terminal takeover kept the terminal fronted
+    // after New Session / ⌘N. The fix is to reveal the workspace — NOT to
+    // clear the takeover atom. That atom is the terminal's open/closed state
+    // in every layout: clearing it here closed a terminal sitting in its own
+    // zone (Default / Terminal deck / Quad), and persisted a `false` that left
+    // the Focus tab unable to mount its workspace after a restart. Behind a
+    // tab the terminal is hidden, not closed.
     const navigate = vi.fn()
     const requestGateway = vi.fn(async () => ({}) as never)
     let handle: HarnessHandle | null = null
@@ -451,7 +454,8 @@ describe('startFreshSessionDraft', () => {
 
     act(() => handle!.startFreshSessionDraft({ preserveRoute: true, workspaceTarget: null }))
 
-    expect($terminalTakeover.get()).toBe(false)
+    expect(revealTreePane).toHaveBeenCalledWith('workspace')
+    expect($terminalTakeover.get()).toBe(true)
   })
 })
 
