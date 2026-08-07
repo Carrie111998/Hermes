@@ -155,7 +155,7 @@ class ReviewStateStore:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS leases "
                 "(key TEXT PRIMARY KEY, lease_token TEXT NOT NULL, "
-                "lease_until INTEGER NOT NULL)"
+                "lease_until INTEGER NOT NULL, publication_claimed_at INTEGER)"
             )
             lease_columns = {
                 str(row[1])
@@ -164,6 +164,10 @@ class ReviewStateStore:
             if "lease_token" not in lease_columns:
                 connection.execute("ALTER TABLE leases ADD COLUMN lease_token TEXT")
                 connection.execute("DELETE FROM leases")
+            if "publication_claimed_at" not in lease_columns:
+                connection.execute(
+                    "ALTER TABLE leases ADD COLUMN publication_claimed_at INTEGER"
+                )
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS completions "
                 "(key TEXT PRIMARY KEY, completed_at INTEGER NOT NULL)"
@@ -237,6 +241,32 @@ class ReviewStateStore:
             )
             return lease_token if cursor.rowcount == 1 else None
 
+    def claim_publication(
+        self,
+        review_tuple: ReviewTuple,
+        *,
+        lease_token: str,
+        now: int,
+        lease_seconds: int,
+    ) -> None:
+        if lease_seconds <= 0:
+            raise ValueError("invalid publication lease")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE leases SET lease_until = ?, publication_claimed_at = ? "
+                "WHERE key = ? AND lease_token = ? AND lease_until > ? "
+                "AND publication_claimed_at IS NULL",
+                (
+                    now + lease_seconds,
+                    now,
+                    tuple_key(review_tuple),
+                    lease_token,
+                    now,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("review publication claim not found")
+
     def release(self, review_tuple: ReviewTuple, *, lease_token: str) -> None:
         with self._connect() as connection:
             cursor = connection.execute(
@@ -254,8 +284,15 @@ class ReviewStateStore:
         now: int,
         retry_delay: int,
         max_attempts: int,
+        dead_letter_marker: str,
+        dead_letter_content: str,
     ) -> dict:
-        if retry_delay <= 0 or max_attempts <= 0:
+        if (
+            retry_delay <= 0
+            or max_attempts <= 0
+            or not dead_letter_marker
+            or not dead_letter_content
+        ):
             raise ValueError("invalid retry policy")
         key = tuple_key(review_tuple)
         with self._connect() as connection:
@@ -277,6 +314,16 @@ class ReviewStateStore:
                 "(key, failures, retry_after, dead_lettered_at) VALUES (?, ?, ?, ?)",
                 (key, failures, retry_after, now if dead_lettered else None),
             )
+            if dead_lettered:
+                connection.execute(
+                    "INSERT OR IGNORE INTO summary_outbox(key, marker, content) "
+                    "VALUES (?, ?, ?)",
+                    (
+                        f"blocker:dead-letter:{key}",
+                        dead_letter_marker,
+                        dead_letter_content,
+                    ),
+                )
         return {
             "attempts": failures,
             "dead_lettered": dead_lettered,
@@ -442,6 +489,26 @@ class ReviewStateStore:
             "claim_token": claim_token,
         }
 
+    def renew_summary_claim(
+        self,
+        outbox_id: int,
+        *,
+        claim_token: str,
+        now: int,
+        lease_seconds: int,
+    ) -> None:
+        if lease_seconds <= 0:
+            raise ValueError("invalid outbox lease")
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE summary_outbox SET claim_until = ? "
+                "WHERE id = ? AND claim_token = ? AND sent_event_id IS NULL "
+                "AND claim_until > ?",
+                (now + lease_seconds, outbox_id, claim_token, now),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("outbox claim not found")
+
     def release_summary_claim(
         self, outbox_id: int, *, claim_token: str, retry_after: int
     ) -> None:
@@ -488,12 +555,18 @@ def drain_summary_outbox(
     processed = 0
     while True:
         now = int(time.time())
-        item = store.claim_summary(now=now, lease_seconds=60)
+        item = store.claim_summary(now=now, lease_seconds=5 * 60)
         if item is None:
             break
         try:
             event_id = find_existing(item["marker"])
             if event_id is None:
+                store.renew_summary_claim(
+                    item["id"],
+                    claim_token=item["claim_token"],
+                    now=int(time.time()),
+                    lease_seconds=5 * 60,
+                )
                 event_id = send(f'{item["content"]}\n\n{item["marker"]}')
             store.mark_summary_sent(
                 item["id"], event_id, claim_token=item["claim_token"]
@@ -1118,8 +1191,9 @@ def _workflow_source_sha256(commit_sha: str, path: str) -> str:
     ):
         raise RuntimeError("GitHub returned malformed workflow content")
     try:
-        content = base64.b64decode(value["content"], validate=True)
-    except (binascii.Error, ValueError) as exc:
+        encoded = re.sub(r"[\t\n\r\f\v ]+", "", value["content"])
+        content = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, UnicodeEncodeError, ValueError) as exc:
         raise RuntimeError("GitHub returned malformed workflow content") from exc
     return hashlib.sha256(content).hexdigest()
 
@@ -2045,28 +2119,33 @@ def _settle(payload: dict, expected_login: str, store: ReviewStateStore) -> dict
         or LEASE_TOKEN_PATTERN.fullmatch(lease_token) is None
     ):
         raise RuntimeError("invalid settlement lease token")
+    if operation == "claim_publish":
+        store.claim_publication(
+            review_tuple,
+            lease_token=lease_token,
+            now=int(time.time()),
+            lease_seconds=15 * 60,
+        )
+        return {"settled": "claim_publish"}
     if operation == "release":
+        pr_url = f"https://github.com/{REPOSITORY}/pull/{review_tuple.pr_number}"
         failure = store.record_failure(
             review_tuple,
             lease_token=lease_token,
             now=int(time.time()),
             retry_delay=RETRY_DELAY_SECONDS,
             max_attempts=MAX_REVIEW_ATTEMPTS,
+            dead_letter_marker=_dead_letter_marker(review_tuple),
+            dead_letter_content=(
+                "**Operational blocker:** automated review for PR "
+                f"#{review_tuple.pr_number} at head `{review_tuple.head_sha}` "
+                f"failed after {MAX_REVIEW_ATTEMPTS} attempts. The tuple was "
+                "dead-lettered. GitHub error-status publication is attempted "
+                "separately and may still be pending."
+            ),
         )
         if failure["dead_lettered"]:
-            pr_url = f"https://github.com/{REPOSITORY}/pull/{review_tuple.pr_number}"
             _post_error_status(review_tuple, pr_url)
-            store.enqueue_blocker(
-                review_tuple,
-                kind="dead-letter",
-                marker=_dead_letter_marker(review_tuple),
-                content=(
-                    "**Operational blocker:** automated review for PR "
-                    f"#{review_tuple.pr_number} at head `{review_tuple.head_sha}` "
-                    f"failed after {failure['attempts']} attempts. The tuple was "
-                    "dead-lettered and the GitHub status was marked error."
-                ),
-            )
             drain_summary_outbox(store, find_existing=_buzz_find, send=_buzz_send)
         return {"settled": "release", **failure}
     if operation != "complete":

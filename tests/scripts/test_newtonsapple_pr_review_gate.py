@@ -569,6 +569,19 @@ def test_capture_run_loader_accepts_the_pinned_base_workflow_source(monkeypatch)
     assert gate._load_run(123) == run
 
 
+def test_workflow_source_hash_accepts_github_wrapped_base64(monkeypatch):
+    content = b"name: trusted\non: workflow_dispatch\n"
+    encoded = base64.b64encode(content).decode("ascii")
+    wrapped = "\n".join(encoded[index : index + 12] for index in range(0, len(encoded), 12)) + "\n"
+    monkeypatch.setattr(
+        gate,
+        "gh_json",
+        lambda *args: {"type": "file", "encoding": "base64", "content": wrapped},
+    )
+
+    assert gate._workflow_source_sha256(BASE_SHA, ".github/workflows/review.yml") == hashlib.sha256(content).hexdigest()
+
+
 def test_dispatch_status_requires_canonical_run_name_and_allowlisted_actor():
     trusted = TrustedWorkflow(
         workflow_id=778899,
@@ -684,6 +697,65 @@ def test_review_state_store_uses_wal_and_reclaims_only_expired_leases(tmp_path):
     assert store.reserve(review_tuple, now=10_000, lease_seconds=30) is None
 
 
+def test_publication_claim_is_single_use_token_fenced_and_extends_lease(tmp_path):
+    first_store = ReviewStateStore(tmp_path / "review.sqlite3")
+    second_store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    lease_token = first_store.reserve(review_tuple, now=100, lease_seconds=30)
+    assert isinstance(lease_token, str)
+
+    first_store.claim_publication(
+        review_tuple,
+        lease_token=lease_token,
+        now=120,
+        lease_seconds=300,
+    )
+
+    assert second_store.reserve(review_tuple, now=131, lease_seconds=30) is None
+    with pytest.raises(ValueError, match="review publication claim not found"):
+        first_store.claim_publication(
+            review_tuple,
+            lease_token=lease_token,
+            now=121,
+            lease_seconds=300,
+        )
+    replacement = second_store.reserve(review_tuple, now=420, lease_seconds=30)
+    assert isinstance(replacement, str)
+
+
+def test_settlement_control_plane_claims_publication_before_side_effect(monkeypatch, tmp_path):
+    store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    lease_token = store.reserve(review_tuple, now=100, lease_seconds=60)
+    assert isinstance(lease_token, str)
+    monkeypatch.setattr(gate.time, "time", lambda: 120)
+    payload = {
+        "operation": "claim_publish",
+        "contract_version": "v2",
+        "repository": review_tuple.repository,
+        "pr_number": review_tuple.pr_number,
+        "base_sha": review_tuple.base_sha,
+        "head_sha": review_tuple.head_sha,
+        "lease_token": lease_token,
+    }
+
+    assert gate._settle(payload, "newtonsapple-bot", store) == {
+        "settled": "claim_publish"
+    }
+    with pytest.raises(ValueError, match="review publication claim not found"):
+        gate._settle(payload, "newtonsapple-bot", store)
+
+
 def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
     store = ReviewStateStore(tmp_path / "review.sqlite3")
     review_tuple = ReviewTuple(
@@ -701,6 +773,8 @@ def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
         now=110,
         retry_delay=60,
         max_attempts=2,
+        dead_letter_marker="dead-letter-marker",
+        dead_letter_content="review failed permanently",
     )
     assert first == {"attempts": 1, "dead_lettered": False, "retry_after": 170}
     assert store.reserve(review_tuple, now=169, lease_seconds=30) is None
@@ -713,8 +787,18 @@ def test_review_failures_back_off_and_eventually_dead_letter(tmp_path):
         now=180,
         retry_delay=60,
         max_attempts=2,
+        dead_letter_marker="dead-letter-marker",
+        dead_letter_content="review failed permanently",
     )
     assert second == {"attempts": 2, "dead_lettered": True, "retry_after": None}
+    assert store.pending_summaries() == [
+        {
+            "id": 1,
+            "key": f"blocker:dead-letter:{gate.tuple_key(review_tuple)}",
+            "marker": "dead-letter-marker",
+            "content": "review failed permanently",
+        }
+    ]
     assert store.reserve(review_tuple, now=10_000, lease_seconds=30) is None
 
 
@@ -881,6 +965,38 @@ def test_summary_outbox_claims_are_exclusive_and_stale_tokens_cannot_ack(tmp_pat
         outbox_id, "accepted-event", claim_token=second_claim["claim_token"]
     )
     assert first_store.sent_event_id(outbox_id) == "accepted-event"
+
+
+def test_buzz_outbox_claim_can_be_token_fenced_and_renewed(tmp_path):
+    first_store = ReviewStateStore(tmp_path / "review.sqlite3")
+    second_store = ReviewStateStore(tmp_path / "review.sqlite3")
+    review_tuple = ReviewTuple(
+        repository="NewtonsAppleAI/newtonsapple-web",
+        pr_number=185,
+        base_sha=BASE_SHA,
+        head_sha=HEAD_SHA,
+    )
+    outbox_id = first_store.enqueue_summary(
+        review_tuple, marker="tuple-marker", content="summary"
+    )
+    claim = first_store.claim_summary(now=100, lease_seconds=60)
+    assert claim is not None
+
+    first_store.renew_summary_claim(
+        outbox_id,
+        claim_token=claim["claim_token"],
+        now=150,
+        lease_seconds=300,
+    )
+
+    assert second_store.claim_summary(now=200, lease_seconds=60) is None
+    with pytest.raises(ValueError, match="outbox claim not found"):
+        first_store.renew_summary_claim(
+            outbox_id,
+            claim_token="stale-token",
+            now=200,
+            lease_seconds=300,
+        )
 
 
 def test_operational_blocker_has_distinct_outbox_identity_from_later_summary(tmp_path):
