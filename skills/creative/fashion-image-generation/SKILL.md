@@ -58,7 +58,7 @@ it; regenerate any shot that looks elongated.
 **Required pose set (every garment × every colorway).** Beyond the basic e-commerce front
 shot, each garment must also be produced in **two additional variants** (in addition to
 `front`), always on-model and always faithful to the ghost mannequin + model reference:
-- `bust34` — **three-quarter bust shot** (waist up), slight three-quarter angle.
+- `bust34` — **three-quarter bust shot** (framed from the waist up, lower body/legs cropped out of frame), slight three-quarter angle.
 - `editorial` — **dynamic editorial fashion pose** (weight shifted, one hand in the coat
   pocket or adjusting the collar), set on the **editorial/street scene** (`EDITORIAL_SCENE`),
   not the studio background.

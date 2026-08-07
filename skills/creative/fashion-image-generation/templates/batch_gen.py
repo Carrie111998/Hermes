@@ -47,7 +47,7 @@ POSES = {
     "34":          "three-quarter angle pose, arms relaxed",
     "back":        "back-facing pose, standing upright",
     "detail":      "close-up on the garment fabric and construction",
-    "bust34":      "three-quarter length bust shot from the waist up, slight three-quarter angle, arms relaxed",
+    "bust34":      "framed as a close three-quarter bust shot from the waist up, the lower body and legs cropped out of frame, slight three-quarter angle, arms relaxed",
     "editorial":   "a dynamic editorial fashion pose, weight shifted, one hand in coat pocket or adjusting the collar, confident stance",
 }
 # Editorial scene replaces the studio background for campaign variants.
