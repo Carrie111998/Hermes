@@ -808,6 +808,11 @@ class WebhookAdapter(BasePlatformAdapter):
                 self._route_processor.run_route_script,
                 route_config.get("script"),
                 payload,
+                **(
+                    {"trusted_github_pr_environment": True}
+                    if route_config.get("evidence") == "github_pr"
+                    else {}
+                ),
             )
             if not keep:
                 logger.info(
@@ -1067,6 +1072,11 @@ class WebhookAdapter(BasePlatformAdapter):
             self._route_processor.run_route_script,
             script,
             {"operation": "reconcile"},
+            **(
+                {"trusted_github_pr_environment": True}
+                if route_config.get("evidence") == "github_pr"
+                else {}
+            ),
         )
         if not ok or not isinstance(result, dict):
             return 0
@@ -1142,6 +1152,7 @@ class WebhookAdapter(BasePlatformAdapter):
             self._route_processor.run_route_script,
             static_route["script"],
             settlement,
+            trusted_github_pr_environment=True,
         )
         return keep
 
@@ -1166,6 +1177,11 @@ class WebhookAdapter(BasePlatformAdapter):
             self._route_processor.run_route_script,
             route_config.get("script"),
             payload,
+            **(
+                {"trusted_github_pr_environment": True}
+                if route_config.get("evidence") == "github_pr"
+                else {}
+            ),
         )
         if not keep:
             return False
@@ -1363,9 +1379,12 @@ class WebhookAdapter(BasePlatformAdapter):
                 "head_sha": scope.head_sha,
             }
             script_kwargs = (
-                {"timeout_seconds": 4 * 60 * 60}
+                {
+                    "timeout_seconds": 4 * 60 * 60,
+                    "trusted_github_pr_environment": True,
+                }
                 if operation == "execution_evidence"
-                else {}
+                else {"trusted_github_pr_environment": True}
             )
             keep, result = self._route_processor.run_route_script(
                 script, request, **script_kwargs
@@ -1478,6 +1497,7 @@ class WebhookAdapter(BasePlatformAdapter):
             self._route_processor.run_route_script,
             static_route["script"],
             settlement_payload,
+            trusted_github_pr_environment=True,
         )
         if not keep:
             logger.error(

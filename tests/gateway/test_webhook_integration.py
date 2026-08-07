@@ -12,6 +12,8 @@ import base64
 import hashlib
 import hmac
 import json
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -30,9 +32,53 @@ from gateway.platforms.base import (
     SendResult,
 )
 from gateway.platforms.webhook import WebhookAdapter, _INSECURE_NO_AUTH
+from gateway.platforms.webhook_filters import WebhookRouteProcessor
 from hermes_cli.tools_config import _get_platform_tools
 from model_tools import _clear_tool_defs_cache, get_tool_definitions
 from tools.github_pr_evidence import EvidenceScope, evidence_scope
+
+
+def test_trusted_github_pr_script_receives_only_its_reviewed_control_plane_env(
+    monkeypatch,
+):
+    allowed = {
+        "NEWTONSAPPLE_REVIEW_BOT_LOGIN": "newtonsapple-bot",
+        "NEWTONSAPPLE_REVIEW_ATTESTATION_PRIVATE_KEY": "signer",
+        "GH_CONFIG_DIR": "/trusted/bot-gh",
+        "BUZZ_RELAY_URL": "wss://relay.example",
+        "BUZZ_PRIVATE_KEY": "buzz-key",
+        "BUZZ_AUTH_TAG": "buzz-auth",
+    }
+    for key, value in allowed.items():
+        monkeypatch.setenv(key, value)
+    monkeypatch.setenv("UNRELATED_PROVIDER_SECRET", "must-not-propagate")
+    sanitized = {"PATH": "/usr/bin:/bin", "HOME": "/tmp/safe-home"}
+
+    with patch(
+        "gateway.platforms.webhook_filters._resolve_script_path",
+        return_value=(Path("/tmp/trusted-gate.py"), None),
+    ), patch(
+        "tools.environments.local.build_subprocess_env",
+        return_value=sanitized.copy(),
+    ), patch(
+        "gateway.platforms.webhook_filters.subprocess.run",
+        return_value=SimpleNamespace(
+            returncode=0,
+            stdout='{"verified":true}',
+            stderr="",
+        ),
+    ) as run:
+        keep, transformed = WebhookRouteProcessor().run_route_script(
+            "trusted-gate.py",
+            {"operation": "reconcile"},
+            trusted_github_pr_environment=True,
+        )
+
+    assert keep is True
+    assert transformed == {"verified": True}
+    child_env = run.call_args.kwargs["env"]
+    assert {key: child_env[key] for key in allowed} == allowed
+    assert "UNRELATED_PROVIDER_SECRET" not in child_env
 
 
 # ---------------------------------------------------------------------------
@@ -329,6 +375,7 @@ class TestGitHubPREvidenceScope:
                 "head_sha": "b" * 40,
             },
             timeout_seconds=4 * 60 * 60,
+            trusted_github_pr_environment=True,
         )
 
     def test_gate_resolution_loader_uses_static_policy_and_exact_tuple(self):
@@ -370,6 +417,7 @@ class TestGitHubPREvidenceScope:
                 "base_sha": "a" * 40,
                 "head_sha": "b" * 40,
             },
+            trusted_github_pr_environment=True,
         )
 
     def test_dynamic_route_cannot_grant_evidence_scope(self):
@@ -1268,6 +1316,7 @@ class TestGitHubReviewDelivery:
                 "head_sha": self.head_sha,
                 "lease_token": "lllllllllllllllllllllllllllllllllllllllllll",
             },
+            trusted_github_pr_environment=True,
         )
 
     @pytest.mark.asyncio

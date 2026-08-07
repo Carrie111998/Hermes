@@ -15,6 +15,14 @@ from typing import Any, Optional
 logger = logging.getLogger(__name__)
 
 DEFAULT_SCRIPT_TIMEOUT_SECONDS = 30
+_TRUSTED_GITHUB_PR_SCRIPT_ENV = (
+    "NEWTONSAPPLE_REVIEW_BOT_LOGIN",
+    "NEWTONSAPPLE_REVIEW_ATTESTATION_PRIVATE_KEY",
+    "GH_CONFIG_DIR",
+    "BUZZ_RELAY_URL",
+    "BUZZ_PRIVATE_KEY",
+    "BUZZ_AUTH_TAG",
+)
 _MISSING = object()
 
 
@@ -231,6 +239,7 @@ class WebhookRouteProcessor:
         payload: dict,
         *,
         timeout_seconds: Optional[int] = None,
+        trusted_github_pr_environment: bool = False,
     ) -> tuple[bool, Optional[dict]]:
         """Run a route script and return (should_continue, transformed_payload)."""
         path, error = _resolve_script_path(script_value)
@@ -254,6 +263,12 @@ class WebhookRouteProcessor:
             from tools.environments.local import build_subprocess_env
 
             popen_kwargs = {"creationflags": 0x08000000} if sys.platform == "win32" else {}
+            script_env = build_subprocess_env()
+            if trusted_github_pr_environment:
+                for key in _TRUSTED_GITHUB_PR_SCRIPT_ENV:
+                    value = os.environ.get(key)
+                    if value:
+                        script_env[key] = value
             result = subprocess.run(
                 argv,
                 input=json.dumps(payload),
@@ -265,7 +280,7 @@ class WebhookRouteProcessor:
                     else timeout_seconds
                 ),
                 cwd=str(path.parent),
-                env=build_subprocess_env(),
+                env=script_env,
                 **popen_kwargs,
             )
         except subprocess.TimeoutExpired:
