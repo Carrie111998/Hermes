@@ -56,6 +56,16 @@ def _fmt_task_line(t: kb.Task) -> str:
     return f"{icon} {t.id}  {t.status:8s}  {assignee:20s}{tenant}  {t.title}"
 
 
+def _positive_wip_limit(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError("WIP limit must be a positive integer") from exc
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("WIP limit must be a positive integer")
+    return parsed
+
+
 def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     return {
         "id": t.id,
@@ -290,6 +300,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Switch to the new board after creating it")
     b_create.add_argument("--default-workdir", default=None,
                           help="Default workspace path for tasks created on this board")
+    b_create.add_argument("--wip-limit", type=_positive_wip_limit, default=None,
+                          help="Maximum automatically running tasks (positive integer)")
 
     b_rm = boards_sub.add_parser(
         "rm", aliases=["remove", "delete"],
@@ -325,6 +337,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     b_set_wd.add_argument("slug")
     b_set_wd.add_argument("path", nargs="?", default=None,
                           help="Absolute path to use as default workdir. Omit to clear.")
+
+    b_set_wip = boards_sub.add_parser(
+        "set-wip-limit",
+        help="Set or clear the maximum automatically running tasks",
+    )
+    b_set_wip.add_argument("slug")
+    b_set_wip.add_argument("limit", nargs="?", type=_positive_wip_limit,
+                           help="Positive integer; omit to clear")
 
     # --- create ---
     p_create = sub.add_parser("create", help="Create a new task")
@@ -1154,6 +1174,7 @@ _DELEGATED_CHILD_DENIED_BOARD_ACTIONS: frozenset[str] = frozenset({
     "use",
     "rename",
     "set-default-workdir",
+    "set-wip-limit",
 })
 
 
@@ -1201,6 +1222,8 @@ def _dispatch_boards(args: argparse.Namespace) -> int:
         return _cmd_boards_rename(args)
     if sub == "set-default-workdir":
         return _cmd_boards_set_default_workdir(args)
+    if sub == "set-wip-limit":
+        return _cmd_boards_set_wip_limit(args)
     print(f"kanban boards: unknown action {sub!r}", file=sys.stderr)
     return 2
 
@@ -1236,7 +1259,7 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
     if not boards:
         print("(no boards — create one with `hermes kanban boards create <slug>`)")
         return 0
-    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  COUNTS")
+    print(f"{'':2s}  {'SLUG':24s}  {'NAME':28s}  WIP LIMIT  COUNTS")
     for b in boards:
         marker = "●" if b["is_current"] else " "
         counts = b["counts"] or {}
@@ -1247,7 +1270,8 @@ def _cmd_boards_list(args: argparse.Namespace) -> int:
         name = b.get("name") or ""
         if b.get("archived"):
             name += " [archived]"
-        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  {counts_str}")
+        wip = b.get("wip_limit") or "unlimited"
+        print(f"{marker:2s}  {b['slug']:24s}  {name:28s}  WIP={wip}  {counts_str}")
     print()
     print(f"Current board: {current}")
     if len(boards) > 1:
@@ -1265,17 +1289,20 @@ def _cmd_boards_create(args: argparse.Namespace) -> int:
         print("kanban boards create: slug is required", file=sys.stderr)
         return 2
     already = kb.board_exists(normed) and normed != kb.DEFAULT_BOARD
-    meta = kb.create_board(
-        normed,
-        name=args.name,
-        description=args.description,
-        icon=args.icon,
-        color=args.color,
-        default_workdir=args.default_workdir,
-    )
+    create_kwargs = {
+        "name": args.name,
+        "description": args.description,
+        "icon": args.icon,
+        "color": args.color,
+        "default_workdir": args.default_workdir,
+    }
+    if getattr(args, "wip_limit", None) is not None:
+        create_kwargs["wip_limit"] = args.wip_limit
+    meta = kb.create_board(normed, **create_kwargs)
     verb = "already exists" if already else "created"
     print(f"Board {meta['slug']!r} {verb}.")
     print(f"  Display name: {meta.get('name', '')}")
+    print(f"  WIP limit:    {meta.get('wip_limit') or 'unlimited'}")
     print(f"  DB path:      {meta['db_path']}")
     if getattr(args, "switch", False):
         kb.set_current_board(meta["slug"])
@@ -1333,6 +1360,7 @@ def _cmd_boards_show(args: argparse.Namespace) -> int:
     total = sum(counts.values())
     print(f"Current board: {current}")
     print(f"  Display name: {meta.get('name', '')}")
+    print(f"  WIP limit:    {meta.get('wip_limit') or 'unlimited'}")
     if meta.get("description"):
         print(f"  Description:  {meta['description']}")
     print(f"  DB path:      {meta['db_path']}")
@@ -1373,6 +1401,24 @@ def _cmd_boards_set_default_workdir(args: argparse.Namespace) -> int:
         print(f"Board {normed!r} default workdir set to {new_val!r}.")
     else:
         print(f"Board {normed!r} default workdir cleared.")
+    return 0
+
+
+def _cmd_boards_set_wip_limit(args: argparse.Namespace) -> int:
+    try:
+        normed = kb._normalize_board_slug(args.slug)
+    except ValueError as exc:
+        print(f"kanban boards set-wip-limit: {exc}", file=sys.stderr)
+        return 2
+    if not normed or not kb.board_exists(normed):
+        print(f"kanban boards set-wip-limit: board {args.slug!r} does not exist",
+              file=sys.stderr)
+        return 1
+    meta = kb.write_board_metadata(normed, wip_limit=args.limit)
+    if meta.get("wip_limit") is None:
+        print(f"Board {normed!r} WIP limit cleared.")
+    else:
+        print(f"Board {normed!r} WIP limit set to {meta['wip_limit']}.")
     return 0
 
 
@@ -2495,6 +2541,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_wip_capped": res.skipped_wip_capped,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2527,6 +2574,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    if res.skipped_wip_capped:
+        print(f"Deferred (board WIP limit): {', '.join(res.skipped_wip_capped)}")
     if res.skipped_per_profile_capped:
         for tid, who, current in res.skipped_per_profile_capped:
             print(
@@ -2611,7 +2660,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     def _on_tick(res):
         ready_pending = bool(res.skipped_unassigned) or _ready_queue_nonempty()
         spawned_any = bool(res.spawned)
-        if ready_pending and not spawned_any:
+        wip_capped = bool(res.skipped_wip_capped)
+        if ready_pending and not spawned_any and not wip_capped:
             health_state["bad_ticks"] += 1
         else:
             health_state["bad_ticks"] = 0
@@ -2637,6 +2687,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         did_work = (
             res.reclaimed or res.crashed or res.timed_out or res.promoted
             or res.spawned or res.auto_blocked or res.stale
+            or res.skipped_wip_capped
         )
         if did_work:
             print(
@@ -2644,7 +2695,8 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
                 f"reclaimed={res.reclaimed} crashed={len(res.crashed)} "
                 f"timed_out={len(res.timed_out)} stale={len(res.stale)} "
                 f"promoted={res.promoted} spawned={len(res.spawned)} "
-                f"auto_blocked={len(res.auto_blocked)}",
+                f"auto_blocked={len(res.auto_blocked)} "
+                f"wip_capped={len(res.skipped_wip_capped)}",
                 flush=True,
             )
 
