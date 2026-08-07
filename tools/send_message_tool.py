@@ -1103,11 +1103,38 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             last_result = result
         return last_result
 
+    # --- SimpleX: native media via the plugin's standalone_sender_fn
+    # (plugins/platforms/simplex/adapter.py::_standalone_send). The sender
+    # supports the structured /_send @<numeric-id> json form with JPEG
+    # thumbnails, so MEDIA: delivery works for out-of-process callers too.
+    # SimpleX is a dynamic plugin platform (no static Platform member).
+    if platform == Platform("simplex") and media_files:
+        from gateway.platform_registry import platform_registry as _pr_simplex
+        from hermes_cli.plugins import discover_plugins as _dp_simplex
+        _dp_simplex()
+        _simplex_entry = _pr_simplex.get("simplex")
+        if _simplex_entry is None or _simplex_entry.standalone_sender_fn is None:
+            return {"error": "Simplex plugin not registered or missing standalone_sender_fn"}
+        last_result = None
+        for i, chunk in enumerate(chunks):
+            is_last = (i == len(chunks) - 1)
+            result = await _simplex_entry.standalone_sender_fn(
+                pconfig,
+                chat_id,
+                chunk,
+                media_files=media_files if is_last else None,
+                thread_id=thread_id,
+            )
+            if isinstance(result, dict) and result.get("error"):
+                return result
+            last_result = result
+        return last_result
+
     # --- Non-media platforms ---
     if media_files and not message.strip():
         return {
             "error": (
-                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack; "
+                f"send_message MEDIA delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp, slack and simplex; "
                 f"target {platform.value} had only media attachments"
             )
         }
@@ -1115,7 +1142,7 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     if media_files:
         warning = (
             f"MEDIA attachments were omitted for {platform.value}; "
-            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp and slack"
+            "native send_message media delivery is currently only supported for telegram, discord, matrix, weixin, signal, yuanbao, feishu, whatsapp, slack and simplex"
         )
 
     last_result = None
