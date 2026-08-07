@@ -2702,12 +2702,40 @@ class SessionDB:
             )
         return format(canonical, ".6f")
 
+    def _bridge_migration_applied(
+        self, cursor: sqlite3.Cursor, migration_name: str
+    ) -> bool:
+        """Lock-free check whether *migration_name* is already recorded.
+
+        Runs as a plain autocommit read (no ``BEGIN IMMEDIATE``) so an
+        already-migrated database — the overwhelmingly common case on every
+        ``SessionDB()`` open, including the desktop's per-request read
+        endpoints — never has to acquire the WAL write lock.  Taking that lock
+        unconditionally is what let transient session-bridge write contention
+        raise ``database is locked`` and blank the desktop session list
+        (2026-08-07 incident).  Returns False (fall through to the locked
+        migration path) when the ledger table does not exist yet on a
+        brand-new database.
+        """
+        try:
+            row = cursor.execute(
+                "SELECT 1 FROM session_bridge_migrations WHERE migration_name = ?",
+                (migration_name,),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return False
+            raise
+        return row is not None
+
     def _apply_bridge_migrations(self, cursor: sqlite3.Cursor) -> None:
         """Apply bridge-only data migrations independently of core/FTS."""
         migration_name = "claude_visibility_security_v24"
         connection = self._conn
         if connection is None:
             raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            return
         try:
             cursor.execute("BEGIN IMMEDIATE")
             applied = cursor.execute(
@@ -2782,6 +2810,8 @@ class SessionDB:
         connection = self._conn
         if connection is None:
             raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            return
         try:
             cursor.execute("BEGIN IMMEDIATE")
             applied = cursor.execute(
@@ -2959,6 +2989,9 @@ class SessionDB:
         connection = self._conn
         if connection is None:
             raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            self._validate_claude_characterization_events_v28(cursor)
+            return
         try:
             cursor.execute("BEGIN IMMEDIATE")
             applied = cursor.execute(
@@ -3049,6 +3082,8 @@ class SessionDB:
         connection = self._conn
         if connection is None:
             raise RuntimeError("bridge migration requires an open database")
+        if self._bridge_migration_applied(cursor, migration_name):
+            return
         try:
             cursor.execute("BEGIN IMMEDIATE")
             applied = cursor.execute(
@@ -3101,12 +3136,38 @@ class SessionDB:
         # put the complete bridge DDL in one transaction. This keeps a v19
         # database at v19 with none of the additive bridge objects if any
         # statement fails partway through the script.
-        try:
-            cursor.executescript("BEGIN IMMEDIATE;\n" + BRIDGE_SCHEMA_SQL + "\nCOMMIT;")
-        except Exception:
-            if self._conn.in_transaction:
-                self._conn.rollback()
-            raise
+        #
+        # This BEGIN IMMEDIATE is the one write lock every open still takes even
+        # on a fully-initialised database (the migrations below short-circuit
+        # lock-free once applied).  The DDL is idempotent (CREATE ... IF NOT
+        # EXISTS), so on transient session-bridge write contention we roll back
+        # and retry with jitter rather than letting a momentary
+        # ``database is locked`` propagate and blank a read caller's session
+        # list (2026-08-07 incident).
+        for attempt in range(self._WRITE_MAX_RETRIES):
+            try:
+                cursor.executescript(
+                    "BEGIN IMMEDIATE;\n" + BRIDGE_SCHEMA_SQL + "\nCOMMIT;"
+                )
+                break
+            except sqlite3.OperationalError as exc:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                msg = str(exc).lower()
+                if ("locked" in msg or "busy" in msg) and (
+                    attempt < self._WRITE_MAX_RETRIES - 1
+                ):
+                    time.sleep(
+                        random.uniform(
+                            self._WRITE_RETRY_MIN_S, self._WRITE_RETRY_MAX_S
+                        )
+                    )
+                    continue
+                raise
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
         # ── Declarative column reconciliation ──────────────────────────
         # Diff live tables against SCHEMA_SQL and ADD any missing columns.
