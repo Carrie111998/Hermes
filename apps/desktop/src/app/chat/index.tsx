@@ -15,6 +15,7 @@ import { usePaneVisible } from '@/components/pane-shell/pane-visibility'
 import { $sessionTileDragging, $sessionTileEdgeHover } from '@/components/pane-shell/tree/store'
 import { PromptOverlays } from '@/components/prompt-overlays'
 import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
 import { ErrorState } from '@/components/ui/error-state'
 import { TitleMenuTrigger } from '@/components/ui/title-menu-trigger'
 import { type HermesGateway } from '@/hermes'
@@ -28,7 +29,7 @@ import { cn } from '@/lib/utils'
 import { migrateSessionDraft } from '@/store/composer'
 import { migrateQueuedPrompts, parkQueuedPrompts } from '@/store/composer-queue'
 import { $introSplash } from '@/store/intro-splash'
-import { $pinnedSessionIds } from '@/store/layout'
+import { $fileBrowserOpen, $pinnedSessionIds, toggleFileBrowserOpen } from '@/store/layout'
 import { $petActive } from '@/store/pet'
 import { $petOverlayActive } from '@/store/pet-overlay'
 import { $activeGatewayProfile, $gatewaySwapTarget, $profiles } from '@/store/profile'
@@ -126,6 +127,8 @@ function ChatHeader({
   const sessions = useStore($sessions)
   const pinnedSessionIds = useStore($pinnedSessionIds)
   const profiles = useStore($profiles)
+  const { t } = useI18n()
+  const fileBrowserOpen = useStore($fileBrowserOpen)
 
   const activeStoredSession =
     (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
@@ -159,7 +162,7 @@ function ChatHeader({
         className={cn(titlebarHeaderTitleClass, showProfileTag && 'flex items-center')}
         style={{
           maxWidth:
-            'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right) - var(--titlebar-tools-width) - 1.5rem)'
+            'calc(100vw - var(--titlebar-content-inset,0px) - var(--titlebar-tools-right,0.75rem) - var(--titlebar-tools-width,5.5rem) - 1.5rem)'
         }}
       >
         {showProfileTag && <ProfileTag className="pointer-events-auto mr-1.5" profile={activeStoredSession?.profile} />}
@@ -174,6 +177,28 @@ function ChatHeader({
         >
           <TitleMenuTrigger>{title}</TitleMenuTrigger>
         </SessionActionsMenu>
+      </div>
+
+      {/* File browser toggle — the SAME $fileBrowserOpen the titlebar button
+          and ⌘J drive, so all three entries stay in lockstep. Highlighted
+          while the workspace file tree is showing. Absolutely positioned at
+          the header's right edge, LEFT of the titlebar tools (which float at
+          z-70 over the header's padding): an ml-auto in-flow button would sit
+          underneath them and never be visible. */}
+      <div className="pointer-events-auto absolute right-[calc(var(--titlebar-tools-right,0.75rem)+var(--titlebar-tools-width,5.5rem)+0.75rem)] top-1/2 z-[71] flex -translate-y-1/2 items-center">
+        <button
+          aria-label={fileBrowserOpen ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar}
+          className={cn(
+            'grid size-6 place-items-center rounded-md text-(--ui-text-tertiary) transition-colors',
+            'hover:bg-(--ui-control-hover-background) hover:text-foreground',
+            fileBrowserOpen && 'bg-(--ui-control-hover-background) text-(--ui-accent)'
+          )}
+          onClick={toggleFileBrowserOpen}
+          title={fileBrowserOpen ? t.titlebar.hideRightSidebar : t.titlebar.showRightSidebar}
+          type="button"
+        >
+          <Codicon name="files" />
+        </button>
       </div>
     </header>
   )

@@ -914,13 +914,17 @@ export function closeTreePane(paneId: string) {
  */
 export type TreeSide = 'left' | 'right'
 
-export const $collapsedTreeSides = atom<ReadonlySet<TreeSide>>(new Set())
+// The right rail (review / terminal) starts COLLAPSED: with the file tree and
+// previews living inside the workspace pane, nothing occupies the side by
+// default. Opening a pane there (⌘G review, ⌃` terminal) un-collapses it via
+// revealTreePane.
+export const $collapsedTreeSides = atom<ReadonlySet<TreeSide>>(new Set<TreeSide>(['right']))
 
-// Side visibility is DERIVED from an app store (the binding owns persistence
-// + button state). Reveals un-collapse the column directly instead of writing
-// back through the setter — the right side's store IS the file tree's toggle,
-// so a neighbour's reveal must not press it. Layout reset still reopens every
-// side through its setter, because there the toggles SHOULD move.
+// Side visibility is DERIVED from an app store for the LEFT (the sidebar
+// binding owns persistence + button state); the RIGHT has no owning store now
+// (the file browser moved inside the workspace pane), so reveals un-collapse
+// the column directly. Layout reset still reopens every side through its
+// setter, because there the toggles SHOULD move.
 const sideOpeners: Partial<Record<TreeSide, (open: boolean) => void>> = {}
 
 export function setTreeSideCollapsed(side: TreeSide, collapsed: boolean) {

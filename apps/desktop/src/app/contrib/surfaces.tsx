@@ -16,14 +16,23 @@ import { useContributions } from '@/contrib/react/use-contributions'
 import { $activeConnectionId } from '@/store/connections'
 import { $gateway } from '@/store/gateway'
 import { normalizeOrLocalPreviewTarget } from '@/lib/local-preview'
+import { cn } from '@/lib/utils'
+import { $fileBrowserOpen } from '@/store/layout'
 import { notifyError } from '@/store/notifications'
-import { openPreview } from '@/store/preview'
 import { $activeGatewayProfile } from '@/store/profile'
 import { $currentCwd, $freshDraftReady, $gatewayState } from '@/store/session'
 
 import { ChatView } from '../chat'
 import { ChatSidebar } from '../chat/sidebar'
-import { ComponentsResizeSeam, useComponentsWidth } from '../chat/tile/components-area'
+import {
+  ComponentsResizeSeam,
+  PREVIEW_DEFAULT_WIDTH,
+  PREVIEW_MAX_WIDTH,
+  PREVIEW_MIN_WIDTH,
+  useComponentsWidth,
+  useResizableWidth
+} from '../chat/tile/components-area'
+import { PreviewTabs, usePreviewTabs } from '../chat/tile/preview-tabs'
 import { TileFiles } from '../chat/tile/tile-files'
 import { TerminalPaneChrome } from '../right-sidebar/terminal/chrome'
 import { contributedRoutes, NEW_CHAT_ROUTE, ROUTES_AREA, sessionRoute } from '../routes'
@@ -149,6 +158,34 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   const workspaceCwd = useStore($currentCwd).trim()
   const { componentsWidth, startResize } = useComponentsWidth()
 
+  // The workspace pane's file browser is driven by the SAME $fileBrowserOpen
+  // the titlebar button and ⌘J toggle — one source of truth for "file browser
+  // visible". Collapsed keeps the tree MOUNTED at width 0 so its expand/scroll
+  // state survives a hide/show cycle.
+  const fileBrowserOpen = useStore($fileBrowserOpen)
+
+  // In-workspace preview tabs: a file click adds a tab between chat and tree
+  // (chat | preview tabs | files), mirroring the per-tile behavior — the
+  // preview rail is a layout-tree surface, this one keeps its own embedded
+  // tabs. Multiple files stay open at once, switched from the strip above.
+  const {
+    activeUrl: activePreviewUrl,
+    close: closePreviewTab,
+    closeAll: closeAllPreviewTabs,
+    closeOthers: closeOtherPreviewTabs,
+    closeToRight: closePreviewTabsToRight,
+    open: openPreviewTab,
+    setActiveUrl: setActivePreviewUrl,
+    tabs: previewTabs
+  } = usePreviewTabs()
+
+  // Preview strip width, drag-resizable like the tree (seam on its left).
+  const { startResize: startPreviewResize, width: previewWidth } = useResizableWidth(
+    PREVIEW_DEFAULT_WIDTH,
+    PREVIEW_MIN_WIDTH,
+    PREVIEW_MAX_WIDTH
+  )
+
   const openFilePreview = async (path: string) => {
     try {
       const preview = await normalizeOrLocalPreviewTarget(path, workspaceCwd || undefined)
@@ -157,7 +194,7 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
         throw new Error('Could not preview')
       }
 
-      openPreview(preview, 'file-browser')
+      openPreviewTab(preview)
     } catch (error) {
       notifyError(error, 'Preview unavailable')
     }
@@ -173,12 +210,40 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
           {...chatActions}
         />
       </div>
-      <ComponentsResizeSeam onPointerDown={startResize} />
+      {previewTabs.length > 0 && (
+        <>
+          <ComponentsResizeSeam onPointerDown={startPreviewResize} />
+          <div
+            className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary) bg-(--ui-chat-surface-background)"
+            style={{ width: previewWidth }}
+          >
+            <PreviewTabs
+              activeUrl={activePreviewUrl}
+              onActivate={setActivePreviewUrl}
+              onClose={closePreviewTab}
+              onCloseAll={closeAllPreviewTabs}
+              onCloseOthers={closeOtherPreviewTabs}
+              onCloseToRight={closePreviewTabsToRight}
+              scopeId="workspace-preview"
+              tabs={previewTabs}
+            />
+          </div>
+        </>
+      )}
+      {fileBrowserOpen && <ComponentsResizeSeam onPointerDown={startResize} />}
       <div
-        className="flex shrink-0 flex-col overflow-hidden border-l border-(--ui-stroke-secondary)"
-        style={{ width: componentsWidth }}
+        className={cn(
+          'flex shrink-0 flex-col overflow-hidden border-l transition-[width] duration-150',
+          fileBrowserOpen ? 'border-(--ui-stroke-secondary)' : 'border-transparent'
+        )}
+        style={{ width: fileBrowserOpen ? componentsWidth : 0 }}
       >
-        <TileFiles cwd={workspaceCwd} onActivateFile={openFilePreview} onActivateFolder={openFilePreview} />
+        <TileFiles
+          cwd={workspaceCwd}
+          onActivateFile={openFilePreview}
+          onActivateFolder={openFilePreview}
+          onPreviewTarget={openPreviewTab}
+        />
       </div>
     </div>
   )
