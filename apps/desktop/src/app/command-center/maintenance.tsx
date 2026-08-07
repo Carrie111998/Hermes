@@ -168,7 +168,7 @@ export function MaintenancePanel() {
   }, [curator, mm])
 
   const doResetMemory = useCallback(
-    async (target: 'all' | 'memory' | 'user', label: string) => {
+    async (target: 'all' | 'memory' | 'user' | 'posture', label: string) => {
       if (!window.confirm(mm.resetConfirm(label))) {
         return
       }
@@ -337,6 +337,14 @@ export function MaintenancePanel() {
               resetLabel={mm.resetUser}
               size={memory.builtin_files.user}
               sizeLabel={memory.builtin_files.user > 0 ? formatBytes(memory.builtin_files.user) : mm.empty}
+            />
+            <MemoryFileRow
+              busy={memoryBusy}
+              label={mm.postureFile}
+              onReset={() => void doResetMemory('posture', mm.postureFile)}
+              resetLabel={mm.resetPosture}
+              size={memory.builtin_files.posture}
+              sizeLabel={memory.builtin_files.posture > 0 ? formatBytes(memory.builtin_files.posture) : mm.empty}
             />
           </div>
         )}

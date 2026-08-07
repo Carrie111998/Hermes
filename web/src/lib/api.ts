@@ -1186,7 +1186,7 @@ export const api = {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ provider }),
     }),
-  resetMemory: (target: "all" | "memory" | "user") =>
+  resetMemory: (target: "all" | "memory" | "user" | "posture") =>
     fetchJSON<{ ok: boolean; deleted: string[] }>("/api/memory/reset", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -1670,7 +1670,7 @@ export interface MemoryProviderInfo {
 export interface MemoryStatus {
   active: string;
   providers: MemoryProviderInfo[];
-  builtin_files: { memory: number; user: number };
+  builtin_files: { memory: number; user: number; posture: number };
 }
 
 export interface MemoryProviderExternalDependency {

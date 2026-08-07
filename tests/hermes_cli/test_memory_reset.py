@@ -1,8 +1,8 @@
 """Tests for the `hermes memory reset` CLI command.
 
 Covers:
-- Reset both stores (MEMORY.md + USER.md)
-- Reset individual stores (--target memory / --target user)
+- Reset all stores (MEMORY.md + USER.md + POSTURE.md)
+- Reset individual stores (--target memory / --target user / --target posture)
 - Skip confirmation with --yes
 - Graceful handling when no memory files exist
 - Profile-scoped reset (uses HERMES_HOME)
@@ -28,6 +28,10 @@ def memory_env(tmp_path, monkeypatch):
         "§\nUser is Teknium\n§\nTimezone: US Pacific",
         encoding="utf-8",
     )
+    (memories / "POSTURE.md").write_text(
+        "§\nPrimary bet: current review queue",
+        encoding="utf-8",
+    )
     return hermes_home, memories
 
 
@@ -44,6 +48,8 @@ def _run_memory_reset(target="all", yes=False, monkeypatch=None, confirm_input="
         files_to_reset.append(("MEMORY.md", "agent notes"))
     if target in {"all", "user"}:
         files_to_reset.append(("USER.md", "user profile"))
+    if target in {"all", "posture"}:
+        files_to_reset.append(("POSTURE.md", "current posture"))
 
     existing = [(f, desc) for f, desc in files_to_reset if (mem_dir / f).exists()]
     if not existing:
@@ -63,15 +69,17 @@ class TestMemoryReset:
     """Tests for `hermes memory reset` subcommand."""
 
     def test_reset_all_with_yes_flag(self, memory_env):
-        """--yes flag should skip confirmation and delete both files."""
+        """--yes flag should skip confirmation and delete all files."""
         hermes_home, memories = memory_env
         assert (memories / "MEMORY.md").exists()
         assert (memories / "USER.md").exists()
+        assert (memories / "POSTURE.md").exists()
 
         result = _run_memory_reset(target="all", yes=True)
         assert result == "deleted"
         assert not (memories / "MEMORY.md").exists()
         assert not (memories / "USER.md").exists()
+        assert not (memories / "POSTURE.md").exists()
 
 
     def test_reset_no_files_exist(self, tmp_path, monkeypatch):
@@ -92,4 +100,3 @@ class TestMemoryReset:
         result = _run_memory_reset(target="all", yes=True)
         assert result == "deleted"
         assert not (memories / "MEMORY.md").exists()
-

@@ -3,6 +3,7 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 
 class RecordingMemoryProvider:
     name = "recording"
@@ -23,6 +24,81 @@ class RecordingMemoryProvider:
 
     def shutdown(self):
         pass
+
+
+@pytest.mark.parametrize(
+    "memory_config, expected",
+    [
+        (
+            {"memory_enabled": True, "user_profile_enabled": False},
+            (True, False, True),
+        ),
+        (
+            {
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+                "posture_enabled": False,
+            },
+            (True, True, False),
+        ),
+        (
+            {
+                "memory_enabled": False,
+                "user_profile_enabled": False,
+                "posture_enabled": True,
+            },
+            (False, False, True),
+        ),
+        (
+            {
+                "memory_enabled": False,
+                "user_profile_enabled": False,
+                "posture_enabled": False,
+            },
+            (False, False, False),
+        ),
+    ],
+    ids=["derived-on", "explicit-false", "explicit-true", "blank-slate"],
+)
+def test_aiagent_applies_effective_posture_enablement(
+    memory_config,
+    expected,
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    cfg = {"memory": memory_config, "agent": {}}
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=cfg),
+        patch(
+            "hermes_cli.config.load_config_readonly",
+            return_value=cfg,
+        ),
+        patch(
+            "agent.model_metadata.get_model_context_length",
+            return_value=204_800,
+        ),
+        patch("run_agent.get_tool_definitions", return_value=[]),
+        patch("run_agent.check_toolset_requirements", return_value={}),
+        patch("run_agent.OpenAI"),
+    ):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key-1234567890",
+            base_url="https://openrouter.ai/api/v1",
+            quiet_mode=True,
+            skip_context_files=True,
+            skip_memory=False,
+        )
+
+    assert (
+        agent._memory_enabled,
+        agent._user_profile_enabled,
+        agent._posture_enabled,
+    ) == expected
+    assert (agent._memory_store is not None) is any(expected)
 
 
 def test_blank_memory_provider_does_not_auto_enable_honcho():
@@ -134,5 +210,4 @@ def test_core_tool_names_rejected_from_memory_routing_table():
     assert "clarify" not in schema_names
     assert "delegate_task" not in schema_names
     assert "honcho_search" in schema_names
-
 

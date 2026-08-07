@@ -1165,10 +1165,12 @@ export interface Translations {
       builtinMemory: string
       memoryFile: string
       userFile: string
+      postureFile: string
       bytes: (size: string) => string
       empty: string
       resetMemory: string
       resetUser: string
+      resetPosture: string
       resetAll: string
       resetConfirm: (target: string) => string
       resetDone: (files: string) => string

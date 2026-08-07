@@ -223,6 +223,11 @@ class TestMemoryEndpoints:
     def test_status_and_select(self):
         data = self.client.get("/api/memory").json()
         assert "active" in data and "providers" in data and "builtin_files" in data
+        assert data["builtin_files"] == {
+            "memory": 0,
+            "user": 0,
+            "posture": 0,
+        }
 
         r = self.client.put("/api/memory/provider", json={"provider": "built-in"})
         assert r.status_code == 200 and r.json()["active"] == ""
@@ -238,10 +243,12 @@ class TestMemoryEndpoints:
         mem = get_hermes_home() / "memories"
         (mem / "MEMORY.md").write_text("notes")
         (mem / "USER.md").write_text("user")
+        (mem / "POSTURE.md").write_text("posture")
 
-        r = self.client.post("/api/memory/reset", json={"target": "user"})
-        assert r.status_code == 200 and "USER.md" in r.json()["deleted"]
+        r = self.client.post("/api/memory/reset", json={"target": "posture"})
+        assert r.status_code == 200 and "POSTURE.md" in r.json()["deleted"]
         assert (mem / "MEMORY.md").exists()
+        assert (mem / "USER.md").exists()
 
         assert self.client.post(
             "/api/memory/reset", json={"target": "bogus"}
