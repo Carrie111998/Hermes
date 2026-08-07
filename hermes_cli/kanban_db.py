@@ -4697,9 +4697,8 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a git worktree at ``workspace_path``.  Not created
-      automatically in v1 -- the kanban-worker skill documents
-      ``git worktree add`` as a worker-side step.  Returns the intended path.
+    - ``worktree``: a git worktree at ``workspace_path``. Existing paths are
+      returned unchanged; missing paths are rejected before a worker starts.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.
@@ -4737,13 +4736,16 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
     if kind == "worktree":
         if not task.workspace_path:
             # Default: .worktrees/<id>/ under CWD.  Worker skill creates it.
-            return Path.cwd() / ".worktrees" / task.id
-        p = Path(task.workspace_path).expanduser()
-        if not p.is_absolute():
-            raise ValueError(
-                f"task {task.id} has non-absolute worktree path "
-                f"{task.workspace_path!r}; use an absolute path"
-            )
+            p = Path.cwd() / ".worktrees" / task.id
+        else:
+            p = Path(task.workspace_path).expanduser()
+            if not p.is_absolute():
+                raise ValueError(
+                    f"task {task.id} has non-absolute worktree path "
+                    f"{task.workspace_path!r}; use an absolute path"
+                )
+        if not p.is_dir():
+            raise FileNotFoundError(f"missing workspace path: {p}")
         return p
     raise ValueError(f"unknown workspace_kind: {kind}")
 
@@ -4895,7 +4897,7 @@ class DispatchResult:
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
-    """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    """Task ids auto-blocked by workspace preflight or the spawn circuit breaker."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -6284,6 +6286,15 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except FileNotFoundError as exc:
+            if block_task(
+                conn,
+                claimed.id,
+                reason=str(exc),
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",
@@ -6370,6 +6381,15 @@ def dispatch_once(
             continue
         try:
             workspace = resolve_workspace(claimed, board=board)
+        except FileNotFoundError as exc:
+            if block_task(
+                conn,
+                claimed.id,
+                reason=str(exc),
+                expected_run_id=claimed.current_run_id,
+            ):
+                result.auto_blocked.append(claimed.id)
+            continue
         except Exception as exc:
             auto = _record_spawn_failure(
                 conn, claimed.id, f"workspace: {exc}",

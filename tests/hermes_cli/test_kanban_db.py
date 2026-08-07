@@ -1918,15 +1918,48 @@ def test_dir_workspace_honors_given_path(kanban_home, tmp_path):
 
 
 def test_worktree_workspace_returns_intended_path(kanban_home, tmp_path):
-    target = str(tmp_path / ".worktrees" / "my-task")
+    target_path = tmp_path / ".worktrees" / "my-task"
+    target_path.mkdir(parents=True)
+    target = str(target_path)
     with kb.connect() as conn:
         t = kb.create_task(
             conn, title="ship", workspace_kind="worktree", workspace_path=target
         )
         task = kb.get_task(conn, t)
         ws = kb.resolve_workspace(task)
-    # We do NOT auto-create worktrees; the worker's skill handles that.
+    # Existing worktrees are passed through unchanged.
     assert str(ws) == target
+
+
+def test_dispatch_blocks_missing_worktree_before_spawn(
+    kanban_home, tmp_path, all_assignees_spawnable
+):
+    target = tmp_path / ".worktrees" / "missing"
+    spawned = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="ship",
+            assignee="worker",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawned.append((task, workspace)),
+        )
+        task = kb.get_task(conn, task_id)
+        events = kb.list_events(conn, task_id)
+
+    assert spawned == []
+    assert task.status == "blocked"
+    assert task.consecutive_failures == 0
+    assert task_id in result.auto_blocked
+    blocked = [event for event in events if event.kind == "blocked"]
+    assert blocked[-1].payload == {
+        "reason": f"missing workspace path: {target}"
+    }
 
 
 # ---------------------------------------------------------------------------
