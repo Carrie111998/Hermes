@@ -44,9 +44,9 @@ def _cmd_status(args) -> int:
     counts = em.ledger.summary_counts()
     print(f"total={counts['total']} by_state={json.dumps(counts['by_state'])} "
           f"by_source={json.dumps(counts['by_source'])}")
-    requested = em.ledger.list_requests(state="REQUESTED", limit=1)
-    if requested:
-        print(f"oldest_requested={requested[0]['created_at']} request_id={requested[0]['request_id']}")
+    oldest = em.ledger.oldest_requested()
+    if oldest:
+        print(f"oldest_requested={oldest['created_at']} request_id={oldest['request_id']}")
     return 0
 
 

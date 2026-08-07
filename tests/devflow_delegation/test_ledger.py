@@ -140,6 +140,35 @@ def test_list_requests_filters_state(ledger):
     assert len(ledger.list_requests()) == 2
 
 
+def test_oldest_requested_returns_earliest_open_row(ledger):
+    # status CLI needs the OLDEST open request (the most-aged stuck one). Insert
+    # two REQUESTED rows with distinct, explicit created_at (adopt_envelope
+    # preserves the envelope's timestamp) and assert ascending selection — a
+    # DESC LIMIT 1 (the list_requests default) would return the NEWER row, so
+    # this is a positive control for the ascending query.
+    a = make_request(key="old")
+    ea = a.to_envelope()
+    ea["created_at"] = "2020-01-01T00:00:00+00:00"
+    ledger.adopt_envelope(ea)
+    b = make_request(key="new", title="A different newer problem")
+    eb = b.to_envelope()
+    eb["created_at"] = "2021-01-01T00:00:00+00:00"
+    ledger.adopt_envelope(eb)
+
+    row = ledger.oldest_requested()
+    assert row["request_id"] == ea["request_id"]
+    assert row["created_at"] == "2020-01-01T00:00:00+00:00"
+
+    # excludes non-REQUESTED: once the 2020 row leaves REQUESTED, the 2021 row
+    # becomes the oldest OPEN request.
+    ledger.set_state(ea["request_id"], "TRIAGED")
+    assert ledger.oldest_requested()["request_id"] == eb["request_id"]
+
+
+def test_oldest_requested_none_when_empty(ledger):
+    assert ledger.oldest_requested() is None
+
+
 def test_adopt_envelope_preserves_request_id(ledger):
     req = make_request()
     env = req.to_envelope()

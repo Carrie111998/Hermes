@@ -220,6 +220,15 @@ class DelegationLedger:
         row = self._conn().execute(sql, (fingerprint, *sorted(TERMINAL_STATES))).fetchone()
         return self._row_to_dict(row)
 
+    def oldest_requested(self) -> Optional[Dict[str, Any]]:
+        """The most-aged still-open (REQUESTED) row, or None. Ascending by
+        created_at — distinct from list_requests(), which is DESC (newest
+        first). The status CLI uses this to surface the oldest stuck request."""
+        row = self._conn().execute(
+            "SELECT * FROM requests WHERE state='REQUESTED' ORDER BY created_at ASC LIMIT 1"
+        ).fetchone()
+        return self._row_to_dict(row)
+
     def evidence_count(self, request_id: str) -> int:
         row = self._conn().execute(
             "SELECT COUNT(*) AS n FROM evidence_log WHERE request_id=?", (request_id,)
