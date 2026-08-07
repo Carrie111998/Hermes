@@ -161,6 +161,40 @@ def test_voucher_topup_does_not_create_new_campaign_bonus_entitlement() -> None:
     assert "date/time does not prove BookNow" in scenario["focus"]
 
 
+def test_universal_value_voucher_is_model_first_prompt_and_evaluation_material() -> None:
+    expected_principle = (
+        "При подарък без конкретно преживяване използвай facts за универсалния "
+        "„Подаръчен ваучер на стойност“ и отговори директно, че съществува: купувачът "
+        "избира сумата, а получателят избира преживяването по-късно. Не измисляй и не "
+        "налагай конкретно преживяване; това е моделно разсъждение върху facts, не router или шаблон."
+    )
+    prompt = dev_gateway.build_skyai_system_prompt()
+    principles = json.loads(QA_PRINCIPLES_PATH.read_text(encoding="utf-8"))
+    scenarios = json.loads(COMPARE_SCENARIOS_PATH.read_text(encoding="utf-8"))
+
+    assert dev_gateway.SKYAI_UNIVERSAL_VALUE_VOUCHER_PRINCIPLE == expected_principle
+    assert expected_principle in prompt
+
+    principle = next(
+        case for case in principles if case["id"] == "universal_value_voucher_non_specific_gift"
+    )
+    assert principle["source_threads"] == [
+        "case:skyai-voucher-value-20260807-1535227388445720779"
+    ]
+    assert "universal value voucher exists" in principle["principle"]
+    assert "recipient chooses the experience later" in principle["principle"]
+    assert "do not invent or force a selected experience" in principle["principle"]
+    assert "not a keyword router or answer template" in principle["principle"]
+
+    scenario = next(
+        case for case in scenarios if case["id"] == "universal_value_voucher_non_specific_gift"
+    )
+    assert scenario["message"] == "Искам да не е конкретен"
+    assert "universal value voucher exists" in scenario["focus"]
+    assert "non-specific gift" in scenario["focus"]
+    assert "no invented selected experience" in scenario["focus"]
+
+
 def test_external_voucher_boundary_is_a_general_hermes_principle() -> None:
     prompt = dev_gateway.build_skyai_system_prompt()
     support = public_tools.handle_skyai_support_knowledge(include_contacts=True)
@@ -397,6 +431,31 @@ def test_minimum_reservation_architecture_guard_has_no_runtime_router_or_templat
     assert "alternative_guidance" not in payload_keys
     assert "recommended_alternative" not in payload_keys
     assert "customer_ready_answer" not in payload_keys
+
+
+def test_value_voucher_architecture_guard_has_no_runtime_router_or_templates() -> None:
+    combined = "\n".join(
+        Path(path).read_text(encoding="utf-8")
+        for path in (
+            "plugins/skyai_customer/public_tools.py",
+            "plugins/skyai_customer/dev_gateway.py",
+            "plugins/skyai_customer/production_gateway.py",
+        )
+    )
+    forbidden = (
+        "VALUE_VOUCHER_QUERY_TERMS",
+        "_value_voucher_requested",
+        "value_voucher_classifier",
+        "value_voucher_router",
+        "value_voucher_scenario_router",
+        "value_voucher_answer_template",
+        "value_voucher_response_template",
+        "value_voucher_post_process",
+        "value_voucher_answer_rewrite",
+    )
+    for marker in forbidden:
+        assert marker not in combined
+
 
 def test_campaign_tool_returns_fact_pack_not_customer_script() -> None:
     result = public_tools.handle_skyai_campaign_knowledge()

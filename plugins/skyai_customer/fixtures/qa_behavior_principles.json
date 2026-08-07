@@ -313,6 +313,20 @@
     ]
   },
   {
+    "id": "universal_value_voucher_non_specific_gift",
+    "source_threads": [
+      "case:skyai-voucher-value-20260807-1535227388445720779"
+    ],
+    "principle": "When a customer wants a gift that is not tied to a specific experience, answer directly that SkyVision's universal value voucher exists. The buyer selects the sum and the recipient chooses the experience later; do not invent or force a selected experience. Use the dedicated support fact pack for the current title, public URL, starting price, top-up, residual-value, and validity facts. This is model reasoning over facts, not a keyword router or answer template.",
+    "scoring": [
+      "universal_voucher_recognition",
+      "non_specific_gift_intent",
+      "fact_pack_use",
+      "no_invented_experience",
+      "model_first_reasoning"
+    ]
+  },
+  {
     "id": "no_keyword_backend_patches",
     "source_threads": [
       "architecture"
