@@ -1,11 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 
 type BrowserAudioContext = typeof AudioContext
 
 export interface MicRecorderOptions {
   onLevel?: (level: number) => void
   onError?: (error: Error) => void
+  onPartialAudio?: (audio: Blob) => Promise<void> | void
   onSilence?: () => void
+  partialAudioMaxMs?: number
+  partialAudioMs?: number
   silenceLevel?: number
   silenceMs?: number
   idleSilenceMs?: number
@@ -77,8 +80,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
   const silenceTriggeredRef = useRef(false)
   const silenceStartedAtRef = useRef<number | null>(null)
   const stopResolverRef = useRef<((recording: MicRecording | null) => void) | null>(null)
+  const startGenerationRef = useRef(0)
+  const mountedRef = useRef(true)
 
-  const cleanup = () => {
+  const cleanup = useCallback(() => {
     if (animationRef.current) {
       window.cancelAnimationFrame(animationRef.current)
       animationRef.current = null
@@ -89,12 +94,51 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     streamRef.current?.getTracks().forEach(track => track.stop())
     streamRef.current = null
     recorderRef.current = null
-    setLevel(0)
-    setRecording(false)
-    silenceTriggeredRef.current = false
-  }
 
-  useEffect(() => () => cleanup(), [])
+    if (mountedRef.current) {
+      setLevel(0)
+      setRecording(false)
+    }
+
+    silenceTriggeredRef.current = false
+  }, [])
+
+  const abortRecording = useCallback(() => {
+    const recorder = recorderRef.current
+    const resolver = stopResolverRef.current
+
+    stopResolverRef.current = null
+
+    if (recorder) {
+      recorder.ondataavailable = null
+      recorder.onerror = null
+      recorder.onstop = null
+
+      if (recorder.state !== 'inactive') {
+        try {
+          recorder.stop()
+        } catch {
+          // The stream tracks are still stopped by cleanup below.
+        }
+      }
+    }
+
+    cleanup()
+    resolver?.(null)
+  }, [cleanup])
+
+  useEffect(
+    () => {
+      mountedRef.current = true
+
+      return () => {
+        mountedRef.current = false
+        startGenerationRef.current += 1
+        abortRecording()
+      }
+    },
+    [abortRecording]
+  )
 
   const startMeter = (stream: MediaStream, options: MicRecorderOptions) => {
     const audioWindow = window as Window & { webkitAudioContext?: BrowserAudioContext }
@@ -116,6 +160,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       audioContextRef.current = audioContext
 
       const tick = () => {
+        if (!mountedRef.current || streamRef.current !== stream) {
+          return
+        }
+
         analyser.getByteTimeDomainData(data)
 
         let sum = 0
@@ -171,11 +219,17 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       return
     }
 
+    const startGeneration = ++startGenerationRef.current
+
     if (!navigator.mediaDevices?.getUserMedia || typeof MediaRecorder === 'undefined') {
       throw new Error(copy.microphoneUnsupported)
     }
 
     const permitted = await window.hermesDesktop?.requestMicrophoneAccess?.()
+
+    if (startGeneration !== startGenerationRef.current || !mountedRef.current) {
+      return
+    }
 
     if (permitted === false) {
       throw new Error(copy.microphoneAccessDenied)
@@ -188,7 +242,17 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
         audio: { echoCancellation: true, noiseSuppression: true }
       })
     } catch (error) {
+      if (startGeneration !== startGenerationRef.current || !mountedRef.current) {
+        return
+      }
+
       throw micError(error, copy)
+    }
+
+    if (startGeneration !== startGenerationRef.current || !mountedRef.current) {
+      stream.getTracks().forEach(track => track.stop())
+
+      return
     }
 
     const mimeType =
@@ -214,12 +278,28 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     startedAtRef.current = Date.now()
 
     recorder.ondataavailable = event => {
+      if (!mountedRef.current || recorderRef.current !== recorder) {
+        return
+      }
+
       if (event.data.size > 0) {
         chunksRef.current.push(event.data)
+
+        const withinPartialAudioLimit =
+          !options.partialAudioMaxMs || Date.now() - startedAtRef.current <= options.partialAudioMaxMs
+
+        if (options.onPartialAudio && options.partialAudioMs && options.partialAudioMs > 0 && withinPartialAudioLimit) {
+          const recordingType = recorder.mimeType || mimeType || 'audio/webm'
+          void options.onPartialAudio(new Blob(chunksRef.current, { type: recordingType }))
+        }
       }
     }
 
     recorder.onstop = () => {
+      if (!mountedRef.current || recorderRef.current !== recorder) {
+        return
+      }
+
       const chunks = chunksRef.current
       const recordingType = recorder.mimeType || mimeType || 'audio/webm'
       const durationMs = Date.now() - startedAtRef.current
@@ -245,6 +325,10 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     }
 
     recorder.onerror = event => {
+      if (!mountedRef.current || recorderRef.current !== recorder) {
+        return
+      }
+
       const error = micError((event as Event & { error?: unknown }).error, copy)
       const resolver = stopResolverRef.current
       stopResolverRef.current = null
@@ -253,13 +337,28 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
       resolver?.(null)
     }
 
-    recorder.start()
+    try {
+      if (options.onPartialAudio && options.partialAudioMs && options.partialAudioMs > 0) {
+        recorder.start(options.partialAudioMs)
+      } else {
+        recorder.start()
+      }
+    } catch (error) {
+      recorder.ondataavailable = null
+      recorder.onerror = null
+      recorder.onstop = null
+      cleanup()
+
+      throw micError(error, copy)
+    }
+
     setRecording(true)
     startMeter(stream, options)
   }
 
   const stop: MicRecorderHandle['stop'] = () =>
     new Promise<MicRecording | null>(resolve => {
+      startGenerationRef.current += 1
       const recorder = recorderRef.current
 
       if (!recorder || recorder.state === 'inactive') {
@@ -274,19 +373,8 @@ export function useMicRecorder(copy: MicRecorderErrorCopy): {
     })
 
   const cancel: MicRecorderHandle['cancel'] = () => {
-    const recorder = recorderRef.current
-    const resolver = stopResolverRef.current
-    stopResolverRef.current = null
-
-    if (recorder && recorder.state !== 'inactive') {
-      recorder.ondataavailable = null
-      recorder.onerror = null
-      recorder.onstop = null
-      recorder.stop()
-    }
-
-    cleanup()
-    resolver?.(null)
+    startGenerationRef.current += 1
+    abortRecording()
   }
 
   const handle: MicRecorderHandle = { start, stop, cancel }

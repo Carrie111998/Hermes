@@ -2,6 +2,7 @@ import type { AppendMessage, ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { type MutableRefObject, useCallback, useEffect, useRef } from 'react'
 
+import type { AudioTranscriptionOptions } from '@/app/chat/composer/types'
 import { PROMPT_SUBMIT_REQUEST_TIMEOUT_MS, transcribeAudio } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { stripAnsi } from '@/lib/ansi'
@@ -588,13 +589,13 @@ export function usePromptActions({
   )
 
   const transcribeVoiceAudio = useCallback(
-    async (audio: Blob) => {
+    async (audio: Blob, options?: AudioTranscriptionOptions) => {
       if (!sttEnabled) {
         throw new Error(copy.sttDisabled)
       }
 
       const dataUrl = await blobToDataUrl(audio)
-      const result = await transcribeAudio(dataUrl, audio.type)
+      const result = await transcribeAudio(dataUrl, audio.type, options)
 
       return result.transcript
     },

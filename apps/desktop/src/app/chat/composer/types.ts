@@ -17,6 +17,11 @@ export interface QuickModelOption {
   model: string
 }
 
+export interface AudioTranscriptionOptions {
+  localOnly?: boolean
+  previewOnly?: boolean
+}
+
 export interface ChatBarState {
   model: {
     model: string
@@ -53,7 +58,7 @@ export interface ChatBarProps {
   onRemoveAttachment?: (id: string) => void
   onSteer?: (text: string) => Promise<boolean> | boolean
   onSubmit: (value: string, options?: SubmitTextOptions) => Promise<boolean> | boolean
-  onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onTranscribeAudio?: (audio: Blob, options?: AudioTranscriptionOptions) => Promise<string>
 }
 
 export type VoiceStatus = 'idle' | 'recording' | 'transcribing'

@@ -55,7 +55,7 @@ import { ChatBar, ChatBarFallback } from './composer'
 import { requestComposerInsert } from './composer/focus'
 import { droppedFileInlineRefs } from './composer/inline-refs'
 import { useComposerScope } from './composer/scope'
-import type { ChatBarState } from './composer/types'
+import type { AudioTranscriptionOptions, ChatBarState } from './composer/types'
 import { type DroppedFile, partitionDroppedFiles } from './hooks/use-composer-actions'
 import { type DragKind, useFileDropZone } from './hooks/use-file-drop-zone'
 import { ProfileTag } from './profile-tag'
@@ -90,7 +90,7 @@ interface ChatViewProps extends Omit<React.ComponentProps<'div'>, 'onSubmit'> {
   onReload: (parentId: string | null) => Promise<void>
   onRestoreToMessage?: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
   onRetryResume: (sessionId: string) => void
-  onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onTranscribeAudio?: (audio: Blob, options?: AudioTranscriptionOptions) => Promise<string>
   onDismissError?: (messageId: string) => void
 }
 

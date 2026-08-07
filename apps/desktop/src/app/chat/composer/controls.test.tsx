@@ -137,3 +137,40 @@ describe('wake-word ear visibility', () => {
     expect((ear as HTMLButtonElement).disabled).toBe(true)
   })
 })
+
+describe('ComposerControls voice caption', () => {
+  it('shows the current partial transcript during a voice conversation', () => {
+    renderControls({
+      conversation: {
+        active: true,
+        level: 0.4,
+        muted: false,
+        onEnd: vi.fn(),
+        onStart: vi.fn(),
+        onStopTurn: vi.fn(),
+        onToggleMute: vi.fn(),
+        status: 'listening',
+        transcript: '지금 화면에 보이는 자막입니다'
+      }
+    })
+
+    expect(screen.getByText('지금 화면에 보이는 자막입니다')).toBeTruthy()
+  })
+
+  it('renders no caption element before any transcript arrives', () => {
+    const { container } = renderControls({
+      conversation: {
+        active: true,
+        level: 0.4,
+        muted: false,
+        onEnd: vi.fn(),
+        onStart: vi.fn(),
+        onStopTurn: vi.fn(),
+        onToggleMute: vi.fn(),
+        status: 'listening'
+      }
+    })
+
+    expect(container.querySelector('[aria-live="polite"]')).toBeNull()
+  })
+})

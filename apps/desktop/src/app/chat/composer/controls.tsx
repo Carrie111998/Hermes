@@ -44,6 +44,9 @@ interface ConversationProps {
   level: number
   muted: boolean
   status: ConversationStatus
+  /** Live caption for the utterance in progress; absent until a preview or
+   *  final transcription lands. */
+  transcript?: string
   onEnd: () => void
   onStart: () => void
   onStopTurn: () => void
@@ -176,7 +179,8 @@ function ConversationPill({
   onEnd,
   onStopTurn,
   onToggleMute,
-  status
+  status,
+  transcript
 }: ConversationProps & { disabled: boolean }) {
   const { t } = useI18n()
   const c = t.composer
@@ -196,6 +200,18 @@ function ConversationPill({
 
   return (
     <div className="ml-auto flex shrink-0 items-center gap-(--composer-control-gap)">
+      {/* Live preview of what the mic is picking up, ahead of the final
+          (authoritative) transcription. Sits left of the controls so a long
+          transcript truncates instead of pushing the buttons off-row. */}
+      {transcript && (
+        <span
+          aria-live="polite"
+          className="max-w-[min(28rem,42vw)] truncate rounded-lg bg-accent/45 px-2.5 py-1 text-sm text-foreground"
+          title={transcript}
+        >
+          {transcript}
+        </span>
+      )}
       {/* Keep the ear visible during voice chat — shown paused, since the
           conversation holds the mic (the one time wake must not listen). */}
       <WakeWordButton disabled={disabled} pausedForVoice />

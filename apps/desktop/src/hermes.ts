@@ -1616,19 +1616,35 @@ export function getActionStatus(name: string, lines = 200): Promise<ActionStatus
   })
 }
 
-export function transcribeAudio(dataUrl: string, mimeType?: string): Promise<AudioTranscriptionResponse> {
+export async function transcribeAudio(
+  dataUrl: string,
+  mimeType?: string,
+  options?: { localOnly?: boolean; previewOnly?: boolean }
+): Promise<AudioTranscriptionResponse> {
+  if (options?.previewOnly) {
+    const connection = await window.hermesDesktop.getConnectionConfig(_apiProfile)
+
+    if (connection.mode !== 'local') {
+      throw new Error('Live transcription previews require a local Hermes backend')
+    }
+  }
+
   return window.hermesDesktop.api<AudioTranscriptionResponse>({
+    ...profileScoped(),
     path: '/api/audio/transcribe',
     method: 'POST',
-    ...profileScoped(),
+    requireLocalBackend: options?.previewOnly ?? false,
     body: {
       data_url: dataUrl,
-      mime_type: mimeType
+      mime_type: mimeType,
+      local_only: options?.localOnly ?? false,
+      preview_only: options?.previewOnly ?? false
     },
     // Transcription blocks until provider STT, file handling, and response
     // encoding finish. Remote providers and long clips regularly exceed the
-    // default 15s Electron backend timeout.
-    timeoutMs: audioTranscribeRequestTimeoutMs(dataUrl)
+    // default 15s Electron backend timeout. Previews are capped short on
+    // purpose — a slow preview is discarded, never awaited.
+    timeoutMs: options?.previewOnly ? 15_000 : audioTranscribeRequestTimeoutMs(dataUrl)
   })
 }
 

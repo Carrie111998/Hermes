@@ -14,6 +14,54 @@ from unittest.mock import patch, MagicMock
 import pytest
 import yaml
 
+
+def _hang_preview_process_forever(_file_path, _result_connection):
+    """Picklable spawn target for preview-cancellation regression coverage."""
+    import time
+
+    while True:
+        time.sleep(60)
+
+
+def _assert_preview_launch_is_blocked(web_server, monkeypatch):
+    """Prove final priority rejects a preview before its process can start."""
+    started = False
+
+    class FakeConnection:
+        def close(self):
+            pass
+
+    class FakeProcess:
+        def start(self):
+            nonlocal started
+            started = True
+
+        def is_alive(self):
+            return False
+
+        def join(self, _timeout=None):
+            pass
+
+        def close(self):
+            pass
+
+    class FakeContext:
+        def Pipe(self, *, duplex):
+            assert duplex is False
+            return FakeConnection(), FakeConnection()
+
+        def Process(self, **_kwargs):
+            return FakeProcess()
+
+    monkeypatch.setattr(
+        web_server.multiprocessing, "get_context", lambda _method: FakeContext()
+    )
+
+    with pytest.raises(TimeoutError, match="cancelled"):
+        web_server._run_local_preview_isolated("preview.webm", 0.1)
+    assert started is False
+
+
 from hermes_cli.config import (
     reload_env,
     redact_key,
@@ -1024,16 +1072,467 @@ class TestWebServerEndpoints:
         ]
 
 
+    def test_audio_transcription_can_force_local_provider(self, monkeypatch):
+        """local_only must survive the whole endpoint → transcribe_recording →
+        transcribe_audio chain and land as provider_override='local'."""
+        import tools.transcription_tools as transcription_tools
 
+        captured = {}
 
+        def fake_transcribe_audio(path, model=None, *, provider_override=None):
+            captured["provider_override"] = provider_override
+            return {
+                "success": True,
+                "transcript": "local caption",
+                "provider": "local",
+            }
 
+        monkeypatch.setattr(transcription_tools, "transcribe_audio", fake_transcribe_audio)
 
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+                "local_only": True,
+            },
+        )
 
+        assert resp.status_code == 200
+        assert captured["provider_override"] == "local"
 
+    def test_audio_preview_transcription_requires_local_provider(self):
+        resp = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+                "preview_only": True,
+            },
+        )
 
+        assert resp.status_code == 400
+        assert "local provider" in resp.json()["detail"]
 
+    def test_audio_preview_timeout_removes_temp_file(self, monkeypatch):
+        import hermes_cli.web_server as web_server
 
+        captured = {"path": ""}
 
+        def fake_isolated_preview(path, _timeout):
+            captured["path"] = path
+            raise TimeoutError("hung preview")
+
+        monkeypatch.setattr(web_server, "_run_local_preview_isolated", fake_isolated_preview)
+
+        payload = {
+            "data_url": "data:audio/webm;base64,aGVsbG8=",
+            "mime_type": "audio/webm",
+            "local_only": True,
+            "preview_only": True,
+        }
+
+        timed_out = self.client.post("/api/audio/transcribe", json=payload)
+
+        assert timed_out.status_code == 504
+        assert captured["path"]
+        assert not Path(captured["path"]).exists()
+        assert not web_server._PARTIAL_TRANSCRIPTION_LOCK.locked()
+
+    def test_audio_preview_rejects_when_worker_lock_is_held(self):
+        import hermes_cli.web_server as web_server
+
+        acquired = web_server._PARTIAL_TRANSCRIPTION_LOCK.acquire(blocking=False)
+        assert acquired
+
+        try:
+            resp = self.client.post(
+                "/api/audio/transcribe",
+                json={
+                    "data_url": "data:audio/webm;base64,aGVsbG8=",
+                    "mime_type": "audio/webm",
+                    "local_only": True,
+                    "preview_only": True,
+                },
+            )
+        finally:
+            web_server._PARTIAL_TRANSCRIPTION_LOCK.release()
+
+        assert resp.status_code == 429
+
+    def test_permanently_hung_preview_cannot_starve_final_transcription(self, monkeypatch, tmp_path):
+        import time
+        from concurrent.futures import ThreadPoolExecutor
+
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda _path, **_kwargs: {
+                "success": True,
+                "transcript": "authoritative final",
+                "provider": "local",
+            },
+        )
+
+        preview_file = tmp_path / "preview.webm"
+        preview_file.write_bytes(b"preview")
+        final_payload = {
+            "data_url": "data:audio/webm;base64,aGVsbG8=",
+            "mime_type": "audio/webm",
+            "local_only": True,
+        }
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            preview = executor.submit(
+                web_server._run_local_preview_isolated,
+                str(preview_file),
+                60.0,
+                _hang_preview_process_forever,
+            )
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                with web_server._ACTIVE_PREVIEW_PROCESS_LOCK:
+                    process = web_server._ACTIVE_PREVIEW_PROCESS
+                if process is not None and process.is_alive():
+                    break
+                time.sleep(0.01)
+            else:
+                pytest.fail("hung preview process did not start")
+
+            started = time.monotonic()
+            final_response = self.client.post("/api/audio/transcribe", json=final_payload)
+            elapsed = time.monotonic() - started
+
+            with pytest.raises(TimeoutError, match="cancelled"):
+                preview.result(timeout=3)
+
+        assert final_response.status_code == 200
+        assert final_response.json()["transcript"] == "authoritative final"
+        assert elapsed < 3.0
+
+    def test_final_priority_serializes_paused_preview_launch(self, monkeypatch):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+
+        import hermes_cli.web_server as web_server
+
+        launch_entered = threading.Event()
+        allow_launch = threading.Event()
+        final_attempted = threading.Event()
+        final_started = threading.Event()
+        allow_final_finish = threading.Event()
+
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+            def poll(self, timeout):
+                assert process.terminated.wait(timeout)
+                return True
+
+            def recv(self):
+                raise EOFError
+
+        receive_connection = FakeConnection()
+        send_connection = FakeConnection()
+
+        class PausedStartProcess:
+            def __init__(self):
+                self.alive = False
+                self.terminated = threading.Event()
+                self.joined = False
+                self.closed = False
+
+            def start(self):
+                launch_entered.set()
+                assert allow_launch.wait(2)
+                self.alive = True
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.alive = False
+                self.terminated.set()
+
+            def join(self, _timeout=None):
+                self.joined = True
+
+            def close(self):
+                self.closed = True
+
+        process = PausedStartProcess()
+
+        class FakeContext:
+            def Pipe(self, *, duplex):
+                assert duplex is False
+                return receive_connection, send_connection
+
+            def Process(self, **_kwargs):
+                return process
+
+        monkeypatch.setattr(
+            web_server.multiprocessing, "get_context", lambda method: FakeContext()
+        )
+
+        def run_final_transcription():
+            final_attempted.set()
+            web_server._begin_final_transcription_priority()
+            try:
+                # This represents the authoritative STT call. It must not begin
+                # until the paused launch is registered and then terminated.
+                assert not process.is_alive()
+                final_started.set()
+                assert allow_final_finish.wait(2)
+            finally:
+                web_server._end_final_transcription_priority()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            preview = executor.submit(
+                web_server._run_local_preview_isolated, "preview.webm", 2.0
+            )
+            assert launch_entered.wait(2)
+
+            final = executor.submit(run_final_transcription)
+            assert final_attempted.wait(2)
+            assert not final_started.wait(0.1)
+
+            allow_launch.set()
+            assert final_started.wait(2)
+            assert process.terminated.is_set()
+            assert not process.is_alive()
+            allow_final_finish.set()
+
+            final.result(timeout=2)
+            with pytest.raises(TimeoutError, match="cancelled"):
+                preview.result(timeout=2)
+
+        assert web_server._ACTIVE_PREVIEW_PROCESS is None
+        assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0
+        assert not web_server._ACTIVE_PREVIEW_PROCESS_LOCK.locked()
+        assert receive_connection.closed
+        assert send_connection.closed
+
+    def test_cancel_during_final_priority_acquisition_releases_after_preview_cleanup(
+        self, monkeypatch
+    ):
+        import threading
+
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+
+        cleanup_started = threading.Event()
+        allow_cleanup = threading.Event()
+        active_preview = object()
+        original_cleanup = web_server._cleanup_preview_process
+
+        def blocking_cleanup(process):
+            if process is active_preview:
+                cleanup_started.set()
+                assert allow_cleanup.wait(2)
+                return
+            original_cleanup(process)
+
+        monkeypatch.setattr(web_server, "_cleanup_preview_process", blocking_cleanup)
+        monkeypatch.setattr(
+            transcription_tools,
+            "transcribe_audio",
+            lambda *_args, **_kwargs: pytest.fail(
+                "cancelled acquisition must not start final transcription"
+            ),
+        )
+        with web_server._ACTIVE_PREVIEW_PROCESS_LOCK:
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0
+            web_server._ACTIVE_PREVIEW_PROCESS = active_preview
+
+        async def scenario():
+            request = asyncio.create_task(
+                web_server.transcribe_audio_upload(
+                    web_server.AudioTranscriptionRequest(
+                        data_url="data:audio/webm;base64,aGVsbG8=",
+                        mime_type="audio/webm",
+                        local_only=True,
+                    )
+                )
+            )
+            assert await asyncio.to_thread(cleanup_started.wait, 2)
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 1
+
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 1
+            _assert_preview_launch_is_blocked(web_server, monkeypatch)
+
+            allow_cleanup.set()
+            for _ in range(100):
+                if web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            allow_cleanup.set()
+            with web_server._ACTIVE_PREVIEW_PROCESS_LOCK:
+                web_server._ACTIVE_PREVIEW_PROCESS = None
+
+    def test_cancel_during_final_executor_holds_priority_and_temp_file_until_done(
+        self, monkeypatch
+    ):
+        import threading
+
+        import hermes_cli.web_server as web_server
+        import tools.transcription_tools as transcription_tools
+
+        transcription_started = threading.Event()
+        allow_transcription = threading.Event()
+        captured = {"path": ""}
+
+        def blocking_transcription(path, **_kwargs):
+            captured["path"] = path
+            transcription_started.set()
+            assert allow_transcription.wait(2)
+            return {
+                "success": True,
+                "transcript": "cancelled final",
+                "provider": "local",
+            }
+
+        monkeypatch.setattr(
+            transcription_tools, "transcribe_audio", blocking_transcription
+        )
+
+        async def scenario():
+            request = asyncio.create_task(
+                web_server.transcribe_audio_upload(
+                    web_server.AudioTranscriptionRequest(
+                        data_url="data:audio/webm;base64,aGVsbG8=",
+                        mime_type="audio/webm",
+                        local_only=True,
+                    )
+                )
+            )
+            assert await asyncio.to_thread(transcription_started.wait, 2)
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 1
+
+            request.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await request
+
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 1
+            assert Path(captured["path"]).exists()
+            _assert_preview_launch_is_blocked(web_server, monkeypatch)
+
+            allow_transcription.set()
+            for _ in range(100):
+                if web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert web_server._ACTIVE_FINAL_TRANSCRIPTIONS == 0
+            assert not Path(captured["path"]).exists()
+
+        try:
+            asyncio.run(scenario())
+        finally:
+            allow_transcription.set()
+
+    def test_preview_start_failure_cleans_resources_and_endpoint_lock(
+        self, monkeypatch
+    ):
+        import hermes_cli.web_server as web_server
+
+        class FakeConnection:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        receive_connection = FakeConnection()
+        send_connection = FakeConnection()
+
+        class PartiallyStartedProcess:
+            def __init__(self):
+                self.alive = False
+                self.terminated = False
+                self.joined = False
+                self.closed = False
+
+            def start(self):
+                self.alive = True
+                raise RuntimeError("simulated process.start failure")
+
+            def is_alive(self):
+                return self.alive
+
+            def terminate(self):
+                self.terminated = True
+                self.alive = False
+
+            def join(self, _timeout=None):
+                self.joined = True
+
+            def close(self):
+                self.closed = True
+
+        process = PartiallyStartedProcess()
+
+        class FakeContext:
+            def Pipe(self, *, duplex):
+                assert duplex is False
+                return receive_connection, send_connection
+
+            def Process(self, **_kwargs):
+                return process
+
+        monkeypatch.setattr(
+            web_server.multiprocessing, "get_context", lambda method: FakeContext()
+        )
+
+        response = self.client.post(
+            "/api/audio/transcribe",
+            json={
+                "data_url": "data:audio/webm;base64,aGVsbG8=",
+                "mime_type": "audio/webm",
+                "local_only": True,
+                "preview_only": True,
+            },
+        )
+
+        assert response.status_code == 500
+        assert "simulated process.start failure" in response.json()["detail"]
+        assert receive_connection.closed
+        assert send_connection.closed
+        assert process.terminated
+        assert process.joined
+        assert process.closed
+        assert web_server._ACTIVE_PREVIEW_PROCESS is None
+        assert not web_server._ACTIVE_PREVIEW_PROCESS_LOCK.locked()
+        assert not web_server._PARTIAL_TRANSCRIPTION_LOCK.locked()
+
+    def test_desktop_audio_routes_registered(self):
+        """All three desktop voice endpoints must exist.
+
+        The renderer (apps/desktop) calls /api/audio/transcribe, /speak, and
+        /elevenlabs/voices. /speak + /voices were silently dropped in a merge
+        once; this guards the contract so a future merge can't lose them
+        without failing CI.
+        """
+        from hermes_cli.web_server import app
+
+        paths = {getattr(r, "path", None) for r in app.routes}
+        assert "/api/audio/transcribe" in paths
+        assert "/api/audio/speak" in paths
+        assert "/api/audio/elevenlabs/voices" in paths
 
     def test_latest_descendant_survives_parent_cycle(self):
         """Regression for the #39140 CTE salvage: a corrupted parent chain

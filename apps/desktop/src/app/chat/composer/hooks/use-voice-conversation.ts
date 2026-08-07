@@ -14,9 +14,17 @@ import { isVoiceStopCommand } from '@/lib/voice-stop-word'
 import { notify, notifyError } from '@/store/notifications'
 import { $voicePlayback } from '@/store/voice-playback'
 
+import type { AudioTranscriptionOptions } from '../types'
+
 import { useMicRecorder } from './use-mic-recorder'
 
 export type ConversationStatus = 'idle' | 'listening' | 'transcribing' | 'thinking' | 'speaking'
+
+/** How much speech accumulates before a live-caption preview is attempted. */
+const PARTIAL_AUDIO_MS = 2_500
+/** Stop previewing past this much audio — long clips make local STT too slow
+ *  to be a *preview*, and the final transcription is what actually matters. */
+const PARTIAL_AUDIO_MAX_MS = 10_000
 
 interface PendingVoiceResponse {
   id: string
@@ -33,7 +41,7 @@ interface VoiceConversationOptions {
   onInterrupt?: () => Promise<void> | void
   onStopWord?: () => void
   onSubmit: (text: string) => Promise<void> | void
-  onTranscribeAudio?: (audio: Blob) => Promise<string>
+  onTranscribeAudio?: (audio: Blob, options?: AudioTranscriptionOptions) => Promise<string>
   pendingResponse: () => PendingVoiceResponse | null
   consumePendingResponse: () => void
   /** Awaited right before the mic is opened. Used to let the wake-word listener
@@ -62,6 +70,15 @@ export function useVoiceConversation({
   const { handle, level } = useMicRecorder(voiceCopy)
   const [status, setStatus] = useState<ConversationStatus>('idle')
   const [muted, setMuted] = useState(false)
+  // Live caption of the current utterance, filled by best-effort local preview
+  // passes and then replaced by the authoritative final transcription.
+  const [transcript, setTranscript] = useState('')
+  // Bumped at every turn boundary. A preview that resolves after its turn ended
+  // carries a stale generation and is dropped instead of repainting the caption.
+  const transcriptGenerationRef = useRef(0)
+  // Holds the generation of the in-flight preview, so previews (which fire
+  // every PARTIAL_AUDIO_MS of speech) never stack on top of each other.
+  const partialTranscriptionGenerationRef = useRef<number | null>(null)
   const turnTimeoutRef = useRef<number | null>(null)
   const pendingStartRef = useRef(false)
   const turnClosingRef = useRef(false)
@@ -135,6 +152,65 @@ export function useVoiceConversation({
     spokenSourceLengthRef.current = 0
   }
 
+  /** Close the current caption generation: clears the text and invalidates any
+   *  preview still in flight for the turn that just ended. */
+  const resetTranscript = () => {
+    transcriptGenerationRef.current += 1
+    partialTranscriptionGenerationRef.current = null
+    setTranscript('')
+  }
+
+  /**
+   * Best-effort live caption for the utterance being spoken.
+   *
+   * Runs strictly on-device (`localOnly`) so partial audio never reaches a
+   * cloud provider, and `previewOnly` marks it droppable: the backend caps it,
+   * runs it in a killable process, and lets the authoritative final
+   * transcription pre-empt it. Failures are swallowed on purpose — a caption
+   * that doesn't show is a cosmetic loss, and the final transcript still
+   * surfaces its own errors.
+   */
+  const transcribePartialAudio = useCallback(
+    (audio: Blob) => {
+      const generation = transcriptGenerationRef.current
+
+      if (
+        !onTranscribeAudio ||
+        !enabledRef.current ||
+        partialTranscriptionGenerationRef.current === generation ||
+        turnClosingRef.current ||
+        statusRef.current !== 'listening'
+      ) {
+        return Promise.resolve()
+      }
+
+      partialTranscriptionGenerationRef.current = generation
+
+      return (async () => {
+        try {
+          const partial = (await onTranscribeAudio(audio, { localOnly: true, previewOnly: true })).trim()
+
+          if (
+            partial &&
+            generation === transcriptGenerationRef.current &&
+            !turnClosingRef.current &&
+            statusRef.current === 'listening'
+          ) {
+            setTranscript(partial)
+          }
+        } catch {
+          // Partial captions are best-effort. The final turn transcription
+          // remains authoritative and surfaces its own error if it fails.
+        } finally {
+          if (partialTranscriptionGenerationRef.current === generation) {
+            partialTranscriptionGenerationRef.current = null
+          }
+        }
+      })()
+    },
+    [onTranscribeAudio]
+  )
+
   const handleTurn = useCallback(
     async (forceTranscribe = false) => {
       if (turnClosingRef.current) {
@@ -153,19 +229,21 @@ export function useVoiceConversation({
             pendingStartRef.current = true
           }
 
+          resetTranscript()
           setStatus('idle')
 
           return
         }
 
         try {
-          const transcript = (await onTranscribeAudio(result.audio)).trim()
+          const finalTranscript = (await onTranscribeAudio(result.audio)).trim()
 
-          if (!transcript) {
+          if (!finalTranscript) {
             if (enabledRef.current) {
               pendingStartRef.current = true
             }
 
+            resetTranscript()
             setStatus('idle')
 
             return
@@ -175,8 +253,9 @@ export function useVoiceConversation({
           // conversation instead of being submitted as a turn. Only whole-
           // utterance stop commands match, so "stop the container" still goes
           // through as a real request.
-          if (isVoiceStopCommand(transcript)) {
+          if (isVoiceStopCommand(finalTranscript)) {
             dropSpeechSession()
+            resetTranscript()
             setStatus('idle')
             onStopWordRef.current?.()
 
@@ -185,7 +264,12 @@ export function useVoiceConversation({
 
           awaitingSpokenResponseRef.current = true
           dropSpeechSession()
-          await onSubmit(transcript)
+          // Replace any preview caption with the authoritative text. It stays
+          // on screen through 'thinking' and is cleared when listening resumes.
+          transcriptGenerationRef.current += 1
+          partialTranscriptionGenerationRef.current = null
+          setTranscript(finalTranscript)
+          await onSubmit(finalTranscript)
           setStatus('thinking')
         } catch (error) {
           notifyError(error, voiceCopy.transcriptionFailed)
@@ -234,15 +318,19 @@ export function useVoiceConversation({
 
     try {
       // VAD tuning mirrors `tools.voice_mode` defaults so the browser loop matches the CLI.
+      resetTranscript()
       await handle.start({
         silenceLevel: 0.075,
         silenceMs: 1_250,
         idleSilenceMs: 12_000,
+        partialAudioMaxMs: PARTIAL_AUDIO_MAX_MS,
+        partialAudioMs: PARTIAL_AUDIO_MS,
         onError: error => {
           notifyError(error, voiceCopy.microphoneFailed)
           pendingStartRef.current = false
           onFatalError?.()
         },
+        onPartialAudio: transcribePartialAudio,
         onSilence: () => void handleTurn()
       })
       setStatus('listening')
@@ -259,7 +347,14 @@ export function useVoiceConversation({
       setStatus('idle')
       onFatalError?.()
     }
-  }, [handle, handleTurn, onFatalError, voiceCopy.couldNotStartSession, voiceCopy.microphoneFailed])
+  }, [
+    handle,
+    handleTurn,
+    onFatalError,
+    transcribePartialAudio,
+    voiceCopy.couldNotStartSession,
+    voiceCopy.microphoneFailed
+  ])
 
   const settleAfterSpeech = useCallback(
     (barged: boolean, stoppedDuringSetup = false) => {
@@ -324,9 +419,10 @@ export function useVoiceConversation({
       setStatus('transcribing')
 
       try {
-        const transcript = (await onTranscribeAudio(audio)).trim()
+        const finalTranscript = (await onTranscribeAudio(audio)).trim()
 
-        if (!transcript) {
+        if (!finalTranscript) {
+          resetTranscript()
           resumeListening()
 
           return
@@ -335,8 +431,9 @@ export function useVoiceConversation({
         // A spoken stop command while barging means "stop everything" — the
         // turn/playback was already cut at trip time; now end the conversation
         // instead of submitting "stop" as a new prompt.
-        if (isVoiceStopCommand(transcript)) {
+        if (isVoiceStopCommand(finalTranscript)) {
           dropSpeechSession()
+          resetTranscript()
           setStatus('idle')
           onStopWordRef.current?.()
 
@@ -354,10 +451,14 @@ export function useVoiceConversation({
         awaitingSpokenResponseRef.current = true
         dropSpeechSession()
         consumePendingResponse()
-        await onSubmit(transcript)
+        transcriptGenerationRef.current += 1
+        partialTranscriptionGenerationRef.current = null
+        setTranscript(finalTranscript)
+        await onSubmit(finalTranscript)
         setStatus('thinking')
       } catch (error) {
         notifyError(error, voiceCopy.transcriptionFailed)
+        resetTranscript()
         resumeListening()
       }
     },
@@ -608,6 +709,7 @@ export function useVoiceConversation({
     awaitingSpokenResponseRef.current = false
     dropSpeechSession()
     consumePendingResponse()
+    resetTranscript()
     setMuted(false)
     setStatus('idle')
   }, [consumePendingResponse, handle])
@@ -732,5 +834,5 @@ export function useVoiceConversation({
     wasEnabledRef.current = enabled
   }, [enabled, end, start])
 
-  return { end, level, muted, start, status, stopTurn, toggleMute }
+  return { end, level, muted, start, status, stopTurn, toggleMute, transcript }
 }

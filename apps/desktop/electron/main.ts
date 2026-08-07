@@ -32,6 +32,7 @@ import {
 import nodePty from 'node-pty'
 
 import { classifyActiveRuntime } from './active-runtime-state'
+import { assertLocalBackendForRequest, resolveLocalitySensitiveBackend } from './api-backend-routing'
 import { stopBackendChild as stopBackendChildImpl } from './backend-child'
 import { dashboardFallbackArgs, sourceDeclaresServe } from './backend-command'
 import { createBackendConnectionState } from './backend-connection-state'
@@ -10248,11 +10249,19 @@ async function mergeRemoteProfileSessions(searchParams, remoteProfiles) {
 }
 
 ipcMain.handle('hermes:api', async (_event, request) => {
+  // Pin privacy-sensitive audio to one concrete connection descriptor. Config
+  // may change while the handler awaits interception/preparation work; never
+  // re-resolve and accidentally transmit the body through a different backend.
+  const localitySensitiveConnection = await resolveLocalitySensitiveBackend(request, ensureBackend)
+  assertLocalBackendForRequest(request, localitySensitiveConnection)
+
   // Remote-profile session requests would otherwise hit the local primary off
   // each profile's on-disk state.db — fine for local profiles, but a remote
   // profile's sessions live on its remote host, so the UI's IDs 404 (or mutations
   // no-op) the moment they run there. Route reads + mutations to the remote.
-  const rerouted = await interceptSessionRequestForRemote(request)
+  // A locality-pinned request is never rerouted to a remote host — that is the
+  // whole point of the pin, and reroute would hand its body to a remote backend.
+  const rerouted = request?.requireLocalBackend ? undefined : await interceptSessionRequestForRemote(request)
 
   if (rerouted !== undefined) {
     return rerouted
@@ -10266,7 +10275,13 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // backend calls ensure_hermes_home() which recreates the profile directory,
   // defeating the deletion and leaving a zombie process.
   const routeProfile = resolveRouteProfile(tornDownProfile, profile)
-  const connection = await ensureBackend(routeProfile)
+  // Reuse the backend pinned above for locality-sensitive requests instead of
+  // re-resolving — an intervening config change must not swap in a remote one.
+  const connection = localitySensitiveConnection || (await ensureBackend(routeProfile))
+  // Validate the exact descriptor used below, immediately before transmission.
+  // This preserves normal local/token/OAuth routing while failing closed for a
+  // remote descriptor that was selected before an intervening config change.
+  assertLocalBackendForRequest(request, connection)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
   const requestPath = pathWithGlobalRemoteProfile(request.path, profile, profileRouteOptions(profile))
