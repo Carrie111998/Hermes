@@ -184,6 +184,67 @@ class TestHandleVoiceCommand:
         assert runner._voice_mode["slack:999"] == "off"
 
 
+class TestVoiceJoinPreservesExistingMode:
+    """Issue #81041: ``/voice join`` must NOT clobber a saved mode."""
+
+    def _make_runner(self, tmp_path):
+        runner = _make_runner(tmp_path)
+        # Pre-existing saved mode for this Discord channel: voice_only
+        runner._voice_mode["discord:777"] = "voice_only"
+        # Stub adapter lookup + adapter API surface the join handler uses.
+        from types import SimpleNamespace
+        adapter = SimpleNamespace(
+            join_voice_channel=AsyncMock(return_value=True),
+            get_user_voice_channel=AsyncMock(
+                return_value=SimpleNamespace(name="general", id=42)
+            ),
+            _voice_text_channels={},
+            _voice_sources={},
+            _auto_tts_enabled_chats=set(),
+        )
+        runner.adapters = {"discord": adapter}
+        runner._adapter_for_source = lambda source: adapter
+        return runner
+
+    @pytest.mark.asyncio
+    async def test_join_preserves_voice_only(self, tmp_path):
+        """Regression for issue #81041.
+
+        ``/voice join`` previously set ``_voice_mode[key] = "all"``
+        unconditionally, silently overwriting a previously-saved
+        ``voice_only``. The user then had to re-run ``/voice on`` after
+        every join/rejoin or the bot would speak every typed reply into
+        the VC.
+        """
+        from gateway.config import Platform
+        runner = self._make_runner(tmp_path)
+
+        event = _make_event("/voice join", chat_id="777")
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+
+        await runner._handle_voice_channel_join(event)
+
+        assert runner._voice_mode["discord:777"] == "voice_only"
+
+    @pytest.mark.asyncio
+    async def test_join_seeds_default_when_no_saved_mode(self, tmp_path):
+        """Channels with no saved mode keep the documented ``"all"`` default
+        on first join (unchanged behaviour for everyone else, #81041)."""
+        from gateway.config import Platform
+        runner = self._make_runner(tmp_path)
+        # No pre-existing entry for chat_id=888
+        runner._voice_mode.pop("discord:888", None)
+
+        event = _make_event("/voice join", chat_id="888")
+        event.source.platform = Platform.DISCORD
+        event.raw_message = SimpleNamespace(guild_id=111, guild=None)
+
+        await runner._handle_voice_channel_join(event)
+
+        assert runner._voice_mode["discord:888"] == "all"
+
+
 # =====================================================================
 # Auto voice reply decision logic
 # =====================================================================

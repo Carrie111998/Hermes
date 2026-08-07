@@ -19190,13 +19190,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter._voice_text_channels[guild_id] = int(event.source.chat_id)
             if hasattr(adapter, "_voice_sources"):
                 adapter._voice_sources[guild_id] = event.source.to_dict()
-            self._voice_mode[self._voice_key(event.source.platform, event.source.chat_id)] = "all"
+            # Respect any previously-saved voice mode for this chat —
+            # only seed the "all" default on first-ever join (#81041).
+            voice_key = self._voice_key(
+                event.source.platform, event.source.chat_id
+            )
+            effective_mode = self._voice_mode.setdefault(voice_key, "all")
             self._save_voice_modes()
             self._set_adapter_auto_tts_enabled(adapter, event.source.chat_id, enabled=True)
-            return (
-                f"Joined voice channel **{voice_channel.name}**.\n"
-                f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
-            )
+            if effective_mode == "voice_only":
+                reply = (
+                    f"Joined voice channel **{voice_channel.name}**.\n"
+                    "I'll listen in voice and stay text-only for typed messages "
+                    "(mode: voice_only). Use /voice leave to disconnect."
+                )
+            else:
+                reply = (
+                    f"Joined voice channel **{voice_channel.name}**.\n"
+                    f"I'll speak my replies and listen to you. Use /voice leave to disconnect."
+                )
+            return reply
         # Join failed — clear callback
         adapter._voice_input_callback = None
         return "Failed to join voice channel. Check bot permissions (Connect + Speak)."
