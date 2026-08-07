@@ -3261,7 +3261,7 @@ class AIAgent:
 
     def steer(self, text: str) -> bool:
         """
-        Inject a user message into the next tool result without interrupting.
+        Inject a user message into the active task without interrupting.
 
         Unlike interrupt(), this does NOT stop the current tool call. The
         text is stashed and the agent loop appends it to the LAST tool
@@ -3280,6 +3280,26 @@ class AIAgent:
         if not text or not text.strip():
             return False
         cleaned = text.strip()
+
+        # Codex app-server owns its internal tool/reasoning loop.  When its
+        # turn is active, use the native turn/steer operation so the guidance
+        # reaches that same task.  Before turn/start there is no native target;
+        # the local queue below is drained into the session immediately after
+        # the turn becomes active.  A rejected native request also falls back
+        # to that queue, which the runtime returns as a next turn rather than
+        # silently dropping the user's message.
+        if getattr(self, "api_mode", None) == "codex_app_server":
+            _codex_session = getattr(self, "_codex_session", None)
+            _native_steer = getattr(_codex_session, "request_steer", None)
+            if callable(_native_steer):
+                try:
+                    if bool(_native_steer(cleaned)):
+                        return True
+                except Exception:
+                    logger.debug(
+                        "Codex app-server turn/steer failed; retaining locally",
+                        exc_info=True,
+                    )
         _lock = getattr(self, "_pending_steer_lock", None)
         if _lock is None:
             # Test stubs that built AIAgent via object.__new__ skip __init__.

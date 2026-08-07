@@ -14,6 +14,7 @@ from typing import Any, Optional
 import pytest
 
 import agent.transports.codex_app_server_session as session_mod
+from agent.transports.codex_app_server import CodexAppServerError
 from agent.transports.codex_app_server_session import (
     CodexAppServerSession,
     _ServerRequestRouting,
@@ -173,6 +174,23 @@ class TestLifecycle:
         method, params = next(r for r in client.requests if r[0] == "thread/start")
         assert params["cwd"] == "/tmp"
         assert "permissions" not in params  # see session.ensure_started() comment
+        assert "developerInstructions" not in params
+
+    def test_thread_start_passes_stable_developer_instructions(self):
+        client = FakeClient()
+        s = make_session(client)
+        s.set_developer_instructions("Publish concise progress commentary.")
+
+        s.ensure_started()
+
+        _, params = next(r for r in client.requests if r[0] == "thread/start")
+        assert params["developerInstructions"] == (
+            "Publish concise progress commentary."
+        )
+        # Reusing the exact same bytes is allowed; changing a live thread is not.
+        s.set_developer_instructions("Publish concise progress commentary.")
+        with pytest.raises(RuntimeError):
+            s.set_developer_instructions("Different instructions")
 
     def test_close_idempotent(self):
         client = FakeClient()
@@ -384,6 +402,95 @@ class TestRunTurn:
             "input": [{"type": "text", "text": "Use Postgres instead"}],
             "expectedTurnId": "turn-live-123",
         }
+
+    def test_startup_race_steer_is_adopted_after_turn_start(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        pending = ["keep the completed analysis and add the Discord test"]
+        s = make_session(client)
+        s.bind_pending_steer_provider(
+            lambda: pending.pop(0) if pending else None
+        )
+
+        result = s.run_turn("start", turn_timeout=2.0)
+
+        steer_calls = [request for request in client.requests if request[0] == "turn/steer"]
+        assert steer_calls == [
+            (
+                "turn/steer",
+                {
+                    "threadId": "thread-fake-001",
+                    "input": [
+                        {
+                            "type": "text",
+                            "text": "keep the completed analysis and add the Discord test",
+                        }
+                    ],
+                    "expectedTurnId": "turn-fake-001",
+                },
+            )
+        ]
+        assert result.pending_steer is None
+
+    def test_rejected_native_steer_returns_as_next_turn_guidance(self):
+        client = FakeClient()
+
+        def reject_steer(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                raise CodexAppServerError(code=-32602, message="turn completed")
+            return {}
+
+        client._request_handler = reject_steer
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        pending = ["do not lose this correction"]
+        s = make_session(client)
+        s.bind_pending_steer_provider(
+            lambda: pending.pop(0) if pending else None
+        )
+
+        result = s.run_turn("start", turn_timeout=2.0)
+
+        assert result.pending_steer == "do not lose this correction"
+
+    def test_unexpected_native_steer_error_does_not_lose_startup_guidance(self):
+        client = FakeClient()
+
+        def broken_steer(method, params):
+            if method == "thread/start":
+                return {"thread": {"id": "thread-fake-001"}}
+            if method == "turn/start":
+                return {"turn": {"id": "turn-fake-001"}}
+            if method == "turn/steer":
+                raise ValueError("unexpected client failure")
+            return {}
+
+        client._request_handler = broken_steer
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        pending = ["preserve this exact user guidance"]
+        s = make_session(client)
+        s.bind_pending_steer_provider(
+            lambda: pending.pop(0) if pending else None
+        )
+
+        result = s.run_turn("start", turn_timeout=2.0)
+
+        assert result.pending_steer == "preserve this exact user guidance"
 
 
 
@@ -895,4 +1002,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-

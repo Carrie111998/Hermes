@@ -533,6 +533,7 @@ def overlay_production_gateway_config(
     agent["verify_on_stop"] = False
     agent["verification_ledger_enabled"] = False
     agent["background_review_enabled"] = False
+    agent["model_authored_progress"] = True
 
     compression = _mapping(target, "compression")
     compression["enabled"] = True
@@ -768,6 +769,7 @@ def validate_production_gateway_config(raw: Mapping[str, Any]) -> None:
             agent.get("verify_on_stop") is not False,
             agent.get("verification_ledger_enabled") is not False,
             agent.get("background_review_enabled") is not False,
+            agent.get("model_authored_progress") is not True,
             agent.get("task_completion_guidance") is not True,
             agent.get("parallel_tool_call_guidance") is not True,
         )

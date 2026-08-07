@@ -72,6 +72,7 @@ MUTATIONS = (
     "agent.reasoning_effort=medium",
     "agent.adaptive_reasoning={enabled:true,max_effort:max}",
     "agent.background_review_enabled=false",
+    "agent.model_authored_progress=true",
     "agent.tool_use_enforcement=true",
     "agent.verify_on_stop=false",
     "agent.verification_ledger_enabled=false",
@@ -322,6 +323,7 @@ def _target_mapping(value: Mapping[str, Any]) -> dict[str, Any]:
     if agent.get("background_review_enabled") not in {None, False}:
         raise ConfigGateError("config_background_review_policy_drifted")
     agent["background_review_enabled"] = False
+    agent["model_authored_progress"] = True
     agent["tool_use_enforcement"] = True
     verify_on_stop_source = agent.get("verify_on_stop")
     if (

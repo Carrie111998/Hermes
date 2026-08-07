@@ -482,6 +482,7 @@ def test_producer_preserves_unrelated_config_and_seals_target() -> None:
         "max_effort": "max",
     }
     assert effective["agent"]["background_review_enabled"] is False
+    assert effective["agent"]["model_authored_progress"] is True
     assert effective["agent"]["verify_on_stop"] is False
     assert effective["agent"]["verification_ledger_enabled"] is False
     assert effective["agent"]["gateway_notify_interval"] == 180
@@ -913,6 +914,7 @@ def test_rendered_unit_is_the_normal_sha_pinned_production_contract() -> None:
     ("path", "value", "code"),
     [
         (("agent", "background_review_enabled"), True, "agent_policy"),
+        (("agent", "model_authored_progress"), False, "agent_policy"),
         (("agent", "adaptive_reasoning"), {"enabled": False}, "agent_policy"),
         (("compression", "abort_on_summary_failure"), False, "compression"),
         (("context", "engine"), "lcm", "context_engine"),
@@ -1077,6 +1079,7 @@ def test_overlay_pins_discord_steering_commentary_and_preserves_unrelated_displa
     effective = runtime.overlay_production_gateway_config(source)
 
     assert effective["agent"]["gateway_notify_interval"] == 180
+    assert effective["agent"]["model_authored_progress"] is True
     assert effective["display"]["language"] == "bg"
     assert effective["display"]["busy_input_mode"] == "steer"
     assert effective["display"]["show_commentary"] is True

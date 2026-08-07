@@ -1872,6 +1872,14 @@ def init_agent(
     # single turn; the runtime already executes such batches concurrently.
     agent._parallel_tool_call_guidance = bool(_agent_section.get("parallel_tool_call_guidance", True))
 
+    # Let the acting model publish concise user-visible progress at meaningful
+    # boundaries.  Default-off avoids changing transcript volume for existing
+    # installations; managed Muncho production pins it on.  This flag is
+    # resolved once so the session's cached system prompt stays byte-stable.
+    agent._model_authored_progress = bool(
+        _agent_section.get("model_authored_progress", False)
+    )
+
     # Local Python toolchain probe toggle.  Default True.  When False,
     # the probe is skipped entirely (no subprocess calls, no system-prompt
     # line).  Useful for users on exotic setups where the probe heuristics

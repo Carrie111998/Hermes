@@ -318,6 +318,24 @@ TASK_COMPLETION_GUIDANCE = (
     "is always better than inventing a result."
 )
 
+# Optional, model-authored user-visible progress guidance.  This is static for
+# the lifetime of a conversation (the config flag is resolved during agent
+# construction), so enabling it does not invalidate the cached prompt prefix.
+# The model remains the sole semantic authority: runtime code neither classifies
+# tasks nor manufactures status text.
+MODEL_AUTHORED_PROGRESS_GUIDANCE = (
+    "# User-visible work updates\n"
+    "For tasks requiring multiple meaningful steps, proactively send concise "
+    "progress commentary at useful boundaries while continuing work. Each "
+    "update should orient the user to the goal, the result just established, "
+    "and what you will do next. Never expose private chain-of-thought, scratch "
+    "reasoning, raw tool logs, commands, identifiers, stack traces, or routine "
+    "bookkeeping. Skip trivial turns and avoid repetitive updates. If the user "
+    "sends a message mid-turn, treat it as steering within the current task; "
+    "use your judgment to integrate it or, if they clearly replace the task, "
+    "change course without losing relevant completed work."
+)
+
 # Universal parallel-tool-call guidance — applied to ALL models.
 #
 # Why this matters for cost: every assistant turn resends the entire

@@ -35,6 +35,7 @@ from agent.prompt_builder import (
     HERMES_AGENT_HELP_GUIDANCE,
     KANBAN_GUIDANCE,
     MEMORY_GUIDANCE,
+    MODEL_AUTHORED_PROGRESS_GUIDANCE,
     PARALLEL_TOOL_CALL_GUIDANCE,
     PLATFORM_HINTS,
     SESSION_SEARCH_GUIDANCE,
@@ -219,6 +220,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # (default True) and only injected when tools are actually loaded.
     if getattr(agent, "_parallel_tool_call_guidance", True) and agent.valid_tool_names:
         stable_parts.append(PARALLEL_TOOL_CALL_GUIDANCE)
+
+    # Concise, model-authored progress is optional globally and pinned on for
+    # the managed Muncho runtime.  The block is static and decided at agent
+    # construction, preserving the byte-stable cached prefix.  No runtime
+    # keyword/classifier decides when or what to publish.
+    if getattr(agent, "_model_authored_progress", False):
+        stable_parts.append(MODEL_AUTHORED_PROGRESS_GUIDANCE)
 
     # Tool-aware behavioral guidance: only inject when the tools are loaded
     tool_guidance = []

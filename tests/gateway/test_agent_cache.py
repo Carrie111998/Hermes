@@ -279,6 +279,24 @@ class TestExtractCacheBustingConfig:
         assert out["checkpoints.max_total_size_mb"] == 333
         assert out["checkpoints.max_file_size_mb"] == 5
 
+    def test_model_authored_progress_busts_cached_prompt(self):
+        from gateway.run import GatewayRunner
+
+        disabled = GatewayRunner._extract_cache_busting_config(
+            {"agent": {"model_authored_progress": False}}
+        )
+        enabled = GatewayRunner._extract_cache_busting_config(
+            {"agent": {"model_authored_progress": True}}
+        )
+
+        assert disabled["agent.model_authored_progress"] is False
+        assert enabled["agent.model_authored_progress"] is True
+        assert GatewayRunner._agent_config_signature(
+            "m", {}, [], "", cache_keys=disabled
+        ) != GatewayRunner._agent_config_signature(
+            "m", {}, [], "", cache_keys=enabled
+        )
+
     def test_reads_legacy_checkpoint_boolean(self):
         from gateway.run import GatewayRunner
 
