@@ -219,6 +219,30 @@ class AnthropicTransport(ProviderTransport):
             return getattr(response, "stop_reason", None) in {"end_turn", "refusal"}
         return True
 
+    def diagnose_empty_content(self, response: Any) -> dict:
+        """Return diagnostic metadata about an empty-content response.
+
+        Called when ``validate_response`` returned False with an empty
+        ``content`` list whose ``stop_reason`` was neither ``end_turn``
+        nor ``refusal``.  The returned dict is suitable for log
+        correlation and operator debugging.
+        """
+        stop_reason = str(getattr(response, "stop_reason", None) or "none")
+        usage_info = {}
+        usage = getattr(response, "usage", None)
+        if usage is not None:
+            for attr in ("input_tokens", "output_tokens", "cache_read_input_tokens",
+                         "cache_creation_input_tokens"):
+                val = getattr(usage, attr, None)
+                if val is not None:
+                    usage_info[attr] = val
+        return {
+            "stop_reason": stop_reason,
+            "content_length": 0,
+            "usage": usage_info or None,
+            "response_type": type(response).__name__,
+        }
+
     def extract_cache_stats(self, response: Any) -> Optional[Dict[str, int]]:
         """Extract Anthropic cache_read and cache_creation token counts."""
         usage = getattr(response, "usage", None)
