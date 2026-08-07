@@ -225,6 +225,9 @@ mem0 = ["mem0ai==2.0.10"]
 # CLI under prompt_toolkit (#40490). This extra is kept as a no-op back-compat
 # alias so existing requests for the `vision` extra resolve.
 vision = []
+# HEIC/HEIF decoder for iPhone photos received by opt-in iMessage platforms.
+# Lazy-installed through tools/lazy_deps.py on the first HEIC conversion.
+heic = ["pillow-heif==1.4.0"]
 # Kept as a no-op back-compat alias — `ptyprocess` and `pywinpty` are now
 # in the main `dependencies` list (with the same platform markers), so
 # any existing requests for the `pty` extra resolve cleanly

@@ -24,14 +24,12 @@ import httpx
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
+    CachedMedia,
     MessageEvent,
     MessageType,
     SendResult,
-    cache_image_from_bytes,
-    cache_audio_from_bytes,
-    cache_document_from_bytes,
+    cache_media_bytes_async,
 )
-from .media_cache import ext_for_mime
 from gateway.platforms.helpers import compile_mention_patterns, strip_markdown
 
 # Historical BlueBubbles mime→ext maps, preserved verbatim as overrides for
@@ -812,10 +810,10 @@ class BlueBubblesAdapter(BasePlatformAdapter):
 
     async def _download_attachment(
         self, att_guid: str, att_meta: Dict[str, Any]
-    ) -> Optional[str]:
+    ) -> Optional[CachedMedia]:
         """Download an attachment from BlueBubbles and cache it locally.
 
-        Returns the local file path on success, None on failure.
+        Returns cached media metadata on success, None on failure.
         """
         if not self.client:
             return None
@@ -832,33 +830,13 @@ class BlueBubblesAdapter(BasePlatformAdapter):
             mime = (att_meta.get("mimeType") or "").lower()
             transfer_name = att_meta.get("transferName", "")
 
-            if mime.startswith("image/"):
-                ext = ext_for_mime(
-                    mime,
-                    overrides=_BLUEBUBBLES_IMAGE_EXT_OVERRIDES,
-                    # Historical map was closed: any unlisted image mime
-                    # fell back to .jpg without consulting mimetypes.
-                    use_defaults=False,
-                    use_mimetypes=False,
-                    fallback=".jpg",
-                ) or ".jpg"
-                return cache_image_from_bytes(data, ext)
-
-            if mime.startswith("audio/"):
-                ext = ext_for_mime(
-                    mime,
-                    overrides=_BLUEBUBBLES_AUDIO_EXT_OVERRIDES,
-                    # Historical map was closed: any unlisted audio mime
-                    # fell back to .mp3 without consulting mimetypes.
-                    use_defaults=False,
-                    use_mimetypes=False,
-                    fallback=".mp3",
-                ) or ".mp3"
-                return cache_audio_from_bytes(data, ext)
-
-            # Videos, documents, and everything else
             filename = transfer_name or f"file_{uuid.uuid4().hex[:8]}"
-            return cache_document_from_bytes(data, filename)
+            return await cache_media_bytes_async(
+                data,
+                filename=filename,
+                mime_type=mime,
+                transcode_heic=True,
+            )
 
         except Exception as exc:
             logger.warning(
@@ -966,16 +944,15 @@ class BlueBubblesAdapter(BasePlatformAdapter):
                 continue
             cached = await self._download_attachment(att_guid, att)
             if cached:
-                mime = (att.get("mimeType") or "").lower()
-                media_urls.append(cached)
-                media_types.append(mime)
-                if mime.startswith("image/"):
+                media_urls.append(cached.path)
+                media_types.append(cached.media_type)
+                if cached.kind == "image":
                     msg_type = MessageType.PHOTO
-                elif mime.startswith("audio/") or (att.get("uti") or "").endswith(
+                elif cached.kind == "audio" or (att.get("uti") or "").endswith(
                     "caf"
                 ):
                     msg_type = MessageType.VOICE
-                elif mime.startswith("video/"):
+                elif cached.kind == "video":
                     msg_type = MessageType.VIDEO
                 else:
                     msg_type = MessageType.DOCUMENT

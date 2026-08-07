@@ -287,6 +287,9 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # call site uses prompt=False so it can never raise a blocking input()
     # prompt mid-session (#40490).
     "tool.vision": ("Pillow==12.3.0",),
+    # HEIC/HEIF decoder used only when an opt-in iMessage platform receives
+    # an HEIC attachment. Conversion falls back to a document if unavailable.
+    "media.heic": ("pillow-heif==1.4.0",),
     # Document-to-Markdown extraction for read_file (firecrawl-anydoc, Rust
     # core, imports as `anydoc`). Widens read_file's auto-extraction beyond
     # the stdlib .ipynb/.docx/.xlsx to PDF, legacy Office (.doc/.ppt/.xls),
