@@ -24,7 +24,7 @@ import { notify, notifyError } from '@/store/notifications'
 import { $desktopOnboarding, startManualLocalEndpoint, startManualProviderOAuth } from '@/store/onboarding'
 import type { CredentialPoolEntry, EnvVarInfo, OAuthProvider } from '@/types/hermes'
 
-import { isKeyVar, ProviderKeyRows } from './credential-key-ui'
+import { CredentialPoolStatus, isKeyVar, ProviderKeyRows } from './credential-key-ui'
 import { CustomEndpointsSettings } from './custom-endpoints-settings'
 import { SettingsCategoryHeading, useEnvCredentials } from './env-credentials'
 import { providerGroup, providerMeta, providerPriority } from './helpers'
@@ -106,6 +106,11 @@ function buildProviderKeyGroups(vars: Record<string, EnvVarInfo>): ProviderKeyGr
       docsUrl: meta?.docsUrl ?? primary[1].url ?? undefined,
       hasAnySet: entries.some(([, i]) => i.is_set),
       name,
+      // The credential-pool endpoint keys by the backend's raw provider id
+      // (`copilot`, `deepseek`, ...), which can differ from the display name
+      // used to bucket this group — carry it through so the row can look up
+      // its pool entries without re-deriving the id.
+      poolProvider: primary[1].provider?.trim(),
       primary,
       priority: providerPriority(name)
     })
@@ -298,36 +303,6 @@ function ConnectedProviderRow({
           account needs no "which one is active" affordance. */}
       {poolEntries && poolEntries.length > 1 && <CredentialPoolStatus entries={poolEntries} />}
     </div>
-  )
-}
-
-// Redacted rotation-pool readout: label + active/exhausted status per stored
-// credential, so a user juggling e.g. a personal + a shared Copilot account
-// can see which one requests are actually using without touching the CLI.
-function CredentialPoolStatus({ entries }: { entries: CredentialPoolEntry[] }) {
-  const sorted = [...entries].sort((a, b) => a.priority - b.priority)
-
-  return (
-    <ul className="mb-1 ml-3 grid gap-0.5 border-l border-(--ui-border) pl-3">
-      {sorted.map(entry => {
-        const active = entry.last_status !== 'exhausted' && entry.last_status !== 'error'
-
-        return (
-          <li className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground" key={entry.index}>
-            <span
-              className={cn(
-                'inline-block size-1.5 rounded-full',
-                active ? 'bg-primary' : 'bg-muted-foreground/40'
-              )}
-            />
-            <span className="truncate">{entry.label || entry.token_preview}</span>
-            <span className="text-muted-foreground/60">
-              {entry.last_status ?? (active ? 'active' : 'idle')}
-            </span>
-          </li>
-        )
-      })}
-    </ul>
   )
 }
 
@@ -536,6 +511,7 @@ export function ProvidersSettings({
                     key={group.name}
                     onExpand={() => setOpenProvider(group.name)}
                     onToggle={() => setOpenProvider(prev => (prev === group.name ? null : group.name))}
+                    poolEntries={group.poolProvider ? poolByProvider[group.poolProvider] : undefined}
                     rowProps={rowProps}
                   />
                 ))}
@@ -577,6 +553,7 @@ interface ProviderKeyGroup {
   docsUrl?: string
   hasAnySet: boolean
   name: string
+  poolProvider?: string
   primary: [string, EnvVarInfo]
   priority: number
 }

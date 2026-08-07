@@ -5,7 +5,7 @@ import { Input } from '@/components/ui/input'
 import { translateNow, useI18n } from '@/i18n'
 import { ChevronDown, ExternalLink, Loader2, Save, Trash2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
-import type { EnvVarInfo } from '@/types/hermes'
+import type { CredentialPoolEntry, EnvVarInfo } from '@/types/hermes'
 
 import { CONTROL_TEXT } from './constants'
 import { prettyName, withoutKey } from './helpers'
@@ -13,6 +13,31 @@ import { ListRow } from './primitives'
 import type { EnvRowProps } from './types'
 
 export type KeyRowProps = Omit<EnvRowProps, 'info' | 'varKey'>
+
+// Redacted rotation-pool readout: label + active/exhausted status per stored
+// credential, so a user juggling e.g. a personal + a shared Copilot account
+// can see which one requests are actually using without touching the CLI.
+export function CredentialPoolStatus({ entries }: { entries: CredentialPoolEntry[] }) {
+  const sorted = [...entries].sort((a, b) => a.priority - b.priority)
+
+  return (
+    <ul className="mb-1 ml-3 grid gap-0.5 border-l border-(--ui-border) pl-3">
+      {sorted.map(entry => {
+        const active = entry.last_status !== 'exhausted' && entry.last_status !== 'error'
+
+        return (
+          <li className="flex items-center gap-2 py-0.5 text-xs text-muted-foreground" key={entry.index}>
+            <span
+              className={cn('inline-block size-1.5 rounded-full', active ? 'bg-primary' : 'bg-muted-foreground/40')}
+            />
+            <span className="truncate">{entry.label || entry.token_preview}</span>
+            <span className="text-muted-foreground/60">{entry.last_status ?? (active ? 'active' : 'idle')}</span>
+          </li>
+        )
+      })}
+    </ul>
+  )
+}
 
 /** Matches Advanced / config field controls (ListRow + Input). */
 export const CREDENTIAL_CONTROL_CLASS = cn('h-8', CONTROL_TEXT)
@@ -253,7 +278,7 @@ export function CredentialKeyCard({
 }
 
 /** Provider API key group — collapsible card; description, docs link, and advanced fields expand on click. */
-export function ProviderKeyRows({ expanded, group, onExpand, onToggle, rowProps }: ProviderKeyRowsProps) {
+export function ProviderKeyRows({ expanded, group, onExpand, onToggle, poolEntries, rowProps }: ProviderKeyRowsProps) {
   const { t } = useI18n()
   const docsUrl = group.docsUrl?.trim()
   const description = group.description?.trim()
@@ -331,6 +356,15 @@ export function ProviderKeyRows({ expanded, group, onExpand, onToggle, rowProps 
           />
         </div>
 
+        {/* Only shown when the provider has >1 pooled credential (e.g. a
+            personal + a shared Copilot account) — a single credential needs
+            no "which one is active" affordance. */}
+        {poolEntries && poolEntries.length > 1 && (
+          <div className="@2xl:col-span-2">
+            <CredentialPoolStatus entries={poolEntries} />
+          </div>
+        )}
+
         {expandable && expanded && (
           <div className="grid gap-3 @2xl:col-span-2" onClick={e => e.stopPropagation()}>
             {description && (
@@ -393,6 +427,7 @@ interface ProviderKeyRowsProps {
   group: ProviderKeyRowGroup
   onExpand: () => void
   onToggle: () => void
+  poolEntries?: CredentialPoolEntry[]
   rowProps: KeyRowProps
 }
 
@@ -402,5 +437,6 @@ export interface ProviderKeyRowGroup {
   docsUrl?: string
   hasAnySet: boolean
   name: string
+  poolProvider?: string
   primary: [string, EnvVarInfo]
 }

@@ -210,11 +210,17 @@ describe('ProvidersSettings', () => {
   it('shows a per-credential pool status only for a provider with >1 stored credential', async () => {
     // Regression: multi-credential providers (e.g. a personal + a shared
     // Copilot key) had no Desktop UI to see which stored credential is
-    // actually active. See issue #80828.
+    // actually active. Copilot's key lives in the API-keys view, keyed by the
+    // backend's raw provider id ("copilot"), which is what /api/credentials/pool
+    // groups by too — see issue #80828.
+    getEnvVars.mockResolvedValue({
+      COPILOT_GITHUB_TOKEN: keyVar({ provider: 'copilot', provider_label: 'GitHub Copilot', is_set: true }),
+      ACME_API_KEY: keyVar({ provider: 'acme', provider_label: 'Acme', is_set: true })
+    })
     getCredentialPool.mockResolvedValue({
       providers: [
         {
-          provider: 'nous',
+          provider: 'copilot',
           entries: [
             { index: 1, label: 'wadefengx', priority: 0, request_count: 12, token_preview: 'sk-…abcd', has_refresh: false, last_status: 'ok' },
             { index: 2, label: 'shared-fallback', priority: 1, request_count: 0, token_preview: 'sk-…wxyz', has_refresh: false, last_status: 'exhausted' }
@@ -222,13 +228,15 @@ describe('ProvidersSettings', () => {
         }
       ]
     })
+    listOAuthProviders.mockResolvedValue({ providers: [] })
 
-    await renderProvidersSettings()
+    const { ProvidersSettings } = await import('./providers-settings')
+    render(<ProvidersSettings onClose={vi.fn()} onViewChange={vi.fn()} view="keys" />)
 
     expect(await screen.findByText('wadefengx')).toBeTruthy()
     expect(screen.getByText('shared-fallback')).toBeTruthy()
     expect(screen.getByText('exhausted')).toBeTruthy()
-    // minimax-oauth has no pool entries in this test → no status list rendered for it.
+    // Acme has no pool entries in this test → no status list rendered for it.
     expect(screen.queryByText('sk-…wxyz')).toBeNull()
   })
 })
