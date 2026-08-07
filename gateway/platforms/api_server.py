@@ -2516,6 +2516,10 @@ class APIServerAdapter(BasePlatformAdapter):
         self._api_cleanup_tasks: set["asyncio.Task"] = set()
         self._api_cleanup_retry_tasks: Dict[str, "asyncio.Task"] = {}
         self._api_active_agents: Dict[int, Any] = {}
+        # Every agent currently inside _run_agent(), including the chat and
+        # responses routes that do not have a public /v1/runs run_id. Shutdown
+        # interrupts this exact adapter-owned set before subprocess cleanup.
+        self._shutdown_interruptible_agents: Dict[int, Any] = {}
         # Keep one agent per exact API conversation so consecutive turns retain
         # the byte-stable cached prompt prefix.
         self._api_agent_cache: "OrderedDict[APIRequestScope, Dict[str, Any]]" = (
@@ -3585,6 +3589,52 @@ class APIServerAdapter(BasePlatformAdapter):
             )
         except Exception:
             return 0
+
+    def interrupt_active_runs(self, reason: str) -> int:
+        """Cooperatively interrupt every adapter-owned agent during shutdown.
+
+        The gateway drain accounts for API-server work through
+        ``active_agent_work_count()``, but those agents are owned by this
+        adapter rather than ``GatewayRunner._running_agents``, so
+        ``GatewayRunner._interrupt_running_agents()`` never reaches them: the
+        turn runs to the drain timeout with no cooperative interrupt and is
+        then amputated by the post-interrupt tool-subprocess kill.
+
+        Cover the same set the drain waits on, so accounting and interrupt
+        agree:
+
+        * ``_active_run_agents`` — the ``/v1/runs`` agents counted through
+          ``_active_run_tasks``.
+        * ``_shutdown_interruptible_agents`` — every ``_run_agent()`` turn
+          counted through ``_inflight_agent_runs``, i.e. both session-chat
+          routes, ``/v1/chat/completions`` and ``/v1/responses`` in their
+          streaming and non-streaming forms.
+
+        ``_pending_agent_requests`` is intentionally not covered: it counts
+        admitted requests that have not constructed an agent yet, so there is
+        no object to interrupt.
+
+        Returns the number of agents that accepted an interrupt.
+        """
+        agents: Dict[int, Any] = {}
+        for agent in list(self._active_run_agents.values()):
+            if agent is not None:
+                agents[id(agent)] = agent
+        for agent in list(self._shutdown_interruptible_agents.values()):
+            if agent is not None:
+                # Dedupe by object identity — the two registries are disjoint
+                # today (/v1/runs runs its own lifecycle, not _run_agent), but
+                # an agent published to both must still be interrupted once.
+                agents[id(agent)] = agent
+
+        interrupted = 0
+        for agent in agents.values():
+            try:
+                if request_hard_interrupt(agent, reason):
+                    interrupted += 1
+            except Exception as exc:
+                logger.debug("[api_server] failed interrupting active agent: %s", exc)
+        return interrupted
 
     @staticmethod
     def _gateway_is_draining() -> bool:
@@ -11839,6 +11889,9 @@ class APIServerAdapter(BasePlatformAdapter):
                             agent._api_approval_session_key = bound_session_key
                             with self._api_agent_cache_lock:
                                 self._api_active_agents[id(agent)] = agent
+                            # Shutdown interrupt coverage for every _run_agent
+                            # caller, including routes without a public run_id.
+                            self._shutdown_interruptible_agents[id(agent)] = agent
                             if agent_ref is not None:
                                 agent_ref[0] = agent
                             effective_task_id = request_authority.bind(
@@ -12020,6 +12073,7 @@ class APIServerAdapter(BasePlatformAdapter):
                         # left running.
                         if agent is not None:
                             _clear_turn_process_ownership(agent)
+                            self._shutdown_interruptible_agents.pop(id(agent), None)
                             # This runs while the per-conversation execution
                             # lock is still held.  The old callback can no
                             # longer execute, and a queued next turn cannot yet
