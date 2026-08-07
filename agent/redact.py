@@ -506,9 +506,12 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     one side, span crosses \\n), fall back to per-line masking so at
     least the prefix-bearing line is masked (#81012).
     """
-    _CONTROL_FOR_SHADOW = re.compile(
-        r"[\x00-\x1f\x7f-‏ - ⁠﻿]"
-    )
+    # Eat control / zero-width chars using the module-level class. It
+    # covers ESC, \n, \r, and the zero-width/format ranges; using it
+    # (rather than re-declaring the ranges inline) guarantees the
+    # shadow-copy strip and the body-safe check below agree with the
+    # existing definition and cannot drift.
+    _CONTROL_FOR_SHADOW = _CONTROL_CHARS_RE
     stripped_chars: list[str] = []
     orig_idx: list[int] = []
     csi_eaten: set[int] = set()
