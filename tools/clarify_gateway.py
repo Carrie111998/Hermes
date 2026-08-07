@@ -164,16 +164,21 @@ def wait_for_response(clarify_id: str, timeout: float) -> Optional[str]:
 def resolve_gateway_clarify(clarify_id: str, response: str) -> bool:
     """Unblock the agent thread waiting on ``clarify_id``.
 
-    Returns True if an entry was found and resolved, False otherwise
-    (already resolved, expired, or never existed).
+    The first terminal action wins. This matters when a native button
+    callback races a free-form message cancelling the same prompt.
     """
     with _lock:
         entry = _entries.get(clarify_id)
-        if entry is None:
+        if entry is None or entry.event.is_set():
             return False
-    entry.response = str(response) if response is not None else ""
-    entry.event.set()
-    return True
+        entry.response = str(response) if response is not None else ""
+        entry.event.set()
+        return True
+
+
+def cancel_gateway_clarify(clarify_id: str) -> bool:
+    """Cancel one pending clarify and release its waiter with no answer."""
+    return resolve_gateway_clarify(clarify_id, "")
 
 
 def get_pending_for_session(

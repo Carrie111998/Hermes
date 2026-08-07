@@ -14764,8 +14764,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Intercept messages that are responses to a pending clarify.
         # Open-ended prompts and "Other" responses are captured as free text;
         # direct replies to multi-choice prompts are accepted too ("2" maps
-        # to the second option, arbitrary text becomes a custom answer). Slash
-        # commands still bypass this path so /stop and friends keep working.
+        # to the second option). Free-form input cancels a native choice prompt
+        # and continues as a normal turn. Slash commands still bypass this path
+        # so /stop and friends keep working.
         _clarify_mod = None
         try:
             from tools import clarify_gateway as _clarify_mod
@@ -14817,6 +14818,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
                     return ""
+
+                # Native interactive choice prompts reject arbitrary prose as
+                # an answer. End that exact pending wait before allowing the
+                # message through as a new turn; otherwise the active-session
+                # queue holds the message until the clarify timeout expires.
+                # Cancellation is first-wins, so a concurrent button callback
+                # cannot be overwritten (and vice versa).
+                if _clarify_mod.cancel_gateway_clarify(
+                    _pending_clarify.clarify_id
+                ):
+                    logger.info(
+                        "Gateway cancelled pending clarify for free-form input "
+                        "(session=%s, id=%s)",
+                        _quick_key,
+                        _pending_clarify.clarify_id,
+                    )
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are

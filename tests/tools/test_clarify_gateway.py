@@ -42,6 +42,46 @@ class TestClarifyPrimitive:
         result = cm.wait_for_response("id1", timeout=10.0)
         assert result == "B"
 
+    def test_cancel_releases_blocked_wait_immediately(self):
+        """Free-form cancellation releases the waiter instead of waiting for timeout."""
+        from tools import clarify_gateway as cm
+
+        cm.register("id-cancel", "sk-cancel", "Pick one", ["A", "B"])
+        result = {}
+
+        waiter = threading.Thread(
+            target=lambda: result.setdefault(
+                "response", cm.wait_for_response("id-cancel", timeout=10.0)
+            )
+        )
+        waiter.start()
+
+        assert cm.cancel_gateway_clarify("id-cancel") is True
+        waiter.join(timeout=1.0)
+
+        assert not waiter.is_alive()
+        assert result["response"] == ""
+        assert cm.resolve_gateway_clarify("id-cancel", "B") is False
+
+    def test_cancel_does_not_overwrite_a_concurrent_answer(self):
+        """The first terminal action wins when free-form cancellation races a button."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-race", "sk-race", "Pick one", ["A", "B"])
+        assert cm.resolve_gateway_clarify("id-race", "B") is True
+        assert cm.cancel_gateway_clarify("id-race") is False
+        assert entry.event.is_set()
+        assert entry.response == "B"
+
+    def test_duplicate_resolutions_are_first_wins(self):
+        """Concurrent transport callbacks cannot replace an accepted response."""
+        from tools import clarify_gateway as cm
+
+        entry = cm.register("id-double", "sk-double", "Pick one", ["A", "B"])
+        assert cm.resolve_gateway_clarify("id-double", "A") is True
+        assert cm.resolve_gateway_clarify("id-double", "B") is False
+        assert entry.response == "A"
+
     def test_open_ended_auto_awaits_text(self):
         """Clarify with no choices is in text-capture mode immediately."""
         from tools import clarify_gateway as cm

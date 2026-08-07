@@ -7,12 +7,13 @@ consume ANY non-command message in the session as the clarify answer —
 arbitrary prose vanished into clarify resolution and the agent appeared to
 ignore the user's thread messages.
 
-After the fix (``tools/clarify_gateway._coerce_text_response`` rejects
+After the fix (``tools.clarify_gateway._coerce_text_response`` rejects
 arbitrary prose for native multi-choice prompts):
 
-  * numeric selections ("2") and exact choice labels still resolve, and
-  * arbitrary prose falls through the intercept and continues as a normal
-    message-handling turn.
+  * numeric selections ("2") and exact choice labels still resolve,
+  * arbitrary prose cancels the pending choice wait and continues as a normal
+    message-handling turn, and
+  * cancellation is first-wins with any concurrent button callback.
 
 Open-ended clarifies, explicit "Other" text-capture mode, and the base
 adapter's numbered-text fallback (which flips ``awaiting_text`` at send time)
@@ -109,8 +110,8 @@ async def _dispatch(runner, event):
 
 
 @pytest.mark.asyncio
-async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
-    """Arbitrary prose during a pending button-clarify continues as a normal turn."""
+async def test_thread_prose_cancels_native_multi_choice_clarify_and_falls_through():
+    """A normal follow-up ends the button clarify before continuing as a new turn."""
     _clear_clarify_state()
     from tools import clarify_gateway as cm
 
@@ -123,11 +124,10 @@ async def test_thread_prose_not_swallowed_by_native_multi_choice_clarify():
     with pytest.raises(_FellThroughIntercept):
         await _dispatch(runner, _event("just checking the visual UI, no need to pass any data"))
 
-    # The clarify entry must still be pending and unresolved.
-    with cm._lock:
-        entry = cm._entries.get("cl-native")
-    assert entry is not None
-    assert not entry.event.is_set()
+    # The free-form message is not a clarify answer, but it must release the
+    # pending wait before continuing through normal message handling.
+    assert entry.event.is_set()
+    assert entry.response == ""
     _clear_clarify_state()
 
 
