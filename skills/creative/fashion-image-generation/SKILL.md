@@ -53,6 +53,18 @@ Reference for "good proportions" is the user-confirmed example: `indossato_front
 (Montana · Mastic) — natural leg length and true coat length. Spot-check every batch against
 it; regenerate any shot that looks elongated.
 
+**Required pose set (every garment × every colorway).** Beyond the basic e-commerce front
+shot, each garment must also be produced in **two additional variants** (in addition to
+`front`), always on-model and always faithful to the ghost mannequin + model reference:
+- `bust34` — **three-quarter bust shot** (waist up), slight three-quarter angle.
+- `editorial` — **dynamic editorial fashion pose** (weight shifted, one hand in the coat
+  pocket or adjusting the collar), set on the **editorial/street scene** (`EDITORIAL_SCENE`),
+  not the studio background.
+
+So the full per-colorway STEP B set is: `front` (studio), `bust34` (studio), `editorial` (street).
+Output naming: `indossato_<POSA>_<COLOR>.png` (e.g. `indossato_bust34_NOCCIOLA-302.png`,
+`indossato_editorial_NOCCIOLA-302.png`).
+
 ## Workflow (end-to-end)
 1. **Enumerate the Drive source** — for each garment folder: identify the ghost mannequin (product photo on flat grey) vs. the color swatches (flat rectangle with a color name+code). Use vision to disambiguate and to map each swatch file → its color code (`NOCCIOLA-302`…). A single `seed` colorway may also come pre-generated.
 2. **Scaffold a manifest** of `{garment: {ghost: path, swatch: {COLOR: path}}}`.

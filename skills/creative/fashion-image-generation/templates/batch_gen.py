@@ -43,10 +43,12 @@ STEPB_PROMPT = ("The model from the reference image wearing the garment from the
 
 # Poses: each STEP B variant appends its own pose clause to STEPB_PROMPT.
 POSES = {
-    "front":   "standing front pose, arms relaxed at sides",
-    "34":      "three-quarter angle pose, arms relaxed",
-    "back":    "back-facing pose, standing upright",
-    "detail":  "close-up on the garment fabric and construction",
+    "front":       "standing front pose, arms relaxed at sides",
+    "34":          "three-quarter angle pose, arms relaxed",
+    "back":        "back-facing pose, standing upright",
+    "detail":      "close-up on the garment fabric and construction",
+    "bust34":      "three-quarter length bust shot from the waist up, slight three-quarter angle, arms relaxed",
+    "editorial":   "a dynamic editorial fashion pose, weight shifted, one hand in coat pocket or adjusting the collar, confident stance",
 }
 # Editorial scene replaces the studio background for campaign variants.
 EDITORIAL_SCENE = ("standing on a wet cobblestone street in a European winter city at early morning, "
@@ -104,22 +106,36 @@ for capo, cfg in MANIFEST.items():
                 print(f"  STEP A FAIL {colore}: {e}", flush=True)
         else:
             print("  STEP A: skip", flush=True)
-        # STEP B: skip if worn output already exists (idempotent!) or model missing
-        if not only_stepa and os.path.exists(g_out) and not os.path.exists(w_out):
-            if not os.path.exists(modela):
-                print(f"  STEP B skip: model photo missing ({modela})", flush=True)
-                continue
-            try:
-                n, c = gen(STEPB_PROMPT, [data_url(modela), data_url(g_out)], w_out)
-                print(f"  STEP B ok ${c}", flush=True); summary.append(("B", capo, colore, c))
-            except Exception as e:
-                print(f"  STEP B FAIL {colore}: {e}", flush=True)
+        # STEP B: skip if ALL worn outputs exist or model missing
+        if only_stepa:
+            print("  STEP B: skip (--stepa)", flush=True)
+        elif not os.path.exists(g_out):
+            print("  STEP B skip: ghost missing", flush=True)
+        elif not os.path.exists(modela):
+            print(f"  STEP B skip: model photo missing ({modela})", flush=True)
         else:
-            print("  STEP B: skip", flush=True)
+            for posa in cfg.get("poses", ["front", "bust34", "editorial"]):
+                w_out = f"{BASE}/{capo}/indossato_{posa}_{colore}.png"
+                if os.path.exists(w_out):
+                    print(f"  STEP B {posa}: skip", flush=True)
+                    continue
+                pose_clause = POSES.get(posa, POSES["front"])
+                scene = EDITORIAL_SCENE if posa == "editorial" else "neutral light grey background, full body shot, professional ecommerce fashion photography, clean studio lighting"
+                prompt = f"{STEPB_PROMPT} {pose_clause}, {scene}."
+                try:
+                    n, c = gen(prompt, [data_url(modela), data_url(g_out)], w_out)
+                    print(f"  STEP B {posa} ok ${c}", flush=True); summary.append(("B", capo, colore, posa, c))
+                except Exception as e:
+                    print(f"  STEP B {posa} FAIL {colore}: {e}", flush=True)
 
 tot = sum((c or 0) for *_, c in summary)
 print("\n===== RIEPILOGO =====")
-for s, capo, colore, c in summary:
-    print(f"  STEP {s} {capo} {colore}: ${c}")
+for row in summary:
+    if row[0] == "A":
+        s, capo, colore, c = row
+        print(f"  STEP A {capo} {colore}: ${c}")
+    else:
+        s, capo, colore, posa, c = row
+        print(f"  STEP B {capo} {colore} [{posa}]: ${c}")
 print(f"COSTO TOTALE: ${tot:.4f}")
 print("DONE")
