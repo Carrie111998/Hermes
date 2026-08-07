@@ -796,10 +796,12 @@ def build_turn_context(
         )
 
         if not _preflight_deferred:
-            _last = _compressor.last_prompt_tokens
-            # Do NOT overwrite the -1 sentinel (#36718).
-            if _last >= 0 and _preflight_tokens > _last:
-                _compressor.last_prompt_tokens = _preflight_tokens
+            # 2026-08-08 用户决策：preflight 预估不再覆盖 last_prompt_tokens。
+            # 预估只服务压缩决策（下方 should_compress(_preflight_tokens) 显式传参，
+            # 完全独立）——覆盖显示会让状态栏出现 623K→750K 的假跳变（本地粗估
+            # char/4 + 全量工具 schema vs API 实测的口径差，最多虚高 127K），
+            # 且把 last_prompt_delta 算成负值。状态栏保持 API 实测，如实反映占用。
+            pass
 
         _compression_cooldown = getattr(
             _compressor,
