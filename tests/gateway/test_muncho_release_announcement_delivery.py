@@ -543,7 +543,7 @@ async def test_verified_native_delivery_reaches_exact_sha_terminal_health(
     assert release_cli.main([
         "coordinator-prepare",
         "--version",
-        "2.3.2",
+        CURRENT_VERSION,
         "--release-sha",
         RELEASE_SHA,
         "--state-dir",
@@ -556,7 +556,7 @@ async def test_verified_native_delivery_reaches_exact_sha_terminal_health(
     assert release_cli.main([
         "coordinator-complete",
         "--version",
-        "2.3.2",
+        CURRENT_VERSION,
         "--release-sha",
         RELEASE_SHA,
         "--state-dir",
@@ -575,7 +575,7 @@ async def test_verified_native_delivery_reaches_exact_sha_terminal_health(
     assert terminal["healthy"] is True
     assert release_health(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["healthy"] is True
 
@@ -846,7 +846,7 @@ async def test_native_readback_mismatch_stays_pending_and_replays_without_duplic
     assert uncertain[0]["state"] == "dispatch_uncertain"
     assert release_status(
         state,
-        version="2.3.2",
+        version=CURRENT_VERSION,
         release_sha=RELEASE_SHA,
     )["discord_summary_published"] is False
 
