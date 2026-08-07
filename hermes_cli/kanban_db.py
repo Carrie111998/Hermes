@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -1177,6 +1178,154 @@ class Event:
     run_id: Optional[int] = None
 
 
+class ProviderRecoveryProofKind(str, Enum):
+    """Successful live observations that are sufficient recovery proof."""
+
+    LIVE_REQUEST_SUCCEEDED = "live_request_succeeded"
+    LIVE_VALIDATION_SUCCEEDED = "live_validation_succeeded"
+
+
+class ProviderRecoveryDeliveryState(str, Enum):
+    PENDING = "pending"
+    DELIVERED = "delivered"
+    STALE = "stale"
+
+
+_RECOVERY_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+
+
+def _strict_recovery_id(value: object, *, field_name: str) -> str:
+    """Normalize a non-secret metadata identifier to a narrow safe alphabet."""
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} must be a string")
+    normalized = value.strip()
+    if not normalized:
+        raise ValueError(f"{field_name} cannot be empty")
+    if not _RECOVERY_ID_RE.fullmatch(normalized):
+        raise ValueError(f"{field_name} must be a non-secret identifier")
+    return normalized
+
+
+def _strict_recovery_timestamp(value: object, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{field_name} must be an integer Unix timestamp")
+    if value <= 0:
+        raise ValueError(f"{field_name} must be positive")
+    return value
+
+
+@dataclass(frozen=True)
+class ProviderRecoveryScope:
+    """Normalized recovery identity without any credential material.
+
+    The generation is a positive monotonic number, not a credential
+    fingerprint. Its integer type makes values and hashes structurally
+    impossible to persist in the scope.
+    """
+
+    profile: str
+    provider: str
+    credential_generation: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, str) or not self.profile.strip():
+            raise ValueError("profile must be a nonempty string")
+        from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+        profile = normalize_profile_name(self.profile)
+        validate_profile_name(profile)
+
+        if not isinstance(self.provider, str) or not self.provider.strip():
+            raise ValueError("provider must be a nonempty string")
+        from hermes_cli.models import normalize_provider
+
+        provider = _strict_recovery_id(
+            normalize_provider(self.provider), field_name="provider"
+        ).lower()
+        # ``open-router`` is a common display spelling but the durable Hermes
+        # provider id is ``openrouter``. Keep hyphens in all other provider ids
+        # because several canonical providers legitimately use them.
+        if provider == "open-router":
+            provider = "openrouter"
+        if provider == "auto":
+            raise ValueError("provider recovery scope requires a concrete provider")
+
+        generation = self.credential_generation
+        if isinstance(generation, bool) or not isinstance(generation, int):
+            raise TypeError("credential_generation must be a positive integer")
+        if generation <= 0:
+            raise ValueError("credential_generation must be positive")
+
+        object.__setattr__(self, "profile", profile)
+        object.__setattr__(self, "provider", provider)
+
+
+@dataclass(frozen=True)
+class ProviderRecoveryProof:
+    """Successful live proof with no payload or secret-bearing fields."""
+
+    stable_proof_id: str
+    scope: ProviderRecoveryScope
+    kind: ProviderRecoveryProofKind
+    provider_observed_at: int
+    publisher_id: str
+    publisher_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.scope, ProviderRecoveryScope):
+            raise TypeError("scope must be ProviderRecoveryScope")
+        if not isinstance(self.kind, ProviderRecoveryProofKind):
+            raise ValueError("kind must be a successful live provider proof kind")
+        object.__setattr__(
+            self, "stable_proof_id",
+            _strict_recovery_id(self.stable_proof_id, field_name="stable_proof_id"),
+        )
+        object.__setattr__(
+            self, "provider_observed_at",
+            _strict_recovery_timestamp(
+                self.provider_observed_at, field_name="provider_observed_at"
+            ),
+        )
+        object.__setattr__(
+            self, "publisher_id",
+            _strict_recovery_id(self.publisher_id, field_name="publisher_id"),
+        )
+        object.__setattr__(
+            self, "publisher_version",
+            _strict_recovery_id(self.publisher_version, field_name="publisher_version"),
+        )
+
+
+@dataclass(frozen=True)
+class ProviderRecoveryEvent:
+    id: int
+    stable_proof_id: str
+    scope: ProviderRecoveryScope
+    kind: ProviderRecoveryProofKind
+    provider_observed_at: int
+    publisher_id: str
+    publisher_version: str
+    inserted_at: int
+
+
+@dataclass(frozen=True)
+class ProviderRecoveryDelivery:
+    event_id: int
+    task_id: str
+    run_id: int
+    session_id: str
+    state: ProviderRecoveryDeliveryState
+    created_at: int
+    claim_owner: Optional[str]
+    claim_expires: Optional[int]
+    resolved_at: Optional[int]
+    scope: ProviderRecoveryScope
+    proof_kind: ProviderRecoveryProofKind
+    provider_observed_at: int
+    publisher_id: str
+    publisher_version: str
+
+
 # ---------------------------------------------------------------------------
 # Schema
 # ---------------------------------------------------------------------------
@@ -1364,6 +1513,52 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Exact-run registrations awaiting a successful live provider observation.
+-- No credential, header, token, request, or response material belongs here.
+CREATE TABLE IF NOT EXISTS provider_recovery_waits (
+    task_id               TEXT NOT NULL,
+    run_id                INTEGER NOT NULL,
+    session_id            TEXT NOT NULL,
+    profile               TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    waiting_at             INTEGER NOT NULL,
+    PRIMARY KEY (task_id, run_id, session_id)
+);
+
+-- Append-only successful live provider proofs. stable_proof_id makes retries
+-- idempotent while the complete row comparison rejects identity collisions.
+CREATE TABLE IF NOT EXISTS provider_recovery_events (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    stable_proof_id       TEXT NOT NULL UNIQUE,
+    profile               TEXT NOT NULL,
+    provider              TEXT NOT NULL,
+    credential_generation INTEGER NOT NULL CHECK (credential_generation > 0),
+    proof_kind            TEXT NOT NULL CHECK (
+        proof_kind IN ('live_request_succeeded', 'live_validation_succeeded')
+    ),
+    provider_observed_at  INTEGER NOT NULL,
+    publisher_id          TEXT NOT NULL,
+    publisher_version     TEXT NOT NULL,
+    inserted_at           INTEGER NOT NULL
+);
+
+-- Per-event fanout. An event is never globally consumed: every exact waiter
+-- has an independently leased pending/delivered/stale delivery.
+CREATE TABLE IF NOT EXISTS provider_recovery_deliveries (
+    event_id      INTEGER NOT NULL,
+    task_id       TEXT NOT NULL,
+    run_id        INTEGER NOT NULL,
+    session_id    TEXT NOT NULL,
+    state         TEXT NOT NULL DEFAULT 'pending'
+                  CHECK (state IN ('pending', 'delivered', 'stale')),
+    created_at    INTEGER NOT NULL,
+    claim_owner   TEXT,
+    claim_expires INTEGER,
+    resolved_at   INTEGER,
+    PRIMARY KEY (event_id, task_id, run_id, session_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1374,6 +1569,12 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_provider_recovery_wait_scope
+    ON provider_recovery_waits(profile, provider, credential_generation, waiting_at);
+CREATE INDEX IF NOT EXISTS idx_provider_recovery_event_scope
+    ON provider_recovery_events(profile, provider, credential_generation, id);
+CREATE INDEX IF NOT EXISTS idx_provider_recovery_delivery_claim
+    ON provider_recovery_deliveries(state, claim_expires, event_id);
 """
 
 
@@ -4025,6 +4226,10 @@ def _end_run(
             now,
             run_id,
         ),
+    )
+    conn.execute(
+        "DELETE FROM provider_recovery_waits WHERE task_id = ? AND run_id = ?",
+        (task_id, run_id),
     )
     conn.execute(
         "UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,),
@@ -6916,6 +7121,16 @@ def _classify_worker_exit(pid: int) -> "tuple[str, Optional[int]]":
     if entry is None:
         return ("unknown", None)
     raw, _ = entry
+    if os.name == "nt":
+        # Windows has no waitpid/WIFEXITED helpers. Supervised Popen.wait()
+        # callbacks encode their direct return code in the POSIX-compatible
+        # high byte before storing it in this shared registry.
+        code = int(raw) >> 8
+        if code == 0:
+            return ("clean_exit", 0)
+        if code == KANBAN_RATE_LIMIT_EXIT_CODE:
+            return ("rate_limited", code)
+        return ("nonzero_exit", code)
     try:
         if os.WIFEXITED(raw):
             code = os.WEXITSTATUS(raw)
@@ -7647,13 +7862,30 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # counter (see the post-txn loop below).
     crash_details: list[tuple[str, int, str, bool, str]] = []
     # (task_id, pid, claimer, protocol_violation, error_text)
+    main_db_row = next(
+        (row for row in conn.execute("PRAGMA database_list") if row[1] == "main"),
+        None,
+    )
+    main_db_path = str(Path(main_db_row[2]).resolve()) if main_db_row and main_db_row[2] else None
+    supervisor = (
+        _dispatcher_worker_supervisors.get(main_db_path) if main_db_path else None
+    )
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
         for row in rows:
+            active_pid = supervisor.active_pid(row["id"]) if supervisor is not None else None
+            if active_pid is not None:
+                if int(row["worker_pid"]) != active_pid:
+                    conn.execute(
+                        "UPDATE tasks SET worker_pid = ? "
+                        "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                        (active_pid, row["id"], row["current_run_id"]),
+                    )
+                continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
@@ -8368,6 +8600,29 @@ def dispatch_once(
         return result
 
 
+def _invoke_dispatch_spawn(
+    spawn_fn,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str],
+) -> Optional[int]:
+    """Invoke the test seam or the dispatcher-owned production supervisor."""
+    if spawn_fn is None:
+        return _start_supervised_worker(task, workspace, board=board)
+
+    # Back-compat: older spawn_fn signatures accept only (task, workspace).
+    # Introspect the callable and pass `board` only when supported.
+    import inspect
+    try:
+        sig = inspect.signature(spawn_fn)
+        if "board" in sig.parameters:
+            return spawn_fn(task, workspace, board=board)
+        return spawn_fn(task, workspace)
+    except (TypeError, ValueError):
+        return spawn_fn(task, workspace)
+
+
 def _dispatch_once_locked(
     conn: sqlite3.Connection,
     *,
@@ -8416,6 +8671,8 @@ def _dispatch_once_locked(
     reap_worker_zombies()
 
     result = DispatchResult()
+    if not dry_run:
+        _consume_provider_recovery_deliveries(conn, board=board)
     result.reclaimed = release_stale_claims(conn)
     if reconcile_orphans:
         # Orphaned-card reconciliation: requeue 'running' cards whose claim
@@ -8653,20 +8910,10 @@ def _dispatch_once_locked(
         if claimed.workspace_kind == "worktree":
             set_branch_name(conn, claimed.id, resolved_branch_name or (claimed.branch_name or "").strip() or f"wt/{claimed.id}")
         _maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            # Back-compat: older spawn_fn signatures accept only
-            # (task, workspace). Test stubs in the suite rely on that.
-            # Introspect the callable and pass `board` only when supported.
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_dispatch_spawn(
+                spawn_fn, claimed, str(workspace), board=board,
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             # NOTE: we intentionally do NOT reset consecutive_failures
@@ -8751,17 +8998,10 @@ def _dispatch_once_locked(
         # prompt via KANBAN_GUIDANCE, so this is the only extra skill the
         # review agent needs.
         claimed.skills = ["sdlc-review"]
-        _spawn = spawn_fn if spawn_fn is not None else _default_spawn
         try:
-            import inspect
-            try:
-                sig = inspect.signature(_spawn)
-                if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
-            except (TypeError, ValueError):
-                pid = _spawn(claimed, str(workspace))
+            pid = _invoke_dispatch_spawn(
+                spawn_fn, claimed, str(workspace), board=board,
+            )
             if pid:
                 _set_worker_pid(conn, claimed.id, int(pid))
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
@@ -9064,18 +9304,339 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _default_spawn(
+_dispatcher_worker_supervisors: dict[str, Any] = {}
+_provider_recovery_consumer_id = (
+    f"dispatcher-{os.getpid()}-{secrets.token_hex(8)}"
+)
+
+
+def _dispatcher_worker_supervisor(*, board: Optional[str] = None):
+    """Return the long-lived process owner for one resolved board."""
+    from hermes_cli.worker_supervisor import DispatcherWorkerSupervisor
+
+    db_path = kanban_db_path(board=board).resolve()
+    key = str(db_path)
+    supervisor = _dispatcher_worker_supervisors.get(key)
+    if supervisor is None:
+        supervisor = DispatcherWorkerSupervisor(
+            event_root=db_path.parent / "worker-lifecycle",
+        )
+        _dispatcher_worker_supervisors[key] = supervisor
+    return supervisor
+
+
+def _supervised_worker_profile_state_db(task: Task) -> tuple[str, Path]:
+    """Return the exact assignee profile and state DB used by its worker."""
+    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+    if not task.assignee:
+        raise ValueError(f"task {task.id} has no assignee")
+    profile_name = normalize_profile_name(task.assignee)
+    return profile_name, Path(resolve_profile_env(profile_name)) / "state.db"
+
+
+def signal_worker_recovery(
+    task_id: str,
+    reason: str,
+    *,
+    board: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+    expected_session_id: Optional[str] = None,
+) -> bool:
+    """Deliver recovery only to the board's exact current supervised run."""
+    from hermes_cli.worker_supervisor import WorkerIdentity
+
+    key = str(kanban_db_path(board=board).resolve())
+    supervisor = _dispatcher_worker_supervisors.get(key)
+    if supervisor is None:
+        return False
+    conn = connect(Path(key))
+    try:
+        task = get_task(conn, task_id)
+    finally:
+        conn.close()
+    if (
+        task is None
+        or task.status != "running"
+        or task.current_run_id is None
+        or not task.workspace_path
+    ):
+        return False
+    session_id = task.session_id or f"kanban:{task.id}:{task.current_run_id}"
+    if expected_run_id is not None and task.current_run_id != expected_run_id:
+        return False
+    if expected_session_id is not None and session_id != expected_session_id:
+        return False
+    identity = WorkerIdentity(
+        task.id,
+        session_id,
+        Path(task.workspace_path),
+        run_id=task.current_run_id,
+    )
+    return bool(supervisor.signal_recovery(identity, reason))
+
+
+def _consume_provider_recovery_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> None:
+    """Lease and deliver durable recovery proof to exact waiting runs only."""
+    claimed = claim_provider_recovery_deliveries(
+        conn,
+        consumer_id=_provider_recovery_consumer_id,
+    )
+    for delivery in claimed:
+        delivered = signal_worker_recovery(
+            delivery.task_id,
+            "provider_recovered",
+            board=board,
+            expected_run_id=delivery.run_id,
+            expected_session_id=delivery.session_id,
+        )
+        marker = (
+            mark_provider_recovery_delivery_delivered
+            if delivered
+            else mark_provider_recovery_delivery_stale
+        )
+        marker(
+            conn,
+            event_id=delivery.event_id,
+            task_id=delivery.task_id,
+            run_id=delivery.run_id,
+            session_id=delivery.session_id,
+            consumer_id=_provider_recovery_consumer_id,
+        )
+
+
+def _record_supervised_worker_exit(attempt_exit) -> None:
+    """Retain a Popen.wait return code for existing crash classification."""
+    returncode = int(attempt_exit.exit_code)
+    raw_status = returncode << 8 if returncode >= 0 else -returncode
+    _record_worker_exit(int(attempt_exit.pid), raw_status)
+
+
+def _precreate_supervised_worker_session(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+) -> str:
+    """Create and project the durable CLI session bound to this worker run."""
+    import uuid
+
+    from hermes_state import SessionDB
+
+    if not task.assignee:
+        raise ValueError(f"task {task.id} has no assignee")
+    if task.current_run_id is None:
+        raise RuntimeError(f"task {task.id} has no current run")
+
+    profile_name, state_db_path = _supervised_worker_profile_state_db(task)
+    canonical_workspace = str(Path(workspace).resolve())
+    session_id = f"worker_{uuid.uuid4().hex}"
+    session_db = SessionDB(state_db_path)
+    try:
+        session_db.create_session(
+            session_id,
+            source="kanban",
+            cwd=canonical_workspace,
+            profile_name=profile_name,
+            git_repo_root=canonical_workspace,
+        )
+    finally:
+        session_db.close()
+
+    conn = connect(kanban_db_path(board=board).resolve())
+    try:
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE tasks SET session_id = ? "
+                "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                (session_id, task.id, task.current_run_id),
+            )
+            if cur.rowcount != 1:
+                raise RuntimeError("worker session projection lost exact run ownership")
+    finally:
+        conn.close()
+    return session_id
+
+
+def _start_supervised_worker(
     task: Task,
     workspace: str,
     *,
     board: Optional[str] = None,
 ) -> Optional[int]:
-    """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
+    """Launch and retain a real dispatcher child under lifecycle supervision."""
+    from hermes_cli.worker_supervisor import (
+        SessionCompressionLineageResolver,
+        WorkerIdentity,
+    )
 
-    Returns the spawned child's PID so the dispatcher can detect crashes
-    before the claim TTL expires. The child's completion is still observed
-    via the ``complete`` / ``block`` transitions the worker writes itself;
-    the PID check is a safety net for crashes, OOM kills, and Ctrl+C.
+    lineage_resolver = None
+    if _default_spawn is _PRODUCTION_DEFAULT_SPAWN:
+        _, state_db_path = _supervised_worker_profile_state_db(task)
+        session_id = _precreate_supervised_worker_session(
+            task, workspace, board=board,
+        )
+        lineage_resolver = SessionCompressionLineageResolver(state_db_path)
+    else:
+        # Keep the existing monkeypatch/injection seam behaviorally unchanged;
+        # durable prebinding belongs to the production CLI launch only.
+        session_id = task.session_id or f"{task.id}-run-{task.current_run_id}"
+    identity = WorkerIdentity(
+        task.id,
+        session_id,
+        Path(workspace),
+        run_id=task.current_run_id,
+    )
+    db_path = kanban_db_path(board=board).resolve()
+    stable_run_id = task.current_run_id
+
+    def launch(
+        _identity,
+        attempt: int,
+        event_path: Path,
+        *,
+        start_nonce: Optional[str] = None,
+    ):
+        return _spawn_supervised_attempt(
+            task,
+            workspace,
+            identity,
+            attempt,
+            event_path,
+            board=board,
+            start_nonce=start_nonce,
+        )
+
+    def on_exit(attempt_exit) -> None:
+        _record_supervised_worker_exit(attempt_exit)
+        event_conn = connect(db_path)
+        try:
+            with write_txn(event_conn):
+                _append_event(
+                    event_conn, task.id, "worker_attempt_exit",
+                    attempt_exit.as_dict(), run_id=stable_run_id,
+                )
+            if attempt_exit.classification == "transient_provider":
+                terminal_events = [
+                    event
+                    for event in attempt_exit.events
+                    if isinstance(event, dict) and event.get("kind") == "terminal"
+                ]
+                if len(terminal_events) == 1:
+                    terminal_event = terminal_events[0]
+                    try:
+                        scope = ProviderRecoveryScope(
+                            terminal_event.get("profile"),
+                            terminal_event.get("provider"),
+                            terminal_event.get("credential_generation"),
+                        )
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        register_provider_recovery_wait(
+                            event_conn,
+                            evidence=attempt_exit,
+                            scope=scope,
+                        )
+        finally:
+            event_conn.close()
+
+    def on_pid(_identity, attempt: int, pid: int) -> None:
+        if attempt == 1:
+            return
+        retry_conn = connect(db_path)
+        try:
+            with write_txn(retry_conn):
+                cur = retry_conn.execute(
+                    "UPDATE tasks SET worker_pid = ? "
+                    "WHERE id = ? AND status = 'running' AND current_run_id IS ?",
+                    (int(pid), task.id, stable_run_id),
+                )
+                if cur.rowcount != 1:
+                    raise RuntimeError("retry PID projection lost exact run ownership")
+        finally:
+            retry_conn.close()
+
+    def notify(failure) -> None:
+        event_conn = connect(db_path)
+        try:
+            with write_txn(event_conn):
+                _append_event(
+                    event_conn,
+                    task.id,
+                    "worker_supervision_failed",
+                    failure.as_dict(),
+                    run_id=stable_run_id,
+                )
+        finally:
+            event_conn.close()
+
+    supervisor = _dispatcher_worker_supervisor(board=board)
+    handle = supervisor.start(
+        identity,
+        launch,
+        on_exit=on_exit,
+        on_pid=on_pid,
+        notifier=notify,
+        lineage_resolver=lineage_resolver,
+    )
+    return handle.pid
+
+
+def _spawn_supervised_attempt(
+    task: Task,
+    workspace: str,
+    identity,
+    attempt: int,
+    event_path: Path,
+    *,
+    board: Optional[str],
+    start_nonce: Optional[str] = None,
+):
+    """Invoke production spawn while preserving older injected test seams."""
+    import inspect
+
+    kwargs: dict[str, Any] = {
+        "board": board,
+        "lifecycle_event_path": event_path,
+        "lifecycle_attempt": attempt,
+    }
+    parameters = inspect.signature(_default_spawn).parameters
+    accepts_kwargs = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if "worker_session_id" in parameters:
+        kwargs["worker_session_id"] = identity.session_id
+    if "resume_session_id" in parameters:
+        kwargs["resume_session_id"] = identity.session_id
+    if "start_nonce" in parameters or accepts_kwargs:
+        kwargs["start_nonce"] = start_nonce
+    return _default_spawn(task, workspace, **kwargs)
+
+
+def _default_spawn(
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
+    lifecycle_event_path: Optional[Path] = None,
+    lifecycle_attempt: int = 1,
+    worker_session_id: Optional[str] = None,
+    resume_session_id: Optional[str] = None,
+    start_nonce: Optional[str] = None,
+    provider_recovery_db_path: Optional[Path] = None,
+    provider_recovery_profile: Optional[str] = None,
+    provider_credential_generation: Optional[int] = None,
+):
+    """Spawn ``hermes -p <profile> chat -q ...`` and return its live handle.
+
+    The child is started in a new session/process group so it survives gateway
+    restarts and can be cleanly killed as a unit.
 
     ``board`` pins the child's kanban context to that board: the child's
     ``HERMES_KANBAN_DB`` / ``HERMES_KANBAN_BOARD`` / workspaces_root env
@@ -9098,6 +9659,10 @@ def _default_spawn(
     from gateway.session_context import _VAR_MAP
     for key in _VAR_MAP:
         env.pop(key, None)
+    # Recovery proof authority must never leak from a dispatcher's inherited
+    # environment. R2a does not create a generation; a later dispatcher slice
+    # may pass the complete trusted scope explicitly through these arguments.
+    env.pop("HERMES_PROVIDER_CREDENTIAL_GENERATION", None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -9120,7 +9685,7 @@ def _default_spawn(
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
-    env["HERMES_KANBAN_WORKSPACE"] = workspace
+    env["HERMES_KANBAN_WORKSPACE"] = str(Path(workspace).resolve())
     # Tag the worker's session so it lands in state.db as `kanban`, not as an
     # untitled `cli` row. A worker is a dispatcher-owned run whose transcript is
     # read on the board and in `hermes kanban log` — it is not a conversation
@@ -9129,6 +9694,14 @@ def _default_spawn(
     # sidebar renders one row per attempt, labeled with the worker's own prompt
     # ("work kanban task t_…").
     env["HERMES_SESSION_SOURCE"] = "kanban"
+    if lifecycle_event_path is not None:
+        if not start_nonce:
+            raise ValueError("supervised worker launch requires a start nonce")
+        env["HERMES_WORKER_LIFECYCLE_EVENT_PATH"] = str(lifecycle_event_path)
+        env["HERMES_WORKER_LIFECYCLE_ATTEMPT"] = str(int(lifecycle_attempt))
+        env["HERMES_WORKER_START_NONCE"] = str(start_nonce)
+    if worker_session_id:
+        env["HERMES_WORKER_SESSION_ID"] = str(worker_session_id)
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already
@@ -9188,6 +9761,32 @@ def _default_spawn(
     # attributed correctly regardless of how the child loads config.
     env["HERMES_PROFILE"] = profile_arg
 
+    recovery_scope_args = (
+        provider_recovery_db_path,
+        provider_recovery_profile,
+        provider_credential_generation,
+    )
+    if any(value is not None for value in recovery_scope_args):
+        if not all(value is not None for value in recovery_scope_args):
+            raise ValueError("provider recovery launch scope must be complete")
+        recovery_db_path = Path(provider_recovery_db_path)
+        recovery_profile = normalize_profile_name(str(provider_recovery_profile))
+        if not recovery_db_path.is_absolute():
+            raise ValueError("provider recovery DB path must be absolute")
+        if recovery_profile != provider_recovery_profile or recovery_profile != profile_arg:
+            raise ValueError("provider recovery profile must be the normalized worker profile")
+        if (
+            isinstance(provider_credential_generation, bool)
+            or not isinstance(provider_credential_generation, int)
+            or provider_credential_generation <= 0
+        ):
+            raise ValueError("provider credential generation must be a positive integer")
+        env["HERMES_KANBAN_DB"] = str(recovery_db_path)
+        env["HERMES_PROFILE"] = recovery_profile
+        env["HERMES_PROVIDER_CREDENTIAL_GENERATION"] = str(
+            provider_credential_generation
+        )
+
     # A worker must NEVER boot the interactive TUI: an inherited HERMES_TUI=1
     # or a `display.interface: tui` in the profile's config would send the
     # quiet chat run into the Ink TUI, whose no-TTY bail-out exits 0 without
@@ -9231,17 +9830,13 @@ def _default_spawn(
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    if resume_session_id:
+        cmd.extend(["--resume", str(resume_session_id)])
     cmd.extend([
         "chat",
         "-q", prompt,
+        "-Q",
     ])
-    if task.goal_mode:
-        # Goal-mode workers must take the fully-quiet single-query path:
-        # the kanban goal-loop hook (_run_kanban_goal_loop_q) only runs in
-        # cli.py's quiet branch. Without -Q the worker gets exactly one
-        # turn, prints text, exits rc=0, and the dispatcher records a
-        # protocol violation (incident 2026-06-09 t_d9cbe312).
-        cmd.append("-Q")
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -9276,7 +9871,10 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    return proc
+
+
+_PRODUCTION_DEFAULT_SPAWN = _default_spawn
 
 
 # ---------------------------------------------------------------------------
@@ -10097,6 +10695,484 @@ def rewind_notify_cursor(
             ),
         )
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Durable provider recovery
+# ---------------------------------------------------------------------------
+
+def register_provider_recovery_wait(
+    conn: sqlite3.Connection,
+    *,
+    evidence: object,
+    scope: ProviderRecoveryScope,
+    waiting_at: Optional[int] = None,
+) -> bool:
+    """Register one exact running attempt after typed provider failure evidence.
+
+    ``AttemptExit`` is the supervisor's validated terminal evidence type. The
+    registration CAS proves that its task/run/session triple is still the exact
+    running attempt in both ``tasks`` and ``task_runs``. Re-registration of the
+    same exact scope is idempotent and never replaces the original timestamp.
+    """
+    from hermes_cli.worker_supervisor import AttemptExit
+
+    if not isinstance(scope, ProviderRecoveryScope):
+        raise TypeError("scope must be ProviderRecoveryScope")
+    if not isinstance(evidence, AttemptExit):
+        raise TypeError("evidence must be typed AttemptExit terminal evidence")
+    if evidence.classification != "transient_provider":
+        return False
+    if not evidence.task_id or not evidence.session_id:
+        return False
+    if isinstance(evidence.run_id, bool) or int(evidence.run_id) <= 0:
+        return False
+    wait_time = _strict_recovery_timestamp(
+        int(time.time()) if waiting_at is None else waiting_at,
+        field_name="waiting_at",
+    )
+
+    with write_txn(conn):
+        current = conn.execute(
+            """
+            SELECT 1
+            FROM tasks AS t
+            JOIN task_runs AS r
+              ON r.id = t.current_run_id AND r.task_id = t.id
+            WHERE t.id = ?
+              AND t.current_run_id = ?
+              AND t.session_id = ?
+              AND t.status = 'running'
+              AND r.status = 'running'
+              AND r.ended_at IS NULL
+            """,
+            (evidence.task_id, evidence.run_id, evidence.session_id),
+        ).fetchone()
+        if current is None:
+            return False
+
+        existing = conn.execute(
+            """
+            SELECT profile, provider, credential_generation
+            FROM provider_recovery_waits
+            WHERE task_id = ? AND run_id = ? AND session_id = ?
+            """,
+            (evidence.task_id, evidence.run_id, evidence.session_id),
+        ).fetchone()
+        if existing is not None:
+            return (
+                existing["profile"] == scope.profile
+                and existing["provider"] == scope.provider
+                and int(existing["credential_generation"])
+                == scope.credential_generation
+            )
+
+        conn.execute(
+            """
+            INSERT INTO provider_recovery_waits (
+                task_id, run_id, session_id,
+                profile, provider, credential_generation, waiting_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                evidence.task_id,
+                evidence.run_id,
+                evidence.session_id,
+                scope.profile,
+                scope.provider,
+                scope.credential_generation,
+                wait_time,
+            ),
+        )
+        return True
+
+
+def close_provider_recovery_wait(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    run_id: int,
+    session_id: str,
+) -> bool:
+    """Remove only the specified exact wait registration."""
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            DELETE FROM provider_recovery_waits
+            WHERE task_id = ? AND run_id = ? AND session_id = ?
+            """,
+            (task_id, run_id, session_id),
+        )
+    return cur.rowcount == 1
+
+
+def _provider_recovery_event_from_row(row: sqlite3.Row) -> ProviderRecoveryEvent:
+    return ProviderRecoveryEvent(
+        id=int(row["id"]),
+        stable_proof_id=row["stable_proof_id"],
+        scope=ProviderRecoveryScope(
+            row["profile"], row["provider"], int(row["credential_generation"])
+        ),
+        kind=ProviderRecoveryProofKind(row["proof_kind"]),
+        provider_observed_at=int(row["provider_observed_at"]),
+        publisher_id=row["publisher_id"],
+        publisher_version=row["publisher_version"],
+        inserted_at=int(row["inserted_at"]),
+    )
+
+
+def _provider_recovery_event_matches_proof(
+    event: ProviderRecoveryEvent, proof: ProviderRecoveryProof
+) -> bool:
+    return (
+        event.stable_proof_id == proof.stable_proof_id
+        and event.scope == proof.scope
+        and event.kind == proof.kind
+        and event.provider_observed_at == proof.provider_observed_at
+        and event.publisher_id == proof.publisher_id
+        and event.publisher_version == proof.publisher_version
+    )
+
+
+def publish_provider_recovery_event(
+    conn: sqlite3.Connection,
+    proof: ProviderRecoveryProof,
+    *,
+    inserted_at: Optional[int] = None,
+) -> ProviderRecoveryEvent:
+    """Append one successful proof and atomically materialize its fanout.
+
+    A stable proof id retry returns the original immutable event. Reusing that
+    id for different proof metadata is rejected instead of conflating proofs.
+    """
+    if not isinstance(proof, ProviderRecoveryProof):
+        raise TypeError("proof must be ProviderRecoveryProof")
+    insertion_time = _strict_recovery_timestamp(
+        int(time.time()) if inserted_at is None else inserted_at,
+        field_name="inserted_at",
+    )
+
+    with write_txn(conn):
+        existing_row = conn.execute(
+            "SELECT * FROM provider_recovery_events WHERE stable_proof_id = ?",
+            (proof.stable_proof_id,),
+        ).fetchone()
+        if existing_row is not None:
+            existing = _provider_recovery_event_from_row(existing_row)
+            if not _provider_recovery_event_matches_proof(existing, proof):
+                raise ValueError("stable proof id already identifies a different proof")
+            return existing
+
+        cur = conn.execute(
+            """
+            INSERT INTO provider_recovery_events (
+                stable_proof_id, profile, provider, credential_generation,
+                proof_kind, provider_observed_at,
+                publisher_id, publisher_version, inserted_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                proof.stable_proof_id,
+                proof.scope.profile,
+                proof.scope.provider,
+                proof.scope.credential_generation,
+                proof.kind.value,
+                proof.provider_observed_at,
+                proof.publisher_id,
+                proof.publisher_version,
+                insertion_time,
+            ),
+        )
+        event_id = int(cur.lastrowid)
+
+        # Fanout is part of the event insertion transaction. Only waiters that
+        # existed before the provider observation and still identify the exact
+        # current running attempt receive a delivery.
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO provider_recovery_deliveries (
+                event_id, task_id, run_id, session_id, state, created_at
+            )
+            SELECT ?, w.task_id, w.run_id, w.session_id, 'pending', ?
+            FROM provider_recovery_waits AS w
+            JOIN tasks AS t
+              ON t.id = w.task_id
+             AND t.current_run_id = w.run_id
+             AND t.session_id = w.session_id
+             AND t.status = 'running'
+            JOIN task_runs AS r
+              ON r.id = w.run_id
+             AND r.task_id = w.task_id
+             AND r.status = 'running'
+             AND r.ended_at IS NULL
+            WHERE w.profile = ?
+              AND w.provider = ?
+              AND w.credential_generation = ?
+              AND w.waiting_at < ?
+            """,
+            (
+                event_id,
+                insertion_time,
+                proof.scope.profile,
+                proof.scope.provider,
+                proof.scope.credential_generation,
+                proof.provider_observed_at,
+            ),
+        )
+        row = conn.execute(
+            "SELECT * FROM provider_recovery_events WHERE id = ?", (event_id,)
+        ).fetchone()
+        return _provider_recovery_event_from_row(row)
+
+
+_PROVIDER_RECOVERY_DELIVERY_SELECT = """
+    SELECT
+        d.event_id, d.task_id, d.run_id, d.session_id, d.state,
+        d.created_at, d.claim_owner, d.claim_expires, d.resolved_at,
+        e.profile, e.provider, e.credential_generation, e.proof_kind,
+        e.provider_observed_at, e.publisher_id, e.publisher_version
+    FROM provider_recovery_deliveries AS d
+    JOIN provider_recovery_events AS e ON e.id = d.event_id
+"""
+
+
+def _provider_recovery_delivery_from_row(
+    row: sqlite3.Row,
+) -> ProviderRecoveryDelivery:
+    return ProviderRecoveryDelivery(
+        event_id=int(row["event_id"]),
+        task_id=row["task_id"],
+        run_id=int(row["run_id"]),
+        session_id=row["session_id"],
+        state=ProviderRecoveryDeliveryState(row["state"]),
+        created_at=int(row["created_at"]),
+        claim_owner=row["claim_owner"],
+        claim_expires=(
+            int(row["claim_expires"])
+            if row["claim_expires"] is not None
+            else None
+        ),
+        resolved_at=(
+            int(row["resolved_at"]) if row["resolved_at"] is not None else None
+        ),
+        scope=ProviderRecoveryScope(
+            row["profile"], row["provider"], int(row["credential_generation"])
+        ),
+        proof_kind=ProviderRecoveryProofKind(row["proof_kind"]),
+        provider_observed_at=int(row["provider_observed_at"]),
+        publisher_id=row["publisher_id"],
+        publisher_version=row["publisher_version"],
+    )
+
+
+def list_provider_recovery_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    event_id: Optional[int] = None,
+    state: Optional[ProviderRecoveryDeliveryState] = None,
+) -> list[ProviderRecoveryDelivery]:
+    """List durable deliveries without claiming or consuming them."""
+    clauses: list[str] = []
+    params: list[object] = []
+    if event_id is not None:
+        clauses.append("d.event_id = ?")
+        params.append(int(event_id))
+    if state is not None:
+        if not isinstance(state, ProviderRecoveryDeliveryState):
+            raise TypeError("state must be ProviderRecoveryDeliveryState")
+        clauses.append("d.state = ?")
+        params.append(state.value)
+    where = f" WHERE {' AND '.join(clauses)}" if clauses else ""
+    rows = conn.execute(
+        _PROVIDER_RECOVERY_DELIVERY_SELECT
+        + where
+        + " ORDER BY d.event_id, d.task_id, d.run_id, d.session_id",
+        params,
+    ).fetchall()
+    return [_provider_recovery_delivery_from_row(row) for row in rows]
+
+
+def claim_provider_recovery_deliveries(
+    conn: sqlite3.Connection,
+    *,
+    consumer_id: str,
+    limit: int = 100,
+    lease_seconds: int = 60,
+    now: Optional[int] = None,
+) -> list[ProviderRecoveryDelivery]:
+    """Exclusively lease pending deliveries, reclaiming expired leases."""
+    owner = _strict_recovery_id(consumer_id, field_name="consumer_id")
+    if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 1000:
+        raise ValueError("limit must be an integer from 1 to 1000")
+    if (
+        isinstance(lease_seconds, bool)
+        or not isinstance(lease_seconds, int)
+        or not 1 <= lease_seconds <= 86_400
+    ):
+        raise ValueError("lease_seconds must be an integer from 1 to 86400")
+    claim_time = _strict_recovery_timestamp(
+        int(time.time()) if now is None else now, field_name="now"
+    )
+    lease_expires = claim_time + lease_seconds
+
+    with write_txn(conn):
+        keys = conn.execute(
+            """
+            SELECT event_id, task_id, run_id, session_id
+            FROM provider_recovery_deliveries
+            WHERE state = 'pending'
+              AND (
+                    claim_owner IS NULL
+                 OR claim_expires IS NULL
+                 OR claim_expires <= ?
+              )
+            ORDER BY event_id, task_id, run_id, session_id
+            LIMIT ?
+            """,
+            (claim_time, limit),
+        ).fetchall()
+        claimed: list[ProviderRecoveryDelivery] = []
+        for key in keys:
+            cur = conn.execute(
+                """
+                UPDATE provider_recovery_deliveries
+                SET claim_owner = ?, claim_expires = ?
+                WHERE event_id = ? AND task_id = ? AND run_id = ? AND session_id = ?
+                  AND state = 'pending'
+                  AND (
+                        claim_owner IS NULL
+                     OR claim_expires IS NULL
+                     OR claim_expires <= ?
+                  )
+                """,
+                (
+                    owner,
+                    lease_expires,
+                    key["event_id"],
+                    key["task_id"],
+                    key["run_id"],
+                    key["session_id"],
+                    claim_time,
+                ),
+            )
+            if cur.rowcount != 1:
+                continue
+            row = conn.execute(
+                _PROVIDER_RECOVERY_DELIVERY_SELECT
+                + " WHERE d.event_id = ? AND d.task_id = ? AND d.run_id = ? "
+                "AND d.session_id = ?",
+                (
+                    key["event_id"], key["task_id"],
+                    key["run_id"], key["session_id"],
+                ),
+            ).fetchone()
+            claimed.append(_provider_recovery_delivery_from_row(row))
+        return claimed
+
+
+def mark_provider_recovery_delivery_delivered(
+    conn: sqlite3.Connection,
+    *,
+    event_id: int,
+    task_id: str,
+    run_id: int,
+    session_id: str,
+    consumer_id: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Resolve a claimed delivery only while its exact run remains current."""
+    owner = _strict_recovery_id(consumer_id, field_name="consumer_id")
+    resolved = _strict_recovery_timestamp(
+        int(time.time()) if now is None else now, field_name="now"
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE provider_recovery_deliveries AS d
+            SET state = 'delivered', resolved_at = ?,
+                claim_owner = NULL, claim_expires = NULL
+            WHERE d.event_id = ? AND d.task_id = ?
+              AND d.run_id = ? AND d.session_id = ?
+              AND d.state = 'pending'
+              AND d.claim_owner = ? AND d.claim_expires > ?
+              AND EXISTS (
+                  SELECT 1
+                  FROM tasks AS t
+                  JOIN task_runs AS r
+                    ON r.id = t.current_run_id AND r.task_id = t.id
+                  WHERE t.id = d.task_id
+                    AND t.current_run_id = d.run_id
+                    AND t.session_id = d.session_id
+                    AND t.status = 'running'
+                    AND r.status = 'running'
+                    AND r.ended_at IS NULL
+              )
+            """,
+            (resolved, event_id, task_id, run_id, session_id, owner, resolved),
+        )
+        if cur.rowcount != 1:
+            return False
+        conn.execute(
+            """
+            DELETE FROM provider_recovery_waits
+            WHERE task_id = ? AND run_id = ? AND session_id = ?
+            """,
+            (task_id, run_id, session_id),
+        )
+        return True
+
+
+def mark_provider_recovery_delivery_stale(
+    conn: sqlite3.Connection,
+    *,
+    event_id: int,
+    task_id: str,
+    run_id: int,
+    session_id: str,
+    consumer_id: str,
+    now: Optional[int] = None,
+) -> bool:
+    """Resolve only an old exact delivery whose run is no longer current."""
+    owner = _strict_recovery_id(consumer_id, field_name="consumer_id")
+    resolved = _strict_recovery_timestamp(
+        int(time.time()) if now is None else now, field_name="now"
+    )
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            UPDATE provider_recovery_deliveries AS d
+            SET state = 'stale', resolved_at = ?,
+                claim_owner = NULL, claim_expires = NULL
+            WHERE d.event_id = ? AND d.task_id = ?
+              AND d.run_id = ? AND d.session_id = ?
+              AND d.state = 'pending'
+              AND d.claim_owner = ? AND d.claim_expires > ?
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM tasks AS t
+                  JOIN task_runs AS r
+                    ON r.id = t.current_run_id AND r.task_id = t.id
+                  WHERE t.id = d.task_id
+                    AND t.current_run_id = d.run_id
+                    AND t.session_id = d.session_id
+                    AND t.status = 'running'
+                    AND r.status = 'running'
+                    AND r.ended_at IS NULL
+              )
+            """,
+            (resolved, event_id, task_id, run_id, session_id, owner, resolved),
+        )
+        if cur.rowcount != 1:
+            return False
+        # Exact-key deletion cannot touch a successor wait registration.
+        conn.execute(
+            """
+            DELETE FROM provider_recovery_waits
+            WHERE task_id = ? AND run_id = ? AND session_id = ?
+            """,
+            (task_id, run_id, session_id),
+        )
+        return True
 
 
 # ---------------------------------------------------------------------------
