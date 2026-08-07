@@ -2348,6 +2348,8 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
 def _run_job_script(
     script_path: str,
     workdir: Optional[str] = None,
+    *,
+    preserve_output: bool = False,
 ) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2473,7 +2475,9 @@ def _run_job_script(
             env=env,
             **popen_kwargs,
         )
-        stdout = (result.stdout or "").strip()
+        stdout = result.stdout or ""
+        if not preserve_output:
+            stdout = stdout.strip()
         stderr = (result.stderr or "").strip()
 
         # Redact secrets from both stdout and stderr before any return path.

@@ -1820,6 +1820,29 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            previous_monitor_source = (
+                _normalize_job_optional_text(job.get("monitor_script")),
+                _normalize_job_optional_text(job.get("monitor_url")),
+            )
+            updated_monitor_source = (
+                _normalize_job_optional_text(updated.get("monitor_script")),
+                _normalize_job_optional_text(updated.get("monitor_url")),
+            )
+            if all(updated_monitor_source):
+                raise ValueError(
+                    "monitor_script and monitor_url are mutually exclusive — a job "
+                    "can only have one monitor source."
+                )
+            if any(updated_monitor_source) and bool(updated.get("no_agent")):
+                raise ValueError(
+                    "monitor_script/monitor_url cannot be combined with no_agent=True"
+                )
+            monitor_source_changed = updated_monitor_source != previous_monitor_source
+            if monitor_source_changed:
+                # A hash belongs to one source identity. Reusing it after a
+                # replace/clear can suppress the new source's first observation
+                # when its output happens to match the old source.
+                updated["monitor_state"] = None
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
@@ -1889,6 +1912,13 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
 
             jobs[i] = updated
             save_jobs(jobs)
+            if monitor_source_changed:
+                # Save the new job shape first. A stale snapshot is harmless
+                # while monitor_state is None, and best-effort cleanup avoids
+                # orphaning source data after monitor mode is cleared.
+                from cron.monitor import clear_monitor_snapshot
+
+                clear_monitor_snapshot(job_id)
             return _normalize_job_record(jobs[i])
     return None
 

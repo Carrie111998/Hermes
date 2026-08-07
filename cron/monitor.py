@@ -36,6 +36,7 @@ import hashlib
 import logging
 from dataclasses import dataclass
 from typing import Optional
+from urllib.parse import urljoin, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,7 @@ MAX_OUTPUT_CHARS = 8000
 # Bounded GET limits for monitor_url sources.
 URL_TIMEOUT_SECONDS = 30
 MAX_URL_BYTES = 262_144  # 256 KiB
+MAX_URL_REDIRECTS = 5
 
 _SNAPSHOT_FILENAME = "monitor_last_output.txt"
 
@@ -108,19 +110,53 @@ def _write_last_output(job_id: str, output: str) -> None:
         logger.warning("Monitor: failed to persist last output for %r: %s", job_id, exc)
 
 
+def clear_monitor_snapshot(job_id: str) -> None:
+    """Remove a monitor's persisted diff snapshot after its source changes."""
+    try:
+        _snapshot_path(job_id).unlink(missing_ok=True)
+    except Exception as exc:
+        logger.warning("Monitor: failed to clear last output for %r: %s", job_id, exc)
+
+
 def _fetch_monitor_url(url: str) -> tuple[bool, str]:
     """Bounded GET of a monitor URL. Returns (ok, body-or-error)."""
-    import urllib.request
+    from tools.url_safety import create_ssrf_safe_client, is_safe_url
 
-    if not str(url).lower().startswith(("http://", "https://")):
-        return False, f"monitor_url must be http(s): {url!r}"
+    current_url = str(url)
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "hermes-cron-monitor"})
-        with urllib.request.urlopen(req, timeout=URL_TIMEOUT_SECONDS) as resp:  # nosec B310 — scheme checked above
-            body = resp.read(MAX_URL_BYTES + 1)
-        if len(body) > MAX_URL_BYTES:
-            body = body[:MAX_URL_BYTES]
-        return True, body.decode("utf-8", errors="replace")
+        with create_ssrf_safe_client(
+            timeout=URL_TIMEOUT_SECONDS,
+            follow_redirects=False,
+            headers={"User-Agent": "hermes-cron-monitor"},
+        ) as client:
+            for _ in range(MAX_URL_REDIRECTS + 1):
+                scheme = (urlparse(current_url).scheme or "").lower()
+                if scheme not in {"http", "https"}:
+                    return False, f"monitor_url must be http(s): {current_url!r}"
+                if not is_safe_url(current_url):
+                    return False, "monitor_url blocked by SSRF protection"
+
+                with client.stream("GET", current_url) as resp:
+                    if resp.is_redirect:
+                        location = resp.headers.get("location")
+                        if not location:
+                            return False, "monitor_url redirect omitted Location"
+                        current_url = urljoin(current_url, location)
+                        continue
+
+                    resp.raise_for_status()
+                    chunks: list[bytes] = []
+                    total = 0
+                    for chunk in resp.iter_bytes(65_536):
+                        total += len(chunk)
+                        if total > MAX_URL_BYTES:
+                            return False, (
+                                f"monitor_url response exceeds {MAX_URL_BYTES} bytes"
+                            )
+                        chunks.append(chunk)
+                    body = b"".join(chunks)
+                    return True, body.decode("utf-8", errors="replace")
+        return False, f"monitor_url exceeded {MAX_URL_REDIRECTS} redirects"
     except Exception as exc:
         return False, f"monitor_url fetch failed: {exc}"
 
@@ -133,7 +169,11 @@ def _run_monitor_source(job: dict) -> tuple[bool, str]:
         from cron.scheduler import _run_job_script
 
         workdir = (job.get("workdir") or "").strip() or None
-        return _run_job_script(monitor_script, workdir=workdir)
+        return _run_job_script(
+            monitor_script,
+            workdir=workdir,
+            preserve_output=True,
+        )
     monitor_url = (job.get("monitor_url") or "").strip()
     if monitor_url:
         return _fetch_monitor_url(monitor_url)

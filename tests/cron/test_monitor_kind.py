@@ -153,6 +153,56 @@ def test_create_job_monitor_rejected_with_no_agent(hermes_env):
         )
 
 
+@pytest.mark.parametrize(
+    ("initial_monitor", "updates"),
+    [
+        (True, {"no_agent": True, "script": "worker.sh"}),
+        (False, {"monitor_script": "monitor.sh"}),
+    ],
+)
+def test_update_job_rejects_monitor_with_no_agent(
+    hermes_env, initial_monitor, updates
+):
+    from cron.jobs import create_job, update_job
+
+    _write_script(hermes_env, "monitor.sh", "echo state\n")
+    _write_script(hermes_env, "worker.sh", "echo alert\n")
+    job = create_job(
+        prompt="React" if initial_monitor else None,
+        schedule="every 5m",
+        monitor_script="monitor.sh" if initial_monitor else None,
+        script=None if initial_monitor else "worker.sh",
+        no_agent=not initial_monitor,
+    )
+
+    with pytest.raises(ValueError, match="no_agent"):
+        update_job(job["id"], updates)
+
+
+def test_update_job_resets_baseline_when_monitor_source_changes(hermes_env):
+    from cron.jobs import create_job, get_job, update_job
+    from cron.monitor import _snapshot_path, _write_last_output
+
+    _write_script(hermes_env, "one.sh", "echo one\n")
+    _write_script(hermes_env, "two.sh", "echo two\n")
+    job = create_job(
+        prompt="React",
+        schedule="every 5m",
+        monitor_script="one.sh",
+    )
+    update_job(
+        job["id"],
+        {"monitor_state": {"last_output_hash": "old", "last_changed_at": "now"}},
+    )
+    _write_last_output(job["id"], "old output")
+    assert _snapshot_path(job["id"]).exists()
+
+    update_job(job["id"], {"monitor_script": "two.sh"})
+
+    assert get_job(job["id"])["monitor_state"] is None
+    assert not _snapshot_path(job["id"]).exists()
+
+
 # ---------------------------------------------------------------------------
 # cron.monitor: hashing + diff unit behavior
 # ---------------------------------------------------------------------------
@@ -164,6 +214,61 @@ def test_hash_is_exact_bytes(hermes_env):
     assert hash_monitor_output("a\nb") == hash_monitor_output("a\nb")
     # Exact-bytes contract: even whitespace-only differences are changes.
     assert hash_monitor_output("a\nb") != hash_monitor_output("a\nb ")
+
+
+def test_monitor_url_rejects_ssrf_blocked_target(hermes_env, monkeypatch):
+    import tools.url_safety as url_safety
+    from cron.monitor import _fetch_monitor_url
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: False)
+
+    ok, error = _fetch_monitor_url("http://127.0.0.1:8080/private")
+
+    assert ok is False
+    assert "SSRF" in error
+
+
+def test_monitor_url_rejects_oversized_response(hermes_env, monkeypatch):
+    import tools.url_safety as url_safety
+    from cron.monitor import MAX_URL_BYTES, _fetch_monitor_url
+
+    class FakeResponse:
+        is_redirect = False
+        headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self, _chunk_size):
+            yield b"x" * (MAX_URL_BYTES + 1)
+
+    class FakeClient:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def stream(self, _method, _url):
+            return FakeResponse()
+
+    monkeypatch.setattr(url_safety, "is_safe_url", lambda _url: True)
+    monkeypatch.setattr(
+        url_safety,
+        "create_ssrf_safe_client",
+        lambda **_kwargs: FakeClient(),
+    )
+
+    ok, error = _fetch_monitor_url("https://example.com/status")
+
+    assert ok is False
+    assert "exceeds" in error
 
 
 def test_unified_diff_is_capped(hermes_env):
@@ -190,6 +295,10 @@ def _make_monitor_job(hermes_env, script_body: str):
         schedule="every 5m",
         monitor_script="mon.sh",
         deliver="local",
+        # Keep the runtime stub and persisted job pins aligned so the
+        # provider/model drift guard does not depend on a developer's config.
+        provider="test",
+        model="test-model",
     )
 
 
@@ -250,6 +359,22 @@ def test_changed_output_injects_diff(hermes_env, monkeypatch):
     assert "-state A" in prompt
     assert "+state B" in prompt
     assert "state B" in prompt  # new output included verbatim
+
+
+def test_boundary_whitespace_change_runs_agent(hermes_env, monkeypatch):
+    from cron.jobs import get_job
+    from cron.scheduler import run_job
+
+    job = _make_monitor_job(hermes_env, "printf 'state A'")
+    observed: dict = {}
+    _install_agent_stubs(monkeypatch, observed)
+
+    run_job(job)
+    _write_script(hermes_env, "mon.sh", "printf 'state A '")
+    run_job(get_job(job["id"]))
+
+    assert observed["agent_runs"] == 2
+    assert "+state A " in observed["prompts"][1]
 
 
 def test_hash_persists_across_scheduler_restart(hermes_env, monkeypatch):
