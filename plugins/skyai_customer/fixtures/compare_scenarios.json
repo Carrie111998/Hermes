@@ -32,6 +32,17 @@
     "focus": "existing voucher redemption with card top-up: reject categorical yes; no new free-flight campaign entitlement from top-up alone; qualifying new voucher/direct BookNow only under verified rules; date/time does not prove BookNow; original buyer/order email may own any pre-existing bonus; clarify unknown purchase origin"
   },
   {
+    "id": "universal_value_voucher_non_specific_gift",
+    "message": "Искам да не е конкретен",
+    "history": [
+      {
+        "role": "user",
+        "content": "Искам да подаря ваучер за преживяване."
+      }
+    ],
+    "focus": "answer directly that a universal value voucher exists for a non-specific gift; buyer selects the sum and recipient selects the experience later; use the support fact pack; no invented selected experience, keyword router, or answer template"
+  },
+  {
     "id": "prohodna_bungee_minimum_anxiety",
     "message": "Много искам бънджи на Проходна на 15 август, но ме притеснява, че ако не се съберат хора, може да не стане. Какво да направя?",
     "history": [

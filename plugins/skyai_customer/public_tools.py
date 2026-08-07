@@ -848,6 +848,19 @@ def handle_skyai_support_knowledge(
             ),
         },
         "vouchers": {
+            "universal_value_voucher": {
+                "canonical_title": "Подаръчен ваучер на стойност",
+                "public_url": "https://skyvision.bg/gift-details/voucher-gift/",
+                "universal": True,
+                "non_specific": True,
+                "buyer_selects_sum": True,
+                "recipient_selects_experience_later": True,
+                "starting_price_eur": "25.00",
+                "starting_price_bgn": "48.89",
+                "higher_price_requires_top_up": True,
+                "lower_price_creates_residual_voucher": True,
+                "residual_voucher_keeps_original_validity": True,
+            },
             "issuer_scope": {
                 "skyvision_issued_vouchers": {
                     "profile_compatible": True,
