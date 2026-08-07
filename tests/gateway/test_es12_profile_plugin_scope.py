@@ -39,12 +39,20 @@ def _make_profile(home: Path, plugin_name: str) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def _clean_manager_cache():
+def _clean_manager_cache(tmp_path, monkeypatch):
     """The cache is process-global; do not leak managers between tests."""
+    from agent.secret_scope import is_multiplex_active, set_multiplex_active
+
+    bundled = tmp_path / "bundled_plugins"
+    bundled.mkdir()
+    monkeypatch.setattr(plugins_mod, "get_bundled_plugins_dir", lambda: bundled)
     modules_before = set(sys.modules)
+    multiplex_before = is_multiplex_active()
+    set_multiplex_active(True)
     plugins_mod.reset_plugin_managers()
     yield
     plugins_mod.reset_plugin_managers()
+    set_multiplex_active(multiplex_before)
     for name in set(sys.modules) - modules_before:
         if name.startswith("hermes_plugins."):
             sys.modules.pop(name, None)
@@ -168,8 +176,8 @@ def test_profile_discovery_is_serialized_across_managers(two_profiles, monkeypat
     assert max_active == 1
 
 
-def test_profiles_reuse_an_identical_directory_plugin_module(tmp_path):
-    """Two profile managers may register one source without re-importing it."""
+def test_profiles_isolate_an_identical_directory_plugin_module(tmp_path):
+    """Two profile managers import one source into private module namespaces."""
     from gateway.run import _profile_runtime_scope
 
     shared = tmp_path / "shared_plugin"
@@ -209,53 +217,14 @@ def test_profiles_reuse_an_identical_directory_plugin_module(tmp_path):
 
     first = managers[0]._plugins["shared_relative"]
     second = managers[1]._plugins["shared_relative"]
-    assert first.module is second.module
+    assert first.module is not second.module
+    assert first.module.__name__.startswith("hermes_plugins.scope_")
+    assert second.module.__name__.startswith("hermes_plugins.scope_")
+    assert first.module.__name__ != second.module.__name__
     assert first.error is None
     assert second.error is None
     assert managers[0].invoke_hook("transform_llm_output") == ["loaded"]
     assert managers[1].invoke_hook("transform_llm_output") == ["loaded"]
-
-
-def test_profiles_reject_same_plugin_key_from_different_sources(tmp_path):
-    from gateway.run import _profile_runtime_scope
-
-    managers = []
-    for index, value in enumerate(("profile-a", "profile-b")):
-        home = tmp_path / f"profile_{index}"
-        plugin = home / "plugins" / "shared_relative"
-        plugin.mkdir(parents=True)
-        (plugin / "plugin.yaml").write_text(
-            yaml.safe_dump({"name": "shared_relative", "version": "0.1.0"}),
-            encoding="utf-8",
-        )
-        (plugin / "schemas.py").write_text(
-            f"SHARED_VALUE = {value!r}\n",
-            encoding="utf-8",
-        )
-        (plugin / "__init__.py").write_text(
-            "from .schemas import SHARED_VALUE\n"
-            "def register(ctx):\n"
-            "    ctx.register_hook("
-            "'transform_llm_output', lambda **kw: SHARED_VALUE"
-            ")\n",
-            encoding="utf-8",
-        )
-        (home / "config.yaml").write_text(
-            yaml.safe_dump({"plugins": {"enabled": ["shared_relative"]}}),
-            encoding="utf-8",
-        )
-        with _profile_runtime_scope(home):
-            plugins_mod.discover_plugins()
-            managers.append(plugins_mod.get_plugin_manager())
-
-    first = managers[0]._plugins["shared_relative"]
-    second = managers[1]._plugins["shared_relative"]
-    assert first.enabled is True
-    assert first.error is None
-    assert managers[0].invoke_hook("transform_llm_output") == ["profile-a"]
-    assert second.enabled is False
-    assert "different source" in (second.error or "")
-    assert managers[1].invoke_hook("transform_llm_output") == []
 
 
 def test_profiles_do_not_reuse_a_partially_imported_identical_plugin(tmp_path):
@@ -302,8 +271,10 @@ def test_profiles_do_not_reuse_a_partially_imported_identical_plugin(tmp_path):
         assert loaded.enabled is False
         assert "import failed" in (loaded.error or "")
         assert manager.invoke_hook("transform_llm_output") == []
-    assert "hermes_plugins.shared_failed" not in sys.modules
-    assert "hermes_plugins.shared_failed.schemas" not in sys.modules
+    assert not any(
+        name.startswith("hermes_plugins.scope_") and "__shared_failed" in name
+        for name in sys.modules
+    )
 
 
 def test_single_profile_gateway_behaviour_unchanged(tmp_path, monkeypatch):
@@ -314,6 +285,21 @@ def test_single_profile_gateway_behaviour_unchanged(tmp_path, monkeypatch):
     second = plugins_mod.get_plugin_manager()
 
     assert first is second
+
+
+def test_non_multiplex_directory_module_name_is_unchanged(tmp_path):
+    """The adapter namespace applies only to a multiplex gateway process."""
+    from agent.secret_scope import set_multiplex_active
+    from gateway.run import _profile_runtime_scope
+
+    set_multiplex_active(False)
+    home = _make_profile(tmp_path / "solo_module", "es12_solo_module")
+    with _profile_runtime_scope(home):
+        plugins_mod.discover_plugins()
+        loaded = plugins_mod.get_plugin_manager()._plugins["es12_solo_module"]
+
+    assert loaded.error is None
+    assert loaded.module.__name__ == "hermes_plugins.es12_solo_module"
 
 
 def test_explicit_pin_still_wins(tmp_path, monkeypatch):
