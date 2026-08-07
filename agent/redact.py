@@ -496,42 +496,115 @@ def _mask_control_split_tokens(text: str, mask_fn) -> str:
     corresponding span in the *original* — but only when the original span
     contains solely token-body and control chars (a match that crosses into a
     different line's unrelated text, e.g. ``EXA_API_KEY=*** is rejected).
+
+    Issue #81012: bare-ESC stripping left CSI terminator bytes (``m`` / ``K``
+    / ...) glued to the token head in the stripped copy, which defeats the
+    ``(?<![A-Za-z0-9_-])`` prefix-regex lookbehind and lets the whole
+    token leak (``\\x1b[32msk-...\\x1b[0m``). Strip the COMPLETE CSI
+    sequence instead. When the cross-line match would have been
+    rejected by the legacy line-boundary guard (fragment self-matches
+    one side, span crosses \\n), fall back to per-line masking so at
+    least the prefix-bearing line is masked (#81012).
     """
-    stripped = _CONTROL_CHARS_RE.sub("", text)
+    _CONTROL_FOR_SHADOW = re.compile(
+        r"[\x00-\x1f\x7f-‏ - ⁠﻿]"
+    )
+    stripped_chars: list[str] = []
+    orig_idx: list[int] = []
+    csi_eaten: set[int] = set()
+    i = 0
+    n = len(text)
+    while i < n:
+        c = text[i]
+        # Eat a complete CSI sequence FIRST (ESC '[' [params] <terminator>).
+        # A bare ESC check would consume the ESC byte alone and leave the
+        # CSI terminator letter (``m``) glued to the next token in the
+        # stripped copy, defeating the prefix-regex lookbehind (#81012).
+        if c == "\x1b" and i + 1 < n and text[i + 1] == "[":
+            j = i + 2
+            if j < n and text[j] == "?":
+                j += 1
+            while j < n and (text[j].isdigit() or text[j] == ";"):
+                j += 1
+            if j < n and text[j].isalpha():
+                for k in range(i, j + 1):
+                    csi_eaten.add(k)
+                i = j + 1
+                continue
+        if _CONTROL_FOR_SHADOW.match(c):
+            i += 1
+            continue
+        stripped_chars.append(c)
+        orig_idx.append(i)
+        i += 1
+    stripped = "".join(stripped_chars)
     if stripped == text:
         return text
-    orig_idx = [i for i, c in enumerate(text) if not _CONTROL_CHARS_RE.match(c)]
     out = list(text)
-    matches = []
+    matches: list[tuple[int, int, str]] = []
+
+    def _try_record(start_o: int, end_o: int, body: str) -> bool:
+        span = text[start_o:end_o]
+        for k, c in enumerate(span):
+            abs_k = start_o + k
+            if c in _TOKEN_BODY_CHARS:
+                continue
+            if _CONTROL_FOR_SHADOW.match(c):
+                continue
+            if abs_k in csi_eaten:
+                continue
+            return False
+        if end_o < len(text) and text[end_o] == "=":
+            return False
+        matches.append((start_o, end_o, mask_fn(body)))
+        return True
+
+    def _per_line_fallback(start_o: int, end_o: int) -> None:
+        """Mask the prefix-bearing line inside the cross-line span.
+
+        Used when the cross-line match was rejected by the
+        legacy line-boundary guard because a fragment self-matches.
+        Re-runs _PREFIX_RE on each line of the original span
+        independently so the prefix-side of the split is masked
+        instead of the whole token leaking (#81012).
+        """
+        # Split original span into per-line chunks, mask any prefix
+        # match found inside. We scan each line's text directly
+        # (not the shadow) because the original code's per-line
+        # behaviour is what we want here: a self-matching prefix on
+        # the line itself is masked regardless of any cross-line
+        # join attempt.
+        local = text[start_o:end_o]
+        line_start = start_o
+        for k, c in enumerate(local):
+            if c == "\n" or c == "\r":
+                line_text = local[line_start - start_o:k + (1 if c == "\r" and k + 1 < len(local) and local[k+1] == "\n" else 0):k + 1]
+                if line_text:
+                    for m in _PREFIX_RE.finditer(line_text):
+                        so = start_o + m.start(1)
+                        eo = start_o + m.end(1)
+                        _try_record(so, eo, m.group(1))
+                line_start = start_o + k + 1
+        tail = local[line_start - start_o:]
+        if tail:
+            for m in _PREFIX_RE.finditer(tail):
+                so = start_o + m.start(1)
+                eo = start_o + m.end(1)
+                _try_record(so, eo, m.group(1))
+
     for m in _PREFIX_RE.finditer(stripped):
         body = m.group(1)
         start_orig = orig_idx[m.start(1)]
         end_orig = orig_idx[m.end(1) - 1] + 1
-        # If a fragment inside the span already matches _PREFIX_RE on its
-        # own AND the span crosses a LINE boundary (\n / \r), do NOT join.
-        # A complete token at end-of-line followed by a word line
-        # (``ghp_<token>\nbutton [ref=e3]``) joins into one stripped-copy
-        # match and the mask eats ``button``. Line structure is legitimate;
-        # the self-matching fragment is handled by the ordinary prefix pass
-        # (any remainder past the newline is left unmasked — accepted
-        # residual to preserve line structure).
-        # For NON-newline controls (ESC, ZWSP, ...) the join proceeds even
-        # when a fragment self-matches: those bytes never legitimately sit
-        # between a token and adjacent prose, and skipping there let the
-        # non-matching remainder of a split token leak
-        # (``sk-<head>\x1b<tail>`` masked only the head).
         span = text[start_orig:end_orig]
-        if ("\n" in span or "\r" in span) and _PREFIX_RE.search(span):
+        cross_line = ("\n" in span or "\r" in span)
+        if cross_line and _PREFIX_RE.search(span):
+            # A fragment on one side already self-matches; the
+            # legacy guard would skip the whole join and leak the
+            # tail. Recover what we can by masking the prefix side.
+            _per_line_fallback(start_orig, end_orig)
             continue
-        # Reject matches whose original span crosses a non-token char
-        # (e.g. ``sk_abc…\nTAVILY_API_KEY=…`` — the ``=`` is not part of a
-        # token body, so the regex matched across unrelated lines). Also
-        # reject when the match runs into a ``KEY=`` name: a real token value
-        # is followed by a newline/space/end, not ``=``.
-        if (all(c in _TOKEN_BODY_CHARS or _CONTROL_CHARS_RE.match(c)
-                for c in span)
-                and (end_orig >= len(text) or text[end_orig] != "=")):
-            matches.append((start_orig, end_orig, mask_fn(body)))
+        _try_record(start_orig, end_orig, body)
     for start_orig, end_orig, replacement in reversed(matches):
         out[start_orig:end_orig] = list(replacement)
     return "".join(out)

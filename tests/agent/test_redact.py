@@ -206,6 +206,45 @@ class TestControlCharSplitTokens:
         assert "SHELL=/bin/bash" in result
         assert "HOME=/home/user" in result
 
+    def test_csi_wrapped_prefix_masked(self):
+        # Regression for issue #81012: a vendor-prefixed token wrapped in
+        # a complete CSI/SGR sequence used to leak because stripping only
+        # the ESC byte left ``[32msk-…[0m``, defeating the prefix-regex
+        # lookbehind (the trailing ``m`` is alphanumeric and glues to the
+        # token head). The real leak shape has no spaces between the CSI
+        # terminator and the token — see issue body.
+        tok = "sk-" + "a" * 20 + "b" * 8
+        text = f"\x1b[32m{tok}\x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert tok not in result
+        assert tok[:12] not in result
+        assert tok[12:] not in result
+
+    def test_csi_wrapped_prefix_with_space_masked(self):
+        # Same shape with a single space between the CSI terminator and
+        # the prefix — the prefix-regex lookbehind happens to pass here
+        # because space is not alphanumeric, but we still want the mask
+        # to cover the whole token, not just the prefix.
+        tok = "sk-" + "a" * 20 + "b" * 8
+        text = f"\x1b[32m {tok} \x1b[0m"
+        result = redact_sensitive_text(text, force=True)
+        assert tok not in result
+
+    def test_esc_split_across_newline_masked(self):
+        # Regression for issue #81012 (second gap): the previous
+        # line-boundary guard short-circuited any join whose original
+        # span crossed \n, even when an ESC inside the span was the
+        # legitimate splitter. Per-line iteration must still mask the
+        # token body that lives on the SAME line as the prefix.
+        tok = "sk-" + "a" * 20
+        tail = "b" * 20
+        # The escape splits the head/mid on line 1; the tail lands on line 2.
+        text = f"{tok[:10]}\x1b{tok[10:]}\n{tail}"
+        result = redact_sensitive_text(text, force=True)
+        # The head line (containing the prefix) is masked entirely.
+        assert tok not in result
+        assert tok[:12] not in result
+
 
 class TestEnvLookupPreserved:
     """Programmatic env var lookups must not be corrupted (issue #2852)."""
