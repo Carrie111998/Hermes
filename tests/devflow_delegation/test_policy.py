@@ -38,9 +38,20 @@ def test_threshold_rejects_low_confidence_and_severity():
     pol = build_policy({})["critic"]
     d = evaluate_source_threshold(pol, confidence=pol.min_confidence - 0.01, severity="high")
     assert not d.allowed and d.reason == "below_confidence"
-    d = evaluate_source_threshold(pol, confidence=1.0, severity="low")
-    assert (not d.allowed and d.reason == "below_severity") or d.allowed  # critic floor may be low
     d = evaluate_source_threshold(pol, confidence=1.0, severity="critical")
+    assert d.allowed
+
+
+def test_threshold_below_severity_is_actually_rejected():
+    # A source with a high floor must reject a low-severity finding — the
+    # severity gate is a stated security invariant, so assert the reject path
+    # directly rather than a disjunction that a broken impl could satisfy.
+    pol = build_policy({"watchdog": {"min_severity": "high"}})["watchdog"]
+    d = evaluate_source_threshold(pol, confidence=1.0, severity="low")
+    assert not d.allowed and d.reason == "below_severity"
+    d = evaluate_source_threshold(pol, confidence=1.0, severity="medium")
+    assert not d.allowed and d.reason == "below_severity"
+    d = evaluate_source_threshold(pol, confidence=1.0, severity="high")
     assert d.allowed
 
 
@@ -50,6 +61,18 @@ def test_rate_limits_source_window():
     assert ok.allowed
     blocked = check_rate_limits(pol, source_count=2, global_count=2, critical_used=0, is_critical=False)
     assert not blocked.allowed and blocked.reason == "rate_limit_source"
+
+
+def test_global_cap_blocks_and_critical_never_bypasses_it():
+    # The global window cap is a hard ceiling: it is checked before the source
+    # limit, and a critical finding may bypass the SOURCE limit but NEVER the
+    # global one (stated security invariant).
+    pol = build_policy({"critic": {"max_per_window": 10}})["critic"]
+    blocked = check_rate_limits(pol, source_count=0, global_count=40, critical_used=0, is_critical=False)
+    assert not blocked.allowed and blocked.reason == "rate_limit_global"
+    # critical + room in the critical budget still cannot cross the global cap
+    still_blocked = check_rate_limits(pol, source_count=0, global_count=40, critical_used=0, is_critical=True)
+    assert not still_blocked.allowed and still_blocked.reason == "rate_limit_global"
 
 
 def test_critical_bypass_consumes_separate_budget():
@@ -75,6 +98,17 @@ def test_missing_policy_file_is_not_an_error(tmp_path):
     assert load_policy_overrides(tmp_path / "nope.json") == {}
 
 
+def test_invalid_override_value_fails_closed(tmp_path):
+    # An operator typo in a security-gating enum field (a bad severity or an
+    # unknown mode) must fail closed at the config boundary, not silently
+    # disable the floor (min_severity) or ship an unknown mode downstream.
+    for bad in ({"watchdog": {"min_severity": "hihg"}}, {"critic": {"mode": "auto"}}):
+        p = tmp_path / "policy.json"
+        p.write_text(json.dumps(bad), encoding="utf-8")
+        with pytest.raises(PolicyError):
+            load_policy_overrides(p)
+
+
 def test_malformed_policy_file_raises(tmp_path):
     p = tmp_path / "policy.json"
     p.write_text("{oops", encoding="utf-8")
@@ -92,6 +126,13 @@ def test_cooldown_windows():
     assert not in_cooldown(policy=pol, terminal_state="DECLINED", terminal_updated_at_iso=old, now=NOW)
     # non-terminal states never cooldown
     assert not in_cooldown(policy=pol, terminal_state="FAILED", terminal_updated_at_iso=recent, now=NOW)
+
+
+def test_cooldown_malformed_timestamp_does_not_gate():
+    # A garbage terminal timestamp must not wedge the dedup guard shut; it
+    # fails open (returns False) so the fingerprint can be re-attempted.
+    pol = build_policy({})["critic"]
+    assert not in_cooldown(policy=pol, terminal_state="DEPLOYED", terminal_updated_at_iso="not-a-date", now=NOW)
 
 
 def test_first_rate_limit_crossing_fires_once():

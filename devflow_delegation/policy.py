@@ -65,6 +65,7 @@ DEFAULT_SOURCE_POLICIES: Dict[str, SourcePolicy] = {
 }
 
 _SEVERITY_RANK = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+_VALID_MODES = {"dry_run", "queue"}
 
 
 def load_policy_overrides(path: Path) -> Dict[str, dict]:
@@ -83,10 +84,28 @@ def load_policy_overrides(path: Path) -> Dict[str, dict]:
         unknown = set(fields) - _POLICY_FIELDS
         if unknown:
             raise PolicyError(f"policy override for '{source}' has unknown fields: {sorted(unknown)}")
+        # Enum fields gate security decisions, so a typo must fail CLOSED at the
+        # config boundary. An unknown min_severity would otherwise rank 0 and
+        # silently disable the severity floor (accept-all); an unknown mode
+        # would ship downstream. Numeric fields are left to fail loud at use.
+        if "min_severity" in fields and fields["min_severity"] not in _SEVERITY_RANK:
+            raise PolicyError(
+                f"policy override for '{source}' has invalid min_severity: {fields['min_severity']!r}"
+            )
+        if "mode" in fields and fields["mode"] not in _VALID_MODES:
+            raise PolicyError(
+                f"policy override for '{source}' has invalid mode: {fields['mode']!r}"
+            )
     return data
 
 
 def build_policy(overrides: Dict[str, dict]) -> Dict[str, SourcePolicy]:
+    """Merge validated operator overrides onto the defaults. Trusts
+    pre-validated input: feed it DEFAULT_SOURCE_POLICIES-shaped dicts or the
+    output of load_policy_overrides (which rejects unknown keys and bad enum
+    values). An unknown key here surfaces as a raw TypeError from
+    dataclasses.replace — by design, since this is an internal, not operator,
+    boundary."""
     merged = dict(DEFAULT_SOURCE_POLICIES)
     for source, fields in overrides.items():
         base = merged.get(source, DEFAULT_SOURCE_POLICIES["explicit"])
